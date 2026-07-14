@@ -1843,6 +1843,26 @@ mod tests {
     }
 
     #[test]
+    fn reverse_edge_witness_handles_a_bordered_suffix() {
+        let suffix = [0x7F, 0x11, 0x7F];
+        for class in [
+            ByteClass::from_bytes(&[0x00, 0x80]),
+            ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+        ] {
+            let plan = plan(class, &suffix, false);
+            let mut haystack = vec![0x00; 100];
+            haystack[94..97].copy_from_slice(&suffix);
+            let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, Some((0, 97)));
+            assert_eq!(accounting.prefilter_calls, 2);
+            assert_eq!(accounting.prefix_bytes_examined, 128);
+            assert!(accounting.suffix_confirmation_attempted);
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+        }
+    }
+
+    #[test]
     fn overlapping_edge_regions_use_one_forward_prefilter() {
         let suffix = [0x7F, 0x11, 0x22];
         for class in [
