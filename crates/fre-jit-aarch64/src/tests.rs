@@ -983,6 +983,152 @@ fn aggregate_contract_auditor_rejects_cfg_abi_status_load_and_manifest_tampering
 }
 
 #[test]
+fn aggregate_audit_rejects_confirmation_scalar_last_offset() {
+    let literal = b"0123456789abcdefg";
+    let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+        .expect("aggregate program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("aggregate image");
+    let mut inner = valid.inner().clone();
+    let confirmation_load = decoded_position(inner.code(), |instruction| {
+        matches!(
+            instruction,
+            DecodedInstruction::LoadByte {
+                destination: 10,
+                base: 15,
+                offset: 0
+            }
+        )
+    });
+    let malicious_offset = u16::try_from(literal.len() - 1).expect("small literal");
+    let malicious_word = 0x3940_0000_u32 | (u32::from(malicious_offset) << 10) | (15 << 5) | 10;
+    inner.code[confirmation_load..confirmation_load + 4]
+        .copy_from_slice(&malicious_word.to_le_bytes());
+    assert_eq!(
+        decode_one(
+            malicious_word,
+            u32::try_from(confirmation_load).expect("small code")
+        ),
+        Ok(DecodedInstruction::LoadByte {
+            destination: 10,
+            base: 15,
+            offset: malicious_offset,
+        })
+    );
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateControlFlow {
+            offset: u32::try_from(confirmation_load).expect("small code")
+        })
+    );
+}
+
+#[test]
+fn aggregate_audit_rejects_nonprogress_scalar_scan_backedge() {
+    let program = build_exact_aggregate::<Count>(b"needle", ValidateLimits::default())
+        .expect("aggregate program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("aggregate image");
+    let mut inner = valid.inner().clone();
+    let instructions = decode(inner.code()).expect("valid aggregate code");
+    let branch_index = instructions
+        .windows(2)
+        .position(|pair| {
+            matches!(
+                pair,
+                [
+                    DecodedInstruction::CompareRegister64 { left: 5, right: 7 },
+                    DecodedInstruction::BranchCondition {
+                        condition: Condition::Higher,
+                        ..
+                    }
+                ]
+            )
+        })
+        .expect("scalar scan guard")
+        + 1;
+    let branch = branch_index.checked_mul(4).expect("small code");
+    let scalar_guard = branch.checked_sub(4).expect("branch follows guard");
+    let branch_u32 = u32::try_from(branch).expect("small code");
+    let scalar_guard_u32 = u32::try_from(scalar_guard).expect("small code");
+    assert!(
+        inner
+            .labels
+            .iter()
+            .any(|label| label.offset == scalar_guard_u32)
+    );
+    let malicious_word = 0x54ff_ffe8_u32;
+    inner.code[branch..branch + 4].copy_from_slice(&malicious_word.to_le_bytes());
+    let relocation = inner
+        .relocations
+        .iter_mut()
+        .find(|relocation| relocation.code_offset == branch_u32)
+        .expect("scalar scan relocation");
+    relocation.target = RelocationTarget::CodeOffset(scalar_guard_u32);
+    relocation.resolved_word = malicious_word;
+    assert_eq!(
+        decode_one(malicious_word, branch_u32),
+        Ok(DecodedInstruction::BranchCondition {
+            condition: Condition::Higher,
+            displacement: -4,
+        })
+    );
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateControlFlow { offset: branch_u32 })
+    );
+}
+
+#[test]
+fn aggregate_audit_binds_reducer_delta_to_manifest() {
+    let literal = b"needle";
+    let count = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+        .expect("count aggregate program");
+    let spans = build_exact_aggregate::<SpanSum>(literal, ValidateLimits::default())
+        .expect("span-sum aggregate program");
+    let count_image =
+        emit_exact_aggregate(&count, EmitLimits::default()).expect("count aggregate image");
+    let span_image =
+        emit_exact_aggregate(&spans, EmitLimits::default()).expect("span-sum aggregate image");
+
+    for (valid, output, malicious_delta) in [
+        (
+            count_image,
+            AggregateOutput::Count,
+            u16::try_from(literal.len()).expect("small literal"),
+        ),
+        (span_image, AggregateOutput::SpanSum, 1_u16),
+    ] {
+        assert_eq!(valid.output(), output);
+        let mut inner = valid.inner().clone();
+        let reducer = decoded_position(inner.code(), |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::AddImmediate64 {
+                    destination: 13,
+                    source: 13,
+                    ..
+                }
+            )
+        });
+        let malicious_word = 0x9100_0000_u32 | (u32::from(malicious_delta) << 10) | (13 << 5) | 13;
+        inner.code[reducer..reducer + 4].copy_from_slice(&malicious_word.to_le_bytes());
+        assert_eq!(
+            decode_one(malicious_word, u32::try_from(reducer).expect("small code")),
+            Ok(DecodedInstruction::AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: malicious_delta,
+            })
+        );
+        assert_eq!(
+            audit_aggregate(&NativeAggregateImage::new(inner)),
+            Err(AuditError::InvalidAggregateControlFlow {
+                offset: u32::try_from(reducer).expect("small code")
+            })
+        );
+    }
+}
+
+#[test]
 fn decoder_matches_independently_assembled_instruction_words() {
     let fixtures = [
         (

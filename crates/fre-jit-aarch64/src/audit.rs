@@ -393,7 +393,7 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
         if let Some(register) = first_forbidden_aggregate_vector_register(instruction) {
             return Err(AuditError::ForbiddenAggregateVectorRegister { offset, register });
         }
-        validate_aggregate_critical_write(&instructions, index, literal_len)?;
+        validate_aggregate_critical_write(&instructions, index, literal_len, manifest.output)?;
         match instruction {
             DecodedInstruction::Address { destination: 8, .. } => {
                 address_count = address_count
@@ -647,6 +647,7 @@ fn validate_aggregate_critical_write(
     instructions: &[DecodedInstruction],
     index: usize,
     literal_len: usize,
+    output: AggregateOutput,
 ) -> Result<(), AuditError> {
     let instruction = instructions[index];
     let Some(destination) = instruction.written_gpr() else {
@@ -718,7 +719,7 @@ fn validate_aggregate_critical_write(
                 shift: 0
             } if usize::from(immediate) == literal_len
         ),
-        13 => valid_aggregate_accumulator_write(instructions, index, literal_len),
+        13 => valid_aggregate_accumulator_write(instructions, index, literal_len, output),
         14 => matches!(
             instruction,
             DecodedInstruction::MoveRegister64 {
@@ -880,6 +881,7 @@ fn valid_aggregate_accumulator_write(
     instructions: &[DecodedInstruction],
     index: usize,
     literal_len: usize,
+    output: AggregateOutput,
 ) -> bool {
     let instruction = instructions[index];
     if index == 0
@@ -895,6 +897,7 @@ fn valid_aggregate_accumulator_write(
         return true;
     }
     if literal_len == 0
+        && output == AggregateOutput::Count
         && matches!(
             instruction,
             DecodedInstruction::AddImmediate64 {
@@ -906,21 +909,27 @@ fn valid_aggregate_accumulator_write(
     {
         return true;
     }
-    let is_accumulation = matches!(
-        instruction,
-        DecodedInstruction::AddRegister64 {
-            destination: 13,
-            left: 13,
-            right: 10
-        }
-    ) || matches!(
-        instruction,
-        DecodedInstruction::AddImmediate64 {
-            destination: 13,
-            source: 13,
-            immediate,
-        } if immediate == 1 || usize::from(immediate) == literal_len
-    );
+    let expected_delta = match output {
+        AggregateOutput::Count => 1,
+        AggregateOutput::SpanSum => literal_len,
+    };
+    let is_accumulation = (literal_len == 1
+        && matches!(
+            instruction,
+            DecodedInstruction::AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 10
+            }
+        ))
+        || matches!(
+            instruction,
+            DecodedInstruction::AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate,
+            } if usize::from(immediate) == expected_delta
+        );
     is_accumulation
         && matches!(
             index
@@ -962,10 +971,10 @@ fn valid_aggregate_load(
     match instructions[index] {
         DecodedInstruction::LoadByte {
             base: 8 | 15,
-            offset,
+            offset: 0,
             ..
-        } => matches!(offset, 0) || offset == last,
-        DecodedInstruction::LoadByte {
+        }
+        | DecodedInstruction::LoadByte {
             base: 16,
             offset: 0,
             ..
@@ -978,6 +987,11 @@ fn valid_aggregate_load(
             offset: 0,
             ..
         } => true,
+        DecodedInstruction::LoadByte {
+            base: 8 | 15,
+            offset,
+            ..
+        } if offset == last => valid_aggregate_last_byte_filter_load(instructions, index, last),
         DecodedInstruction::LoadVector128 {
             base: 10,
             offset: 0,
@@ -998,11 +1012,96 @@ fn valid_aggregate_load(
     }
 }
 
+fn valid_aggregate_last_byte_filter_load(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    last: u16,
+) -> bool {
+    match instructions[index] {
+        DecodedInstruction::LoadByte {
+            destination: 10,
+            base: 15,
+            offset,
+        } if offset == last => {
+            matches!(
+                index
+                    .checked_sub(1)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::AddRegister64 {
+                    destination: 15,
+                    left: 0,
+                    right: 5
+                })
+            ) && matches!(
+                instruction_after(instructions, index, 1),
+                Some(DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset
+                }) if *offset == last
+            ) && matches!(
+                instruction_after(instructions, index, 2),
+                Some(DecodedInstruction::CompareRegister32 {
+                    left: 10,
+                    right: 11
+                })
+            )
+        }
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 8,
+            offset,
+        } if offset == last => {
+            let initial_filter = matches!(
+                index
+                    .checked_sub(2)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset: 0
+                })
+            ) && matches!(
+                index
+                    .checked_sub(1)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::DuplicateByte16 {
+                    destination: 1,
+                    source: 11
+                })
+            ) && matches!(
+                instruction_after(instructions, index, 1),
+                Some(DecodedInstruction::DuplicateByte16 {
+                    destination: 3,
+                    source: 11
+                })
+            );
+            let scalar_filter = matches!(
+                index.checked_sub(1).and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::LoadByte {
+                    destination: 10,
+                    base: 15,
+                    offset
+                }) if *offset == last
+            ) && matches!(
+                instruction_after(instructions, index, 1),
+                Some(DecodedInstruction::CompareRegister32 {
+                    left: 10,
+                    right: 11
+                })
+            );
+            initial_filter || scalar_filter
+        }
+        _ => false,
+    }
+}
+
 fn validate_aggregate_branches(
     instructions: &[DecodedInstruction],
     protected_targets: &[usize],
     literal_len: usize,
 ) -> Result<(), AuditError> {
+    let vector_cursor_guard = unique_vector_cursor_guard(instructions);
     for (index, &instruction) in instructions.iter().enumerate() {
         let (DecodedInstruction::Branch { displacement }
         | DecodedInstruction::BranchCondition { displacement, .. }
@@ -1017,7 +1116,9 @@ fn validate_aggregate_branches(
             });
         }
         let valid_edge = match target.cmp(&index) {
-            core::cmp::Ordering::Less => valid_aggregate_back_edge(instructions, index, target),
+            core::cmp::Ordering::Less => {
+                valid_aggregate_back_edge(instructions, index, target, vector_cursor_guard)
+            }
             core::cmp::Ordering::Greater => {
                 valid_aggregate_forward_edge(instructions, index, target, literal_len)
             }
@@ -1408,6 +1509,7 @@ fn valid_aggregate_back_edge(
     instructions: &[DecodedInstruction],
     index: usize,
     target: usize,
+    vector_cursor_guard: Option<usize>,
 ) -> bool {
     let prior = index
         .checked_sub(1)
@@ -1445,7 +1547,7 @@ fn valid_aggregate_back_edge(
             matches!(
                 prior,
                 Some(DecodedInstruction::CompareRegister64 { left: 5, right: 7 })
-            ) && guarded_cursor_loop(instructions, target)
+            ) && vector_cursor_guard == Some(target)
         }
         DecodedInstruction::CompareBranchZero64 {
             register: 17,
@@ -1461,6 +1563,27 @@ fn valid_aggregate_back_edge(
         ),
         _ => false,
     }
+}
+
+fn unique_vector_cursor_guard(instructions: &[DecodedInstruction]) -> Option<usize> {
+    let mut guards = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (matches!(
+                instruction,
+                DecodedInstruction::CompareRegister64 { left: 5, right: 6 }
+            ) && matches!(
+                instruction_after(instructions, index, 1),
+                Some(DecodedInstruction::BranchCondition {
+                    condition: crate::Condition::Higher,
+                    ..
+                })
+            ))
+            .then_some(index)
+        });
+    let guard = guards.next()?;
+    guards.next().is_none().then_some(guard)
 }
 
 fn guarded_cursor_loop(instructions: &[DecodedInstruction], target: usize) -> bool {
