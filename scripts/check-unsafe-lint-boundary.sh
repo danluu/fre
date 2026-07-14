@@ -6,6 +6,32 @@ temporary="$(mktemp -d "${TMPDIR:-/tmp}/fre-unsafe-lint-boundary.XXXXXX")"
 trap 'rm -rf "$temporary"' EXIT
 cd "$root"
 
+extract_lints() {
+    awk '
+        /^\[(workspace\.)?lints\.(rust|clippy)\]$/ {
+            inside = 1
+            sub(/workspace\./, "")
+            print
+            next
+        }
+        /^\[/ {
+            inside = 0
+        }
+        inside && !/^#/ && !/^$/ {
+            print
+        }
+    ' "$1"
+}
+
+extract_lints Cargo.toml >"$temporary/workspace-lints"
+extract_lints crates/fre-kernels/Cargo.toml \
+    | sed 's/^unsafe_code = "deny"$/unsafe_code = "forbid"/' \
+    >"$temporary/kernel-lints-normalized"
+if ! diff -u "$temporary/workspace-lints" "$temporary/kernel-lints-normalized"; then
+    echo "unsafe lint boundary failure: fre-kernels lint table drifted" >&2
+    exit 1
+fi
+
 cat >"$temporary/forbid-mutation.rs" <<'RS'
 #![allow(unsafe_code)]
 
@@ -67,4 +93,4 @@ cargo test -p fre-kernels \
     -- --exact >"$temporary/helper-test.log" 2>&1
 
 printf '%s\n' \
-    'PASS workspace-unrelated=forbid target-allow=E0453 audited-library=deny helper=pass examples=forbid'
+    'PASS lint-tables=matched workspace-unrelated=forbid target-allow=E0453 audited-library=deny helper=pass examples=forbid'
