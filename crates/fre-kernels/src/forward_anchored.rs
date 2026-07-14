@@ -866,46 +866,37 @@ const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_BACK: usize = 32;
 const EDGE_WITNESS_DISJOINT: usize = EDGE_WITNESS_FRONT + EDGE_WITNESS_BACK;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EdgeWitnessRange {
-    start: usize,
-    end: usize,
+#[cfg(test)]
+std::thread_local! {
+    static EDGE_WITNESS_VISITS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EdgeWitnessPartition {
-    /// First in execution order.
-    front: EdgeWitnessRange,
-    /// Second in execution order, despite lying after `middle` in coordinate
-    /// order, so a back hit avoids the native middle call.
-    back: EdgeWitnessRange,
-    /// Third in execution order.
-    middle: EdgeWitnessRange,
+#[cfg(test)]
+fn begin_edge_witness_trace() {
+    EDGE_WITNESS_VISITS.with(|trace| {
+        assert!(trace.borrow_mut().replace(Vec::new()).is_none());
+    });
 }
 
-impl EdgeWitnessPartition {
-    fn for_len(bytes_len: usize) -> Result<Self, SearchError> {
-        let back_start =
-            bytes_len
-                .checked_sub(EDGE_WITNESS_BACK)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "edge witness back partition",
-                })?;
-        Ok(Self {
-            front: EdgeWitnessRange {
-                start: 0,
-                end: EDGE_WITNESS_FRONT,
-            },
-            back: EdgeWitnessRange {
-                start: back_start,
-                end: bytes_len,
-            },
-            middle: EdgeWitnessRange {
-                start: EDGE_WITNESS_FRONT,
-                end: back_start,
-            },
-        })
-    }
+#[cfg(test)]
+fn record_edge_witness_region(start: usize, end: usize, reverse: bool) {
+    EDGE_WITNESS_VISITS.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(visits) = trace.as_mut() else {
+            return;
+        };
+        if reverse {
+            visits.extend((start..end).rev());
+        } else {
+            visits.extend(start..end);
+        }
+    });
+}
+
+#[cfg(test)]
+fn finish_edge_witness_trace() -> Vec<usize> {
+    EDGE_WITNESS_VISITS.with(|trace| trace.borrow_mut().take().unwrap())
 }
 
 /// Find any suffix-first witness while searching each logical byte at most
@@ -923,26 +914,28 @@ fn asymmetric_suffix_witness(
     bytes: &[u8],
 ) -> Result<(Option<usize>, usize), SearchError> {
     if bytes.len() < EDGE_WITNESS_DISJOINT {
+        #[cfg(test)]
+        record_edge_witness_region(0, bytes.len(), false);
         return Ok((memchr(needle, bytes), 1));
     }
 
-    let partition = EdgeWitnessPartition::for_len(bytes.len())?;
-    let front = &bytes[partition.front.start..partition.front.end];
-    let front_candidate = if front[0] == needle {
+    #[cfg(test)]
+    record_edge_witness_region(0, EDGE_WITNESS_FRONT, false);
+    let front_candidate = if bytes[0] == needle {
         Some(0)
-    } else if front[1] == needle {
+    } else if bytes[1] == needle {
         Some(1)
-    } else if front[2] == needle {
+    } else if bytes[2] == needle {
         Some(2)
-    } else if front[3] == needle {
+    } else if bytes[3] == needle {
         Some(3)
-    } else if front[4] == needle {
+    } else if bytes[4] == needle {
         Some(4)
-    } else if front[5] == needle {
+    } else if bytes[5] == needle {
         Some(5)
-    } else if front[6] == needle {
+    } else if bytes[6] == needle {
         Some(6)
-    } else if front[7] == needle {
+    } else if bytes[7] == needle {
         Some(7)
     } else {
         None
@@ -951,32 +944,43 @@ fn asymmetric_suffix_witness(
         return Ok((front_candidate, 0));
     }
 
-    if let Some(relative_candidate) =
-        memrchr(needle, &bytes[partition.back.start..partition.back.end])
-    {
-        let candidate = partition.back.start.checked_add(relative_candidate).ok_or(
-            SearchError::ArithmeticOverflow {
-                computation: "edge witness back candidate",
-            },
-        )?;
+    let back_start =
+        bytes
+            .len()
+            .checked_sub(EDGE_WITNESS_BACK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "edge witness back partition",
+            })?;
+    #[cfg(test)]
+    record_edge_witness_region(back_start, bytes.len(), true);
+    if let Some(relative_candidate) = memrchr(needle, &bytes[back_start..]) {
+        let candidate =
+            back_start
+                .checked_add(relative_candidate)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "edge witness back candidate",
+                })?;
         return Ok((Some(candidate), 1));
     }
 
-    let middle = &bytes[partition.middle.start..partition.middle.end];
+    let middle_start = EDGE_WITNESS_FRONT;
+    let middle_end = back_start;
+    let middle = &bytes[middle_start..middle_end];
     if middle.is_empty() {
         return Ok((None, 1));
     }
+    #[cfg(test)]
+    record_edge_witness_region(middle_start, middle_end, false);
     let relative_candidate = memchr(needle, middle);
-    let candidate =
-        relative_candidate
-            .map(|relative| {
-                partition.middle.start.checked_add(relative).ok_or(
-                    SearchError::ArithmeticOverflow {
-                        computation: "edge witness middle candidate",
-                    },
-                )
-            })
-            .transpose()?;
+    let candidate = relative_candidate
+        .map(|relative| {
+            middle_start
+                .checked_add(relative)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "edge witness middle candidate",
+                })
+        })
+        .transpose()?;
     Ok((candidate, 2))
 }
 
@@ -1235,9 +1239,9 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, EdgeWitnessPartition,
-        EdgeWitnessRange, ForwardAnchoredPlan, SearchError, SearchLimits,
-        asymmetric_suffix_witness,
+        Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
+        SearchError, SearchLimits, asymmetric_suffix_witness, begin_edge_witness_trace,
+        finish_edge_witness_trace,
     };
     use crate::Window;
 
@@ -1939,84 +1943,61 @@ mod tests {
         }
     }
 
-    fn ranges_overlap(first: EdgeWitnessRange, second: EdgeWitnessRange) -> bool {
-        first.start < first.end
-            && second.start < second.end
-            && first.start < second.end
-            && second.start < first.end
-    }
-
-    fn partition_proof_holds(length: usize, partition: EdgeWitnessPartition) -> bool {
-        if length < 40 {
+    fn trace_proves_ordered_disjoint_complete_partition(length: usize, visits: &[usize]) -> bool {
+        let expected: Vec<usize> = if length < 40 {
+            (0..length).collect()
+        } else {
+            let back_start = length.checked_sub(32).unwrap();
+            (0..8)
+                .chain((back_start..length).rev())
+                .chain(8..back_start)
+                .collect()
+        };
+        if visits != expected || visits.len() != length {
             return false;
         }
-        let expected_back_start = length.checked_sub(32).unwrap();
-        if partition.front != (EdgeWitnessRange { start: 0, end: 8 })
-            || partition.middle
-                != (EdgeWitnessRange {
-                    start: 8,
-                    end: expected_back_start,
-                })
-            || partition.back
-                != (EdgeWitnessRange {
-                    start: expected_back_start,
-                    end: length,
-                })
-        {
-            return false;
-        }
-
-        let ranges = [partition.front, partition.back, partition.middle];
-        if ranges
-            .iter()
-            .any(|range| range.start > range.end || range.end > length)
-        {
-            return false;
-        }
-        let total = ranges
-            .iter()
-            .map(|range| range.end.checked_sub(range.start).unwrap())
-            .sum::<usize>();
-        if total != length
-            || ranges_overlap(partition.front, partition.middle)
-            || ranges_overlap(partition.front, partition.back)
-            || ranges_overlap(partition.middle, partition.back)
-        {
-            return false;
-        }
-
         let mut visits = vec![0_u8; length];
-        // This is the production execution order: front, reverse back, then
-        // middle. Direction within back does not affect exactly-once coverage.
-        for range in ranges {
-            for count in &mut visits[range.start..range.end] {
-                *count = count.saturating_add(1);
-            }
+        for &index in &expected {
+            let Some(count) = visits.get_mut(index) else {
+                return false;
+            };
+            *count = count.saturating_add(1);
         }
         visits.into_iter().all(|count| count == 1)
     }
 
     #[test]
     fn asymmetric_partition_is_ordered_disjoint_complete_and_mutation_effective() {
-        for length in [40_usize, 41, 42, 99, 4096] {
-            let partition = EdgeWitnessPartition::for_len(length).unwrap();
-            assert!(partition_proof_holds(length, partition));
-            assert_eq!(partition.front.end, partition.middle.start);
-            assert_eq!(partition.middle.end, partition.back.start);
+        for length in [39_usize, 40, 41, 42, 99, 4096] {
+            let absent = vec![0x11; length];
+            begin_edge_witness_trace();
+            let result = asymmetric_suffix_witness(0x7F, &absent).unwrap();
+            let visits = finish_edge_witness_trace();
+            assert_eq!(result.0, None);
+            assert!(trace_proves_ordered_disjoint_complete_partition(
+                length, &visits
+            ));
 
             if length > 40 {
-                let mut front_middle_overlap = partition;
-                front_middle_overlap.middle.start = 7;
+                let back_start = length.checked_sub(32).unwrap();
+                let front_middle_overlap: Vec<usize> = (0..8)
+                    .chain((back_start..length).rev())
+                    .chain(7..back_start)
+                    .collect();
                 assert!(
-                    !partition_proof_holds(length, front_middle_overlap),
+                    !trace_proves_ordered_disjoint_complete_partition(
+                        length,
+                        &front_middle_overlap
+                    ),
                     "guarded front/middle overlap survived at length={length}"
                 );
 
-                let mut middle_back_overlap = partition;
-                middle_back_overlap.middle.end =
-                    middle_back_overlap.back.start.checked_add(1).unwrap();
+                let middle_back_overlap: Vec<usize> = (0..8)
+                    .chain((back_start..length).rev())
+                    .chain(8..back_start.checked_add(1).unwrap())
+                    .collect();
                 assert!(
-                    !partition_proof_holds(length, middle_back_overlap),
+                    !trace_proves_ordered_disjoint_complete_partition(length, &middle_back_overlap),
                     "guarded middle/back overlap survived at length={length}"
                 );
             }
