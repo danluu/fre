@@ -1,0 +1,18 @@
+[package]
+name = "fre-required-literal-lab"
+version.workspace = true
+description = "Bounded required-literal candidate and confirmation laboratory for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+readme = "README.md"
+
+[dependencies]
+memchr = "=2.8.3"
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+
+[lints]
+workspace = true

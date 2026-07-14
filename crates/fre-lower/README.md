@@ -1,0 +1,79 @@
+# `fre-lower`
+
+`fre-lower` is the checked boundary between `fre-syntax` HIR and the portable
+capture-free K0 engine in `fre-automata`. It is deliberately independently
+testable: syntax parsing produces immutable HIR, this crate produces a
+`RawPlan`, and `fre-automata` validates that plan again before search.
+
+## Current semantic certificate
+
+The first certificate covers:
+
+- empty expressions and fixed byte literals;
+- byte classes with inclusive byte ranges;
+- concatenation and ordered leftmost-first alternation;
+- finite greedy or lazy repetition, plus unbounded repetition whose body must
+  consume at least one byte;
+- whole-original-haystack `Start` and `End` assertions; and
+- capture-node erasure only when the operation planner declares a
+  capture-free output contract.
+
+It explicitly rejects Unicode scalar classes, mixed-width Unicode class
+lowering, line and word assertions, all capture-sensitive operations, and
+unbounded repetition unless its body has `minimum_len() == Some(n)` for `n > 0`.
+Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
+rejected: `None` is not treated as a non-nullability certificate. The
+restriction is required because K0's generation deduplication does not yet
+provide a proof for ordered nullable-loop priority (`(?:|a)*` and `(?:a|)*`
+select different spans in Rust regex). There is no fallback that silently
+changes those semantics.
+
+## Bounded construction
+
+HIR traversal is postorder over an explicit task stack. Repetition expansion,
+fragment storage, Thompson edge patching, state/edge emission, raw-table
+storage, and validator work all have checked arithmetic and declared limits.
+Large finite repeats can therefore fail on stack, work, state, or edge limits
+before constructing an unbounded graph. No lowering pass uses recursion or
+unsafe code.
+
+The lowering work meter includes task dispatch and insertion, fragment and
+patch-list movement, possible vector relocation, state/edge emission, edge
+patching, and every final CSR table item. Each linear move is precharged before
+it runs; allocator implementation internals are outside the unit definition,
+while requested storage is separately preflighted and fallibly reserved.
+
+`LowerStats::erased_captures` is the source HIR's count of distinct explicit
+capture annotations. It is intentionally not multiplied when a finite repeat
+emits several copies of the same annotated subexpression.
+
+Edge order is semantic data: earlier alternation branches have higher
+priority, and loop-versus-exit ordering represents greediness. Assertions are
+emitted as original-haystack assertions, so a ranged search does not reinterpret
+its range as a new haystack.
+
+## Test layers
+
+Integration tests exercise the full `fre-syntax -> fre-lower -> fre-automata`
+path, priority and greediness, explicit nullable-cycle rejection, ranged assertion context,
+resource failures, and a 20,000-term concatenation on a 128 KiB native stack.
+An exhaustive small-alphabet differential suite compares supported expressions
+with exactly `regex` 1.12.4, labeled as the pinned Rebar baseline adapter rather
+than the separate regex 1.13.0 source-profile admission oracle.
+
+## Limitations ledger
+
+- This crate lowers `RustParsed` HIR only. It does not implement the RE2 parser
+  surface or decide strict upstream constructor admission.
+- Unicode scalar classes and other variable-width UTF-8 transitions remain a
+  separate compiler track; accepting fixed literal bytes is not a claim that
+  mixed-width classes work.
+- Only whole-haystack `Start`/`End` assertions are emitted. Line, CRLF, and
+  ASCII/Unicode word assertions are rejected.
+- Capture-sensitive search is unavailable. Capture syntax may be erased only
+  after the caller selects the capture-free operation contract.
+- Unbounded nullable or unknown-minimum bodies are rejected pending an ordered
+  closure proof; finite nullable repetition remains acyclic and supported.
+- The output is a portable K0 `RawPlan`/`Automaton`. This crate contains no JIT,
+  AOT, SIMD, multi-pattern, replacement, or aggregate-iteration implementation
+  and makes no claim yet about beating an upstream engine.

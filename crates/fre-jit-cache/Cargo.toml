@@ -1,0 +1,18 @@
+[package]
+name = "fre-jit-cache"
+version.workspace = true
+description = "Bounded concurrent cache for FRE native kernel mappings"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-jit-runtime = { path = "../fre-jit-runtime" }
+
+[dev-dependencies]
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+
+[lints]
+workspace = true

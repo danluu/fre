@@ -1,0 +1,22 @@
+[package]
+name = "fre-lower"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Checked iterative lowering from FRE syntax HIR to prioritized byte automata"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fre-automata = { path = "../fre-automata" }
+fre-syntax = { path = "../fre-syntax" }
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+
+[lints]
+workspace = true

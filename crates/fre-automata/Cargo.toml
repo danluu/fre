@@ -1,0 +1,14 @@
+[package]
+name = "fre-automata"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT OR Apache-2.0"
+description = "Bounded prioritized automata and a portable capture-free search floor for FRE"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

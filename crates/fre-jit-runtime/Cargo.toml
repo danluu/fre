@@ -1,0 +1,30 @@
+[package]
+name = "fre-jit-runtime"
+version.workspace = true
+description = "Narrow executable-memory and native-call boundary for FRE JIT images"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+libc = "=0.2.186"
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

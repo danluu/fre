@@ -1,0 +1,241 @@
+use regex_syntax::{
+    ParserBuilder,
+    hir::{Class, Hir, HirKind},
+};
+
+use crate::{
+    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
+    ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind, RustOptions,
+    RustParsed, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion, UpstreamRevision,
+};
+
+pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseError> {
+    let (pattern, profile, admission, safety) = request.into_parts();
+    let Some(source) = pattern.as_str() else {
+        return Err(ParseError::new(
+            profile,
+            ErrorCategory::InvalidPatternEncoding,
+            "Rust regex patterns must be valid UTF-8 strings",
+        ));
+    };
+    let (options, utf8) = match &profile {
+        CompatibilityProfile::RustText(rust) => (&rust.options, true),
+        CompatibilityProfile::RustBytes(rust) => (&rust.options, false),
+        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+    };
+    validate_rust_configuration(&profile, options)?;
+
+    let mut builder = ParserBuilder::new();
+    builder
+        .nest_limit(options.nest_limit)
+        .octal(options.octal)
+        .utf8(utf8)
+        .ignore_whitespace(options.ignore_whitespace)
+        .case_insensitive(options.case_insensitive)
+        .multi_line(options.multi_line)
+        .dot_matches_new_line(options.dot_matches_new_line)
+        .crlf(options.crlf)
+        .line_terminator(options.line_terminator)
+        .swap_greed(options.swap_greed)
+        .unicode(options.unicode);
+    let hir = builder.build().parse(source).map_err(|error| {
+        let span = match &error {
+            regex_syntax::Error::Parse(error) => Some(error.span()),
+            regex_syntax::Error::Translate(error) => Some(error.span()),
+            _ => None,
+        };
+        let record = ParseError::new(
+            profile.clone(),
+            ErrorCategory::UpstreamRustSyntax,
+            error.to_string(),
+        );
+        if let Some(span) = span {
+            record.with_span(crate::SourceSpan {
+                start: u64::try_from(span.start.offset).unwrap_or(u64::MAX),
+                end: u64::try_from(span.end.offset).unwrap_or(u64::MAX),
+            })
+        } else {
+            record
+        }
+    })?;
+    let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let summary = summarize_hir(&hir, source_bytes, &profile, admission, safety)?;
+    Ok(ParseRecord {
+        key: CacheKey {
+            schema_version: SCHEMA_VERSION,
+            pattern,
+            profile,
+            admission,
+            safety,
+        },
+        admission_status: AdmissionStatus::from_policy(admission),
+        summary,
+        pattern: CanonicalPattern::Rust(RustParsed { hir }),
+    })
+}
+
+fn validate_rust_configuration(
+    profile: &CompatibilityProfile,
+    options: &RustOptions,
+) -> Result<(), ParseError> {
+    let rust = match profile {
+        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => rust,
+        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+    };
+    if rust.revision != UpstreamRevision::RustRegex1_13_0_926af2e
+        || rust.regex_syntax_version != (0, 8, 11)
+        || rust.unicode != UnicodeVersion::RUST_16_0_0
+    {
+        return Err(ParseError::new(
+            profile.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "this parser only implements the pinned Rust regex 1.13.0 / regex-syntax 0.8.11 / Unicode 16.0 profile",
+        ));
+    }
+    if options.unicode && !options.line_terminator.is_ascii() {
+        return Err(ParseError::new(
+            profile.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "a non-ASCII line terminator is invalid while Unicode mode is enabled",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_add(
+    value: &mut u64,
+    add: u64,
+    profile: &CompatibilityProfile,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+    resource: ResourceKind,
+) -> Result<(), ParseError> {
+    let observed = value.checked_add(add).unwrap_or(u64::MAX);
+    let limit = admission.limit_for(resource, safety);
+    if observed > limit {
+        return Err(admission.limit_error(profile.clone(), resource, safety, observed));
+    }
+    *value = observed;
+    Ok(())
+}
+
+fn summarize_hir(
+    hir: &Hir,
+    source_bytes: u64,
+    profile: &CompatibilityProfile,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+) -> Result<ParseSummary, ParseError> {
+    let mut summary = ParseSummary {
+        parse_work: source_bytes,
+        guarantees_valid_utf8_nonempty: hir.properties().is_utf8(),
+        ..ParseSummary::default()
+    };
+    let mut stack = Vec::new();
+    stack.push((hir, 0_u64));
+    while let Some((node, depth)) = stack.pop() {
+        checked_add(
+            &mut summary.hir_nodes,
+            1,
+            profile,
+            admission,
+            safety,
+            ResourceKind::HirNodes,
+        )?;
+        checked_add(
+            &mut summary.parse_work,
+            1,
+            profile,
+            admission,
+            safety,
+            ResourceKind::ParseWork,
+        )?;
+        summary.max_depth = summary.max_depth.max(depth);
+        if depth > admission.limit_for(ResourceKind::Nesting, safety) {
+            return Err(admission.limit_error(
+                profile.clone(),
+                ResourceKind::Nesting,
+                safety,
+                depth,
+            ));
+        }
+        charge_kind(&mut summary, node.kind(), profile, admission, safety)?;
+        for sub in node.kind().subs() {
+            let pending = u64::try_from(stack.len()).unwrap_or(u64::MAX);
+            let limit = admission.limit_for(ResourceKind::TraversalStack, safety);
+            if pending >= limit {
+                return Err(admission.limit_error(
+                    profile.clone(),
+                    ResourceKind::TraversalStack,
+                    safety,
+                    pending.saturating_add(1),
+                ));
+            }
+            stack.push((sub, depth.saturating_add(1)));
+        }
+    }
+    Ok(summary)
+}
+
+fn charge_kind(
+    summary: &mut ParseSummary,
+    kind: &HirKind,
+    profile: &CompatibilityProfile,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+) -> Result<(), ParseError> {
+    let work = match kind {
+        HirKind::Literal(literal) => {
+            let len = u64::try_from(literal.0.len()).unwrap_or(u64::MAX);
+            checked_add(
+                &mut summary.literal_bytes,
+                len,
+                profile,
+                admission,
+                safety,
+                ResourceKind::ParseWork,
+            )?;
+            len
+        }
+        HirKind::Class(class) => {
+            let ranges = match class {
+                Class::Unicode(class) => class.ranges().len(),
+                Class::Bytes(class) => class.ranges().len(),
+            };
+            let ranges = u64::try_from(ranges).unwrap_or(u64::MAX);
+            checked_add(
+                &mut summary.class_ranges,
+                ranges,
+                profile,
+                admission,
+                safety,
+                ResourceKind::ParseWork,
+            )?;
+            ranges
+        }
+        HirKind::Capture(_) => {
+            summary.captures = summary.captures.saturating_add(1);
+            0
+        }
+        HirKind::Repetition(repetition) => {
+            summary.repetitions = summary.repetitions.saturating_add(1);
+            if let Some(max) = repetition.max {
+                summary.largest_finite_repeat = Some(
+                    summary
+                        .largest_finite_repeat
+                        .map_or(max, |old| old.max(max)),
+                );
+            }
+            0
+        }
+        HirKind::Empty | HirKind::Look(_) | HirKind::Concat(_) | HirKind::Alternation(_) => 0,
+    };
+    checked_add(
+        &mut summary.parse_work,
+        work,
+        profile,
+        admission,
+        safety,
+        ResourceKind::ParseWork,
+    )
+}

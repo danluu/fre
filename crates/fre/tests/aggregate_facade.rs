@@ -1,0 +1,1451 @@
+use fre::{
+    AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
+    AggregateExecutionSource, AggregateLiteralIneligibility, AggregateOperation,
+    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
+    AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError, LiteralAggregateOperation,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, SearchLimits,
+};
+
+const STRATEGIES: [AggregateStrategy; 2] = [
+    AggregateStrategy::FullTable,
+    AggregateStrategy::ReverseSequentialRows,
+];
+
+fn upstream(pattern: &str, haystack: &[u8], case_insensitive: bool) -> Vec<(usize, usize)> {
+    upstream_profile(pattern, haystack, case_insensitive, false)
+}
+
+fn upstream_profile(
+    pattern: &str,
+    haystack: &[u8],
+    case_insensitive: bool,
+    unicode: bool,
+) -> Vec<(usize, usize)> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .build()
+        .unwrap_or_else(|error| panic!("upstream rejected {pattern:?}: {error}"))
+        .find_iter(haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect()
+}
+
+fn continuation_details(
+    details: &AggregateExecutionDetails,
+) -> (
+    &fre::AggregateOperationCertificate,
+    &fre::AggregateExecutionAccounting,
+) {
+    match details {
+        AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } => (certificate, accounting),
+        AggregateExecutionDetails::ExactLiteral(_) => {
+            panic!("expected continuation execution details")
+        }
+    }
+}
+
+#[test]
+fn operation_specific_continuation_facades_match_rust_for_directed_global_sequences() {
+    let cases: [(&str, &[u8], bool); 11] = [
+        ("", b"", false),
+        ("", b"ab", false),
+        ("a*?", b"aa", false),
+        (r"(?:a+b|a)", b"aaaa", false),
+        (r"(?:a+b|a)", b"aaaab", false),
+        (r"(?:(?:|a){1,2}?b?)*", b"aab", false),
+        (r"(?:|a){2,}?", b"aa", false),
+        (r"[a-c\xFF]+", &[b'a', 0xFF, b'd', b'c'], false),
+        (r"\A(?:a|)*\z", b"aa", false),
+        (r"(?P<word>[a-z]+)", b"ab  c", false),
+        ("sherlock", b"SHERLOCK sherlock", true),
+    ];
+
+    for (pattern, haystack, case_insensitive) in cases {
+        let expected = upstream(pattern, haystack, case_insensitive);
+        let expected_sum = u64::try_from(
+            expected
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum::<usize>(),
+        )
+        .unwrap();
+        for strategy in STRATEGIES {
+            let builder = || {
+                AggregateBuilder::new(pattern)
+                    .unicode(false)
+                    .case_insensitive(case_insensitive)
+                    .plan_selection(AggregatePlanSelection::ForceContinuation)
+                    .strategy(strategy)
+            };
+            let spans = builder()
+                .build_spans()
+                .unwrap_or_else(|error| panic!("spans build {pattern:?}/{strategy:?}: {error}"))
+                .spans(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("spans run {pattern:?}/{strategy:?}: {error}"));
+            let actual: Vec<_> = spans
+                .iter()
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            assert_eq!(actual, expected, "spans {pattern:?}/{strategy:?}");
+            assert_eq!(spans.len(), expected.len());
+            let (certificate, _) = continuation_details(&spans.report().details);
+            assert_eq!(certificate.range, 0..haystack.len());
+
+            let count = builder()
+                .build_count()
+                .unwrap_or_else(|error| panic!("count build {pattern:?}/{strategy:?}: {error}"))
+                .count(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("count run {pattern:?}/{strategy:?}: {error}"));
+            assert_eq!(count.value(), u64::try_from(expected.len()).unwrap());
+
+            let span_sum = builder()
+                .build_span_sum()
+                .unwrap_or_else(|error| panic!("sum build {pattern:?}/{strategy:?}: {error}"))
+                .span_sum(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("sum run {pattern:?}/{strategy:?}: {error}"));
+            assert_eq!(span_sum.value(), expected_sum);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact/continuation/audited/value-only differential matrix is clearest together"
+)]
+fn exact_literal_auto_and_forced_results_match_continuation_and_rust() {
+    let cases: [(&str, &[&[u8]]); 6] = [
+        ("", &[b"", b"abc", &[0xFF, 0x00]]),
+        ("abc", &[b"", b"abc", b"xxabcabcx", &[0xFF, 0x00]]),
+        (r"a\x62c", &[b"abc", b"zabcabc"]),
+        (r"((abc))", &[b"xxabcabcx", &[0xFF, b'a', b'b', b'c']]),
+        (r"\xFF\x00", &[&[0xFF, 0x00, 0xFF, 0x00], &[0xFF]]),
+        ("aba", &[b"ababa", b"abaaba"]),
+    ];
+
+    for (pattern, haystacks) in cases {
+        for haystack in haystacks {
+            let expected = upstream(pattern, haystack, false);
+            let expected_count = u64::try_from(expected.len()).unwrap();
+            let expected_sum = expected
+                .iter()
+                .map(|(start, end)| u64::try_from(end - start).unwrap())
+                .sum::<u64>();
+
+            let auto_count = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .build_count()
+                .unwrap();
+            let forced_count = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+                .build_count()
+                .unwrap();
+            let continuation_count = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(AggregatePlanSelection::ForceContinuation)
+                .build_count()
+                .unwrap();
+            assert_eq!(
+                auto_count.build_report().plan,
+                AggregatePlanKind::ExactLiteral
+            );
+            assert_eq!(auto_count.build_report().continuation_strategy, None);
+            assert!(matches!(
+                auto_count.build_report().build,
+                AggregateBuildAccounting::ExactLiteral(_)
+            ));
+            for actual in [
+                auto_count
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                auto_count
+                    .count_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                forced_count
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                forced_count
+                    .count_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                continuation_count
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                continuation_count
+                    .count_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+            ] {
+                assert_eq!(actual, expected_count, "count {pattern:?}/{haystack:?}");
+            }
+
+            let auto_sum = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .build_span_sum()
+                .unwrap();
+            let forced_sum = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+                .build_span_sum()
+                .unwrap();
+            let continuation_sum = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(AggregatePlanSelection::ForceContinuation)
+                .build_span_sum()
+                .unwrap();
+            for actual in [
+                auto_sum
+                    .span_sum(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                auto_sum
+                    .span_sum_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                forced_sum
+                    .span_sum(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                forced_sum
+                    .span_sum_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                continuation_sum
+                    .span_sum(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value(),
+                continuation_sum
+                    .span_sum_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+            ] {
+                assert_eq!(actual, expected_sum, "span sum {pattern:?}/{haystack:?}");
+            }
+        }
+    }
+}
+
+struct UnicodeExactOracle {
+    upstream: regex::bytes::Regex,
+    auto_count: fre::AggregateCountRegex,
+    forced_count: fre::AggregateCountRegex,
+    auto_sum: fre::AggregateSpanSumRegex,
+    forced_sum: fre::AggregateSpanSumRegex,
+}
+
+impl UnicodeExactOracle {
+    fn new(pattern: &str) -> Self {
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(true)
+            .case_insensitive(false)
+            .build()
+            .unwrap_or_else(|error| panic!("Unicode oracle rejected {pattern:?}: {error}"));
+        let builder = || AggregateBuilder::new(pattern).unicode(true);
+        let auto_count = builder().build_count().unwrap();
+        let forced_count = builder()
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let auto_sum = builder().build_span_sum().unwrap();
+        let forced_sum = builder()
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_span_sum()
+            .unwrap();
+        for (identity, operation) in [
+            (
+                auto_count.build_report().plan_identity,
+                LiteralAggregateOperation::Count,
+            ),
+            (
+                forced_count.build_report().plan_identity,
+                LiteralAggregateOperation::Count,
+            ),
+            (
+                auto_sum.build_report().plan_identity,
+                LiteralAggregateOperation::SpanSum,
+            ),
+            (
+                forced_sum.build_report().plan_identity,
+                LiteralAggregateOperation::SpanSum,
+            ),
+        ] {
+            assert!(matches!(
+                identity,
+                AggregatePlanIdentity::ExactLiteral(identity)
+                    if identity.semantics
+                        == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
+                        && identity.kernel.operation == operation
+            ));
+        }
+        Self {
+            upstream,
+            auto_count,
+            forced_count,
+            auto_sum,
+            forced_sum,
+        }
+    }
+
+    fn assert_haystack(&self, pattern: &str, haystack: &[u8]) {
+        let expected: Vec<_> = self
+            .upstream
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
+            .sum::<u64>();
+        let limits = AggregateRunLimits::default();
+        for actual in [
+            self.auto_count.count(haystack, limits).unwrap().value(),
+            self.auto_count.count_value(haystack, limits).unwrap(),
+            self.forced_count.count(haystack, limits).unwrap().value(),
+            self.forced_count.count_value(haystack, limits).unwrap(),
+        ] {
+            assert_eq!(actual, expected_count, "count {pattern:?}/{haystack:?}");
+        }
+        for actual in [
+            self.auto_sum.span_sum(haystack, limits).unwrap().value(),
+            self.auto_sum.span_sum_value(haystack, limits).unwrap(),
+            self.forced_sum.span_sum(haystack, limits).unwrap().value(),
+            self.forced_sum.span_sum_value(haystack, limits).unwrap(),
+        ] {
+            assert_eq!(actual, expected_sum, "span sum {pattern:?}/{haystack:?}");
+        }
+    }
+}
+
+#[test]
+fn unicode_nonempty_exact_literals_match_pinned_rust_on_exhaustive_arbitrary_bytes() {
+    let cases = [
+        ("a", "a"),
+        ("é", "é"),
+        ("雪", "雪"),
+        ("🦀", "🦀"),
+        (r"\u{00E9}", "é"),
+        (r"\x{96EA}", "雪"),
+        (r"\u{1F980}", "🦀"),
+        (r"(?-u:\xC3\xA9)", "é"),
+        (r"\.", "."),
+        (r"\*", "*"),
+    ];
+    for (pattern, literal) in cases {
+        let oracle = UnicodeExactOracle::new(pattern);
+        oracle.assert_haystack(pattern, b"");
+        for first in u8::MIN..=u8::MAX {
+            oracle.assert_haystack(pattern, &[first]);
+            for second in u8::MIN..=u8::MAX {
+                oracle.assert_haystack(pattern, &[first, second]);
+            }
+        }
+
+        let needle = literal.as_bytes();
+        let mut surrounded = Vec::with_capacity(needle.len() + 2);
+        surrounded.push(0);
+        surrounded.extend_from_slice(needle);
+        surrounded.push(0);
+        for before in u8::MIN..=u8::MAX {
+            surrounded[0] = before;
+            for after in u8::MIN..=u8::MAX {
+                let last = surrounded.len() - 1;
+                surrounded[last] = after;
+                oracle.assert_haystack(pattern, &surrounded);
+            }
+        }
+
+        let mut mutated = needle.to_vec();
+        for index in 0..needle.len() {
+            for byte in u8::MIN..=u8::MAX {
+                mutated.copy_from_slice(needle);
+                mutated[index] = byte;
+                oracle.assert_haystack(pattern, &mutated);
+            }
+        }
+    }
+}
+
+fn raw_nonoverlapping_matches(
+    needle: &[u8],
+    haystack: &[u8],
+    range: core::ops::Range<usize>,
+) -> Vec<(usize, usize)> {
+    assert!(!needle.is_empty());
+    let mut matches = Vec::new();
+    let mut at = range.start;
+    while at <= range.end.saturating_sub(needle.len()) {
+        let Some(relative) = haystack[at..range.end]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
+            break;
+        };
+        let start = at.checked_add(relative).unwrap();
+        let end = start.checked_add(needle.len()).unwrap();
+        matches.push((start, end));
+        at = end;
+    }
+    matches
+}
+
+#[test]
+fn unicode_nonempty_literal_raw_search_matches_pinned_input_spans() {
+    use regex_automata::{Input, meta::Regex, util::syntax};
+
+    let cases = [("a", "a"), ("é", "é"), ("雪", "雪"), ("🦀", "🦀")];
+    for (pattern, literal) in cases {
+        let regex = Regex::builder()
+            .configure(Regex::config().utf8_empty(false))
+            .syntax(syntax::Config::new().utf8(false).unicode(true))
+            .build(pattern)
+            .unwrap();
+        let needle = literal.as_bytes();
+        let haystacks = [
+            needle.to_vec(),
+            [b"\xFF\x80".as_slice(), needle, b"\xC0\xAF".as_slice()].concat(),
+            [b"\xF0\x80".as_slice(), needle, b"\xED\xA0\x80".as_slice()].concat(),
+            [needle, needle, b"\x80\xFF".as_slice()].concat(),
+        ];
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = raw_nonoverlapping_matches(needle, &haystack, start..end);
+                    let actual: Vec<_> = regex
+                        .find_iter(Input::new(&haystack).span(start..end))
+                        .map(|matched| (matched.start(), matched.end()))
+                        .collect();
+                    assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}..{end}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_empty_bytes_oracle_is_recorded_but_facade_scope_refuses_it() {
+    let oracle = regex::bytes::RegexBuilder::new("")
+        .unicode(true)
+        .build()
+        .unwrap();
+    for haystack in ["☃".as_bytes(), &[0xFF, 0x80][..]] {
+        let actual: Vec<_> = oracle
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let expected: Vec<_> = (0..=haystack.len()).map(|at| (at, at)).collect();
+        assert_eq!(
+            actual, expected,
+            "pinned bytes oracle must use byte boundaries"
+        );
+    }
+
+    for pattern in ["", r"(?:)"] {
+        assert!(matches!(
+            AggregateBuilder::new(pattern).build_count(),
+            Err(AggregateBuildError::UnicodeEnabled {
+                operation: AggregateOperation::Count,
+                selection: AggregatePlanSelection::Auto,
+            })
+        ));
+        assert!(matches!(
+            AggregateBuilder::new(pattern)
+                .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+                .build_span_sum(),
+            Err(AggregateBuildError::ExactLiteralIneligible {
+                operation: AggregateOperation::SpanSum,
+                reason: AggregateLiteralIneligibility::UnicodeEmptyOutsideAdmission,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn unicode_profile_local_raw_valid_utf8_literal_is_hir_eligible() {
+    let pattern = r"(?-u:\xC3\xA9)";
+    let haystack = [0xFF, 0xC3, 0xA9, 0x80, 0xC3, 0xA9];
+    let expected = upstream_profile(pattern, &haystack, false, true);
+    assert_eq!(expected, vec![(1, 3), (4, 6)]);
+
+    for selection in [
+        AggregatePlanSelection::Auto,
+        AggregatePlanSelection::ForceExactLiteral,
+    ] {
+        let count = AggregateBuilder::new(pattern)
+            .plan_selection(selection)
+            .build_count()
+            .unwrap();
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::ExactLiteral(identity)
+                if identity.semantics
+                    == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
+                    && identity.kernel.operation == LiteralAggregateOperation::Count
+        ));
+        assert_eq!(
+            count
+                .count(&haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            2
+        );
+        assert_eq!(
+            count
+                .count_value(&haystack, AggregateRunLimits::default())
+                .unwrap(),
+            2
+        );
+
+        let sum = AggregateBuilder::new(pattern)
+            .plan_selection(selection)
+            .build_span_sum()
+            .unwrap();
+        assert_eq!(
+            sum.span_sum(&haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            4
+        );
+        assert_eq!(
+            sum.span_sum_value(&haystack, AggregateRunLimits::default())
+                .unwrap(),
+            4
+        );
+    }
+}
+
+#[test]
+fn unicode_profile_local_raw_byte_literal_is_typed_ineligible_not_invariant() {
+    let pattern = r"(?-u:\xFF)";
+    let haystack = [0xFF, b'a', 0xFF];
+    let oracle = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .unwrap();
+    let matches: Vec<_> = oracle
+        .find_iter(&haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect();
+    assert_eq!(matches, vec![(0, 1), (2, 3)]);
+
+    assert!(matches!(
+        AggregateBuilder::new(pattern).build_count(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new(pattern)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count(),
+        Err(AggregateBuildError::ExactLiteralIneligible {
+            reason: AggregateLiteralIneligibility::UnicodeLiteralNotUtf8,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
+    let unicode = AggregateBuilder::new("a").build_count().unwrap();
+    let bytes = AggregateBuilder::new("a")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_ne!(
+        unicode.build_report().plan_identity,
+        bytes.build_report().plan_identity
+    );
+    assert!(matches!(
+        unicode.build_report().plan_identity,
+        AggregatePlanIdentity::ExactLiteral(identity)
+            if identity.semantics
+                == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
+    ));
+    assert!(matches!(
+        bytes.build_report().plan_identity,
+        AggregatePlanIdentity::ExactLiteral(identity)
+            if identity.semantics == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
+    ));
+
+    for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+", r"(?i:a)"] {
+        assert!(matches!(
+            AggregateBuilder::new(pattern).build_count(),
+            Err(AggregateBuildError::UnicodeEnabled { .. })
+        ));
+        assert!(matches!(
+            AggregateBuilder::new(pattern)
+                .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+                .build_count(),
+            Err(AggregateBuildError::ExactLiteralIneligible {
+                reason: AggregateLiteralIneligibility::UnicodeCanonicalRootNotNonemptyLiteral,
+                ..
+            })
+        ));
+    }
+    assert!(matches!(
+        AggregateBuilder::new("рус")
+            .case_insensitive(true)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new("рус")
+            .case_insensitive(true)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count(),
+        Err(AggregateBuildError::ExactLiteralIneligible {
+            reason: AggregateLiteralIneligibility::UnicodeCaseInsensitiveOutsideAdmission,
+            ..
+        })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new(r"(?-i:a)")
+            .case_insensitive(true)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new(r"(?-i:a)")
+            .case_insensitive(true)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count(),
+        Err(AggregateBuildError::ExactLiteralIneligible {
+            reason: AggregateLiteralIneligibility::UnicodeCaseInsensitiveOutsideAdmission,
+            ..
+        })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new("雪")
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
+    assert!(matches!(
+        AggregateBuilder::new("雪").build_spans(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
+}
+
+fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
+    AggregateBuilder::new("雪")
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(limits)
+        .build_count()
+        .unwrap_err()
+}
+
+fn unicode_exact_count_error(
+    regex: &fre::AggregateCountRegex,
+    haystack: &[u8],
+    limits: AggregateRunLimits,
+) -> LiteralAggregateReduceError {
+    let audited = regex.count(haystack, limits).unwrap_err();
+    let value = regex.count_value(haystack, limits).unwrap_err();
+    assert_eq!(value.identity, audited.identity);
+    assert_eq!(value.source, audited.source);
+    assert!(matches!(
+        audited.identity.plan_identity,
+        AggregatePlanIdentity::ExactLiteral(identity)
+            if identity.semantics
+                == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
+    ));
+    match audited.source {
+        AggregateExecutionSource::ExactLiteral(source) => source,
+        source => panic!("Unicode exact literal attempted another engine: {source:?}"),
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "every Unicode exact-literal planner/build/reducer dimension is checked at and below its boundary"
+)]
+fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
+    let baseline = AggregateBuilder::new("雪")
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::ExactLiteral(build) = baseline.build_report().build else {
+        panic!("forced Unicode literal selected another plan")
+    };
+    assert_eq!(baseline.build_report().planner_work, 1);
+    assert_eq!(baseline.build_report().captures_erased, 0);
+
+    let exact_build = AggregateBuildLimits {
+        max_literal_planner_work: 1,
+        exact_literal: fre::LiteralAggregateBuildLimits {
+            max_needle_bytes: build.needle_bytes,
+            max_build_work: build.work_upper_bound,
+            max_scratch_bytes: build.scratch_bytes,
+            max_persistent_bytes: build.persistent_bytes,
+            max_peak_bytes: build.peak_bytes,
+        },
+        ..AggregateBuildLimits::default()
+    };
+    AggregateBuilder::new("雪")
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(exact_build)
+        .build_count()
+        .unwrap();
+
+    let mut one_below_build = exact_build;
+    one_below_build.max_literal_planner_work = 0;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::LiteralPlannerWorkLimit {
+            needed: 1,
+            limit: 0,
+            ..
+        }
+    ));
+    one_below_build = exact_build;
+    one_below_build.exact_literal.max_needle_bytes -= 1;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::NeedleLimit { .. },
+            ..
+        }
+    ));
+    one_below_build = exact_build;
+    one_below_build.exact_literal.max_build_work -= 1;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::WorkLimit { .. },
+            ..
+        }
+    ));
+    one_below_build = exact_build;
+    one_below_build.exact_literal.max_scratch_bytes -= 1;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::ScratchLimit { .. },
+            ..
+        }
+    ));
+    one_below_build = exact_build;
+    one_below_build.exact_literal.max_persistent_bytes -= 1;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::PersistentLimit { .. },
+            ..
+        }
+    ));
+    one_below_build = exact_build;
+    one_below_build.exact_literal.max_peak_bytes -= 1;
+    assert!(matches!(
+        unicode_exact_build_error(one_below_build),
+        AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::PeakLimit { .. },
+            ..
+        }
+    ));
+
+    let haystack = [b"\xFF\x80".as_slice(), "雪雪".as_bytes(), b"\xC0"].concat();
+    let audited = baseline
+        .count(&haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::ExactLiteral(accounting) = audited.report().details else {
+        panic!("forced Unicode literal executed another plan")
+    };
+    assert_eq!(audited.value(), 2);
+    assert_eq!(
+        baseline
+            .count_value(&haystack, AggregateRunLimits::default())
+            .unwrap(),
+        2
+    );
+    let upper = accounting.upper_bounds;
+    assert!(upper.linear_terms > 0);
+    assert!(upper.match_events > 0);
+    assert!(upper.count > 0);
+    assert!(upper.reducer_steps > 0);
+    assert_eq!(upper.scratch_bytes, 0);
+    assert!(upper.peak_bytes > 0);
+
+    let mut exact_run = AggregateRunLimits::default();
+    exact_run.exact_literal.max_linear_terms = upper.linear_terms;
+    exact_run.exact_literal.max_match_events = upper.match_events;
+    exact_run.exact_literal.max_count = upper.count;
+    exact_run.exact_literal.max_span_sum = upper.span_sum;
+    exact_run.exact_literal.max_reducer_steps = upper.reducer_steps;
+    exact_run.exact_literal.max_scratch_bytes = upper.scratch_bytes;
+    exact_run.exact_literal.max_peak_bytes = upper.peak_bytes;
+    assert_eq!(baseline.count(&haystack, exact_run).unwrap().value(), 2);
+    assert_eq!(baseline.count_value(&haystack, exact_run).unwrap(), 2);
+
+    let mut one_below_run = exact_run;
+    one_below_run.exact_literal.max_linear_terms -= 1;
+    assert!(matches!(
+        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        LiteralAggregateReduceError::LinearTermsLimit { .. }
+    ));
+    one_below_run = exact_run;
+    one_below_run.exact_literal.max_match_events -= 1;
+    assert!(matches!(
+        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        LiteralAggregateReduceError::MatchEventsLimit { .. }
+    ));
+    one_below_run = exact_run;
+    one_below_run.exact_literal.max_count -= 1;
+    assert!(matches!(
+        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        LiteralAggregateReduceError::CountLimit { .. }
+    ));
+    one_below_run = exact_run;
+    one_below_run.exact_literal.max_reducer_steps -= 1;
+    assert!(matches!(
+        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        LiteralAggregateReduceError::ReducerStepsLimit { .. }
+    ));
+    one_below_run = exact_run;
+    one_below_run.exact_literal.max_peak_bytes -= 1;
+    assert!(matches!(
+        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        LiteralAggregateReduceError::PeakLimit { .. }
+    ));
+
+    let sum = AggregateBuilder::new("雪")
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(exact_build)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(sum.span_sum(&haystack, exact_run).unwrap().value(), 6);
+    assert_eq!(sum.span_sum_value(&haystack, exact_run).unwrap(), 6);
+    one_below_run = exact_run;
+    one_below_run.exact_literal.max_span_sum -= 1;
+    let audited_error = sum.span_sum(&haystack, one_below_run).unwrap_err();
+    let value_error = sum.span_sum_value(&haystack, one_below_run).unwrap_err();
+    assert_eq!(value_error.identity, audited_error.identity);
+    assert_eq!(value_error.source, audited_error.source);
+    assert!(matches!(
+        audited_error.source,
+        AggregateExecutionSource::ExactLiteral(LiteralAggregateReduceError::SpanSumLimit { .. })
+    ));
+}
+
+#[test]
+fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
+    let regex = AggregateBuilder::new(r"(?P<outer>(?P<inner>a))")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let report = regex.build_report();
+    let AggregateBuildAccounting::Continuation(compiler) = report.build else {
+        panic!("forced continuation selected another plan")
+    };
+    assert_eq!(report.captures_erased, 2);
+    assert_eq!(report.capture_erasure_work, 4);
+    assert_eq!(compiler.captures_erased, report.captures_erased);
+    assert_eq!(compiler.capture_erasure_work, report.capture_erasure_work);
+    assert!(report.capture_erasure_work <= compiler.work);
+    assert_eq!(
+        regex
+            .count(b"baab", AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        2
+    );
+
+    let uncaptured = AggregateBuilder::new("a")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        report.plan_identity,
+        uncaptured.build_report().plan_identity
+    );
+    assert_ne!(report.syntax_key, uncaptured.build_report().syntax_key);
+    assert_ne!(
+        regex.cache_identity(AggregateRunLimits::default()),
+        uncaptured.cache_identity(AggregateRunLimits::default())
+    );
+
+    assert!(matches!(
+        AggregateBuilder::new("").build_count(),
+        Err(AggregateBuildError::UnicodeEnabled {
+            operation: AggregateOperation::Count,
+            ..
+        })
+    ));
+    assert_eq!(
+        AggregateBuilder::new("a")
+            .build_count()
+            .unwrap()
+            .count_value(b"baab", AggregateRunLimits::default())
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn exact_literal_eligibility_is_canonical_and_operation_specific() {
+    assert!(matches!(
+        AggregateBuilder::new("abc")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_spans(),
+        Err(AggregateBuildError::ExactLiteralIneligible {
+            reason: AggregateLiteralIneligibility::SpanOperation,
+            ..
+        })
+    ));
+    for pattern in [r"\Aabc", r"abc\z", r"a|b", r"(?i:a)"] {
+        assert!(
+            matches!(
+                AggregateBuilder::new(pattern)
+                    .unicode(false)
+                    .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+                    .build_count(),
+                Err(AggregateBuildError::ExactLiteralIneligible {
+                    reason: AggregateLiteralIneligibility::CanonicalRootNotLiteralOrEmpty,
+                    ..
+                })
+            ),
+            "{pattern:?}"
+        );
+    }
+
+    let nested = AggregateBuilder::new("((abc))")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .build_count()
+        .unwrap();
+    assert_eq!(nested.build_report().captures_erased, 2);
+    assert_eq!(nested.build_report().capture_erasure_work, 2);
+    assert_eq!(nested.build_report().planner_work, 3);
+
+    let work = nested.build_report().planner_work;
+    let mut limits = AggregateBuildLimits {
+        max_literal_planner_work: work,
+        ..AggregateBuildLimits::default()
+    };
+    AggregateBuilder::new("((abc))")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(limits)
+        .build_count()
+        .unwrap();
+    limits.max_literal_planner_work = work - 1;
+    assert!(matches!(
+        AggregateBuilder::new("((abc))")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .limits(limits)
+            .build_count(),
+        Err(AggregateBuildError::LiteralPlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == work && limit == work - 1
+    ));
+}
+
+#[test]
+fn exact_literal_identity_is_semantic_and_does_not_publish_strategy() {
+    let captured = AggregateBuilder::new("(needle)")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let plain = AggregateBuilder::new("needle")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let sum = AggregateBuilder::new("needle")
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    let continuation = AggregateBuilder::new("needle")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+
+    assert_eq!(
+        captured.build_report().plan_identity,
+        plain.build_report().plan_identity
+    );
+    assert_ne!(
+        captured.build_report().syntax_key,
+        plain.build_report().syntax_key
+    );
+    assert_ne!(
+        plain.build_report().plan_identity,
+        sum.build_report().plan_identity
+    );
+    assert!(matches!(
+        plain.build_report().plan_identity,
+        AggregatePlanIdentity::ExactLiteral(identity)
+            if identity.kernel.operation == LiteralAggregateOperation::Count
+                && identity.semantics
+                    == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
+    ));
+    assert!(matches!(
+        sum.build_report().plan_identity,
+        AggregatePlanIdentity::ExactLiteral(identity)
+            if identity.kernel.operation == LiteralAggregateOperation::SpanSum
+                && identity.semantics
+                    == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
+    ));
+    assert_eq!(plain.build_report().continuation_strategy, None);
+    assert_eq!(
+        continuation.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_ne!(
+        plain.cache_identity(AggregateRunLimits::default()),
+        continuation.cache_identity(AggregateRunLimits::default())
+    );
+}
+
+#[test]
+fn absolute_anchors_use_the_complete_original_haystack() {
+    let limits = AggregateRunLimits::default();
+    let anchored = AggregateBuilder::new(r"\Afoo\z")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(anchored.count(b"xxfoo", limits).unwrap().value(), 0);
+
+    let end_anchored = AggregateBuilder::new(r"foo\z")
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    let spans = end_anchored.spans(b"xxfoo", limits).unwrap();
+    assert_eq!(
+        spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        vec![(2, 5)]
+    );
+    let (certificate, _) = continuation_details(&spans.report().details);
+    assert_eq!(certificate.range, 0..5);
+}
+
+#[test]
+fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
+    let full = AggregateBuilder::new(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::FullTable)
+        .build_count()
+        .unwrap();
+    let rows = AggregateBuilder::new(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_count()
+        .unwrap();
+    let sum = AggregateBuilder::new(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::FullTable)
+        .build_span_sum()
+        .unwrap();
+    let AggregateBuildAccounting::Continuation(compiler) = full.build_report().build else {
+        panic!("forced continuation selected another plan")
+    };
+    assert_eq!(
+        full.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        full.build_report().plan_identity,
+        rows.build_report().plan_identity
+    );
+    assert_eq!(
+        full.build_report().plan_identity,
+        sum.build_report().plan_identity
+    );
+    assert_eq!(
+        full.build_report().retained_capacity_bytes,
+        compiler.program_bytes
+    );
+    assert!(compiler.work > 0);
+
+    let limits = AggregateRunLimits::default();
+    assert_ne!(full.cache_identity(limits), rows.cache_identity(limits));
+    assert_ne!(full.cache_identity(limits), sum.cache_identity(limits));
+    let admitted = full.count(b"aaaa", limits).unwrap();
+    assert_eq!(admitted.value(), 4);
+    assert_eq!(full.count_value(b"aaaa", limits).unwrap(), 4);
+    assert_eq!(admitted.report().identity, full.cache_identity(limits));
+    let (certificate, accounting) = continuation_details(&admitted.report().details);
+    assert_eq!(certificate.strategy, AggregateStrategy::FullTable);
+    assert_eq!(certificate.range, 0..4);
+    assert!(accounting.work <= certificate.work_bound);
+
+    let required = certificate.random_access_bytes;
+    assert!(required > 0);
+    let mut refused_limits = limits;
+    refused_limits.continuation.max_random_access_bytes = required - 1;
+    let error = full.count(b"aaaa", refused_limits).unwrap_err();
+    let value_error = full.count_value(b"aaaa", refused_limits).unwrap_err();
+    assert_eq!(
+        error.identity.as_ref(),
+        &full.cache_identity(refused_limits)
+    );
+    assert_eq!(value_error.identity, error.identity);
+    assert_eq!(value_error.source, error.source);
+    assert_eq!(
+        error.identity.continuation_strategy,
+        Some(AggregateStrategy::FullTable)
+    );
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::RandomAccessBytes,
+            required: actual,
+            limit,
+        }) if actual == required && limit == required - 1
+    ));
+}
+
+#[test]
+fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
+    for (pattern, selection, haystack) in [
+        (
+            "aba",
+            AggregatePlanSelection::ForceExactLiteral,
+            &b"ababaaba"[..],
+        ),
+        (
+            r"(?:a+b|a)",
+            AggregatePlanSelection::ForceContinuation,
+            &b"aaaabaaaa"[..],
+        ),
+    ] {
+        let count = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(selection)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&count.build_report().syntax_key),
+            1
+        );
+        let hot = count
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&count.build_report().syntax_key),
+            1
+        );
+        let audited = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(hot, audited.value());
+        assert_eq!(
+            std::sync::Arc::strong_count(&count.build_report().syntax_key),
+            2
+        );
+        drop(audited);
+        assert_eq!(
+            std::sync::Arc::strong_count(&count.build_report().syntax_key),
+            1
+        );
+
+        let sum = AggregateBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(selection)
+            .build_span_sum()
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&sum.build_report().syntax_key),
+            1
+        );
+        let hot = sum
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&sum.build_report().syntax_key),
+            1
+        );
+        let audited = sum
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(hot, audited.value());
+        assert_eq!(
+            std::sync::Arc::strong_count(&sum.build_report().syntax_key),
+            2
+        );
+        drop(audited);
+        assert_eq!(
+            std::sync::Arc::strong_count(&sum.build_report().syntax_key),
+            1
+        );
+    }
+}
+
+fn exact_build_error(limits: AggregateBuildLimits) -> LiteralAggregateBuildError {
+    match AggregateBuilder::new("needle")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(limits)
+        .build_count()
+    {
+        Err(AggregateBuildError::ExactLiteralBuild { source, .. }) => source,
+        other => panic!("expected exact-literal build refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
+    let baseline = AggregateBuilder::new("needle")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::ExactLiteral(accounting) = baseline.build_report().build else {
+        panic!("forced exact literal selected another plan")
+    };
+    assert!(accounting.needle_bytes > 0);
+    assert!(accounting.work_upper_bound > 0);
+    assert!(accounting.scratch_bytes > 0);
+    assert!(accounting.persistent_bytes > 0);
+    assert!(accounting.peak_bytes > 0);
+
+    let mut limits = AggregateBuildLimits::default();
+    limits.exact_literal.max_needle_bytes = accounting.needle_bytes;
+    limits.exact_literal.max_build_work = accounting.work_upper_bound;
+    limits.exact_literal.max_scratch_bytes = accounting.scratch_bytes;
+    limits.exact_literal.max_persistent_bytes = accounting.persistent_bytes;
+    limits.exact_literal.max_peak_bytes = accounting.peak_bytes;
+    AggregateBuilder::new("needle")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .limits(limits)
+        .build_count()
+        .unwrap();
+
+    let mut one_below = limits;
+    one_below.exact_literal.max_needle_bytes -= 1;
+    assert!(matches!(
+        exact_build_error(one_below),
+        LiteralAggregateBuildError::NeedleLimit { .. }
+    ));
+    one_below = limits;
+    one_below.exact_literal.max_build_work -= 1;
+    assert!(matches!(
+        exact_build_error(one_below),
+        LiteralAggregateBuildError::WorkLimit { .. }
+    ));
+    one_below = limits;
+    one_below.exact_literal.max_scratch_bytes -= 1;
+    assert!(matches!(
+        exact_build_error(one_below),
+        LiteralAggregateBuildError::ScratchLimit { .. }
+    ));
+    one_below = limits;
+    one_below.exact_literal.max_persistent_bytes -= 1;
+    assert!(matches!(
+        exact_build_error(one_below),
+        LiteralAggregateBuildError::PersistentLimit { .. }
+    ));
+    one_below = limits;
+    one_below.exact_literal.max_peak_bytes -= 1;
+    assert!(matches!(
+        exact_build_error(one_below),
+        LiteralAggregateBuildError::PeakLimit { .. }
+    ));
+
+    let mut auto_refusal = AggregateBuildLimits::default();
+    auto_refusal.exact_literal.max_needle_bytes = accounting.needle_bytes - 1;
+    assert!(matches!(
+        AggregateBuilder::new("needle")
+            .unicode(false)
+            .limits(auto_refusal)
+            .build_count(),
+        Err(AggregateBuildError::ExactLiteralBuild {
+            source: LiteralAggregateBuildError::NeedleLimit { .. },
+            selection: AggregatePlanSelection::Auto,
+            ..
+        })
+    ));
+}
+
+fn exact_reduce_error(
+    regex: &fre::AggregateCountRegex,
+    limits: AggregateRunLimits,
+) -> LiteralAggregateReduceError {
+    let error = regex.count(b"needleneedleXneedle", limits).unwrap_err();
+    assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
+    match error.source {
+        AggregateExecutionSource::ExactLiteral(source) => source,
+        source => panic!("selected exact plan attempted another engine: {source:?}"),
+    }
+}
+
+fn exact_reduce_value_error(
+    regex: &fre::AggregateCountRegex,
+    limits: AggregateRunLimits,
+) -> LiteralAggregateReduceError {
+    let error = regex
+        .count_value(b"needleneedleXneedle", limits)
+        .unwrap_err();
+    assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
+    match error.source {
+        AggregateExecutionSource::ExactLiteral(source) => source,
+        source => panic!("selected exact plan attempted another engine: {source:?}"),
+    }
+}
+
+#[test]
+fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
+    let count = AggregateBuilder::new("needle")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let haystack = b"needleneedleXneedle";
+    let baseline = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::ExactLiteral(accounting) = baseline.report().details else {
+        panic!("auto literal selected continuation")
+    };
+    let upper = accounting.upper_bounds;
+    assert!(upper.linear_terms > 0);
+    assert!(upper.match_events > 0);
+    assert!(upper.count > 0);
+    assert!(upper.reducer_steps > 0);
+    assert!(upper.peak_bytes > 0);
+    assert_eq!(upper.scratch_bytes, 0);
+
+    let mut exact = AggregateRunLimits::default();
+    exact.exact_literal.max_linear_terms = upper.linear_terms;
+    exact.exact_literal.max_match_events = upper.match_events;
+    exact.exact_literal.max_count = upper.count;
+    exact.exact_literal.max_span_sum = upper.span_sum;
+    exact.exact_literal.max_reducer_steps = upper.reducer_steps;
+    exact.exact_literal.max_scratch_bytes = upper.scratch_bytes;
+    exact.exact_literal.max_peak_bytes = upper.peak_bytes;
+    count.count(haystack, exact).unwrap();
+    assert_eq!(
+        count.count_value(haystack, exact).unwrap(),
+        baseline.value()
+    );
+
+    let mut one_below = exact;
+    one_below.exact_literal.max_linear_terms -= 1;
+    assert!(matches!(
+        exact_reduce_error(&count, one_below),
+        LiteralAggregateReduceError::LinearTermsLimit { .. }
+    ));
+    assert!(matches!(
+        exact_reduce_value_error(&count, one_below),
+        LiteralAggregateReduceError::LinearTermsLimit { .. }
+    ));
+    one_below = exact;
+    one_below.exact_literal.max_match_events -= 1;
+    assert!(matches!(
+        exact_reduce_error(&count, one_below),
+        LiteralAggregateReduceError::MatchEventsLimit { .. }
+    ));
+    assert!(matches!(
+        exact_reduce_value_error(&count, one_below),
+        LiteralAggregateReduceError::MatchEventsLimit { .. }
+    ));
+    one_below = exact;
+    one_below.exact_literal.max_count -= 1;
+    assert!(matches!(
+        exact_reduce_error(&count, one_below),
+        LiteralAggregateReduceError::CountLimit { .. }
+    ));
+    assert!(matches!(
+        exact_reduce_value_error(&count, one_below),
+        LiteralAggregateReduceError::CountLimit { .. }
+    ));
+    one_below = exact;
+    one_below.exact_literal.max_reducer_steps -= 1;
+    assert!(matches!(
+        exact_reduce_error(&count, one_below),
+        LiteralAggregateReduceError::ReducerStepsLimit { .. }
+    ));
+    assert!(matches!(
+        exact_reduce_value_error(&count, one_below),
+        LiteralAggregateReduceError::ReducerStepsLimit { .. }
+    ));
+    one_below = exact;
+    one_below.exact_literal.max_peak_bytes -= 1;
+    assert!(matches!(
+        exact_reduce_error(&count, one_below),
+        LiteralAggregateReduceError::PeakLimit { .. }
+    ));
+    assert!(matches!(
+        exact_reduce_value_error(&count, one_below),
+        LiteralAggregateReduceError::PeakLimit { .. }
+    ));
+
+    let sum = AggregateBuilder::new("needle")
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    sum.span_sum(haystack, exact).unwrap();
+    let expected_sum = u64::try_from(haystack.len() - 1).unwrap();
+    assert_eq!(sum.span_sum_value(haystack, exact).unwrap(), expected_sum);
+    one_below = exact;
+    one_below.exact_literal.max_span_sum -= 1;
+    let error = sum.span_sum(haystack, one_below).unwrap_err();
+    let value_error = sum.span_sum_value(haystack, one_below).unwrap_err();
+    assert_eq!(value_error.identity, error.identity);
+    assert_eq!(value_error.source, error.source);
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::ExactLiteral(LiteralAggregateReduceError::SpanSumLimit { .. })
+    ));
+}
+
+#[test]
+fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() {
+    let pattern = r"(?P<outer>(?:a|(?P<inner>[b-d])){1,2}?)";
+    let baseline = AggregateBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::Continuation(compiler) = baseline.build_report().build else {
+        panic!("forced continuation selected another plan")
+    };
+    let work = compiler.work;
+    assert!(work > 0);
+    let mut exact_limits = AggregateBuildLimits::default();
+    exact_limits.continuation.max_work = work;
+    AggregateBuilder::new(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .limits(exact_limits)
+        .build_count()
+        .unwrap();
+    exact_limits.continuation.max_work = work - 1;
+    assert!(matches!(
+        AggregateBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .limits(exact_limits)
+            .build_count(),
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::CompileWork,
+                required,
+                limit,
+            },
+            ..
+        }) if required == work && limit == work - 1
+    ));
+
+    let portable = PortableBuilder::new("foo").unicode(false).build().unwrap();
+    assert_eq!(portable.build_report().plan, PlanKind::ExactLiteral);
+    let (matched, _) = portable.find(b"xxfoo", SearchLimits::default()).unwrap();
+    let matched = matched.unwrap();
+    assert_eq!((matched.start(), matched.end()), (2, 5));
+}

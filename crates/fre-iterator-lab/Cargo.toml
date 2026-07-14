@@ -1,0 +1,14 @@
+[package]
+name = "fre-iterator-lab"
+version.workspace = true
+description = "Bounded exact aggregate-iteration research prototypes for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }

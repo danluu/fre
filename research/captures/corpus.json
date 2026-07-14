@@ -1,0 +1,17 @@
+{
+  "schema": "fre.capture-corpus.v1",
+  "profile": "regex::bytes 1.12.4; default + logging + perf-dfa-full",
+  "generator": "crates/fre-capture-lab/tests/conformance.rs",
+  "seed": "deterministic-exhaustive-no-rng",
+  "base_asts": 39,
+  "capture_wrappers": 6,
+  "haystacks": 31,
+  "window_layouts": 2,
+  "generated_core_comparisons_per_candidate": 14508,
+  "nested_catalog_comparisons_per_candidate": 496,
+  "other_directed_comparisons_per_candidate": 12,
+  "single_match_comparisons_per_candidate": 15016,
+  "aggregate_sequences_per_candidate": 20,
+  "candidate_count": 2,
+  "status": "all-pass"
+}

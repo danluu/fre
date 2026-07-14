@@ -1,0 +1,19 @@
+[package]
+name = "fre-kernel-ir"
+version.workspace = true
+description = "Verified pattern-specialized kernel IR for FRE native backends"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+fre-automata = { path = "../fre-automata" }
+fre-lower = { path = "../fre-lower" }
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
+
+[lints]
+workspace = true

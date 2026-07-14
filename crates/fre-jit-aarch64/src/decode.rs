@@ -1,0 +1,779 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    reason = "fixed-width instruction bitfields are masked before bounded shifts and scaling"
+)]
+
+use core::fmt;
+
+/// `AArch64` condition code used by the emitter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Condition {
+    Equal = 0,
+    NotEqual = 1,
+    CarrySet = 2,
+    CarryClear = 3,
+    Higher = 8,
+    LowerOrSame = 9,
+    Always = 14,
+}
+
+impl Condition {
+    const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Equal),
+            1 => Some(Self::NotEqual),
+            2 => Some(Self::CarrySet),
+            3 => Some(Self::CarryClear),
+            8 => Some(Self::Higher),
+            9 => Some(Self::LowerOrSame),
+            14 => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
+/// Independently decoded instruction admitted by the v1 backend policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodedInstruction {
+    MoveRegister64 {
+        destination: u8,
+        source: u8,
+    },
+    MoveZero64 {
+        destination: u8,
+        immediate: u16,
+        shift: u8,
+    },
+    MoveKeep64 {
+        destination: u8,
+        immediate: u16,
+        shift: u8,
+    },
+    CompareRegister64 {
+        left: u8,
+        right: u8,
+    },
+    CompareRegister32 {
+        left: u8,
+        right: u8,
+    },
+    CompareImmediate64 {
+        register: u8,
+        immediate: u16,
+    },
+    CompareImmediate32 {
+        register: u8,
+        immediate: u16,
+    },
+    AddRegister64 {
+        destination: u8,
+        left: u8,
+        right: u8,
+    },
+    AddImmediate64 {
+        destination: u8,
+        source: u8,
+        immediate: u16,
+    },
+    SubtractRegister64 {
+        destination: u8,
+        left: u8,
+        right: u8,
+    },
+    SubtractImmediate64 {
+        destination: u8,
+        source: u8,
+        immediate: u16,
+    },
+    AndLowBits64 {
+        destination: u8,
+        source: u8,
+        bits: u8,
+    },
+    LogicalShiftRightImmediate64 {
+        destination: u8,
+        source: u8,
+        shift: u8,
+    },
+    LogicalShiftLeftImmediate64 {
+        destination: u8,
+        source: u8,
+        shift: u8,
+    },
+    LoadByte {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
+    LoadByteRegister {
+        destination: u8,
+        base: u8,
+        index: u8,
+    },
+    Load64RegisterScaled {
+        destination: u8,
+        base: u8,
+        index: u8,
+    },
+    Store64 {
+        source: u8,
+        base: u8,
+        offset: u16,
+    },
+    LoadVector128 {
+        destination: u8,
+        base: u8,
+        offset: u16,
+    },
+    DuplicateByte16 {
+        destination: u8,
+        source: u8,
+    },
+    CompareEqualBytes16 {
+        destination: u8,
+        left: u8,
+        right: u8,
+    },
+    AndBytes16 {
+        destination: u8,
+        left: u8,
+        right: u8,
+    },
+    UnsignedMinBytes16 {
+        destination: u8,
+        source: u8,
+    },
+    UnsignedMaxBytes16 {
+        destination: u8,
+        source: u8,
+    },
+    AddAcrossBytes16 {
+        destination: u8,
+        source: u8,
+    },
+    MoveVectorByteTo32 {
+        destination: u8,
+        source: u8,
+    },
+    LogicalShiftRightVariable64 {
+        destination: u8,
+        source: u8,
+        shift: u8,
+    },
+    Address {
+        destination: u8,
+        displacement: i32,
+    },
+    Branch {
+        displacement: i32,
+    },
+    BranchCondition {
+        condition: Condition,
+        displacement: i32,
+    },
+    CompareBranchZero64 {
+        register: u8,
+        nonzero: bool,
+        displacement: i32,
+    },
+    Return,
+}
+
+impl DecodedInstruction {
+    /// Whether this instruction uses baseline Advanced SIMD.
+    #[must_use]
+    pub const fn is_vector(self) -> bool {
+        matches!(
+            self,
+            Self::LoadVector128 { .. }
+                | Self::DuplicateByte16 { .. }
+                | Self::CompareEqualBytes16 { .. }
+                | Self::AndBytes16 { .. }
+                | Self::UnsignedMinBytes16 { .. }
+                | Self::UnsignedMaxBytes16 { .. }
+                | Self::AddAcrossBytes16 { .. }
+                | Self::MoveVectorByteTo32 { .. }
+        )
+    }
+
+    /// Direct PC-relative target displacement, if any.
+    #[must_use]
+    pub const fn direct_displacement(self) -> Option<i32> {
+        match self {
+            Self::Address { displacement, .. }
+            | Self::Branch { displacement }
+            | Self::BranchCondition { displacement, .. }
+            | Self::CompareBranchZero64 { displacement, .. } => Some(displacement),
+            _ => None,
+        }
+    }
+
+    /// General-purpose register overwritten by this instruction, if any.
+    ///
+    /// Vector-only destinations are intentionally excluded. The independent
+    /// auditor uses this to prove that an ABI result-pointer register remains
+    /// unchanged from entry through every permitted result store.
+    #[must_use]
+    pub const fn written_gpr(self) -> Option<u8> {
+        match self {
+            Self::MoveRegister64 { destination, .. }
+            | Self::MoveZero64 { destination, .. }
+            | Self::MoveKeep64 { destination, .. }
+            | Self::AddRegister64 { destination, .. }
+            | Self::AddImmediate64 { destination, .. }
+            | Self::SubtractRegister64 { destination, .. }
+            | Self::SubtractImmediate64 { destination, .. }
+            | Self::AndLowBits64 { destination, .. }
+            | Self::LogicalShiftRightImmediate64 { destination, .. }
+            | Self::LogicalShiftLeftImmediate64 { destination, .. }
+            | Self::LoadByte { destination, .. }
+            | Self::LoadByteRegister { destination, .. }
+            | Self::Load64RegisterScaled { destination, .. }
+            | Self::MoveVectorByteTo32 { destination, .. }
+            | Self::LogicalShiftRightVariable64 { destination, .. }
+            | Self::Address { destination, .. } => Some(destination),
+            Self::CompareRegister64 { .. }
+            | Self::CompareRegister32 { .. }
+            | Self::CompareImmediate64 { .. }
+            | Self::CompareImmediate32 { .. }
+            | Self::Store64 { .. }
+            | Self::LoadVector128 { .. }
+            | Self::DuplicateByte16 { .. }
+            | Self::CompareEqualBytes16 { .. }
+            | Self::AndBytes16 { .. }
+            | Self::UnsignedMinBytes16 { .. }
+            | Self::UnsignedMaxBytes16 { .. }
+            | Self::AddAcrossBytes16 { .. }
+            | Self::Branch { .. }
+            | Self::BranchCondition { .. }
+            | Self::CompareBranchZero64 { .. }
+            | Self::Return => None,
+        }
+    }
+}
+
+/// Failure from the small policy decoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    UnalignedCodeLength { length: usize },
+    UnknownInstruction { offset: u32, word: u32 },
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "AArch64 decode failed: {self:?}")
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Decode an entire little-endian code section using the independent policy
+/// decoder. Unknown or forbidden instructions are rejected.
+pub fn decode(code: &[u8]) -> Result<Vec<DecodedInstruction>, DecodeError> {
+    if !code.len().is_multiple_of(4) {
+        return Err(DecodeError::UnalignedCodeLength { length: code.len() });
+    }
+    let mut decoded = Vec::with_capacity(code.len() / 4);
+    for (index, bytes) in code.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let offset = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_mul(4))
+            .unwrap_or(u32::MAX);
+        decoded.push(decode_one(word, offset)?);
+    }
+    Ok(decoded)
+}
+
+/// Decode one little-endian instruction word at a byte offset.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a single ordered mask table keeps the authenticity decoder easy to inspect"
+)]
+pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeError> {
+    let rd = reg(word);
+    let rn = reg(word >> 5);
+    let rm = reg(word >> 16);
+    let instruction = if word & 0xffe0_ffe0 == 0xaa00_03e0 {
+        DecodedInstruction::MoveRegister64 {
+            destination: rd,
+            source: rm,
+        }
+    } else if word & 0xff80_0000 == 0xd280_0000 {
+        DecodedInstruction::MoveZero64 {
+            destination: rd,
+            immediate: imm16(word),
+            shift: halfword_shift(word),
+        }
+    } else if word & 0xff80_0000 == 0xf280_0000 {
+        DecodedInstruction::MoveKeep64 {
+            destination: rd,
+            immediate: imm16(word),
+            shift: halfword_shift(word),
+        }
+    } else if word & 0xffe0_fc1f == 0xeb00_001f {
+        DecodedInstruction::CompareRegister64 {
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffe0_fc1f == 0x6b00_001f {
+        DecodedInstruction::CompareRegister32 {
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffc0_001f == 0xf100_001f {
+        DecodedInstruction::CompareImmediate64 {
+            register: rn,
+            immediate: imm12(word),
+        }
+    } else if word & 0xffc0_001f == 0x7100_001f {
+        DecodedInstruction::CompareImmediate32 {
+            register: rn,
+            immediate: imm12(word),
+        }
+    } else if word & 0xffe0_fc00 == 0x8b00_0000 {
+        DecodedInstruction::AddRegister64 {
+            destination: rd,
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffc0_0000 == 0x9100_0000 {
+        DecodedInstruction::AddImmediate64 {
+            destination: rd,
+            source: rn,
+            immediate: imm12(word),
+        }
+    } else if word & 0xffe0_fc00 == 0xcb00_0000 {
+        DecodedInstruction::SubtractRegister64 {
+            destination: rd,
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffc0_0000 == 0xd100_0000 {
+        DecodedInstruction::SubtractImmediate64 {
+            destination: rd,
+            source: rn,
+            immediate: imm12(word),
+        }
+    } else if word & 0xffc0_0000 == 0x9240_0000 && (word >> 16).trailing_zeros() >= 6 {
+        DecodedInstruction::AndLowBits64 {
+            destination: rd,
+            source: rn,
+            bits: u8::try_from(((word >> 10) & 0x3f).checked_add(1).expect("six-bit field"))
+                .expect("at most 64"),
+        }
+    } else if word & 0xffc0_0000 == 0xd340_0000 {
+        decode_bitfield(word, offset)?
+    } else if word & 0xffc0_0000 == 0x3940_0000 {
+        DecodedInstruction::LoadByte {
+            destination: rd,
+            base: rn,
+            offset: imm12(word),
+        }
+    } else if word & 0xffe0_fc00 == 0x3860_6800 {
+        DecodedInstruction::LoadByteRegister {
+            destination: rd,
+            base: rn,
+            index: rm,
+        }
+    } else if word & 0xffe0_fc00 == 0xf860_7800 {
+        DecodedInstruction::Load64RegisterScaled {
+            destination: rd,
+            base: rn,
+            index: rm,
+        }
+    } else if word & 0xffc0_0000 == 0xf900_0000 {
+        DecodedInstruction::Store64 {
+            source: rd,
+            base: rn,
+            offset: imm12(word).checked_mul(8).expect("scaled imm12 fits u16"),
+        }
+    } else if word & 0xffc0_0000 == 0x3dc0_0000 {
+        DecodedInstruction::LoadVector128 {
+            destination: rd,
+            base: rn,
+            offset: imm12(word)
+                .checked_mul(16)
+                .expect("scaled vector imm12 fits u16"),
+        }
+    } else if word & 0xffff_fc00 == 0x4e01_0c00 {
+        DecodedInstruction::DuplicateByte16 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffe0_fc00 == 0x6e20_8c00 {
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: rd,
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffe0_fc00 == 0x4e20_1c00 {
+        DecodedInstruction::AndBytes16 {
+            destination: rd,
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffff_fc00 == 0x6e31_a800 {
+        DecodedInstruction::UnsignedMinBytes16 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffff_fc00 == 0x6e30_a800 {
+        DecodedInstruction::UnsignedMaxBytes16 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffff_fc00 == 0x4e31_b800 {
+        DecodedInstruction::AddAcrossBytes16 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffff_fc00 == 0x0e01_3c00 {
+        DecodedInstruction::MoveVectorByteTo32 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffe0_fc00 == 0x9ac0_2400 {
+        DecodedInstruction::LogicalShiftRightVariable64 {
+            destination: rd,
+            source: rn,
+            shift: rm,
+        }
+    } else if word & 0x9f00_0000 == 0x1000_0000 {
+        DecodedInstruction::Address {
+            destination: rd,
+            displacement: decode_adr_displacement(word),
+        }
+    } else if word & 0xfc00_0000 == 0x1400_0000 {
+        DecodedInstruction::Branch {
+            displacement: sign_extend(word & 0x03ff_ffff, 26) << 2,
+        }
+    } else if word & 0xff00_0010 == 0x5400_0000 {
+        let condition = Condition::from_bits(u8::try_from(word & 0xf).expect("four-bit field"))
+            .ok_or(DecodeError::UnknownInstruction { offset, word })?;
+        DecodedInstruction::BranchCondition {
+            condition,
+            displacement: sign_extend((word >> 5) & 0x7_ffff, 19) << 2,
+        }
+    } else if word & 0xff00_0000 == 0xb400_0000 || word & 0xff00_0000 == 0xb500_0000 {
+        DecodedInstruction::CompareBranchZero64 {
+            register: rd,
+            nonzero: word & 0x0100_0000 != 0,
+            displacement: sign_extend((word >> 5) & 0x7_ffff, 19) << 2,
+        }
+    } else if word == 0xd65f_03c0 {
+        DecodedInstruction::Return
+    } else {
+        return Err(DecodeError::UnknownInstruction { offset, word });
+    };
+    Ok(instruction)
+}
+
+/// Independent canonical re-encoding used only to authenticate decoder round
+/// trips. This is intentionally separate from the lowering assembler.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive match makes missing instruction round trips a compile error"
+)]
+pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
+    let word = match instruction {
+        DecodedInstruction::MoveRegister64 {
+            destination,
+            source,
+        } => 0xaa00_03e0 | field(source, 16)? | field(destination, 0)?,
+        DecodedInstruction::MoveZero64 {
+            destination,
+            immediate,
+            shift,
+        } => {
+            0xd280_0000
+                | halfword_field(shift)?
+                | (u32::from(immediate) << 5)
+                | field(destination, 0)?
+        }
+        DecodedInstruction::MoveKeep64 {
+            destination,
+            immediate,
+            shift,
+        } => {
+            0xf280_0000
+                | halfword_field(shift)?
+                | (u32::from(immediate) << 5)
+                | field(destination, 0)?
+        }
+        DecodedInstruction::CompareRegister64 { left, right } => {
+            0xeb00_001f | field(right, 16)? | field(left, 5)?
+        }
+        DecodedInstruction::CompareRegister32 { left, right } => {
+            0x6b00_001f | field(right, 16)? | field(left, 5)?
+        }
+        DecodedInstruction::CompareImmediate64 {
+            register,
+            immediate,
+        } => 0xf100_001f | immediate_field(immediate, 12, 10)? | field(register, 5)?,
+        DecodedInstruction::CompareImmediate32 {
+            register,
+            immediate,
+        } => 0x7100_001f | immediate_field(immediate, 12, 10)? | field(register, 5)?,
+        DecodedInstruction::AddRegister64 {
+            destination,
+            left,
+            right,
+        } => 0x8b00_0000 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
+        DecodedInstruction::AddImmediate64 {
+            destination,
+            source,
+            immediate,
+        } => {
+            0x9100_0000
+                | immediate_field(immediate, 12, 10)?
+                | field(source, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::SubtractRegister64 {
+            destination,
+            left,
+            right,
+        } => 0xcb00_0000 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
+        DecodedInstruction::SubtractImmediate64 {
+            destination,
+            source,
+            immediate,
+        } => {
+            0xd100_0000
+                | immediate_field(immediate, 12, 10)?
+                | field(source, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::AndLowBits64 {
+            destination,
+            source,
+            bits,
+        } => {
+            let mask = bits.checked_sub(1)?;
+            0x9240_0000 | (u32::from(mask) << 10) | field(source, 5)? | field(destination, 0)?
+        }
+        DecodedInstruction::LogicalShiftRightImmediate64 {
+            destination,
+            source,
+            shift,
+        } => {
+            0xd340_0000
+                | (u32::from(shift) << 16)
+                | (63 << 10)
+                | field(source, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::LogicalShiftLeftImmediate64 {
+            destination,
+            source,
+            shift,
+        } => {
+            let rotate = 64_u8.checked_sub(shift)?;
+            let mask = 63_u8.checked_sub(shift)?;
+            0xd340_0000
+                | (u32::from(rotate) << 16)
+                | (u32::from(mask) << 10)
+                | field(source, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::LoadByte {
+            destination,
+            base,
+            offset,
+        } => {
+            0x3940_0000
+                | immediate_field(offset, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::LoadByteRegister {
+            destination,
+            base,
+            index,
+        } => 0x3860_6800 | field(index, 16)? | field(base, 5)? | field(destination, 0)?,
+        DecodedInstruction::Load64RegisterScaled {
+            destination,
+            base,
+            index,
+        } => 0xf860_7800 | field(index, 16)? | field(base, 5)? | field(destination, 0)?,
+        DecodedInstruction::Store64 {
+            source,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(8) {
+                return None;
+            }
+            0xf900_0000 | immediate_field(offset / 8, 12, 10)? | field(base, 5)? | field(source, 0)?
+        }
+        DecodedInstruction::LoadVector128 {
+            destination,
+            base,
+            offset,
+        } => {
+            if !offset.is_multiple_of(16) {
+                return None;
+            }
+            0x3dc0_0000
+                | immediate_field(offset / 16, 12, 10)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::DuplicateByte16 {
+            destination,
+            source,
+        } => 0x4e01_0c00 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::CompareEqualBytes16 {
+            destination,
+            left,
+            right,
+        } => 0x6e20_8c00 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
+        DecodedInstruction::AndBytes16 {
+            destination,
+            left,
+            right,
+        } => 0x4e20_1c00 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
+        DecodedInstruction::UnsignedMinBytes16 {
+            destination,
+            source,
+        } => 0x6e31_a800 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::UnsignedMaxBytes16 {
+            destination,
+            source,
+        } => 0x6e30_a800 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::AddAcrossBytes16 {
+            destination,
+            source,
+        } => 0x4e31_b800 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::MoveVectorByteTo32 {
+            destination,
+            source,
+        } => 0x0e01_3c00 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::LogicalShiftRightVariable64 {
+            destination,
+            source,
+            shift,
+        } => 0x9ac0_2400 | field(shift, 16)? | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::Address {
+            destination,
+            displacement,
+        } => {
+            if !(-1_048_576..=1_048_575).contains(&displacement) {
+                return None;
+            }
+            let encoded = displacement.cast_unsigned() & 0x1f_ffff;
+            0x1000_0000 | ((encoded & 3) << 29) | ((encoded >> 2) << 5) | field(destination, 0)?
+        }
+        DecodedInstruction::Branch { displacement } => {
+            0x1400_0000 | displacement_field(displacement, 26, 0)?
+        }
+        DecodedInstruction::BranchCondition {
+            condition,
+            displacement,
+        } => 0x5400_0000 | displacement_field(displacement, 19, 5)? | condition_bits(condition),
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero,
+            displacement,
+        } => {
+            let base = if nonzero { 0xb500_0000 } else { 0xb400_0000 };
+            base | displacement_field(displacement, 19, 5)? | field(register, 0)?
+        }
+        DecodedInstruction::Return => 0xd65f_03c0,
+    };
+    Some(word)
+}
+
+fn field(value: u8, shift: u8) -> Option<u32> {
+    (value < 32).then(|| u32::from(value) << shift)
+}
+
+fn immediate_field(value: u16, bits: u8, shift: u8) -> Option<u32> {
+    let limit = 1_u32.checked_shl(u32::from(bits))?;
+    (u32::from(value) < limit).then(|| u32::from(value) << shift)
+}
+
+fn halfword_field(shift: u8) -> Option<u32> {
+    if !shift.is_multiple_of(16) || shift > 48 {
+        return None;
+    }
+    Some(u32::from(shift / 16) << 21)
+}
+
+fn displacement_field(displacement: i32, bits: u8, shift: u8) -> Option<u32> {
+    if displacement.checked_rem(4) != Some(0) {
+        return None;
+    }
+    let scaled = displacement / 4;
+    let magnitude = 1_i32.checked_shl(u32::from(bits.checked_sub(1)?))?;
+    if scaled < magnitude.checked_neg()? || scaled >= magnitude {
+        return None;
+    }
+    let mask = 1_u32.checked_shl(u32::from(bits))?.checked_sub(1)?;
+    Some((scaled.cast_unsigned() & mask) << shift)
+}
+
+const fn condition_bits(condition: Condition) -> u32 {
+    match condition {
+        Condition::Equal => 0,
+        Condition::NotEqual => 1,
+        Condition::CarrySet => 2,
+        Condition::CarryClear => 3,
+        Condition::Higher => 8,
+        Condition::LowerOrSame => 9,
+        Condition::Always => 14,
+    }
+}
+
+fn decode_bitfield(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeError> {
+    let destination = reg(word);
+    let source = reg(word >> 5);
+    let rotate = u8::try_from((word >> 16) & 0x3f).expect("six-bit field");
+    let mask = u8::try_from((word >> 10) & 0x3f).expect("six-bit field");
+    if mask == 63 {
+        return Ok(DecodedInstruction::LogicalShiftRightImmediate64 {
+            destination,
+            source,
+            shift: rotate,
+        });
+    }
+    if mask.wrapping_add(1) == rotate {
+        return Ok(DecodedInstruction::LogicalShiftLeftImmediate64 {
+            destination,
+            source,
+            shift: 64_u8.wrapping_sub(rotate),
+        });
+    }
+    Err(DecodeError::UnknownInstruction { offset, word })
+}
+
+fn reg(word: u32) -> u8 {
+    u8::try_from(word & 0x1f).expect("five-bit field")
+}
+
+fn imm12(word: u32) -> u16 {
+    u16::try_from((word >> 10) & 0xfff).expect("12-bit field")
+}
+
+fn imm16(word: u32) -> u16 {
+    u16::try_from((word >> 5) & 0xffff).expect("16-bit field")
+}
+
+fn halfword_shift(word: u32) -> u8 {
+    u8::try_from(((word >> 21) & 3).checked_mul(16).expect("two-bit field")).expect("at most 48")
+}
+
+fn decode_adr_displacement(word: u32) -> i32 {
+    let low = (word >> 29) & 3;
+    let high = (word >> 5) & 0x7_ffff;
+    sign_extend((high << 2) | low, 21)
+}
+
+fn sign_extend(value: u32, bits: u8) -> i32 {
+    let shift = 32_u32
+        .checked_sub(u32::from(bits))
+        .expect("field no wider than u32");
+    (value << shift).cast_signed() >> shift
+}

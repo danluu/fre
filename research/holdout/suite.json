@@ -1,0 +1,405 @@
+{
+  "schema": "fre.holdout.suite.v1",
+  "suite_id": "fre-non-rebar-holdout-2026-07-14-v1",
+  "freeze_date": "2026-07-14",
+  "oracle": {
+    "implementation": "rust-regex",
+    "version": "1.12.4",
+    "api": "bytes",
+    "unicode": false
+  },
+  "timing": {
+    "warmup_iterations": 3,
+    "measured_iterations": 9
+  },
+  "dimensions": [
+    {
+      "id": "changing-haystacks",
+      "status": "covered",
+      "detail": "Every generated family has multiple immutable haystacks; hot samples rotate them."
+    },
+    {
+      "id": "one-shot-hot-reuse",
+      "status": "covered",
+      "detail": "Correctness receipts distinguish construction-per-operation from one construction reused for the case."
+    },
+    {
+      "id": "positive-negative-short-long-adversarial",
+      "status": "covered",
+      "detail": "Oracle-classified positives, targeted negatives, empty/short inputs, inputs through 65537 bytes, and overlapping-prefix adversaries are frozen."
+    },
+    {
+      "id": "anchors-empty-ascii-bytes",
+      "status": "covered",
+      "detail": "Absolute anchors, empty/nullable matches, NUL, 0xFF, and the complete byte class are present under Unicode-off byte semantics."
+    },
+    {
+      "id": "multi-literal-languages",
+      "status": "covered",
+      "detail": "Single regexes containing disjoint English alternatives and overlapping a-prefix alternatives are included."
+    },
+    {
+      "id": "pattern-fleets",
+      "status": "future",
+      "detail": "Independent 1/1000/10000+ compiled-pattern fleets, cache churn, and Zipf-distributed pattern rotation are not executed by v1."
+    },
+    {
+      "id": "mixed-regex-shapes",
+      "status": "covered",
+      "detail": "Classes, concatenation, ordered alternation, bounded and unbounded repetition, and optional suffixes are included."
+    },
+    {
+      "id": "captures",
+      "status": "unsupported",
+      "detail": "Only capture-free find/exists/end values are compared; capture group values and histories are not covered."
+    },
+    {
+      "id": "unicode-text",
+      "status": "unsupported",
+      "detail": "The frozen oracle profile is regex::bytes with Unicode disabled; Unicode scalar semantics and UTF-8 boundary filtering are absent."
+    },
+    {
+      "id": "re2-profiles",
+      "status": "future",
+      "detail": "RE2 Perl UTF-8, Latin1, POSIX, and longest-match profiles are not oracle-covered; v1 is Rust-regex bytes Unicode-off leftmost-first only."
+    },
+    {
+      "id": "replacement-split",
+      "status": "future",
+      "detail": "Replacement expansion and split iteration have no candidate API in this harness."
+    },
+    {
+      "id": "streaming-vectored",
+      "status": "future",
+      "detail": "Chunked streams and vectored haystacks are declared but not executed."
+    },
+    {
+      "id": "concurrency",
+      "status": "future",
+      "detail": "Shared-matcher multi-thread correctness and contention are not executed."
+    },
+    {
+      "id": "jit-denied",
+      "status": "future",
+      "detail": "Execution with executable-memory/JIT permission denied is not exercised."
+    },
+    {
+      "id": "memory-pressure",
+      "status": "future",
+      "detail": "Allocator failure injection, cgroup limits, and page-pressure behavior are not exercised."
+    },
+    {
+      "id": "architecture-aarch64",
+      "status": "runtime-required",
+      "detail": "The portable correctness suite is architecture-neutral, but an AArch64 receipt must be generated on an actual AArch64 host before architecture coverage is claimed."
+    },
+    {
+      "id": "architecture-x86_64",
+      "status": "runtime-required",
+      "detail": "The portable correctness suite is architecture-neutral, but an x86_64 receipt must be generated on an actual x86_64 host before architecture coverage is claimed."
+    },
+    {
+      "id": "performance",
+      "status": "partial",
+      "detail": "Raw compile/search timings are diagnostic-only, host-specific, threshold-free, and forbidden as planner feedback."
+    }
+  ],
+  "cases": [
+    {
+      "id": "literal-sherlock-changing",
+      "family": "literal",
+      "labels": ["positive", "negative", "short", "long", "changing-haystacks"],
+      "pattern": "Sherlock",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0x2f6e2b1d4379a055",
+        "alphabet_hex": "204142434445464748494a4b4c4d4e4f505152535455565758595a6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        "lengths": [0, 7, 8, 15, 64, 1024, 65536],
+        "variants_per_length": 3,
+        "injection": {
+          "needle_hex": "536865726c6f636b",
+          "variants": [0],
+          "placement": "seeded"
+        }
+      }
+    },
+    {
+      "id": "literal-binary-ff-nul",
+      "family": "ascii-bytes",
+      "labels": ["literal", "nul", "invalid-utf8", "positive", "negative"],
+      "pattern": "\\xFF\\x00A",
+      "generator": {
+        "kind": "explicit",
+        "inputs": [
+          {"hex": "", "intent": "negative"},
+          {"hex": "ff0041", "intent": "positive-exact"},
+          {"hex": "00ff0041ff", "intent": "positive-middle"},
+          {"hex": "ff0040", "intent": "negative-near"}
+        ]
+      }
+    },
+    {
+      "id": "literal-fleet-english",
+      "family": "literal-fleet",
+      "labels": ["fleet", "positive", "negative", "long"],
+      "pattern": "(?:alpha|beta|gamma|delta|epsilon|zeta|theta|lambda|omega|kappa|sigma|foobar)",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0x715bd42a6083ee19",
+        "alphabet_hex": "202c2e3b6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        "lengths": [5, 31, 256, 4096],
+        "variants_per_length": 3,
+        "injection": {
+          "needle_hex": "6f6d656761",
+          "variants": [0],
+          "placement": "middle"
+        }
+      }
+    },
+    {
+      "id": "literal-fleet-overlapping-prefix",
+      "family": "literal-fleet",
+      "labels": ["overlap", "adversarial", "short", "long"],
+      "pattern": "(?:aaaaaaaaab|aaaaaaaab|aaaaaaab|aaaaaab|aaaaab|aaaab|aaab|aab|ab)",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [0, 1, 2, 4, 8, 16, 64, 1024, 65536],
+        "suffix_hex": "62",
+        "intent": "overlapping-prefix"
+      }
+    },
+    {
+      "id": "mixed-concat-repeat-optional",
+      "family": "mixed-shape",
+      "labels": ["concat", "class", "repeat", "optional", "positive", "negative"],
+      "pattern": "ab+c[de]?",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0xd00657f04ccf173a",
+        "alphabet_hex": "616263646578797a",
+        "lengths": [0, 5, 6, 17, 128, 8192],
+        "variants_per_length": 3,
+        "injection": {
+          "needle_hex": "616262626364",
+          "variants": [0],
+          "placement": "seeded"
+        }
+      }
+    },
+    {
+      "id": "required-literal-class-suffix",
+      "family": "mixed-shape",
+      "labels": ["class-plus", "suffix", "positive", "negative", "long"],
+      "pattern": "[A-Za-z0-9_]+END",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0x8919f7343b2a4421",
+        "alphabet_hex": "212d5f303132333435363738394142434445464748494a4b4c4d4e4f505152535455565758595a6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        "lengths": [3, 7, 31, 512, 16384],
+        "variants_per_length": 3,
+        "injection": {
+          "needle_hex": "6162635f454e44",
+          "variants": [0],
+          "placement": "seeded"
+        }
+      }
+    },
+    {
+      "id": "forward-anchored-long",
+      "family": "anchor",
+      "labels": ["start", "end", "positive", "long"],
+      "pattern": "\\A[A-Z]+END\\z",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "41",
+        "lengths": [1, 4, 32, 4096],
+        "suffix_hex": "454e44",
+        "intent": "anchored-positive"
+      }
+    },
+    {
+      "id": "absolute-anchor-boundaries",
+      "family": "anchor",
+      "labels": ["start", "end", "positive", "negative", "short"],
+      "pattern": "\\AHEAD(?:[0-9]+)?TAIL\\z",
+      "generator": {
+        "kind": "explicit",
+        "inputs": [
+          {"hex": "484541445441494c", "intent": "positive-no-digits"},
+          {"hex": "4845414431323334355441494c", "intent": "positive-digits"},
+          {"hex": "78484541445441494c", "intent": "negative-leading"},
+          {"hex": "484541445441494c78", "intent": "negative-trailing"},
+          {"hex": "48454144785441494c", "intent": "negative-middle"},
+          {"hex": "", "intent": "negative-empty"}
+        ]
+      }
+    },
+    {
+      "id": "end-anchor-changing",
+      "family": "anchor",
+      "labels": ["end", "positive", "negative", "long"],
+      "pattern": "tail\\z",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0x90e3774931ad278e",
+        "alphabet_hex": "202d5f6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        "lengths": [4, 8, 64, 4096],
+        "variants_per_length": 3,
+        "injection": {
+          "needle_hex": "7461696c",
+          "variants": [0],
+          "placement": "end"
+        }
+      }
+    },
+    {
+      "id": "empty-match-invalid-bytes",
+      "family": "empty",
+      "labels": ["empty-match", "invalid-utf8", "short", "long"],
+      "pattern": "(?:)",
+      "generator": {
+        "kind": "seeded-bytes",
+        "seed": "0x4f3a9d5eb1998877",
+        "alphabet_hex": "00ff61620a",
+        "lengths": [0, 1, 2, 17, 4096],
+        "variants_per_length": 2,
+        "injection": null
+      }
+    },
+    {
+      "id": "nullable-lazy-long",
+      "family": "empty",
+      "labels": ["nullable", "lazy", "empty-match", "long"],
+      "pattern": "a*?",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [0, 1, 2, 64, 4096, 65536],
+        "suffix_hex": "ff",
+        "intent": "positive-empty"
+      }
+    },
+    {
+      "id": "adversarial-overlap-positive",
+      "family": "adversarial",
+      "labels": ["overlap", "unbounded-repeat", "positive", "long"],
+      "pattern": "(?:a|aa)*b",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [0, 1, 2, 4, 16, 256, 4096, 65536],
+        "suffix_hex": "62",
+        "intent": "adversarial-positive-tail"
+      }
+    },
+    {
+      "id": "adversarial-overlap-negative",
+      "family": "adversarial",
+      "labels": ["overlap", "unbounded-repeat", "negative", "long"],
+      "pattern": "(?:a|aa)*b",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [0, 1, 2, 4, 16, 256, 4096, 65536],
+        "suffix_hex": "63",
+        "intent": "adversarial-negative-tail"
+      }
+    },
+    {
+      "id": "bounded-repeat-boundary",
+      "family": "mixed-shape",
+      "labels": ["bounded-repeat", "boundary", "short", "long"],
+      "pattern": "a{0,100}b",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [0, 1, 99, 100, 101, 1000, 65536],
+        "suffix_hex": "62",
+        "intent": "bounded-repeat-boundary"
+      }
+    },
+    {
+      "id": "ordered-alternation-short-long",
+      "family": "mixed-shape",
+      "labels": ["ordered-alternation", "leftmost-first", "positive", "negative"],
+      "pattern": "(?:ab|a)",
+      "generator": {
+        "kind": "explicit",
+        "inputs": [
+          {"hex": "6162", "intent": "preferred-long"},
+          {"hex": "61", "intent": "fallback-short"},
+          {"hex": "786162", "intent": "positive-offset"},
+          {"hex": "78", "intent": "negative"},
+          {"hex": "6161", "intent": "short-first"},
+          {"hex": "", "intent": "negative-empty"}
+        ]
+      }
+    },
+    {
+      "id": "complete-byte-class",
+      "family": "ascii-bytes",
+      "labels": ["class", "nul", "invalid-utf8", "positive", "negative"],
+      "pattern": "[\\x00-\\xFF]",
+      "generator": {
+        "kind": "explicit",
+        "inputs": [
+          {"hex": "", "intent": "negative-empty"},
+          {"hex": "00", "intent": "positive-nul"},
+          {"hex": "ff", "intent": "positive-invalid-utf8"},
+          {"hex": "61", "intent": "positive-ascii"},
+          {"hex": "f09f92a9", "intent": "positive-first-byte"}
+        ]
+      }
+    },
+    {
+      "id": "decision-horizon-fallback-geometric",
+      "family": "adversarial",
+      "labels": ["decision-horizon", "suffix-restart-quadratic", "ordered-alternation", "positive", "long"],
+      "pattern": "(?:a+b|a)",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [1, 2, 4, 16, 256, 4096, 65536],
+        "suffix_hex": "",
+        "intent": "higher-priority-a-plus-b-reaches-eof-before-one-byte-fallback"
+      }
+    },
+    {
+      "id": "decision-horizon-primary-geometric",
+      "family": "adversarial",
+      "labels": ["decision-horizon", "suffix-restart-quadratic", "ordered-alternation", "positive", "long"],
+      "pattern": "(?:a+b|a)",
+      "generator": {
+        "kind": "repeated-byte",
+        "prefix_hex": "",
+        "byte_hex": "61",
+        "lengths": [1, 2, 4, 16, 256, 4096, 65536],
+        "suffix_hex": "62",
+        "intent": "higher-priority-a-plus-b-positive-at-tail"
+      }
+    },
+    {
+      "id": "word-boundary-frontier",
+      "family": "declared-unsupported",
+      "labels": ["word-boundary", "unsupported-frontier"],
+      "pattern": "\\bword",
+      "generator": {
+        "kind": "explicit",
+        "inputs": [
+          {"hex": "776f7264", "intent": "oracle-positive"},
+          {"hex": "7820776f7264", "intent": "oracle-positive-offset"},
+          {"hex": "73776f7264", "intent": "oracle-negative"},
+          {"hex": "", "intent": "oracle-negative-empty"}
+        ]
+      }
+    }
+  ]
+}

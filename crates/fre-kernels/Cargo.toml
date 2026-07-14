@@ -1,0 +1,18 @@
+[package]
+name = "fre-kernels"
+version.workspace = true
+description = "Bounded operation-specific search kernels for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aho-corasick = "=1.1.4"
+memchr = "=2.8.3"
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+
+[lints]
+workspace = true

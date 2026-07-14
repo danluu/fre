@@ -1,0 +1,11 @@
+[package]
+name = "fre-reference"
+version.workspace = true
+description = "Independent, fuel-bounded small-case semantic oracle for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

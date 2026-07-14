@@ -1,0 +1,14 @@
+[package]
+name = "fre-jit-x86_64"
+version.workspace = true
+description = "Bounded x86-64 native emitter for verified FRE Kernel IR"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+
+[lints]
+workspace = true

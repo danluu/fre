@@ -1,0 +1,4 @@
+# format-version: 1
+# purpose: deterministic small differential corpus reproduction
+# algorithm: generate_small_exhaustive / xorshift64 visitation order
+0x4652452d53454544 finite-grammar-v1 patterns=96 haystacks=31 comparisons=2976

@@ -1,0 +1,3 @@
+id	seed	case_ast	haystack_hex	oracle_first_span	direct_k0_status	reason
+K0-NULLABLE-001	0x4652452d4e554c31	Repeat(Alt(Empty,Byte(0x61)),0,None,Greedy)	61	0..0	unsupported	nullable unbounded loop priority is not represented by simple epsilon-cycle dedup
+K0-NULLABLE-002	0x4652452d4e554c32	Repeat(Alt(Byte(0x61),Empty),0,None,Greedy)	61	0..1	unsupported	nullable unbounded loop priority is not represented by simple epsilon-cycle dedup

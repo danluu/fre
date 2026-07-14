@@ -1,0 +1,9 @@
+fre_v1_config_default
+fre_v1_get_abi_descriptor
+fre_v1_regex_compile
+fre_v1_regex_exists
+fre_v1_regex_plan
+fre_v1_regex_release
+fre_v1_regex_retain
+fre_v1_regex_selected_end
+fre_v1_regex_span

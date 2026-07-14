@@ -1,0 +1,10 @@
+[package]
+name = "fre-re2-syntax"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0 OR MIT"
+description = "Bounded Rust-native RE2 syntax compatibility track for FRE"
+
+[lints]
+workspace = true

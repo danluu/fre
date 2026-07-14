@@ -1,0 +1,27 @@
+[package]
+name = "fre"
+version.workspace = true
+description = "Facade for the FRE bounded native regular-expression engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-aggregate = { path = "../fre-aggregate" }
+fre-automata = { path = "../fre-automata" }
+fre-kernels = { path = "../fre-kernels" }
+fre-lower = { path = "../fre-lower" }
+fre-syntax = { path = "../fre-syntax" }
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
+
+[dev-dependencies]
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+regex-automata = "=0.4.14"
+
+[[bench]]
+name = "portable_baseline"
+harness = false
+
+[lints]
+workspace = true

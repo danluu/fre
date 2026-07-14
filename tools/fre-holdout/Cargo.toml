@@ -1,0 +1,22 @@
+[package]
+name = "fre-holdout"
+version.workspace = true
+description = "Frozen non-Rebar semantic and diagnostic holdout qualification for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+fre = { path = "../../crates/fre" }
+fre-automata = { path = "../../crates/fre-automata" }
+fre-kernels = { path = "../../crates/fre-kernels" }
+fre-lower = { path = "../../crates/fre-lower" }
+fre-syntax = { path = "../../crates/fre-syntax" }
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"

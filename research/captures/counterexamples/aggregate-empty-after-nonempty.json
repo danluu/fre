@@ -1,0 +1,17 @@
+{
+  "schema": "fre.capture-counterexample.v1",
+  "status": "fixed-regression",
+  "profile": "regex::bytes 1.12.4",
+  "pattern": "(?:(a))*",
+  "haystack_hex": "61",
+  "operation": "captures_iter",
+  "incorrect_records_before_fix": [
+    [[0, 1], [0, 1]],
+    [[1, 1], null]
+  ],
+  "oracle_records": [
+    [[0, 1], [0, 1]]
+  ],
+  "cause": "an empty match beginning exactly at the previous non-empty match end must be suppressed",
+  "regression_test": "aggregate_empty_suppression_matches_pinned_regex"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "fre-conformance"
+version.workspace = true
+description = "Bounded differential conformance harness for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-automata = { path = "../fre-automata" }
+fre-reference = { path = "../fre-reference" }
+
+[dev-dependencies]
+# This is a separately labelled secondary comparator, never the semantic oracle.
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+
+[lints]
+workspace = true

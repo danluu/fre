@@ -1,0 +1,20 @@
+[package]
+name = "fre-aggregate"
+version.workspace = true
+description = "Bounded whole-operation regex iteration for FRE"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+regex-syntax = "=0.8.11"
+
+[dev-dependencies]
+fre-iterator-lab = { path = "../fre-iterator-lab" }
+fre-reference = { path = "../fre-reference" }
+regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
+regex-automata = "=0.4.14"
+
+[lints]
+workspace = true

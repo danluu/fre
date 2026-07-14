@@ -1,0 +1,14 @@
+[package]
+name = "fre-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned compatibility profiles and bounded syntax parsing for FRE"
+
+[dependencies]
+fre-re2-syntax = { path = "../fre-re2-syntax" }
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
+
+[lints]
+workspace = true

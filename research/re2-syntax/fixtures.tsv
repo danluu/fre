@@ -1,0 +1,36 @@
+# schema=fre.re2-syntax-fixtures.v1 revision=972a15cedd008d846f1a39b2e88ce48d7f166cbd
+# label<TAB>syntax<TAB>encoding<TAB>flags<TAB>pattern_hex<TAB>haystack_hex<TAB>source_expectation
+literal	perl	utf8	-	61	786179	construct-ok
+concat	perl	utf8	-	616263	2d2d6162632d2d	construct-ok
+alternate	perl	utf8	-	61627c6364	787863647979	construct-ok
+capture	perl	utf8	-	286129	7a61	construct-ok
+named-python	perl	utf8	-	283f503c6e616d653e6129	7a61	construct-ok
+named-dotnet	perl	utf8	-	283f3c6e616d653e6129	7a61	construct-ok
+noncapture	perl	utf8	-	283f3a6162292a	61626162	construct-ok
+perl-class	perl	utf8	-	5c642b	313233	construct-ok
+word-boundary	perl	utf8	-	5c62776f72645c62	6120776f72642062	construct-ok
+anchors	perl	utf8	-	5c41612b5c7a	616161	construct-ok
+any-byte	perl	utf8	-	5c43	ff	construct-ok
+quoted	perl	utf8	-	5c512b7c2a3f7b5b5c45	2b7c2a3f7b5b	construct-ok
+counted	perl	utf8	-	617b322c347d	616161	construct-ok
+lazy	perl	utf8	-	612a3f	616161	construct-ok
+flags	perl	utf8	-	283f696d2d733a612e2924	410a	construct-ok
+class-range	perl	utf8	-	5b612d7a5d2b	616263	construct-ok
+core-escapes	perl	utf8	-	5c6e5c7834315c313431	0a4161	construct-ok
+posix-basic	posix	utf8	-	28617c62292b	616262	construct-ok
+posix-perl-classes	posix	utf8	perl_classes	5c642b	3132	construct-ok
+posix-word-boundary	posix	utf8	word_boundary	5c62785c62	78	construct-ok
+latin1	perl	latin1	-	ff61	ff61	construct-ok
+literal-option	perl	utf8	literal	28297c2a	28297c2a	construct-ok
+never-capture	perl	utf8	never_capture	286129	61	construct-ok
+bad-missing-paren	perl	utf8	-	2861	-	construct-error
+bad-unexpected-paren	perl	utf8	-	29	-	construct-error
+bad-class-range	perl	utf8	-	5b7a2d615d	-	construct-error
+bad-repeat-bound	perl	utf8	-	787b313030317d	-	construct-error
+bad-stacked-perl	perl	utf8	-	612b2b	-	construct-error
+ok-stacked-posix	posix	utf8	-	612b2b	61	construct-ok
+bad-lookbehind	perl	utf8	-	283f3c3d6129	-	construct-error
+bad-utf8	perl	utf8	-	ff	-	construct-error
+latin1-nonutf8	perl	latin1	-	ff	ff	construct-ok
+unicode-class	perl	utf8	-	5c707b48616e7d	E4B880	construct-ok
+posix-class	posix	utf8	-	5b5b3a6c6f7765723a5d5d	61	construct-ok

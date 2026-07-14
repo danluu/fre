@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fre.invalid/schema/holdout-suite-v1.json",
+  "title": "FRE frozen non-Rebar holdout suite v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "suite_id", "freeze_date", "oracle", "timing", "dimensions", "cases"],
+  "properties": {
+    "schema": {"const": "fre.holdout.suite.v1"},
+    "suite_id": {"type": "string", "minLength": 1},
+    "freeze_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "version", "api", "unicode"],
+      "properties": {
+        "implementation": {"const": "rust-regex"},
+        "version": {"const": "1.12.4"},
+        "api": {"const": "bytes"},
+        "unicode": {"const": false}
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmup_iterations", "measured_iterations"],
+      "properties": {
+        "warmup_iterations": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "measured_iterations": {"type": "integer", "minimum": 1, "maximum": 10000}
+      }
+    },
+    "dimensions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/dimension"}
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "detail"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["covered", "partial", "unsupported", "future", "runtime-required"]},
+        "detail": {"type": "string", "minLength": 1}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "family", "labels", "pattern", "generator"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "family": {"type": "string", "minLength": 1},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "pattern": {"type": "string"},
+        "generator": {
+          "oneOf": [
+            {"$ref": "#/$defs/explicitGenerator"},
+            {"$ref": "#/$defs/seededGenerator"},
+            {"$ref": "#/$defs/repeatedGenerator"}
+          ]
+        }
+      }
+    },
+    "explicitGenerator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "inputs"],
+      "properties": {
+        "kind": {"const": "explicit"},
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["hex", "intent"],
+            "properties": {
+              "hex": {"type": "string", "pattern": "^(?:[0-9A-Fa-f]{2})*$"},
+              "intent": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "seededGenerator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "seed", "alphabet_hex", "lengths", "variants_per_length", "injection"],
+      "properties": {
+        "kind": {"const": "seeded-bytes"},
+        "seed": {"type": "string", "pattern": "^(?:0x[0-9A-Fa-f]+|[0-9]+)$"},
+        "alphabet_hex": {"type": "string", "pattern": "^(?:[0-9A-Fa-f]{2})+$"},
+        "lengths": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+        "variants_per_length": {"type": "integer", "minimum": 1},
+        "injection": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["needle_hex", "variants", "placement"],
+              "properties": {
+                "needle_hex": {"type": "string", "pattern": "^(?:[0-9A-Fa-f]{2})*$"},
+                "variants": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                "placement": {"enum": ["start", "middle", "end", "seeded"]}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "repeatedGenerator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "prefix_hex", "byte_hex", "lengths", "suffix_hex", "intent"],
+      "properties": {
+        "kind": {"const": "repeated-byte"},
+        "prefix_hex": {"type": "string", "pattern": "^(?:[0-9A-Fa-f]{2})*$"},
+        "byte_hex": {"type": "string", "pattern": "^[0-9A-Fa-f]{2}$"},
+        "lengths": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+        "suffix_hex": {"type": "string", "pattern": "^(?:[0-9A-Fa-f]{2})*$"},
+        "intent": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

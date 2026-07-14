@@ -1,0 +1,15 @@
+[package]
+name = "fre-jit-aarch64"
+version.workspace = true
+description = "Bounded AArch64 native emitter for verified FRE Kernel IR"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true
