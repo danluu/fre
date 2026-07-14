@@ -32,7 +32,10 @@ rust-version = "1.93"
 license = "Apache-2.0 OR MIT"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Crates that promise to contain no unsafe code also state `forbid` at their
+# crate roots. The workspace default is `deny` so a crate can make a narrowly
+# scoped, reasoned exception for an audited primitive.
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unreachable_pub = "warn"

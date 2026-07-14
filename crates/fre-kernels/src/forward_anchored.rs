@@ -6,7 +6,8 @@
 //! possible repetition boundary. Suffix borders are therefore irrelevant.
 //! Search is worst-case linear and allocates no memory.
 
-use core::{fmt, mem::size_of};
+use core::{alloc::Layout, fmt, mem::size_of, ptr};
+use std::alloc::alloc;
 
 use memchr::{memchr, memrchr};
 
@@ -208,7 +209,7 @@ impl Default for SearchLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildAccounting {
     pub suffix_bytes: usize,
-    /// Actual retained allocation capacity after `try_reserve_exact`.
+    /// Exact retained allocation capacity of the suffix copy.
     pub suffix_capacity_bytes: usize,
     pub class_cardinality: usize,
     pub implementation: ClassImplementation,
@@ -399,6 +400,86 @@ pub struct ForwardAnchoredPlan {
     build: BuildAccounting,
 }
 
+/// Copy `suffix` into a fallible allocation whose reported capacity is exact.
+fn copy_suffix_exact(suffix: &[u8]) -> Result<Vec<u8>, BuildError> {
+    // SAFETY: `alloc` either returns null or a fresh allocation from the global
+    // allocator for exactly the requested layout, and it does not unwind after
+    // returning ownership. These are precisely the callback requirements.
+    #[allow(
+        unsafe_code,
+        reason = "the audited exact-layout helper requires the global allocator"
+    )]
+    unsafe {
+        copy_suffix_exact_with(suffix, |layout| alloc(layout))
+    }
+}
+
+/// The allocation seam used by [`copy_suffix_exact`] and its failure tests.
+///
+/// # Safety
+///
+/// If `allocate` returns non-null, its pointer must be a fresh, uniquely owned
+/// allocation from the global allocator for the supplied layout. The callback
+/// must not unwind after obtaining that allocation. `suffix` must not overlap
+/// the returned allocation.
+#[allow(
+    unsafe_code,
+    reason = "constructing a Vec from an exact global-allocation layout is the audited primitive"
+)]
+unsafe fn copy_suffix_exact_with<A>(suffix: &[u8], allocate: A) -> Result<Vec<u8>, BuildError>
+where
+    A: FnOnce(Layout) -> *mut u8,
+{
+    if suffix.is_empty() {
+        return Err(BuildError::EmptySuffix);
+    }
+    let layout = Layout::array::<u8>(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
+        computation: "exact suffix allocation layout",
+    })?;
+
+    #[cfg(test)]
+    exact_suffix_copy_probe::record();
+    let allocation = allocate(layout);
+    if allocation.is_null() {
+        return Err(BuildError::AllocationFailed {
+            structure: "forward anchored suffix",
+            additional: suffix.len(),
+        });
+    }
+
+    // SAFETY: the function contract gives a fresh global allocation with
+    // `layout == Layout::array::<u8>(suffix.len())`. Every u8 alignment is
+    // valid, the allocation is disjoint from `suffix`, and all `len` bytes are
+    // initialized by the non-overlapping copy. No panicking operation occurs
+    // between allocation and `Vec` ownership. `len == capacity`, so `Vec` will
+    // later deallocate using the identical layout.
+    unsafe {
+        ptr::copy_nonoverlapping(suffix.as_ptr(), allocation, suffix.len());
+        Ok(Vec::from_raw_parts(allocation, suffix.len(), suffix.len()))
+    }
+}
+
+#[cfg(test)]
+mod exact_suffix_copy_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().checked_add(1).expect("test probe overflow"));
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 impl ForwardAnchoredPlan {
     /// Prove eligibility and copy the fixed suffix.
     ///
@@ -481,17 +562,18 @@ impl ForwardAnchoredPlan {
                 computation: "build work upper bound",
             })?;
         let scratch_bytes = 0_usize;
-        let persistent_lower_bound =
+        let persistent_bytes =
             size_of::<Self>()
                 .checked_add(suffix.len())
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent plan lower bound",
+                    computation: "persistent plan bytes",
                 })?;
-        let peak_lower_bound = persistent_lower_bound.checked_add(scratch_bytes).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "construction peak lower bound",
-            },
-        )?;
+        let peak_bytes =
+            persistent_bytes
+                .checked_add(scratch_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "construction peak bytes",
+                })?;
 
         if suffix.len() > limits.max_suffix_bytes {
             return Err(BuildError::SuffixLimit {
@@ -511,38 +593,6 @@ impl ForwardAnchoredPlan {
                 limit: limits.max_scratch_bytes,
             });
         }
-        if persistent_lower_bound > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_lower_bound,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        if peak_lower_bound > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_lower_bound,
-                limit: limits.max_peak_bytes,
-            });
-        }
-
-        let mut owned_suffix = Vec::new();
-        owned_suffix
-            .try_reserve_exact(suffix.len())
-            .map_err(|_| BuildError::AllocationFailed {
-                structure: "forward anchored suffix",
-                additional: suffix.len(),
-            })?;
-        owned_suffix.extend_from_slice(suffix);
-        let persistent_bytes = size_of::<Self>()
-            .checked_add(owned_suffix.capacity())
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "persistent plan bytes from allocated capacity",
-            })?;
-        let peak_bytes =
-            persistent_bytes
-                .checked_add(scratch_bytes)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "construction peak bytes from allocated capacity",
-                })?;
         if persistent_bytes > limits.max_persistent_bytes {
             return Err(BuildError::PersistentLimit {
                 needed: persistent_bytes,
@@ -555,6 +605,9 @@ impl ForwardAnchoredPlan {
                 limit: limits.max_peak_bytes,
             });
         }
+
+        let owned_suffix = copy_suffix_exact(suffix)?;
+        debug_assert_eq!(owned_suffix.len(), owned_suffix.capacity());
         let suffix_capacity_bytes = owned_suffix.capacity();
         Ok(Self {
             class,
