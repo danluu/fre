@@ -169,9 +169,7 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
         }
         "five-member-generalization" => {
             let size = requested_size.max(2);
-            let prefix = size
-                .checked_sub(1)
-                .ok_or("five-member prefix underflow")?;
+            let prefix = size.checked_sub(1).ok_or("five-member prefix underflow")?;
             let mut haystack = make_prefix(b"acegi", prefix);
             haystack.push(b'Z');
             Fixture {
