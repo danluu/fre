@@ -167,6 +167,10 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                 haystack,
             }
         }
+        "bitset-suffix-absent" => Fixture {
+            pattern: r"\A[aceg]+Z".into(),
+            haystack: make_prefix(b"aceg", requested_size),
+        },
         "five-member-generalization" => {
             let size = requested_size.max(2);
             let prefix = size.checked_sub(1).ok_or("five-member prefix underflow")?;
@@ -187,6 +191,10 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                 haystack,
             }
         }
+        "whitespace-suffix-absent" => Fixture {
+            pattern: r"\A[ \t]+END".into(),
+            haystack: make_prefix(b" \t", requested_size),
+        },
         _ => return Err(format!("unknown CASE {case:?}")),
     };
     Ok(fixture)
