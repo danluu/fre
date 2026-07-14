@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Release driver for complete exact-literal reducers.
 
 use std::{

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Structural scaling receipt for the exact-literal whole-operation plan.
 
 use std::process::ExitCode;

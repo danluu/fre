@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Development-only release smoke comparison for the ordered literal-set DFA.
 
 use std::hint::black_box;
