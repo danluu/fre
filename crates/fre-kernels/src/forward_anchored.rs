@@ -655,6 +655,10 @@ impl ForwardAnchoredPlan {
             if !self.class.contains(first_byte) {
                 return Ok((None, accounting));
             }
+            // Small exact classes can use any suffix-first witness as an
+            // upper bound on the first outsider. The helper partitions long
+            // tails without overlap; controls retain their first-candidate
+            // forward search.
             let uses_edge_witness = matches!(
                 self.implementation,
                 ClassImplementation::Pair { .. }
@@ -687,6 +691,9 @@ impl ForwardAnchoredPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "actual prefix examinations",
                 })?;
+            // A forward witness is the first suffix-first byte, so an earlier
+            // outsider cannot begin the suffix. An edge witness may be later;
+            // there the scanner's returned first outsider is authoritative.
             if !uses_edge_witness && boundary != candidate {
                 return Ok((None, accounting));
             }
@@ -848,6 +855,9 @@ const RANGE_BLOCK: usize = 32;
 const EDGE_WITNESS_BLOCK: usize = 32;
 const EDGE_WITNESS_SPAN: usize = EDGE_WITNESS_BLOCK * 2;
 
+/// Find any suffix-first witness while searching each logical byte at most
+/// once on absence. Short tails use one forward search. Long tails search a
+/// fixed front, a disjoint fixed back in reverse, and the untouched middle.
 fn edge_suffix_witness(needle: u8, bytes: &[u8]) -> Result<(Option<usize>, usize), SearchError> {
     if bytes.len() < EDGE_WITNESS_SPAN {
         return Ok((memchr(needle, bytes), 1));
