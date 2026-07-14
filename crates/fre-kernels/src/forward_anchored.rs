@@ -1890,7 +1890,7 @@ mod tests {
         if let Some(candidate) = (0..8).find(|&index| bytes[index] == needle) {
             return (Some(candidate), 0);
         }
-        let back_start = bytes.len() - 32;
+        let back_start = bytes.len().checked_sub(32).unwrap();
         if let Some(candidate) = (back_start..bytes.len())
             .rev()
             .find(|&index| bytes[index] == needle)
@@ -1924,7 +1924,7 @@ mod tests {
                     1
                 } else if candidate < 8 {
                     0
-                } else if candidate >= length - 32 {
+                } else if candidate >= length.checked_sub(32).unwrap() {
                     1
                 } else {
                     2
@@ -1950,7 +1950,7 @@ mod tests {
         if length < 40 {
             return false;
         }
-        let expected_back_start = length - 32;
+        let expected_back_start = length.checked_sub(32).unwrap();
         if partition.front != (EdgeWitnessRange { start: 0, end: 8 })
             || partition.middle
                 != (EdgeWitnessRange {
@@ -1975,7 +1975,7 @@ mod tests {
         }
         let total = ranges
             .iter()
-            .map(|range| range.end - range.start)
+            .map(|range| range.end.checked_sub(range.start).unwrap())
             .sum::<usize>();
         if total != length
             || ranges_overlap(partition.front, partition.middle)
@@ -2013,7 +2013,8 @@ mod tests {
                 );
 
                 let mut middle_back_overlap = partition;
-                middle_back_overlap.middle.end = middle_back_overlap.back.start + 1;
+                middle_back_overlap.middle.end =
+                    middle_back_overlap.back.start.checked_add(1).unwrap();
                 assert!(
                     !partition_proof_holds(length, middle_back_overlap),
                     "guarded middle/back overlap survived at length={length}"

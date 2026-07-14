@@ -1,3 +1,8 @@
+#![allow(
+    clippy::arithmetic_side_effects,
+    reason = "all arithmetic operands are explicitly bounded by this deterministic test oracle"
+)]
+
 use fre_kernels::{
     ForwardAnchoredAnchors as Anchors, ForwardAnchoredBuildLimits as BuildLimits,
     ForwardAnchoredByteClass as ByteClass, ForwardAnchoredPlan,
