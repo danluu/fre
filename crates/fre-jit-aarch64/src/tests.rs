@@ -14,7 +14,7 @@ use fre_kernel_ir::{
 
 use crate::{
     AggregateResultLayout, AotLimits, AuditError, Condition, ConfirmationKind, CpuFeatures,
-    DecodeError, DecodedInstruction, EmitError, EmitLimits, MAX_REPEATED_CONFIRM_BYTES,
+    DecodeError, DecodedInstruction, EmitError, EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES,
     NativeAggregateImage, NativeAggregateResult, NativeImage, NativeResult, RelocationKind,
     RelocationTarget, ResourceKind, ResultLayout, audit, audit_aggregate, decode, decode_one, emit,
     emit_exact_aggregate,
@@ -805,6 +805,778 @@ fn aggregate_v1_envelope_is_exact_for_every_shape_family() {
             audit_aggregate(&image).expect("exact v1 envelope passes");
         }
     }
+}
+
+struct M17CountTemplateCursor<'a> {
+    instructions: &'a [DecodedInstruction],
+    position: usize,
+}
+
+impl<'a> M17CountTemplateCursor<'a> {
+    const fn new(instructions: &'a [DecodedInstruction]) -> Self {
+        Self {
+            instructions,
+            position: 0,
+        }
+    }
+
+    fn expect(&mut self, expected: DecodedInstruction) -> bool {
+        if self.instructions.get(self.position) != Some(&expected) {
+            return false;
+        }
+        self.position += 1;
+        true
+    }
+
+    fn finished(&self) -> bool {
+        self.position == self.instructions.len()
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independently transcribed M=17 Count prototype keeps every decoded operand visible"
+)]
+fn m17_count_template_matches(image: &NativeImage) -> bool {
+    use DecodedInstruction::{
+        AddImmediate64, AddRegister64, Address, AndBytes16, Branch, BranchCondition,
+        CompareBranchZero64, CompareEqualBytes16, CompareImmediate32, CompareImmediate64,
+        CompareRegister32, CompareRegister64, DuplicateByte16, LoadByte, LoadByteRegister,
+        LoadVector128, MoveRegister64, MoveVectorByteTo32, MoveZero64, Return, Store64,
+        SubtractImmediate64, SubtractRegister64, UnsignedMaxBytes16, UnsignedMinBytes16,
+    };
+
+    let expected = [
+        MoveZero64 {
+            destination: 13,
+            immediate: 0,
+            shift: 0,
+        },
+        Address {
+            destination: 8,
+            displacement: 316,
+        },
+        MoveZero64 {
+            destination: 12,
+            immediate: 17,
+            shift: 0,
+        },
+        CompareRegister64 { left: 1, right: 12 },
+        BranchCondition {
+            condition: Condition::CarryClear,
+            displacement: 284,
+        },
+        SubtractRegister64 {
+            destination: 6,
+            left: 1,
+            right: 12,
+        },
+        MoveZero64 {
+            destination: 5,
+            immediate: 0,
+            shift: 0,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        DuplicateByte16 {
+            destination: 1,
+            source: 11,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 16,
+        },
+        DuplicateByte16 {
+            destination: 3,
+            source: 11,
+        },
+        CompareRegister64 { left: 5, right: 6 },
+        BranchCondition {
+            condition: Condition::Higher,
+            displacement: 252,
+        },
+        SubtractRegister64 {
+            destination: 10,
+            left: 6,
+            right: 5,
+        },
+        CompareImmediate64 {
+            register: 10,
+            immediate: 15,
+        },
+        BranchCondition {
+            condition: Condition::CarryClear,
+            displacement: 60,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        LoadVector128 {
+            destination: 0,
+            base: 15,
+            offset: 0,
+        },
+        CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: 1,
+        },
+        AddImmediate64 {
+            destination: 10,
+            source: 15,
+            immediate: 16,
+        },
+        LoadVector128 {
+            destination: 2,
+            base: 10,
+            offset: 0,
+        },
+        CompareEqualBytes16 {
+            destination: 2,
+            left: 2,
+            right: 3,
+        },
+        AndBytes16 {
+            destination: 0,
+            left: 0,
+            right: 2,
+        },
+        UnsignedMaxBytes16 {
+            destination: 0,
+            source: 0,
+        },
+        MoveVectorByteTo32 {
+            destination: 10,
+            source: 0,
+        },
+        CompareBranchZero64 {
+            register: 10,
+            nonzero: true,
+            displacement: 12,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 16,
+        },
+        Branch { displacement: -64 },
+        AddImmediate64 {
+            destination: 7,
+            source: 5,
+            immediate: 15,
+        },
+        Branch { displacement: 8 },
+        MoveRegister64 {
+            destination: 7,
+            source: 6,
+        },
+        CompareRegister64 { left: 5, right: 7 },
+        BranchCondition {
+            condition: Condition::Higher,
+            displacement: -84,
+        },
+        LoadByteRegister {
+            destination: 10,
+            base: 0,
+            index: 5,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: Condition::NotEqual,
+            displacement: 148,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        LoadByte {
+            destination: 10,
+            base: 15,
+            offset: 16,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 16,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: Condition::NotEqual,
+            displacement: 128,
+        },
+        MoveRegister64 {
+            destination: 15,
+            source: 15,
+        },
+        MoveRegister64 {
+            destination: 16,
+            source: 8,
+        },
+        MoveZero64 {
+            destination: 17,
+            immediate: 17,
+            shift: 0,
+        },
+        CompareImmediate64 {
+            register: 17,
+            immediate: 16,
+        },
+        BranchCondition {
+            condition: Condition::CarryClear,
+            displacement: 48,
+        },
+        LoadVector128 {
+            destination: 4,
+            base: 15,
+            offset: 0,
+        },
+        LoadVector128 {
+            destination: 5,
+            base: 16,
+            offset: 0,
+        },
+        CompareEqualBytes16 {
+            destination: 4,
+            left: 4,
+            right: 5,
+        },
+        UnsignedMinBytes16 {
+            destination: 4,
+            source: 4,
+        },
+        MoveVectorByteTo32 {
+            destination: 10,
+            source: 4,
+        },
+        CompareImmediate32 {
+            register: 10,
+            immediate: 255,
+        },
+        BranchCondition {
+            condition: Condition::NotEqual,
+            displacement: 80,
+        },
+        AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 16,
+        },
+        AddImmediate64 {
+            destination: 16,
+            source: 16,
+            immediate: 16,
+        },
+        SubtractImmediate64 {
+            destination: 17,
+            source: 17,
+            immediate: 16,
+        },
+        Branch { displacement: -48 },
+        CompareBranchZero64 {
+            register: 17,
+            nonzero: false,
+            displacement: 36,
+        },
+        LoadByte {
+            destination: 10,
+            base: 15,
+            offset: 0,
+        },
+        LoadByte {
+            destination: 11,
+            base: 16,
+            offset: 0,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: Condition::NotEqual,
+            displacement: 44,
+        },
+        AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 1,
+        },
+        AddImmediate64 {
+            destination: 16,
+            source: 16,
+            immediate: 1,
+        },
+        SubtractImmediate64 {
+            destination: 17,
+            source: 17,
+            immediate: 1,
+        },
+        CompareBranchZero64 {
+            register: 17,
+            nonzero: true,
+            displacement: -28,
+        },
+        MoveRegister64 {
+            destination: 14,
+            source: 13,
+        },
+        AddImmediate64 {
+            destination: 13,
+            source: 13,
+            immediate: 1,
+        },
+        CompareRegister64 {
+            left: 13,
+            right: 14,
+        },
+        BranchCondition {
+            condition: Condition::CarryClear,
+            displacement: 32,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 17,
+        },
+        Branch { displacement: -164 },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+        Branch { displacement: -172 },
+        Store64 {
+            source: 13,
+            base: 2,
+            offset: 0,
+        },
+        MoveZero64 {
+            destination: 0,
+            immediate: 0,
+            shift: 0,
+        },
+        Return,
+        MoveZero64 {
+            destination: 0,
+            immediate: 1,
+            shift: 0,
+        },
+        Return,
+    ];
+    let expected_labels = [
+        (0, LabelKind::Entry),
+        (44, LabelKind::Loop),
+        (104, LabelKind::Internal),
+        (112, LabelKind::SlowPath),
+        (120, LabelKind::SlowPath),
+        (124, LabelKind::Loop),
+        (180, LabelKind::Loop),
+        (232, LabelKind::Internal),
+        (236, LabelKind::Loop),
+        (268, LabelKind::Internal),
+        (292, LabelKind::Internal),
+        (300, LabelKind::ReturnFound),
+        (312, LabelKind::ReturnNone),
+    ];
+    let expected_relocations = [
+        (
+            4,
+            RelocationKind::Address21,
+            RelocationTarget::RodataOffset(0),
+        ),
+        (
+            16,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(300),
+        ),
+        (
+            48,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(300),
+        ),
+        (
+            60,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(120),
+        ),
+        (
+            100,
+            RelocationKind::CompareBranch19,
+            RelocationTarget::CodeOffset(112),
+        ),
+        (
+            108,
+            RelocationKind::Branch26,
+            RelocationTarget::CodeOffset(44),
+        ),
+        (
+            116,
+            RelocationKind::Branch26,
+            RelocationTarget::CodeOffset(124),
+        ),
+        (
+            128,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(44),
+        ),
+        (
+            144,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(292),
+        ),
+        (
+            164,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(292),
+        ),
+        (
+            184,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(232),
+        ),
+        (
+            212,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(292),
+        ),
+        (
+            228,
+            RelocationKind::Branch26,
+            RelocationTarget::CodeOffset(180),
+        ),
+        (
+            232,
+            RelocationKind::CompareBranch19,
+            RelocationTarget::CodeOffset(268),
+        ),
+        (
+            248,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(292),
+        ),
+        (
+            264,
+            RelocationKind::CompareBranch19,
+            RelocationTarget::CodeOffset(236),
+        ),
+        (
+            280,
+            RelocationKind::ConditionalBranch19,
+            RelocationTarget::CodeOffset(312),
+        ),
+        (
+            288,
+            RelocationKind::Branch26,
+            RelocationTarget::CodeOffset(124),
+        ),
+        (
+            296,
+            RelocationKind::Branch26,
+            RelocationTarget::CodeOffset(124),
+        ),
+    ];
+
+    if image.code.len() != 320
+        || image.rodata.len() != 17
+        || image.labels.len() != expected_labels.len()
+        || image.relocations.len() != expected_relocations.len()
+        || image.stats.vector_instructions != 14
+        || !matches!(
+            image.aggregate_manifest(),
+            Some(manifest)
+                if manifest.output == AggregateOutput::Count && manifest.literal_bytes == 17
+        )
+        || !image
+            .labels
+            .iter()
+            .zip(expected_labels)
+            .all(|(actual, (offset, kind))| actual.offset == offset && actual.kind == kind)
+        || !image.relocations.iter().zip(expected_relocations).all(
+            |(actual, (offset, kind, target))| {
+                let start = usize::try_from(offset).expect("small prototype offset");
+                let resolved = u32::from_le_bytes(
+                    image.code[start..start + 4]
+                        .try_into()
+                        .expect("one instruction"),
+                );
+                actual.code_offset == offset
+                    && actual.kind == kind
+                    && actual.target == target
+                    && actual.addend == 0
+                    && actual.resolved_word == resolved
+            },
+        )
+    {
+        return false;
+    }
+
+    let Ok(instructions) = decode(image.code()) else {
+        return false;
+    };
+    let mut cursor = M17CountTemplateCursor::new(&instructions);
+    expected
+        .into_iter()
+        .all(|instruction| cursor.expect(instruction))
+        && cursor.finished()
+}
+
+fn reseal_test_image(image: &mut NativeImage) {
+    image.artifact_identity = image
+        .compute_artifact_identity()
+        .expect("bounded test artifact identity");
+}
+
+#[test]
+fn m17_count_decoded_template_accepts_only_the_canonical_phase_graph() {
+    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
+        .expect("M=17 Count program");
+    let image = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+    assert!(m17_count_template_matches(image.inner()));
+    audit_aggregate(&image).expect("existing independent audit also accepts the canonical image");
+}
+
+fn replace_test_instruction(
+    image: &mut NativeImage,
+    predicate: impl Fn(DecodedInstruction) -> bool,
+    replacement: u32,
+) -> u32 {
+    let position = decoded_position(image.code(), predicate);
+    let offset = u32::try_from(position).expect("small test image");
+    decode_one(replacement, offset).expect("canonical test mutation");
+    image.code[position..position + 4].copy_from_slice(&replacement.to_le_bytes());
+    offset
+}
+
+fn assert_m17_prototype_rejects(mut image: NativeImage, mutation: &str) {
+    reseal_test_image(&mut image);
+    assert!(decode(image.code()).is_ok(), "{mutation} remains decodable");
+    assert!(
+        !m17_count_template_matches(&image),
+        "M=17 prototype accepted {mutation}"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded prototype keeps one coherent witness from each semantic mutation class together"
+)]
+fn m17_count_decoded_template_rejects_representative_semantic_mutations() {
+    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
+        .expect("M=17 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SubtractRegister64 {
+                    destination: 10,
+                    left: 6,
+                    right: 5
+                }
+            )
+        },
+        0xcb05_002a,
+    );
+    assert_m17_prototype_rejects(inner, "remaining-length source substitution");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::AddImmediate64 {
+                    destination: 15,
+                    source: 15,
+                    immediate: 16
+                }
+            )
+        },
+        0x9100_05ef,
+    );
+    assert_m17_prototype_rejects(inner, "vector-confirmation stride substitution");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::MoveRegister64 {
+                    destination: 15,
+                    source: 15
+                }
+            )
+        },
+        0x9100_41ef,
+    );
+    assert_m17_prototype_rejects(inner, "confirmation prologue pointer advance");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadByte {
+                    destination: 10,
+                    base: 15,
+                    offset: 0
+                }
+            )
+        },
+        0x3940_010a,
+    );
+    assert_m17_prototype_rejects(inner, "scalar-confirmation load-role substitution");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: 1
+                }
+            )
+        },
+        0x6e20_8c00,
+    );
+    assert_m17_prototype_rejects(inner, "SIMD self-compare substitution");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::AddImmediate64 {
+                    destination: 5,
+                    source: 5,
+                    immediate: 16
+                }
+            )
+        },
+        0x9100_44a5,
+    );
+    assert_m17_prototype_rejects(inner, "vector-skip cursor delta substitution");
+
+    let mut inner = valid.inner().clone();
+    let branch_offset = 264_u32;
+    let target = 180_u32;
+    let displacement_words = i32::try_from(target).expect("small target")
+        - i32::try_from(branch_offset).expect("small branch");
+    let displacement_words = displacement_words / 4;
+    let immediate = u32::from_ne_bytes(displacement_words.to_ne_bytes()) & 0x7_ffff;
+    let replacement = 0xb500_0000 | (immediate << 5) | 17;
+    assert_eq!(
+        decode_one(replacement, branch_offset),
+        Ok(DecodedInstruction::CompareBranchZero64 {
+            register: 17,
+            nonzero: true,
+            displacement: -84,
+        })
+    );
+    inner.code[264..268].copy_from_slice(&replacement.to_le_bytes());
+    let relocation = inner
+        .relocations
+        .iter_mut()
+        .find(|relocation| relocation.code_offset == branch_offset)
+        .expect("scalar confirmation relocation");
+    relocation.target = RelocationTarget::CodeOffset(target);
+    relocation.resolved_word = replacement;
+    assert_m17_prototype_rejects(inner, "confirmation CBNZ retarget");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset: 16
+                }
+            )
+        },
+        0x3940_010b,
+    );
+    assert_m17_prototype_rejects(inner, "last-byte filter offset substitution");
+
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::AddImmediate64 {
+                    destination: 13,
+                    source: 13,
+                    immediate: 1
+                }
+            )
+        },
+        0x9100_45ad,
+    );
+    assert_m17_prototype_rejects(inner, "Count reducer-delta substitution");
+
+    let mut inner = valid.inner().clone();
+    for byte in 0..4 {
+        inner.code.swap(168 + byte, 172 + byte);
+    }
+    assert_m17_prototype_rejects(inner, "instruction reorder");
+}
+
+#[test]
+#[ignore = "red witness until the all-shape decoded template gate is activated"]
+fn width_one_audit_rejects_in_cycle_cursor_reset() {
+    let program =
+        build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("M=1 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=1 Count image");
+    let mut inner = valid.inner().clone();
+    replace_test_instruction(
+        &mut inner,
+        |instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::MoveZero64 {
+                    destination: 11,
+                    immediate: 256,
+                    shift: 0
+                }
+            )
+        },
+        0xd280_0005,
+    );
+    reseal_test_image(&mut inner);
+    assert!(matches!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateControlFlow { .. })
+    ));
 }
 
 #[test]
