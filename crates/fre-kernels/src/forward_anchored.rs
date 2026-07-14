@@ -8,7 +8,7 @@
 
 use core::{fmt, mem::size_of};
 
-use memchr::memchr;
+use memchr::{memchr, memrchr};
 
 use crate::Window;
 
@@ -654,8 +654,19 @@ impl ForwardAnchoredPlan {
             if !self.class.contains(first_byte) {
                 return Ok((None, accounting));
             }
-            accounting.prefilter_calls = 1;
-            let Some(relative_candidate) = memchr(self.suffix[0], &searched[1..]) else {
+            let uses_edge_witness = matches!(
+                self.implementation,
+                ClassImplementation::Pair { .. }
+                    | ClassImplementation::Triple { .. }
+                    | ClassImplementation::Quad { .. }
+            );
+            let (relative_candidate, prefilter_calls) = if uses_edge_witness {
+                edge_suffix_witness(self.suffix[0], &searched[1..])?
+            } else {
+                (memchr(self.suffix[0], &searched[1..]), 1)
+            };
+            accounting.prefilter_calls = prefilter_calls;
+            let Some(relative_candidate) = relative_candidate else {
                 return Ok((None, accounting));
             };
             let candidate =
@@ -675,7 +686,7 @@ impl ForwardAnchoredPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "actual prefix examinations",
                 })?;
-            if boundary != candidate {
+            if !uses_edge_witness && boundary != candidate {
                 return Ok((None, accounting));
             }
             boundary
@@ -833,6 +844,51 @@ fn scan_bitset_prefix(bytes: &[u8], class: ByteClass) -> (usize, usize) {
 /// safe scalar source loops, not SIMD claims; retained assembly decides which
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
+const EDGE_WITNESS_BLOCK: usize = 32;
+const EDGE_WITNESS_SPAN: usize = EDGE_WITNESS_BLOCK * 2;
+
+fn edge_suffix_witness(needle: u8, bytes: &[u8]) -> Result<(Option<usize>, usize), SearchError> {
+    if bytes.len() < EDGE_WITNESS_SPAN {
+        return Ok((memchr(needle, bytes), 1));
+    }
+
+    if let Some(candidate) = memchr(needle, &bytes[..EDGE_WITNESS_BLOCK]) {
+        return Ok((Some(candidate), 1));
+    }
+
+    let back_start =
+        bytes
+            .len()
+            .checked_sub(EDGE_WITNESS_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "edge witness back partition",
+            })?;
+    if let Some(relative_candidate) = memrchr(needle, &bytes[back_start..]) {
+        let candidate =
+            back_start
+                .checked_add(relative_candidate)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "edge witness back candidate",
+                })?;
+        return Ok((Some(candidate), 2));
+    }
+
+    let middle = &bytes[EDGE_WITNESS_BLOCK..back_start];
+    if middle.is_empty() {
+        return Ok((None, 2));
+    }
+    let relative_candidate = memchr(needle, middle);
+    let candidate = relative_candidate
+        .map(|relative| {
+            EDGE_WITNESS_BLOCK
+                .checked_add(relative)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "edge witness middle candidate",
+                })
+        })
+        .transpose()?;
+    Ok((candidate, 3))
+}
 
 fn scan_pair_prefix(bytes: &[u8], first: u8, second: u8) -> Result<(usize, usize), SearchError> {
     let mut consumed = 0_usize;
