@@ -515,7 +515,7 @@ fn collect_regular_files(
         let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
         let file_type = entry
             .file_type()
-            .map_err(|error| format!("read file type for {:?}: {error}", entry.path()))?;
+            .map_err(|error| format!("read file type for {}: {error}", entry.path().display()))?;
         let path = entry.path();
         if file_type.is_symlink() {
             return Err(format!(
