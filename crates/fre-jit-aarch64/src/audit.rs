@@ -133,9 +133,7 @@ pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
 
 /// Independently re-decode a whole-haystack aggregate image.
 pub fn audit_aggregate(image: &NativeAggregateImage) -> Result<AuditReport, AuditError> {
-    if image.inner().aggregate_manifest().is_none() {
-        return Err(AuditError::InvalidImageContract);
-    }
+    audit_aggregate_shape(image.inner())?;
     let report = audit_impl(image.inner(), StoreContract::Aggregate)?;
     audit_aggregate_contract(image.inner())?;
     Ok(report)
@@ -341,17 +339,10 @@ fn audit_impl(
     reason = "the aggregate-only decoded contract is intentionally kept as one auditable gate"
 )]
 fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
+    let literal_len = audit_aggregate_shape(image)?;
     let manifest = image
         .aggregate_manifest()
         .ok_or(AuditError::InvalidAggregateManifest)?;
-    let literal_len = usize::try_from(manifest.literal_bytes)
-        .map_err(|_| AuditError::InvalidAggregateManifest)?;
-    if literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
-        || image.rodata.len() != literal_len
-        || image.symbols.len() != 1
-    {
-        return Err(AuditError::InvalidAggregateManifest);
-    }
     let symbol = image.symbols[0];
     if symbol.ir_data_id != 0
         || symbol.offset != 0
@@ -488,6 +479,21 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
     validate_aggregate_definite_initialization(&instructions)?;
     validate_aggregate_reachability(&instructions)?;
     Ok(())
+}
+
+fn audit_aggregate_shape(image: &NativeImage) -> Result<usize, AuditError> {
+    let manifest = image
+        .aggregate_manifest()
+        .ok_or(AuditError::InvalidAggregateManifest)?;
+    let literal_len = usize::try_from(manifest.literal_bytes)
+        .map_err(|_| AuditError::InvalidAggregateManifest)?;
+    if literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+        || image.rodata.len() != literal_len
+        || image.symbols.len() != 1
+    {
+        return Err(AuditError::InvalidAggregateManifest);
+    }
+    Ok(literal_len)
 }
 
 fn instruction_offset(index: usize) -> Result<u32, AuditError> {

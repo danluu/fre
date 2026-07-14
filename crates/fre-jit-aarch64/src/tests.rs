@@ -753,6 +753,22 @@ fn auditor_rejects_result_pointer_clobbers_for_both_abis() {
 }
 
 #[test]
+fn aggregate_audit_preflights_symbol_cardinality() {
+    let program = build_exact_aggregate::<Count>(b"needle", ValidateLimits::default())
+        .expect("aggregate program");
+    let image = emit_exact_aggregate(&program, EmitLimits::default()).expect("aggregate image");
+    let mut inner = image.inner().clone();
+    let mut symbols = inner.symbols.into_vec();
+    symbols.push(symbols[0]);
+    inner.symbols = symbols.into_boxed_slice();
+
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateManifest)
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     clippy::type_complexity,
