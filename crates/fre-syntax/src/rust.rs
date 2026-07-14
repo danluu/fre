@@ -74,6 +74,13 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
     })
 }
 
+fn rebar_options_match_runner_surface(options: &RustOptions) -> bool {
+    let mut exposed = RustOptions::default();
+    exposed.unicode = options.unicode;
+    exposed.case_insensitive = options.case_insensitive;
+    options == &exposed
+}
+
 fn validate_rust_configuration(
     profile: &CompatibilityProfile,
     options: &RustOptions,
@@ -127,6 +134,7 @@ fn validate_rust_configuration(
                 && !*utf8_empty
                 && *build_many_ordered
                 && *thompson_nfa_size_limit == 100 * 1_048_576
+                && rebar_options_match_runner_surface(options)
         }
         (
             RustConstructor::RebarMeta { .. },
@@ -146,13 +154,6 @@ fn validate_rust_configuration(
             profile.clone(),
             ErrorCategory::InvalidConfiguration,
             "this parser only implements the exact regex 1.12.4 / regex-automata 0.4.14 / regex-syntax 0.8.11 / Unicode 16.0 high-level and Rebar profiles",
-        ));
-    }
-    if options.unicode && !options.line_terminator.is_ascii() {
-        return Err(ParseError::new(
-            profile.clone(),
-            ErrorCategory::InvalidConfiguration,
-            "a non-ASCII line terminator is invalid while Unicode mode is enabled",
         ));
     }
     Ok(())

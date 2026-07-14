@@ -139,6 +139,97 @@ fn forged_rebar_admission_stamp_is_rejected() {
 }
 
 #[test]
+fn rebar_profile_rejects_every_runner_fixed_option_override() {
+    type Mutation = fn(&mut RustProfile);
+    let cases: [(&str, &str, Mutation); 8] = [
+        ("multi_line", "a", |profile| {
+            profile.options.multi_line = true
+        }),
+        ("dot_matches_new_line", "a", |profile| {
+            profile.options.dot_matches_new_line = true;
+        }),
+        ("crlf", "a", |profile| profile.options.crlf = true),
+        ("line_terminator", "a", |profile| {
+            profile.options.line_terminator = b'\r';
+        }),
+        ("swap_greed", "a+", |profile| {
+            profile.options.swap_greed = true;
+        }),
+        ("ignore_whitespace", "a b", |profile| {
+            profile.options.ignore_whitespace = true;
+        }),
+        ("octal", "a", |profile| profile.options.octal = true),
+        ("nest_limit", "a", |profile| {
+            profile.options.nest_limit += 1;
+        }),
+    ];
+
+    for (name, pattern, mutate) in cases {
+        let mut profile = RustProfile::rebar_1_12_4();
+        mutate(&mut profile);
+        let error = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustBytes(profile),
+        ))
+        .expect_err(name);
+        assert_eq!(
+            error.category,
+            ErrorCategory::InvalidConfiguration,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn rebar_profile_allows_only_job_options_to_vary() {
+    for (unicode, case_insensitive) in [(false, false), (true, true)] {
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = unicode;
+        profile.options.case_insensitive = case_insensitive;
+        let expected_profile = CompatibilityProfile::RustBytes(profile.clone());
+        let record = parse(ParseRequest::rust("a", expected_profile.clone()))
+            .expect("Rebar job-controlled options must remain configurable");
+
+        assert_eq!(record.key.profile, expected_profile);
+        assert_eq!(
+            record.admission_status,
+            AdmissionStatus::UpstreamOraclePending
+        );
+        let CompatibilityProfile::RustBytes(accepted) = record.key.profile else {
+            panic!("Rebar profile changed syntax family")
+        };
+        assert_eq!(accepted.options.unicode, unicode);
+        assert_eq!(accepted.options.case_insensitive, case_insensitive);
+    }
+}
+
+#[test]
+fn high_level_line_terminator_validation_is_pattern_sensitive() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.options.line_terminator = 0x80;
+    let profile = CompatibilityProfile::RustText(profile);
+
+    parse(ParseRequest::rust("a", profile.clone()))
+        .expect("a literal does not expose a non-ASCII line terminator to Unicode matching");
+    let error = parse(ParseRequest::rust(".", profile))
+        .expect_err("a Unicode dot cannot exclude a non-ASCII byte line terminator");
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
+fn bytes_local_unicode_flags_control_line_terminator_validity() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.options.line_terminator = 0x80;
+    let profile = CompatibilityProfile::RustBytes(profile);
+
+    parse(ParseRequest::rust("(?-u:.)", profile.clone()))
+        .expect("a byte-mode dot can use a non-ASCII line terminator");
+    let error = parse(ParseRequest::rust("(?u:.)", profile))
+        .expect_err("a locally Unicode dot must reject a non-ASCII byte line terminator");
+    assert_eq!(error.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn cache_keys_separate_facade_options_policy_and_safety() {
     let text =
         parse(ParseRequest::rust("abc", CompatibilityProfile::rust_text())).expect("text parses");
@@ -456,8 +547,8 @@ fn error_categories_do_not_depend_on_message_parsing() {
         ".",
         CompatibilityProfile::RustText(invalid),
     ))
-    .expect_err("non-ASCII terminator is invalid in Unicode mode");
-    assert_eq!(config.category, ErrorCategory::InvalidConfiguration);
+    .expect_err("Unicode dot rejects a non-ASCII byte line terminator");
+    assert_eq!(config.category, ErrorCategory::UpstreamRustSyntax);
 
     let unstamped = RustProfile {
         unicode: UnicodeVersion {
