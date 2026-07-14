@@ -1371,6 +1371,10 @@ fn assert_m17_prototype_rejects(mut image: NativeImage, mutation: &str) {
         !m17_count_template_matches(&image),
         "M=17 prototype accepted {mutation}"
     );
+    assert!(
+        audit_aggregate(&NativeAggregateImage::new(image)).is_err(),
+        "production template accepted {mutation}"
+    );
 }
 
 #[test]
@@ -1552,7 +1556,6 @@ fn m17_count_decoded_template_rejects_representative_semantic_mutations() {
 }
 
 #[test]
-#[ignore = "red witness until the all-shape decoded template gate is activated"]
 fn width_one_audit_rejects_in_cycle_cursor_reset() {
     let program =
         build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("M=1 Count program");
@@ -1573,10 +1576,10 @@ fn width_one_audit_rejects_in_cycle_cursor_reset() {
         0xd280_0005,
     );
     reseal_test_image(&mut inner);
-    assert!(matches!(
+    assert_eq!(
         audit_aggregate(&NativeAggregateImage::new(inner)),
-        Err(AuditError::InvalidAggregateControlFlow { .. })
-    ));
+        Err(AuditError::InvalidAggregateTemplate { offset: 64 })
+    );
 }
 
 #[test]

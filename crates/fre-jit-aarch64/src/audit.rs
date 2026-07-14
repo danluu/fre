@@ -85,6 +85,9 @@ pub enum AuditError {
         offset: u32,
     },
     InvalidAggregateStoreContract,
+    InvalidAggregateTemplate {
+        offset: u32,
+    },
     ArtifactIdentityMismatch,
     FeatureMismatch,
     ArithmeticOverflow,
@@ -492,6 +495,7 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
     validate_aggregate_branches(&instructions, &protected, literal_len)?;
     validate_aggregate_definite_initialization(&instructions)?;
     validate_aggregate_reachability(&instructions)?;
+    validate_aggregate_template(image, &instructions, literal_len, manifest.output)?;
     Ok(())
 }
 
@@ -533,6 +537,926 @@ fn audit_aggregate_shape(image: &NativeImage) -> Result<usize, AuditError> {
     Ok(literal_len)
 }
 
+struct AggregateTemplateCursor<'a> {
+    instructions: &'a [DecodedInstruction],
+    position: usize,
+}
+
+impl<'a> AggregateTemplateCursor<'a> {
+    const fn new(instructions: &'a [DecodedInstruction]) -> Self {
+        Self {
+            instructions,
+            position: 0,
+        }
+    }
+
+    fn expect_all<const N: usize>(
+        &mut self,
+        expected: [DecodedInstruction; N],
+    ) -> Result<(), AuditError> {
+        for instruction in expected {
+            if self.instructions.get(self.position) != Some(&instruction) {
+                return Err(AuditError::InvalidAggregateTemplate {
+                    offset: instruction_offset(self.position)?,
+                });
+            }
+            self.position = self
+                .position
+                .checked_add(1)
+                .ok_or(AuditError::ArithmeticOverflow)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), AuditError> {
+        if self.position != self.instructions.len() {
+            return Err(AuditError::InvalidAggregateTemplate {
+                offset: instruction_offset(self.position)?,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_aggregate_template_labels(
+    image: &NativeImage,
+    literal_len: usize,
+    output: AggregateOutput,
+) -> Result<(), AuditError> {
+    const M0_COUNT: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (36, LabelKind::ReturnFound),
+        (48, LabelKind::ReturnNone),
+    ];
+    const M0_SPAN_SUM: &[(u32, LabelKind)] =
+        &[(0, LabelKind::Entry), (8, LabelKind::ReturnFound)];
+    const M1: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (24, LabelKind::Loop),
+        (100, LabelKind::SlowPath),
+        (140, LabelKind::Internal),
+        (148, LabelKind::ReturnFound),
+        (160, LabelKind::ReturnNone),
+    ];
+    const M2: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (44, LabelKind::Loop),
+        (104, LabelKind::Internal),
+        (112, LabelKind::SlowPath),
+        (120, LabelKind::SlowPath),
+        (124, LabelKind::Loop),
+        (192, LabelKind::Internal),
+        (200, LabelKind::ReturnFound),
+        (212, LabelKind::ReturnNone),
+    ];
+    const M3_TO_M15: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (44, LabelKind::Loop),
+        (104, LabelKind::Internal),
+        (112, LabelKind::SlowPath),
+        (120, LabelKind::SlowPath),
+        (124, LabelKind::Loop),
+        (184, LabelKind::Internal),
+        (188, LabelKind::Loop),
+        (220, LabelKind::Internal),
+        (244, LabelKind::Internal),
+        (252, LabelKind::ReturnFound),
+        (264, LabelKind::ReturnNone),
+    ];
+    const M16_TO_M32: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (44, LabelKind::Loop),
+        (104, LabelKind::Internal),
+        (112, LabelKind::SlowPath),
+        (120, LabelKind::SlowPath),
+        (124, LabelKind::Loop),
+        (180, LabelKind::Loop),
+        (232, LabelKind::Internal),
+        (236, LabelKind::Loop),
+        (268, LabelKind::Internal),
+        (292, LabelKind::Internal),
+        (300, LabelKind::ReturnFound),
+        (312, LabelKind::ReturnNone),
+    ];
+
+    let expected = match (output, literal_len) {
+        (AggregateOutput::Count, 0) => M0_COUNT,
+        (AggregateOutput::SpanSum, 0) => M0_SPAN_SUM,
+        (_, 1) => M1,
+        (_, 2) => M2,
+        (_, 3..=15) => M3_TO_M15,
+        (_, 16..=32) => M16_TO_M32,
+        _ => {
+            return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+        }
+    };
+    if image.labels.len() != expected.len() {
+        return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+    }
+    for (actual, &(offset, kind)) in image.labels.iter().zip(expected) {
+        if actual.offset != offset || actual.kind != kind {
+            return Err(AuditError::InvalidAggregateTemplate {
+                offset: actual.offset,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the v1 decoded aggregate templates deliberately expose every opcode and operand without emitter dependencies"
+)]
+fn validate_aggregate_template(
+    image: &NativeImage,
+    instructions: &[DecodedInstruction],
+    literal_len: usize,
+    output: AggregateOutput,
+) -> Result<(), AuditError> {
+    use DecodedInstruction::{
+        AddAcrossBytes16, AddImmediate64, AddRegister64, Address, AndBytes16, AndLowBits64,
+        Branch, BranchCondition, CompareBranchZero64, CompareEqualBytes16, CompareImmediate32,
+        CompareImmediate64, CompareRegister32, CompareRegister64, DuplicateByte16, LoadByte,
+        LoadByteRegister, LoadVector128, MoveKeep64, MoveRegister64, MoveVectorByteTo32,
+        MoveZero64, Return, Store64, SubtractImmediate64, SubtractRegister64,
+        UnsignedMaxBytes16, UnsignedMinBytes16,
+    };
+
+    validate_aggregate_template_labels(image, literal_len, output)?;
+    let mut cursor = AggregateTemplateCursor::new(instructions);
+    if literal_len == 0 {
+        match output {
+            AggregateOutput::Count => cursor.expect_all([
+                MoveZero64 {
+                    destination: 13,
+                    immediate: 0,
+                    shift: 0,
+                },
+                MoveZero64 {
+                    destination: 10,
+                    immediate: u16::MAX,
+                    shift: 0,
+                },
+                MoveKeep64 {
+                    destination: 10,
+                    immediate: u16::MAX,
+                    shift: 16,
+                },
+                MoveKeep64 {
+                    destination: 10,
+                    immediate: u16::MAX,
+                    shift: 32,
+                },
+                MoveKeep64 {
+                    destination: 10,
+                    immediate: u16::MAX,
+                    shift: 48,
+                },
+                CompareRegister64 { left: 1, right: 10 },
+                BranchCondition {
+                    condition: crate::Condition::Equal,
+                    displacement: 24,
+                },
+                AddImmediate64 {
+                    destination: 13,
+                    source: 1,
+                    immediate: 1,
+                },
+                Branch { displacement: 4 },
+                Store64 {
+                    source: 13,
+                    base: 2,
+                    offset: 0,
+                },
+                MoveZero64 {
+                    destination: 0,
+                    immediate: 0,
+                    shift: 0,
+                },
+                Return,
+                MoveZero64 {
+                    destination: 0,
+                    immediate: 1,
+                    shift: 0,
+                },
+                Return,
+            ])?,
+            AggregateOutput::SpanSum => cursor.expect_all([
+                MoveZero64 {
+                    destination: 13,
+                    immediate: 0,
+                    shift: 0,
+                },
+                Branch { displacement: 4 },
+                Store64 {
+                    source: 13,
+                    base: 2,
+                    offset: 0,
+                },
+                MoveZero64 {
+                    destination: 0,
+                    immediate: 0,
+                    shift: 0,
+                },
+                Return,
+            ])?,
+        }
+        return cursor.finish();
+    }
+
+    let width = u16::try_from(literal_len).map_err(|_| AuditError::InvalidAggregateManifest)?;
+    if literal_len == 1 {
+        cursor.expect_all([
+            MoveZero64 {
+                destination: 13,
+                immediate: 0,
+                shift: 0,
+            },
+            Address {
+                destination: 8,
+                displacement: 172,
+            },
+            MoveZero64 {
+                destination: 12,
+                immediate: 1,
+                shift: 0,
+            },
+            LoadByte {
+                destination: 11,
+                base: 8,
+                offset: 0,
+            },
+            DuplicateByte16 {
+                destination: 1,
+                source: 11,
+            },
+            MoveZero64 {
+                destination: 5,
+                immediate: 0,
+                shift: 0,
+            },
+            CompareRegister64 { left: 5, right: 1 },
+            BranchCondition {
+                condition: crate::Condition::CarrySet,
+                displacement: 120,
+            },
+            SubtractRegister64 {
+                destination: 10,
+                left: 1,
+                right: 5,
+            },
+            CompareImmediate64 {
+                register: 10,
+                immediate: 16,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 60,
+            },
+            AddRegister64 {
+                destination: 15,
+                left: 0,
+                right: 5,
+            },
+            LoadVector128 {
+                destination: 0,
+                base: 15,
+                offset: 0,
+            },
+            CompareEqualBytes16 {
+                destination: 0,
+                left: 0,
+                right: 1,
+            },
+            AddAcrossBytes16 {
+                destination: 0,
+                source: 0,
+            },
+            MoveVectorByteTo32 {
+                destination: 10,
+                source: 0,
+            },
+            MoveZero64 {
+                destination: 11,
+                immediate: 256,
+                shift: 0,
+            },
+            SubtractRegister64 {
+                destination: 10,
+                left: 11,
+                right: 10,
+            },
+            AndLowBits64 {
+                destination: 10,
+                source: 10,
+                bits: 8,
+            },
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 10,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 72,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 16,
+            },
+            Branch { displacement: -72 },
+            CompareRegister64 { left: 5, right: 1 },
+            BranchCondition {
+                condition: crate::Condition::CarrySet,
+                displacement: 44,
+            },
+            LoadByteRegister {
+                destination: 10,
+                base: 0,
+                index: 5,
+            },
+            LoadByte {
+                destination: 11,
+                base: 8,
+                offset: 0,
+            },
+            CompareRegister32 {
+                left: 10,
+                right: 11,
+            },
+            BranchCondition {
+                condition: crate::Condition::NotEqual,
+                displacement: 20,
+            },
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: 1,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 24,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 1,
+            },
+            Branch { displacement: -44 },
+            Store64 {
+                source: 13,
+                base: 2,
+                offset: 0,
+            },
+            MoveZero64 {
+                destination: 0,
+                immediate: 0,
+                shift: 0,
+            },
+            Return,
+            MoveZero64 {
+                destination: 0,
+                immediate: 1,
+                shift: 0,
+            },
+            Return,
+        ])?;
+        return cursor.finish();
+    }
+
+    let last = width
+        .checked_sub(1)
+        .ok_or(AuditError::InvalidAggregateManifest)?;
+    let (address_displacement, initial_fault_displacement, vector_fault_displacement) =
+        match literal_len {
+            2 => (220, 184, 152),
+            3..=15 => (268, 236, 204),
+            16..=32 => (316, 284, 252),
+            _ => return Err(AuditError::InvalidAggregateTemplate { offset: 0 }),
+        };
+    let (first_miss_displacement, last_miss_displacement) = match literal_len {
+        2 => (48, 28),
+        3..=15 => (100, 80),
+        16..=32 => (148, 128),
+        _ => return Err(AuditError::InvalidAggregateTemplate { offset: 0 }),
+    };
+    cursor.expect_all([
+        MoveZero64 {
+            destination: 13,
+            immediate: 0,
+            shift: 0,
+        },
+        Address {
+            destination: 8,
+            displacement: address_displacement,
+        },
+        MoveZero64 {
+            destination: 12,
+            immediate: width,
+            shift: 0,
+        },
+        CompareRegister64 { left: 1, right: 12 },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: initial_fault_displacement,
+        },
+        SubtractRegister64 {
+            destination: 6,
+            left: 1,
+            right: 12,
+        },
+        MoveZero64 {
+            destination: 5,
+            immediate: 0,
+            shift: 0,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        DuplicateByte16 {
+            destination: 1,
+            source: 11,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: last,
+        },
+        DuplicateByte16 {
+            destination: 3,
+            source: 11,
+        },
+        CompareRegister64 { left: 5, right: 6 },
+        BranchCondition {
+            condition: crate::Condition::Higher,
+            displacement: vector_fault_displacement,
+        },
+        SubtractRegister64 {
+            destination: 10,
+            left: 6,
+            right: 5,
+        },
+        CompareImmediate64 {
+            register: 10,
+            immediate: 15,
+        },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 60,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        LoadVector128 {
+            destination: 0,
+            base: 15,
+            offset: 0,
+        },
+        CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: 1,
+        },
+        AddImmediate64 {
+            destination: 10,
+            source: 15,
+            immediate: last,
+        },
+        LoadVector128 {
+            destination: 2,
+            base: 10,
+            offset: 0,
+        },
+        CompareEqualBytes16 {
+            destination: 2,
+            left: 2,
+            right: 3,
+        },
+        AndBytes16 {
+            destination: 0,
+            left: 0,
+            right: 2,
+        },
+        UnsignedMaxBytes16 {
+            destination: 0,
+            source: 0,
+        },
+        MoveVectorByteTo32 {
+            destination: 10,
+            source: 0,
+        },
+        CompareBranchZero64 {
+            register: 10,
+            nonzero: true,
+            displacement: 12,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 16,
+        },
+        Branch { displacement: -64 },
+        AddImmediate64 {
+            destination: 7,
+            source: 5,
+            immediate: 15,
+        },
+        Branch { displacement: 8 },
+        MoveRegister64 {
+            destination: 7,
+            source: 6,
+        },
+        CompareRegister64 { left: 5, right: 7 },
+        BranchCondition {
+            condition: crate::Condition::Higher,
+            displacement: -84,
+        },
+        LoadByteRegister {
+            destination: 10,
+            base: 0,
+            index: 5,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: crate::Condition::NotEqual,
+            displacement: first_miss_displacement,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        LoadByte {
+            destination: 10,
+            base: 15,
+            offset: last,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: last,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: crate::Condition::NotEqual,
+            displacement: last_miss_displacement,
+        },
+    ])?;
+
+    let reducer_delta = match output {
+        AggregateOutput::Count => 1,
+        AggregateOutput::SpanSum => width,
+    };
+    match literal_len {
+        2 => cursor.expect_all([
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: reducer_delta,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 32,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: width,
+            },
+            Branch { displacement: -64 },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 1,
+            },
+            Branch { displacement: -72 },
+            Store64 {
+                source: 13,
+                base: 2,
+                offset: 0,
+            },
+            MoveZero64 {
+                destination: 0,
+                immediate: 0,
+                shift: 0,
+            },
+            Return,
+            MoveZero64 {
+                destination: 0,
+                immediate: 1,
+                shift: 0,
+            },
+            Return,
+        ])?,
+        3..=15 => cursor.expect_all([
+            MoveRegister64 {
+                destination: 15,
+                source: 15,
+            },
+            MoveRegister64 {
+                destination: 16,
+                source: 8,
+            },
+            MoveZero64 {
+                destination: 17,
+                immediate: width,
+                shift: 0,
+            },
+            Branch { displacement: 4 },
+            CompareBranchZero64 {
+                register: 17,
+                nonzero: false,
+                displacement: 36,
+            },
+            LoadByte {
+                destination: 10,
+                base: 15,
+                offset: 0,
+            },
+            LoadByte {
+                destination: 11,
+                base: 16,
+                offset: 0,
+            },
+            CompareRegister32 {
+                left: 10,
+                right: 11,
+            },
+            BranchCondition {
+                condition: crate::Condition::NotEqual,
+                displacement: 44,
+            },
+            AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: 1,
+            },
+            AddImmediate64 {
+                destination: 16,
+                source: 16,
+                immediate: 1,
+            },
+            SubtractImmediate64 {
+                destination: 17,
+                source: 17,
+                immediate: 1,
+            },
+            CompareBranchZero64 {
+                register: 17,
+                nonzero: true,
+                displacement: -28,
+            },
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: reducer_delta,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 32,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: width,
+            },
+            Branch { displacement: -116 },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 1,
+            },
+            Branch { displacement: -124 },
+            Store64 {
+                source: 13,
+                base: 2,
+                offset: 0,
+            },
+            MoveZero64 {
+                destination: 0,
+                immediate: 0,
+                shift: 0,
+            },
+            Return,
+            MoveZero64 {
+                destination: 0,
+                immediate: 1,
+                shift: 0,
+            },
+            Return,
+        ])?,
+        16..=32 => cursor.expect_all([
+            MoveRegister64 {
+                destination: 15,
+                source: 15,
+            },
+            MoveRegister64 {
+                destination: 16,
+                source: 8,
+            },
+            MoveZero64 {
+                destination: 17,
+                immediate: width,
+                shift: 0,
+            },
+            CompareImmediate64 {
+                register: 17,
+                immediate: 16,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 48,
+            },
+            LoadVector128 {
+                destination: 4,
+                base: 15,
+                offset: 0,
+            },
+            LoadVector128 {
+                destination: 5,
+                base: 16,
+                offset: 0,
+            },
+            CompareEqualBytes16 {
+                destination: 4,
+                left: 4,
+                right: 5,
+            },
+            UnsignedMinBytes16 {
+                destination: 4,
+                source: 4,
+            },
+            MoveVectorByteTo32 {
+                destination: 10,
+                source: 4,
+            },
+            CompareImmediate32 {
+                register: 10,
+                immediate: 255,
+            },
+            BranchCondition {
+                condition: crate::Condition::NotEqual,
+                displacement: 80,
+            },
+            AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: 16,
+            },
+            AddImmediate64 {
+                destination: 16,
+                source: 16,
+                immediate: 16,
+            },
+            SubtractImmediate64 {
+                destination: 17,
+                source: 17,
+                immediate: 16,
+            },
+            Branch { displacement: -48 },
+            CompareBranchZero64 {
+                register: 17,
+                nonzero: false,
+                displacement: 36,
+            },
+            LoadByte {
+                destination: 10,
+                base: 15,
+                offset: 0,
+            },
+            LoadByte {
+                destination: 11,
+                base: 16,
+                offset: 0,
+            },
+            CompareRegister32 {
+                left: 10,
+                right: 11,
+            },
+            BranchCondition {
+                condition: crate::Condition::NotEqual,
+                displacement: 44,
+            },
+            AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: 1,
+            },
+            AddImmediate64 {
+                destination: 16,
+                source: 16,
+                immediate: 1,
+            },
+            SubtractImmediate64 {
+                destination: 17,
+                source: 17,
+                immediate: 1,
+            },
+            CompareBranchZero64 {
+                register: 17,
+                nonzero: true,
+                displacement: -28,
+            },
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: reducer_delta,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 32,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: width,
+            },
+            Branch { displacement: -164 },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 1,
+            },
+            Branch { displacement: -172 },
+            Store64 {
+                source: 13,
+                base: 2,
+                offset: 0,
+            },
+            MoveZero64 {
+                destination: 0,
+                immediate: 0,
+                shift: 0,
+            },
+            Return,
+            MoveZero64 {
+                destination: 0,
+                immediate: 1,
+                shift: 0,
+            },
+            Return,
+        ])?,
+        _ => return Err(AuditError::InvalidAggregateTemplate { offset: 0 }),
+    }
+    cursor.finish()
+}
+
 fn instruction_offset(index: usize) -> Result<u32, AuditError> {
     u32::try_from(index)
         .ok()
@@ -554,7 +1478,7 @@ fn instruction_after(
     clippy::match_same_arms,
     reason = "operand arities remain grouped by decoded ISA form for security review"
 )]
-fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> Option<u8> {
+pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> Option<u8> {
     fn forbidden(registers: &[u8]) -> Option<u8> {
         registers.iter().copied().find(|&register| register >= 18)
     }
