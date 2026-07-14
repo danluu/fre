@@ -13,7 +13,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.forward.v1";
+pub const PLAN_ID: &str = "anchored-class-suffix.edge-witness-disjoint-32.v1";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -225,6 +225,7 @@ pub struct SearchAccounting {
     pub examined_bytes_upper_bound: usize,
     pub work_upper_bound: u64,
     pub scratch_bytes: usize,
+    /// Native prefilter calls actually issued by this search.
     pub prefilter_calls: usize,
     pub prefix_bytes_examined: usize,
     pub suffix_confirmation_attempted: bool,
@@ -1146,7 +1147,7 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
 mod tests {
     use super::{
         Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
-        SearchError, SearchLimits,
+        SearchError, SearchLimits, edge_suffix_witness,
     };
     use crate::Window;
 
@@ -1216,6 +1217,10 @@ mod tests {
         );
 
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
+        assert_eq!(
+            pair.plan_id(),
+            "anchored-class-suffix.edge-witness-disjoint-32.v1"
+        );
         assert_eq!(
             pair.implementation(),
             ClassImplementation::Pair {
@@ -1575,7 +1580,7 @@ mod tests {
                 &[0x00, 0x02, 0x80, 0xFF],
             ),
         ];
-        let suffix = [0x7F, 0x11, 0x7F];
+        let suffix = [0x7F, 0x11, 0x22];
         for (class, members) in cases {
             let plan = plan(class, &suffix, false);
             for candidate in [1_usize, 4, 31, 32, 33, 63, 64, 65] {
@@ -1586,10 +1591,14 @@ mod tests {
 
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, Some((0, haystack.len())));
-                assert_eq!(
-                    accounting.prefilter_calls,
-                    usize::from(haystack.len() >= 32)
-                );
+                let expected_prefilter_calls = if haystack.len() < 32 {
+                    0
+                } else if haystack.len() < 65 {
+                    1
+                } else {
+                    2
+                };
+                assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                 assert!(accounting.suffix_confirmation_attempted);
                 assert_eq!(
                     accounting.prefix_bytes_examined,
@@ -1651,11 +1660,11 @@ mod tests {
                 &[0x00, 0x02, 0x80, 0xFF],
             ),
         ];
-        let suffix = [0x7F, 0x11, 0x7F];
+        let suffix = [0x7F, 0x11, 0x22];
         for (class, members) in cases {
             let plan = plan(class, &suffix, false);
 
-            for length in [31_usize, 32, 33, 63, 64, 65] {
+            for length in [31_usize, 32, 33, 63, 64, 65, 66] {
                 let haystack: Vec<u8> = (0..length)
                     .map(|index| members[index % members.len()])
                     .collect();
@@ -1666,7 +1675,12 @@ mod tests {
                     assert_eq!(accounting.prefilter_calls, 0);
                     assert_eq!(accounting.prefix_bytes_examined, length);
                 } else {
-                    assert_eq!(accounting.prefilter_calls, 1);
+                    let expected_prefilter_calls = match length {
+                        32..=64 => 1,
+                        65 => 2,
+                        _ => 3,
+                    };
+                    assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                 }
             }
@@ -1681,8 +1695,9 @@ mod tests {
                 haystack.extend_from_slice(&suffix);
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, None);
-                assert_eq!(accounting.prefilter_calls, 1);
-                assert!(!accounting.suffix_confirmation_attempted);
+                let expected_prefilter_calls = if haystack.len() < 65 { 1 } else { 2 };
+                assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
+                assert!(accounting.suffix_confirmation_attempted);
                 assert!(accounting.prefix_bytes_examined > wrong_outsider);
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             }
@@ -1716,6 +1731,140 @@ mod tests {
             assert_eq!(
                 plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
                 Some((0, first_candidate + suffix.len()))
+            );
+        }
+    }
+
+    #[test]
+    fn edge_witness_partitions_are_disjoint_and_cover_boundaries() {
+        for (length, expected_calls) in [(63_usize, 1_usize), (64, 2), (65, 3)] {
+            let bytes = vec![0x00; length];
+            assert_eq!(
+                edge_suffix_witness(0x7F, &bytes).unwrap(),
+                (None, expected_calls)
+            );
+        }
+
+        for (candidate, expected_calls) in [
+            (0_usize, 1_usize),
+            (31, 1),
+            (32, 3),
+            (66, 3),
+            (67, 2),
+            (98, 2),
+        ] {
+            let mut bytes = vec![0x00; 99];
+            bytes[candidate] = 0x7F;
+            assert_eq!(
+                edge_suffix_witness(0x7F, &bytes).unwrap(),
+                (Some(candidate), expected_calls)
+            );
+        }
+
+        let mut middle_and_back = vec![0x00; 99];
+        middle_and_back[32] = 0x7F;
+        middle_and_back[67] = 0x7F;
+        middle_and_back[98] = 0x7F;
+        assert_eq!(
+            edge_suffix_witness(0x7F, &middle_and_back).unwrap(),
+            (Some(98), 2)
+        );
+    }
+
+    #[test]
+    fn edge_witness_plan_preserves_partition_boundary_semantics() {
+        let suffix = [0x7F, 0x11, 0x22];
+        for class in [
+            ByteClass::from_bytes(&[0x00, 0x80]),
+            ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+        ] {
+            let plan = plan(class, &suffix, false);
+            for (candidate, expected_calls) in [
+                (1_usize, 1_usize),
+                (32, 1),
+                (33, 3),
+                (67, 3),
+                (68, 2),
+                (97, 2),
+            ] {
+                let mut haystack = vec![0x00; 100];
+                haystack[candidate..candidate + suffix.len()].copy_from_slice(&suffix);
+                let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+                assert_eq!(span, Some((0, candidate + suffix.len())));
+                assert_eq!(accounting.prefilter_calls, expected_calls);
+                assert_eq!(accounting.prefix_bytes_examined, candidate + 1);
+                assert!(accounting.suffix_confirmation_attempted);
+            }
+        }
+    }
+
+    #[test]
+    fn edge_witness_confirms_the_returned_first_outsider() {
+        let suffix = [0x7F, 0x11, 0x22];
+        for class in [
+            ByteClass::from_bytes(&[0x00, 0x80]),
+            ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+        ] {
+            let plan = plan(class, &suffix, false);
+
+            let mut earlier_valid = vec![0x00; 100];
+            earlier_valid[40..43].copy_from_slice(&suffix);
+            earlier_valid[90..93].copy_from_slice(&suffix);
+            let (span, accounting) = plan
+                .find(&earlier_valid, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(span, Some((0, 43)));
+            assert_eq!(accounting.prefilter_calls, 2);
+            assert!(accounting.suffix_confirmation_attempted);
+
+            let mut earlier_wrong = vec![0x00; 100];
+            earlier_wrong[40] = 0x40;
+            earlier_wrong[90..93].copy_from_slice(&suffix);
+            let (span, accounting) = plan
+                .find(&earlier_wrong, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(span, None);
+            assert_eq!(accounting.prefilter_calls, 2);
+            assert!(accounting.suffix_confirmation_attempted);
+
+            let mut earlier_mismatching_candidate = vec![0x00; 100];
+            earlier_mismatching_candidate[40] = suffix[0];
+            earlier_mismatching_candidate[41] = 0x40;
+            earlier_mismatching_candidate[90..93].copy_from_slice(&suffix);
+            assert_eq!(
+                plan.find(&earlier_mismatching_candidate, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_edge_regions_use_one_forward_prefilter() {
+        let suffix = [0x7F, 0x11, 0x22];
+        for class in [
+            ByteClass::from_bytes(&[0x00, 0x80]),
+            ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+        ] {
+            let plan = plan(class, &suffix, false);
+            let mut haystack = vec![0x00; 64];
+            haystack[10] = suffix[0];
+            haystack[11] = 0x40;
+            haystack[50..53].copy_from_slice(&suffix);
+            let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, None);
+            assert_eq!(accounting.prefilter_calls, 1);
+            assert!(accounting.suffix_confirmation_attempted);
+
+            haystack[11] = suffix[1];
+            haystack[12] = suffix[2];
+            assert_eq!(
+                plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+                Some((0, 13))
             );
         }
     }
@@ -1826,15 +1975,18 @@ mod tests {
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, Some((0, haystack.len())));
                 assert_eq!(accounting.prefix_bytes_examined, candidate + 1);
+                assert_eq!(
+                    accounting.prefilter_calls,
+                    usize::from(haystack.len() >= 32)
+                );
             }
 
             let absent: Vec<u8> = (0..65)
                 .map(|index| members[index % members.len()])
                 .collect();
-            assert_eq!(
-                plan.find(&absent, SearchLimits::unlimited()).unwrap().0,
-                None
-            );
+            let (span, accounting) = plan.find(&absent, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, None);
+            assert_eq!(accounting.prefilter_calls, 1);
 
             let mut earlier_wrong: Vec<u8> = (0..64)
                 .map(|index| members[index % members.len()])
@@ -1845,6 +1997,7 @@ mod tests {
                 .find(&earlier_wrong, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(span, None);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert!(!accounting.suffix_confirmation_attempted);
         }
     }
