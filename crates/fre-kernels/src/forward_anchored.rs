@@ -13,7 +13,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32.v1";
+pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -863,6 +863,11 @@ const EDGE_WITNESS_DISJOINT: usize = EDGE_WITNESS_FRONT + EDGE_WITNESS_BACK;
 /// fixed eight-byte front with unrolled scalar comparisons, a disjoint fixed
 /// 32-byte back in reverse, and the untouched middle. The returned call count
 /// includes only native `memchr`/`memrchr` calls, not scalar comparisons.
+#[allow(
+    clippy::inline_always,
+    reason = "release linked AArch64 code otherwise retains this helper on the near-front route"
+)]
+#[inline(always)]
 fn asymmetric_suffix_witness(
     needle: u8,
     bytes: &[u8],
@@ -1256,7 +1261,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.asymmetric-scalar8-reverse32.v1"
+            "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1"
         );
         assert_eq!(
             pair.implementation(),
