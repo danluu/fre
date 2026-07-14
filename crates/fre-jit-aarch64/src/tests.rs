@@ -1583,22 +1583,99 @@ fn width_one_audit_rejects_in_cycle_cursor_reset() {
 }
 
 #[test]
-fn search_audit_rejects_explicit_sp_operand() {
+fn aggregate_template_rejects_coherent_structural_and_metadata_mutations() {
+    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
+        .expect("M=17 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+
+    let mut inner = valid.inner().clone();
+    let mut code = inner.code.into_vec();
+    code.extend_from_slice(&0xd65f_03c0_u32.to_le_bytes());
+    inner.code = code.into_boxed_slice();
+    inner.stats.code_bytes = 324;
+    inner.layout.rodata_from_code_start = 336;
+    inner.layout.total_mapped_bytes = 353;
+    let address = crate::decode::canonical_word(DecodedInstruction::Address {
+        destination: 8,
+        displacement: 332,
+    })
+    .expect("canonical shifted ADR");
+    inner.code[4..8].copy_from_slice(&address.to_le_bytes());
+    inner.relocations[0].resolved_word = address;
+    reseal_test_image(&mut inner);
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateManifest),
+        "coherent unreachable tail must fail the exact early envelope"
+    );
+
+    let mut inner = valid.inner().clone();
+    let mut code = inner.code.into_vec();
+    code.truncate(316);
+    inner.code = code.into_boxed_slice();
+    inner.stats.code_bytes = 316;
+    reseal_test_image(&mut inner);
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateManifest),
+        "omitted final instruction must fail the exact early envelope"
+    );
+
+    let mut inner = valid.inner().clone();
+    let mut labels = inner.labels.into_vec();
+    let extra = *labels.last().expect("canonical labels");
+    labels.push(extra);
+    inner.labels = labels.into_boxed_slice();
+    inner.stats.labels = 14;
+    reseal_test_image(&mut inner);
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateManifest),
+        "extra label must fail the exact early envelope"
+    );
+
+    let mut inner = valid.inner().clone();
+    let branch = crate::decode::canonical_word(DecodedInstruction::Branch { displacement: -4 })
+        .expect("canonical alternate branch");
+    inner.code[296..300].copy_from_slice(&branch.to_le_bytes());
+    let relocation = inner
+        .relocations
+        .iter_mut()
+        .find(|relocation| relocation.code_offset == 296)
+        .expect("canonical final backedge relocation");
+    relocation.target = RelocationTarget::CodeOffset(292);
+    relocation.resolved_word = branch;
+    reseal_test_image(&mut inner);
+    assert!(
+        audit_aggregate(&NativeAggregateImage::new(inner)).is_err(),
+        "coherent alternate relocation must fail"
+    );
+}
+
+#[test]
+fn search_audit_rejects_explicit_x18_x30_and_sp_operands() {
     let program =
         build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
             .expect("search program");
-    let mut image = emit(&program, EmitLimits::default()).expect("search image");
-    // The exact RET encoding still has its implicit x30 use; this explicit
-    // `add sp, sp, #16` at entry must be rejected by the common operand visitor.
-    image.code[0..4].copy_from_slice(&0x9100_43ff_u32.to_le_bytes());
-    image.artifact_identity = image.compute_artifact_identity().expect("bounded identity");
-    assert_eq!(
-        audit(&image),
-        Err(AuditError::ForbiddenAggregateRegister {
-            offset: 0,
-            register: 31,
-        })
-    );
+    let valid = emit(&program, EmitLimits::default()).expect("search image");
+    // The exact RET encoding still has its implicit x30 use. These are all
+    // explicit entry operands, including the concrete no-match SP mutation.
+    for (word, register) in [
+        (0xaa00_03f2_u32, 18_u8),
+        (0xaa00_03fe_u32, 30_u8),
+        (0x9100_43ff_u32, 31_u8),
+    ] {
+        let mut image = valid.clone();
+        image.code[0..4].copy_from_slice(&word.to_le_bytes());
+        reseal_test_image(&mut image);
+        assert_eq!(
+            audit(&image),
+            Err(AuditError::ForbiddenAggregateRegister {
+                offset: 0,
+                register,
+            })
+        );
+    }
 }
 
 #[test]
@@ -2202,6 +2279,245 @@ fn written_gpr_policy_covers_every_admitted_instruction_form() {
         non_writers
             .into_iter()
             .all(|instruction| instruction.written_gpr().is_none())
+    );
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "each decoded GPR field is instantiated separately at the common audit boundary"
+)]
+fn every_explicit_gpr_role(register: u8) -> Vec<DecodedInstruction> {
+    vec![
+        DecodedInstruction::MoveRegister64 {
+            destination: register,
+            source: 1,
+        },
+        DecodedInstruction::MoveRegister64 {
+            destination: 1,
+            source: register,
+        },
+        DecodedInstruction::MoveZero64 {
+            destination: register,
+            immediate: 0,
+            shift: 0,
+        },
+        DecodedInstruction::MoveKeep64 {
+            destination: register,
+            immediate: 0,
+            shift: 16,
+        },
+        DecodedInstruction::CompareImmediate64 {
+            register,
+            immediate: 0,
+        },
+        DecodedInstruction::CompareImmediate32 {
+            register,
+            immediate: 0,
+        },
+        DecodedInstruction::MoveVectorByteTo32 {
+            destination: register,
+            source: 0,
+        },
+        DecodedInstruction::Address {
+            destination: register,
+            displacement: 0,
+        },
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: false,
+            displacement: 0,
+        },
+        DecodedInstruction::CompareRegister64 {
+            left: register,
+            right: 1,
+        },
+        DecodedInstruction::CompareRegister64 {
+            left: 1,
+            right: register,
+        },
+        DecodedInstruction::CompareRegister32 {
+            left: register,
+            right: 1,
+        },
+        DecodedInstruction::CompareRegister32 {
+            left: 1,
+            right: register,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: register,
+            left: 1,
+            right: 2,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: 1,
+            left: register,
+            right: 2,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: 1,
+            left: 2,
+            right: register,
+        },
+        DecodedInstruction::SubtractRegister64 {
+            destination: register,
+            left: 1,
+            right: 2,
+        },
+        DecodedInstruction::SubtractRegister64 {
+            destination: 1,
+            left: register,
+            right: 2,
+        },
+        DecodedInstruction::SubtractRegister64 {
+            destination: 1,
+            left: 2,
+            right: register,
+        },
+        DecodedInstruction::AddImmediate64 {
+            destination: register,
+            source: 1,
+            immediate: 0,
+        },
+        DecodedInstruction::AddImmediate64 {
+            destination: 1,
+            source: register,
+            immediate: 0,
+        },
+        DecodedInstruction::SubtractImmediate64 {
+            destination: register,
+            source: 1,
+            immediate: 0,
+        },
+        DecodedInstruction::SubtractImmediate64 {
+            destination: 1,
+            source: register,
+            immediate: 0,
+        },
+        DecodedInstruction::AndLowBits64 {
+            destination: register,
+            source: 1,
+            bits: 8,
+        },
+        DecodedInstruction::AndLowBits64 {
+            destination: 1,
+            source: register,
+            bits: 8,
+        },
+        DecodedInstruction::LogicalShiftRightImmediate64 {
+            destination: register,
+            source: 1,
+            shift: 1,
+        },
+        DecodedInstruction::LogicalShiftRightImmediate64 {
+            destination: 1,
+            source: register,
+            shift: 1,
+        },
+        DecodedInstruction::LogicalShiftLeftImmediate64 {
+            destination: register,
+            source: 1,
+            shift: 1,
+        },
+        DecodedInstruction::LogicalShiftLeftImmediate64 {
+            destination: 1,
+            source: register,
+            shift: 1,
+        },
+        DecodedInstruction::LoadByte {
+            destination: register,
+            base: 1,
+            offset: 0,
+        },
+        DecodedInstruction::LoadByte {
+            destination: 1,
+            base: register,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 0,
+            base: register,
+            offset: 0,
+        },
+        DecodedInstruction::LoadByteRegister {
+            destination: register,
+            base: 1,
+            index: 2,
+        },
+        DecodedInstruction::LoadByteRegister {
+            destination: 1,
+            base: register,
+            index: 2,
+        },
+        DecodedInstruction::LoadByteRegister {
+            destination: 1,
+            base: 2,
+            index: register,
+        },
+        DecodedInstruction::Load64RegisterScaled {
+            destination: register,
+            base: 1,
+            index: 2,
+        },
+        DecodedInstruction::Load64RegisterScaled {
+            destination: 1,
+            base: register,
+            index: 2,
+        },
+        DecodedInstruction::Load64RegisterScaled {
+            destination: 1,
+            base: 2,
+            index: register,
+        },
+        DecodedInstruction::Store64 {
+            source: register,
+            base: 1,
+            offset: 0,
+        },
+        DecodedInstruction::Store64 {
+            source: 1,
+            base: register,
+            offset: 0,
+        },
+        DecodedInstruction::DuplicateByte16 {
+            destination: 0,
+            source: register,
+        },
+        DecodedInstruction::LogicalShiftRightVariable64 {
+            destination: register,
+            source: 1,
+            shift: 2,
+        },
+        DecodedInstruction::LogicalShiftRightVariable64 {
+            destination: 1,
+            source: register,
+            shift: 2,
+        },
+        DecodedInstruction::LogicalShiftRightVariable64 {
+            destination: 1,
+            source: 2,
+            shift: register,
+        },
+    ]
+}
+
+#[test]
+fn explicit_gpr_visitor_covers_x18_x30_and_register_31_in_every_role() {
+    for forbidden in [18_u8, 30, 31] {
+        for instruction in every_explicit_gpr_role(forbidden) {
+            assert_eq!(
+                crate::audit::first_forbidden_explicit_gpr(instruction),
+                Some(forbidden),
+                "missed explicit register {forbidden} in {instruction:?}"
+            );
+        }
+    }
+    for instruction in every_explicit_gpr_role(17) {
+        assert_eq!(crate::audit::first_forbidden_explicit_gpr(instruction), None);
+    }
+    assert_eq!(
+        crate::audit::first_forbidden_explicit_gpr(DecodedInstruction::Return),
+        None,
+        "RET's implicit x30 is permitted"
     );
 }
 
