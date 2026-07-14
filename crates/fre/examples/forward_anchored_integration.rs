@@ -171,6 +171,35 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
             pattern: r"\A[aceg]+Z".into(),
             haystack: make_prefix(b"aceg", requested_size),
         },
+        "bitset-suffix-near-front" => {
+            let size = requested_size.max(5);
+            let mut haystack = make_prefix(b"aceg", size);
+            haystack[4] = b'Z';
+            Fixture {
+                pattern: r"\A[aceg]+Z".into(),
+                haystack,
+            }
+        }
+        "bitset-early-outsider" => {
+            let size = requested_size.max(3);
+            let mut haystack = make_prefix(b"aceg", size);
+            haystack[1] = b'!';
+            haystack[size - 1] = b'Z';
+            Fixture {
+                pattern: r"\A[aceg]+Z".into(),
+                haystack,
+            }
+        }
+        "triple-generalization" => {
+            let size = requested_size.max(2);
+            let prefix = size.checked_sub(1).ok_or("triple prefix underflow")?;
+            let mut haystack = make_prefix(b"ace", prefix);
+            haystack.push(b'Z');
+            Fixture {
+                pattern: r"\A[ace]+Z".into(),
+                haystack,
+            }
+        }
         "five-member-generalization" => {
             let size = requested_size.max(2);
             let prefix = size.checked_sub(1).ok_or("five-member prefix underflow")?;
