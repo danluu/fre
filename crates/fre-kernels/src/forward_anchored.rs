@@ -1522,7 +1522,7 @@ mod tests {
         let suffix = [0x7F, 0x11, 0x7F];
         for (class, members) in cases {
             let plan = plan(class, &suffix, false);
-            for candidate in [31_usize, 32, 33, 63, 64, 65] {
+            for candidate in [1_usize, 4, 31, 32, 33, 63, 64, 65] {
                 let mut haystack: Vec<u8> = (0..candidate)
                     .map(|index| members[index % members.len()])
                     .collect();
@@ -1530,15 +1530,19 @@ mod tests {
 
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, Some((0, haystack.len())));
-                assert_eq!(accounting.prefilter_calls, 1);
+                assert_eq!(
+                    accounting.prefilter_calls,
+                    usize::from(haystack.len() >= 32)
+                );
                 assert!(accounting.suffix_confirmation_attempted);
                 assert_eq!(
                     accounting.prefix_bytes_examined,
                     candidate.checked_add(1).unwrap()
                 );
+                let rescan_margin = usize::from(haystack.len() >= 32) * 32;
                 assert_eq!(
                     accounting.prefix_bytes_upper_bound,
-                    haystack.len().checked_add(32).unwrap()
+                    haystack.len().checked_add(rescan_margin).unwrap()
                 );
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
 
@@ -1626,6 +1630,37 @@ mod tests {
                 assert!(accounting.prefix_bytes_examined > wrong_outsider);
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             }
+        }
+    }
+
+    #[test]
+    fn first_suffix_byte_candidate_is_the_only_possible_boundary() {
+        let suffix = [0x7F, 0x11, 0x7F];
+        for class in [
+            ByteClass::from_bytes(&[0x00, 0x80]),
+            ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+        ] {
+            let plan = plan(class, &suffix, false);
+            let first_candidate = 33_usize;
+            let mut haystack = vec![0x00; first_candidate];
+            haystack.extend_from_slice(&[suffix[0], 0x40, suffix[2]]);
+            haystack.extend_from_slice(&[0x00, 0x80]);
+            haystack.extend_from_slice(&suffix);
+
+            let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, None);
+            assert!(accounting.suffix_confirmation_attempted);
+            assert_eq!(
+                accounting.prefix_bytes_examined,
+                first_candidate.checked_add(1).unwrap()
+            );
+
+            haystack[first_candidate + 1] = suffix[1];
+            assert_eq!(
+                plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+                Some((0, first_candidate + suffix.len()))
+            );
         }
     }
 
@@ -1727,7 +1762,7 @@ mod tests {
         assert_eq!(cases[1].0.implementation(), ClassImplementation::Bitset);
 
         for (plan, members, wrong) in cases {
-            for candidate in [31_usize, 32, 33, 63, 64, 65] {
+            for candidate in [1_usize, 4, 31, 32, 33, 63, 64, 65] {
                 let mut haystack: Vec<u8> = (0..candidate)
                     .map(|index| members[index % members.len()])
                     .collect();
