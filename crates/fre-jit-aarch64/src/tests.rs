@@ -769,6 +769,64 @@ fn aggregate_audit_preflights_symbol_cardinality() {
 }
 
 #[test]
+fn aggregate_v1_envelope_is_exact_for_every_shape_family() {
+    for width in [0_usize, 1, 2, 3, 15, 16, 17, 32] {
+        let literal = vec![b'x'; width];
+        let count = build_exact_aggregate::<Count>(&literal, ValidateLimits::default())
+            .expect("Count aggregate");
+        let spans = build_exact_aggregate::<SpanSum>(&literal, ValidateLimits::default())
+            .expect("SpanSum aggregate");
+        let images = [
+            emit_exact_aggregate(&count, EmitLimits::default()).expect("Count image"),
+            emit_exact_aggregate(&spans, EmitLimits::default()).expect("SpanSum image"),
+        ];
+        for image in images {
+            let (instructions, labels, relocations, vectors) = match (image.output(), width) {
+                (AggregateOutput::Count, 0) => (14_usize, 3_usize, 2_usize, 0_u32),
+                (AggregateOutput::SpanSum, 0) => (5, 2, 1, 0),
+                (_, 1) => (42, 6, 9, 5),
+                (_, 2) => (55, 9, 13, 9),
+                (_, 3..=15) => (68, 12, 17, 9),
+                (_, 16..=32) => (80, 13, 19, 14),
+                _ => unreachable!("covered width"),
+            };
+            assert_eq!(image.code().len(), instructions * 4);
+            assert_eq!(image.labels().len(), labels);
+            assert_eq!(image.relocations().len(), relocations);
+            assert_eq!(image.stats().vector_instructions, vectors);
+            assert!(
+                image
+                    .to_aot(AotLimits::default())
+                    .expect("bounded AOT")
+                    .as_bytes()
+                    .len()
+                    <= 984
+            );
+            audit_aggregate(&image).expect("exact v1 envelope passes");
+        }
+    }
+}
+
+#[test]
+fn search_audit_rejects_explicit_sp_operand() {
+    let program =
+        build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
+            .expect("search program");
+    let mut image = emit(&program, EmitLimits::default()).expect("search image");
+    // The exact RET encoding still has its implicit x30 use; this explicit
+    // `add sp, sp, #16` at entry must be rejected by the common operand visitor.
+    image.code[0..4].copy_from_slice(&0x9100_43ff_u32.to_le_bytes());
+    image.artifact_identity = image.compute_artifact_identity().expect("bounded identity");
+    assert_eq!(
+        audit(&image),
+        Err(AuditError::ForbiddenAggregateRegister {
+            offset: 0,
+            register: 31,
+        })
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     clippy::type_complexity,

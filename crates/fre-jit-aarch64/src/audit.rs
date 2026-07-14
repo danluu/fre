@@ -6,8 +6,8 @@ use fre_kernel_ir::{
 };
 
 use crate::{
-    CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction, LabelKind, NativeAggregateImage,
-    NativeImage, RelocationKind, RelocationTarget,
+    BackendVersion, CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction, LabelKind,
+    NativeAggregateImage, NativeImage, RelocationKind, RelocationTarget,
     decode::{canonical_word, decode_one},
 };
 
@@ -85,6 +85,7 @@ pub enum AuditError {
         offset: u32,
     },
     InvalidAggregateStoreContract,
+    ArtifactIdentityMismatch,
     FeatureMismatch,
     ArithmeticOverflow,
 }
@@ -128,7 +129,9 @@ pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
     if image.aggregate_manifest().is_some() {
         return Err(AuditError::InvalidImageContract);
     }
-    audit_impl(image, StoreContract::Search)
+    let report = audit_impl(image, StoreContract::Search)?;
+    validate_artifact_identity(image)?;
+    Ok(report)
 }
 
 /// Independently re-decode a whole-haystack aggregate image.
@@ -136,7 +139,18 @@ pub fn audit_aggregate(image: &NativeAggregateImage) -> Result<AuditReport, Audi
     audit_aggregate_shape(image.inner())?;
     let report = audit_impl(image.inner(), StoreContract::Aggregate)?;
     audit_aggregate_contract(image.inner())?;
+    validate_artifact_identity(image.inner())?;
     Ok(report)
+}
+
+fn validate_artifact_identity(image: &NativeImage) -> Result<(), AuditError> {
+    let recomputed = image
+        .compute_artifact_identity()
+        .map_err(|_| AuditError::ArithmeticOverflow)?;
+    if recomputed != image.artifact_identity() {
+        return Err(AuditError::ArtifactIdentityMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -175,6 +189,9 @@ fn audit_impl(
         let instruction = decode_one(word, offset)?;
         if canonical_word(instruction) != Some(word) {
             return Err(AuditError::NonCanonicalInstruction { offset });
+        }
+        if let Some(register) = first_forbidden_explicit_gpr(instruction) {
+            return Err(AuditError::ForbiddenAggregateRegister { offset, register });
         }
         report.instructions = report
             .instructions
@@ -378,9 +395,6 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
     let mut address_count = 0_usize;
     for (index, &instruction) in instructions.iter().enumerate() {
         let offset = instruction_offset(index)?;
-        if let Some(register) = first_forbidden_aggregate_register(instruction) {
-            return Err(AuditError::ForbiddenAggregateRegister { offset, register });
-        }
         if let Some(register) = first_forbidden_aggregate_vector_register(instruction) {
             return Err(AuditError::ForbiddenAggregateVectorRegister { offset, register });
         }
@@ -487,9 +501,32 @@ fn audit_aggregate_shape(image: &NativeImage) -> Result<usize, AuditError> {
         .ok_or(AuditError::InvalidAggregateManifest)?;
     let literal_len = usize::try_from(manifest.literal_bytes)
         .map_err(|_| AuditError::InvalidAggregateManifest)?;
-    if literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+    if image.backend_version != BackendVersion::CURRENT
+        || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
+    {
+        return Err(AuditError::InvalidAggregateManifest);
+    }
+
+    let (instructions, labels, relocations, vector_instructions) =
+        match (manifest.output, literal_len) {
+            (AggregateOutput::Count, 0) => (14_usize, 3_usize, 2_usize, 0_u32),
+            (AggregateOutput::SpanSum, 0) => (5, 2, 1, 0),
+            (_, 1) => (42, 6, 9, 5),
+            (_, 2) => (55, 9, 13, 9),
+            (_, 3..=15) => (68, 12, 17, 9),
+            (_, 16..=MAX_EXACT_AGGREGATE_LITERAL_BYTES) => (80, 13, 19, 14),
+            _ => return Err(AuditError::InvalidAggregateManifest),
+        };
+    let code_bytes = instructions
+        .checked_mul(4)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    if image.code.len() != code_bytes
+        || image.labels.len() != labels
+        || image.relocations.len() != relocations
+        || image.stats.vector_instructions != vector_instructions
+        || crate::image::aot_size(image).map_err(|_| AuditError::ArithmeticOverflow)? > 984
     {
         return Err(AuditError::InvalidAggregateManifest);
     }
@@ -517,7 +554,7 @@ fn instruction_after(
     clippy::match_same_arms,
     reason = "operand arities remain grouped by decoded ISA form for security review"
 )]
-fn first_forbidden_aggregate_register(instruction: DecodedInstruction) -> Option<u8> {
+fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> Option<u8> {
     fn forbidden(registers: &[u8]) -> Option<u8> {
         registers.iter().copied().find(|&register| register >= 18)
     }
