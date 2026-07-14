@@ -112,7 +112,7 @@ impl ByteClass {
                 let byte_index = word_index.checked_mul(64)?.checked_add(bit_index)?;
                 members[member_count] = u8::try_from(byte_index).ok()?;
                 member_count = member_count.checked_add(1)?;
-                remaining &= remaining - 1;
+                remaining &= remaining.wrapping_sub(1);
             }
         }
         (member_count == N).then_some(members)
