@@ -2028,6 +2028,21 @@ mod tests {
     }
 
     #[test]
+    fn es8i_runtime_identity_rejects_the_stale_forward_family_label() {
+        const ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
+        const STALE_FORWARD_ID: &str = "anchored-class-suffix.forward.v1";
+
+        assert_eq!(fre_kernels::FORWARD_ANCHORED_PLAN_ID, ES8I_ID);
+        let forward = PortableBuilder::new(r"\A[a-z]+Z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        assert_eq!(forward.runtime_implementation_id(), ES8I_ID);
+        assert_ne!(forward.runtime_implementation_id(), STALE_FORWARD_ID);
+    }
+
+    #[test]
     fn forward_forced_facade_matches_regex_1_12_4_exhaustively() {
         let alphabet = [0_u8, 1, 2];
         let haystacks = byte_words(&alphabet, 6);
