@@ -1298,7 +1298,7 @@ mod tests {
         finish_edge_witness_trace,
     };
     use crate::Window;
-    use core::mem::size_of;
+    use core::{cell::Cell, mem::size_of};
 
     fn plan(class: ByteClass, suffix: &[u8], end: bool) -> ForwardAnchoredPlan {
         ForwardAnchoredPlan::build(
@@ -1501,10 +1501,21 @@ mod tests {
         assert_eq!(exact_suffix_copy_probe::calls(), 0);
 
         exact_suffix_copy_probe::reset();
+        let observed_layout = Cell::new(None);
         let error = unsafe {
-            copy_suffix_exact_with(b"forced allocation failure", |_| core::ptr::null_mut())
+            copy_suffix_exact_with(b"forced allocation failure", |layout| {
+                observed_layout.set(Some((layout.size(), layout.align())));
+                core::ptr::null_mut()
+            })
         }
         .unwrap_err();
+        assert_eq!(
+            observed_layout.get(),
+            Some((
+                b"forced allocation failure".len(),
+                core::mem::align_of::<u8>(),
+            ))
+        );
         assert_eq!(
             error,
             BuildError::AllocationFailed {
