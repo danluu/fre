@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
+./scripts/check-unsafe-lint-boundary.sh
 cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
