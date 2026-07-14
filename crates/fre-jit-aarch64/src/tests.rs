@@ -1605,10 +1605,7 @@ fn m17_template_rejects_every_cursor_delta_pairwise_substitution() {
                     immediate: replacement,
                 },
             );
-            assert_m17_prototype_rejects(
-                inner,
-                "pairwise cursor-delta phase substitution",
-            );
+            assert_m17_prototype_rejects(inner, "pairwise cursor-delta phase substitution");
         }
     }
 }
@@ -1626,7 +1623,10 @@ fn m17_template_rejects_every_confirmation_stride_and_load_base_substitution() {
             source,
             immediate,
         } = instruction
-            && matches!((destination, source, immediate), (15, 15, 1 | 16) | (16, 16, 1 | 16))
+            && matches!(
+                (destination, source, immediate),
+                (15, 15, 1 | 16) | (16, 16, 1 | 16)
+            )
         {
             let mut inner = valid.inner().clone();
             replace_test_decoded_at(
@@ -1723,8 +1723,8 @@ fn template_rejects_each_last_filter_and_width_one_simd_opcode_substitution() {
         }
     }
 
-    let width_one = build_exact_aggregate::<Count>(b"x", ValidateLimits::default())
-        .expect("M=1 Count program");
+    let width_one =
+        build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("M=1 Count program");
     let valid = emit_exact_aggregate(&width_one, EmitLimits::default()).expect("M=1 Count image");
     let instructions = decode(valid.code()).expect("canonical M=1 decode");
     let index = instructions
@@ -2711,7 +2711,10 @@ fn explicit_gpr_visitor_covers_x18_x30_and_register_31_in_every_role() {
         }
     }
     for instruction in every_explicit_gpr_role(17) {
-        assert_eq!(crate::audit::first_forbidden_explicit_gpr(instruction), None);
+        assert_eq!(
+            crate::audit::first_forbidden_explicit_gpr(instruction),
+            None
+        );
     }
     assert_eq!(
         crate::audit::first_forbidden_explicit_gpr(DecodedInstruction::Return),

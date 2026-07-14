@@ -588,8 +588,7 @@ fn validate_aggregate_template_labels(
         (36, LabelKind::ReturnFound),
         (48, LabelKind::ReturnNone),
     ];
-    const M0_SPAN_SUM: &[(u32, LabelKind)] =
-        &[(0, LabelKind::Entry), (8, LabelKind::ReturnFound)];
+    const M0_SPAN_SUM: &[(u32, LabelKind)] = &[(0, LabelKind::Entry), (8, LabelKind::ReturnFound)];
     const M1: &[(u32, LabelKind)] = &[
         (0, LabelKind::Entry),
         (24, LabelKind::Loop),
@@ -674,12 +673,12 @@ fn validate_aggregate_template(
     output: AggregateOutput,
 ) -> Result<(), AuditError> {
     use DecodedInstruction::{
-        AddAcrossBytes16, AddImmediate64, AddRegister64, Address, AndBytes16, AndLowBits64,
-        Branch, BranchCondition, CompareBranchZero64, CompareEqualBytes16, CompareImmediate32,
+        AddAcrossBytes16, AddImmediate64, AddRegister64, Address, AndBytes16, AndLowBits64, Branch,
+        BranchCondition, CompareBranchZero64, CompareEqualBytes16, CompareImmediate32,
         CompareImmediate64, CompareRegister32, CompareRegister64, DuplicateByte16, LoadByte,
         LoadByteRegister, LoadVector128, MoveKeep64, MoveRegister64, MoveVectorByteTo32,
-        MoveZero64, Return, Store64, SubtractImmediate64, SubtractRegister64,
-        UnsignedMaxBytes16, UnsignedMinBytes16,
+        MoveZero64, Return, Store64, SubtractImmediate64, SubtractRegister64, UnsignedMaxBytes16,
+        UnsignedMinBytes16,
     };
 
     validate_aggregate_template_labels(image, literal_len, output)?;
