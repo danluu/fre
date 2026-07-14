@@ -1294,9 +1294,11 @@ mod tests {
     use super::{
         Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
         SearchError, SearchLimits, asymmetric_suffix_witness, begin_edge_witness_trace,
+        copy_suffix_exact, copy_suffix_exact_with, exact_suffix_copy_probe,
         finish_edge_witness_trace,
     };
     use crate::Window;
+    use core::mem::size_of;
 
     fn plan(class: ByteClass, suffix: &[u8], end: bool) -> ForwardAnchoredPlan {
         ForwardAnchoredPlan::build(
@@ -1476,6 +1478,140 @@ mod tests {
             both.find_window(b"aaZx", Window::new(0, 5), SearchLimits::unlimited()),
             Err(SearchError::InvalidWindow { .. })
         ));
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "the test injects a null result into the audited allocation seam"
+    )]
+    fn exact_suffix_copy_has_exact_capacity_and_typed_failure() {
+        for len in [1_usize, 2, 3, 7, 8, 15, 16, 31, 32, 255, 256, 4096] {
+            let suffix: Vec<u8> = (0_u8..=u8::MAX).cycle().take(len).collect();
+            exact_suffix_copy_probe::reset();
+            let owned = copy_suffix_exact(&suffix).unwrap();
+            assert_eq!(exact_suffix_copy_probe::calls(), 1);
+            assert_eq!(owned, suffix);
+            assert_eq!(owned.len(), len);
+            assert_eq!(owned.capacity(), len);
+        }
+
+        exact_suffix_copy_probe::reset();
+        assert_eq!(copy_suffix_exact(b""), Err(BuildError::EmptySuffix));
+        assert_eq!(exact_suffix_copy_probe::calls(), 0);
+
+        exact_suffix_copy_probe::reset();
+        let error = unsafe {
+            copy_suffix_exact_with(b"forced allocation failure", |_| core::ptr::null_mut())
+        }
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BuildError::AllocationFailed {
+                structure: "forward anchored suffix",
+                additional: b"forced allocation failure".len(),
+            }
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+    }
+
+    #[test]
+    fn persistent_and_peak_caps_precede_suffix_copy_and_allocation() {
+        let class = ByteClass::from_bytes(b"a");
+        let suffix = b"Zallocator-independent-borderedaba";
+        let anchors = Anchors {
+            start: true,
+            end: false,
+        };
+        let exact_bytes = size_of::<ForwardAnchoredPlan>()
+            .checked_add(suffix.len())
+            .unwrap();
+        let permissive = BuildLimits {
+            max_suffix_bytes: usize::MAX,
+            max_build_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+
+        exact_suffix_copy_probe::reset();
+        let persistent_exact = ForwardAnchoredPlan::build(
+            class,
+            suffix,
+            anchors,
+            BuildLimits {
+                max_persistent_bytes: exact_bytes,
+                ..permissive
+            },
+        )
+        .unwrap();
+        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+        assert_eq!(
+            persistent_exact.build_accounting().suffix_bytes,
+            suffix.len()
+        );
+        assert_eq!(
+            persistent_exact.build_accounting().suffix_capacity_bytes,
+            suffix.len()
+        );
+        assert_eq!(
+            persistent_exact.build_accounting().persistent_bytes,
+            exact_bytes
+        );
+
+        exact_suffix_copy_probe::reset();
+        let persistent_error = ForwardAnchoredPlan::build(
+            class,
+            suffix,
+            anchors,
+            BuildLimits {
+                max_persistent_bytes: exact_bytes.checked_sub(1).unwrap(),
+                ..permissive
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            persistent_error,
+            BuildError::PersistentLimit {
+                needed: exact_bytes,
+                limit: exact_bytes.checked_sub(1).unwrap(),
+            }
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 0);
+
+        exact_suffix_copy_probe::reset();
+        let peak_exact = ForwardAnchoredPlan::build(
+            class,
+            suffix,
+            anchors,
+            BuildLimits {
+                max_peak_bytes: exact_bytes,
+                ..permissive
+            },
+        )
+        .unwrap();
+        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+        assert_eq!(peak_exact.build_accounting().peak_bytes, exact_bytes);
+
+        exact_suffix_copy_probe::reset();
+        let peak_error = ForwardAnchoredPlan::build(
+            class,
+            suffix,
+            anchors,
+            BuildLimits {
+                max_peak_bytes: exact_bytes.checked_sub(1).unwrap(),
+                ..permissive
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            peak_error,
+            BuildError::PeakLimit {
+                needed: exact_bytes,
+                limit: exact_bytes.checked_sub(1).unwrap(),
+            }
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 0);
     }
 
     #[test]
