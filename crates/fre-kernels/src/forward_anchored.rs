@@ -98,6 +98,25 @@ impl ByteClass {
         }
         Some((u8::try_from(first).ok()?, u8::try_from(last).ok()?))
     }
+
+    fn canonical_members<const N: usize>(self) -> Option<[u8; N]> {
+        let mut members = [0_u8; N];
+        let mut member_count = 0_usize;
+        for (word_index, &word) in self.words.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                if member_count == N {
+                    return None;
+                }
+                let bit_index = usize::try_from(remaining.trailing_zeros()).ok()?;
+                let byte_index = word_index.checked_mul(64)?.checked_add(bit_index)?;
+                members[member_count] = u8::try_from(byte_index).ok()?;
+                member_count = member_count.checked_add(1)?;
+                remaining &= remaining - 1;
+            }
+        }
+        (member_count == N).then_some(members)
+    }
 }
 
 /// Absolute anchors interpreted against the original haystack.
@@ -116,6 +135,17 @@ pub enum ClassImplementation {
     Bitset,
     /// One inclusive range, scanned in fixed blocks before a scalar tail.
     InclusiveRange { start: u8, end: u8 },
+    /// Two canonical, ascending members scanned with a fixed equality network.
+    Pair { first: u8, second: u8 },
+    /// Three canonical, ascending members scanned with a fixed equality network.
+    Triple { first: u8, second: u8, third: u8 },
+    /// Four canonical, ascending members scanned with a fixed equality network.
+    Quad {
+        first: u8,
+        second: u8,
+        third: u8,
+        fourth: u8,
+    },
 }
 
 /// Limits checked before plan construction.
@@ -389,9 +419,45 @@ impl ForwardAnchoredPlan {
             return Err(BuildError::FirstSuffixByteInClass { byte: first });
         }
 
+        let class_cardinality = class.cardinality();
         let implementation = match class.single_inclusive_range() {
             Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
-            None => ClassImplementation::Bitset,
+            None => match class_cardinality {
+                2 => {
+                    let [first, second] = class.canonical_members::<2>().ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "canonical pair extraction",
+                        },
+                    )?;
+                    ClassImplementation::Pair { first, second }
+                }
+                3 => {
+                    let [first, second, third] = class.canonical_members::<3>().ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "canonical triple extraction",
+                        },
+                    )?;
+                    ClassImplementation::Triple {
+                        first,
+                        second,
+                        third,
+                    }
+                }
+                4 => {
+                    let [first, second, third, fourth] = class.canonical_members::<4>().ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "canonical quad extraction",
+                        },
+                    )?;
+                    ClassImplementation::Quad {
+                        first,
+                        second,
+                        third,
+                        fourth,
+                    }
+                }
+                _ => ClassImplementation::Bitset,
+            },
         };
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
@@ -487,7 +553,7 @@ impl ForwardAnchoredPlan {
             build: BuildAccounting {
                 suffix_bytes: suffix.len(),
                 suffix_capacity_bytes,
-                class_cardinality: class.cardinality(),
+                class_cardinality,
                 implementation,
                 work_upper_bound,
                 scratch_bytes,
@@ -640,6 +706,20 @@ impl ForwardAnchoredPlan {
             ClassImplementation::InclusiveRange { start, end } => {
                 scan_range_prefix(bytes, start, end)
             }
+            ClassImplementation::Pair { first, second } => {
+                scan_pair_prefix(bytes, first, second)
+            }
+            ClassImplementation::Triple {
+                first,
+                second,
+                third,
+            } => scan_triple_prefix(bytes, first, second, third),
+            ClassImplementation::Quad {
+                first,
+                second,
+                third,
+                fourth,
+            } => scan_quad_prefix(bytes, first, second, third, fourth),
         }
     }
 
@@ -656,11 +736,17 @@ impl ForwardAnchoredPlan {
                     computation: "search window bytes",
                 })?;
         let uses_prefilter = window_bytes >= RANGE_BLOCK;
-        let rescan_margin = match self.implementation {
-            ClassImplementation::InclusiveRange { .. } if window_bytes >= RANGE_BLOCK => {
-                RANGE_BLOCK
-            }
-            ClassImplementation::Bitset | ClassImplementation::InclusiveRange { .. } => 0,
+        let block_scanner = matches!(
+            self.implementation,
+            ClassImplementation::InclusiveRange { .. }
+                | ClassImplementation::Pair { .. }
+                | ClassImplementation::Triple { .. }
+                | ClassImplementation::Quad { .. }
+        );
+        let rescan_margin = if block_scanner && window_bytes >= RANGE_BLOCK {
+            RANGE_BLOCK
+        } else {
+            0
         };
         let prefilter_bytes_upper_bound = if uses_prefilter {
             window_bytes.saturating_sub(1)
@@ -745,10 +831,213 @@ fn scan_bitset_prefix(bytes: &[u8], class: ByteClass) -> (usize, usize) {
     (boundary, examined)
 }
 
-/// Fixed blocks expose a branch-free membership reduction to LLVM. This is a
-/// safe scalar source loop, not a SIMD claim; retained assembly decides which
+/// Fixed blocks expose branch-free membership reductions to LLVM. These are
+/// safe scalar source loops, not SIMD claims; retained assembly decides which
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
+
+fn scan_pair_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK / 2);
+        let low_outside = low.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first) | u8::from(byte == second);
+            outside | (inside ^ 1)
+        });
+        let high_outside = high.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first) | u8::from(byte == second);
+            outside | (inside ^ 1)
+        });
+        if low_outside | high_outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| byte != first && byte != second)
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "pair boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed pair block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed pair blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte != first && byte != second)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "pair remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "pair remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+fn scan_triple_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+    third: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK / 2);
+        let low_outside = low.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third);
+            outside | (inside ^ 1)
+        });
+        let high_outside = high.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third);
+            outside | (inside ^ 1)
+        });
+        if low_outside | high_outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| byte != first && byte != second && byte != third)
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "triple boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed triple block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed triple blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte != first && byte != second && byte != third)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "triple remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "triple remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+fn scan_quad_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+    third: u8,
+    fourth: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK / 2);
+        let low_outside = low.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third)
+                | u8::from(byte == fourth);
+            outside | (inside ^ 1)
+        });
+        let high_outside = high.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third)
+                | u8::from(byte == fourth);
+            outside | (inside ^ 1)
+        });
+        if low_outside | high_outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| {
+                    byte != first && byte != second && byte != third && byte != fourth
+                })
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "quad boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed quad block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed quad blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| {
+            byte != first && byte != second && byte != third && byte != fourth
+        })
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "quad remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "quad remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
 
 fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize), SearchError> {
     let width = end.wrapping_sub(start);
@@ -862,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_range_and_arbitrary_bitset_floors() {
+    fn selects_canonical_small_sets_and_unchanged_floors() {
         let range = plan(ByteClass::inclusive(b'a', b'z'), b"Z", false);
         assert_eq!(
             range.implementation(),
@@ -871,14 +1160,59 @@ mod tests {
                 end: b'z'
             }
         );
-        let bitset = plan(ByteClass::from_bytes(&[0, 2, 255]), b"Z", false);
+        let contiguous_pair = plan(ByteClass::from_bytes(b"baa"), b"Z", false);
+        assert_eq!(
+            contiguous_pair.implementation(),
+            ClassImplementation::InclusiveRange {
+                start: b'a',
+                end: b'b'
+            }
+        );
+
+        let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
+        assert_eq!(
+            pair.implementation(),
+            ClassImplementation::Pair {
+                first: b'\t',
+                second: b' '
+            }
+        );
+        let triple = plan(
+            ByteClass::from_bytes(&[0xFF, 0x80, 0x00, 0xFF]),
+            b"Z",
+            false,
+        );
+        assert_eq!(
+            triple.implementation(),
+            ClassImplementation::Triple {
+                first: 0x00,
+                second: 0x80,
+                third: 0xFF
+            }
+        );
+        let quad = plan(ByteClass::from_bytes(b"geacg"), b"Z", false);
+        assert_eq!(
+            quad.implementation(),
+            ClassImplementation::Quad {
+                first: b'a',
+                second: b'c',
+                third: b'e',
+                fourth: b'g'
+            }
+        );
+
+        let bitset = plan(
+            ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+            b"Z",
+            false,
+        );
         assert_eq!(bitset.implementation(), ClassImplementation::Bitset);
         assert_eq!(
             bitset
-                .find(&[0, 2, 255, b'Z'], SearchLimits::unlimited())
+                .find(&[0, 2, 4, 0x80, 0xFF, b'Z'], SearchLimits::unlimited())
                 .unwrap()
                 .0,
-            Some((0, 4))
+            Some((0, 6))
         );
     }
 
@@ -1067,6 +1401,127 @@ mod tests {
             ),
             Err(SearchError::ExaminedBytesLimit { .. })
         ));
+    }
+
+    #[test]
+    fn small_set_scanners_cover_block_lanes_tails_and_arbitrary_bytes() {
+        let cases: [(ByteClass, &[u8]); 3] = [
+            (ByteClass::from_bytes(&[0x00, 0x80]), &[0x00, 0x80]),
+            (
+                ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
+                &[0x00, 0x80, 0xFF],
+            ),
+            (
+                ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
+                &[0x00, 0x02, 0x80, 0xFF],
+            ),
+        ];
+        let lengths = [0_usize, 1, 15, 16, 31, 32, 33, 63, 64, 65];
+        for (class, members) in cases {
+            let plan = plan(class, b"Z", false);
+            for length in lengths {
+                let all_members: Vec<u8> = (0..length)
+                    .map(|index| members[index % members.len()])
+                    .collect();
+                assert_eq!(plan.scan_prefix(&all_members).unwrap(), (length, length));
+            }
+
+            for block_start in [0_usize, 32] {
+                for lane in [0_usize, 15, 16, 31] {
+                    let outsider = block_start.checked_add(lane).unwrap();
+                    let mut bytes = vec![0x00; 65];
+                    bytes[outsider] = b'Z';
+                    let expected_examined = block_start
+                        .checked_add(32)
+                        .and_then(|value| value.checked_add(lane))
+                        .and_then(|value| value.checked_add(1))
+                        .unwrap();
+                    assert_eq!(
+                        plan.scan_prefix(&bytes).unwrap(),
+                        (outsider, expected_examined)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pair_triple_and_quad_confirm_suffix_at_the_first_outsider() {
+        for class in [
+            ByteClass::from_bytes(b"ac"),
+            ByteClass::from_bytes(b"ace"),
+            ByteClass::from_bytes(b"aceg"),
+        ] {
+            let plan = plan(class, b"END", false);
+            let mut haystack: Vec<u8> = [b'a', b'c']
+                .into_iter()
+                .cycle()
+                .take(40)
+                .collect();
+            haystack.extend_from_slice(b"END");
+            assert_eq!(
+                plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+                Some((0, 43))
+            );
+
+            assert_eq!(
+                plan.find(b"ENDac", SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn equality_block_rescan_is_preflighted_with_exact_and_one_below_limits() {
+        for class in [
+            ByteClass::from_bytes(b"ac"),
+            ByteClass::from_bytes(b"ace"),
+            ByteClass::from_bytes(b"aceg"),
+        ] {
+            let plan = plan(class, b"Z", false);
+            let mut haystack = vec![b'a'; 64];
+            haystack[31] = b'Z';
+            let (span, accounting) = plan
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(span, Some((0, 32)));
+            assert_eq!(accounting.prefilter_calls, 1);
+            assert_eq!(accounting.prefix_bytes_examined, 65);
+            assert_eq!(
+                accounting.prefix_bytes_upper_bound,
+                haystack.len().checked_add(33).unwrap()
+            );
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+
+            let exact = SearchLimits {
+                max_work_upper_bound: accounting.work_upper_bound,
+                max_examined_bytes_upper_bound: accounting.examined_bytes_upper_bound,
+                max_scratch_bytes: accounting.scratch_bytes,
+            };
+            assert!(plan.find(&haystack, exact).is_ok());
+            assert!(matches!(
+                plan.find(
+                    &haystack,
+                    SearchLimits {
+                        max_examined_bytes_upper_bound: accounting.examined_bytes_upper_bound - 1,
+                        ..exact
+                    }
+                ),
+                Err(SearchError::ExaminedBytesLimit { .. })
+            ));
+            assert!(matches!(
+                plan.find(
+                    &haystack,
+                    SearchLimits {
+                        max_work_upper_bound: accounting.work_upper_bound - 1,
+                        ..exact
+                    }
+                ),
+                Err(SearchError::WorkLimit { .. })
+            ));
+        }
     }
 
     #[test]
