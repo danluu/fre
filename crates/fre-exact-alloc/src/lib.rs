@@ -30,16 +30,24 @@ impl std::error::Error for CopyError {}
 /// An empty input needs no allocation and returns an empty vector. For a
 /// nonempty input, allocation failure is reported without invoking the
 /// infallible allocation-error handler.
+pub fn copy_exact(bytes: &[u8]) -> Result<Vec<u8>, CopyError> {
+    copy_exact_with(bytes, false)
+}
+
 #[allow(
     unsafe_code,
     reason = "this one reviewed function owns FRE's exact-layout allocation boundary"
 )]
-pub fn copy_exact(bytes: &[u8]) -> Result<Vec<u8>, CopyError> {
+fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
     let layout = Layout::array::<u8>(bytes.len()).map_err(|_| CopyError::LayoutOverflow)?;
-    let allocation = unsafe { alloc(layout) };
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
     if allocation.is_null() {
         return Err(CopyError::AllocationFailed);
     }
@@ -57,7 +65,7 @@ pub fn copy_exact(bytes: &[u8]) -> Result<Vec<u8>, CopyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_exact;
+    use super::{CopyError, copy_exact, copy_exact_with};
 
     #[test]
     fn empty_and_nonempty_copies_have_exact_capacity() {
@@ -72,5 +80,10 @@ mod tests {
             assert_eq!(copied.len(), len);
             assert_eq!(copied.capacity(), len);
         }
+
+        assert_eq!(
+            copy_exact_with(b"forced allocation failure", true),
+            Err(CopyError::AllocationFailed)
+        );
     }
 }
