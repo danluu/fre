@@ -420,45 +420,46 @@ impl ForwardAnchoredPlan {
         }
 
         let class_cardinality = class.cardinality();
-        let implementation = match class.single_inclusive_range() {
-            Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
-            None => match class_cardinality {
-                2 => {
-                    let [first, second] = class.canonical_members::<2>().ok_or(
-                        BuildError::ArithmeticOverflow {
-                            computation: "canonical pair extraction",
-                        },
-                    )?;
-                    ClassImplementation::Pair { first, second }
-                }
-                3 => {
-                    let [first, second, third] = class.canonical_members::<3>().ok_or(
-                        BuildError::ArithmeticOverflow {
-                            computation: "canonical triple extraction",
-                        },
-                    )?;
-                    ClassImplementation::Triple {
-                        first,
-                        second,
-                        third,
+        let implementation =
+            match class.single_inclusive_range() {
+                Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
+                None => match class_cardinality {
+                    2 => {
+                        let [first, second] = class.canonical_members::<2>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical pair extraction",
+                            },
+                        )?;
+                        ClassImplementation::Pair { first, second }
                     }
-                }
-                4 => {
-                    let [first, second, third, fourth] = class.canonical_members::<4>().ok_or(
-                        BuildError::ArithmeticOverflow {
-                            computation: "canonical quad extraction",
-                        },
-                    )?;
-                    ClassImplementation::Quad {
-                        first,
-                        second,
-                        third,
-                        fourth,
+                    3 => {
+                        let [first, second, third] = class.canonical_members::<3>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical triple extraction",
+                            },
+                        )?;
+                        ClassImplementation::Triple {
+                            first,
+                            second,
+                            third,
+                        }
                     }
-                }
-                _ => ClassImplementation::Bitset,
-            },
-        };
+                    4 => {
+                        let [first, second, third, fourth] = class.canonical_members::<4>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical quad extraction",
+                            },
+                        )?;
+                        ClassImplementation::Quad {
+                            first,
+                            second,
+                            third,
+                            fourth,
+                        }
+                    }
+                    _ => ClassImplementation::Bitset,
+                },
+            };
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "suffix length as u64",
@@ -706,9 +707,7 @@ impl ForwardAnchoredPlan {
             ClassImplementation::InclusiveRange { start, end } => {
                 scan_range_prefix(bytes, start, end)
             }
-            ClassImplementation::Pair { first, second } => {
-                scan_pair_prefix(bytes, first, second)
-            }
+            ClassImplementation::Pair { first, second } => scan_pair_prefix(bytes, first, second),
             ClassImplementation::Triple {
                 first,
                 second,
@@ -836,11 +835,7 @@ fn scan_bitset_prefix(bytes: &[u8], class: ByteClass) -> (usize, usize) {
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
 
-fn scan_pair_prefix(
-    bytes: &[u8],
-    first: u8,
-    second: u8,
-) -> Result<(usize, usize), SearchError> {
+fn scan_pair_prefix(bytes: &[u8], first: u8, second: u8) -> Result<(usize, usize), SearchError> {
     let mut consumed = 0_usize;
     let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
     for block in &mut blocks {
@@ -909,15 +904,13 @@ fn scan_triple_prefix(
     for block in &mut blocks {
         let (low, high) = block.split_at(RANGE_BLOCK / 2);
         let low_outside = low.iter().fold(0_u8, |outside, &byte| {
-            let inside = u8::from(byte == first)
-                | u8::from(byte == second)
-                | u8::from(byte == third);
+            let inside =
+                u8::from(byte == first) | u8::from(byte == second) | u8::from(byte == third);
             outside | (inside ^ 1)
         });
         let high_outside = high.iter().fold(0_u8, |outside, &byte| {
-            let inside = u8::from(byte == first)
-                | u8::from(byte == second)
-                | u8::from(byte == third);
+            let inside =
+                u8::from(byte == first) | u8::from(byte == second) | u8::from(byte == third);
             outside | (inside ^ 1)
         });
         if low_outside | high_outside != 0 {
@@ -1021,9 +1014,7 @@ fn scan_quad_prefix(
     let remainder = blocks.remainder();
     let within_remainder = remainder
         .iter()
-        .position(|&byte| {
-            byte != first && byte != second && byte != third && byte != fourth
-        })
+        .position(|&byte| byte != first && byte != second && byte != third && byte != fourth)
         .unwrap_or(remainder.len());
     let boundary =
         consumed
@@ -1453,11 +1444,7 @@ mod tests {
             ByteClass::from_bytes(b"aceg"),
         ] {
             let plan = plan(class, b"END", false);
-            let mut haystack: Vec<u8> = [b'a', b'c']
-                .into_iter()
-                .cycle()
-                .take(40)
-                .collect();
+            let mut haystack: Vec<u8> = [b'a', b'c'].into_iter().cycle().take(40).collect();
             haystack.extend_from_slice(b"END");
             assert_eq!(
                 plan.find(&haystack, SearchLimits::unlimited()).unwrap().0,
@@ -1465,9 +1452,7 @@ mod tests {
             );
 
             assert_eq!(
-                plan.find(b"ENDac", SearchLimits::unlimited())
-                    .unwrap()
-                    .0,
+                plan.find(b"ENDac", SearchLimits::unlimited()).unwrap().0,
                 None
             );
         }
@@ -1483,9 +1468,7 @@ mod tests {
             let plan = plan(class, b"Z", false);
             let mut haystack = vec![b'a'; 64];
             haystack[31] = b'Z';
-            let (span, accounting) = plan
-                .find(&haystack, SearchLimits::unlimited())
-                .unwrap();
+            let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, Some((0, 32)));
             assert_eq!(accounting.prefilter_calls, 1);
             assert_eq!(accounting.prefix_bytes_examined, 65);
