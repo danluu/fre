@@ -664,12 +664,11 @@ impl ForwardAnchoredPlan {
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "native prefilter candidate",
                     })?;
-            let scan_end = candidate
-                .checked_add(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "forward prefix scan end",
-                })?;
-            let (boundary, examined) = self.scan_prefix(&searched[..scan_end])?;
+            // `candidate` is already known to contain `suffix[0]`, which is
+            // outside the class by construction. Validate only the prefix
+            // before it so a valid candidate never enters failed-block
+            // recovery merely to rediscover that known boundary.
+            let (boundary, examined) = self.scan_prefix(&searched[..candidate])?;
             accounting.prefix_bytes_examined = accounting
                 .prefix_bytes_examined
                 .checked_add(examined)
@@ -752,12 +751,12 @@ impl ForwardAnchoredPlan {
         } else {
             0
         };
-        let prefix_bytes_upper_bound = window_bytes
-            .checked_add(rescan_margin)
-            .and_then(|value| value.checked_add(usize::from(uses_prefilter)))
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "prefix examinations upper bound",
-            })?;
+        let prefix_bytes_upper_bound =
+            window_bytes
+                .checked_add(rescan_margin)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "prefix examinations upper bound",
+                })?;
         let suffix_bytes_upper_bound = self.suffix.len().min(window_bytes);
         let examined_bytes_upper_bound = prefilter_bytes_upper_bound
             .checked_add(prefix_bytes_upper_bound)
