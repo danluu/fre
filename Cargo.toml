@@ -23,6 +23,7 @@ members = [
     "tools/rebar-compare",
     "tools/rebar-manifest",
     "tools/fre-holdout",
+    "tools/fre-unsafe-lint-boundary",
 ]
 
 [workspace.package]

@@ -254,6 +254,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-unsafe-lint-boundary"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

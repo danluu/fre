@@ -63,7 +63,16 @@ fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_TARGET_DIR="$temporary/target"
 
-cargo check -p rebar-expand --lib -v >"$temporary/unrelated.log" 2>&1
+cargo test --locked --offline -p fre-unsafe-lint-boundary \
+    >"$temporary/metadata-checker-tests.log" 2>&1
+cargo metadata --locked --offline --no-deps --format-version 1 \
+    >"$temporary/metadata.json"
+cargo run --locked --offline --quiet -p fre-unsafe-lint-boundary \
+    <"$temporary/metadata.json" \
+    >"$temporary/metadata-audit.log" 2>&1
+
+cargo check --locked --offline -p rebar-expand --lib -v \
+    >"$temporary/unrelated.log" 2>&1
 if ! grep -E -- '--crate-name rebar_expand .*--forbid=unsafe_code' \
     "$temporary/unrelated.log" >/dev/null
 then
@@ -72,7 +81,8 @@ then
     exit 1
 fi
 
-cargo check -p fre-kernels --lib -v >"$temporary/kernels.log" 2>&1
+cargo check --locked --offline -p fre-kernels --lib -v \
+    >"$temporary/kernels.log" 2>&1
 if ! grep -E -- '--crate-name fre_kernels .*--deny=unsafe_code' \
     "$temporary/kernels.log" >/dev/null
 then
@@ -81,16 +91,9 @@ then
     exit 1
 fi
 
-for example in crates/fre-kernels/examples/*.rs; do
-    if ! grep -q '^#!\[forbid(unsafe_code)\]$' "$example"; then
-        echo "unsafe lint boundary failure: missing example-root forbid: $example" >&2
-        exit 1
-    fi
-done
-
-cargo test -p fre-kernels \
+cargo test --locked --offline -p fre-kernels \
     forward_anchored::tests::exact_suffix_copy_has_exact_capacity_and_typed_failure \
-    -- --exact >"$temporary/helper-test.log" 2>&1
+    --lib -- --exact >"$temporary/helper-test.log" 2>&1
 
 printf '%s\n' \
-    'PASS lint-tables=matched workspace-unrelated=forbid target-allow=E0453 audited-library=deny helper=pass examples=forbid'
+    'PASS lint-tables=matched workspace-unrelated=forbid target-allow=E0453 audited-library=deny metadata-targets=forbid exceptions=allowlisted mutation-fixtures=pass helper=pass'

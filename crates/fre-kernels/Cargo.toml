@@ -16,7 +16,9 @@ regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 
 [lints.rust]
 # The library contains one function-local, audited exact-layout allocation
-# primitive. Every other workspace package inherits the workspace `forbid`.
+# primitive. This is the only newly introduced package-local exception; the
+# metadata boundary check pins every intentional exception and non-library
+# target.
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }

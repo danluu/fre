@@ -1,0 +1,16 @@
+[package]
+name = "fre-unsafe-lint-boundary"
+version.workspace = true
+description = "Fail-closed Cargo target and unsafe-lint boundary verifier"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+toml = "=1.1.2"
+
+[lints]
+workspace = true
