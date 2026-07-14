@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
