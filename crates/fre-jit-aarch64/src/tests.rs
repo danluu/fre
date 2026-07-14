@@ -1574,6 +1574,10 @@ fn m17_count_decoded_template_rejects_representative_semantic_mutations() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three independently simulated overread witnesses remain adjacent for auditability"
+)]
 fn semantic_memory_mutants_have_independent_invalid_read_witnesses() {
     let literal = b"0123456789abcdefg";
     let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
