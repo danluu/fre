@@ -5,8 +5,8 @@ use regex_syntax::{
 
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
-    ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind, RustOptions,
-    RustParsed, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion, UpstreamRevision,
+    ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
+    RustConstructor, RustOptions, RustParsed, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
 };
 
 pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseError> {
@@ -82,14 +82,70 @@ fn validate_rust_configuration(
         CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => rust,
         CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
     };
-    if rust.revision != UpstreamRevision::RustRegex1_13_0_926af2e
-        || rust.regex_syntax_version != (0, 8, 11)
+    let supported_constructor = match (&rust.constructor, profile) {
+        (
+            RustConstructor::RegexBuilder {
+                size_limit,
+                dfa_size_limit,
+                text_syntax_utf8,
+                bytes_syntax_utf8,
+                text_utf8_empty,
+                bytes_utf8_empty,
+                match_kind: crate::RustMatchKind::LeftmostFirst,
+            },
+            _,
+        ) => {
+            *size_limit == 10 * (1 << 20)
+                && *dfa_size_limit == 2 * (1 << 20)
+                && *text_syntax_utf8
+                && !*bytes_syntax_utf8
+                && *text_utf8_empty
+                && !*bytes_utf8_empty
+        }
+        (
+            RustConstructor::RebarMeta {
+                rebar_revision,
+                regex_default_features,
+                regex_logging,
+                regex_perf_dfa_full,
+                regex_automata_default_features,
+                syntax_utf8,
+                utf8_empty,
+                match_kind: crate::RustMatchKind::LeftmostFirst,
+                build_many_ordered,
+                thompson_nfa_size_limit,
+                admission_status: AdmissionStatus::UpstreamOraclePending,
+            },
+            CompatibilityProfile::RustBytes(_),
+        ) => {
+            *rebar_revision == crate::UpstreamRevision::Rebar463d00f
+                && *regex_default_features
+                && *regex_logging
+                && *regex_perf_dfa_full
+                && *regex_automata_default_features
+                && !*syntax_utf8
+                && !*utf8_empty
+                && *build_many_ordered
+                && *thompson_nfa_size_limit == 100 * 1_048_576
+        }
+        (
+            RustConstructor::RebarMeta { .. },
+            CompatibilityProfile::RustBytes(_) | CompatibilityProfile::RustText(_),
+        ) => false,
+        (RustConstructor::RebarMeta { .. }, CompatibilityProfile::Re2(_)) => {
+            unreachable!("dispatch validated profile")
+        }
+    };
+    if rust.regex != crate::PackageIdentity::REGEX_1_12_4
+        || rust.regex_automata != crate::PackageIdentity::REGEX_AUTOMATA_0_4_14
+        || rust.regex_syntax != crate::PackageIdentity::REGEX_SYNTAX_0_8_11
         || rust.unicode != UnicodeVersion::RUST_16_0_0
+        || !supported_constructor
     {
         return Err(ParseError::new(
             profile.clone(),
             ErrorCategory::InvalidConfiguration,
-            "this parser only implements the pinned Rust regex 1.13.0 / regex-syntax 0.8.11 / Unicode 16.0 profile",
+            "this parser only implements the exact regex 1.12.4 / regex-automata 0.4.14 / regex-syntax 0.8.11 / Unicode 16.0 high-level and Rebar profiles",
         ));
     }
     if options.unicode && !options.line_terminator.is_ascii() {

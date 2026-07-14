@@ -448,6 +448,13 @@ impl AggregateBuilder {
         }
     }
 
+    /// Select the complete Rust release-stack and constructor identity.
+    #[must_use]
+    pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Set Unicode syntax mode. `true` admits only the nonempty exact-literal
     /// proof; general Unicode continuation execution remains a typed refusal.
     #[must_use]

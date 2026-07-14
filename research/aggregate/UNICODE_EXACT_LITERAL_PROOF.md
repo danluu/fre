@@ -144,7 +144,7 @@ candidate over all 79 formerly unsupported Unicode `count`/`count-spans` jobs.
 Exactly the five closed-set job IDs become passing `aggregate-exact-literal`
 executions; the other 74 remain typed unsupported. Separate pinned-Rust and
 FRE receipts for the five jobs are all passes, producing ten closed-set
-receipts. Sentinel schema v2 pins every retained job's exact refusal reason and
+receipts. The retained legacy sentinel schema v2 pins every retained job's exact refusal reason and
 complete receipt, with digests `9e8a2d9e...a835c4a` and
 `fd31d8f0...f3ec70`. The embedded complete-frontier and closed receipt digests
 are respectively `c7be610a...5e40218` and `e49a0d8d...07d6056`.
@@ -167,21 +167,25 @@ target/debug/examples/unicode_literal_sentinel \
 This checkpoint contains no timing evidence and makes no Unicode-continuation
 or performance-promotion claim.
 
-## Profile-identity promotion blocker
+## Profile identity
 
-This slice is **not promotable yet**. The facade currently initializes
-`AggregateBuilder::profile` with `RustProfile::default()` in
-`crates/fre/src/aggregate.rs`. That default records
-`UpstreamRevision::RustRegex1_13_0_926af2e`, regex-syntax 0.8.11, and Unicode
-16.0 in `crates/fre-syntax/src/profile.rs`; validation in
-`crates/fre-syntax/src/rust.rs` accepts only that 1.13 profile. The Rebar oracle
-used here is instead pinned to regex 1.12.4 and regex-automata 0.4.14 in
-`tools/rebar-compare/Cargo.toml` and `tools/rebar-compare/src/lib.rs`.
+The facade now has separate typed high-level and Rebar profiles for the released
+`regex` 1.12.4, `regex-automata` 0.4.14 and `regex-syntax` 0.8.11 stack. Each
+component records its crates.io checksum and independent packaged VCS revision.
+The Rebar profile additionally records revision `463d00f`, dependency features,
+ordered leftmost-first meta construction, `syntax.utf8=false`,
+`utf8_empty=false`, the 100 MiB Thompson NFA limit, Unicode 16.0.0, and pending
+upstream admission. Comparator and admission-frontier paths select that profile
+explicitly; the 100 MiB upstream setting is identity only and does not widen an
+FRE safety envelope or quota.
 
-The exhaustive differentials establish matching behavior for this narrow HIR
-family, but they cannot make a 1.13-labelled `CacheKey` an honest 1.12.4
-identity. A dedicated follow-up must add and validate an explicit regex 1.12.4
-Rust-bytes profile, construct this facade with it, and rerun every semantic,
-identity, resource, and frontier gate. Until then the retained sentinel is
-diagnostic evidence only; canonical report regeneration, timing, and promotion
-remain blocked.
+`fre-syntax` schema 2 prevents the corrected component/configuration stamp from
+aliasing the former shape. Aggregate schema 3 is unchanged because its nested
+syntax key carries that version. The comparator remains report schema v2 with
+candidate adapter `fre-current-aggregate-v3`. The next sentinel uses schema v3
+and semantic-domain v2 while reading the retained canonical frontier through an
+explicit legacy `fre-current-aggregate-v2` identity.
+
+The retained sentinel above remains diagnostic evidence only. All semantic,
+identity, resource, deterministic-sentinel, comparator, and holdout gates must
+be rerun before canonical report regeneration, timing, or promotion.

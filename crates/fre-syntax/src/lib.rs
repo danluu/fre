@@ -24,8 +24,9 @@ pub use parsed::{
     PatternBytes, Re2Literal, Re2Parsed, RustParsed, SCHEMA_VERSION,
 };
 pub use profile::{
-    CompatibilityProfile, InputKind, Re2Encoding, Re2Options, Re2Profile, Re2Syntax, RustOptions,
-    RustProfile, UnicodeVersion, UpstreamRevision,
+    CompatibilityProfile, InputKind, PackageIdentity, PackageVersion, Re2Encoding, Re2Options,
+    Re2Profile, Re2Syntax, RustConstructor, RustMatchKind, RustOptions, RustProfile,
+    UnicodeVersion, UpstreamRevision,
 };
 pub use re2::{Re2Capability, Re2CapabilityStatus, Re2Surface, re2_surface_inventory};
 

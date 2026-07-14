@@ -58,8 +58,8 @@ Integration tests exercise the full `fre-syntax -> fre-lower -> fre-automata`
 path, priority and greediness, explicit nullable-cycle rejection, ranged assertion context,
 resource failures, and a 20,000-term concatenation on a 128 KiB native stack.
 An exhaustive small-alphabet differential suite compares supported expressions
-with exactly `regex` 1.12.4, labeled as the pinned Rebar baseline adapter rather
-than the separate regex 1.13.0 source-profile admission oracle.
+with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
+`regex-syntax` 0.8.11 with their independently packaged source receipts.
 
 ## Limitations ledger
 

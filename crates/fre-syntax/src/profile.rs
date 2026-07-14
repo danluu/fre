@@ -1,10 +1,18 @@
 use core::fmt;
 
+use crate::AdmissionStatus;
+
 /// A pinned upstream source revision that participates in semantic identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum UpstreamRevision {
-    /// `rust-lang/regex` 1.13.0 at the revision used by this prototype.
-    RustRegex1_13_0_926af2e,
+    /// Packaged VCS revision for `regex` 1.12.4.
+    RustRegex1_12_4_7b96fdc,
+    /// Packaged VCS revision for `regex-automata` 0.4.14.
+    RustRegexAutomata0_4_14_5e195de,
+    /// Packaged VCS revision for `regex-syntax` 0.8.11.
+    RustRegexSyntax0_8_11_1401679,
+    /// Rebar revision whose Rust adapter configuration is represented here.
+    Rebar463d00f,
     /// `google/re2` at revision `972a15cedd008d846f1a39b2e88ce48d7f166cbd`.
     Re2_972a15c,
 }
@@ -13,10 +21,65 @@ impl UpstreamRevision {
     #[must_use]
     pub const fn commit(self) -> &'static str {
         match self {
-            Self::RustRegex1_13_0_926af2e => "926af2e68eca3ce089815790541cf50759ba2c59",
+            Self::RustRegex1_12_4_7b96fdc => "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1",
+            Self::RustRegexAutomata0_4_14_5e195de => "5e195de266e203441b2c8001d6ebefab1161a59e",
+            Self::RustRegexSyntax0_8_11_1401679 => "140167995737fa11dfe11b8af8b9aa143b790b4e",
+            Self::Rebar463d00f => "463d00f31887e84c38467805b9e3122c314b9521",
             Self::Re2_972a15c => "972a15cedd008d846f1a39b2e88ce48d7f166cbd",
         }
     }
+}
+
+/// A crates.io package version participating in compatibility identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl fmt::Display for PackageVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Exact crates.io and packaged-source receipt for one Rust component.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageIdentity {
+    pub version: PackageVersion,
+    pub checksum: &'static str,
+    pub vcs_revision: UpstreamRevision,
+}
+
+impl PackageIdentity {
+    pub const REGEX_1_12_4: Self = Self {
+        version: PackageVersion {
+            major: 1,
+            minor: 12,
+            patch: 4,
+        },
+        checksum: "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba",
+        vcs_revision: UpstreamRevision::RustRegex1_12_4_7b96fdc,
+    };
+    pub const REGEX_AUTOMATA_0_4_14: Self = Self {
+        version: PackageVersion {
+            major: 0,
+            minor: 4,
+            patch: 14,
+        },
+        checksum: "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f",
+        vcs_revision: UpstreamRevision::RustRegexAutomata0_4_14_5e195de,
+    };
+    pub const REGEX_SYNTAX_0_8_11: Self = Self {
+        version: PackageVersion {
+            major: 0,
+            minor: 8,
+            patch: 11,
+        },
+        checksum: "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4",
+        vcs_revision: UpstreamRevision::RustRegexSyntax0_8_11_1401679,
+    };
 }
 
 /// Unicode Character Database version used by a semantic profile.
@@ -48,8 +111,6 @@ impl fmt::Display for UnicodeVersion {
 
 /// All public Rust regex builder settings that affect compatibility identity.
 ///
-/// `size_limit` and `dfa_size_limit` do not change language semantics, but do
-/// change constructor behavior and therefore remain in cache/admission keys.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -65,8 +126,6 @@ pub struct RustOptions {
     pub ignore_whitespace: bool,
     pub unicode: bool,
     pub octal: bool,
-    pub size_limit: u64,
-    pub dfa_size_limit: u64,
     pub nest_limit: u32,
 }
 
@@ -82,30 +141,128 @@ impl Default for RustOptions {
             ignore_whitespace: false,
             unicode: true,
             octal: false,
-            size_limit: 10 * (1 << 20),
-            dfa_size_limit: 2 * (1 << 20),
             nest_limit: 250,
         }
     }
 }
 
+/// Match selection configured by a Rust constructor profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RustMatchKind {
+    LeftmostFirst,
+}
+
+/// Constructor and feature identity beyond syntax builder options.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RustConstructor {
+    /// High-level `regex::bytes::RegexBuilder` release defaults.
+    RegexBuilder {
+        size_limit: u64,
+        dfa_size_limit: u64,
+        text_syntax_utf8: bool,
+        bytes_syntax_utf8: bool,
+        text_utf8_empty: bool,
+        bytes_utf8_empty: bool,
+        match_kind: RustMatchKind,
+    },
+    /// Rebar's ordered `regex_automata::meta::Regex::builder` configuration.
+    RebarMeta {
+        rebar_revision: UpstreamRevision,
+        regex_default_features: bool,
+        regex_logging: bool,
+        regex_perf_dfa_full: bool,
+        regex_automata_default_features: bool,
+        syntax_utf8: bool,
+        utf8_empty: bool,
+        match_kind: RustMatchKind,
+        build_many_ordered: bool,
+        thompson_nfa_size_limit: u64,
+        admission_status: AdmissionStatus,
+    },
+}
+
 /// Versioned Rust-regex profile data shared by text and bytes facades.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RustProfile {
-    pub revision: UpstreamRevision,
-    pub regex_syntax_version: (u16, u16, u16),
+    pub regex: PackageIdentity,
+    pub regex_automata: PackageIdentity,
+    pub regex_syntax: PackageIdentity,
     pub unicode: UnicodeVersion,
+    pub constructor: RustConstructor,
     pub options: RustOptions,
 }
 
 impl Default for RustProfile {
     fn default() -> Self {
+        Self::regex_1_12_4()
+    }
+}
+
+impl RustProfile {
+    /// Honest high-level `regex` 1.12.4 release-stack identity.
+    #[must_use]
+    pub fn regex_1_12_4() -> Self {
         Self {
-            revision: UpstreamRevision::RustRegex1_13_0_926af2e,
-            regex_syntax_version: (0, 8, 11),
+            regex: PackageIdentity::REGEX_1_12_4,
+            regex_automata: PackageIdentity::REGEX_AUTOMATA_0_4_14,
+            regex_syntax: PackageIdentity::REGEX_SYNTAX_0_8_11,
             unicode: UnicodeVersion::RUST_16_0_0,
+            constructor: RustConstructor::RegexBuilder {
+                size_limit: 10 * (1 << 20),
+                dfa_size_limit: 2 * (1 << 20),
+                text_syntax_utf8: true,
+                bytes_syntax_utf8: false,
+                text_utf8_empty: true,
+                bytes_utf8_empty: false,
+                match_kind: RustMatchKind::LeftmostFirst,
+            },
             options: RustOptions::default(),
         }
+    }
+
+    /// Exact Rebar 1.12.4 Rust adapter construction identity.
+    #[must_use]
+    pub fn rebar_1_12_4() -> Self {
+        Self {
+            regex: PackageIdentity::REGEX_1_12_4,
+            regex_automata: PackageIdentity::REGEX_AUTOMATA_0_4_14,
+            regex_syntax: PackageIdentity::REGEX_SYNTAX_0_8_11,
+            unicode: UnicodeVersion::RUST_16_0_0,
+            constructor: RustConstructor::RebarMeta {
+                rebar_revision: UpstreamRevision::Rebar463d00f,
+                regex_default_features: true,
+                regex_logging: true,
+                regex_perf_dfa_full: true,
+                regex_automata_default_features: true,
+                syntax_utf8: false,
+                utf8_empty: false,
+                match_kind: RustMatchKind::LeftmostFirst,
+                build_many_ordered: true,
+                thompson_nfa_size_limit: 100 * 1_048_576,
+                admission_status: AdmissionStatus::UpstreamOraclePending,
+            },
+            options: RustOptions::default(),
+        }
+    }
+
+    /// Stable textual receipt derived from the typed component/config stamp.
+    #[must_use]
+    pub fn identity_string(&self) -> String {
+        format!(
+            "regex={}@{}#{}; regex-automata={}@{}#{}; regex-syntax={}@{}#{}; unicode={}; constructor={:?}; options={:?}",
+            self.regex.version,
+            self.regex.vcs_revision.commit(),
+            self.regex.checksum,
+            self.regex_automata.version,
+            self.regex_automata.vcs_revision.commit(),
+            self.regex_automata.checksum,
+            self.regex_syntax.version,
+            self.regex_syntax.vcs_revision.commit(),
+            self.regex_syntax.checksum,
+            self.unicode,
+            self.constructor,
+            self.options,
+        )
     }
 }
 

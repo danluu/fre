@@ -7,7 +7,7 @@ use std::{
     process::ExitCode,
 };
 
-use fre::PortableBuilder;
+use fre::{PortableBuilder, RustProfile};
 use rebar_expand::Manifest;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -119,6 +119,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let pattern = String::from_utf8(bytes)?;
             match PortableBuilder::new(pattern)
+                .profile(RustProfile::rebar_1_12_4())
                 .unicode(job.regex.unicode)
                 .build()
             {

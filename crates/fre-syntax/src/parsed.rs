@@ -2,7 +2,7 @@ use regex_syntax::hir::Hir;
 
 use crate::{AdmissionPolicy, CompatibilityProfile, ParseError, SafetyEnvelope};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Pattern source is bytes because RE2's Latin-1 surface is not a Rust `str`.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

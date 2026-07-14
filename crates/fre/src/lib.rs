@@ -56,8 +56,10 @@ use fre_kernels::{
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ParseSummary,
-    RustProfile, SafetyEnvelope,
+    SafetyEnvelope,
 };
+
+pub use fre_syntax::RustProfile;
 
 pub use fre_automata::{SearchError as K0SearchError, SearchLimits, SearchWindow};
 
@@ -133,6 +135,8 @@ impl Match {
 /// Auditable construction facts for one portable plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildReport {
+    /// Complete compatibility profile selected before parsing.
+    pub profile: CompatibilityProfile,
     /// What has and has not established constructor admission.
     pub admission: AdmissionStatus,
     /// Bounded syntax traversal facts.
@@ -501,6 +505,13 @@ impl PortableBuilder {
         }
     }
 
+    /// Select the complete Rust release-stack and constructor identity.
+    #[must_use]
+    pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Set the Rust bytes facade's Unicode mode before parsing.
     #[must_use]
     pub fn unicode(mut self, enabled: bool) -> Self {
@@ -556,9 +567,10 @@ impl PortableBuilder {
             let plan = automaton.stats();
             return Ok(PortableRegex {
                 plan: PortablePlan::K0(automaton),
-                profile,
+                profile: profile.clone(),
                 limits: self.limits,
                 report: BuildReport {
+                    profile: profile.clone(),
                     admission,
                     syntax,
                     plan: PlanKind::K0,
@@ -591,9 +603,10 @@ impl PortableBuilder {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
                             plan: PortablePlan::ForwardAnchored(plan),
-                            profile,
+                            profile: profile.clone(),
                             limits: self.limits,
                             report: BuildReport {
+                                profile: profile.clone(),
                                 admission,
                                 syntax,
                                 plan: PlanKind::ForwardAnchored,
@@ -633,9 +646,10 @@ impl PortableBuilder {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
                             plan: PortablePlan::RequiredLiteral(plan),
-                            profile,
+                            profile: profile.clone(),
                             limits: self.limits,
                             report: BuildReport {
+                                profile: profile.clone(),
                                 admission,
                                 syntax,
                                 plan: PlanKind::RequiredLiteral,
@@ -672,9 +686,10 @@ impl PortableBuilder {
                 let storage = literal.storage_bytes();
                 return Ok(PortableRegex {
                     plan: PortablePlan::ExactLiteral(literal),
-                    profile,
+                    profile: profile.clone(),
                     limits: self.limits,
                     report: BuildReport {
+                        profile: profile.clone(),
                         admission,
                         syntax,
                         plan: PlanKind::ExactLiteral,
@@ -696,9 +711,10 @@ impl PortableBuilder {
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
                         plan: PortablePlan::PackedLiteralSet(packed),
-                        profile,
+                        profile: profile.clone(),
                         limits: self.limits,
                         report: BuildReport {
+                            profile: profile.clone(),
                             admission,
                             syntax,
                             plan: PlanKind::PackedLiteralSet,
@@ -717,9 +733,10 @@ impl PortableBuilder {
                 let storage = literal_set.build_accounting().persistent_bytes;
                 return Ok(PortableRegex {
                     plan: PortablePlan::LiteralSetDfa(literal_set),
-                    profile,
+                    profile: profile.clone(),
                     limits: self.limits,
                     report: BuildReport {
+                        profile: profile.clone(),
                         admission,
                         syntax,
                         plan: PlanKind::LiteralSetDfa,
@@ -742,9 +759,10 @@ impl PortableBuilder {
         let plan = automaton.stats();
         Ok(PortableRegex {
             plan: PortablePlan::K0(automaton),
-            profile,
+            profile: profile.clone(),
             limits: self.limits,
             report: BuildReport {
+                profile: profile.clone(),
                 admission,
                 syntax,
                 plan: PlanKind::K0,

@@ -2,9 +2,10 @@ use std::collections::{BTreeSet, HashSet};
 
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ErrorCategory,
-    ParseRequest, QuotaBounded, Re2CapabilityStatus, Re2Encoding, Re2Options, Re2Profile,
-    Re2Surface, ResourceKind, RustProfile, SafetyEnvelope, StrictAdmission, SyntaxQuotas,
-    UnicodeVersion, UpstreamRevision, parse, re2_surface_inventory,
+    PackageIdentity, ParseRequest, QuotaBounded, Re2CapabilityStatus, Re2Encoding, Re2Options,
+    Re2Profile, Re2Surface, ResourceKind, RustConstructor, RustMatchKind, RustProfile,
+    SafetyEnvelope, StrictAdmission, SyntaxQuotas, UnicodeVersion, UpstreamRevision, parse,
+    re2_surface_inventory,
 };
 
 fn re2_literal_profile() -> CompatibilityProfile {
@@ -16,18 +17,75 @@ fn re2_literal_profile() -> CompatibilityProfile {
 #[test]
 fn pinned_defaults_are_explicit() {
     let RustProfile {
-        revision,
-        regex_syntax_version,
+        regex,
+        regex_automata,
+        regex_syntax,
         unicode,
+        constructor,
         options,
     } = RustProfile::default();
-    assert_eq!(revision, UpstreamRevision::RustRegex1_13_0_926af2e);
-    assert_eq!(regex_syntax_version, (0, 8, 11));
+    assert_eq!(regex, PackageIdentity::REGEX_1_12_4);
+    assert_eq!(regex_automata, PackageIdentity::REGEX_AUTOMATA_0_4_14);
+    assert_eq!(regex_syntax, PackageIdentity::REGEX_SYNTAX_0_8_11);
+    assert_eq!(regex.version.to_string(), "1.12.4");
+    assert_eq!(regex_automata.version.to_string(), "0.4.14");
+    assert_eq!(regex_syntax.version.to_string(), "0.8.11");
+    assert_eq!(
+        regex.checksum,
+        "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+    );
+    assert_eq!(
+        regex_automata.checksum,
+        "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+    );
+    assert_eq!(
+        regex_syntax.checksum,
+        "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+    );
+    assert_eq!(
+        regex.vcs_revision.commit(),
+        "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1"
+    );
+    assert_eq!(
+        regex_automata.vcs_revision.commit(),
+        "5e195de266e203441b2c8001d6ebefab1161a59e"
+    );
+    assert_eq!(
+        regex_syntax.vcs_revision.commit(),
+        "140167995737fa11dfe11b8af8b9aa143b790b4e"
+    );
     assert_eq!(unicode, UnicodeVersion::RUST_16_0_0);
     assert!(options.unicode);
     assert_eq!(options.nest_limit, 250);
-    assert_eq!(options.size_limit, 10 * (1 << 20));
-    assert_eq!(options.dfa_size_limit, 2 * (1 << 20));
+    assert_eq!(
+        constructor,
+        RustConstructor::RegexBuilder {
+            size_limit: 10 * (1 << 20),
+            dfa_size_limit: 2 * (1 << 20),
+            text_syntax_utf8: true,
+            bytes_syntax_utf8: false,
+            text_utf8_empty: true,
+            bytes_utf8_empty: false,
+            match_kind: RustMatchKind::LeftmostFirst,
+        }
+    );
+
+    assert!(matches!(
+        RustProfile::rebar_1_12_4().constructor,
+        RustConstructor::RebarMeta {
+            rebar_revision: UpstreamRevision::Rebar463d00f,
+            regex_default_features: true,
+            regex_logging: true,
+            regex_perf_dfa_full: true,
+            regex_automata_default_features: true,
+            syntax_utf8: false,
+            utf8_empty: false,
+            match_kind: RustMatchKind::LeftmostFirst,
+            build_many_ordered: true,
+            thompson_nfa_size_limit: 104_857_600,
+            admission_status: AdmissionStatus::UpstreamOraclePending,
+        }
+    ));
 
     let re2 = Re2Profile::default();
     assert_eq!(re2.revision, UpstreamRevision::Re2_972a15c);
@@ -36,6 +94,48 @@ fn pinned_defaults_are_explicit() {
     assert!(re2.options.log_errors);
     assert!(re2.options.case_sensitive);
     assert!(!re2.options.posix_syntax);
+}
+
+#[test]
+fn high_level_and_rebar_profiles_share_syntax_but_not_cache_identity() {
+    let high_level = parse(ParseRequest::rust(
+        "(?i:ab[c-e])",
+        CompatibilityProfile::RustBytes(RustProfile::regex_1_12_4()),
+    ))
+    .expect("high-level profile parses");
+    let rebar = parse(ParseRequest::rust(
+        "(?i:ab[c-e])",
+        CompatibilityProfile::RustBytes(RustProfile::rebar_1_12_4()),
+    ))
+    .expect("Rebar profile parses");
+    assert_eq!(high_level.summary, rebar.summary);
+    assert_ne!(high_level.key, rebar.key);
+    let CanonicalPattern::Rust(high_level) = high_level.pattern else {
+        panic!("Rust request returned another syntax family")
+    };
+    let CanonicalPattern::Rust(rebar) = rebar.pattern else {
+        panic!("Rust request returned another syntax family")
+    };
+    assert_eq!(high_level.hir, rebar.hir);
+}
+
+#[test]
+fn forged_rebar_admission_stamp_is_rejected() {
+    let mut forged = RustProfile::rebar_1_12_4();
+    let RustConstructor::RebarMeta {
+        admission_status, ..
+    } = &mut forged.constructor
+    else {
+        panic!("Rebar profile did not use the Rebar constructor")
+    };
+    *admission_status = AdmissionStatus::QuotaChecked;
+
+    let error = parse(ParseRequest::rust(
+        "a",
+        CompatibilityProfile::RustBytes(forged),
+    ))
+    .expect_err("a forged Rebar admission stamp must be rejected");
+    assert_eq!(error.category, ErrorCategory::InvalidConfiguration);
 }
 
 #[test]
@@ -372,5 +472,14 @@ fn error_categories_do_not_depend_on_message_parsing() {
         CompatibilityProfile::RustText(unstamped),
     ))
     .expect_err("an unimplemented version stamp cannot borrow current semantics");
+    assert_eq!(stamp.category, ErrorCategory::InvalidConfiguration);
+
+    let mut mismatched_receipt = RustProfile::rebar_1_12_4();
+    mismatched_receipt.regex.checksum = "mismatched";
+    let stamp = parse(ParseRequest::rust(
+        ".",
+        CompatibilityProfile::RustBytes(mismatched_receipt),
+    ))
+    .expect_err("a mismatched component receipt cannot borrow current semantics");
     assert_eq!(stamp.category, ErrorCategory::InvalidConfiguration);
 }

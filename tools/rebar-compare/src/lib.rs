@@ -23,7 +23,8 @@ use fre::{
     AggregateExecutionSource, AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy,
     LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, LiteralAggregateReduceLimits, PortableBuilder, SearchLimits,
+    LiteralAggregateReduceError, LiteralAggregateReduceLimits, PortableBuilder, RustProfile,
+    SearchLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -38,7 +39,9 @@ pub const LITERAL_AGGREGATE_TIMING_SCHEMA: &str = "fre.rebar.literal-aggregate-t
 pub const LITERAL_AGGREGATE_VALUE_TIMING_SCHEMA: &str =
     "fre.rebar.literal-aggregate-value-timing.v1";
 /// Deterministic affected-family semantic sentinel for Unicode exact literals.
-pub const UNICODE_LITERAL_SENTINEL_SCHEMA: &str = "fre.rebar.unicode-exact-literal-sentinel.v2";
+pub const UNICODE_LITERAL_SENTINEL_SCHEMA: &str = "fre.rebar.unicode-exact-literal-sentinel.v3";
+/// Candidate identity expected only while reading the canonical v2 baseline.
+pub const LEGACY_FRE_ADAPTER_V2: &str = "fre-current-aggregate-v2";
 /// Exact Rebar revision accepted by this implementation.
 pub const AUDITED_REBAR_REVISION: &str = rebar_expand::AUDITED_REBAR_REVISION;
 /// Exact Rust adapter package version.
@@ -50,10 +53,10 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v3";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
-    "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v1";
+    "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
 const UNICODE_LITERAL_RETAINED_UNSUPPORTED_JOBS: usize = 74;
 const UNICODE_LITERAL_RETAINED_UNSUPPORTED_REASONS_SHA256: &str =
     "9e8a2d9ef8da3c3783742f9f5107db3a26ee1ccbbdefa0c4c0d9a9b49a835c4a";
@@ -66,6 +69,10 @@ const UNICODE_LITERAL_SENTINEL_JOB_IDS: [&str; 5] = [
     "hyperscan/literal-russian-som@rust/regex",
     "opt/prefilter/literal-russian@rust/regex",
 ];
+
+fn rebar_profile() -> RustProfile {
+    RustProfile::rebar_1_12_4()
+}
 
 /// Hard deterministic resource limits for one report generation.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -326,10 +333,13 @@ impl CandidateAdapter for CurrentFreAdapter {
     }
 
     fn identity(&self) -> AdapterIdentity {
+        let profile = rebar_profile();
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
-            identity: "fre Rust-bytes facade: PortableRegex grep plus construction-selected exact-literal or continuation count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure"
-                .to_string(),
+            identity: format!(
+                "{}; fre Rust-bytes facade: PortableRegex grep plus construction-selected exact-literal or continuation count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
+                profile.identity_string()
+            ),
             availability: "one-pattern count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; existing portable grep executes when bounded construction and operation admission succeed; all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
@@ -934,7 +944,7 @@ pub fn run_unicode_literal_sentinel(
     let expected_new: BTreeSet<&str> = UNICODE_LITERAL_SENTINEL_JOB_IDS.into_iter().collect();
     let mut frontier_remaining = BTreeSet::new();
     for receipt in &baseline.receipts {
-        if receipt.adapter == FRE_ADAPTER
+        if receipt.adapter == LEGACY_FRE_ADAPTER_V2
             && receipt.status == Status::Unsupported
             && receipt.input.unicode
             && matches!(receipt.model.as_str(), "count" | "count-spans")
@@ -1049,7 +1059,15 @@ pub fn run_unicode_literal_sentinel(
             "Unicode frontier exact refusal-reason digest {retained_reason_hash} differs from pinned {UNICODE_LITERAL_RETAINED_UNSUPPORTED_REASONS_SHA256}"
         )));
     }
-    let retained_receipt_bytes = serde_json::to_vec(&retained_receipts)
+    let legacy_retained_receipts: Vec<_> = retained_receipts
+        .iter()
+        .map(|receipt| {
+            let mut legacy = (*receipt).clone();
+            legacy.adapter = LEGACY_FRE_ADAPTER_V2.to_string();
+            legacy
+        })
+        .collect();
+    let retained_receipt_bytes = serde_json::to_vec(&legacy_retained_receipts)
         .map_err(|error| CompareError::new(format!("serialize retained receipts: {error}")))?;
     let retained_receipt_hash = sha256(&retained_receipt_bytes);
     if retained_receipt_hash != UNICODE_LITERAL_RETAINED_UNSUPPORTED_RECEIPTS_SHA256 {
@@ -2001,6 +2019,7 @@ fn fre_aggregate_count(
 ) -> Result<FreReduction, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
     let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
         .unicode(request.unicode)
         .case_insensitive(request.case_insensitive)
         .limits(aggregate_build_limits(limits))
@@ -2037,6 +2056,7 @@ fn fre_aggregate_span_sum(
 ) -> Result<FreReduction, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
     let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
         .unicode(request.unicode)
         .case_insensitive(request.case_insensitive)
         .limits(aggregate_build_limits(limits))
@@ -2089,6 +2109,7 @@ impl TimedFreAggregate {
         };
         let builder = || {
             AggregateBuilder::new(pattern)
+                .profile(rebar_profile())
                 .unicode(job.regex.unicode)
                 .case_insensitive(job.regex.case_insensitive)
                 .limits(aggregate_build_limits(limits))
@@ -2375,6 +2396,7 @@ fn fre_grep(
         ));
     }
     let regex = PortableBuilder::new(pattern)
+        .profile(rebar_profile())
         .unicode(request.unicode)
         .build()
         .map_err(|error| {
@@ -2709,9 +2731,7 @@ fn adapter_identities(
         },
         AdapterIdentity {
             adapter: RUST_ADAPTER.to_string(),
-            identity: format!(
-                "regex={RUST_REGEX_VERSION}; regex-automata={REGEX_AUTOMATA_VERSION}; utf8_empty=false; nfa_size_limit={NFA_SIZE_LIMIT}; syntax utf8=false"
-            ),
+            identity: rebar_profile().identity_string(),
             availability: rust_availability,
             runtime_sha256: rust_digest,
         },

@@ -4,13 +4,57 @@ use fre::{
     AggregateExecutionSource, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
     AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError, LiteralAggregateOperation,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, SearchLimits,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
 };
 
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
     AggregateStrategy::ReverseSequentialRows,
 ];
+
+fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
+    AggregateBuilder::new(pattern).profile(RustProfile::rebar_1_12_4())
+}
+
+fn portable_builder(pattern: impl Into<String>) -> PortableBuilder {
+    PortableBuilder::new(pattern).profile(RustProfile::rebar_1_12_4())
+}
+
+#[test]
+fn selected_rebar_profile_reaches_reports_and_option_updates_preserve_stamps() {
+    let expected = RustProfile::rebar_1_12_4();
+    let aggregate = aggregate_builder("a")
+        .unicode(false)
+        .case_insensitive(true)
+        .build_count()
+        .expect("Rebar-profile aggregate builds");
+    let fre_syntax::CompatibilityProfile::RustBytes(actual) =
+        &aggregate.build_report().syntax_key.profile
+    else {
+        panic!("aggregate report retained another profile family")
+    };
+    assert_eq!(actual.regex, expected.regex);
+    assert_eq!(actual.regex_automata, expected.regex_automata);
+    assert_eq!(actual.regex_syntax, expected.regex_syntax);
+    assert_eq!(actual.constructor, expected.constructor);
+    assert!(!actual.options.unicode);
+    assert!(actual.options.case_insensitive);
+
+    let portable = portable_builder("a")
+        .unicode(false)
+        .build()
+        .expect("Rebar-profile portable plan builds");
+    assert_eq!(&portable.build_report().profile, portable.profile());
+    let fre_syntax::CompatibilityProfile::RustBytes(actual) = &portable.build_report().profile
+    else {
+        panic!("portable report retained another profile family")
+    };
+    assert_eq!(actual.regex, expected.regex);
+    assert_eq!(actual.regex_automata, expected.regex_automata);
+    assert_eq!(actual.regex_syntax, expected.regex_syntax);
+    assert_eq!(actual.constructor, expected.constructor);
+    assert!(!actual.options.unicode);
+}
 
 fn upstream(pattern: &str, haystack: &[u8], case_insensitive: bool) -> Vec<(usize, usize)> {
     upstream_profile(pattern, haystack, case_insensitive, false)
@@ -76,7 +120,7 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
         .unwrap();
         for strategy in STRATEGIES {
             let builder = || {
-                AggregateBuilder::new(pattern)
+                aggregate_builder(pattern)
                     .unicode(false)
                     .case_insensitive(case_insensitive)
                     .plan_selection(AggregatePlanSelection::ForceContinuation)
@@ -137,16 +181,16 @@ fn exact_literal_auto_and_forced_results_match_continuation_and_rust() {
                 .map(|(start, end)| u64::try_from(end - start).unwrap())
                 .sum::<u64>();
 
-            let auto_count = AggregateBuilder::new(pattern)
+            let auto_count = aggregate_builder(pattern)
                 .unicode(false)
                 .build_count()
                 .unwrap();
-            let forced_count = AggregateBuilder::new(pattern)
+            let forced_count = aggregate_builder(pattern)
                 .unicode(false)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
                 .build_count()
                 .unwrap();
-            let continuation_count = AggregateBuilder::new(pattern)
+            let continuation_count = aggregate_builder(pattern)
                 .unicode(false)
                 .plan_selection(AggregatePlanSelection::ForceContinuation)
                 .build_count()
@@ -186,16 +230,16 @@ fn exact_literal_auto_and_forced_results_match_continuation_and_rust() {
                 assert_eq!(actual, expected_count, "count {pattern:?}/{haystack:?}");
             }
 
-            let auto_sum = AggregateBuilder::new(pattern)
+            let auto_sum = aggregate_builder(pattern)
                 .unicode(false)
                 .build_span_sum()
                 .unwrap();
-            let forced_sum = AggregateBuilder::new(pattern)
+            let forced_sum = aggregate_builder(pattern)
                 .unicode(false)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
                 .build_span_sum()
                 .unwrap();
-            let continuation_sum = AggregateBuilder::new(pattern)
+            let continuation_sum = aggregate_builder(pattern)
                 .unicode(false)
                 .plan_selection(AggregatePlanSelection::ForceContinuation)
                 .build_span_sum()
@@ -244,7 +288,7 @@ impl UnicodeExactOracle {
             .case_insensitive(false)
             .build()
             .unwrap_or_else(|error| panic!("Unicode oracle rejected {pattern:?}: {error}"));
-        let builder = || AggregateBuilder::new(pattern).unicode(true);
+        let builder = || aggregate_builder(pattern).unicode(true);
         let auto_count = builder().build_count().unwrap();
         let forced_count = builder()
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
@@ -446,14 +490,14 @@ fn unicode_empty_bytes_oracle_is_recorded_but_facade_scope_refuses_it() {
 
     for pattern in ["", r"(?:)"] {
         assert!(matches!(
-            AggregateBuilder::new(pattern).build_count(),
+            aggregate_builder(pattern).build_count(),
             Err(AggregateBuildError::UnicodeEnabled {
                 operation: AggregateOperation::Count,
                 selection: AggregatePlanSelection::Auto,
             })
         ));
         assert!(matches!(
-            AggregateBuilder::new(pattern)
+            aggregate_builder(pattern)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
                 .build_span_sum(),
             Err(AggregateBuildError::ExactLiteralIneligible {
@@ -476,7 +520,7 @@ fn unicode_profile_local_raw_valid_utf8_literal_is_hir_eligible() {
         AggregatePlanSelection::Auto,
         AggregatePlanSelection::ForceExactLiteral,
     ] {
-        let count = AggregateBuilder::new(pattern)
+        let count = aggregate_builder(pattern)
             .plan_selection(selection)
             .build_count()
             .unwrap();
@@ -501,7 +545,7 @@ fn unicode_profile_local_raw_valid_utf8_literal_is_hir_eligible() {
             2
         );
 
-        let sum = AggregateBuilder::new(pattern)
+        let sum = aggregate_builder(pattern)
             .plan_selection(selection)
             .build_span_sum()
             .unwrap();
@@ -534,11 +578,11 @@ fn unicode_profile_local_raw_byte_literal_is_typed_ineligible_not_invariant() {
     assert_eq!(matches, vec![(0, 1), (2, 3)]);
 
     assert!(matches!(
-        AggregateBuilder::new(pattern).build_count(),
+        aggregate_builder(pattern).build_count(),
         Err(AggregateBuildError::UnicodeEnabled { .. })
     ));
     assert!(matches!(
-        AggregateBuilder::new(pattern)
+        aggregate_builder(pattern)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .build_count(),
         Err(AggregateBuildError::ExactLiteralIneligible {
@@ -550,11 +594,8 @@ fn unicode_profile_local_raw_byte_literal_is_typed_ineligible_not_invariant() {
 
 #[test]
 fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
-    let unicode = AggregateBuilder::new("a").build_count().unwrap();
-    let bytes = AggregateBuilder::new("a")
-        .unicode(false)
-        .build_count()
-        .unwrap();
+    let unicode = aggregate_builder("a").build_count().unwrap();
+    let bytes = aggregate_builder("a").unicode(false).build_count().unwrap();
     assert_ne!(
         unicode.build_report().plan_identity,
         bytes.build_report().plan_identity
@@ -573,11 +614,11 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
 
     for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+", r"(?i:a)"] {
         assert!(matches!(
-            AggregateBuilder::new(pattern).build_count(),
+            aggregate_builder(pattern).build_count(),
             Err(AggregateBuildError::UnicodeEnabled { .. })
         ));
         assert!(matches!(
-            AggregateBuilder::new(pattern)
+            aggregate_builder(pattern)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
                 .build_count(),
             Err(AggregateBuildError::ExactLiteralIneligible {
@@ -587,13 +628,13 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         ));
     }
     assert!(matches!(
-        AggregateBuilder::new("рус")
+        aggregate_builder("рус")
             .case_insensitive(true)
             .build_count(),
         Err(AggregateBuildError::UnicodeEnabled { .. })
     ));
     assert!(matches!(
-        AggregateBuilder::new("рус")
+        aggregate_builder("рус")
             .case_insensitive(true)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .build_count(),
@@ -603,13 +644,13 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         })
     ));
     assert!(matches!(
-        AggregateBuilder::new(r"(?-i:a)")
+        aggregate_builder(r"(?-i:a)")
             .case_insensitive(true)
             .build_count(),
         Err(AggregateBuildError::UnicodeEnabled { .. })
     ));
     assert!(matches!(
-        AggregateBuilder::new(r"(?-i:a)")
+        aggregate_builder(r"(?-i:a)")
             .case_insensitive(true)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .build_count(),
@@ -619,19 +660,19 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         })
     ));
     assert!(matches!(
-        AggregateBuilder::new("雪")
+        aggregate_builder("雪")
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .build_count(),
         Err(AggregateBuildError::UnicodeEnabled { .. })
     ));
     assert!(matches!(
-        AggregateBuilder::new("雪").build_spans(),
+        aggregate_builder("雪").build_spans(),
         Err(AggregateBuildError::UnicodeEnabled { .. })
     ));
 }
 
 fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
-    AggregateBuilder::new("雪")
+    aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(limits)
         .build_count()
@@ -665,7 +706,7 @@ fn unicode_exact_count_error(
     reason = "every Unicode exact-literal planner/build/reducer dimension is checked at and below its boundary"
 )]
 fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
-    let baseline = AggregateBuilder::new("雪")
+    let baseline = aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .build_count()
         .unwrap();
@@ -686,7 +727,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
         },
         ..AggregateBuildLimits::default()
     };
-    AggregateBuilder::new("雪")
+    aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(exact_build)
         .build_count()
@@ -812,7 +853,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 
-    let sum = AggregateBuilder::new("雪")
+    let sum = aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(exact_build)
         .build_span_sum()
@@ -833,7 +874,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
 
 #[test]
 fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
-    let regex = AggregateBuilder::new(r"(?P<outer>(?P<inner>a))")
+    let regex = aggregate_builder(r"(?P<outer>(?P<inner>a))")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .build_count()
@@ -855,7 +896,7 @@ fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
         2
     );
 
-    let uncaptured = AggregateBuilder::new("a")
+    let uncaptured = aggregate_builder("a")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .build_count()
@@ -871,14 +912,14 @@ fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
     );
 
     assert!(matches!(
-        AggregateBuilder::new("").build_count(),
+        aggregate_builder("").build_count(),
         Err(AggregateBuildError::UnicodeEnabled {
             operation: AggregateOperation::Count,
             ..
         })
     ));
     assert_eq!(
-        AggregateBuilder::new("a")
+        aggregate_builder("a")
             .build_count()
             .unwrap()
             .count_value(b"baab", AggregateRunLimits::default())
@@ -890,7 +931,7 @@ fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
 #[test]
 fn exact_literal_eligibility_is_canonical_and_operation_specific() {
     assert!(matches!(
-        AggregateBuilder::new("abc")
+        aggregate_builder("abc")
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .build_spans(),
@@ -902,7 +943,7 @@ fn exact_literal_eligibility_is_canonical_and_operation_specific() {
     for pattern in [r"\Aabc", r"abc\z", r"a|b", r"(?i:a)"] {
         assert!(
             matches!(
-                AggregateBuilder::new(pattern)
+                aggregate_builder(pattern)
                     .unicode(false)
                     .plan_selection(AggregatePlanSelection::ForceExactLiteral)
                     .build_count(),
@@ -915,7 +956,7 @@ fn exact_literal_eligibility_is_canonical_and_operation_specific() {
         );
     }
 
-    let nested = AggregateBuilder::new("((abc))")
+    let nested = aggregate_builder("((abc))")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .build_count()
@@ -929,7 +970,7 @@ fn exact_literal_eligibility_is_canonical_and_operation_specific() {
         max_literal_planner_work: work,
         ..AggregateBuildLimits::default()
     };
-    AggregateBuilder::new("((abc))")
+    aggregate_builder("((abc))")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(limits)
@@ -937,7 +978,7 @@ fn exact_literal_eligibility_is_canonical_and_operation_specific() {
         .unwrap();
     limits.max_literal_planner_work = work - 1;
     assert!(matches!(
-        AggregateBuilder::new("((abc))")
+        aggregate_builder("((abc))")
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .limits(limits)
@@ -952,19 +993,19 @@ fn exact_literal_eligibility_is_canonical_and_operation_specific() {
 
 #[test]
 fn exact_literal_identity_is_semantic_and_does_not_publish_strategy() {
-    let captured = AggregateBuilder::new("(needle)")
+    let captured = aggregate_builder("(needle)")
         .unicode(false)
         .build_count()
         .unwrap();
-    let plain = AggregateBuilder::new("needle")
+    let plain = aggregate_builder("needle")
         .unicode(false)
         .build_count()
         .unwrap();
-    let sum = AggregateBuilder::new("needle")
+    let sum = aggregate_builder("needle")
         .unicode(false)
         .build_span_sum()
         .unwrap();
-    let continuation = AggregateBuilder::new("needle")
+    let continuation = aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .build_count()
@@ -1010,13 +1051,13 @@ fn exact_literal_identity_is_semantic_and_does_not_publish_strategy() {
 #[test]
 fn absolute_anchors_use_the_complete_original_haystack() {
     let limits = AggregateRunLimits::default();
-    let anchored = AggregateBuilder::new(r"\Afoo\z")
+    let anchored = aggregate_builder(r"\Afoo\z")
         .unicode(false)
         .build_count()
         .unwrap();
     assert_eq!(anchored.count(b"xxfoo", limits).unwrap().value(), 0);
 
-    let end_anchored = AggregateBuilder::new(r"foo\z")
+    let end_anchored = aggregate_builder(r"foo\z")
         .unicode(false)
         .build_spans()
         .unwrap();
@@ -1034,19 +1075,19 @@ fn absolute_anchors_use_the_complete_original_haystack() {
 
 #[test]
 fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
-    let full = AggregateBuilder::new(r"(?:a+b|a)")
+    let full = aggregate_builder(r"(?:a+b|a)")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .strategy(AggregateStrategy::FullTable)
         .build_count()
         .unwrap();
-    let rows = AggregateBuilder::new(r"(?:a+b|a)")
+    let rows = aggregate_builder(r"(?:a+b|a)")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .strategy(AggregateStrategy::ReverseSequentialRows)
         .build_count()
         .unwrap();
-    let sum = AggregateBuilder::new(r"(?:a+b|a)")
+    let sum = aggregate_builder(r"(?:a+b|a)")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .strategy(AggregateStrategy::FullTable)
@@ -1125,7 +1166,7 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
             &b"aaaabaaaa"[..],
         ),
     ] {
-        let count = AggregateBuilder::new(pattern)
+        let count = aggregate_builder(pattern)
             .unicode(false)
             .plan_selection(selection)
             .build_count()
@@ -1155,7 +1196,7 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
             1
         );
 
-        let sum = AggregateBuilder::new(pattern)
+        let sum = aggregate_builder(pattern)
             .unicode(false)
             .plan_selection(selection)
             .build_span_sum()
@@ -1188,7 +1229,7 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
 }
 
 fn exact_build_error(limits: AggregateBuildLimits) -> LiteralAggregateBuildError {
-    match AggregateBuilder::new("needle")
+    match aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(limits)
@@ -1201,7 +1242,7 @@ fn exact_build_error(limits: AggregateBuildLimits) -> LiteralAggregateBuildError
 
 #[test]
 fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
-    let baseline = AggregateBuilder::new("needle")
+    let baseline = aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .build_count()
@@ -1221,7 +1262,7 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
     limits.exact_literal.max_scratch_bytes = accounting.scratch_bytes;
     limits.exact_literal.max_persistent_bytes = accounting.persistent_bytes;
     limits.exact_literal.max_peak_bytes = accounting.peak_bytes;
-    AggregateBuilder::new("needle")
+    aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
         .limits(limits)
@@ -1262,7 +1303,7 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
     let mut auto_refusal = AggregateBuildLimits::default();
     auto_refusal.exact_literal.max_needle_bytes = accounting.needle_bytes - 1;
     assert!(matches!(
-        AggregateBuilder::new("needle")
+        aggregate_builder("needle")
             .unicode(false)
             .limits(auto_refusal)
             .build_count(),
@@ -1302,7 +1343,7 @@ fn exact_reduce_value_error(
 
 #[test]
 fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
-    let count = AggregateBuilder::new("needle")
+    let count = aggregate_builder("needle")
         .unicode(false)
         .build_count()
         .unwrap();
@@ -1386,7 +1427,7 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 
-    let sum = AggregateBuilder::new("needle")
+    let sum = aggregate_builder("needle")
         .unicode(false)
         .build_span_sum()
         .unwrap();
@@ -1408,7 +1449,7 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
 #[test]
 fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() {
     let pattern = r"(?P<outer>(?:a|(?P<inner>[b-d])){1,2}?)";
-    let baseline = AggregateBuilder::new(pattern)
+    let baseline = aggregate_builder(pattern)
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .build_count()
@@ -1420,7 +1461,7 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
     assert!(work > 0);
     let mut exact_limits = AggregateBuildLimits::default();
     exact_limits.continuation.max_work = work;
-    AggregateBuilder::new(pattern)
+    aggregate_builder(pattern)
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceContinuation)
         .limits(exact_limits)
@@ -1428,7 +1469,7 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
         .unwrap();
     exact_limits.continuation.max_work = work - 1;
     assert!(matches!(
-        AggregateBuilder::new(pattern)
+        aggregate_builder(pattern)
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .limits(exact_limits)
@@ -1443,7 +1484,7 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
         }) if required == work && limit == work - 1
     ));
 
-    let portable = PortableBuilder::new("foo").unicode(false).build().unwrap();
+    let portable = portable_builder("foo").unicode(false).build().unwrap();
     assert_eq!(portable.build_report().plan, PlanKind::ExactLiteral);
     let (matched, _) = portable.find(b"xxfoo", SearchLimits::default()).unwrap();
     let matched = matched.unwrap();

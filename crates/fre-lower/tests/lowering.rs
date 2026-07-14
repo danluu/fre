@@ -8,7 +8,7 @@ use fre_syntax::{
 };
 
 fn profile(unicode: bool) -> CompatibilityProfile {
-    let mut profile = RustProfile::default();
+    let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = unicode;
     CompatibilityProfile::RustBytes(profile)
 }
@@ -356,7 +356,7 @@ fn deep_flat_concatenation_uses_an_explicit_checked_stack() {
 #[test]
 fn supported_subset_matches_pinned_rebar_regex_baseline() {
     // This exact crates.io release is the Rebar baseline adapter, not the
-    // separate regex 1.13.0 source-profile admission oracle.
+    // explicitly selected Rebar 1.12.4 release-stack profile.
     const PATTERNS: &[&str] = &[
         "",
         "a",
