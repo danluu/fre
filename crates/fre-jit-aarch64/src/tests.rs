@@ -1574,6 +1574,117 @@ fn m17_count_decoded_template_rejects_representative_semantic_mutations() {
 }
 
 #[test]
+fn semantic_memory_mutants_have_independent_invalid_read_witnesses() {
+    let literal = b"0123456789abcdefg";
+    let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+        .expect("M=17 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+
+    let mut remainder_source = valid.inner().clone();
+    let index = decode(remainder_source.code())
+        .expect("canonical M=17 decode")
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SubtractRegister64 {
+                    destination: 10,
+                    left: 6,
+                    right: 5
+                }
+            )
+        })
+        .expect("remaining-length subtraction");
+    replace_test_decoded_at(
+        &mut remainder_source,
+        index,
+        DecodedInstruction::SubtractRegister64 {
+            destination: 10,
+            left: 1,
+            right: 5,
+        },
+    );
+    assert_eq!(
+        simulate_aggregate(
+            &NativeAggregateImage::new(remainder_source.clone()),
+            literal
+        ),
+        Err(SimError::InvalidMemoryRead),
+        "x10=x1-x5 admits an out-of-range last-column vector load"
+    );
+    assert_m17_prototype_rejects(remainder_source, "remaining-length source overread");
+
+    let mut advanced_prologue = valid.inner().clone();
+    let index = decode(advanced_prologue.code())
+        .expect("canonical M=17 decode")
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::MoveRegister64 {
+                    destination: 15,
+                    source: 15
+                }
+            )
+        })
+        .expect("confirmation prologue");
+    replace_test_decoded_at(
+        &mut advanced_prologue,
+        index,
+        DecodedInstruction::AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 16,
+        },
+    );
+    assert_eq!(
+        simulate_aggregate(
+            &NativeAggregateImage::new(advanced_prologue.clone()),
+            literal
+        ),
+        Err(SimError::InvalidMemoryRead),
+        "advanced confirmation prologue reads beyond the exact-width haystack"
+    );
+    assert_m17_prototype_rejects(advanced_prologue, "confirmation prologue overread");
+
+    let literal = b"0123456789abcdefgh";
+    let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+        .expect("M=18 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=18 Count image");
+    let mut scalar_stride = valid.inner().clone();
+    let instructions = decode(scalar_stride.code()).expect("canonical M=18 decode");
+    let index = instructions
+        .iter()
+        .rposition(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::AddImmediate64 {
+                    destination: 15,
+                    source: 15,
+                    immediate: 1
+                }
+            )
+        })
+        .expect("scalar confirmation haystack stride");
+    replace_test_decoded_at(
+        &mut scalar_stride,
+        index,
+        DecodedInstruction::AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 16,
+        },
+    );
+    assert_eq!(
+        simulate_aggregate(&NativeAggregateImage::new(scalar_stride.clone()), literal),
+        Err(SimError::InvalidMemoryRead),
+        "scalar +16 stride overruns before the remaining counter reaches zero"
+    );
+    reseal_test_image(&mut scalar_stride);
+    assert!(audit_aggregate(&NativeAggregateImage::new(scalar_stride)).is_err());
+}
+
+#[test]
 fn m17_template_rejects_every_cursor_delta_pairwise_substitution() {
     let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
         .expect("M=17 Count program");
@@ -1689,6 +1800,31 @@ fn m17_template_rejects_every_confirmation_stride_and_load_base_substitution() {
             replace_test_decoded_at(&mut inner, index, replacement);
             assert_m17_prototype_rejects(inner, "confirmation load-base role substitution");
         }
+
+        let replacement = match instruction {
+            DecodedInstruction::LoadVector128 {
+                destination,
+                base,
+                offset,
+            } => DecodedInstruction::LoadVector128 {
+                destination: if destination == 4 { 5 } else { 4 },
+                base,
+                offset,
+            },
+            DecodedInstruction::LoadByte {
+                destination,
+                base,
+                offset,
+            } => DecodedInstruction::LoadByte {
+                destination: if destination == 10 { 11 } else { 10 },
+                base,
+                offset,
+            },
+            _ => unreachable!("classified confirmation load"),
+        };
+        let mut inner = valid.inner().clone();
+        replace_test_decoded_at(&mut inner, index, replacement);
+        assert_m17_prototype_rejects(inner, "confirmation load destination-role substitution");
     }
 }
 
@@ -1702,25 +1838,33 @@ fn template_rejects_each_last_filter_and_width_one_simd_opcode_substitution() {
         .into_iter()
         .enumerate()
     {
-        if instruction
-            == (DecodedInstruction::LoadByte {
+        let replacement = match instruction {
+            DecodedInstruction::LoadByte {
                 destination: 11,
                 base: 8,
                 offset: 16,
-            })
-        {
-            let mut inner = valid.inner().clone();
-            replace_test_decoded_at(
-                &mut inner,
-                index,
-                DecodedInstruction::LoadByte {
-                    destination: 11,
-                    base: 8,
-                    offset: 0,
-                },
-            );
-            assert_m17_prototype_rejects(inner, "last-byte filter offset reset");
-        }
+            } => Some(DecodedInstruction::LoadByte {
+                destination: 11,
+                base: 8,
+                offset: 0,
+            }),
+            DecodedInstruction::LoadByte {
+                destination: 10,
+                base: 15,
+                offset: 16,
+            } => Some(DecodedInstruction::LoadByte {
+                destination: 10,
+                base: 15,
+                offset: 0,
+            }),
+            _ => None,
+        };
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        let mut inner = valid.inner().clone();
+        replace_test_decoded_at(&mut inner, index, replacement);
+        assert_m17_prototype_rejects(inner, "last-byte filter offset reset");
     }
 
     let width_one =
@@ -1773,6 +1917,11 @@ fn width_one_audit_rejects_in_cycle_cursor_reset() {
             )
         },
         0xd280_0005,
+    );
+    assert_eq!(
+        simulate_aggregate(&NativeAggregateImage::new(inner.clone()), &[b'x'; 32]),
+        Err(SimError::StepLimit),
+        "cursor reset repeats the second vector block indefinitely"
     );
     reseal_test_image(&mut inner);
     assert_eq!(
@@ -1848,6 +1997,84 @@ fn aggregate_template_rejects_coherent_structural_and_metadata_mutations() {
     assert!(
         audit_aggregate(&NativeAggregateImage::new(inner)).is_err(),
         "coherent alternate relocation must fail"
+    );
+}
+
+#[test]
+fn aggregate_template_rejects_cbnz_retarget_to_inserted_confirmation_reset_label() {
+    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
+        .expect("M=17 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+    let mut inner = valid.inner().clone();
+    let branch_index = decode(inner.code())
+        .expect("canonical M=17 decode")
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 17,
+                    nonzero: true,
+                    ..
+                }
+            )
+        })
+        .expect("scalar confirmation CBNZ");
+    let branch_offset = u32::try_from(branch_index * 4).expect("small code");
+    assert_eq!(branch_offset, 264);
+    replace_test_decoded_at(
+        &mut inner,
+        branch_index,
+        DecodedInstruction::CompareBranchZero64 {
+            register: 17,
+            nonzero: true,
+            displacement: -116,
+        },
+    );
+    let resolved_word = u32::from_le_bytes(
+        inner.code[branch_index * 4..branch_index * 4 + 4]
+            .try_into()
+            .expect("one instruction"),
+    );
+    let relocation = inner
+        .relocations
+        .iter_mut()
+        .find(|relocation| relocation.code_offset == branch_offset)
+        .expect("scalar confirmation relocation");
+    relocation.target = RelocationTarget::CodeOffset(148);
+    relocation.resolved_word = resolved_word;
+
+    let mut labels = inner.labels.into_vec();
+    let mut inserted = labels[0];
+    inserted.offset = 148;
+    inserted.kind = LabelKind::Loop;
+    labels.push(inserted);
+    labels.sort_unstable();
+    inner.labels = labels.into_boxed_slice();
+    inner.stats.labels = 14;
+    reseal_test_image(&mut inner);
+    assert!(!m17_count_template_matches(&inner));
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::InvalidAggregateManifest),
+        "the exact pre-decode label envelope rejects the inserted reset target"
+    );
+}
+
+#[test]
+fn aggregate_audit_rejects_stale_artifact_identity_after_semantic_checks() {
+    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
+        .expect("M=17 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+    let mut inner = valid.inner().clone();
+    inner.stats.emission_work = inner
+        .stats
+        .emission_work
+        .checked_add(1)
+        .expect("bounded accounting mutation");
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(inner)),
+        Err(AuditError::ArtifactIdentityMismatch)
     );
 }
 
