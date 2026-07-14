@@ -57,7 +57,7 @@ fn run() -> Result<(), String> {
     }
 
     let fixture = fixture(&case, requested_size)?;
-    let (elapsed, checksum, plan) = if matches!(operation, Operation::Build) {
+    let (elapsed, checksum, implementation_id) = if matches!(operation, Operation::Build) {
         time_build(&engine, &fixture.pattern, iterations)?
     } else {
         time_search(&engine, &fixture, operation, iterations)?
@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
     let ns_whole = ns_per_iteration_milli / 1_000;
     let ns_fraction = ns_per_iteration_milli % 1_000;
     println!(
-        "{engine},{case},{},{},{iterations},{total_ns},{ns_whole}.{ns_fraction:03},{checksum},{plan}",
+        "{engine},{case},{},{},{iterations},{total_ns},{ns_whole}.{ns_fraction:03},{checksum},{implementation_id}",
         operation_name(operation),
         fixture.haystack.len(),
     );
@@ -234,9 +234,9 @@ fn time_build(
     pattern: &str,
     iterations: u64,
 ) -> Result<(std::time::Duration, u64, &'static str), String> {
+    let implementation_id = output_implementation_id(engine, pattern)?;
     let start = Instant::now();
     let mut checksum = 0_u64;
-    let mut selected = "rust-regex";
     for iteration in 0..iterations {
         if engine == "rust" {
             let regex = regex::bytes::RegexBuilder::new(black_box(pattern))
@@ -247,12 +247,11 @@ fn time_build(
             checksum = accumulate(checksum, value, iteration);
         } else {
             let regex = build_fre(engine, black_box(pattern))?;
-            selected = plan_name(regex.build_report().plan);
             let value = u64::from(plan_tag(black_box(regex.build_report().plan)));
             checksum = accumulate(checksum, value, iteration);
         }
     }
-    Ok((start.elapsed(), checksum, selected))
+    Ok((start.elapsed(), checksum, implementation_id))
 }
 
 fn time_search(
@@ -290,7 +289,7 @@ fn time_search(
     }
 
     let regex = build_fre(engine, &fixture.pattern)?;
-    let plan = plan_name(regex.build_report().plan);
+    let implementation_id = regex.runtime_implementation_id();
     let start = Instant::now();
     let mut checksum = 0_u64;
     for iteration in 0..iterations {
@@ -317,7 +316,15 @@ fn time_search(
         };
         checksum = accumulate(checksum, value, iteration);
     }
-    Ok((start.elapsed(), checksum, plan))
+    Ok((start.elapsed(), checksum, implementation_id))
+}
+
+fn output_implementation_id(engine: &str, pattern: &str) -> Result<&'static str, String> {
+    if engine == "rust" {
+        Ok("rust-regex")
+    } else {
+        Ok(build_fre(engine, pattern)?.runtime_implementation_id())
+    }
 }
 
 fn build_fre(engine: &str, pattern: &str) -> Result<fre::PortableRegex, String> {
@@ -355,20 +362,27 @@ const fn plan_tag(plan: PlanKind) -> u8 {
     }
 }
 
-const fn plan_name(plan: PlanKind) -> &'static str {
-    match plan {
-        PlanKind::ExactLiteral => "exact-literal",
-        PlanKind::PackedLiteralSet => "packed-literal-set",
-        PlanKind::LiteralSetDfa => "literal-set-dfa",
-        PlanKind::RequiredLiteral => "required-literal-v1",
-        PlanKind::ForwardAnchored => "anchored-class-suffix.forward.v1",
-        PlanKind::K0 => "k0",
-    }
-}
-
 const fn accumulate(checksum: u64, value: u64, iteration: u64) -> u64 {
     checksum
         .rotate_left(1)
         .wrapping_add(value)
         .wrapping_add(iteration)
+}
+
+#[cfg(test)]
+mod tests {
+    use fre::{CaptureFreeOperation, SearchLimits};
+
+    use super::{build_fre, output_implementation_id};
+
+    #[test]
+    fn forward_output_field_uses_selected_runtime_implementation_id() {
+        let regex = build_fre("forward", r"\A[a-z]+Z").unwrap();
+        let implementation_id = output_implementation_id("forward", r"\A[a-z]+Z").unwrap();
+        let cache_id = regex
+            .forward_anchored_cache_identity(CaptureFreeOperation::Span, SearchLimits::unlimited())
+            .unwrap()
+            .plan_id;
+        assert_eq!(implementation_id, cache_id);
+    }
 }

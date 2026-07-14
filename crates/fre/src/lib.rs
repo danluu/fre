@@ -798,6 +798,19 @@ enum PortablePlan {
     K0(Automaton),
 }
 
+impl PortablePlan {
+    const fn runtime_implementation_id(&self) -> &'static str {
+        match self {
+            Self::ExactLiteral(_) => "exact-literal",
+            Self::PackedLiteralSet(_) => "packed-literal-set",
+            Self::LiteralSetDfa(_) => "literal-set-dfa",
+            Self::RequiredLiteral(required) => required.plan_id(),
+            Self::ForwardAnchored(forward) => forward.plan_id(),
+            Self::K0(_) => "k0",
+        }
+    }
+}
+
 impl PortableRegex {
     /// Construct with pinned Rust-bytes defaults and default resource limits.
     ///
@@ -819,6 +832,17 @@ impl PortableRegex {
     #[must_use]
     pub const fn build_report(&self) -> &BuildReport {
         &self.report
+    }
+
+    /// Stable identity of the selected runtime implementation.
+    ///
+    /// This is intentionally obtained from the stored plan rather than
+    /// reconstructed from [`PlanKind`]. For the required-literal and
+    /// forward-anchored plans, it is the same strategy identity stored in
+    /// their operation cache keys.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.plan.runtime_implementation_id()
     }
 
     /// Whether a selected match exists.
@@ -1965,6 +1989,42 @@ mod tests {
                 .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn runtime_implementation_identity_tracks_cache_bound_strategy_variants() {
+        let pattern = r"\A[a-z]+Z";
+        let limits = SearchLimits::default();
+        let forward = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        let required = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+
+        let forward_id = forward.runtime_implementation_id();
+        let required_id = required.runtime_implementation_id();
+        assert_eq!(forward.build_report().plan, PlanKind::ForwardAnchored);
+        assert_eq!(required.build_report().plan, PlanKind::RequiredLiteral);
+        assert_eq!(
+            forward_id,
+            forward
+                .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
+                .unwrap()
+                .plan_id
+        );
+        assert_eq!(
+            required_id,
+            required
+                .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
+                .unwrap()
+                .plan_id
+        );
+        assert_ne!(forward_id, required_id);
     }
 
     #[test]

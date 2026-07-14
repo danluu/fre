@@ -45,8 +45,10 @@ Every vector tail must be tested next to guard pages.
 
 ## Promotion gate
 
-- Separate plan/cache/accounting identity
-  `anchored-class-suffix.forward.v1`.
+- Separate plan/cache/accounting identity. Runtime drivers obtain the exact ID
+  from the selected plan instance and therefore report the same strategy
+  identity used for cache keys; they do not reconstruct it from the plan-family
+  tag.
 - Exact build/search/code/work/scratch/persistent/peak bounds and one-below
   refusal tests; no allocation or fallback during search.
 - Exhaustive exists/end/span/window differentials against pinned Rust regex,
