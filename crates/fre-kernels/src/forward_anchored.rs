@@ -13,7 +13,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.edge-witness-disjoint-32.v1";
+pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32.v1";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -225,7 +225,8 @@ pub struct SearchAccounting {
     pub examined_bytes_upper_bound: usize,
     pub work_upper_bound: u64,
     pub scratch_bytes: usize,
-    /// Native prefilter calls actually issued by this search.
+    /// Native prefilter calls actually issued by this search. Fixed scalar
+    /// comparisons in the asymmetric front probe are not native calls.
     pub prefilter_calls: usize,
     pub prefix_bytes_examined: usize,
     pub suffix_confirmation_attempted: bool,
@@ -657,8 +658,9 @@ impl ForwardAnchoredPlan {
             }
             // Small exact classes can use any suffix-first witness as an
             // upper bound on the first outsider. The helper partitions long
-            // tails without overlap; controls retain their first-candidate
-            // forward search.
+            // tails into an asymmetric scalar front, reverse back, and
+            // untouched middle without overlap; controls retain their
+            // first-candidate forward search.
             let uses_edge_witness = matches!(
                 self.implementation,
                 ClassImplementation::Pair { .. }
@@ -666,7 +668,7 @@ impl ForwardAnchoredPlan {
                     | ClassImplementation::Quad { .. }
             );
             let (relative_candidate, prefilter_calls) = if uses_edge_witness {
-                edge_suffix_witness(self.suffix[0], &searched[1..])?
+                asymmetric_suffix_witness(self.suffix[0], &searched[1..])?
             } else {
                 (memchr(self.suffix[0], &searched[1..]), 1)
             };
@@ -852,25 +854,50 @@ fn scan_bitset_prefix(bytes: &[u8], class: ByteClass) -> (usize, usize) {
 /// safe scalar source loops, not SIMD claims; retained assembly decides which
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
-const EDGE_WITNESS_BLOCK: usize = 32;
-const EDGE_WITNESS_SPAN: usize = EDGE_WITNESS_BLOCK * 2;
+const EDGE_WITNESS_FRONT: usize = 8;
+const EDGE_WITNESS_BACK: usize = 32;
+const EDGE_WITNESS_DISJOINT: usize = EDGE_WITNESS_FRONT + EDGE_WITNESS_BACK;
 
 /// Find any suffix-first witness while searching each logical byte at most
 /// once on absence. Short tails use one forward search. Long tails search a
-/// fixed front, a disjoint fixed back in reverse, and the untouched middle.
-fn edge_suffix_witness(needle: u8, bytes: &[u8]) -> Result<(Option<usize>, usize), SearchError> {
-    if bytes.len() < EDGE_WITNESS_SPAN {
+/// fixed eight-byte front with unrolled scalar comparisons, a disjoint fixed
+/// 32-byte back in reverse, and the untouched middle. The returned call count
+/// includes only native `memchr`/`memrchr` calls, not scalar comparisons.
+fn asymmetric_suffix_witness(
+    needle: u8,
+    bytes: &[u8],
+) -> Result<(Option<usize>, usize), SearchError> {
+    if bytes.len() < EDGE_WITNESS_DISJOINT {
         return Ok((memchr(needle, bytes), 1));
     }
 
-    if let Some(candidate) = memchr(needle, &bytes[..EDGE_WITNESS_BLOCK]) {
-        return Ok((Some(candidate), 1));
+    let front_candidate = if bytes[0] == needle {
+        Some(0)
+    } else if bytes[1] == needle {
+        Some(1)
+    } else if bytes[2] == needle {
+        Some(2)
+    } else if bytes[3] == needle {
+        Some(3)
+    } else if bytes[4] == needle {
+        Some(4)
+    } else if bytes[5] == needle {
+        Some(5)
+    } else if bytes[6] == needle {
+        Some(6)
+    } else if bytes[7] == needle {
+        Some(7)
+    } else {
+        None
+    };
+    if front_candidate.is_some() {
+        return Ok((front_candidate, 0));
     }
 
     let back_start =
         bytes
             .len()
-            .checked_sub(EDGE_WITNESS_BLOCK)
+            .checked_sub(EDGE_WITNESS_BACK)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "edge witness back partition",
             })?;
@@ -881,24 +908,24 @@ fn edge_suffix_witness(needle: u8, bytes: &[u8]) -> Result<(Option<usize>, usize
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "edge witness back candidate",
                 })?;
-        return Ok((Some(candidate), 2));
+        return Ok((Some(candidate), 1));
     }
 
-    let middle = &bytes[EDGE_WITNESS_BLOCK..back_start];
+    let middle = &bytes[EDGE_WITNESS_FRONT..back_start];
     if middle.is_empty() {
-        return Ok((None, 2));
+        return Ok((None, 1));
     }
     let relative_candidate = memchr(needle, middle);
     let candidate = relative_candidate
         .map(|relative| {
-            EDGE_WITNESS_BLOCK
+            EDGE_WITNESS_FRONT
                 .checked_add(relative)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "edge witness middle candidate",
                 })
         })
         .transpose()?;
-    Ok((candidate, 3))
+    Ok((candidate, 2))
 }
 
 fn scan_pair_prefix(bytes: &[u8], first: u8, second: u8) -> Result<(usize, usize), SearchError> {
@@ -1157,7 +1184,7 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
 mod tests {
     use super::{
         Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
-        SearchError, SearchLimits, edge_suffix_witness,
+        SearchError, SearchLimits, asymmetric_suffix_witness,
     };
     use crate::Window;
 
@@ -1229,7 +1256,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.edge-witness-disjoint-32.v1"
+            "anchored-class-suffix.asymmetric-scalar8-reverse32.v1"
         );
         assert_eq!(
             pair.implementation(),
@@ -1540,7 +1567,7 @@ mod tests {
             haystack[31] = b'Z';
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, Some((0, 32)));
-            assert_eq!(accounting.prefilter_calls, 1);
+            assert_eq!(accounting.prefilter_calls, 2);
             assert_eq!(accounting.prefix_bytes_examined, 32);
             assert_eq!(
                 accounting.prefix_bytes_upper_bound,
@@ -1601,13 +1628,7 @@ mod tests {
 
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, Some((0, haystack.len())));
-                let expected_prefilter_calls = if haystack.len() < 32 {
-                    0
-                } else if haystack.len() < 65 {
-                    1
-                } else {
-                    2
-                };
+                let expected_prefilter_calls = usize::from(haystack.len() >= 32);
                 assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                 assert!(accounting.suffix_confirmation_attempted);
                 assert_eq!(
@@ -1674,7 +1695,7 @@ mod tests {
         for (class, members) in cases {
             let plan = plan(class, &suffix, false);
 
-            for length in [31_usize, 32, 33, 63, 64, 65, 66] {
+            for length in [31_usize, 32, 33, 40, 41, 42, 63, 64, 65, 66] {
                 let haystack: Vec<u8> = (0..length)
                     .map(|index| members[index % members.len()])
                     .collect();
@@ -1685,11 +1706,7 @@ mod tests {
                     assert_eq!(accounting.prefilter_calls, 0);
                     assert_eq!(accounting.prefix_bytes_examined, length);
                 } else {
-                    let expected_prefilter_calls = match length {
-                        32..=64 => 1,
-                        65 => 2,
-                        _ => 3,
-                    };
+                    let expected_prefilter_calls = usize::from(length >= 42) + 1;
                     assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                 }
@@ -1705,8 +1722,7 @@ mod tests {
                 haystack.extend_from_slice(&suffix);
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, None);
-                let expected_prefilter_calls = if haystack.len() < 65 { 1 } else { 2 };
-                assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
+                assert_eq!(accounting.prefilter_calls, 1);
                 assert!(accounting.suffix_confirmation_attempted);
                 assert!(accounting.prefix_bytes_examined > wrong_outsider);
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
@@ -1731,10 +1747,14 @@ mod tests {
 
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, None);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert!(accounting.suffix_confirmation_attempted);
+            // At the exact disjoint threshold, reverse search selects the
+            // final border byte. The class scan still recovers the first
+            // outsider and charges that bounded recovery exactly.
             assert_eq!(
                 accounting.prefix_bytes_examined,
-                first_candidate.checked_add(1).unwrap()
+                first_candidate.checked_add(2).unwrap()
             );
 
             haystack[first_candidate + 1] = suffix[1];
@@ -1746,43 +1766,69 @@ mod tests {
     }
 
     #[test]
-    fn edge_witness_partitions_are_disjoint_and_cover_boundaries() {
-        for (length, expected_calls) in [(63_usize, 1_usize), (64, 2), (65, 3)] {
+    fn asymmetric_witness_threshold_is_exact_and_overlap_uses_forward() {
+        for (length, expected_calls) in [(39_usize, 1_usize), (40, 1), (41, 2)] {
             let bytes = vec![0x00; length];
             assert_eq!(
-                edge_suffix_witness(0x7F, &bytes).unwrap(),
+                asymmetric_suffix_witness(0x7F, &bytes).unwrap(),
                 (None, expected_calls)
             );
         }
 
+        let mut overlapping = vec![0x00; 39];
+        overlapping[7] = 0x7F;
+        overlapping[38] = 0x7F;
+        assert_eq!(
+            asymmetric_suffix_witness(0x7F, &overlapping).unwrap(),
+            (Some(7), 1)
+        );
+
+        let mut adjacent = vec![0x00; 40];
+        adjacent[8] = 0x7F;
+        adjacent[39] = 0x7F;
+        assert_eq!(
+            asymmetric_suffix_witness(0x7F, &adjacent).unwrap(),
+            (Some(39), 1)
+        );
+    }
+
+    #[test]
+    fn asymmetric_witness_partitions_and_call_counts_are_exact() {
         for (candidate, expected_calls) in [
-            (0_usize, 1_usize),
-            (31, 1),
-            (32, 3),
-            (66, 3),
-            (67, 2),
-            (98, 2),
+            (0_usize, 0_usize),
+            (3, 0),
+            (7, 0),
+            (8, 2),
+            (66, 2),
+            (67, 1),
+            (98, 1),
         ] {
             let mut bytes = vec![0x00; 99];
             bytes[candidate] = 0x7F;
             assert_eq!(
-                edge_suffix_witness(0x7F, &bytes).unwrap(),
+                asymmetric_suffix_witness(0x7F, &bytes).unwrap(),
                 (Some(candidate), expected_calls)
             );
         }
 
         let mut middle_and_back = vec![0x00; 99];
-        middle_and_back[32] = 0x7F;
+        middle_and_back[8] = 0x7F;
         middle_and_back[67] = 0x7F;
         middle_and_back[98] = 0x7F;
         assert_eq!(
-            edge_suffix_witness(0x7F, &middle_and_back).unwrap(),
-            (Some(98), 2)
+            asymmetric_suffix_witness(0x7F, &middle_and_back).unwrap(),
+            (Some(98), 1)
+        );
+
+        middle_and_back[3] = 0x7F;
+        assert_eq!(
+            asymmetric_suffix_witness(0x7F, &middle_and_back).unwrap(),
+            (Some(3), 0)
         );
     }
 
     #[test]
-    fn edge_witness_plan_preserves_partition_boundary_semantics() {
+    fn asymmetric_witness_plan_preserves_partition_boundary_semantics() {
         let suffix = [0x7F, 0x11, 0x22];
         for class in [
             ByteClass::from_bytes(&[0x00, 0x80]),
@@ -1791,12 +1837,13 @@ mod tests {
         ] {
             let plan = plan(class, &suffix, false);
             for (candidate, expected_calls) in [
-                (1_usize, 1_usize),
-                (32, 1),
-                (33, 3),
-                (67, 3),
-                (68, 2),
-                (97, 2),
+                (1_usize, 0_usize),
+                (4, 0),
+                (8, 0),
+                (9, 2),
+                (67, 2),
+                (68, 1),
+                (97, 1),
             ] {
                 let mut haystack = vec![0x00; 100];
                 haystack[candidate..candidate + suffix.len()].copy_from_slice(&suffix);
@@ -1810,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_witness_confirms_the_returned_first_outsider() {
+    fn asymmetric_witness_confirms_the_returned_first_outsider() {
         let suffix = [0x7F, 0x11, 0x22];
         for class in [
             ByteClass::from_bytes(&[0x00, 0x80]),
@@ -1826,7 +1873,7 @@ mod tests {
                 .find(&earlier_valid, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(span, Some((0, 43)));
-            assert_eq!(accounting.prefilter_calls, 2);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert!(accounting.suffix_confirmation_attempted);
 
             let mut earlier_wrong = vec![0x00; 100];
@@ -1836,7 +1883,7 @@ mod tests {
                 .find(&earlier_wrong, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(span, None);
-            assert_eq!(accounting.prefilter_calls, 2);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert!(accounting.suffix_confirmation_attempted);
 
             let mut earlier_mismatching_candidate = vec![0x00; 100];
@@ -1853,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_edge_witness_handles_a_bordered_suffix() {
+    fn reverse_asymmetric_witness_handles_a_bordered_suffix() {
         let suffix = [0x7F, 0x11, 0x7F];
         for class in [
             ByteClass::from_bytes(&[0x00, 0x80]),
@@ -1865,7 +1912,7 @@ mod tests {
             haystack[94..97].copy_from_slice(&suffix);
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, Some((0, 97)));
-            assert_eq!(accounting.prefilter_calls, 2);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert_eq!(accounting.prefix_bytes_examined, 128);
             assert!(accounting.suffix_confirmation_attempted);
             assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
@@ -1873,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_edge_regions_use_one_forward_prefilter() {
+    fn overlapping_asymmetric_regions_use_one_forward_prefilter() {
         let suffix = [0x7F, 0x11, 0x22];
         for class in [
             ByteClass::from_bytes(&[0x00, 0x80]),
@@ -1881,10 +1928,10 @@ mod tests {
             ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
         ] {
             let plan = plan(class, &suffix, false);
-            let mut haystack = vec![0x00; 64];
+            let mut haystack = vec![0x00; 40];
             haystack[10] = suffix[0];
             haystack[11] = 0x40;
-            haystack[50..53].copy_from_slice(&suffix);
+            haystack[35..38].copy_from_slice(&suffix);
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, None);
             assert_eq!(accounting.prefilter_calls, 1);
