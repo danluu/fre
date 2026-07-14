@@ -14,8 +14,69 @@ use serde::Deserialize;
 
 const KERNEL_PACKAGE: &str = "fre-kernels";
 const KERNEL_LIBRARY: &str = "fre_kernels";
-const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
+const EXACT_ALLOC_PACKAGE: &str = "fre-exact-alloc";
+const EXACT_ALLOC_LIBRARY: &str = "fre_exact_alloc";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
+const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
+const EXACT_ALLOC_ALLOW_ATTRIBUTE: &str = r#"#[allow(
+    unsafe_code,
+    reason = "this one reviewed function owns FRE's exact-layout allocation boundary"
+)]"#;
+
+const KERNEL_LINTS: &str = r#"
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+"#;
+
+const WARN_UNSAFE_LINTS: &str = r#"
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+"#;
+
+const EXACT_ALLOC_LINTS: &str = r#"
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+"#;
 
 #[derive(Debug, Deserialize)]
 struct Metadata {
@@ -29,6 +90,7 @@ struct Package {
     id: String,
     name: String,
     manifest_path: PathBuf,
+    dependencies: Vec<serde_json::Value>,
     targets: Vec<Target>,
 }
 
@@ -43,24 +105,24 @@ struct Target {
 struct LocalException {
     package: &'static str,
     manifest: &'static str,
-    unsafe_level: &'static str,
+    expected_lints: &'static str,
 }
 
 const LOCAL_EXCEPTIONS: [LocalException; 3] = [
     LocalException {
         package: "fre-capi",
         manifest: "crates/fre-capi/Cargo.toml",
-        unsafe_level: "warn",
+        expected_lints: WARN_UNSAFE_LINTS,
     },
     LocalException {
         package: "fre-jit-runtime",
         manifest: "crates/fre-jit-runtime/Cargo.toml",
-        unsafe_level: "warn",
+        expected_lints: WARN_UNSAFE_LINTS,
     },
     LocalException {
-        package: KERNEL_PACKAGE,
-        manifest: "crates/fre-kernels/Cargo.toml",
-        unsafe_level: "deny",
+        package: EXACT_ALLOC_PACKAGE,
+        manifest: "crates/fre-exact-alloc/Cargo.toml",
+        expected_lints: EXACT_ALLOC_LINTS,
     },
 ];
 
@@ -149,6 +211,8 @@ fn audit(metadata: &Metadata) -> Result<AuditSummary, String> {
         .get(KERNEL_PACKAGE)
         .ok_or_else(|| format!("missing {KERNEL_PACKAGE} workspace package"))?;
     let protected_kernel_targets = audit_kernel_targets(kernel, &workspace_root)?;
+    audit_kernel_sources(&workspace_root)?;
+    audit_exact_allocator(&packages_by_name, &workspace_root)?;
 
     Ok(AuditSummary {
         workspace_packages: members.len(),
@@ -207,23 +271,9 @@ fn audit_package_lint_inheritance(
                     manifest_path.display()
                 ));
             }
-            if lints.contains_key("workspace") {
-                return Err(format!(
-                    "local lint exception {name} unexpectedly inherits workspace lints"
-                ));
-            }
-            let actual_level = lints
-                .get("rust")
-                .and_then(toml::Value::as_table)
-                .and_then(|rust| rust.get("unsafe_code"))
-                .and_then(toml::Value::as_str)
-                .ok_or_else(|| format!("local lint exception {name} has no unsafe_code level"))?;
-            if actual_level != exception.unsafe_level {
-                return Err(format!(
-                    "local lint exception {name} uses unsafe_code={actual_level:?}, expected {:?}",
-                    exception.unsafe_level
-                ));
-            }
+            require_exact_lints(name, lints, exception.expected_lints)?;
+        } else if *name == KERNEL_PACKAGE {
+            require_exact_lints(name, lints, KERNEL_LINTS)?;
         } else if lints.len() != 1
             || lints.get("workspace").and_then(toml::Value::as_bool) != Some(true)
         {
@@ -237,6 +287,25 @@ fn audit_package_lint_inheritance(
     if observed_exceptions != expected_exceptions {
         return Err(format!(
             "local lint exceptions differ: observed={observed_exceptions:?} expected={expected_exceptions:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_lints(
+    package: &str,
+    actual: &toml::map::Map<String, toml::Value>,
+    expected_source: &str,
+) -> Result<(), String> {
+    let expected_document: toml::Value = toml::from_str(expected_source)
+        .map_err(|error| format!("parse expected lint table for {package}: {error}"))?;
+    let expected = expected_document
+        .get("lints")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format!("expected lint table for {package} is malformed"))?;
+    if actual != expected {
+        return Err(format!(
+            "local lint table for {package} drifted: actual={actual:?} expected={expected:?}"
         ));
     }
     Ok(())
@@ -271,13 +340,13 @@ fn audit_kernel_targets(package: &Package, workspace_root: &Path) -> Result<usiz
             library_count = library_count
                 .checked_add(1)
                 .ok_or_else(|| "fre-kernels library count overflow".to_owned())?;
-            if target.name != KERNEL_LIBRARY || !target.kind.iter().any(|kind| kind == "lib") {
+            if target.name != KERNEL_LIBRARY || target.kind.as_slice() != ["lib"] {
                 return Err(format!(
                     "expected library path belongs to unexpected target {} kind {:?}",
                     target.name, target.kind
                 ));
             }
-            require_attribute(&source, DENY_ATTRIBUTE, false, &target.name)?;
+            require_attribute(&source, FORBID_ATTRIBUTE, false, &target.name)?;
             continue;
         }
 
@@ -300,6 +369,174 @@ fn audit_kernel_targets(package: &Package, workspace_root: &Path) -> Result<usiz
         ));
     }
     Ok(protected)
+}
+
+fn audit_kernel_sources(workspace_root: &Path) -> Result<(), String> {
+    let source_root = canonical(
+        &workspace_root.join("crates/fre-kernels/src"),
+        "fre-kernels source root",
+    )?;
+    let library = canonical(&source_root.join("lib.rs"), "fre-kernels library source")?;
+    let mut files = BTreeSet::new();
+    collect_regular_files(&source_root, &source_root, &mut files)?;
+    for relative in files {
+        if relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("rs")
+        {
+            return Err(format!(
+                "unexpected non-Rust file in fre-kernels source root: {}",
+                relative.display()
+            ));
+        }
+        let path = source_root.join(&relative);
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("read kernel source {}: {error}", path.display()))?;
+        if path == library {
+            if source.matches("unsafe_code").count() != 1 || !source.contains(FORBID_ATTRIBUTE) {
+                return Err("fre-kernels library unsafe boundary drifted".to_owned());
+            }
+        } else if source.contains("unsafe_code") {
+            return Err(format!(
+                "fre-kernels source {} contains an unsafe lint lowering",
+                path.display()
+            ));
+        }
+        for forbidden in ["unsafe {", "unsafe fn", "unsafe impl", "unsafe trait"] {
+            if source.contains(forbidden) {
+                return Err(format!(
+                    "fre-kernels source {} contains forbidden token {forbidden:?}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn audit_exact_allocator(
+    packages: &BTreeMap<&str, &Package>,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let package = packages
+        .get(EXACT_ALLOC_PACKAGE)
+        .ok_or_else(|| format!("missing {EXACT_ALLOC_PACKAGE} workspace package"))?;
+    if !package.dependencies.is_empty() {
+        return Err(format!(
+            "{EXACT_ALLOC_PACKAGE} must have no dependencies, observed {}",
+            package.dependencies.len()
+        ));
+    }
+    if package.targets.len() != 1 {
+        return Err(format!(
+            "{EXACT_ALLOC_PACKAGE} must have exactly one target, observed {}",
+            package.targets.len()
+        ));
+    }
+
+    let package_root = canonical(
+        &workspace_root.join("crates/fre-exact-alloc"),
+        "fre-exact-alloc package root",
+    )?;
+    let expected_manifest =
+        canonical(&package_root.join("Cargo.toml"), "fre-exact-alloc manifest")?;
+    if canonical(&package.manifest_path, "fre-exact-alloc package manifest")? != expected_manifest {
+        return Err("fre-exact-alloc manifest path drifted".to_owned());
+    }
+    let expected_source = canonical(
+        &package_root.join("src/lib.rs"),
+        "fre-exact-alloc library source",
+    )?;
+    let target = &package.targets[0];
+    if target.name != EXACT_ALLOC_LIBRARY
+        || target.kind.as_slice() != ["lib"]
+        || canonical(&target.src_path, "fre-exact-alloc target source")? != expected_source
+    {
+        return Err(format!(
+            "unexpected fre-exact-alloc target {} kind {:?} source {}",
+            target.name,
+            target.kind,
+            target.src_path.display()
+        ));
+    }
+
+    let mut files = BTreeSet::new();
+    collect_regular_files(&package_root, &package_root, &mut files)?;
+    let expected_files = BTreeSet::from([PathBuf::from("Cargo.toml"), PathBuf::from("src/lib.rs")]);
+    if files != expected_files {
+        return Err(format!(
+            "fre-exact-alloc file inventory drifted: actual={files:?} expected={expected_files:?}"
+        ));
+    }
+    audit_exact_allocator_source(&expected_source)
+}
+
+fn audit_exact_allocator_source(source_path: &Path) -> Result<(), String> {
+    let source = fs::read_to_string(source_path)
+        .map_err(|error| format!("read exact allocator source: {error}"))?;
+    if !source.lines().any(|line| line == DENY_ATTRIBUTE) {
+        return Err(format!(
+            "exact allocator source must contain {DENY_ATTRIBUTE}"
+        ));
+    }
+    if source.matches("unsafe_code").count() != 2
+        || source.matches(EXACT_ALLOC_ALLOW_ATTRIBUTE).count() != 1
+    {
+        return Err("exact allocator unsafe-lint lowering inventory drifted".to_owned());
+    }
+    for forbidden in [
+        "include!",
+        "include_bytes!",
+        "include_str!",
+        "#[path",
+        "macro_rules!",
+        "proc_macro",
+        "env!",
+        "option_env!",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "exact allocator source contains forbidden expansion path {forbidden:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_regular_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("read directory {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("read file type for {:?}: {error}", entry.path()))?;
+        let path = entry.path();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "symlink is forbidden in audited source: {}",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_regular_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("strip source root from {}: {error}", path.display()))?;
+            if !files.insert(relative.to_path_buf()) {
+                return Err(format!("duplicate audited source file: {}", path.display()));
+            }
+        } else {
+            return Err(format!("unexpected filesystem entry: {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn require_attribute(
@@ -336,8 +573,13 @@ fn canonical(path: &Path, description: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Package, Target, audit_kernel_targets};
+    use super::{
+        EXACT_ALLOC_ALLOW_ATTRIBUTE, EXACT_ALLOC_LINTS, Package, Target, WARN_UNSAFE_LINTS,
+        audit_exact_allocator, audit_exact_allocator_source, audit_kernel_targets,
+        require_exact_lints,
+    };
     use std::{
+        collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -383,10 +625,10 @@ mod tests {
         }
     }
 
-    fn package(tree: &TestTree, additional: Vec<Target>) -> Package {
+    fn kernel_package(tree: &TestTree, additional: Vec<Target>) -> Package {
         let library = tree.write(
             "crates/fre-kernels/src/lib.rs",
-            "//! fixture\n#![deny(unsafe_code)]\n",
+            "//! fixture\n#![forbid(unsafe_code)]\n",
         );
         let manifest = tree.write(
             "crates/fre-kernels/Cargo.toml",
@@ -402,6 +644,7 @@ mod tests {
             id: "fixture fre-kernels".to_owned(),
             name: "fre-kernels".to_owned(),
             manifest_path: manifest,
+            dependencies: Vec::new(),
             targets,
         }
     }
@@ -414,6 +657,33 @@ mod tests {
         }
     }
 
+    fn exact_source() -> String {
+        format!(
+            "//! fixture\n#![deny(unsafe_code)]\n\n{EXACT_ALLOC_ALLOW_ATTRIBUTE}\npub fn copy_exact() {{ unsafe {{ core::hint::unreachable_unchecked() }} }}\n"
+        )
+    }
+
+    fn exact_package(tree: &TestTree, additional: Vec<Target>) -> Package {
+        let source = tree.write("crates/fre-exact-alloc/src/lib.rs", &exact_source());
+        let manifest = tree.write(
+            "crates/fre-exact-alloc/Cargo.toml",
+            "[package]\nname='fre-exact-alloc'\n",
+        );
+        let mut targets = vec![Target {
+            name: "fre_exact_alloc".to_owned(),
+            kind: vec!["lib".to_owned()],
+            src_path: source,
+        }];
+        targets.extend(additional);
+        Package {
+            id: "fixture fre-exact-alloc".to_owned(),
+            name: "fre-exact-alloc".to_owned(),
+            manifest_path: manifest,
+            dependencies: Vec::new(),
+            targets,
+        }
+    }
+
     #[test]
     fn integration_test_escape_is_rejected() {
         let tree = TestTree::new();
@@ -421,7 +691,7 @@ mod tests {
             "crates/fre-kernels/tests/lint_escape.rs",
             "#![allow(unsafe_code)]\nfn escape() {}\n",
         );
-        let package = package(&tree, vec![target("lint_escape", "test", escape)]);
+        let package = kernel_package(&tree, vec![target("lint_escape", "test", escape)]);
         let error = audit_kernel_targets(&package, tree.root()).unwrap_err();
         assert!(error.contains("lint_escape"));
         assert!(error.contains("#![forbid(unsafe_code)]"));
@@ -434,7 +704,7 @@ mod tests {
             "crates/fre-kernels/custom/escape.rs",
             "#![allow(unsafe_code)]\nfn main() {}\n",
         );
-        let package = package(&tree, vec![target("custom_escape", "example", escape)]);
+        let package = kernel_package(&tree, vec![target("custom_escape", "example", escape)]);
         let error = audit_kernel_targets(&package, tree.root()).unwrap_err();
         assert!(error.contains("custom_escape"));
         assert!(error.contains("#![forbid(unsafe_code)]"));
@@ -451,7 +721,7 @@ mod tests {
             "crates/fre-kernels/custom/protected.rs",
             "#![forbid(unsafe_code)]\nfn main() {}\n",
         );
-        let package = package(
+        let package = kernel_package(
             &tree,
             vec![
                 target("protected", "test", integration),
@@ -459,5 +729,107 @@ mod tests {
             ],
         );
         assert_eq!(audit_kernel_targets(&package, tree.root()), Ok(2));
+    }
+
+    #[test]
+    fn additional_unsafe_lowering_is_rejected() {
+        let tree = TestTree::new();
+        let source = format!(
+            "{}\n#[allow(unsafe_code)]\nunsafe fn escaped() {{}}\n",
+            exact_source()
+        );
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
+        let error = audit_exact_allocator_source(&path).unwrap_err();
+        assert!(error.contains("lowering inventory drifted"));
+    }
+
+    #[test]
+    fn generated_or_additional_allocator_target_is_rejected() {
+        let tree = TestTree::new();
+        let generated = tree.write(
+            "crates/fre-exact-alloc/build.rs",
+            "#![forbid(unsafe_code)]\nfn main() {}\n",
+        );
+        let package = exact_package(
+            &tree,
+            vec![target("build-script-build", "custom-build", generated)],
+        );
+        let packages = BTreeMap::from([("fre-exact-alloc", &package)]);
+        let error = audit_exact_allocator(&packages, tree.root()).unwrap_err();
+        assert!(error.contains("exactly one target"));
+    }
+
+    #[test]
+    fn local_exception_lint_drift_is_rejected() {
+        let document: toml::Value = toml::from_str(WARN_UNSAFE_LINTS).unwrap();
+        let mut actual = document.get("lints").unwrap().as_table().unwrap().clone();
+        actual
+            .get_mut("rust")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "unsafe_op_in_unsafe_fn".to_owned(),
+                toml::Value::String("allow".to_owned()),
+            );
+        let error = require_exact_lints("fre-capi", &actual, WARN_UNSAFE_LINTS).unwrap_err();
+        assert!(error.contains("drifted"));
+    }
+
+    #[test]
+    fn exact_allocator_layout_is_accepted() {
+        let tree = TestTree::new();
+        let package = exact_package(&tree, Vec::new());
+        let packages = BTreeMap::from([("fre-exact-alloc", &package)]);
+        assert_eq!(audit_exact_allocator(&packages, tree.root()), Ok(()));
+
+        let document: toml::Value = toml::from_str(EXACT_ALLOC_LINTS).unwrap();
+        let actual = document.get("lints").unwrap().as_table().unwrap();
+        assert_eq!(
+            require_exact_lints("fre-exact-alloc", actual, EXACT_ALLOC_LINTS),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn allocator_dependency_and_source_expansion_are_rejected() {
+        let tree = TestTree::new();
+        let mut package = exact_package(&tree, Vec::new());
+        package
+            .dependencies
+            .push(serde_json::json!({"name": "escape"}));
+        let packages = BTreeMap::from([("fre-exact-alloc", &package)]);
+        assert!(
+            audit_exact_allocator(&packages, tree.root())
+                .unwrap_err()
+                .contains("no dependencies")
+        );
+
+        drop(packages);
+        package.dependencies.clear();
+        tree.write(
+            "crates/fre-exact-alloc/src/escape.rs",
+            "pub fn escape() {}\n",
+        );
+        let packages = BTreeMap::from([("fre-exact-alloc", &package)]);
+        assert!(
+            audit_exact_allocator(&packages, tree.root())
+                .unwrap_err()
+                .contains("file inventory")
+        );
+    }
+
+    #[test]
+    fn include_and_macro_expansion_paths_are_rejected() {
+        let tree = TestTree::new();
+        let path = tree.write(
+            "crates/fre-exact-alloc/src/lib.rs",
+            &format!("{}\ninclude!(\"generated.rs\");\n", exact_source()),
+        );
+        assert!(
+            audit_exact_allocator_source(&path)
+                .unwrap_err()
+                .contains("expansion path")
+        );
     }
 }

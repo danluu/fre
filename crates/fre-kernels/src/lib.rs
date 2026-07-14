@@ -5,10 +5,7 @@
 //! pattern-specialized JIT. The dependency documents worst-case
 //! `O(needle.len() + haystack.len())` time and constant search space.
 
-// Unsafe code remains denied except for individually reasoned, audited
-// primitives. `forward_anchored` contains one such exact-layout allocation
-// helper; keeping the exception local makes any expansion fail linting.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 

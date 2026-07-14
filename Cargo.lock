@@ -161,6 +161,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-exact-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "fre-iterator-lab"
 version = "0.1.0"
 dependencies = [
@@ -215,6 +219,7 @@ name = "fre-kernels"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "fre-exact-alloc",
  "memchr",
  "regex",
 ]

@@ -7,6 +7,7 @@ members = [
     "crates/fre-capture-lab",
     "crates/fre-capi",
     "crates/fre-conformance",
+    "crates/fre-exact-alloc",
     "crates/fre-iterator-lab",
     "crates/fre-kernel-ir",
     "crates/fre-kernels",

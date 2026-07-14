@@ -1,22 +1,14 @@
 [package]
-name = "fre-kernels"
+name = "fre-exact-alloc"
 version.workspace = true
-description = "Bounded operation-specific search kernels for FRE"
+description = "One audited exact-layout allocation primitive for FRE"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
-[dependencies]
-aho-corasick = "=1.1.4"
-fre-exact-alloc = { path = "../fre-exact-alloc" }
-memchr = "=2.8.3"
-
-[dev-dependencies]
-regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
-
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unreachable_pub = "warn"

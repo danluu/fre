@@ -6,9 +6,9 @@
 //! possible repetition boundary. Suffix borders are therefore irrelevant.
 //! Search is worst-case linear and allocates no memory.
 
-use core::{alloc::Layout, fmt, mem::size_of, ptr};
-use std::alloc::alloc;
+use core::{fmt, mem::size_of};
 
+use fre_exact_alloc::CopyError;
 use memchr::{memchr, memrchr};
 
 use crate::Window;
@@ -402,60 +402,23 @@ pub struct ForwardAnchoredPlan {
 
 /// Copy `suffix` into a fallible allocation whose reported capacity is exact.
 fn copy_suffix_exact(suffix: &[u8]) -> Result<Vec<u8>, BuildError> {
-    // SAFETY: `alloc` either returns null or a fresh allocation from the global
-    // allocator for exactly the requested layout, and it does not unwind after
-    // returning ownership. These are precisely the callback requirements.
-    #[allow(
-        unsafe_code,
-        reason = "the audited exact-layout helper requires the global allocator"
-    )]
-    unsafe {
-        copy_suffix_exact_with(suffix, |layout| alloc(layout))
-    }
-}
-
-/// The allocation seam used by [`copy_suffix_exact`] and its failure tests.
-///
-/// # Safety
-///
-/// If `allocate` returns non-null, its pointer must be a fresh, uniquely owned
-/// allocation from the global allocator for the supplied layout. The callback
-/// must not unwind after obtaining that allocation. `suffix` must not overlap
-/// the returned allocation.
-#[allow(
-    unsafe_code,
-    reason = "constructing a Vec from an exact global-allocation layout is the audited primitive"
-)]
-unsafe fn copy_suffix_exact_with<A>(suffix: &[u8], allocate: A) -> Result<Vec<u8>, BuildError>
-where
-    A: FnOnce(Layout) -> *mut u8,
-{
     if suffix.is_empty() {
         return Err(BuildError::EmptySuffix);
     }
-    let layout = Layout::array::<u8>(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
-        computation: "exact suffix allocation layout",
-    })?;
-
     #[cfg(test)]
     exact_suffix_copy_probe::record();
-    let allocation = allocate(layout);
-    if allocation.is_null() {
-        return Err(BuildError::AllocationFailed {
-            structure: "forward anchored suffix",
-            additional: suffix.len(),
-        });
-    }
+    fre_exact_alloc::copy_exact(suffix).map_err(|error| map_copy_error(error, suffix.len()))
+}
 
-    // SAFETY: the function contract gives a fresh global allocation with
-    // `layout == Layout::array::<u8>(suffix.len())`. Every u8 alignment is
-    // valid, the allocation is disjoint from `suffix`, and all `len` bytes are
-    // initialized by the non-overlapping copy. No panicking operation occurs
-    // between allocation and `Vec` ownership. `len == capacity`, so `Vec` will
-    // later deallocate using the identical layout.
-    unsafe {
-        ptr::copy_nonoverlapping(suffix.as_ptr(), allocation, suffix.len());
-        Ok(Vec::from_raw_parts(allocation, suffix.len(), suffix.len()))
+fn map_copy_error(error: CopyError, suffix_len: usize) -> BuildError {
+    match error {
+        CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+            computation: "exact suffix allocation layout",
+        },
+        CopyError::AllocationFailed => BuildError::AllocationFailed {
+            structure: "forward anchored suffix",
+            additional: suffix_len,
+        },
     }
 }
 
@@ -1294,11 +1257,11 @@ mod tests {
     use super::{
         Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
         SearchError, SearchLimits, asymmetric_suffix_witness, begin_edge_witness_trace,
-        copy_suffix_exact, copy_suffix_exact_with, exact_suffix_copy_probe,
-        finish_edge_witness_trace,
+        copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
     };
     use crate::Window;
-    use core::{cell::Cell, mem::size_of};
+    use core::mem::size_of;
+    use fre_exact_alloc::CopyError;
 
     fn plan(class: ByteClass, suffix: &[u8], end: bool) -> ForwardAnchoredPlan {
         ForwardAnchoredPlan::build(
@@ -1481,10 +1444,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        unsafe_code,
-        reason = "the test injects a null result into the audited allocation seam"
-    )]
     fn exact_suffix_copy_has_exact_capacity_and_typed_failure() {
         for len in [1_usize, 2, 3, 7, 8, 15, 16, 31, 32, 255, 256, 4096] {
             let suffix: Vec<u8> = (0_u8..=u8::MAX).cycle().take(len).collect();
@@ -1501,29 +1460,22 @@ mod tests {
         assert_eq!(exact_suffix_copy_probe::calls(), 0);
 
         exact_suffix_copy_probe::reset();
-        let observed_layout = Cell::new(None);
-        let error = unsafe {
-            copy_suffix_exact_with(b"forced allocation failure", |layout| {
-                observed_layout.set(Some((layout.size(), layout.align())));
-                core::ptr::null_mut()
-            })
-        }
-        .unwrap_err();
         assert_eq!(
-            observed_layout.get(),
-            Some((
-                b"forced allocation failure".len(),
-                core::mem::align_of::<u8>(),
-            ))
-        );
-        assert_eq!(
-            error,
+            map_copy_error(
+                CopyError::AllocationFailed,
+                b"forced allocation failure".len()
+            ),
             BuildError::AllocationFailed {
                 structure: "forward anchored suffix",
                 additional: b"forced allocation failure".len(),
             }
         );
-        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+        assert_eq!(
+            map_copy_error(CopyError::LayoutOverflow, usize::MAX),
+            BuildError::ArithmeticOverflow {
+                computation: "exact suffix allocation layout",
+            }
+        );
     }
 
     #[test]
