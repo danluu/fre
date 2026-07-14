@@ -2006,12 +2006,13 @@ fn aggregate_template_rejects_coherent_structural_and_metadata_mutations() {
 
 #[test]
 fn aggregate_template_rejects_cbnz_retarget_to_inserted_confirmation_reset_label() {
-    let program = build_exact_aggregate::<Count>(b"0123456789abcdefg", ValidateLimits::default())
-        .expect("M=17 Count program");
-    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=17 Count image");
+    let literal = b"0123456789abcdefgh";
+    let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+        .expect("M=18 Count program");
+    let valid = emit_exact_aggregate(&program, EmitLimits::default()).expect("M=18 Count image");
     let mut inner = valid.inner().clone();
     let branch_index = decode(inner.code())
-        .expect("canonical M=17 decode")
+        .expect("canonical M=18 decode")
         .iter()
         .position(|instruction| {
             matches!(
@@ -2056,8 +2057,12 @@ fn aggregate_template_rejects_cbnz_retarget_to_inserted_confirmation_reset_label
     labels.sort_unstable();
     inner.labels = labels.into_boxed_slice();
     inner.stats.labels = 14;
+    assert_eq!(
+        simulate_aggregate(&NativeAggregateImage::new(inner.clone()), literal),
+        Err(SimError::StepLimit),
+        "the taken reset edge reinitializes confirmation forever"
+    );
     reseal_test_image(&mut inner);
-    assert!(!m17_count_template_matches(&inner));
     assert_eq!(
         audit_aggregate(&NativeAggregateImage::new(inner)),
         Err(AuditError::InvalidAggregateManifest),
