@@ -13,9 +13,10 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 /// empty HIR cannot reveal whether Unicode mode was enabled. Passing this
 /// token asserts both the pinned parser configuration and the empty-match
 /// boundary policy. Unicode-on callers receive only the byte-stable HIR
-/// subset: literals, byte classes, ASCII-only Unicode classes, byte-oriented
-/// assertions and their regular composition. Variable-width Unicode classes
-/// and Unicode word assertions remain typed refusals.
+/// subset: literals, byte classes, ASCII Unicode ranges, singleton Unicode
+/// scalar classes, byte-oriented assertions and their regular composition.
+/// Non-singleton non-ASCII Unicode classes and Unicode word assertions remain
+/// typed refusals.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
     unicode: bool,
@@ -106,8 +107,13 @@ impl CompiledRegex {
         capture_policy: CapturePolicy,
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
-        validate_hir(hir, capture_policy, &mut budget)?;
-        let mut builder = Builder::new(limits.max_program_states, capture_policy, &mut budget);
+        validate_hir(hir, profile, capture_policy, &mut budget)?;
+        let mut builder = Builder::new(
+            limits.max_program_states,
+            profile,
+            capture_policy,
+            &mut budget,
+        );
         let accept = builder.push(Inst::Match)?;
         let entry = builder.compile_node(hir, accept, 1)?;
         let insts = builder.finish()?;
@@ -254,6 +260,7 @@ impl CompileBudget {
 
 fn validate_hir(
     hir: &Hir,
+    profile: RustByteProfile,
     capture_policy: CapturePolicy,
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
@@ -297,8 +304,24 @@ fn validate_hir(
                 )?;
             }
             HirKind::Class(Class::Unicode(class)) => {
-                if class.ranges().iter().any(|range| !range.end().is_ascii()) {
-                    return Err(Error::Unsupported(Unsupported::UnicodeClass));
+                for range in class.ranges() {
+                    if !range.end().is_ascii() {
+                        if !profile.unicode || range.start() != range.end() {
+                            return Err(Error::Unsupported(Unsupported::UnicodeClass));
+                        }
+                        let encoded_bytes = range.start().len_utf8();
+                        budget.charge(encoded_bytes)?;
+                        budget.accounting.literal_bytes = add(
+                            budget.accounting.literal_bytes,
+                            encoded_bytes,
+                            Resource::LiteralBytes,
+                        )?;
+                        enforce(
+                            budget.accounting.literal_bytes,
+                            budget.limits.max_literal_bytes,
+                            Resource::LiteralBytes,
+                        )?;
+                    }
                 }
                 let ranges = class.ranges().len();
                 budget.charge(ranges)?;
@@ -402,6 +425,7 @@ fn validate_repetition(repetition: &Repetition, budget: &mut CompileBudget) -> R
 struct Builder<'a> {
     slots: Vec<Inst>,
     state_limit: usize,
+    profile: RustByteProfile,
     capture_policy: CapturePolicy,
     budget: &'a mut CompileBudget,
 }
@@ -409,12 +433,14 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn new(
         state_limit: usize,
+        profile: RustByteProfile,
         capture_policy: CapturePolicy,
         budget: &'a mut CompileBudget,
     ) -> Self {
         Self {
             slots: Vec::new(),
             state_limit,
+            profile,
             capture_policy,
             budget,
         }
@@ -475,22 +501,7 @@ impl<'a> Builder<'a> {
                 })
             }
             HirKind::Class(Class::Unicode(class)) => {
-                let mut bytes = ByteSet::empty();
-                for range in class.ranges() {
-                    if !range.end().is_ascii() {
-                        return Err(Error::Unsupported(Unsupported::UnicodeClass));
-                    }
-                    let start = u8::try_from(u32::from(range.start()))
-                        .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
-                    let end = u8::try_from(u32::from(range.end()))
-                        .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
-                    self.budget.charge(inclusive_byte_width(start, end)?)?;
-                    bytes.insert_range(start, end);
-                }
-                self.push(Inst::Consume {
-                    bytes,
-                    next: continuation,
-                })
+                self.compile_unicode_class(class, continuation)
             }
             HirKind::Look(look) => {
                 let assertion = Assertion::from_look(*look)
@@ -532,6 +543,51 @@ impl<'a> Builder<'a> {
                 self.compile_repetition(repetition, continuation, child_depth)
             }
         }
+    }
+
+    fn compile_unicode_class(
+        &mut self,
+        class: &regex_syntax::hir::ClassUnicode,
+        continuation: usize,
+    ) -> Result<usize, Error> {
+        let mut entry = None;
+        for range in class.ranges() {
+            let next = if range.end().is_ascii() {
+                let start = u8::try_from(u32::from(range.start()))
+                    .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
+                let end = u8::try_from(u32::from(range.end()))
+                    .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
+                self.budget.charge(inclusive_byte_width(start, end)?)?;
+                let mut bytes = ByteSet::empty();
+                bytes.insert_range(start, end);
+                self.push(Inst::Consume {
+                    bytes,
+                    next: continuation,
+                })?
+            } else {
+                if !self.profile.unicode || range.start() != range.end() {
+                    return Err(Error::Unsupported(Unsupported::UnicodeClass));
+                }
+                let mut encoded = [0_u8; 4];
+                let scalar = range.start().encode_utf8(&mut encoded);
+                let mut next = continuation;
+                for &byte in scalar.as_bytes().iter().rev() {
+                    self.budget.charge(1)?;
+                    let mut bytes = ByteSet::empty();
+                    bytes.insert(byte);
+                    next = self.push(Inst::Consume { bytes, next })?;
+                }
+                next
+            };
+            entry = Some(match entry {
+                None => next,
+                Some(preferred) => self.push(Inst::Split {
+                    preferred,
+                    fallback: next,
+                })?,
+            });
+        }
+        entry.ok_or(Error::InternalInvariant("empty Unicode scalar class"))
     }
 
     fn compile_repetition(
@@ -588,8 +644,12 @@ impl<'a> Builder<'a> {
         let initial_loop = self.push(Inst::Unfilled)?;
         let progressed_loop = self.push(Inst::Unfilled)?;
         let (fragment, fragment_entry) = {
-            let mut fragment_builder =
-                Builder::new(self.state_limit, self.capture_policy, self.budget);
+            let mut fragment_builder = Builder::new(
+                self.state_limit,
+                self.profile,
+                self.capture_policy,
+                self.budget,
+            );
             let accept = fragment_builder.push(Inst::Match)?;
             let fragment_entry = fragment_builder.compile_node(child, accept, depth)?;
             (fragment_builder.finish()?, fragment_entry)
@@ -625,8 +685,12 @@ impl<'a> Builder<'a> {
         // Required iterations are finite, but their aggregate progress must
         // select the right mode for the open tail.
         let (required, required_entry) = {
-            let mut fragment_builder =
-                Builder::new(self.state_limit, self.capture_policy, self.budget);
+            let mut fragment_builder = Builder::new(
+                self.state_limit,
+                self.profile,
+                self.capture_policy,
+                self.budget,
+            );
             let accept = fragment_builder.push(Inst::Match)?;
             let mut entry = accept;
             for _ in 0..minimum {

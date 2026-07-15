@@ -134,6 +134,10 @@ fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_variable_width_f
         Err(Error::Unsupported(Unsupported::UnicodeClass))
     ));
     assert!(matches!(
+        compile_unicode_byte_stable("[雪-雫]"),
+        Err(Error::Unsupported(Unsupported::UnicodeClass))
+    ));
+    assert!(matches!(
         compile_unicode_byte_stable(r"\b"),
         Err(Error::Unsupported(Unsupported::Look(Look::WordUnicode)))
     ));

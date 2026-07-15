@@ -14,14 +14,16 @@ iteration: empty matches occur at every byte boundary. The continuation engine
 may execute canonical HIR when every transition is already byte-stable:
 
 - empty expressions and literals, including UTF-8-expanded Unicode literals;
-- byte classes and Unicode classes whose ranges are all ASCII;
+- byte classes, ASCII Unicode ranges, and singleton Unicode scalar classes
+  lowered to their exact canonical one- through four-byte UTF-8 encodings;
 - absolute, LF-aware, and explicitly ASCII word assertions;
 - capture-transparent whole-match composition, ordered alternation,
   concatenation, and bounded or unbounded greedy/lazy repetition.
 
-Non-ASCII Unicode classes, Unicode word assertions, and CRLF assertions remain
-typed compiler refusals. This excludes variable-width scalar decoding, Unicode
-case-folding classes, Unicode `.` classes, and Unicode word-boundary state.
+Non-singleton non-ASCII Unicode classes, Unicode word assertions, and CRLF
+assertions remain typed compiler refusals. This excludes variable-width scalar
+decoding, Unicode case-folding classes, Unicode `.` classes, and Unicode
+word-boundary state.
 There is no fallback after a continuation plan is selected.
 
 The direct compiler requires an explicit
@@ -36,11 +38,13 @@ candidate adapter identity advances to `fre-current-aggregate-v4`.
 ## Equivalence argument
 
 Canonical HIR literals are finite byte strings after parsing. Byte classes and
-the admitted ASCII-only Unicode classes consume exactly one byte. Every
-admitted assertion is a constant-time predicate of the absolute byte boundary
-and at most its adjacent bytes. Composition and repetition therefore operate
-over the same ordered byte transitions as the existing certified Unicode-off
-continuation program.
+the admitted ASCII Unicode ranges consume exactly one byte. Each admitted
+singleton non-ASCII scalar consumes its unique canonical UTF-8 byte sequence;
+no invalid, overlong, surrogate, or neighboring scalar byte sequence reaches
+that path. Every admitted assertion is a constant-time predicate of the
+absolute byte boundary and at most its adjacent bytes. Composition and
+repetition therefore operate over the same ordered byte transitions as the
+existing certified Unicode-off continuation program.
 
 The only profile-dependent iteration detail not retained in HIR is empty-match
 filtering. The pinned bytes/Rebar configuration sets `utf8_empty=false`, so its
