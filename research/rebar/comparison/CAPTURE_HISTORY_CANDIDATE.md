@@ -42,8 +42,12 @@ The capture-specific preflight independently checks:
 - `selected matches * (3 * replay cells + 1)` replay/materialization work.
 
 The certificate publishes both the preflight work bound and actual work.
-Capture replay scratch and group-output allocations are attempted only after
-the capture bounds pass, and allocation failures remain typed. A selected
+Capture replay scratch and group-output allocations use the shared fallible
+exact-layout policy after logical preflight. Their actual visited, stack,
+history, match, group, and temporary-offset capacities are rechecked against
+the named replay/history/output/peak bounds and supply the certificate's
+physical peak; every push is capacity-guarded and full before boxed conversion.
+Allocation failures remain typed. A selected
 capture build or execution refusal never invokes exact-literal, direct Unicode
 scalar, build-many, or capture-erasing fallback.
 

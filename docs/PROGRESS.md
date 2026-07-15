@@ -162,7 +162,10 @@ in the same bounded continuation program, selects whole matches with the
 existing certified recurrence, and reconstructs submatches by prioritized
 exact-span replay. Replay storage is bounded by program states times the
 longest already-selected match, with capture slots, history nodes, output,
-peak bytes, and cumulative grep work checked independently. The projected
+peak bytes, and cumulative grep work checked independently. Capture storage
+uses exact-layout fallible vectors; admission and certificates charge the
+physical capacities of visited, stack, history, match, group, and temporary
+offset storage, with every push bounded before it can reallocate. The projected
 Rebar evaluation universe is 37 rows (15 `count-captures`, 22
 `grep-captures`), not 37 passes. Static Unicode/cardinality preflight narrows
 the exact maximum candidate universe to 22 rows (11 per model); syntax and
