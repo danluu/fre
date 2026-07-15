@@ -89,6 +89,8 @@ fn unicode_scalar_classes_lower_to_exact_utf8_byte_paths() {
     assert_eq!(tuple(find_unicode(".", "😀".as_bytes())), Some((0, 4)));
     assert_eq!(tuple(find_unicode(".", &[0xFF, b'x'])), Some((1, 2)));
     assert_eq!(tuple(find_unicode(".", &[0xCE])), None);
+    assert_eq!(tuple(find_unicode(".", &[0xC0, 0x80])), None);
+    assert_eq!(tuple(find_unicode(".", &[0xED, 0xA0, 0x80])), None);
 
     let ruff = r"^[ \t\f]*#.*?coding[:=][ \t]*utf-?8";
     assert_eq!(
