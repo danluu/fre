@@ -24,9 +24,12 @@ arbitrary byte literals remain part of the existing kernel identity.
 Finite extraction, materialized word capacities, dense-DFA construction,
 persistent bytes, combined construction peak, operation transitions, reducer
 positions, ring initialization, total work, scratch, and operation peak all
-have explicit limits or reported counters. Source/profile, operation, selected
-plan, algorithm/operation tag, all build limits, and all execution limits are
-in facade cache identity. The explain schema advances from 3 to 4.
+have explicit limits or reported counters. The exact observed materialized-word
+capacity is debited from the kernel peak budget before kernel construction and
+is checked again with the kernel's exact observed peak before publication.
+Source/profile, operation, selected plan, algorithm/operation tag, all build
+limits, and all execution limits are in facade cache identity. The explain
+schema advances from 3 to 4.
 
 Patterns with repetition or look assertions, extraction beyond 4,096 words or
 4 MiB of word payload, Unicode-enabled profiles, and complete-span output stay

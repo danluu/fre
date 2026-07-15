@@ -901,6 +901,17 @@ impl AggregateBuilder {
                             limit: limits.finite_ordered_literals.max_build_work,
                         },
                     })?;
+                kernel_limits.max_peak_bytes = kernel_limits
+                    .max_peak_bytes
+                    .checked_sub(words_capacity_bytes)
+                    .ok_or(AggregateBuildError::FiniteOrderedLiteralBuild {
+                        operation,
+                        selection,
+                        source: OrderedLiteralAggregateBuildError::PeakLimit {
+                            needed: words_capacity_bytes,
+                            limit: limits.finite_ordered_literals.max_peak_bytes,
+                        },
+                    })?;
                 let (engine, kernel_build, operation_plan_id) = match operation {
                     AggregateOperation::Count => {
                         let plan = OrderedLiteralCountPlan::build(
