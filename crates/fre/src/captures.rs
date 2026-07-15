@@ -12,6 +12,7 @@ use fre_aggregate::{
     RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
+    AsciiWordLook,
     AggregateLimits, Ast, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
     BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, Greed, HistoryRegex,
     Program, ResourceKind as EngineResource, SearchError as EngineSearchError, Span as EngineSpan,
@@ -730,6 +731,18 @@ fn lower_hir(
         }
         HirKind::Look(Look::Start) => Ok(Ast::Start),
         HirKind::Look(Look::End) => Ok(Ast::End),
+        HirKind::Look(Look::WordAscii) => Ok(Ast::AsciiWordLook(AsciiWordLook::Boundary)),
+        HirKind::Look(Look::WordAsciiNegate) => {
+            Ok(Ast::AsciiWordLook(AsciiWordLook::BoundaryNegate))
+        }
+        HirKind::Look(Look::WordStartAscii) => Ok(Ast::AsciiWordLook(AsciiWordLook::Start)),
+        HirKind::Look(Look::WordEndAscii) => Ok(Ast::AsciiWordLook(AsciiWordLook::End)),
+        HirKind::Look(Look::WordStartHalfAscii) => {
+            Ok(Ast::AsciiWordLook(AsciiWordLook::StartHalf))
+        }
+        HirKind::Look(Look::WordEndHalfAscii) => {
+            Ok(Ast::AsciiWordLook(AsciiWordLook::EndHalf))
+        }
         HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
             *look,
         ))),

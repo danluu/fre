@@ -198,6 +198,7 @@ impl InlineRegex {
                         pc: self.program.start,
                         slots,
                     },
+                    haystack,
                     pos,
                     window,
                     &mut counters,
@@ -254,6 +255,7 @@ impl InlineRegex {
                             pc: *target,
                             slots: thread.slots,
                         },
+                        haystack,
                         next_pos,
                         window,
                         &mut counters,
@@ -347,6 +349,7 @@ fn add_thread(
     seen: &mut [usize],
     generation: usize,
     initial: Thread,
+    haystack: &[u8],
     pos: usize,
     window: Window,
     counters: &mut Counters,
@@ -389,6 +392,18 @@ fn add_thread(
                     stack.push(thread);
                 }
             }
+            State::AssertAsciiWord { look, next } => {
+                let before = pos > window.start
+                    && haystack
+                        .get(pos - 1)
+                        .is_some_and(|byte| is_ascii_word(*byte));
+                let after = pos < window.end
+                    && haystack.get(pos).is_some_and(|byte| is_ascii_word(*byte));
+                if look.matches(before, after) {
+                    thread.pc = *next;
+                    stack.push(thread);
+                }
+            }
             State::Save { slot, next } => {
                 let saved = thread
                     .slots
@@ -411,4 +426,8 @@ fn add_thread(
     }
     counters.peak_threads = counters.peak_threads.max(output.len());
     Ok(())
+}
+
+const fn is_ascii_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }

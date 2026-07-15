@@ -9,6 +9,36 @@ pub enum Greed {
     Lazy,
 }
 
+/// Byte-oriented ASCII word assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsciiWordLook {
+    /// The adjacent bytes differ in ASCII-word membership.
+    Boundary,
+    /// The adjacent bytes have equal ASCII-word membership.
+    BoundaryNegate,
+    /// A non-word byte is followed by an ASCII-word byte.
+    Start,
+    /// An ASCII-word byte is followed by a non-word byte.
+    End,
+    /// The byte before the boundary is not an ASCII-word byte.
+    StartHalf,
+    /// The byte after the boundary is not an ASCII-word byte.
+    EndHalf,
+}
+
+impl AsciiWordLook {
+    pub(crate) const fn matches(self, before: bool, after: bool) -> bool {
+        match self {
+            Self::Boundary => before != after,
+            Self::BoundaryNegate => before == after,
+            Self::Start => !before && after,
+            Self::End => before && !after,
+            Self::StartHalf => !before,
+            Self::EndHalf => !after,
+        }
+    }
+}
+
 /// Syntax accepted by the capture laboratory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ast {
@@ -46,6 +76,8 @@ pub enum Ast {
     Start,
     /// End of the logical window.
     End,
+    /// An ASCII word assertion at the current byte boundary.
+    AsciiWordLook(AsciiWordLook),
 }
 
 impl Ast {
