@@ -15,7 +15,7 @@ use core::{fmt, mem::size_of};
 use crate::Window;
 
 /// Stable identity for the scalar-stream implementation.
-pub const PLAN_ID: &str = "unicode-scalar-aggregate.utf8-stream-ranges.v1";
+pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.valid-scalar.v1";
 /// Stable identity for the matched-byte-sum reducer.
@@ -187,6 +187,9 @@ pub struct ReduceActualCounters {
     pub decode_byte_checks: usize,
     pub valid_scalars: usize,
     pub invalid_bytes: usize,
+    /// ASCII bytes consumed by maximal-run reduction before the general
+    /// UTF-8 decoder. This is also the exact number of ASCII bitmap tests.
+    pub ascii_run_bytes: usize,
     pub ascii_bitmap_tests: usize,
     pub non_ascii_membership_tests: usize,
     pub range_comparisons: usize,
@@ -748,6 +751,7 @@ impl UnicodeScalarAggregatePlan {
             decode_byte_checks: 0,
             valid_scalars: 0,
             invalid_bytes: 0,
+            ascii_run_bytes: 0,
             ascii_bitmap_tests: 0,
             non_ascii_membership_tests: 0,
             range_comparisons: 0,
@@ -758,6 +762,74 @@ impl UnicodeScalarAggregatePlan {
             scratch_bytes: 0,
         };
         while position < local.len() {
+            // ASCII is both one byte wide and always a valid UTF-8 scalar.
+            // Reduce a maximal run without constructing a `DecodedScalar` or
+            // performing checked accounting for every byte. The bitmap test
+            // remains pointwise, so arbitrary scalar classes and match
+            // positions retain exactly the same semantics.
+            if local[position].is_ascii() {
+                let run_start = position;
+                let mut run_matches = 0_usize;
+                while position < local.len() {
+                    let byte = local[position];
+                    if !byte.is_ascii() {
+                        break;
+                    }
+                    let word = self.ascii[usize::from(byte / 64)];
+                    if word & (1_u64 << (byte % 64)) != 0 {
+                        // At most one match is recorded per byte in this run,
+                        // so this cannot exceed the enclosing slice length.
+                        run_matches += 1;
+                    }
+                    // `position < local.len()` proves this addition cannot
+                    // overflow and remains within the slice boundary.
+                    position += 1;
+                }
+                let run_bytes = position - run_start;
+                actual.decode_byte_checks = actual
+                    .decode_byte_checks
+                    .checked_add(run_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run decode byte checks",
+                    })?;
+                actual.valid_scalars = actual.valid_scalars.checked_add(run_bytes).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run valid scalars",
+                    },
+                )?;
+                actual.ascii_run_bytes = actual.ascii_run_bytes.checked_add(run_bytes).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run bytes",
+                    },
+                )?;
+                actual.ascii_bitmap_tests = actual
+                    .ascii_bitmap_tests
+                    .checked_add(run_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run bitmap tests",
+                    })?;
+                actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run match events",
+                    },
+                )?;
+                let run_matches = u64::try_from(run_matches).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run matches",
+                    }
+                })?;
+                actual.count = actual.count.checked_add(run_matches).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run count",
+                    },
+                )?;
+                actual.matched_bytes = actual.matched_bytes.checked_add(run_matches).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual ASCII-run matched bytes",
+                    },
+                )?;
+                continue;
+            }
             let decoded = decode_scalar(&local[position..]);
             actual.decode_byte_checks = actual
                 .decode_byte_checks
@@ -772,30 +844,23 @@ impl UnicodeScalarAggregatePlan {
                             computation: "actual valid scalars",
                         },
                     )?;
-                    if scalar <= 0x7F {
-                        actual.ascii_bitmap_tests = actual
-                            .ascii_bitmap_tests
-                            .checked_add(1)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "actual ASCII bitmap tests",
-                            })?;
-                        self.contains_ascii(scalar)?
-                    } else {
-                        actual.non_ascii_membership_tests = actual
-                            .non_ascii_membership_tests
-                            .checked_add(1)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "actual non-ASCII membership tests",
-                            })?;
-                        let (contains, comparisons) = self.contains_non_ascii(scalar)?;
-                        actual.range_comparisons = actual
-                            .range_comparisons
-                            .checked_add(comparisons)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "actual range comparisons",
-                            })?;
-                        contains
-                    }
+                    // The maximal ASCII-run branch above proves that every
+                    // successfully decoded scalar here is non-ASCII.
+                    debug_assert!(scalar > 0x7F);
+                    actual.non_ascii_membership_tests = actual
+                        .non_ascii_membership_tests
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual non-ASCII membership tests",
+                        })?;
+                    let (contains, comparisons) = self.contains_non_ascii(scalar)?;
+                    actual.range_comparisons = actual
+                        .range_comparisons
+                        .checked_add(comparisons)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual range comparisons",
+                        })?;
+                    contains
                 } else {
                     actual.invalid_bytes = actual.invalid_bytes.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
@@ -852,6 +917,7 @@ impl UnicodeScalarAggregatePlan {
             })?;
         debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
         debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
         debug_assert!(membership_tests <= upper.membership_tests);
         debug_assert!(actual.range_comparisons <= upper.range_comparisons);
         debug_assert!(actual.match_events <= upper.match_events);
@@ -859,14 +925,6 @@ impl UnicodeScalarAggregatePlan {
         debug_assert!(actual.matched_bytes <= upper.span_sum);
         debug_assert!(actual.work <= upper.work);
         Ok(actual)
-    }
-
-    fn contains_ascii(&self, scalar: u32) -> Result<bool, ReduceError> {
-        let index = usize::try_from(scalar / 64).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "ASCII membership index",
-        })?;
-        let shift = scalar % 64;
-        Ok(self.ascii[index] & (1_u64 << shift) != 0)
     }
 
     fn contains_non_ascii(&self, scalar: u32) -> Result<(bool, usize), ReduceError> {
@@ -1501,6 +1559,7 @@ mod tests {
         assert_eq!(right.decode_byte_checks, left.decode_byte_checks * 2);
         assert_eq!(right.valid_scalars, left.valid_scalars * 2);
         assert_eq!(right.invalid_bytes, left.invalid_bytes * 2);
+        assert_eq!(right.ascii_run_bytes, left.ascii_run_bytes * 2);
         assert_eq!(right.ascii_bitmap_tests, left.ascii_bitmap_tests * 2);
         assert_eq!(
             right.non_ascii_membership_tests,
@@ -1511,6 +1570,41 @@ mod tests {
         assert_eq!(right.work, left.work * 2);
         assert_eq!(left.scratch_bytes, 0);
         assert_eq!(right.scratch_bytes, 0);
+    }
+
+    #[test]
+    fn ascii_runs_preserve_match_position_and_scale_at_n_2n_4n() {
+        let plan = class_plan();
+        let cases: [(&[u8], u64); 3] = [
+            (b"A0123456789", 1),
+            (b"0123456789Z", 1),
+            (b"0123456789!", 0),
+        ];
+        for (unit, matches_per_unit) in cases {
+            for scale in [1_usize, 2, 4] {
+                let haystack = unit.repeat(scale);
+                let expected = matches_per_unit * u64::try_from(scale).unwrap();
+                let count = plan
+                    .count(&haystack, ReduceLimits::unlimited())
+                    .unwrap();
+                let sum = plan
+                    .span_sum(&haystack, ReduceLimits::unlimited())
+                    .unwrap();
+                assert_eq!(count.count, expected);
+                assert_eq!(sum.span_sum, expected);
+                let actual = count.accounting.actual;
+                assert_eq!(actual.input_bytes_advanced, haystack.len());
+                assert_eq!(actual.decode_byte_checks, haystack.len());
+                assert_eq!(actual.valid_scalars, haystack.len());
+                assert_eq!(actual.invalid_bytes, 0);
+                assert_eq!(actual.ascii_run_bytes, haystack.len());
+                assert_eq!(actual.ascii_bitmap_tests, haystack.len());
+                assert_eq!(actual.non_ascii_membership_tests, 0);
+                assert_eq!(actual.range_comparisons, 0);
+                assert_eq!(actual.work, haystack.len() * 2);
+                assert_eq!(actual.scratch_bytes, 0);
+            }
+        }
     }
 
     #[test]
