@@ -52,7 +52,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v10-portable-word-run-v1 report={REPORT_SCHEMA} aggregate-explain=7 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v10-portable-word-run-v2 report={REPORT_SCHEMA} aggregate-explain=7 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -521,7 +521,9 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
 
 fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), DynError> {
     match (runtime, plan) {
-        ("k0", PlanKind::K0) | ("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => Ok(()),
+        ("k0", PlanKind::K0)
+        | ("ascii-word-run-linear-v1", PlanKind::UnicodeWordRun)
+        | ("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => Ok(()),
         _ => Err(format!(
             "grep runtime {runtime:?} and selected plan {plan:?} are not an authenticated pair"
         )
@@ -567,16 +569,22 @@ mod tests {
     fn authenticates_each_timed_grep_runtime_against_its_plan() {
         assert!(require_grep_runtime_plan("k0", PlanKind::K0).is_ok());
         assert!(
+            require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::UnicodeWordRun,)
+                .is_ok()
+        );
+        assert!(
             require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun,)
                 .is_ok()
         );
         assert!(require_grep_runtime_plan("k0", PlanKind::UnicodeWordRun).is_err());
+        assert!(require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::K0).is_err());
         assert!(require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::K0).is_err());
     }
 
     #[test]
     fn requires_runtime_identity_for_grep_without_freezing_it_to_k0() {
         assert!(require_runtime_expectation("grep", Some("k0")).is_ok());
+        assert!(require_runtime_expectation("grep", Some("ascii-word-run-linear-v1")).is_ok());
         assert!(require_runtime_expectation("grep", Some("unicode-word-run-linear-v1")).is_ok());
         assert!(require_runtime_expectation("grep", None).is_err());
         assert!(require_runtime_expectation("count", Some("k0")).is_err());

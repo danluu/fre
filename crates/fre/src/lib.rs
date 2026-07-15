@@ -220,7 +220,7 @@ pub enum PlanKind {
     ForwardAnchored,
     /// Generic bounded portable prioritized automaton.
     K0,
-    /// Linear canonical Unicode `\b\w{m,}\b` scalar-run scan.
+    /// Linear canonical ASCII or Unicode `\b\w{m,}\b` word-run scan.
     UnicodeWordRun,
 }
 
@@ -935,7 +935,7 @@ impl PortablePlan {
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
-            Self::UnicodeWordRun(_) => unicode_word_run::PLAN_ID,
+            Self::UnicodeWordRun(plan) => plan.plan_id(),
         }
     }
 }

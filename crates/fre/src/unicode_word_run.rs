@@ -5,11 +5,19 @@ use regex_syntax::{
 
 use crate::{Match, SearchLimits, SearchWindow};
 
-pub(crate) const PLAN_ID: &str = "unicode-word-run-linear-v1";
+pub(crate) const UNICODE_PLAN_ID: &str = "unicode-word-run-linear-v1";
+pub(crate) const ASCII_PLAN_ID: &str = "ascii-word-run-linear-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WordMode {
+    Ascii,
+    Unicode,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Plan {
     minimum_scalars: usize,
+    mode: WordMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,11 +66,11 @@ impl core::fmt::Display for Error {
                 haystack_len,
             } => write!(
                 f,
-                "Unicode word-run window {start}..{end} exceeds haystack length {haystack_len}"
+                "word-run window {start}..{end} exceeds haystack length {haystack_len}"
             ),
             Self::WorkLimitExceeded { needed, limit } => write!(
                 f,
-                "Unicode word-run search needs {needed} work units, exceeding {limit}"
+                "word-run search needs {needed} work units, exceeding {limit}"
             ),
         }
     }
@@ -71,8 +79,18 @@ impl core::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Plan {
-    pub(crate) const fn new(minimum_scalars: usize) -> Self {
-        Self { minimum_scalars }
+    const fn new(minimum_scalars: usize, mode: WordMode) -> Self {
+        Self {
+            minimum_scalars,
+            mode,
+        }
+    }
+
+    pub(crate) const fn plan_id(self) -> &'static str {
+        match self.mode {
+            WordMode::Ascii => ASCII_PLAN_ID,
+            WordMode::Unicode => UNICODE_PLAN_ID,
+        }
     }
 
     pub(crate) fn find_window(
@@ -88,6 +106,78 @@ impl Plan {
                 haystack_len: haystack.len(),
             });
         }
+        match self.mode {
+            WordMode::Ascii => self.find_ascii_window(haystack, window, limits),
+            WordMode::Unicode => self.find_unicode_window(haystack, window, limits),
+        }
+    }
+
+    fn find_ascii_window(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, Accounting), Error> {
+        let mut accounting = Accounting {
+            work: 0,
+            bytes_examined: 0,
+            scalars_decoded: 0,
+        };
+        let mut position = window.start();
+        while position < window.end() {
+            charge(&mut accounting, limits)?;
+            let byte = haystack[position];
+            accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+            accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+            if !is_ascii_word(byte)
+                || position
+                    .checked_sub(1)
+                    .is_some_and(|before| is_ascii_word(haystack[before]))
+            {
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+                continue;
+            }
+
+            let start = position;
+            position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                needed: u64::MAX,
+                limit: limits.max_work,
+            })?;
+            while position < window.end() && is_ascii_word(haystack[position]) {
+                charge(&mut accounting, limits)?;
+                accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+                accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+            }
+            if position.saturating_sub(start) >= self.minimum_scalars
+                && !haystack
+                    .get(position)
+                    .is_some_and(|&byte| is_ascii_word(byte))
+            {
+                return Ok((
+                    Some(Match {
+                        start,
+                        end: position,
+                    }),
+                    accounting,
+                ));
+            }
+        }
+        Ok((None, accounting))
+    }
+
+    fn find_unicode_window(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, Accounting), Error> {
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -106,7 +196,7 @@ impl Plan {
             };
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
-            if !is_word(scalar) || word_before(haystack, position) {
+            if !is_unicode_word(scalar) || unicode_word_before(haystack, position) {
                 position = position
                     .checked_add(width)
                     .ok_or(Error::WorkLimitExceeded {
@@ -132,7 +222,7 @@ impl Plan {
                 };
                 accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
                 accounting.bytes_examined = accounting.bytes_examined.saturating_add(next_width);
-                if !is_word(next) {
+                if !is_unicode_word(next) {
                     break;
                 }
                 count = count.saturating_add(1);
@@ -143,7 +233,7 @@ impl Plan {
                         limit: limits.max_work,
                     })?;
             }
-            if count >= self.minimum_scalars && !word_after(haystack, position) {
+            if count >= self.minimum_scalars && !unicode_word_after(haystack, position) {
                 return Ok((
                     Some(Match {
                         start,
@@ -164,24 +254,25 @@ pub(crate) fn extract(hir: &Hir) -> Option<Plan> {
     let [start, repeated, end] = parts.as_slice() else {
         return None;
     };
-    if !matches!(transparent(start).kind(), HirKind::Look(Look::WordUnicode))
-        || !matches!(transparent(end).kind(), HirKind::Look(Look::WordUnicode))
-    {
-        return None;
-    }
+    let mode = match (transparent(start).kind(), transparent(end).kind()) {
+        (HirKind::Look(Look::WordAscii), HirKind::Look(Look::WordAscii)) => WordMode::Ascii,
+        (HirKind::Look(Look::WordUnicode), HirKind::Look(Look::WordUnicode)) => WordMode::Unicode,
+        _ => return None,
+    };
     let HirKind::Repetition(repetition) = transparent(repeated).kind() else {
         return None;
     };
     if repetition.min == 0 || repetition.max.is_some() || !repetition.greedy {
         return None;
     }
-    let HirKind::Class(Class::Unicode(class)) = transparent(&repetition.sub).kind() else {
-        return None;
-    };
-    if class != &parse_word_class()? {
-        return None;
+    match (mode, transparent(&repetition.sub).kind()) {
+        (WordMode::Ascii, HirKind::Class(Class::Bytes(class)))
+            if class == &parse_ascii_word_class()? => {}
+        (WordMode::Unicode, HirKind::Class(Class::Unicode(class)))
+            if class == &parse_unicode_word_class()? => {}
+        _ => return None,
     }
-    Some(Plan::new(usize::try_from(repetition.min).ok()?))
+    Some(Plan::new(usize::try_from(repetition.min).ok()?, mode))
 }
 
 fn transparent(mut hir: &Hir) -> &Hir {
@@ -191,7 +282,20 @@ fn transparent(mut hir: &Hir) -> &Hir {
     hir
 }
 
-fn parse_word_class() -> Option<regex_syntax::hir::ClassUnicode> {
+fn parse_ascii_word_class() -> Option<regex_syntax::hir::ClassBytes> {
+    let hir = ParserBuilder::new()
+        .unicode(false)
+        .utf8(false)
+        .build()
+        .parse(r"\w")
+        .ok()?;
+    let HirKind::Class(Class::Bytes(class)) = hir.kind() else {
+        return None;
+    };
+    Some(class.clone())
+}
+
+fn parse_unicode_word_class() -> Option<regex_syntax::hir::ClassUnicode> {
     let hir = ParserBuilder::new()
         .unicode(true)
         .utf8(false)
@@ -216,23 +320,32 @@ fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error
     Ok(())
 }
 
-fn word_before(haystack: &[u8], position: usize) -> bool {
-    decode_last(&haystack[..position]).is_some_and(|(scalar, _)| is_word(scalar))
+fn unicode_word_before(haystack: &[u8], position: usize) -> bool {
+    decode_last(&haystack[..position]).is_some_and(|(scalar, _)| is_unicode_word(scalar))
 }
 
-fn word_after(haystack: &[u8], position: usize) -> bool {
-    decode_first(&haystack[position..]).is_some_and(|(scalar, _)| is_word(scalar))
+fn unicode_word_after(haystack: &[u8], position: usize) -> bool {
+    decode_first(&haystack[position..]).is_some_and(|(scalar, _)| is_unicode_word(scalar))
 }
 
-fn is_word(scalar: char) -> bool {
+fn is_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn is_unicode_word(scalar: char) -> bool {
+    if scalar.is_ascii() {
+        return is_ascii_word(scalar as u8);
+    }
     regex_syntax::try_is_word_character(scalar)
         .expect("fre enables regex-syntax's Unicode Perl tables")
 }
 
 fn decode_first(bytes: &[u8]) -> Option<(char, usize)> {
     let first = *bytes.first()?;
+    if first.is_ascii() {
+        return Some((char::from(first), 1));
+    }
     let width = match first {
-        0x00..=0x7F => 1,
         0xC2..=0xDF => 2,
         0xE0..=0xEF => 3,
         0xF0..=0xF4 => 4,

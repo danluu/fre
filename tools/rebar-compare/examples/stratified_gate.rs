@@ -28,7 +28,7 @@ type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 const SCHEMA: &str = "fre.rebar.stratified-performance.v2";
 const PAIRS: usize = 6;
 const PARTS_PER_MILLION: u128 = 1_000_000;
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v2";
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
@@ -888,6 +888,7 @@ fn expected_grep_runtime(model: &str, job_id: &str) -> Option<&'static str> {
     }
     match job_id {
         "grep/long-words-unicode@rust/regex" => Some("unicode-word-run-linear-v1"),
+        "grep/long-words-ascii@rust/regex" => Some("ascii-word-run-linear-v1"),
         _ => Some("k0"),
     }
 }
@@ -998,7 +999,7 @@ fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
     let required = [
         "fre.rebar.klv-runner.v1",
         "protocol=stratified-v1",
-        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v1",
+        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v2",
         "report=fre.rebar.comparison.v2",
         "rebar=463d00f31887e84c38467805b9e3122c314b9521",
         "canonical-sha=",
@@ -1379,7 +1380,7 @@ mod tests {
         );
         assert_eq!(
             expected_grep_runtime("grep", "grep/long-words-ascii@rust/regex"),
-            Some("k0")
+            Some("ascii-word-run-linear-v1")
         );
         assert_eq!(
             expected_grep_runtime("count", "curated/01-literal/sherlock-en@rust/regex"),

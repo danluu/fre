@@ -63,7 +63,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4422,7 +4422,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v10-portable-word-run-v1"
+            "fre-current-aggregate-capture-v10-portable-word-run-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("positive-Unicode-word"));

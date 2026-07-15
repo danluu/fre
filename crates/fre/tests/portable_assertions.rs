@@ -653,6 +653,63 @@ fn unicode_word_runs_select_a_linear_plan_and_match_pinned_ranges() {
 }
 
 #[test]
+fn ascii_word_runs_select_a_byte_linear_plan_and_match_pinned_ranges() {
+    const PATTERNS: &[&str] = &[r"\b\w{1,}\b", r"\b\w{8,}\b", r"\b\w{25,}\b"];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"--alphabetic_identifier--",
+        "--αβγ--".as_bytes(),
+        "😀alpha😀".as_bytes(),
+        &[0xFF, b'a', b'b', 0xFF],
+        &[b'a', 0xFF, b'b'],
+        &[0xCE],
+        &[0xC0, 0x80],
+        &[0xED, 0xA0, 0x80],
+    ];
+
+    for &pattern in PATTERNS {
+        let fre = PortableBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .unwrap_or_else(|error| panic!("ASCII word-run build failed: {error}"));
+        let upstream = pinned_with_unicode(pattern, false);
+        assert_eq!(fre.build_report().plan, PlanKind::UnicodeWordRun);
+        assert_eq!(fre.runtime_implementation_id(), "ascii-word-run-linear-v1");
+        let mut session = fre
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("word-run session uses no workspace");
+        assert_eq!(session.workspace_setup_accounting(), None);
+
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = upstream
+                        .find(Input::new(haystack).span(start..end))
+                        .map(|matched| (matched.start(), matched.end()));
+                    let (actual, accounting) = fre
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(accounting.plan(), PlanKind::UnicodeWordRun);
+                    assert_eq!(
+                        actual.map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "cold {pattern:?}/{haystack:?}/{start}..{end}"
+                    );
+                    let reused = session
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(reused.1.plan(), PlanKind::UnicodeWordRun);
+                    assert_eq!(reused.0, actual);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
     let crlf = PortableBuilder::new(r"(?mR:$)")
         .profile(RustProfile::rebar_1_12_4())
