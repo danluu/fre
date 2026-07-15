@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v17";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v18";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1368,7 +1368,7 @@ const SWAR_REPEAT_BYTE: u64 = 0x0101_0101_0101_0101;
 const SWAR_LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const SWAR_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
-const SINGLE_CANDIDATE_MIN: usize = 73;
+const SINGLE_CANDIDATE_MIN: usize = 32;
 const SINGLE_CANDIDATE_MAX: usize = 65_536;
 const PAIR_SWAR_MIN: usize = 73;
 const PAIR_SWAR_FAST_MAX: usize = 4_096;
@@ -2899,7 +2899,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v17"
+            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v18"
         );
         assert_eq!(
             pair.implementation(),

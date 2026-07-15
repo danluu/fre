@@ -2097,7 +2097,7 @@ mod tests {
 
     #[test]
     fn equality5_short_middle_runtime_identity_rejects_stale_forward_family_labels() {
-        const EQUALITY5_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v17";
+        const EQUALITY5_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v18";
         const STALE_ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
         const STALE_FORWARD_ID: &str = "anchored-class-suffix.forward.v1";
 
