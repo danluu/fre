@@ -4563,6 +4563,31 @@ mod tests {
             5,
             "aggregate-capture-history",
         );
+
+        let unicode = current_fre(
+            "count-captures",
+            &["(雪)".to_string()],
+            "雪".as_bytes(),
+            true,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(unicode, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode syntax disabled")),
+            "Unicode capture history must remain typed unsupported: {unicode:?}"
+        );
+        let many = current_fre(
+            "grep-captures",
+            &["(a)".to_string(), "(b)".to_string()],
+            b"a\nb",
+            false,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(many, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
+            "multi-pattern capture history must remain typed unsupported: {many:?}"
+        );
     }
 
     #[test]

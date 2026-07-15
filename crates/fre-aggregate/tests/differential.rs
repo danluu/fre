@@ -115,6 +115,79 @@ fn capture_history_retains_empty_progress_and_refuses_slots_before_replay_alloca
     ));
 }
 
+#[test]
+fn capture_history_exact_limits_succeed_and_one_below_refuses() {
+    let regex = compile_captures(r"(a|(ab))(b)?");
+    let haystack = b"ab ab";
+    let baseline = regex
+        .admit_captures(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            CaptureLimits::default(),
+        )
+        .unwrap();
+    let certificate = baseline.certificate().clone();
+    assert!(certificate.work <= certificate.work_bound);
+    let exact = CaptureLimits {
+        max_capture_slots: certificate.capture_slots,
+        max_replay_cells: certificate.replay_cells,
+        max_history_nodes: certificate.history_nodes_bound,
+        max_output_bytes: certificate.output_bytes,
+        max_work: certificate.work_bound,
+        max_peak_bytes: certificate.peak_bytes,
+    };
+    regex
+        .admit_captures(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            exact,
+        )
+        .unwrap();
+
+    let cases = [
+        (Resource::CaptureSlots, CaptureLimits {
+            max_capture_slots: exact.max_capture_slots - 1,
+            ..exact
+        }),
+        (Resource::CaptureReplayCells, CaptureLimits {
+            max_replay_cells: exact.max_replay_cells - 1,
+            ..exact
+        }),
+        (Resource::CaptureHistoryNodes, CaptureLimits {
+            max_history_nodes: exact.max_history_nodes - 1,
+            ..exact
+        }),
+        (Resource::CaptureOutputBytes, CaptureLimits {
+            max_output_bytes: exact.max_output_bytes - 1,
+            ..exact
+        }),
+        (Resource::CaptureWork, CaptureLimits {
+            max_work: exact.max_work - 1,
+            ..exact
+        }),
+        (Resource::PeakBytes, CaptureLimits {
+            max_peak_bytes: exact.max_peak_bytes - 1,
+            ..exact
+        }),
+    ];
+    for (resource, limits) in cases {
+        expect_resource(
+            regex.admit_captures(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                limits,
+            ),
+            resource,
+        );
+    }
+}
+
 fn upstream(pattern: &str, haystack: &[u8]) -> Vec<Span> {
     regex::bytes::RegexBuilder::new(pattern)
         .unicode(false)
