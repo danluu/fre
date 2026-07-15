@@ -674,10 +674,11 @@ fn add_thread(
                 }
             }
             State::AssertAsciiWord { look, next } => {
-                let before = pos > window.start
-                    && haystack
-                        .get(pos - 1)
-                        .is_some_and(|byte| is_ascii_word(*byte));
+                let before = pos
+                    .checked_sub(1)
+                    .filter(|&index| index >= window.start)
+                    .and_then(|index| haystack.get(index))
+                    .is_some_and(|byte| is_ascii_word(*byte));
                 let after =
                     pos < window.end && haystack.get(pos).is_some_and(|byte| is_ascii_word(*byte));
                 if look.matches(before, after) {
