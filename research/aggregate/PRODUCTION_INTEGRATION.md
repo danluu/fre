@@ -23,7 +23,9 @@ strategy, facade policy, and Rebar reduction independently testable:
    the generic compiler; a selected finite build or run refusal never does.
 4. Remaining HIR is validated and compiled by `fre-aggregate` into a
    prioritized continuation program with exact work, state, temporary-state,
-   and retained program-capacity accounting.
+   and retained program-capacity accounting. Unicode-on construction requires
+   the separately named byte-stable profile; Unicode-off retains its prior
+   byte-boundary profile and program identity domain.
 5. Distinct facade types expose only one operation each:
    `AggregateCompileRegex`, `AggregateSpansRegex`, `AggregateCountRegex`, and
    `AggregateSpanSumRegex`. Operation and storage strategy are fixed before
@@ -61,11 +63,16 @@ For an exact literal, only root capture nodes are peeled and charged; any other
 canonical root is ineligible. Capture-equivalent exact sources share the
 operation/plan identity but retain distinct source/cache identities.
 
-The production aggregate boundary is Rust bytes with Unicode disabled. Unicode
-`true` is a typed refusal before parsing even for an empty or ASCII-only
-pattern. Case-insensitive mode is admitted when Rust syntax lowering produces
-an HIR inside the byte subset. No profile is inferred from an ASCII-looking
-HIR.
+The production aggregate boundary is Rust bytes. Unicode-off construction may
+select exact literals, bounded finite ordered languages, or continuation.
+Unicode-on construction may select a nonempty exact UTF-8 literal or the
+separately certified byte-stable continuation subset: empty/literal,
+ASCII-range or singleton-scalar classes, absolute/LF/ASCII-word assertions,
+and their regular composition. Non-singleton non-ASCII scalar classes,
+Unicode word assertions, and CRLF assertions remain typed compiler refusals.
+Finite ordered selection is Unicode-off only. Case-insensitive mode is admitted
+only when canonical lowering stays inside the selected proof; no profile is
+inferred from an ASCII-looking HIR.
 
 ## Whole-operation resource contract
 
@@ -153,9 +160,10 @@ retain those Rust failures while FRE passes the canonical definitions.
 The canonical authenticated frontier remains 179 FRE pass / 165 unsupported,
 zero fail/fault: 16 `compile`, 54 `count`, 100 `count-spans`, and nine
 portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
-reverse-suffix failures; pinned RE2 remains 285/285. The finite plan is absent
-from those receipts and claims no additional support before regeneration.
-Exact per-model counts, refusal classes, source/tree identities, and the two
+reverse-suffix failures; pinned RE2 remains 285/285. The finite plan and the
+broader Unicode-on continuation candidate are absent from those receipts and
+claim no additional support before regeneration. Exact per-model counts,
+refusal classes, source/tree identities, and the two
 byte-identical generation digest are retained in
 `../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
 the older baseline and is not silently relabelled as 179-frontier evidence.

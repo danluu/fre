@@ -50,8 +50,8 @@ pub enum AggregateOperation {
 /// Construction-time aggregate plan policy.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregatePlanSelection {
-    /// Select an exact-literal plan, then a bounded finite-language plan when
-    /// canonical HIR proves eligibility; otherwise construct continuation.
+    /// Select an exact-literal plan; for Unicode-off eligible HIR, then try a
+    /// bounded finite-language plan; otherwise construct continuation.
     #[default]
     Auto,
     /// Require the direct canonical exact-literal proof.
@@ -819,6 +819,7 @@ impl AggregateBuilder {
                 });
             }
         };
+
         if selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
             && !unicode

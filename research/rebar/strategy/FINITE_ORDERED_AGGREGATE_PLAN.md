@@ -13,6 +13,11 @@ Aho-Corasick/DP reducer in `fre-kernels`; `compile` retains the count plan for
 its separately timed construction and untimed verification seam. A selected
 build or execution refusal does not fall through to continuation.
 
+Unicode-on profiles bypass finite extraction. They retain aggregate schema 5,
+the nonempty exact-UTF-8 literal identity, and the separately certified
+byte-stable continuation identity. Thus the finite candidate cannot erase or
+alias the Unicode profile proof.
+
 The reducer consumes the haystack once from right to left, records the lowest
 ordered alternative at every original start, and evaluates non-overlapping
 iteration with distinct initial/progressed DP states. Therefore `[a^M b, a]`
@@ -30,7 +35,8 @@ capacity is debited from the kernel peak budget before kernel construction and
 is checked again with the kernel's exact observed peak before publication.
 Source/profile, operation, selected plan, algorithm/operation tag, all build
 limits, and all execution limits are in facade cache identity. The explain
-schema remains version 4 while adding the finite operation identity.
+schema remains version 5 while adding the finite operation identity alongside
+the profile-tagged continuation identity.
 
 Patterns with repetition or look assertions, extraction beyond 4,096 words or
 4 MiB of word payload, Unicode-enabled profiles, and complete-span output stay
@@ -62,8 +68,9 @@ compile-quota receipts—must be measured rather than guessed. The phase-B repor
 must publish job IDs, families, model counts, prior refusal resource, selected
 plan, and remaining typed refusal. No support count should be promoted from the
 36-row upper bound.
+
 Finite-language `compile` candidates among the 33 compile rows are a separate
-unmeasured projection introduced by the schema-v4 semantic union; no count is
+unmeasured projection in the composed schema-v5 source; no count is
 claimed until the same authenticated regeneration classifies them.
 
 ## Focused phase-B gates

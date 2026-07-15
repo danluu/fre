@@ -14,10 +14,10 @@ Every non-pass remains in the report with one of four distinct states:
 `COVERAGE_FRONTIER.md` indexes the exact receipts by operation and benchmark
 family and ties the next coverage gates to concrete Rebar job IDs.
 
-## Coverage
+## Retained report coverage
 
 - Exact Rust/Rebar adapter: 344 jobs executed, 342 pass and 2 fail.
-- Current honest FRE facade: 344 receipts, 144 pass and 200 explicitly
+- Checked-in FRE baseline: 344 receipts, 144 pass and 200 explicitly
   unsupported, with no wrong answer or fault. The passes are 48 `count`, 89
   `count-spans`, and the existing 7 `grep` jobs. Every aggregate pass is a
   one-pattern, Unicode-disabled, whole-haystack operation admitted by the
@@ -27,6 +27,12 @@ family and ties the next coverage gates to concrete Rebar job IDs.
 - Direct upstream KLV differentials: 9/9 agree with the pinned Rebar Rust
   runner. These cover every one of the seven Rebar models plus both retained
   Rust baseline failures.
+
+The later authenticated canonical frontier is indexed in
+`COVERAGE_FRONTIER.md`: 179 pass / 165 unsupported with no FRE fail or fault.
+The Unicode-on byte-stable continuation and bounded finite ordered source
+candidates both remain absent from those receipts and claim no additional
+coverage until a fresh authenticated regeneration.
 
 The two Rust adapter failures are:
 
@@ -45,12 +51,14 @@ deliberately does not reproduce the pinned optimizer's `actual=2` bug.
 
 - Exactly one pattern is checked before construction; there is no hidden
   compile-many path.
-- `count` and `count-spans` compile once into distinct operation types and run
-  once over `0..haystack.len()`, preserving absolute-anchor context. Canonical
-  direct-root `Literal`/`Empty` HIR selects the exact-literal whole-operation
-  reducer; other admitted HIR selects the continuation program. Selection is
-  complete before publication and execution never falls back. Only the
-  continuation plan carries the fixed `ReverseSequentialRows` strategy.
+- `compile`, `count`, and `count-spans` construct distinct operation-specific
+  artifacts; reducer verification or execution runs once over
+  `0..haystack.len()`, preserving absolute-anchor context. Canonical direct-root
+  `Literal`/`Empty` HIR selects the exact-literal whole-operation reducer.
+  Bounded Unicode-off finite HIR may select the ordered finite reducer; other
+  admitted HIR selects the continuation program. Selection is complete before
+  publication and execution never falls back. Only the continuation plan
+  carries the fixed `ReverseSequentialRows` strategy.
 - Direct root capture annotations are transparently peeled by the
   allocation-free literal eligibility proof; the continuation compiler erases
   captures inside its bounded traversal. Both are limited to whole-match
@@ -58,21 +66,21 @@ deliberately does not reproduce the pinned optimizer's `actual=2` bug.
   capture erasure produces the same semantic plan.
 - Unicode-enabled Rust jobs select exact literal execution when eligible, then
   the byte-stable continuation subset. Empty, literals, ASCII-only classes,
-  byte assertions, and their regular composition are eligible; non-ASCII
-  Unicode classes and Unicode word assertions remain typed refusals. ASCII
-  case-insensitive lowering is admitted when the resulting HIR stays within
-  that subset.
-- Every literal planner/build/reducer quota and every continuation
-  operation-limit field is mapped explicitly. Literal bounds use authenticated
-  haystack length and selected-plan needle/persistent accounting; continuation
-  bounds use haystack length and exact compiled state count. Resource refusals
-  remain `unsupported`; arithmetic, allocation, and invariant failures would
-  be `fault`.
+  byte assertions, and their regular composition are eligible; non-singleton
+  non-ASCII Unicode classes and Unicode word assertions remain typed refusals.
+  Finite case folds are admitted when canonical HIR contains only singleton
+  scalars.
+- Every literal and finite planner/build/reducer quota and every continuation
+  operation-limit field is mapped explicitly. Literal and finite bounds use
+  authenticated haystack length plus selected-plan construction accounting;
+  continuation bounds use haystack length and exact compiled state count.
+  Resource refusals remain `unsupported`; arithmetic, allocation, and invariant
+  failures would be `fault`.
 
 The additive v2 `candidate_plan` field is present only after a candidate
 operation successfully returns. It records the plan that actually executed; it
-does not infer eligibility for unsupported receipts. The 144 passing candidate
-receipts split into 24 `aggregate-exact-literal`, 113
+does not infer eligibility for unsupported receipts. In the retained 144-pass
+baseline, candidate receipts split into 24 `aggregate-exact-literal`, 113
 `aggregate-continuation-program`, and seven `portable-single-search` rows.
 
 ## Exact Rust adapter configuration

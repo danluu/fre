@@ -35,6 +35,8 @@ byte-stable semantic proof, so equal instruction graphs constructed under the
 two profiles cannot alias in reports or caches. The changed facade identity
 shape advances the composed aggregate explain/cache schema to 5, and the
 comparator candidate adapter identity advances to `fre-current-aggregate-v5`.
+The later source-only finite ordered composition retains both version numbers:
+that plan is Unicode-off only and carries its own operation-typed identity.
 
 ## Equivalence argument
 
