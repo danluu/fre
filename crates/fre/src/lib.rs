@@ -22,6 +22,7 @@ mod captures;
 mod finite;
 mod forward_anchored;
 mod required_literal;
+mod unicode_word_run;
 
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
@@ -103,6 +104,7 @@ pub use fre_automata::{
     SearchError as K0SearchError, SearchLimits, SearchWindow,
     SetupAccounting as SearchSessionSetupAccounting, WorkspaceLimits as SearchSessionLimits,
 };
+pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
 
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 1;
@@ -218,6 +220,8 @@ pub enum PlanKind {
     ForwardAnchored,
     /// Generic bounded portable prioritized automaton.
     K0,
+    /// Linear canonical Unicode `\b\w{m,}\b` scalar-run scan.
+    UnicodeWordRun,
 }
 
 /// Construction failure without semantic fallback.
@@ -365,6 +369,8 @@ pub enum SearchAccounting {
     RequiredLiteral(RequiredLiteralSearchAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
+    /// Exact linear Unicode word-run counters.
+    UnicodeWordRun(UnicodeWordRunAccounting),
 }
 
 impl SearchAccounting {
@@ -378,6 +384,7 @@ impl SearchAccounting {
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
+            Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
         }
     }
 
@@ -397,6 +404,7 @@ impl SearchAccounting {
             }
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
             Self::ForwardAnchored(accounting) => accounting.work_upper_bound,
+            Self::UnicodeWordRun(accounting) => accounting.work(),
         }
     }
 }
@@ -411,6 +419,7 @@ pub enum SearchError {
     LiteralSetDfa(LiteralSetError),
     RequiredLiteral(RequiredLiteralSearchError),
     ForwardAnchored(ForwardAnchoredSearchError),
+    UnicodeWordRun(UnicodeWordRunError),
 }
 
 impl fmt::Display for SearchError {
@@ -426,6 +435,7 @@ impl fmt::Display for SearchError {
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
             }
+            Self::UnicodeWordRun(error) => write!(f, "Unicode word-run search failed: {error}"),
         }
     }
 }
@@ -439,6 +449,7 @@ impl std::error::Error for SearchError {
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
+            Self::UnicodeWordRun(error) => Some(error),
         }
     }
 }
@@ -476,6 +487,12 @@ impl From<RequiredLiteralSearchError> for SearchError {
 impl From<ForwardAnchoredSearchError> for SearchError {
     fn from(value: ForwardAnchoredSearchError) -> Self {
         Self::ForwardAnchored(value)
+    }
+}
+
+impl From<UnicodeWordRunError> for SearchError {
+    fn from(value: UnicodeWordRunError) -> Self {
+        Self::UnicodeWordRun(value)
     }
 }
 
@@ -640,6 +657,29 @@ impl PortableBuilder {
                     forward_anchored: None,
                 },
             });
+        }
+        if self.selection == PlanSelection::Auto {
+            if let Some(plan) = unicode_word_run::extract(&rust.hir) {
+                return Ok(PortableRegex {
+                    plan: PortablePlan::UnicodeWordRun(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::UnicodeWordRun,
+                        planner_work: 1,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
+                        minimum_match_bytes,
+                        required_literal: None,
+                        forward_anchored: None,
+                    },
+                });
+            }
         }
         let mut planner_work = 0_u64;
         if matches!(
@@ -882,6 +922,7 @@ enum PortablePlan {
     ForwardAnchored(ForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
     K0(Automaton),
+    UnicodeWordRun(unicode_word_run::Plan),
 }
 
 impl PortablePlan {
@@ -894,6 +935,7 @@ impl PortablePlan {
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
+            Self::UnicodeWordRun(_) => unicode_word_run::PLAN_ID,
         }
     }
 }
@@ -1031,6 +1073,11 @@ impl PortableRegex {
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
+            PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((matched.is_some(), SearchAccounting::UnicodeWordRun(accounting)))
+            }
         }
     }
 
@@ -1098,6 +1145,14 @@ impl PortableRegex {
                     .search(haystack, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
+            }
+            PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
             }
         }
     }
@@ -1203,6 +1258,10 @@ impl PortableRegex {
                     end: span.end(),
                 });
                 Ok((matched, SearchAccounting::K0(accounting)))
+            }
+            PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }
         }
     }
