@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre_kernels::{
-    FORWARD_ANCHORED_PLAN_ID, ForwardAnchoredAnchors, ForwardAnchoredBuildLimits,
-    ForwardAnchoredByteClass, ForwardAnchoredPlan as CandidatePlan, ForwardAnchoredSearchError,
+    AbsoluteEndFixedPlan as CandidatePlan, FORWARD_ANCHORED_PLAN_ID, ForwardAnchoredAnchors,
+    ForwardAnchoredBuildLimits, ForwardAnchoredByteClass, ForwardAnchoredSearchError,
     ForwardAnchoredSearchLimits, ForwardClassImplementation, Window,
 };
 
@@ -45,7 +45,10 @@ fn red_fixed_identity_leaf_and_exact_n_accounting() {
     ] {
         let candidate = plan(class, b"ZQ");
         assert_eq!(candidate.plan_id(), FIXED_ID);
-        assert_eq!(candidate.implementation(), ForwardClassImplementation::Bitset);
+        assert_eq!(
+            candidate.implementation(),
+            ForwardClassImplementation::Bitset
+        );
 
         let haystack = [class[0], class[0], b'Z', b'Q'];
         let (matched, accounting) = candidate
@@ -174,10 +177,8 @@ fn red_first_mismatch_still_preflights_full_n() {
     ] {
         assert!(matches!(
             candidate.find(haystack, limits),
-            Err(
-                ForwardAnchoredSearchError::WorkLimit { .. }
-                    | ForwardAnchoredSearchError::ExaminedBytesLimit { .. }
-            )
+            Err(ForwardAnchoredSearchError::WorkLimit { .. }
+                | ForwardAnchoredSearchError::ExaminedBytesLimit { .. })
         ));
     }
 }

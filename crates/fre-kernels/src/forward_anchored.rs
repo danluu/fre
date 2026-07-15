@@ -596,6 +596,142 @@ impl AbsoluteEndFixedPlan {
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
     }
+
+    /// Verify the single split fixed by both absolute anchors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked resource failure before inspecting any haystack byte.
+    #[inline]
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Verify the fixed split while anchors retain original-haystack meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidWindow` before anchor or resource precedence, and a
+    /// checked resource failure before inspecting any feasible haystack byte.
+    #[inline]
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        if window.start() != 0 || window.end() != haystack.len() {
+            let window_bytes = window.end().checked_sub(window.start()).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "impossible fixed-end window bytes",
+                },
+            )?;
+            return Ok((
+                None,
+                zero_accounting(window_bytes, ClassImplementation::Bitset),
+            ));
+        }
+
+        let haystack_len = haystack.len();
+        let suffix_len = self.suffix.len();
+        if haystack_len <= suffix_len {
+            return Ok((
+                None,
+                zero_accounting(haystack_len, ClassImplementation::Bitset),
+            ));
+        }
+        let prefix_len =
+            haystack_len
+                .checked_sub(suffix_len)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fixed-end prefix length",
+                })?;
+        let mut accounting = Self::preflight(haystack_len, prefix_len, suffix_len, limits)?;
+
+        let fixed_suffix =
+            haystack
+                .get(prefix_len..haystack_len)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fixed-end suffix partition",
+                })?;
+        accounting.suffix_confirmation_attempted = true;
+        if fixed_suffix != self.suffix() {
+            return Ok((None, accounting));
+        }
+
+        let prefix = haystack
+            .get(..prefix_len)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "fixed-end prefix partition",
+            })?;
+        for &byte in prefix {
+            accounting.prefix_bytes_examined = accounting
+                .prefix_bytes_examined
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fixed-end actual prefix examinations",
+                })?;
+            if !self.class.contains(byte) {
+                return Ok((None, accounting));
+            }
+        }
+        Ok((Some((0, haystack_len)), accounting))
+    }
+
+    fn preflight(
+        haystack_len: usize,
+        prefix_len: usize,
+        suffix_len: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchAccounting, SearchError> {
+        let work_upper_bound =
+            u64::try_from(haystack_len).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "fixed-end haystack length as u64",
+            })?;
+        let scratch_bytes = 0_usize;
+        if haystack_len > limits.max_examined_bytes_upper_bound {
+            return Err(SearchError::ExaminedBytesLimit {
+                needed: haystack_len,
+                limit: limits.max_examined_bytes_upper_bound,
+            });
+        }
+        if work_upper_bound > limits.max_work_upper_bound {
+            return Err(SearchError::WorkLimit {
+                needed: work_upper_bound,
+                limit: limits.max_work_upper_bound,
+            });
+        }
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(SearchError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        Ok(SearchAccounting {
+            window_bytes: haystack_len,
+            implementation: ClassImplementation::Bitset,
+            prefilter_bytes_upper_bound: 0,
+            prefix_bytes_upper_bound: prefix_len,
+            suffix_bytes_upper_bound: suffix_len,
+            examined_bytes_upper_bound: haystack_len,
+            work_upper_bound,
+            scratch_bytes,
+            prefilter_calls: 0,
+            prefix_bytes_examined: 0,
+            suffix_confirmation_attempted: false,
+        })
+    }
 }
 
 impl ForwardAnchoredPlan {
