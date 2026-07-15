@@ -404,7 +404,7 @@ impl Iterator for UnicodeScalarIter<'_> {
                 let mut bytes = [0_u8; 4];
                 bytes[..width].copy_from_slice(self.bytes.get(start..end)?);
                 self.scalar = end;
-                self.remaining -= 1;
+                self.remaining = self.remaining.checked_sub(1)?;
                 return Some(UnicodeScalarEncoding {
                     bytes,
                     len: u8::try_from(width).ok()?,
