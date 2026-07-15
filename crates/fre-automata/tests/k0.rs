@@ -363,6 +363,8 @@ fn unicode_word_boundary_requires_complete_adjacent_word_scalars() {
         ("-β-".as_bytes(), &[1, 3]),
         ("\u{0301}".as_bytes(), &[0, 2]),
         ("\u{200C}".as_bytes(), &[0, 3]),
+        ("\u{11011}".as_bytes(), &[0, 4]),
+        ("😀".as_bytes(), &[]),
         (&[0xFF, b'a', 0xFF], &[1, 2]),
         (&[0xC0, 0x80, b'a'], &[2, 3]),
         (&[b'a', 0xED, 0xA0, 0x80], &[0, 1]),

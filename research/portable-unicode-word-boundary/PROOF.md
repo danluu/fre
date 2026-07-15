@@ -66,12 +66,13 @@ routes remain independently selected and unchanged.
 ## Directed source specifications
 
 Tests are committed before implementation. The automata layer pins boundaries
-around Greek, ASCII, combining-mark, join-control, symbol, invalid, overlong,
-and surrogate byte sequences, including every interior byte position and the
-conservative work certificate. Lowering pins the distinct edge mapping and all
-remaining typed look refusals. The facade compares a Unicode-boundary pattern
-with a locally byte-stable body against pinned `regex-automata` 0.4.14 over
-every range of valid and invalid haystacks.
+around one-to-four-byte word scalars, ASCII, combining-mark, join-control,
+multi-byte symbols, invalid, overlong, and surrogate byte sequences, including
+every interior byte position and the conservative work certificate. Lowering
+pins the distinct edge mapping and all remaining typed look refusals. The
+facade compares a Unicode-boundary pattern with a locally byte-stable body
+against pinned `regex-automata` 0.4.14 over every range of valid and invalid
+haystacks.
 
 These specifications have not been executed in this source-only lane.
 

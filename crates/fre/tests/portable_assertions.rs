@@ -301,6 +301,8 @@ fn positive_unicode_word_boundary_matches_pinned_ranges_on_arbitrary_bytes() {
         b"",
         b"-ab-",
         "☃ab☃".as_bytes(),
+        "\u{11011}ab-".as_bytes(),
+        "😀ab😀".as_bytes(),
         "βab-".as_bytes(),
         "-abβ".as_bytes(),
         &[0xFF, b'a', b'b', 0xFF],
