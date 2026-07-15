@@ -16,6 +16,10 @@ use crate::Window;
 /// Stable identity of this exact proof and execution strategy.
 pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
 
+/// Stable identity of the absolute-end fixed-boundary verifier.
+pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
+    "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1";
+
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ByteClass {
@@ -246,6 +250,7 @@ pub struct SearchAccounting {
 #[non_exhaustive]
 pub enum BuildError {
     MissingAbsoluteStart,
+    MissingAbsoluteEnd,
     EmptyClass,
     EmptySuffix,
     FirstSuffixByteInClass {
@@ -287,6 +292,7 @@ impl BuildError {
         matches!(
             self,
             Self::MissingAbsoluteStart
+                | Self::MissingAbsoluteEnd
                 | Self::EmptyClass
                 | Self::EmptySuffix
                 | Self::FirstSuffixByteInClass { .. }
@@ -299,6 +305,9 @@ impl fmt::Display for BuildError {
         match self {
             Self::MissingAbsoluteStart => {
                 f.write_str("forward anchored plan requires absolute start")
+            }
+            Self::MissingAbsoluteEnd => {
+                f.write_str("absolute-end fixed plan requires absolute end")
             }
             Self::EmptyClass => f.write_str("forward anchored class is empty"),
             Self::EmptySuffix => f.write_str("forward anchored suffix is empty"),
@@ -400,6 +409,14 @@ pub struct ForwardAnchoredPlan {
     build: BuildAccounting,
 }
 
+/// Immutable, deliberately non-`Clone` plan for the absolute-end fixed split.
+#[derive(Debug)]
+pub struct AbsoluteEndFixedPlan {
+    class: ByteClass,
+    suffix: Vec<u8>,
+    build: BuildAccounting,
+}
+
 /// Copy `suffix` into a fallible allocation whose reported capacity is exact.
 fn copy_suffix_exact(suffix: &[u8]) -> Result<Vec<u8>, BuildError> {
     if suffix.is_empty() {
@@ -440,6 +457,144 @@ mod exact_suffix_copy_probe {
 
     pub(super) fn calls() -> usize {
         CALLS.get()
+    }
+}
+
+impl AbsoluteEndFixedPlan {
+    /// Prove exact fixed-end eligibility and make the plan's only suffix copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed semantic, arithmetic, resource, or allocation refusal.
+    /// Every check except the allocator failure itself occurs before allocation.
+    pub fn build(
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        if !anchors.start {
+            return Err(BuildError::MissingAbsoluteStart);
+        }
+        if !anchors.end {
+            return Err(BuildError::MissingAbsoluteEnd);
+        }
+        if class.is_empty() {
+            return Err(BuildError::EmptyClass);
+        }
+        let Some(&first) = suffix.first() else {
+            return Err(BuildError::EmptySuffix);
+        };
+        if class.contains(first) {
+            return Err(BuildError::FirstSuffixByteInClass { byte: first });
+        }
+
+        let suffix_u64 =
+            u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "suffix length as u64",
+            })?;
+        let work_upper_bound = suffix_u64
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(64))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "build work upper bound",
+            })?;
+        let scratch_bytes = 0_usize;
+        let persistent_bytes =
+            size_of::<Self>()
+                .checked_add(suffix.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "persistent fixed-end plan bytes",
+                })?;
+        let peak_bytes =
+            persistent_bytes
+                .checked_add(scratch_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed-end construction peak bytes",
+                })?;
+
+        if suffix.len() > limits.max_suffix_bytes {
+            return Err(BuildError::SuffixLimit {
+                needed: suffix.len(),
+                limit: limits.max_suffix_bytes,
+            });
+        }
+        if work_upper_bound > limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed: work_upper_bound,
+                limit: limits.max_build_work,
+            });
+        }
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(BuildError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        if persistent_bytes > limits.max_persistent_bytes {
+            return Err(BuildError::PersistentLimit {
+                needed: persistent_bytes,
+                limit: limits.max_persistent_bytes,
+            });
+        }
+        if peak_bytes > limits.max_peak_bytes {
+            return Err(BuildError::PeakLimit {
+                needed: peak_bytes,
+                limit: limits.max_peak_bytes,
+            });
+        }
+
+        let owned_suffix = copy_suffix_exact(suffix)?;
+        debug_assert_eq!(owned_suffix.len(), owned_suffix.capacity());
+        let suffix_capacity_bytes = owned_suffix.capacity();
+        Ok(Self {
+            class,
+            suffix: owned_suffix,
+            build: BuildAccounting {
+                suffix_bytes: suffix.len(),
+                suffix_capacity_bytes,
+                class_cardinality: class.cardinality(),
+                implementation: ClassImplementation::Bitset,
+                work_upper_bound,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            },
+        })
+    }
+
+    /// Stable proof/implementation identity.
+    #[must_use]
+    pub const fn plan_id(&self) -> &'static str {
+        ABSOLUTE_END_FIXED_PLAN_ID
+    }
+
+    #[must_use]
+    pub const fn anchors(&self) -> Anchors {
+        Anchors {
+            start: true,
+            end: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> ByteClass {
+        self.class
+    }
+
+    #[must_use]
+    pub fn suffix(&self) -> &[u8] {
+        &self.suffix
+    }
+
+    #[must_use]
+    pub const fn implementation(&self) -> ClassImplementation {
+        ClassImplementation::Bitset
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> BuildAccounting {
+        self.build
     }
 }
 
@@ -1255,9 +1410,10 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
 #[cfg(test)]
 mod tests {
     use super::{
-        Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation, ForwardAnchoredPlan,
-        SearchError, SearchLimits, asymmetric_suffix_witness, begin_edge_witness_trace,
-        copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
+        ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits,
+        ByteClass, ClassImplementation, ForwardAnchoredPlan, SearchError, SearchLimits,
+        asymmetric_suffix_witness, begin_edge_witness_trace, copy_suffix_exact,
+        exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
     };
     use crate::Window;
     use core::mem::size_of;
@@ -1271,6 +1427,185 @@ mod tests {
             BuildLimits::default(),
         )
         .unwrap()
+    }
+
+    fn fixed(class: ByteClass, suffix: &[u8]) -> AbsoluteEndFixedPlan {
+        AbsoluteEndFixedPlan::build(
+            class,
+            suffix,
+            Anchors {
+                start: true,
+                end: true,
+            },
+            BuildLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fixed_construction_has_one_exact_copy_and_bitset_for_every_geometry() {
+        for length in [1_usize, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 255, 256, 4096] {
+            let suffix = vec![b'Z'; length];
+            exact_suffix_copy_probe::reset();
+            let fixed = fixed(ByteClass::from_bytes(b"aceg"), &suffix);
+            assert_eq!(exact_suffix_copy_probe::calls(), 1);
+            assert_eq!(fixed.plan_id(), ABSOLUTE_END_FIXED_PLAN_ID);
+            assert_eq!(fixed.suffix(), suffix);
+            assert_eq!(fixed.implementation(), ClassImplementation::Bitset);
+            assert_eq!(
+                fixed.anchors(),
+                Anchors {
+                    start: true,
+                    end: true
+                }
+            );
+            let accounting = fixed.build_accounting();
+            assert_eq!(accounting.suffix_bytes, length);
+            assert_eq!(accounting.suffix_capacity_bytes, length);
+            assert_eq!(
+                accounting.persistent_bytes,
+                size_of::<AbsoluteEndFixedPlan>() + length
+            );
+            assert_eq!(accounting.scratch_bytes, 0);
+            assert_eq!(accounting.peak_bytes, accounting.persistent_bytes);
+            assert_eq!(accounting.implementation, ClassImplementation::Bitset);
+        }
+
+        for class in [b"a".as_slice(), b"ab", b"ace", b"aceg", b"abcdefgh"] {
+            assert_eq!(
+                fixed(ByteClass::from_bytes(class), b"Z").implementation(),
+                ClassImplementation::Bitset
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_construction_caps_refuse_before_the_only_copy() {
+        let class = ByteClass::from_bytes(b"ab");
+        let suffix = b"Zborderedaba";
+        let baseline = fixed(class, suffix).build_accounting();
+        let exact = BuildLimits {
+            max_suffix_bytes: baseline.suffix_bytes,
+            max_build_work: baseline.work_upper_bound,
+            max_scratch_bytes: baseline.scratch_bytes,
+            max_persistent_bytes: baseline.persistent_bytes,
+            max_peak_bytes: baseline.peak_bytes,
+        };
+        exact_suffix_copy_probe::reset();
+        assert!(
+            AbsoluteEndFixedPlan::build(
+                class,
+                suffix,
+                Anchors {
+                    start: true,
+                    end: true
+                },
+                exact
+            )
+            .is_ok()
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+
+        for limited in [
+            BuildLimits {
+                max_suffix_bytes: baseline.suffix_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_build_work: baseline.work_upper_bound - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_persistent_bytes: baseline.persistent_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_peak_bytes: baseline.peak_bytes - 1,
+                ..exact
+            },
+        ] {
+            exact_suffix_copy_probe::reset();
+            assert!(
+                AbsoluteEndFixedPlan::build(
+                    class,
+                    suffix,
+                    Anchors {
+                        start: true,
+                        end: true
+                    },
+                    limited
+                )
+                .is_err()
+            );
+            assert_eq!(exact_suffix_copy_probe::calls(), 0);
+        }
+    }
+
+    #[test]
+    fn fixed_semantic_refusals_are_typed_before_copy() {
+        let cases = [
+            AbsoluteEndFixedPlan::build(
+                ByteClass::from_bytes(b"a"),
+                b"Z",
+                Anchors {
+                    start: false,
+                    end: true,
+                },
+                BuildLimits::default(),
+            ),
+            AbsoluteEndFixedPlan::build(
+                ByteClass::from_bytes(b"a"),
+                b"Z",
+                Anchors {
+                    start: true,
+                    end: false,
+                },
+                BuildLimits::default(),
+            ),
+            AbsoluteEndFixedPlan::build(
+                ByteClass::default(),
+                b"Z",
+                Anchors {
+                    start: true,
+                    end: true,
+                },
+                BuildLimits::default(),
+            ),
+            AbsoluteEndFixedPlan::build(
+                ByteClass::from_bytes(b"a"),
+                b"",
+                Anchors {
+                    start: true,
+                    end: true,
+                },
+                BuildLimits::default(),
+            ),
+            AbsoluteEndFixedPlan::build(
+                ByteClass::from_bytes(b"a"),
+                b"a",
+                Anchors {
+                    start: true,
+                    end: true,
+                },
+                BuildLimits::default(),
+            ),
+        ];
+        exact_suffix_copy_probe::reset();
+        assert_eq!(
+            cases[0].as_ref().unwrap_err(),
+            &BuildError::MissingAbsoluteStart
+        );
+        assert_eq!(
+            cases[1].as_ref().unwrap_err(),
+            &BuildError::MissingAbsoluteEnd
+        );
+        assert_eq!(cases[2].as_ref().unwrap_err(), &BuildError::EmptyClass);
+        assert_eq!(cases[3].as_ref().unwrap_err(), &BuildError::EmptySuffix);
+        assert_eq!(
+            cases[4].as_ref().unwrap_err(),
+            &BuildError::FirstSuffixByteInClass { byte: b'a' }
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 0);
     }
 
     #[test]

@@ -20,12 +20,12 @@ mod packed_ordered_literal_aggregate;
 mod required_literal;
 
 pub use forward_anchored::{
-    Anchors as ForwardAnchoredAnchors, BuildAccounting as ForwardAnchoredBuildAccounting,
-    BuildError as ForwardAnchoredBuildError, BuildLimits as ForwardAnchoredBuildLimits,
-    ByteClass as ForwardAnchoredByteClass, ClassImplementation as ForwardClassImplementation,
-    ForwardAnchoredPlan, PLAN_ID as FORWARD_ANCHORED_PLAN_ID,
-    SearchAccounting as ForwardAnchoredSearchAccounting, SearchError as ForwardAnchoredSearchError,
-    SearchLimits as ForwardAnchoredSearchLimits,
+    ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
+    BuildAccounting as ForwardAnchoredBuildAccounting, BuildError as ForwardAnchoredBuildError,
+    BuildLimits as ForwardAnchoredBuildLimits, ByteClass as ForwardAnchoredByteClass,
+    ClassImplementation as ForwardClassImplementation, ForwardAnchoredPlan,
+    PLAN_ID as FORWARD_ANCHORED_PLAN_ID, SearchAccounting as ForwardAnchoredSearchAccounting,
+    SearchError as ForwardAnchoredSearchError, SearchLimits as ForwardAnchoredSearchLimits,
 };
 
 pub use literal_aggregate::{

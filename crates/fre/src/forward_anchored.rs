@@ -3,16 +3,16 @@
 use fre_kernels::{ForwardAnchoredAnchors, ForwardAnchoredByteClass};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
-use crate::{BuildError, charge_planner, reserve_planner};
+use crate::{BuildError, charge_planner};
 
-pub(crate) struct Extraction {
-    pub(crate) shape: Option<Shape>,
+pub(crate) struct Extraction<'hir> {
+    pub(crate) shape: Option<Shape<'hir>>,
     pub(crate) work: u64,
 }
 
-pub(crate) struct Shape {
+pub(crate) struct Shape<'hir> {
     pub(crate) class: ForwardAnchoredByteClass,
-    pub(crate) suffix: Vec<u8>,
+    pub(crate) suffix: &'hir [u8],
     pub(crate) anchors: ForwardAnchoredAnchors,
 }
 
@@ -25,11 +25,11 @@ pub(crate) struct Shape {
     clippy::too_many_lines,
     reason = "the complete exact-shape proof keeps every admitted HIR position visible"
 )]
-pub(crate) fn extract(
-    hir: &Hir,
+pub(crate) fn extract<'hir>(
+    hir: &'hir Hir,
     initial_work: u64,
     work_limit: u64,
-) -> Result<Extraction, BuildError> {
+) -> Result<Extraction<'hir>, BuildError> {
     let mut work = initial_work;
     let root = strip_captures(hir, &mut work, work_limit)?;
     let HirKind::Concat(root_children) = root.kind() else {
@@ -131,15 +131,12 @@ pub(crate) fn extract(
     if literal.0.is_empty() {
         return Ok(Extraction { shape: None, work });
     }
-    let mut suffix = Vec::new();
-    reserve_planner(
-        &mut suffix,
-        literal.0.len(),
+    charge_planner(
         &mut work,
+        u64::try_from(literal.0.len()).unwrap_or(u64::MAX),
         work_limit,
-        "forward anchored suffix",
     )?;
-    suffix.extend_from_slice(&literal.0);
+    let suffix = literal.0.as_ref();
     index = index.checked_add(1).ok_or(BuildError::InternalInvariant(
         "forward anchored child index overflow",
     ))?;
@@ -227,7 +224,10 @@ fn extract_byte_class(
 #[cfg(test)]
 mod tests {
     use super::extract;
-    use regex_syntax::ParserBuilder;
+    use regex_syntax::{
+        ParserBuilder,
+        hir::{Hir, HirKind},
+    };
 
     fn hir(pattern: &str) -> regex_syntax::hir::Hir {
         ParserBuilder::new()
@@ -258,6 +258,35 @@ mod tests {
                 extract(&hir(pattern), 0, u64::MAX).unwrap().shape.is_none(),
                 "pattern={pattern:?}"
             );
+        }
+    }
+
+    fn literal_bytes(hir: &Hir) -> Option<&[u8]> {
+        match hir.kind() {
+            HirKind::Literal(literal) => Some(literal.0.as_ref()),
+            HirKind::Capture(capture) => literal_bytes(&capture.sub),
+            HirKind::Concat(children) => children.iter().find_map(literal_bytes),
+            HirKind::Repetition(repetition) => literal_bytes(&repetition.sub),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn suffix_is_borrowed_from_hir_and_literal_work_is_unchanged() {
+        for pattern in [r"\A[ab]+XYZ\z", r"\A([ab]+?XYZ)\z", r"(\A(?:[ab])+XYZ\z)"] {
+            let parsed = hir(pattern);
+            let literal = literal_bytes(&parsed).unwrap();
+            let unlimited = extract(&parsed, 0, u64::MAX).unwrap();
+            let shape = unlimited.shape.unwrap();
+            let _: &[u8] = shape.suffix;
+            assert_eq!(shape.suffix, b"XYZ");
+            assert_eq!(shape.suffix.as_ptr(), literal.as_ptr());
+            assert_eq!(shape.suffix.len(), literal.len());
+
+            let exact = extract(&parsed, 0, unlimited.work).unwrap();
+            assert_eq!(exact.work, unlimited.work);
+            assert!(exact.shape.is_some());
+            assert!(extract(&parsed, 0, unlimited.work - 1).is_err());
         }
     }
 }
