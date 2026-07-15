@@ -4420,7 +4420,7 @@ mod tests {
     fn current_fre_composition_keeps_unicode_capture_and_build_many_reachable() {
         let limits = RunLimits::default();
         let identity = CurrentFreAdapter.identity();
-        assert_eq!(identity.adapter, "fre-current-aggregate-capture-v9");
+        assert_eq!(identity.adapter, "fre-current-aggregate-capture-v10");
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
             identity
@@ -4741,6 +4741,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(Status::Fault, mismatch.status);
         assert!(mismatch.message.contains("profile/operation identity mismatch"));
+
+        let nosey_repeat = current_fre(
+            "compile",
+            &[r"[A-Za-z0-9_-]{20,1024}".to_string(), "never".to_string()],
+            b"TWITTER_API_KEY",
+            false,
+            false,
+            &RunLimits::default(),
+        );
+        assert!(
+            matches!(nosey_repeat, CandidateOutcome::Unsupported(ref reason) if reason.contains("RepeatBound")),
+            "compile-many must retain the frozen repeat cap: {nosey_repeat:?}"
+        );
     }
 
     #[test]
