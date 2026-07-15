@@ -24,6 +24,11 @@ fn compile_artifact_preserves_order_profile_and_priority_before_verification() {
         .unicode(false)
         .build_compile()
         .unwrap();
+    let fresh_again = AggregateManyBuilder::new(&longer_first)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build_compile()
+        .unwrap();
 
     assert_eq!(
         AggregateManyOperation::Compile,
@@ -33,6 +38,11 @@ fn compile_artifact_preserves_order_profile_and_priority_before_verification() {
         AggregateManyPlanKind::ContinuationProgram,
         longer.build_report().plan
     );
+    assert_eq!(longer.build_report(), fresh_again.build_report());
+    assert!(!core::ptr::eq(
+        longer.build_report().patterns.as_ptr(),
+        fresh_again.build_report().patterns.as_ptr()
+    ));
     assert_eq!(1, longer.verify_count(b"aa", limits).unwrap().value());
     assert_eq!(2, shorter.verify_count(b"aa", limits).unwrap().value());
     for (ordinal, report) in longer.build_report().patterns.iter().enumerate() {
