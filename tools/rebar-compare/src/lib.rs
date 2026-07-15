@@ -110,6 +110,14 @@ pub struct RunLimits {
     pub fre_scratch_bytes: usize,
     /// Maximum work allowed by one FRE aggregate compilation.
     pub fre_aggregate_compile_work: usize,
+    /// Maximum HIR nodes validated by one FRE aggregate compilation.
+    pub fre_aggregate_hir_nodes: usize,
+    /// Maximum explicit HIR traversal stack items retained during one FRE
+    /// aggregate compilation.
+    pub fre_aggregate_hir_stack_items: usize,
+    /// Maximum finite repetition bound expanded by one FRE aggregate
+    /// compilation.
+    pub fre_aggregate_repeat_bound: u32,
     /// Maximum retained continuation-program capacity for one aggregate plan.
     pub fre_aggregate_program_bytes: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
@@ -177,6 +185,9 @@ impl Default for RunLimits {
             fre_search_work: 1_000_000_000,
             fre_scratch_bytes: 256 * 1_048_576,
             fre_aggregate_compile_work: 16 * 1_048_576,
+            fre_aggregate_hir_nodes: 1 << 16,
+            fre_aggregate_hir_stack_items: 1 << 16,
+            fre_aggregate_repeat_bound: 1 << 10,
             fre_aggregate_program_bytes: 16 * 1_048_576,
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
@@ -2260,6 +2271,9 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         continuation: fre::AggregateCompileLimits {
+            max_hir_nodes: limits.fre_aggregate_hir_nodes,
+            max_hir_stack_items: limits.fre_aggregate_hir_stack_items,
+            max_repeat_bound: limits.fre_aggregate_repeat_bound,
             max_work: limits.fre_aggregate_compile_work,
             max_program_bytes: limits.fre_aggregate_program_bytes,
             ..fre::AggregateCompileLimits::default()
@@ -5162,6 +5176,51 @@ mod tests {
         // zero, so a larger policy quota is represented by the tight bound.
         assert_eq!(capped.max_scratch_bytes, 0);
         assert_eq!(capped.max_peak_bytes, 7);
+    }
+
+    #[test]
+    fn continuation_build_limits_map_every_named_structural_quota() {
+        let run = RunLimits {
+            fre_aggregate_compile_work: 11,
+            fre_aggregate_hir_nodes: 12,
+            fre_aggregate_hir_stack_items: 13,
+            fre_aggregate_repeat_bound: 14,
+            fre_aggregate_program_bytes: 15,
+            ..RunLimits::default()
+        };
+        let continuation = aggregate_build_limits(&run).continuation;
+        assert_eq!(continuation.max_work, 11);
+        assert_eq!(continuation.max_hir_nodes, 12);
+        assert_eq!(continuation.max_hir_stack_items, 13);
+        assert_eq!(continuation.max_repeat_bound, 14);
+        assert_eq!(continuation.max_program_bytes, 15);
+    }
+
+    #[test]
+    fn legacy_run_limits_default_new_continuation_structural_quotas() {
+        let mut legacy = serde_json::to_value(RunLimits::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for field in [
+            "fre_aggregate_hir_nodes",
+            "fre_aggregate_hir_stack_items",
+            "fre_aggregate_repeat_bound",
+        ] {
+            assert!(object.remove(field).is_some());
+        }
+        let decoded: RunLimits = serde_json::from_value(legacy).unwrap();
+        let defaults = RunLimits::default();
+        assert_eq!(
+            decoded.fre_aggregate_hir_nodes,
+            defaults.fre_aggregate_hir_nodes
+        );
+        assert_eq!(
+            decoded.fre_aggregate_hir_stack_items,
+            defaults.fre_aggregate_hir_stack_items
+        );
+        assert_eq!(
+            decoded.fre_aggregate_repeat_bound,
+            defaults.fre_aggregate_repeat_bound
+        );
     }
 
     #[test]
