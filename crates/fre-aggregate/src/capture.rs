@@ -554,3 +554,136 @@ fn charge(work: &mut usize, amount: usize, limit: usize) -> Result<(), Error> {
     *work = required;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureStorageCapacities, account_physical_storage};
+    use crate::{CaptureLimits, Error, Resource};
+
+    fn expect_resource(result: Result<super::CaptureStorageFacts, Error>, expected: Resource) {
+        assert!(
+            matches!(
+                result,
+                Err(Error::ResourceLimit { resource, .. }) if resource == expected
+            ),
+            "expected {expected:?}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn physical_capture_capacities_are_the_admitted_one_below_boundary() {
+        let capacities = CaptureStorageCapacities {
+            visited_items: 3,
+            stack_items: 7,
+            history_items: 3,
+            match_items: 2,
+            group_slots: 4,
+            offset_slots: 2,
+        };
+        let whole_match_output_bytes = 24;
+        let generous = CaptureLimits::default();
+        let facts = account_physical_storage(capacities, whole_match_output_bytes, generous)
+            .expect("small physical capacities must fit defaults");
+        let exact = CaptureLimits {
+            max_capture_slots: 2,
+            max_replay_cells: capacities.visited_items,
+            max_history_nodes: capacities.history_items,
+            max_output_bytes: facts.output_bytes,
+            max_work: usize::MAX,
+            max_peak_bytes: facts.peak_bytes,
+        };
+        assert_eq!(
+            account_physical_storage(capacities, whole_match_output_bytes, exact),
+            Ok(facts)
+        );
+
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    visited_items: capacities.visited_items + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::CaptureReplayCells,
+        );
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    stack_items: capacities.stack_items + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::CaptureReplayCells,
+        );
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    history_items: capacities.history_items + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::CaptureHistoryNodes,
+        );
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    match_items: capacities.match_items + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::CaptureOutputBytes,
+        );
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    group_slots: capacities.group_slots + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::CaptureOutputBytes,
+        );
+        expect_resource(
+            account_physical_storage(
+                CaptureStorageCapacities {
+                    offset_slots: capacities.offset_slots + 1,
+                    ..capacities
+                },
+                whole_match_output_bytes,
+                exact,
+            ),
+            Resource::PeakBytes,
+        );
+        expect_resource(
+            account_physical_storage(
+                capacities,
+                whole_match_output_bytes,
+                CaptureLimits {
+                    max_output_bytes: exact.max_output_bytes - 1,
+                    ..exact
+                },
+            ),
+            Resource::CaptureOutputBytes,
+        );
+        expect_resource(
+            account_physical_storage(
+                capacities,
+                whole_match_output_bytes,
+                CaptureLimits {
+                    max_peak_bytes: exact.max_peak_bytes - 1,
+                    ..exact
+                },
+            ),
+            Resource::PeakBytes,
+        );
+    }
+}
