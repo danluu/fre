@@ -2409,7 +2409,11 @@ fn unicode_scalar_operation_limits(
 ) -> Result<UnicodeScalarAggregateReduceLimits, ExecutionError> {
     let decode_byte_checks = checked_aggregate_mul(haystack_len, 4, "scalar decode checks")?;
     let comparisons_per_scalar =
-        scalar_binary_search_comparison_bound(build.retained_non_ascii_ranges);
+        scalar_binary_search_comparison_bound(build.retained_non_ascii_ranges)
+            .checked_add(usize::from(
+                build.repetition.is_run() && build.retained_non_ascii_ranges != 0,
+            ))
+            .ok_or_else(|| ExecutionError::fault("FRE cached scalar comparison bound overflow"))?;
     let range_comparisons = checked_aggregate_mul(
         haystack_len,
         comparisons_per_scalar,
@@ -5138,8 +5142,11 @@ mod tests {
             ..build
         };
         let run = unicode_scalar_operation_limits(10, run_build, &RunLimits::default()).unwrap();
+        // Run plans may probe the previously matched non-ASCII range once
+        // before falling back to the bounded binary search.
+        assert_eq!(run.max_range_comparisons, 40);
         assert_eq!(run.max_reducer_steps, 11);
-        assert_eq!(run.max_work, 91);
+        assert_eq!(run.max_work, 101);
 
         let capped = unicode_scalar_operation_limits(
             10,
@@ -5153,8 +5160,8 @@ mod tests {
         assert_eq!(capped.max_match_events, 4);
         assert_eq!(capped.max_count, 4);
         assert_eq!(capped.max_reducer_steps, 4);
-        assert_eq!(capped.max_range_comparisons, 30);
-        assert_eq!(capped.max_work, 91);
+        assert_eq!(capped.max_range_comparisons, 40);
+        assert_eq!(capped.max_work, 101);
     }
 
     #[test]
