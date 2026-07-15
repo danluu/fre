@@ -991,6 +991,7 @@ impl UnicodeScalarAggregatePlan {
         let mut pending_run_scalars = 0_u64;
         let mut cached_non_ascii_range = None::<usize>;
         let mut previous_non_ascii_scalar = None::<u32>;
+        let mut monotone_range_cursor = true;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
             decode_byte_checks: 0,
@@ -1149,12 +1150,17 @@ impl UnicodeScalarAggregatePlan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual non-ASCII membership tests",
                         })?;
-                    let (contains, comparisons) = if CACHE_RANGE {
-                        self.contains_non_ascii_run(
-                            scalar,
-                            &mut cached_non_ascii_range,
-                            &mut previous_non_ascii_scalar,
-                        )?
+                    let (contains, comparisons) = if CACHE_RANGE && monotone_range_cursor {
+                        if previous_non_ascii_scalar.is_none_or(|previous| scalar >= previous) {
+                            self.contains_non_ascii_run(
+                                scalar,
+                                &mut cached_non_ascii_range,
+                                &mut previous_non_ascii_scalar,
+                            )?
+                        } else {
+                            monotone_range_cursor = false;
+                            self.contains_non_ascii(scalar)?
+                        }
                     } else {
                         self.contains_non_ascii(scalar)?
                     };
@@ -2067,6 +2073,40 @@ mod tests {
             ),
             Err(BuildError::InvalidRepetition { .. })
         ));
+    }
+
+    #[test]
+    fn counted_runs_abandon_the_monotone_cursor_after_a_descent() {
+        let ranges = [('α', 'α'), ('γ', 'γ'), ('ε', 'ε'), ('η', 'η'), ('ι', 'ι')];
+        let run = UnicodeScalarAggregatePlan::build_repeated(
+            ranges,
+            2,
+            Some(4),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let point = UnicodeScalarAggregatePlan::build(ranges, BuildLimits::unlimited()).unwrap();
+        let haystack = format!("αγεηι{}", "ια".repeat(64));
+        let run_result = run
+            .count(haystack.as_bytes(), ReduceLimits::unlimited())
+            .unwrap();
+        let point_result = point
+            .count(haystack.as_bytes(), ReduceLimits::unlimited())
+            .unwrap();
+        let regex = RegexBuilder::new("[αγεηι]{2,4}")
+            .unicode(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            run_result.count,
+            u64::try_from(regex.find_iter(haystack.as_bytes()).count()).unwrap()
+        );
+        assert!(
+            run_result.accounting.actual.range_comparisons
+                <= point_result.accounting.actual.range_comparisons
+        );
     }
 
     #[test]
