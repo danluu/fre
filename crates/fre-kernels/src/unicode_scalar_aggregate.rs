@@ -740,7 +740,13 @@ impl UnicodeScalarAggregatePlan {
                     computation: "decode byte check upper bound",
                 })?;
         let binary_search_comparisons_per_scalar =
-            binary_search_comparison_bound(self.non_ascii.len());
+            binary_search_comparison_bound(self.non_ascii.len())
+                .checked_add(usize::from(
+                    self.repetition.is_run() && !self.non_ascii.is_empty(),
+                ))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached range comparison upper bound",
+                })?;
         let membership_tests = input_bytes;
         let range_comparisons = input_bytes
             .checked_mul(binary_search_comparisons_per_scalar)
@@ -872,6 +878,7 @@ impl UnicodeScalarAggregatePlan {
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
         let mut pending_run_bytes = 0_u64;
+        let mut cached_non_ascii_range = None::<usize>;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
             decode_byte_checks: 0,
@@ -1010,7 +1017,11 @@ impl UnicodeScalarAggregatePlan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual non-ASCII membership tests",
                         })?;
-                    let (contains, comparisons) = self.contains_non_ascii(scalar)?;
+                    let (contains, comparisons) = if RUN {
+                        self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
+                    } else {
+                        self.contains_non_ascii(scalar)?
+                    };
                     actual.range_comparisons = actual
                         .range_comparisons
                         .checked_add(comparisons)
@@ -1125,6 +1136,66 @@ impl UnicodeScalarAggregatePlan {
                         computation: "binary search lower bound",
                     })?;
             } else {
+                return Ok((true, comparisons));
+            }
+        }
+        Ok((false, comparisons))
+    }
+
+    fn contains_non_ascii_run(
+        &self,
+        scalar: u32,
+        cached_range: &mut Option<usize>,
+    ) -> Result<(bool, usize), ReduceError> {
+        let mut comparisons = 0_usize;
+        if let Some(index) = *cached_range {
+            comparisons = 1;
+            let range = self
+                .non_ascii
+                .get(index)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached non-ASCII range access",
+                })?;
+            if scalar >= range.start && scalar <= range.end {
+                return Ok((true, comparisons));
+            }
+            *cached_range = None;
+        }
+
+        let mut low = 0_usize;
+        let mut high = self.non_ascii.len();
+        while low < high {
+            comparisons = comparisons
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search comparisons",
+                })?;
+            let width = high
+                .checked_sub(low)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search width",
+                })?;
+            let middle = low
+                .checked_add(width / 2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search midpoint",
+                })?;
+            let range = self
+                .non_ascii
+                .get(middle)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search range access",
+                })?;
+            if scalar < range.start {
+                high = middle;
+            } else if scalar > range.end {
+                low = middle
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "cached binary search lower bound",
+                    })?;
+            } else {
+                *cached_range = Some(middle);
                 return Ok((true, comparisons));
             }
         }
