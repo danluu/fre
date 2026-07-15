@@ -242,10 +242,7 @@ impl<'h> Compiler<'h> {
         self.push_fragment(fragment)
     }
 
-    fn alternation_fragment(
-        &mut self,
-        branches: Vec<Fragment>,
-    ) -> Result<Fragment, LowerError> {
+    fn alternation_fragment(&mut self, branches: Vec<Fragment>) -> Result<Fragment, LowerError> {
         let split = self.add_state(StateRole::Split)?;
         let mut outs = Vec::new();
         for branch in branches {
@@ -379,16 +376,9 @@ impl<'h> Compiler<'h> {
                     sequence.len(),
                     "UTF-8 sequence fragment list",
                 )?;
-                reserve(
-                    &mut parts,
-                    sequence.len(),
-                    "UTF-8 sequence fragment list",
-                )?;
+                reserve(&mut parts, sequence.len(), "UTF-8 sequence fragment list")?;
                 for range in sequence.as_slice() {
-                    parts.push(self.class_fragment(core::iter::once((
-                        range.start,
-                        range.end,
-                    )))?);
+                    parts.push(self.class_fragment(core::iter::once((range.start, range.end)))?);
                 }
                 let branch = self.concat_fragments(parts)?;
                 self.charge_vector_growth(

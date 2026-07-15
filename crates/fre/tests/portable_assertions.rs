@@ -499,8 +499,8 @@ fn unicode_scalar_classes_match_pinned_ranges_without_consuming_invalid_utf8() {
         b"# -*- coding: utf-8 -*-",
         b"x # coding: utf-8",
         &[
-            b'#', b' ', 0xFF, b'c', b'o', b'd', b'i', b'n', b'g', b':', b' ', b'u', b't',
-            b'f', b'-', b'8',
+            b'#', b' ', 0xFF, b'c', b'o', b'd', b'i', b'n', b'g', b':', b' ', b'u', b't', b'f',
+            b'-', b'8',
         ],
     ];
 

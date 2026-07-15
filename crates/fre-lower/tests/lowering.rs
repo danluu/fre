@@ -85,7 +85,10 @@ fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
 
 #[test]
 fn unicode_scalar_classes_lower_to_exact_utf8_byte_paths() {
-    assert_eq!(tuple(find_unicode("[α-ω]+", "xαβz".as_bytes())), Some((1, 5)));
+    assert_eq!(
+        tuple(find_unicode("[α-ω]+", "xαβz".as_bytes())),
+        Some((1, 5))
+    );
     assert_eq!(tuple(find_unicode(".", "😀".as_bytes())), Some((0, 4)));
     assert_eq!(tuple(find_unicode(".", &[0xFF, b'x'])), Some((1, 2)));
     assert_eq!(tuple(find_unicode(".", &[0xCE])), None);

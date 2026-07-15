@@ -46,9 +46,7 @@ pub enum UnsupportedFeature {
 impl fmt::Display for UnsupportedFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnicodeClass => {
-                f.write_str("Unicode scalar class (legacy unsupported identity)")
-            }
+            Self::UnicodeClass => f.write_str("Unicode scalar class (legacy unsupported identity)"),
             Self::LookAssertion(look) => {
                 write!(
                     f,
