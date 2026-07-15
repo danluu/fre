@@ -11,7 +11,7 @@ fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
         .expect("reference pattern");
     regex
         .captures_iter(haystack)
-        .map(|captures| captures.iter().filter(Option::is_some).count())
+        .map(|captures| captures.iter().flatten().count())
         .sum()
 }
 

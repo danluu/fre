@@ -80,18 +80,10 @@ impl Default for CaptureBuildLimits {
 }
 
 /// Execution limits included verbatim in the execution cache identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureRunLimits {
     /// Limits for repeated bounded searches and capture reduction.
     pub aggregate: AggregateLimits,
-}
-
-impl Default for CaptureRunLimits {
-    fn default() -> Self {
-        Self {
-            aggregate: AggregateLimits::default(),
-        }
-    }
 }
 
 /// Immutable plan identity. Source syntax remains distinct even when HIRs agree.
@@ -382,6 +374,10 @@ impl CaptureRegex {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete checked HIR-to-capture-AST mapping remains locally auditable"
+)]
 fn lower_hir(
     hir: &Hir,
     depth: usize,

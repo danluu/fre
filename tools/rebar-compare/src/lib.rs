@@ -1904,16 +1904,10 @@ fn fre_compile_verify(
 fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
     let message = format!("FRE capture build refused input: {error}");
     match error {
-        CaptureBuildError::Unsupported(_) | CaptureBuildError::HirResource { .. } => {
-            ExecutionError::unsupported(message)
-        }
-        CaptureBuildError::Engine(fre::CaptureEngineBuildError::Resource { .. }) => {
-            ExecutionError::unsupported(message)
-        }
-        CaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
-        CaptureBuildError::Allocation { .. }
-        | CaptureBuildError::Engine(_)
-        | CaptureBuildError::InternalInvariant(_) => ExecutionError::fault(message),
+        CaptureBuildError::Unsupported(_)
+        | CaptureBuildError::HirResource { .. }
+        | CaptureBuildError::Engine(fre::CaptureEngineBuildError::Resource { .. })
+        | CaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
 }
@@ -2046,7 +2040,9 @@ fn fre_grep_captures(
                 "FRE grep-captures line events need {reducer_events}, exceeding {reducer_limit}"
             )));
         }
-        let event_remaining = reducer_limit - reducer_events;
+        let event_remaining = reducer_limit
+            .checked_sub(reducer_events)
+            .ok_or_else(|| ExecutionError::fault("FRE capture event accounting underflow"))?;
         let count_remaining = reducer_limit
             .checked_sub(count)
             .ok_or_else(|| ExecutionError::fault("FRE grep-capture count underflow"))?;
