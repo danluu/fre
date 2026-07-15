@@ -1151,8 +1151,8 @@ impl UnicodeScalarAggregatePlan {
                             computation: "actual non-ASCII membership tests",
                         })?;
                     let (contains, comparisons) = if CACHE_RANGE && monotone_range_cursor {
-                        let nondecreasing = previous_non_ascii_scalar
-                            .is_none_or(|previous| scalar >= previous);
+                        let nondecreasing =
+                            previous_non_ascii_scalar.is_none_or(|previous| scalar >= previous);
                         previous_non_ascii_scalar = Some(scalar);
                         if nondecreasing {
                             self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
@@ -1334,11 +1334,12 @@ impl UnicodeScalarAggregatePlan {
                     })?;
                 *cached_range = Some(next);
                 if let Some(range) = self.non_ascii.get(next) {
-                    comparisons = comparisons.checked_add(1).ok_or(
-                        ReduceError::ArithmeticOverflow {
-                            computation: "monotone range comparisons",
-                        },
-                    )?;
+                    comparisons =
+                        comparisons
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "monotone range comparisons",
+                            })?;
                     if scalar < range.start {
                         return Ok((false, comparisons));
                     }
