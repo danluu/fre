@@ -2749,9 +2749,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::WordRun(fre::UnicodeWordRunError::WorkLimitExceeded {
             ..
         }) => ExecutionError::unsupported(message),
-        AggregateExecutionSource::WordRun(_) => ExecutionError::fault(message),
+        AggregateExecutionSource::WordRun(_)
+        | AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
         AggregateExecutionSource::Continuation(source) => aggregate_engine_error(source, message),
-        AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
 }
 

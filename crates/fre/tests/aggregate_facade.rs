@@ -312,6 +312,10 @@ fn unicode_word_boundary_routes_through_continuation_exactly() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table-driven qualification keeps every direct word-run shape and shared hostile context together"
+)]
 fn canonical_word_runs_use_direct_aggregate_reducers_with_hostile_context() {
     let haystack: &[u8] = &[
         0xFF, b'a', b'b', b'-', 0xCE, 0xB1, 0xCE, 0xB2, b'_', 0xFF, 0xCE,
