@@ -728,6 +728,3 @@ fn artifact_identity(bytes: &[u8]) -> UnicodeCompileArtifactId {
     identity[8..].copy_from_slice(&second.to_le_bytes());
     UnicodeCompileArtifactId(identity)
 }
-    /// Replace all checked artifact-construction limits.
-    /// Exact retained artifact bytes.
-    /// Iterate every canonical literal scalar and class-range endpoint.
