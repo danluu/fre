@@ -1863,18 +1863,28 @@ fn fre_compile_verify(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
-    if request.unicode {
-        return fre_unicode_compile_verify(request, pattern, limits);
-    }
-    let regex = AggregateBuilder::new(pattern)
+    let built = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(request.unicode)
         .case_insensitive(request.case_insensitive)
         .limits(aggregate_build_limits(limits))
         .plan_selection(AggregatePlanSelection::Auto)
         .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_compile()
-        .map_err(|error| aggregate_build_error(&error))?;
+        .build_compile();
+    let regex = match built {
+        Ok(regex) => regex,
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(_),
+            ..
+        })
+        | Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::ResourceLimit { .. },
+            ..
+        }) if request.unicode => {
+            return fre_unicode_compile_verify(request, pattern, limits);
+        }
+        Err(error) => return Err(aggregate_build_error(&error)),
+    };
     require_unicode_plan_identity(
         regex.build_report(),
         request.unicode,
