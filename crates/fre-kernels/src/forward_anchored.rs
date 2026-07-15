@@ -1126,9 +1126,10 @@ impl ForwardAnchoredPlan {
             {
                 scan_single_candidate_prefix(bytes, start)
             }
-            ClassImplementation::Pair { first, second }
-                if (PAIR_SWAR_MIN..=PAIR_SWAR_MAX).contains(&bytes.len()) =>
-            {
+            ClassImplementation::Pair { .. } if bytes.len() > PAIR_SWAR_MAX => {
+                self.scan_pair_candidate_prefix_too_long(bytes)
+            }
+            ClassImplementation::Pair { first, second } if bytes.len() >= PAIR_SWAR_MIN => {
                 scan_pair_swar_candidate_prefix(bytes, first, second)
             }
             ClassImplementation::Triple {
@@ -1145,6 +1146,15 @@ impl ForwardAnchoredPlan {
             } => scan_quint_candidate_prefix(bytes, first, second, third, fourth, fifth),
             _ => self.scan_prefix(bytes),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn scan_pair_candidate_prefix_too_long(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(usize, usize), SearchError> {
+        self.scan_prefix(bytes)
     }
 
     fn preflight(
