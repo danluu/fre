@@ -10,6 +10,9 @@
 //! concatenation, whole-operation absolute and LF-aware line assertions,
 //! ASCII word assertions, positive Unicode word boundaries, and arbitrary
 //! nested greedy or lazy repetition.
+//! Positive Unicode word-boundary operations make a typed admission refusal
+//! for malformed UTF-8 instead of approximating range-dependent byte-regex
+//! iteration behavior.
 //! Assertions always inspect their absolute
 //! boundary in the original haystack, even for an interior operation range;
 //! byte-consuming transitions remain confined to that range.

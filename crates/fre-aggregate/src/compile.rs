@@ -29,6 +29,8 @@ impl RustByteProfile {
 
     /// Pinned Unicode-on Rust-bytes profile with `utf8(false)` and
     /// `utf8_empty(false)`, restricted by validation to byte-stable HIR.
+    /// Positive Unicode word boundaries additionally require valid UTF-8 at
+    /// operation admission.
     pub const PINNED_1_12_4_UNICODE_ON_BYTE_STABLE: Self = Self { unicode: true };
 
     const fn identity_domain(self) -> &'static [u8] {

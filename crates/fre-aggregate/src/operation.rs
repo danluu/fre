@@ -279,6 +279,11 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
+        if self.program.contains_unicode_word_boundary()
+            && core::str::from_utf8(haystack).is_err()
+        {
+            return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
+        }
         let local = &haystack[range.clone()];
         let assertion_context = AssertionContext::new(haystack, range.start, local.len())?;
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;

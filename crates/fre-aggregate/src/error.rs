@@ -77,6 +77,9 @@ pub enum Error {
         end: usize,
         haystack_len: usize,
     },
+    /// Exact Unicode word-boundary iteration over malformed UTF-8 is outside
+    /// the continuation table's static assertion model.
+    InvalidUtf8ForUnicodeWordBoundary,
     InvalidRepetition,
     EmptyAlternation,
     SameBoundaryCycle,
@@ -110,6 +113,9 @@ impl fmt::Display for Error {
                 f,
                 "invalid operation range {start}..{end} for haystack length {haystack_len}"
             ),
+            Self::InvalidUtf8ForUnicodeWordBoundary => {
+                f.write_str("Unicode word boundary requires valid UTF-8 input")
+            }
             Self::InvalidRepetition => f.write_str("invalid repetition bounds"),
             Self::EmptyAlternation => f.write_str("empty alternation"),
             Self::SameBoundaryCycle => f.write_str("compiled program has a same-boundary cycle"),

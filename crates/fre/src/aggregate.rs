@@ -126,7 +126,8 @@ pub enum AggregateContinuationSemantics {
     UnicodeOffByteBoundaries,
     /// Rust bytes with Unicode enabled, `utf8(false)` and
     /// `utf8_empty(false)`, restricted to canonical HIR whose consuming and
-    /// assertion transitions are byte-stable.
+    /// assertion transitions are byte-stable. Positive Unicode word-boundary
+    /// plans additionally make a typed admission refusal on malformed UTF-8.
     UnicodeOnByteStableHir,
 }
 

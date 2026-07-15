@@ -287,7 +287,7 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
 
 #[test]
 fn unicode_word_boundary_routes_through_continuation_exactly() {
-    let haystack = b"ascii \xFF snow\xE9\x9B\xAA_ \x80";
+    let haystack = "ascii snow雪_ Ж".as_bytes();
     let expected = regex::bytes::RegexBuilder::new(r"\b")
         .unicode(true)
         .build()

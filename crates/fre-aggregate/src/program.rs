@@ -229,6 +229,18 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    pub(crate) fn contains_unicode_word_boundary(&self) -> bool {
+        self.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                Inst::Assert {
+                    assertion: Assertion::WordUnicode,
+                    ..
+                }
+            )
+        })
+    }
+
     pub(crate) fn instruction(&self, pc: usize) -> Result<&Inst, Error> {
         self.insts
             .get(pc)

@@ -150,13 +150,11 @@ fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_unicode_classes(
 #[test]
 fn unicode_word_boundary_matches_pinned_rust_at_absolute_byte_ranges() {
     let regex = compile_unicode_byte_stable(r"\b").unwrap();
-    let haystacks: [&[u8]; 6] = [
+    let haystacks: [&[u8]; 4] = [
         b"",
         b"ascii word",
         "雪-Ж_é".as_bytes(),
-        &[0xFF, b'a', 0x80],
-        &[b'a', 0xE9, b'b'],
-        &[0xE9, 0x9B, 0xAA, b'_', 0xFF],
+        " a\u{0301}\u{200C}☃ ".as_bytes(),
     ];
     for haystack in haystacks {
         for start in 0..=haystack.len() {
@@ -182,6 +180,39 @@ fn unicode_word_boundary_matches_pinned_rust_at_absolute_byte_ranges() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn unicode_word_boundary_refuses_malformed_utf8_before_publication() {
+    let regex = compile_unicode_byte_stable(r"\b").unwrap();
+    let haystacks: [&[u8]; 4] = [
+        &[0xFF, b'a', 0x80],
+        &[b'a', 0xE9, b'b'],
+        &[0xC0, 0x80, b'a'],
+        &[b'a', 0xED, 0xA0, 0x80],
+    ];
+    for haystack in haystacks {
+        for strategy in STRATEGIES {
+            assert!(matches!(
+                regex.admit_count(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits::default()
+                ),
+                Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+            ));
+            assert!(matches!(
+                regex.admit_spans(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits::default()
+                ),
+                Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+            ));
         }
     }
 }
