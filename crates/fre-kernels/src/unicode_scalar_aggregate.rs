@@ -804,9 +804,13 @@ impl UnicodeScalarAggregatePlan {
                 })?;
         let binary_search_comparisons_per_scalar =
             binary_search_comparison_bound(self.non_ascii.len())
-                .checked_add(usize::from(
-                    self.repetition.is_run() && !self.non_ascii.is_empty(),
-                ))
+                .checked_add(
+                    usize::from(self.repetition.is_run() && !self.non_ascii.is_empty())
+                        .checked_mul(2)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "cached range comparison allowance",
+                        })?,
+                )
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "cached range comparison upper bound",
                 })?;
@@ -986,6 +990,7 @@ impl UnicodeScalarAggregatePlan {
         let mut pending_run_bytes = 0_u64;
         let mut pending_run_scalars = 0_u64;
         let mut cached_non_ascii_range = None::<usize>;
+        let mut previous_non_ascii_scalar = None::<u32>;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
             decode_byte_checks: 0,
@@ -1145,7 +1150,11 @@ impl UnicodeScalarAggregatePlan {
                             computation: "actual non-ASCII membership tests",
                         })?;
                     let (contains, comparisons) = if CACHE_RANGE {
-                        self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
+                        self.contains_non_ascii_run(
+                            scalar,
+                            &mut cached_non_ascii_range,
+                            &mut previous_non_ascii_scalar,
+                        )?
                     } else {
                         self.contains_non_ascii(scalar)?
                     };
@@ -1299,20 +1308,52 @@ impl UnicodeScalarAggregatePlan {
         &self,
         scalar: u32,
         cached_range: &mut Option<usize>,
+        previous_scalar: &mut Option<u32>,
     ) -> Result<(bool, usize), ReduceError> {
         let mut comparisons = 0_usize;
         if let Some(index) = *cached_range {
-            comparisons = 1;
-            let range = self
-                .non_ascii
-                .get(index)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "cached non-ASCII range access",
-                })?;
-            if scalar >= range.start && scalar <= range.end {
-                return Ok((true, comparisons));
+            if let Some(range) = self.non_ascii.get(index) {
+                comparisons = 1;
+                if scalar >= range.start && scalar <= range.end {
+                    *previous_scalar = Some(scalar);
+                    return Ok((true, comparisons));
+                }
+                if previous_scalar.is_some_and(|previous| scalar >= previous) {
+                    if scalar < range.start {
+                        *previous_scalar = Some(scalar);
+                        return Ok((false, comparisons));
+                    }
+                    let next = index.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "cached non-ASCII range successor",
+                        },
+                    )?;
+                    *cached_range = Some(next);
+                    if let Some(range) = self.non_ascii.get(next) {
+                        comparisons = comparisons.checked_add(1).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "monotone range comparisons",
+                            },
+                        )?;
+                        if scalar < range.start {
+                            *previous_scalar = Some(scalar);
+                            return Ok((false, comparisons));
+                        }
+                        if scalar <= range.end {
+                            *previous_scalar = Some(scalar);
+                            return Ok((true, comparisons));
+                        }
+                    } else {
+                        *previous_scalar = Some(scalar);
+                        return Ok((false, comparisons));
+                    }
+                }
+            } else if index == self.non_ascii.len()
+                && previous_scalar.is_some_and(|previous| scalar >= previous)
+            {
+                *previous_scalar = Some(scalar);
+                return Ok((false, comparisons));
             }
-            *cached_range = None;
         }
 
         let mut low = 0_usize;
@@ -1339,20 +1380,23 @@ impl UnicodeScalarAggregatePlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "cached binary search range access",
                 })?;
-            if scalar < range.start {
+            if scalar <= range.end {
                 high = middle;
-            } else if scalar > range.end {
+            } else {
                 low = middle
                     .checked_add(1)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "cached binary search lower bound",
                     })?;
-            } else {
-                *cached_range = Some(middle);
-                return Ok((true, comparisons));
             }
         }
-        Ok((false, comparisons))
+        *cached_range = Some(low);
+        *previous_scalar = Some(scalar);
+        let contains = self
+            .non_ascii
+            .get(low)
+            .is_some_and(|range| scalar >= range.start);
+        Ok((contains, comparisons))
     }
 }
 
