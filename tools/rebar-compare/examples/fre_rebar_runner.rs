@@ -111,12 +111,7 @@ fn main() -> Result<(), DynError> {
         .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
-    if benchmark.model == "grep" && expectations.runtime.as_deref() != Some("k0") {
-        return Err("formal FRE grep timing requires --expect-runtime k0".into());
-    }
-    if benchmark.model != "grep" && expectations.runtime.is_some() {
-        return Err("formal non-grep timing rejects --expect-runtime".into());
-    }
+    require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
     let samples = match benchmark.model.as_str() {
         "compile" => model_compile(&benchmark, &expectations)?,
         "count" => model_count(&benchmark, &expectations)?,
@@ -171,6 +166,14 @@ fn require_optional(label: &str, expected: Option<&str>, actual: &str) -> Result
         );
     }
     Ok(())
+}
+
+fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(), DynError> {
+    match (model, runtime) {
+        ("grep", None) => Err("formal FRE grep timing requires --expect-runtime".into()),
+        ("grep", Some(_)) | (_, None) => Ok(()),
+        (_, Some(_)) => Err("formal non-grep timing rejects --expect-runtime".into()),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -569,6 +572,15 @@ mod tests {
         );
         assert!(require_grep_runtime_plan("k0", PlanKind::UnicodeWordRun).is_err());
         assert!(require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::K0).is_err());
+    }
+
+    #[test]
+    fn requires_runtime_identity_for_grep_without_freezing_it_to_k0() {
+        assert!(require_runtime_expectation("grep", Some("k0")).is_ok());
+        assert!(require_runtime_expectation("grep", Some("unicode-word-run-linear-v1")).is_ok());
+        assert!(require_runtime_expectation("grep", None).is_err());
+        assert!(require_runtime_expectation("count", Some("k0")).is_err());
+        assert!(require_runtime_expectation("count", None).is_ok());
     }
 
     #[test]
