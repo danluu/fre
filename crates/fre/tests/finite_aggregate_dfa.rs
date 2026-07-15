@@ -1,7 +1,8 @@
 use fre::{
-    AggregateBuilder, AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation,
-    AggregatePlanKind, AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateReduceError,
-    RustProfile,
+    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanKind,
+    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateReduceError, RustProfile,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -72,6 +73,8 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         compiled.build_report().plan,
         AggregatePlanKind::FiniteLiteralDfa
     );
+    assert_eq!(compiled.build_report().schema_version, 10);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 10);
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";
@@ -97,6 +100,39 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         AggregateExecutionSource::FiniteLiteral(
             OrderedLiteralAggregateReduceError::TotalWorkLimit { .. }
         )
+    ));
+}
+
+#[test]
+fn finite_dfa_planner_and_kernel_limits_fail_with_typed_ownership() {
+    let pattern = r"(?:cat|dog|mouse)";
+    let baseline = builder(pattern).build_count().unwrap();
+    let work = baseline.build_report().finite_planner_work;
+    assert!(work > 0);
+
+    let mut planner_limits = AggregateBuildLimits::default();
+    planner_limits.max_finite_planner_work = work - 1;
+    let planner_error = builder(pattern)
+        .limits(planner_limits)
+        .build_count()
+        .unwrap_err();
+    assert!(matches!(
+        planner_error,
+        AggregateBuildError::FinitePlannerWorkLimit { .. }
+    ));
+
+    let mut kernel_limits = AggregateBuildLimits::default();
+    kernel_limits.finite_literal.max_trie_states = 1;
+    let kernel_error = builder(pattern)
+        .limits(kernel_limits)
+        .build_count()
+        .unwrap_err();
+    assert!(matches!(
+        kernel_error,
+        AggregateBuildError::FiniteLiteralBuild {
+            source: OrderedLiteralAggregateBuildError::TrieStatesLimit { .. },
+            ..
+        }
     ));
 }
 
