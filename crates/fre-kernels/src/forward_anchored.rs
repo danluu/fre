@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar16-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v19";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v20";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1378,7 +1378,7 @@ const PAIR_NEON_BLOCK: usize = 16;
 const SWAR_BYTES: usize = size_of::<u64>();
 const SWAR_LOW: u64 = u64::MAX / 0xFF;
 const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
-const START_RANGE_SWAR_MIN: usize = 16;
+const START_RANGE_SWAR_MIN: usize = 8;
 const WORD_BYTES: usize = size_of::<usize>();
 const BYTE_ONES: usize = usize::MAX / 0xFF;
 const BYTE_HIGH: usize = BYTE_ONES * 0x80;
@@ -2899,7 +2899,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar16-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v19"
+            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v20"
         );
         assert_eq!(
             pair.implementation(),
@@ -4111,7 +4111,7 @@ mod tests {
     }
 
     #[test]
-    fn start_range_swar_threshold_and_failed_word_lanes_are_exact() {
+    fn start_range_swar8_threshold_and_failed_word_lanes_are_exact() {
         let plan = plan(ByteClass::inclusive(b'a', b'z'), b"Z", false);
         for prefix_len in [15_usize, 16, 17, 31, 32, 33, 72, 73] {
             let mut valid = vec![b'a'; prefix_len];
@@ -4139,16 +4139,13 @@ mod tests {
             let (matched, accounting) = plan.find(&invalid, SearchLimits::unlimited()).unwrap();
             assert_eq!(matched, None, "lane={lane}");
             assert_eq!(accounting.prefix_bytes_examined, 2 * word_bytes + lane + 2);
-            assert_eq!(
-                accounting.prefix_bytes_upper_bound,
-                valid.len() + word_bytes
-            );
+            assert_eq!(accounting.prefix_bytes_upper_bound, valid.len() + word_bytes);
             assert!(!accounting.suffix_confirmation_attempted);
         }
     }
 
     #[test]
-    fn start_range_swar32_high_bit_ranges_preserve_boundary_and_accounting() {
+    fn start_range_swar8_high_bit_ranges_preserve_boundary_and_accounting() {
         let word_bytes = size_of::<usize>();
         for (start, end, member, outsider, suffix) in [
             (0x80_u8, 0xFE_u8, 0xC0_u8, 0x7F_u8, b'Z'),

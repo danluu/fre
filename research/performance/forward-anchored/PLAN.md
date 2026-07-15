@@ -86,7 +86,7 @@ search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains
-`anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar16-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v19`, and `Auto`
+`anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v20`, and `Auto`
 retains its pre-existing strategy for both shapes. Exact singleton-class
 candidate prefixes from 32 through 65,536 bytes use the same dedicated
 equality-only 32-byte verifier used above the former activation floor. Pair candidate
@@ -98,12 +98,12 @@ dispatcher can encode the 65,536-byte ceiling directly instead of materializing
 the 65,464-value inclusive-range span. Triple candidate prefixes use four safe
 eight-byte SWAR membership words per 32-byte block with scalar recovery only
 after a failing block; that exact 32-byte recovery is isolated in a cold
-non-inlined helper. Non-single inclusive ranges at 16 bytes and above use
+non-inlined helper. Non-single inclusive ranges at 8 bytes and above use
 native-word SWAR membership with exact scalar recovery inside only a failing
-word. The preflight activates its one-word rescan margin at the same inclusive
-16-byte boundary, including the exact-threshold suffix word. Other class
-shapes and fixed-end verification retain their prior leaves.
-The direct legacy kernel constructor is unchanged.
+word and retain their unlimited prefix-length ceiling. The preflight activates
+its one-word rescan margin at the same inclusive 8-byte boundary, including the
+exact-threshold suffix word. Other class shapes and fixed-end verification
+retain their prior leaves. The direct legacy kernel constructor is unchanged.
 
 Extraction borrows the suffix from the parsed HIR and preserves its checked
 planner-work charge. The selected fixed plan performs one preflighted exact
