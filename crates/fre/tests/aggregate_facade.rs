@@ -1779,7 +1779,6 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
     assert_eq!((matched.start(), matched.end()), (2, 5));
 }
 
-
 #[test]
 fn finite_ordered_plan_preserves_priority_nullable_captures_and_invalid_bytes() {
     let cases: [(&str, &[u8]); 6] = [

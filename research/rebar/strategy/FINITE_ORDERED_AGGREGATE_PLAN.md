@@ -30,7 +30,7 @@ capacity is debited from the kernel peak budget before kernel construction and
 is checked again with the kernel's exact observed peak before publication.
 Source/profile, operation, selected plan, algorithm/operation tag, all build
 limits, and all execution limits are in facade cache identity. The explain
-schema advances from 3 to 4.
+schema remains version 4 while adding the finite operation identity.
 
 Patterns with repetition or look assertions, extraction beyond 4,096 words or
 4 MiB of word payload, Unicode-enabled profiles, and complete-span output stay
@@ -39,7 +39,7 @@ and its finite-horizon counterexample behavior are unchanged.
 
 ## Coverage accounting
 
-Authenticated coverage remains exactly 177 pass / 167 unsupported at the
+Authenticated coverage remains exactly 179 pass / 165 unsupported at the
 canonical base until a phase-B regeneration runs; this source-only checkpoint
 claims zero authenticated unlocks.
 
@@ -53,14 +53,15 @@ candidate universe among the 157 one-pattern construction opportunities:
 | **candidate universe** | **26** | **10** | **36** |
 
 This mechanism can remove a resource refusal only where one of those rows is
-in the exact 28-row resource set and its finite extraction/dense construction
-fits the new bounds. The generated manifest/report containing job IDs and the
-family join is intentionally not committed at this base, so the exact
-intersection—21 `count` operation-work, two `count` row-log, three
-`count-spans` operation-work, and two `count-spans` compile-work receipts—must
-be measured rather than guessed. The phase-B report must publish job IDs,
-families, model counts, prior refusal resource, selected plan, and remaining
-typed refusal. No support count should be promoted from the 36-row upper bound.
+in the exact 30-row aggregate resource set and its finite extraction/dense
+construction fits the new bounds. The generated manifest/report containing job
+IDs and the family join is intentionally not committed at this base, so the exact
+intersection—22 `count` operation-work, two `count` row-log, one `count`
+repeat-bound, three `count-spans` operation-work, and two `count-spans`
+compile-quota receipts—must be measured rather than guessed. The phase-B report
+must publish job IDs, families, model counts, prior refusal resource, selected
+plan, and remaining typed refusal. No support count should be promoted from the
+36-row upper bound.
 Finite-language `compile` candidates among the 33 compile rows are a separate
 unmeasured projection introduced by the schema-v4 semantic union; no count is
 claimed until the same authenticated regeneration classifies them.

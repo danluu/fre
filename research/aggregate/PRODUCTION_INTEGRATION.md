@@ -1,6 +1,6 @@
 # Production aggregate integration
 
-Status as of 2026-07-14: the production `fre` facade construction-selects the
+Status as of 2026-07-15: the production `fre` facade construction-selects the
 exact-literal reducer, a bounded finite ordered-language reducer, or the
 `fre-aggregate` continuation program for one-pattern Rust-byte `compile`,
 `count`, and `count-spans`. The finite route is a source-only candidate pending
@@ -36,7 +36,8 @@ strategy, facade policy, and Rebar reduction independently testable:
 7. `CurrentFreAdapter` compiles exactly once and executes exactly once for an
    admitted one-pattern `compile`, `count`, or `count-spans` job. Unsupported
    models and build-many are rejected before candidate compilation. Existing
-   portable single-search/grep routing is unchanged.
+   portable single-search/grep routing is unchanged and retains its certified
+   absolute/LF-line/ASCII-word K0 assertion subset.
 
 `AggregatePlanSelection::{Auto,ForceExactLiteral,ForceContinuation}` makes the
 plan seam testable. `Auto` publishes a selected exact or finite build refusal
@@ -149,15 +150,15 @@ patterns on `zabb`. Both aggregate strategies return count 1. Pinned Rust
 1.12.4 returns 2 through its unsound optimization; exact receipts deliberately
 retain those Rust failures while FRE passes the canonical definitions.
 
-The canonical authenticated frontier remains 177 FRE pass / 167 unsupported,
-zero fail/fault: 16 `compile`, 54 `count`, 100 `count-spans`, and seven
+The canonical authenticated frontier remains 179 FRE pass / 165 unsupported,
+zero fail/fault: 16 `compile`, 54 `count`, 100 `count-spans`, and nine
 portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
 reverse-suffix failures; pinned RE2 remains 285/285. The finite plan is absent
 from those receipts and claims no additional support before regeneration.
 Exact per-model counts, refusal classes, source/tree identities, and the two
 byte-identical generation digest are retained in
 `../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
-the older baseline and is not silently relabelled as 177-frontier evidence.
+the older baseline and is not silently relabelled as 179-frontier evidence.
 
 Five fresh local timing processes cover all 24 exact-literal rows at the full
 public facade boundary. Median-of-five-process medians classify 10 jobs as FRE
@@ -183,8 +184,8 @@ reject a strict faster-everywhere or performance-promotion claim.
    result/report boundaries explicit in measurement. The current wrapper
    around a shared class of SIMD primitive cannot establish strict
    superiority.
-2. Add Unicode byte-mode lowering and the missing assertion semantics with
-   independent differentials.
+2. Add the remaining Unicode byte-mode lowering, Unicode word-state, and
+   variable-width Unicode scalar semantics with independent differentials.
 3. Add ordered build-many and capture-history operation families instead of
    widening whole-match erasure beyond its proof boundary.
 4. Keep compile-model verification and AOT/JIT timing work visible; never hide
