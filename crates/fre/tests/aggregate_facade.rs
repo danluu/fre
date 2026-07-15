@@ -1143,7 +1143,7 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
 
 #[test]
 fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions() {
-    let cases: [(&str, &[u8]); 9] = [
+    let cases: [(&str, &[u8]); 11] = [
         (r"\pL{2,4}", b"ab--cdef--g"),
         (r"\pL{2,4}?", b"ab--cdef--g"),
         (r"\pL{3,}", "αβγ--雪雪雪雪".as_bytes()),
@@ -1153,6 +1153,8 @@ fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions()
         (r"\pL{2,4}", b"\xFFa\x80bcde\xE2\x82"),
         (r".{2,3}", b"ab\ncd\xFFef"),
         (r"(?s:.){2,3}", b"ab\ncd\xFFef"),
+        (r"(?P<run>\pL{2,4})", "ab--αβγ".as_bytes()),
+        (r"(?P<atom>\pL){2,4}", "ab--αβγ".as_bytes()),
     ];
     for (pattern, haystack) in cases {
         let expected = upstream_profile(pattern, haystack, false, true);
