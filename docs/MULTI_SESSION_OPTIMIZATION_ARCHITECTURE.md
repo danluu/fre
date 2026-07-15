@@ -303,28 +303,11 @@ Track marginal yield by completed analytical block:
 - distinct viable mechanisms found;
 - candidates surviving correctness and resource gates;
 - confirmed findings rather than raw allegations;
-- cross-family/model coverage added, with raw supported-row count reported only
-  as a health observation;
+- supported benchmark coverage added;
 - promoted wins and retained losses;
 - wall-clock time from ticket creation to evidence-backed decision.
 
 Raw agent count and confident prose are not throughput metrics.
-
-An implementation reservoir also enforces portfolio concentration limits. No
-single mechanism or semantic family receives more than half of its live source
-seats, including blind replications. At least one third of the reservoir covers
-the whole supported performance surface, at least one third pursues mechanisms
-demonstrated across multiple families or models, and at least one seat remains
-hostile audit or structural falsification work; responsibilities may overlap.
-This preserves repeated independent attempts without allowing an easy benchmark
-subset to become the project objective.
-
-Performance status is stratified by route, family, and model. Each stratum
-reports comparator coverage, geomean, p90, worst ratio, unsupported rows, and
-missing comparator cells for accepted FRE, Rust regex, and RE2 where available.
-No aggregate geomean may hide a material pointwise regression. A newly supported
-surface must include exact affected rows, honest neighboring controls, and
-N/2N/4N scaling before it can advance from semantic support to promotion.
 
 Mechanically equivalent proposals are one discovery cluster even when many
 sessions repeat them. The ledger records both raw attempts and distinct
