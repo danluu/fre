@@ -1,10 +1,11 @@
 # Production aggregate integration
 
-Status as of 2026-07-14: the production `fre` facade construction-selects either
-the exact-literal whole-operation reducer from `fre-kernels` or the bounded
+Status as of 2026-07-14: the production `fre` facade construction-selects the
+exact-literal reducer, a bounded finite ordered-language reducer, or the
 `fre-aggregate` continuation program for one-pattern Rust-byte `count` and
-`count-spans`. The integration is a correctness/coverage result, not a claim
-that either path is faster than Rust regex or RE2 on every workload.
+`count-spans`. The finite route is a source-only candidate pending the gates in
+`../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not a claim that
+any path is faster than Rust regex or RE2 on every workload.
 
 ## Modular production boundary
 
@@ -17,27 +18,30 @@ strategy, facade policy, and Rebar reduction independently testable:
    and proves exact-literal eligibility only when the remaining root is one
    `Literal` or `Empty` node. `fre-kernels::LiteralAggregatePlan` owns one
    needle and exposes distinct count/span-sum identities.
-3. Ineligible HIR is validated and compiled by `fre-aggregate` into a
+3. Unicode-off finite HIR is boundedly enumerated and compiled into the
+   reversed dense ordered-literal AC/DP reducer. Ineligible HIR continues to
+   the generic compiler; a selected finite build or run refusal never does.
+4. Remaining HIR is validated and compiled by `fre-aggregate` into a
    prioritized continuation program with exact work, state, temporary-state,
    and retained program-capacity accounting.
-4. Distinct facade types expose only one operation each:
+5. Distinct facade types expose only one operation each:
    `AggregateSpansRegex`, `AggregateCountRegex`, and
    `AggregateSpanSumRegex`. Operation and storage strategy are fixed before
    compilation and included in reports/cache identity. Count and span-sum
    additionally expose value-only hot APIs; their audited result/report APIs
    remain unchanged.
-5. The facade always runs aggregate operations on `0..haystack.len()`. Absolute
+6. The facade always runs aggregate operations on `0..haystack.len()`. Absolute
    anchors therefore retain original-haystack context; it never implements
    global iteration by repeatedly searching sliced suffixes.
-6. `CurrentFreAdapter` compiles exactly once and executes exactly once for an
+7. `CurrentFreAdapter` compiles exactly once and executes exactly once for an
    admitted one-pattern `count` or `count-spans` job. Unsupported models and
    build-many are rejected before candidate compilation. Existing portable
    single-search/grep routing is unchanged.
 
 `AggregatePlanSelection::{Auto,ForceExactLiteral,ForceContinuation}` makes the
-plan seam testable. `Auto` publishes an eligible literal build refusal instead
-of falling through; a selected execution refusal never invokes the other plan.
-Exact-literal reports contain no continuation strategy label.
+plan seam testable. `Auto` publishes a selected exact or finite build refusal
+instead of falling through; a selected execution refusal never invokes another
+plan. Direct and finite reducer reports contain no continuation strategy label.
 
 ## Capture and profile contract
 
@@ -69,6 +73,12 @@ Every selected plan retains a no-partial-output contract:
 - `ExactLiteral` uses one `memmem::Finder::find_iter` traversal for a nonempty
   needle and a checked `N + 1` byte-boundary formula for an empty needle.
   Count and span sum are separate stable operation identities.
+
+- `FiniteOrderedLiterals` performs one reversed dense-AC transition per input
+  byte and one initial/progressed DP step per boundary. Its ring is bounded by
+  the longest materialized word, and extraction capacity is included in the
+  combined construction peak while the operation reports transition, ring,
+  total-work, scratch, and peak counters.
 
 - `FullTable` materializes one endpoint word per `(boundary, state)`.
 - `ReverseSequentialRows` retains two state rows and a fixed split/root record
