@@ -1,11 +1,15 @@
-//! Direct whole-operation reduction for one canonical Unicode scalar class.
+//! Direct whole-operation reduction for one canonical Unicode scalar class or
+//! its nonempty unbounded repetition.
 //!
 //! Construction copies a sorted, disjoint sequence of inclusive scalar
 //! ranges into a compact ASCII bitmap plus non-ASCII `(u32, u32)` pairs.
 //! Execution walks the requested byte window once. Every valid UTF-8 scalar
 //! start is decoded exactly once, invalid bytes advance by one byte and never
 //! match, and membership is one bitmap test or a binary search over the
-//! immutable non-ASCII ranges.
+//! immutable non-ASCII ranges. Exact-one and lazy-one-or-more emit every
+//! matching scalar. Greedy-one-or-more emits one match for each maximal run of
+//! matching scalars. The latter is a fixed deterministic run automaton, not a
+//! boundary-by-state scan.
 //!
 //! For `N` input bytes and `R` retained non-ASCII ranges, execution takes
 //! `O(N log(R + 1))` work, retains `O(R)` bytes, and uses no dynamic scratch.
@@ -16,16 +20,42 @@ use crate::Window;
 
 /// Stable identity for the scalar-stream implementation.
 pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
+/// Stable identity for the deterministic nonempty run reducer.
+pub const RUN_PLAN_ID: &str =
+    "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.valid-scalar.v1";
 /// Stable identity for the matched-byte-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "unicode-scalar-aggregate.span-sum.valid-scalar.v1";
+/// Stable identity for greedy/lazy nonempty run counting.
+pub const RUN_COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.run-plus.v1";
+/// Stable identity for greedy/lazy nonempty run matched-byte summation.
+pub const RUN_SPAN_SUM_OPERATION_ID: &str = "unicode-scalar-aggregate.span-sum.run-plus.v1";
 
 /// Complete reducer selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Count,
     SpanSum,
+}
+
+/// Root HIR shape reduced by the scalar stream.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Repetition {
+    /// One scalar-class atom.
+    ExactlyOne,
+    /// Greedy `CLASS+`: one match per maximal matching run.
+    OneOrMoreGreedy,
+    /// Lazy `CLASS+?`: one match per matching scalar.
+    OneOrMoreLazy,
+}
+
+impl Repetition {
+    /// Whether this shape uses the deterministic nonempty run reducer.
+    #[must_use]
+    pub const fn is_run(self) -> bool {
+        !matches!(self, Self::ExactlyOne)
+    }
 }
 
 /// UTF-8 and iteration semantics certified by this plan.
@@ -44,21 +74,35 @@ pub struct OperationIdentity {
     pub operation_id: &'static str,
     pub operation: Operation,
     pub scalar_semantics: ScalarSemantics,
+    pub repetition: Repetition,
     pub non_overlapping: bool,
 }
 
 impl OperationIdentity {
     #[must_use]
     pub const fn for_operation(operation: Operation) -> Self {
-        let operation_id = match operation {
-            Operation::Count => COUNT_OPERATION_ID,
-            Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+        Self::for_repetition(operation, Repetition::ExactlyOne)
+    }
+
+    /// Return the immutable identity for an exact atom or proved `+` root.
+    #[must_use]
+    pub const fn for_repetition(operation: Operation, repetition: Repetition) -> Self {
+        let operation_id = match (repetition.is_run(), operation) {
+            (false, Operation::Count) => COUNT_OPERATION_ID,
+            (false, Operation::SpanSum) => SPAN_SUM_OPERATION_ID,
+            (true, Operation::Count) => RUN_COUNT_OPERATION_ID,
+            (true, Operation::SpanSum) => RUN_SPAN_SUM_OPERATION_ID,
         };
         Self {
-            plan_id: PLAN_ID,
+            plan_id: if repetition.is_run() {
+                RUN_PLAN_ID
+            } else {
+                PLAN_ID
+            },
             operation_id,
             operation,
             scalar_semantics: ScalarSemantics::RustBytesUnicodeUtf8False,
+            repetition,
             non_overlapping: true,
         }
     }
@@ -105,6 +149,8 @@ pub struct BuildAccounting {
     pub source_ranges: usize,
     pub retained_non_ascii_ranges: usize,
     pub ascii_scalars: usize,
+    /// Root atom/repetition shape retained in the executable plan.
+    pub repetition: Repetition,
     pub range_payload_bytes: usize,
     pub work: usize,
     pub temporary_capacity_bytes: usize,
@@ -120,6 +166,8 @@ pub struct ReduceLimits {
     pub max_decode_byte_checks: usize,
     pub max_membership_tests: usize,
     pub max_range_comparisons: usize,
+    /// Maximum deterministic reducer transitions after scalar decoding.
+    pub max_reducer_steps: usize,
     pub max_match_events: usize,
     pub max_count: u64,
     pub max_span_sum: u64,
@@ -136,6 +184,7 @@ impl ReduceLimits {
             max_decode_byte_checks: usize::MAX,
             max_membership_tests: usize::MAX,
             max_range_comparisons: usize::MAX,
+            max_reducer_steps: usize::MAX,
             max_match_events: usize::MAX,
             max_count: u64::MAX,
             max_span_sum: u64::MAX,
@@ -153,6 +202,7 @@ impl Default for ReduceLimits {
             max_decode_byte_checks: 512 << 20,
             max_membership_tests: 128 << 20,
             max_range_comparisons: 2 << 30,
+            max_reducer_steps: (128 << 20) + 1,
             max_match_events: 128 << 20,
             max_count: 128 << 20,
             max_span_sum: 128 << 20,
@@ -171,6 +221,7 @@ pub struct ReduceUpperBounds {
     pub membership_tests: usize,
     pub range_comparisons: usize,
     pub binary_search_comparisons_per_scalar: usize,
+    pub reducer_steps: usize,
     pub match_events: usize,
     pub count: u64,
     pub span_sum: u64,
@@ -193,6 +244,8 @@ pub struct ReduceActualCounters {
     pub ascii_bitmap_tests: usize,
     pub non_ascii_membership_tests: usize,
     pub range_comparisons: usize,
+    pub reducer_steps: usize,
+    pub run_flushes: usize,
     pub match_events: usize,
     pub count: u64,
     pub matched_bytes: u64,
@@ -311,6 +364,10 @@ pub enum ReduceError {
         needed: usize,
         limit: usize,
     },
+    ReducerStepsLimit {
+        needed: usize,
+        limit: usize,
+    },
     MatchEventsLimit {
         needed: usize,
         limit: usize,
@@ -369,6 +426,10 @@ impl fmt::Display for ReduceError {
                 f,
                 "Unicode scalar scan may need {needed} range comparisons, limit is {limit}"
             ),
+            Self::ReducerStepsLimit { needed, limit } => write!(
+                f,
+                "Unicode scalar reducer may need {needed} transitions, limit is {limit}"
+            ),
             Self::MatchEventsLimit { needed, limit } => {
                 write!(
                     f,
@@ -422,17 +483,41 @@ struct ScalarRange {
 pub struct UnicodeScalarAggregatePlan {
     ascii: [u64; 2],
     non_ascii: Box<[ScalarRange]>,
+    repetition: Repetition,
     build: BuildAccounting,
 }
 
 impl UnicodeScalarAggregatePlan {
     /// Copy one canonical sequence of inclusive scalar ranges.
+    pub fn build(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_with_repetition(ranges, Repetition::ExactlyOne, limits)
+    }
+
+    /// Copy a canonical scalar class for a proved nonempty unbounded root
+    /// repetition.
+    pub fn build_one_or_more(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        let repetition = if greedy {
+            Repetition::OneOrMoreGreedy
+        } else {
+            Repetition::OneOrMoreLazy
+        };
+        Self::build_with_repetition(ranges, repetition, limits)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "construction keeps canonical validation and all checked storage accounting in one auditable transaction"
     )]
-    pub fn build(
+    fn build_with_repetition(
         ranges: impl IntoIterator<Item = (char, char)>,
+        repetition: Repetition,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
         let mut ascii = [0_u64; 2];
@@ -499,6 +584,10 @@ impl UnicodeScalarAggregatePlan {
         if source_ranges == 0 {
             return Err(BuildError::EmptyClass);
         }
+        if repetition.is_run() {
+            work = checked_add(work, 1, "repetition configuration work")?;
+            enforce_build(work, limits.max_build_work, BuildResource::Work)?;
+        }
 
         let range_payload_bytes = non_ascii
             .len()
@@ -539,6 +628,7 @@ impl UnicodeScalarAggregatePlan {
             source_ranges,
             retained_non_ascii_ranges,
             ascii_scalars,
+            repetition,
             range_payload_bytes,
             work,
             temporary_capacity_bytes,
@@ -549,6 +639,7 @@ impl UnicodeScalarAggregatePlan {
         Ok(Self {
             ascii,
             non_ascii: non_ascii.into_boxed_slice(),
+            repetition,
             build,
         })
     }
@@ -560,12 +651,12 @@ impl UnicodeScalarAggregatePlan {
 
     #[must_use]
     pub const fn count_identity(&self) -> OperationIdentity {
-        OperationIdentity::for_operation(Operation::Count)
+        OperationIdentity::for_repetition(Operation::Count, self.repetition)
     }
 
     #[must_use]
     pub const fn span_sum_identity(&self) -> OperationIdentity {
-        OperationIdentity::for_operation(Operation::SpanSum)
+        OperationIdentity::for_repetition(Operation::SpanSum, self.repetition)
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
@@ -657,6 +748,15 @@ impl UnicodeScalarAggregatePlan {
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "range comparison upper bound",
             })?;
+        let reducer_steps = if self.repetition.is_run() {
+            input_bytes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "run reducer transition upper bound",
+                })?
+        } else {
+            0
+        };
         let match_events = input_bytes;
         let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "count upper bound",
@@ -667,6 +767,7 @@ impl UnicodeScalarAggregatePlan {
         let work = decode_byte_checks
             .checked_add(membership_tests)
             .and_then(|value| value.checked_add(range_comparisons))
+            .and_then(|value| value.checked_add(reducer_steps))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "execution work upper bound",
             })?;
@@ -679,6 +780,7 @@ impl UnicodeScalarAggregatePlan {
             membership_tests,
             range_comparisons,
             binary_search_comparisons_per_scalar,
+            reducer_steps,
             match_events,
             count,
             span_sum,
@@ -706,6 +808,11 @@ impl UnicodeScalarAggregatePlan {
             range_comparisons,
             limits.max_range_comparisons,
             ReduceResource::RangeComparisons,
+        )?;
+        enforce_reduce(
+            reducer_steps,
+            limits.max_reducer_steps,
+            ReduceResource::ReducerSteps,
         )?;
         enforce_reduce(
             match_events,
@@ -747,6 +854,7 @@ impl UnicodeScalarAggregatePlan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
+        let mut pending_run_bytes = 0_u64;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
             decode_byte_checks: 0,
@@ -756,6 +864,8 @@ impl UnicodeScalarAggregatePlan {
             ascii_bitmap_tests: 0,
             non_ascii_membership_tests: 0,
             range_comparisons: 0,
+            reducer_steps: 0,
+            run_flushes: 0,
             match_events: 0,
             count: 0,
             matched_bytes: 0,
@@ -777,7 +887,18 @@ impl UnicodeScalarAggregatePlan {
                         break;
                     }
                     let word = self.ascii[usize::from(byte / 64)];
-                    if word & (1_u64 << (byte % 64)) != 0 {
+                    let matched = word & (1_u64 << (byte % 64)) != 0;
+                    if self.repetition == Repetition::OneOrMoreGreedy {
+                        if matched {
+                            pending_run_bytes = pending_run_bytes.checked_add(1).ok_or(
+                                ReduceError::ArithmeticOverflow {
+                                    computation: "pending greedy ASCII-run bytes",
+                                },
+                            )?;
+                        } else {
+                            flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
+                        }
+                    } else if matched {
                         // At most one match is recorded per byte in this run,
                         // so this cannot exceed the enclosing slice length.
                         run_matches += 1;
@@ -809,26 +930,43 @@ impl UnicodeScalarAggregatePlan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "actual ASCII-run bitmap tests",
                     })?;
-                actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run match events",
-                    },
-                )?;
-                let run_matches =
-                    u64::try_from(run_matches).map_err(|_| ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run matches",
+                if self.repetition.is_run() {
+                    actual.reducer_steps = actual.reducer_steps.checked_add(run_bytes).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run reducer transitions",
+                        },
+                    )?;
+                }
+                if self.repetition != Repetition::OneOrMoreGreedy {
+                    actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run match events",
+                        },
+                    )?;
+                    let run_matches = u64::try_from(run_matches).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run matches",
+                        }
                     })?;
-                actual.count = actual.count.checked_add(run_matches).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run count",
-                    },
-                )?;
-                actual.matched_bytes = actual.matched_bytes.checked_add(run_matches).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run matched bytes",
-                    },
-                )?;
+                    actual.count = actual.count.checked_add(run_matches).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run count",
+                        },
+                    )?;
+                    actual.matched_bytes = actual.matched_bytes.checked_add(run_matches).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run matched bytes",
+                        },
+                    )?;
+                }
                 continue;
+            }
+            if self.repetition.is_run() {
+                actual.reducer_steps = actual.reducer_steps.checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "actual run reducer transitions",
+                    },
+                )?;
             }
             let decoded = decode_scalar(&local[position..]);
             actual.decode_byte_checks = actual
@@ -870,29 +1008,22 @@ impl UnicodeScalarAggregatePlan {
                     false
                 };
             if matched {
-                actual.match_events =
-                    actual
-                        .match_events
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual match events",
-                        })?;
-                actual.count =
-                    actual
-                        .count
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual count",
-                        })?;
-                let width =
-                    u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
-                        computation: "matched scalar width",
-                    })?;
-                actual.matched_bytes = actual.matched_bytes.checked_add(width).ok_or(
+                let width = u64::try_from(decoded.width).map_err(|_| {
                     ReduceError::ArithmeticOverflow {
-                        computation: "actual matched bytes",
-                    },
-                )?;
+                        computation: "matched scalar width",
+                    }
+                })?;
+                if self.repetition == Repetition::OneOrMoreGreedy {
+                    pending_run_bytes = pending_run_bytes.checked_add(width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "pending greedy run bytes",
+                        },
+                    )?;
+                } else {
+                    record_match(&mut actual, width)?;
+                }
+            } else if self.repetition == Repetition::OneOrMoreGreedy {
+                flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
             }
             position =
                 position
@@ -900,6 +1031,16 @@ impl UnicodeScalarAggregatePlan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "scalar stream position",
                     })?;
+        }
+        if self.repetition.is_run() {
+            actual.reducer_steps = actual.reducer_steps.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "final run reducer transition",
+                },
+            )?;
+        }
+        if self.repetition == Repetition::OneOrMoreGreedy {
+            flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
         }
         actual.input_bytes_advanced = position;
         let membership_tests = actual
@@ -912,6 +1053,7 @@ impl UnicodeScalarAggregatePlan {
             .decode_byte_checks
             .checked_add(membership_tests)
             .and_then(|value| value.checked_add(actual.range_comparisons))
+            .and_then(|value| value.checked_add(actual.reducer_steps))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual execution work",
             })?;
@@ -920,6 +1062,7 @@ impl UnicodeScalarAggregatePlan {
         debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
         debug_assert!(membership_tests <= upper.membership_tests);
         debug_assert!(actual.range_comparisons <= upper.range_comparisons);
+        debug_assert!(actual.reducer_steps <= upper.reducer_steps);
         debug_assert!(actual.match_events <= upper.match_events);
         debug_assert!(actual.count <= upper.count);
         debug_assert!(actual.matched_bytes <= upper.span_sum);
@@ -969,6 +1112,45 @@ impl UnicodeScalarAggregatePlan {
     }
 }
 
+fn record_match(actual: &mut ReduceActualCounters, width: u64) -> Result<(), ReduceError> {
+    actual.match_events = actual
+        .match_events
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "actual match events",
+        })?;
+    actual.count = actual
+        .count
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "actual count",
+        })?;
+    actual.matched_bytes = actual.matched_bytes.checked_add(width).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "actual matched bytes",
+        },
+    )?;
+    Ok(())
+}
+
+fn flush_greedy_run(
+    actual: &mut ReduceActualCounters,
+    pending_run_bytes: &mut u64,
+) -> Result<(), ReduceError> {
+    if *pending_run_bytes == 0 {
+        return Ok(());
+    }
+    record_match(actual, *pending_run_bytes)?;
+    actual.run_flushes = actual
+        .run_flushes
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "actual greedy run flushes",
+        })?;
+    *pending_run_bytes = 0;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum BuildResource {
     Ranges,
@@ -1012,6 +1194,7 @@ enum ReduceResource {
     DecodeByteChecks,
     MembershipTests,
     RangeComparisons,
+    ReducerSteps,
     MatchEvents,
     Work,
     Scratch,
@@ -1040,6 +1223,10 @@ fn enforce_reduce(
             limit,
         },
         ReduceResource::RangeComparisons => ReduceError::RangeComparisonsLimit {
+            needed: required,
+            limit,
+        },
+        ReduceResource::ReducerSteps => ReduceError::ReducerStepsLimit {
             needed: required,
             limit,
         },
@@ -1193,8 +1380,8 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, ReduceError, ReduceLimits, UnicodeScalarAggregatePlan,
-        binary_search_comparison_bound,
+        BuildError, BuildLimits, PLAN_ID, ReduceError, ReduceLimits, Repetition,
+        UnicodeScalarAggregatePlan, binary_search_comparison_bound,
     };
     use crate::Window;
 
@@ -1299,6 +1486,133 @@ mod tests {
                 assert_eq!(sum.span_sum, expected_sum, "window={start}..{end}");
             }
         }
+    }
+
+    #[test]
+    fn greedy_and_lazy_one_or_more_match_rust_on_runs_and_invalid_bytes() {
+        let ranges = [('A', 'Z'), ('a', 'z'), ('\u{3B1}', '\u{3C9}'), ('雪', '雪')];
+        let haystacks: [&[u8]; 8] = [
+            b"",
+            b"---",
+            b"abc",
+            b"abc--XYZ",
+            b"\xFFabc\x80XYZ",
+            b"\xCE\xB1\xCE\xB2!\xCE\xB3",
+            b"\xE9\x9B\xAA\xE9\x9B\xAA?A",
+            b"A\xE2\x82z",
+        ];
+        for (greedy, pattern, expected_repetition) in [
+            (true, "[A-Za-zα-ω雪]+", Repetition::OneOrMoreGreedy),
+            (false, "[A-Za-zα-ω雪]+?", Repetition::OneOrMoreLazy),
+        ] {
+            let plan = UnicodeScalarAggregatePlan::build_one_or_more(
+                ranges,
+                greedy,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(plan.build_accounting().repetition, expected_repetition);
+            assert_eq!(plan.count_identity().repetition, expected_repetition);
+            let regex = RegexBuilder::new(pattern).unicode(true).build().unwrap();
+            for haystack in haystacks {
+                let expected = regex.find_iter(haystack).collect::<Vec<_>>();
+                let expected_count = u64::try_from(expected.len()).unwrap();
+                let expected_sum = expected
+                    .iter()
+                    .map(|matched| u64::try_from(matched.len()).unwrap())
+                    .sum::<u64>();
+                let count = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+                let sum = plan
+                    .span_sum(haystack, ReduceLimits::unlimited())
+                    .unwrap();
+                assert_eq!(count.count, expected_count, "pattern={pattern:?} haystack={haystack:?}");
+                assert_eq!(sum.span_sum, expected_sum, "pattern={pattern:?} haystack={haystack:?}");
+                assert_eq!(count.accounting.actual.scratch_bytes, 0);
+            }
+            let windowed = b"x\xCE\xB1\xCE\xB2!\xE9\x9B\xAAz";
+            for start in 0..=windowed.len() {
+                for end in start..=windowed.len() {
+                    let local = &windowed[start..end];
+                    let expected = regex.find_iter(local).collect::<Vec<_>>();
+                    let expected_count = u64::try_from(expected.len()).unwrap();
+                    let expected_sum = expected
+                        .iter()
+                        .map(|matched| u64::try_from(matched.len()).unwrap())
+                        .sum::<u64>();
+                    let count = plan
+                        .count_in(
+                            windowed,
+                            Window::new(start, end),
+                            ReduceLimits::unlimited(),
+                        )
+                        .unwrap();
+                    let sum = plan
+                        .span_sum_in(
+                            windowed,
+                            Window::new(start, end),
+                            ReduceLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(count.count, expected_count, "pattern={pattern:?} window={start}..{end}");
+                    assert_eq!(sum.span_sum, expected_sum, "pattern={pattern:?} window={start}..{end}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn run_reducer_limit_and_n_2n_4n_structure_are_exact() {
+        let ranges = [('A', 'Z'), ('α', 'ω')];
+        let plan =
+            UnicodeScalarAggregatePlan::build_one_or_more(ranges, true, BuildLimits::unlimited())
+                .unwrap();
+        let build = plan.build_accounting();
+        let error = UnicodeScalarAggregatePlan::build_one_or_more(
+            ranges,
+            true,
+            BuildLimits {
+                max_build_work: build.work - 1,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, BuildError::WorkLimit { .. }));
+        assert_ne!(plan.count_identity().plan_id, PLAN_ID);
+        let unit = b"AA!\xCE\xB1\xCE\xB2?\xFF";
+        let mut rows = Vec::new();
+        for copies in [8_usize, 16, 32] {
+            let haystack = unit.repeat(copies);
+            rows.push(
+                plan.count(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .accounting,
+            );
+        }
+        for pair in rows.windows(2) {
+            let left = pair[0].actual;
+            let right = pair[1].actual;
+            assert_eq!(right.input_bytes_advanced, left.input_bytes_advanced * 2);
+            assert_eq!(right.decode_byte_checks, left.decode_byte_checks * 2);
+            assert_eq!(right.valid_scalars, left.valid_scalars * 2);
+            assert_eq!(right.invalid_bytes, left.invalid_bytes * 2);
+            assert_eq!(right.range_comparisons, left.range_comparisons * 2);
+            assert_eq!(right.reducer_steps - 1, (left.reducer_steps - 1) * 2);
+            assert_eq!(right.match_events, left.match_events * 2);
+            assert_eq!(right.run_flushes, left.run_flushes * 2);
+            assert_eq!(right.scratch_bytes, 0);
+        }
+        let upper = rows[0].upper_bounds;
+        assert!(upper.reducer_steps > 0);
+        let error = plan
+            .count(
+                &unit.repeat(8),
+                ReduceLimits {
+                    max_reducer_steps: upper.reducer_steps - 1,
+                    ..ReduceLimits::unlimited()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ReduceError::ReducerStepsLimit { .. }));
     }
 
     #[test]
@@ -1440,6 +1754,7 @@ mod tests {
             ReduceError::DecodeByteChecksLimit { .. } => "decode",
             ReduceError::MembershipTestsLimit { .. } => "membership",
             ReduceError::RangeComparisonsLimit { .. } => "comparisons",
+            ReduceError::ReducerStepsLimit { .. } => "reducer",
             ReduceError::MatchEventsLimit { .. } => "events",
             ReduceError::CountLimit { .. } => "count",
             ReduceError::SpanSumLimit { .. } => "span",
@@ -1463,6 +1778,7 @@ mod tests {
             max_decode_byte_checks: baseline.decode_byte_checks,
             max_membership_tests: baseline.membership_tests,
             max_range_comparisons: baseline.range_comparisons,
+            max_reducer_steps: baseline.reducer_steps,
             max_match_events: baseline.match_events,
             max_count: baseline.count,
             max_span_sum: baseline.span_sum,

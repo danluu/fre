@@ -74,6 +74,11 @@ an open P0 row.
   sequence differentials. Operation-typed count/span-sum facade and exact Rebar
   integration are complete; capture syntax is erased only for whole-match
   outputs with explicit traversal/work accounting.
+- [x] Deterministic Unicode scalar-run aggregate candidate: canonical root
+  `CLASS+` and `CLASS+?` count/span reducers use one scalar traversal, retain
+  greediness in executable identity, charge at most `N+1` run transitions,
+  use zero dynamic scratch, and preserve forced continuation and neighboring
+  routes.
 - [x] `fre-jit-runtime`: audited macOS/AArch64 strict-W^X publication with
   inaccessible guards, copy verification, rollback and concurrent-lifetime
   tests, plus 663,084 actual-hardware/oracle comparisons. Planner promotion

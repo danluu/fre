@@ -13,7 +13,7 @@ use fre_kernels::{
     UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeScalarAggregateSpanSumResult,
+    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -30,7 +30,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 8;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 9;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -64,8 +64,8 @@ pub enum AggregatePlanSelection {
 pub enum AggregatePlanKind {
     /// SIMD-aware `memmem::Finder::find_iter` whole-operation reducer.
     ExactLiteral,
-    /// Direct single-scalar Unicode class stream over compact canonical
-    /// ranges. This is not the continuation state engine.
+    /// Direct Unicode scalar class/run stream over compact canonical ranges.
+    /// This is not the continuation state engine.
     UnicodeScalarClass,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
@@ -109,6 +109,11 @@ pub enum AggregateUnicodeScalarSemantics {
     /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to one
     /// canonical nonempty root scalar class after transparent captures.
     UnicodeOnRootClassUtf8False,
+    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to a
+    /// canonical scalar class under one greedy nonempty unbounded repetition.
+    UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+    /// The same proof for lazy `CLASS+?`, which emits one scalar per match.
+    UnicodeOnRootClassOneOrMoreLazyUtf8False,
 }
 
 /// Facade identity for the construction-selected direct scalar reducer.
@@ -824,6 +829,7 @@ impl AggregateBuilder {
         let unicode_scalar_planner_work = match scalar_inspection {
             Some(UnicodeScalarInspection::Eligible {
                 class,
+                repetition,
                 work,
                 hir_nodes,
                 captures,
@@ -835,13 +841,31 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from Unicode scalar inspection",
                     });
                 }
-                let engine = UnicodeScalarAggregatePlan::build(
+                let ranges = || {
                     class
                         .ranges()
                         .iter()
-                        .map(|range| (range.start(), range.end())),
-                    limits.unicode_scalar,
-                )
+                        .map(|range| (range.start(), range.end()))
+                };
+                let engine = match repetition {
+                    UnicodeScalarAggregateRepetition::ExactlyOne => {
+                        UnicodeScalarAggregatePlan::build(ranges(), limits.unicode_scalar)
+                    }
+                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
+                        UnicodeScalarAggregatePlan::build_one_or_more(
+                            ranges(),
+                            true,
+                            limits.unicode_scalar,
+                        )
+                    }
+                    UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
+                        UnicodeScalarAggregatePlan::build_one_or_more(
+                            ranges(),
+                            false,
+                            limits.unicode_scalar,
+                        )
+                    }
+                }
                 .map_err(|source| AggregateBuildError::UnicodeScalarBuild {
                     operation,
                     selection,
@@ -878,7 +902,17 @@ impl AggregateBuilder {
                     build: AggregateBuildAccounting::UnicodeScalar(build),
                     plan_identity: AggregatePlanIdentity::UnicodeScalar(
                         AggregateUnicodeScalarIdentity {
-                            semantics: AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False,
+                            semantics: match repetition {
+                                UnicodeScalarAggregateRepetition::ExactlyOne => {
+                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
+                                }
+                                UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
+                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
+                                }
+                                UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
+                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
+                                }
+                            },
                             kernel,
                         },
                     ),
@@ -1206,6 +1240,7 @@ enum LiteralInspectionError {
 enum UnicodeScalarInspection<'a> {
     Eligible {
         class: &'a ClassUnicode,
+        repetition: UnicodeScalarAggregateRepetition,
         work: usize,
         hir_nodes: usize,
         captures: usize,
@@ -1227,6 +1262,8 @@ fn inspect_unicode_scalar_class(
     let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
+    let mut repetition = UnicodeScalarAggregateRepetition::ExactlyOne;
+    let mut saw_repetition = false;
     loop {
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
@@ -1239,12 +1276,37 @@ fn inspect_unicode_scalar_class(
                     .ok_or(UnicodeScalarInspectionError::Overflow)?;
                 hir = capture.sub.as_ref();
             }
+            HirKind::Repetition(repeated)
+                if !saw_repetition && repeated.min == 1 && repeated.max.is_none() =>
+            {
+                repetition = if repeated.greedy {
+                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy
+                } else {
+                    UnicodeScalarAggregateRepetition::OneOrMoreLazy
+                };
+                saw_repetition = true;
+                hir = repeated.sub.as_ref();
+            }
             HirKind::Class(Class::Unicode(class)) => {
+                if repetition.is_run() {
+                    if class.ranges().is_empty() {
+                        return Ok(UnicodeScalarInspection::Ineligible { work });
+                    }
+                    charge_unicode_scalar_inspection_work(&mut work, limit)?;
+                    return Ok(UnicodeScalarInspection::Eligible {
+                        class,
+                        repetition,
+                        work,
+                        hir_nodes,
+                        captures,
+                    });
+                }
                 for range in class.ranges() {
                     charge_unicode_scalar_inspection_work(&mut work, limit)?;
                     if !range.end().is_ascii() && range.start() != range.end() {
                         return Ok(UnicodeScalarInspection::Eligible {
                             class,
+                            repetition,
                             work,
                             hir_nodes,
                             captures,

@@ -35,7 +35,7 @@ fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families(
             b"Ab C",
             true,
             2,
-            AggregatePlanKind::ContinuationProgram,
+            AggregatePlanKind::UnicodeScalarClass,
         ),
     ];
     for (pattern, haystack, case_insensitive, expected, plan) in cases {
@@ -1068,6 +1068,76 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
 }
 
 #[test]
+fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
+    let cases: [(&str, &[u8], AggregateUnicodeScalarSemantics); 5] = [
+        (
+            r"\pL+",
+            b"abc--\xCE\xB1\xCE\xB2\xFFZ",
+            AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+        ),
+        (
+            r"\pL+?",
+            b"abc--\xCE\xB1\xCE\xB2\xFFZ",
+            AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False,
+        ),
+        (
+            r"(?P<run>[a-z]+)",
+            b"ab--c\xFFde",
+            AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+        ),
+        (
+            r"(?P<atom>[a-z])+?",
+            b"ab--c\xFFde",
+            AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False,
+        ),
+        (
+            r"(?s:.)+",
+            b"A\n\xFF\xE9\x9B\xAA\x80Z",
+            AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False,
+        ),
+    ];
+    for (pattern, haystack, semantics) in cases {
+        let expected = upstream_profile(pattern, haystack, false, true);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+        let count = aggregate_builder(pattern).build_count().unwrap();
+        assert_eq!(count.build_report().plan, AggregatePlanKind::UnicodeScalarClass);
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.semantics == semantics
+                    && identity.kernel.repetition.is_run()
+                    && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
+        ));
+        let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
+            panic!("scalar repetition selected another build family")
+        };
+        assert!(build.repetition.is_run());
+        let counted = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
+        let AggregateExecutionDetails::UnicodeScalar(accounting) = &counted.report().details else {
+            panic!("scalar repetition executed another family")
+        };
+        assert!(accounting.upper_bounds.reducer_steps > 0);
+        assert!(accounting.actual.reducer_steps <= accounting.upper_bounds.reducer_steps);
+        assert_eq!(accounting.actual.scratch_bytes, 0);
+
+        let sum = aggregate_builder(pattern).build_span_sum().unwrap();
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_sum,
+            "pattern={pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     let pattern = r"(?P<scalar>\pL)";
     let haystack = "A雪1δ".as_bytes();
@@ -1222,7 +1292,7 @@ fn unicode_scalar_selection_admits_composition_and_preserves_existing_paths() {
             "pattern={pattern:?}"
         );
     }
-    for pattern in [r"\pL+", r"\A\pL", r"\pL\z"] {
+    for pattern in [r"\A\pL", r"\pL\z"] {
         assert_eq!(
             aggregate_builder(pattern)
                 .build_count()
@@ -1233,8 +1303,28 @@ fn unicode_scalar_selection_admits_composition_and_preserves_existing_paths() {
             "pattern={pattern:?}"
         );
     }
+    for pattern in [r"\pL+", r"\pL+?", r"[a-z]+"] {
+        assert_eq!(
+            aggregate_builder(pattern)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::UnicodeScalarClass,
+            "pattern={pattern:?}"
+        );
+    }
     assert_eq!(
         aggregate_builder(r"\pL")
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        aggregate_builder(r"\pL+")
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .build_count()
             .unwrap()

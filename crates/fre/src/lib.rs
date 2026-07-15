@@ -77,6 +77,7 @@ pub use fre_kernels::{
     UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceAccounting,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeScalarAggregateRepetition,
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
 };
 

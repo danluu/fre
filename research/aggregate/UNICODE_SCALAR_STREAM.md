@@ -7,13 +7,16 @@ does not recognize benchmark names or special-case individual properties. The
 constructor selects the mechanism from the canonical HIR shape and the typed
 aggregate operation alone.
 
-The current supported shape is a nonempty Unicode scalar class at the root,
-after removing transparent captures and applying the requested syntax options.
-The supported operations are count, matched-byte span sum, and compile with an
-untimed count verification. Span materialization, repetition, concatenation,
-alternation around the class, and anchors remain outside this plan. Existing
-exact-literal, finite case-fold, ordered build-many, and continuation paths are
-selected before or instead of this path where their proofs apply.
+The current supported shapes are a nonempty Unicode scalar class at the root
+and, after removing transparent captures, that class under canonical greedy or
+lazy nonempty unbounded repetition (`CLASS+`/`CLASS+?`). The supported
+operations are count, matched-byte span sum, and compile with an untimed count
+verification. Span materialization, nullable or bounded repetition,
+concatenation, alternation around the class, and anchors remain outside this
+plan. Existing exact-literal, finite case-fold, ordered build-many, and
+continuation paths are selected before or instead of this path where their
+proofs apply. The repetition extension is detailed and preregistered in
+`SCALAR_RUN_DFA_SCREEN.md`; the historical frontier below predates it.
 
 ## Mechanism
 
@@ -29,8 +32,10 @@ also guarantees progress on arbitrary byte strings and arbitrary valid search
 windows.
 
 ASCII membership is constant time. Non-ASCII membership uses binary search in
-the retained ranges. Count increments once per matching scalar. Span sum adds
-the decoded scalar's UTF-8 byte width. Neither reducer materializes matches.
+the retained ranges. An exact root class increments once per matching scalar.
+Lazy `CLASS+?` does the same; greedy `CLASS+` increments once per maximal
+matching run. Span sum adds the bytes in the selected scalar or run. Neither
+reducer materializes matches.
 
 The selected facade identity includes the operation, Rust compatibility
 profile, canonical pattern identity, Unicode scalar semantic domain, retained
@@ -45,6 +50,7 @@ For an input window of `N` bytes and `R` retained non-ASCII ranges:
 - membership performs at most `N` tests;
 - non-ASCII lookup performs at most `N * (floor(log2(R)) + 1)` comparisons for
   nonzero `R`;
+- repeated roots perform at most `N + 1` deterministic reducer transitions;
 - traversal work is therefore `O(N log(R + 1))`;
 - retained plan space is `O(R)`; and
 - reducer scratch space is zero bytes.
@@ -52,7 +58,8 @@ For an input window of `N` bytes and `R` retained non-ASCII ranges:
 Construction and traversal use checked accounting. Limits cover source and
 retained ranges, construction work, temporary capacity, scratch, persistent
 and peak bytes, input bytes, decode checks, membership tests, range
-comparisons, match events, result values, reducer work, and reducer peak bytes.
+comparisons, reducer transitions, match events, result values, reducer work,
+and reducer peak bytes.
 Resource refusals are typed unsupported outcomes; arithmetic and invariant
 violations are faults.
 
@@ -60,8 +67,9 @@ Every scalar quantity named `work` in this lane is a structural work counter,
 not an executed-CPU-instruction estimate. Scalar selection charges one unit for
 every HIR node and every canonical class range it examines. Kernel construction
 charges range validation, ASCII bitmap population, and retained-range copies.
-Traversal work is the sum of decoder byte examinations, membership tests, and
-non-ASCII range comparisons. Loop control, checked counter maintenance,
+Traversal work is the sum of decoder byte examinations, membership tests,
+non-ASCII range comparisons and, for repeated roots, deterministic reducer
+transitions. Other loop control, checked counter maintenance,
 allocator-internal operations, and allocator metadata are outside those work
 counters; their input-dependent dimensions remain separately bounded by the
 reported node, range, byte, scalar, match, capacity, and peak-byte limits.
