@@ -21,24 +21,22 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCaptureBuildError, AggregateCaptureBuildReport,
     AggregateCaptureLimits, AggregateCapturesRegex, AggregateContinuationSemantics,
-    AggregateCountRegex, AggregateEngineError,
-    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateManyBuildAccounting,
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
-    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, AggregateUnicodeScalarSemantics, CompatibilityProfile,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    AggregateCountRegex, AggregateEngineError, AggregateExactLiteralSemantics,
+    AggregateExecutionSource, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
+    AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRunLimits, AggregateOperation,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    CompatibilityProfile, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
     OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RegexReduxBuildError,
     RegexReduxBuildLimits, RegexReduxBuilder, RegexReduxRunError, RegexReduxRunLimits, RustProfile,
-    SearchLimits,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
+    SearchLimits, UnicodeCompileArtifactBuilder, UnicodeCompileBuildError,
+    UnicodeCompileBuildLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -1995,11 +1993,8 @@ fn capture_span_operation_limits(
         output_bytes,
         "capture span peak",
     )?;
-    let state_boundaries = checked_aggregate_mul(
-        program_states,
-        boundaries,
-        "capture state-boundary cells",
-    )?;
+    let state_boundaries =
+        checked_aggregate_mul(program_states, boundaries, "capture state-boundary cells")?;
     let state_work = checked_aggregate_mul(state_boundaries, 11, "capture state work")?;
     let scan_work = checked_aggregate_mul(boundaries, 8, "capture scan work")?;
     let work = checked_aggregate_add(state_work, scan_work, "capture operation work")?;
@@ -2012,8 +2007,9 @@ fn capture_span_operation_limits(
         max_scratch_bytes: random_access.min(limits.fre_aggregate_scratch_bytes),
         max_log_bytes: log_bytes.min(limits.fre_aggregate_log_bytes),
         max_sequential_bytes: sequential.min(limits.fre_aggregate_sequential_bytes),
-        max_match_events: checked_aggregate_mul(boundaries, 2, "capture match events")?
-            .min(checked_aggregate_mul(reducer_events, 2, "capture reducer events")?),
+        max_match_events: checked_aggregate_mul(boundaries, 2, "capture match events")?.min(
+            checked_aggregate_mul(reducer_events, 2, "capture reducer events")?,
+        ),
         max_output_matches: boundaries.min(reducer_events),
         max_output_bytes: output_bytes.min(64 << 20),
         max_span_sum: haystack_len,
@@ -2028,11 +2024,8 @@ fn capture_history_limits(
     limits: &RunLimits,
 ) -> Result<AggregateCaptureLimits, ExecutionError> {
     let boundaries = checked_aggregate_add(haystack_len, 1, "capture output boundaries")?;
-    let output_slots = checked_aggregate_mul(
-        boundaries,
-        report.capture_slots,
-        "capture output slots",
-    )?;
+    let output_slots =
+        checked_aggregate_mul(boundaries, report.capture_slots, "capture output slots")?;
     let group_output_bytes = checked_aggregate_mul(
         output_slots,
         core::mem::size_of::<Option<fre::Match>>(),
@@ -2192,14 +2185,11 @@ fn continuation_span_operation_limits(
         ));
     }
     let boundaries = checked_aggregate_add(haystack_len, 1, "span boundary count")?;
-    let record_bytes = checked_aggregate_add(program_states, 1, "span row decision bits")?
-        .div_ceil(8);
+    let record_bytes =
+        checked_aggregate_add(program_states, 1, "span row decision bits")?.div_ceil(8);
     let row_words = checked_aggregate_mul(program_states, 2, "span row words")?;
-    let row_bytes = checked_aggregate_mul(
-        row_words,
-        core::mem::size_of::<usize>(),
-        "span row bytes",
-    )?;
+    let row_bytes =
+        checked_aggregate_mul(row_words, core::mem::size_of::<usize>(), "span row bytes")?;
     let random_access_upper =
         checked_aggregate_add(row_bytes, record_bytes, "span random-access bytes")?;
     let log_upper = checked_aggregate_mul(record_bytes, boundaries, "span row-log bytes")?;
@@ -2211,8 +2201,7 @@ fn continuation_span_operation_limits(
     )?;
     let peak_without_output =
         checked_aggregate_add(log_upper, random_access_upper, "span engine peak bytes")?;
-    let peak_upper =
-        checked_aggregate_add(peak_without_output, output_upper, "span peak bytes")?;
+    let peak_upper = checked_aggregate_add(peak_without_output, output_upper, "span peak bytes")?;
 
     // Requirements construction plus the two exact scans contribute at most
     // eleven state steps per state/boundary cell and eight scan steps per
@@ -3177,13 +3166,7 @@ fn fre_aggregate_capture_count(
     let regex = fre_capture_regex(request, limits)?;
     let mut events = 0_u64;
     let mut work = 0_usize;
-    let actual = capture_group_reduction(
-        &regex,
-        request.haystack,
-        limits,
-        &mut events,
-        &mut work,
-    )?;
+    let actual = capture_group_reduction(&regex, request.haystack, limits, &mut events, &mut work)?;
     Ok(FreReduction {
         actual,
         plan: "aggregate-capture-history",
@@ -4965,7 +4948,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(Status::Fault, mismatch.status);
-        assert!(mismatch.message.contains("profile/operation identity mismatch"));
+        assert!(
+            mismatch
+                .message
+                .contains("profile/operation identity mismatch")
+        );
 
         let nosey_repeat = current_fre(
             "compile",
@@ -5108,14 +5095,7 @@ mod tests {
             "unexpected external-pattern outcome: {external:?}"
         );
         for (unicode, case_insensitive) in [(true, false), (false, true)] {
-            let changed = current_fre(
-                "regex-redux",
-                &[],
-                b"",
-                unicode,
-                case_insensitive,
-                &limits,
-            );
+            let changed = current_fre("regex-redux", &[], b"", unicode, case_insensitive, &limits);
             assert!(
                 matches!(changed, CandidateOutcome::Unsupported(ref reason) if reason.contains("model-fixed")),
                 "unexpected flag-mutation outcome: {changed:?}"
