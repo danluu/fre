@@ -1,10 +1,13 @@
 # Bounded capture-history candidate
 
 Status: source-only candidate recomposed on exact canonical base
-`5ccbee0bd3211818a76af324b455a561b626a9af`. No compiler, formatter,
+`31001465fa49998eede9cf860a9be4c09b4d0cd5` (tree
+`1470c2420d1e000caf7cdf57d63a232f792eeb42`). No compiler, formatter,
 executable test, report generation, assembly, or timing command was run in this
 lane. The candidate adapter identity advances to
-`fre-current-aggregate-v6`; this document claims no additional coverage.
+`fre-current-aggregate-v6` only for the composed capture route; the finite plan
+retains its v5 schema/timing identities. The authenticated frontier remains
+204 pass / 140 unsupported, and this document claims no additional coverage.
 
 ## Semantic boundary
 
