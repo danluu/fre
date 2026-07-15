@@ -2560,8 +2560,8 @@ fn scan_fixed_range_prefix(
 mod tests {
     use super::{
         ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits,
-        ByteClass, ClassImplementation, ForwardAnchoredPlan, START_RANGE_SWAR_MIN, SearchError,
-        SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
+        ByteClass, ClassImplementation, ForwardAnchoredPlan, RANGE_BLOCK, START_RANGE_SWAR_MIN,
+        SearchError, SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
         copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
         packed_outside_mask, repeat_byte, scan_swar_range_prefix,
     };
@@ -4184,7 +4184,10 @@ mod tests {
                         matched, None,
                         "range={start:02x}-{end:02x} position={position}"
                     );
-                    assert!(!accounting.suffix_confirmation_attempted);
+                    assert_eq!(
+                        accounting.suffix_confirmation_attempted,
+                        valid.len() < RANGE_BLOCK
+                    );
                     assert!(accounting.prefix_bytes_examined <= valid.len() + word_bytes);
                 }
             }
