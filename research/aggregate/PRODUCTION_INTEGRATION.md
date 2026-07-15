@@ -6,8 +6,8 @@ exact-literal reducer, a bounded finite ordered-language reducer, or the
 `count`, and `count-spans`. The finite route is a source-only candidate pending
 the gates in `../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not
 a claim that any path is faster than Rust regex or RE2 on every workload.
-The separate ordered build-many facade is likewise a source-only candidate for
-multi-pattern `count` and `count-spans`.
+The separate ordered build-many facade is qualified for its authenticated
+multi-pattern `count` and `count-spans` frontier.
 
 ## Modular production boundary
 
@@ -43,8 +43,11 @@ strategy, facade policy, and Rebar reduction independently testable:
    admitted operation. One pattern selects the one-pattern facade;
    multi-pattern `count`/`count-spans` selects ordered build-many. Multi-pattern
    `compile`, capture/span outputs, and unsupported models remain typed
-   refusals. Existing portable single-search/grep routing is unchanged and
-   retains its certified absolute/LF-line/ASCII-word K0 assertion subset.
+   refusals. When the reusable one-pattern compile plan is unavailable, the
+   separately bounded canonical Unicode compile-artifact path may construct a
+   compile-only artifact. Existing portable single-search/grep routing is
+   unchanged and retains its certified absolute/LF-line/ASCII-word K0 assertion
+   subset.
 
 `AggregatePlanSelection::{Auto,ForceExactLiteral,ForceContinuation}` makes the
 plan seam testable. `Auto` publishes a selected exact or finite build refusal
@@ -173,16 +176,16 @@ patterns on `zabb`. Both aggregate strategies return count 1. Pinned Rust
 1.12.4 returns 2 through its unsound optimization; exact receipts deliberately
 retain those Rust failures while FRE passes the canonical definitions.
 
-The canonical authenticated frontier remains 187 FRE pass / 157 unsupported,
-zero fail/fault: 17 `compile`, 60 `count`, 101 `count-spans`, and nine
+The canonical authenticated frontier remains 200 FRE pass / 144 unsupported,
+zero fail/fault: 28 `compile`, 62 `count`, 101 `count-spans`, and nine
 portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
 reverse-suffix failures; pinned RE2 remains 285/285. Unicode-on byte-stable
-continuation is included in those receipts; the finite plan and ordered
-build-many source remain absent and claim no additional support before
-regeneration. Exact per-model counts, refusal classes, and source/tree
-identities are retained in
+continuation, canonical Unicode compile artifacts, and the qualified ordered
+build-many rows are included in those receipts; the finite plan remains absent
+and claims no additional support before regeneration. Exact per-model counts,
+refusal classes, and source/tree identities are retained in
 `../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
-the older baseline and is not silently relabelled as 187-frontier evidence.
+the older baseline and is not silently relabelled as 200-frontier evidence.
 
 Five fresh local timing processes cover all 24 exact-literal rows at the full
 public facade boundary. Median-of-five-process medians classify 10 jobs as FRE
@@ -210,8 +213,9 @@ reject a strict faster-everywhere or performance-promotion claim.
    superiority.
 2. Add the remaining Unicode byte-mode lowering, Unicode word-state, and
    variable-width Unicode scalar semantics with independent differentials.
-3. Qualify ordered build-many and add capture-history operation families
-   instead of widening whole-match erasure beyond its proof boundary.
+3. Extend ordered build-many only at its typed compile/resource boundaries and
+   add capture-history operation families instead of widening whole-match
+   erasure beyond its proof boundary.
 4. Keep compile-model verification and AOT/JIT timing work visible; never hide
    compilation or fallback work outside the measured contract.
 5. Preserve the general continuation plan as the bounded semantic backstop,

@@ -1,7 +1,8 @@
 # Finite ordered-language aggregate plan
 
-Status: source-only candidate. No compiler, executable test, report generation,
-or timing command was run in phase A.
+Status: source-only candidate recomposed on exact authenticated 200-row base
+`5f4da7b5536c42bbcdc467ea9c897bf990577938`. No compiler, executable test,
+report generation, or timing command was run in phase A.
 
 ## Mechanism and semantic boundary
 
@@ -45,12 +46,12 @@ and its finite-horizon counterexample behavior are unchanged.
 
 ## Coverage accounting
 
-Authenticated coverage remains exactly 187 pass / 157 unsupported at the
+Authenticated coverage remains exactly 200 pass / 144 unsupported at the
 canonical base until a phase-B regeneration runs; this source-only checkpoint
 claims zero authenticated unlocks.
 
 The committed fast-plan index identifies an exact 36-row finite-language
-candidate universe among the 157 one-pattern construction opportunities:
+candidate universe in the canonical manifest:
 
 | Prior single-search shape | `count` | `count-spans` | total |
 | --- | ---: | ---: | ---: |
@@ -59,16 +60,18 @@ candidate universe among the 157 one-pattern construction opportunities:
 | **candidate universe** | **26** | **10** | **36** |
 
 This mechanism can remove a resource refusal only where one of those rows is
-in the exact 42-row aggregate resource set and its finite extraction/dense
-construction fits the new bounds. That set comprises five `compile`, 28
-`count`, and nine `count-spans` refusals. The generated family join is not
-committed at this base, so the exact intersection must be measured rather than
-guessed. The phase-B report must publish job IDs, families, model counts, prior
-refusal resource, selected plan, and remaining typed refusal. No support count
-should be promoted from the 36-row count/count-spans upper bound.
+in the exact 40-row one-pattern aggregate resource set and its finite
+extraction/dense construction fits the new bounds. That set comprises three
+`compile`, 28 `count`, and nine `count-spans` refusals. The other three resource
+refusals are qualified build-many execution rows and are cardinality-disjoint
+from this mechanism. The generated family join is not committed at this base,
+so the exact intersection must be measured rather than guessed. The phase-B
+report must publish job IDs, families, model counts, prior refusal resource,
+selected plan, and remaining typed refusal. No support count should be promoted
+from the 36-row count/count-spans upper bound.
 
 Finite-language `compile` candidates among the 33 compile rows are a separate
-unmeasured projection in the composed schema-v5 source. The five current
+unmeasured projection in the composed schema-v5 source. The three current
 compile-resource refusals are an absolute ceiling, not a projected unlock
 count, until the same authenticated regeneration classifies them.
 
