@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1131,6 +1131,11 @@ impl ForwardAnchoredPlan {
             {
                 scan_pair_swar_candidate_prefix(bytes, first, second)
             }
+            ClassImplementation::Triple {
+                first,
+                second,
+                third,
+            } => scan_triple_candidate_swar(bytes, first, second, third),
             ClassImplementation::Quint {
                 first,
                 second,
@@ -1305,6 +1310,10 @@ fn scan_fixed_class_prefix(
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
 const FIXED_RANGE_BLOCK: usize = 64;
+const SWAR_WORD_BYTES: usize = 8;
+const SWAR_REPEAT_BYTE: u64 = 0x0101_0101_0101_0101;
+const SWAR_LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+const SWAR_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
 const SINGLE_CANDIDATE_MIN: usize = 73;
 const SINGLE_CANDIDATE_MAX: usize = 1_024;
@@ -1312,7 +1321,6 @@ const PAIR_SWAR_MIN: usize = 73;
 const PAIR_SWAR_MAX: usize = 512;
 const SWAR_BYTES: usize = size_of::<u64>();
 const SWAR_LOW: u64 = u64::MAX / 0xFF;
-const SWAR_LOW_SEVEN: u64 = SWAR_LOW * 0x7F;
 const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
 const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
@@ -1702,6 +1710,115 @@ fn scan_triple_prefix(
         .checked_add(usize::from(within_remainder < remainder.len()))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "triple remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+#[inline]
+fn exact_zero_byte_high_bits(word: u64) -> u64 {
+    let low_seven = word & SWAR_LOW_SEVEN;
+    !(low_seven.wrapping_add(SWAR_LOW_SEVEN) | word | SWAR_LOW_SEVEN) & SWAR_HIGH_BITS
+}
+
+#[inline]
+fn triple_membership_high_bits(word: u64, first: u64, second: u64, third: u64) -> u64 {
+    exact_zero_byte_high_bits(word ^ first)
+        | exact_zero_byte_high_bits(word ^ second)
+        | exact_zero_byte_high_bits(word ^ third)
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "constant-offset safe SWAR loads must remain inside the candidate loop"
+)]
+#[inline(always)]
+fn load_swar_word(block: &[u8], start: usize) -> Result<u64, SearchError> {
+    let end = start
+        .checked_add(SWAR_WORD_BYTES)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "triple SWAR word end",
+        })?;
+    let bytes: [u8; SWAR_WORD_BYTES] = block
+        .get(start..end)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "triple SWAR word slice",
+        })?
+        .try_into()
+        .map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "triple SWAR word conversion",
+        })?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+/// Candidate verification excludes the known suffix outsider. Four exact
+/// eight-byte membership masks cover each 32-byte block with word operations;
+/// only a failed block enters scalar first-outsider recovery.
+#[inline(never)]
+fn scan_triple_candidate_swar(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+    third: u8,
+) -> Result<(usize, usize), SearchError> {
+    let first_word = u64::from(first).wrapping_mul(SWAR_REPEAT_BYTE);
+    let second_word = u64::from(second).wrapping_mul(SWAR_REPEAT_BYTE);
+    let third_word = u64::from(third).wrapping_mul(SWAR_REPEAT_BYTE);
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let word0 = load_swar_word(block, 0)?;
+        let word1 = load_swar_word(block, SWAR_WORD_BYTES)?;
+        let word2 = load_swar_word(block, 16)?;
+        let word3 = load_swar_word(block, 24)?;
+        let outside = (triple_membership_high_bits(word0, first_word, second_word, third_word)
+            ^ SWAR_HIGH_BITS)
+            | (triple_membership_high_bits(word1, first_word, second_word, third_word)
+                ^ SWAR_HIGH_BITS)
+            | (triple_membership_high_bits(word2, first_word, second_word, third_word)
+                ^ SWAR_HIGH_BITS)
+            | (triple_membership_high_bits(word3, first_word, second_word, third_word)
+                ^ SWAR_HIGH_BITS);
+        if outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| byte != first && byte != second && byte != third)
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "triple SWAR candidate boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed triple SWAR candidate block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed triple SWAR candidate blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte != first && byte != second && byte != third)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "triple SWAR candidate remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "triple SWAR candidate remainder examinations",
         })?;
     Ok((boundary, examined))
 }
@@ -2554,7 +2671,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9"
+            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10"
         );
         assert_eq!(
             pair.implementation(),
