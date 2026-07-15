@@ -701,6 +701,10 @@ mod tests {
     use super::{CaptureStorageCapacities, account_physical_storage};
     use crate::{CaptureLimits, Error, Resource};
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the assertion helper owns the temporary result so its failure diagnostic remains available"
+    )]
     fn expect_resource(result: Result<super::CaptureStorageFacts, Error>, expected: Resource) {
         assert!(
             matches!(
@@ -714,6 +718,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
         reason = "small synthetic capacities exercise exact one-above and one-below boundaries"
     )]
     fn physical_capture_capacities_are_the_admitted_one_below_boundary() {
