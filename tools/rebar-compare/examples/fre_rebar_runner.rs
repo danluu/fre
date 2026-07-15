@@ -52,7 +52,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-aggregate-word-run-v1 report={REPORT_SCHEMA} aggregate-explain=11 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1 report={REPORT_SCHEMA} aggregate-explain=10 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -363,14 +363,12 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
             "compile-aggregate-unicode-scalar-class"
         }
         ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
-        ("compile", AggregatePlanKind::WordRun) => "compile-aggregate-word-run",
         ("compile", AggregatePlanKind::ContinuationProgram) => {
             "compile-aggregate-continuation-program"
         }
         (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
         (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::WordRun) => "aggregate-word-run",
         (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
     }
 }

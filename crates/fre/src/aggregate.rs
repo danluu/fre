@@ -1,4 +1,4 @@
-use core::{fmt, mem::size_of, ops::Range};
+use core::{fmt, ops::Range};
 use std::sync::Arc;
 
 use fre_aggregate::{
@@ -30,13 +30,13 @@ use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
     AggregateExecutionAccounting, AggregateOperationCertificate, AggregateOperationLimits,
-    AggregatePlanId, BuildError, Match, SearchLimits, finite, unicode_word_run,
+    AggregatePlanId, BuildError, Match, finite,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 11;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 10;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -76,8 +76,6 @@ pub enum AggregatePlanKind {
     /// Ordered finite HIR lowered to one reversed shared-transition DFA and a
     /// bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
-    /// Direct linear canonical ASCII or Unicode word-run reducer.
-    WordRun,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -92,8 +90,6 @@ pub enum AggregatePlanIdentity {
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
-    /// Canonical word-run proof and direct reducer identity.
-    WordRun(AggregateWordRunIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
 }
@@ -146,13 +142,6 @@ pub struct AggregateUnicodeScalarIdentity {
     pub kernel: UnicodeScalarAggregateOperationIdentity,
 }
 
-/// Stable identity for the direct canonical word-repetition reducer with
-/// zero, one or two positive word boundaries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AggregateWordRunIdentity {
-    pub implementation: &'static str,
-}
-
 /// Profile proof attached to a continuation-program facade identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateContinuationSemantics {
@@ -193,19 +182,8 @@ pub enum AggregateBuildAccounting {
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
-    /// Allocation-free canonical word-run construction certificate.
-    WordRun(AggregateWordRunBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
-}
-
-/// Complete retained-resource facts for a direct word-run plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AggregateWordRunBuildAccounting {
-    pub hir_nodes: usize,
-    pub captures_erased: usize,
-    pub persistent_bytes: usize,
-    pub scratch_bytes: usize,
 }
 
 /// Construction limits whose complete values participate in cache identity.
@@ -249,7 +227,7 @@ impl Default for AggregateBuildLimits {
     }
 }
 
-/// Complete per-invocation limits. Every plan family remains visible so an
+/// Complete per-invocation limits. Both plan families remain visible so an
 /// `Auto` build cannot hide a policy change when its selected plan changes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AggregateRunLimits {
@@ -259,9 +237,6 @@ pub struct AggregateRunLimits {
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Shared finite-language DFA reducer limits.
     pub finite_literal: OrderedLiteralAggregateReduceLimits,
-    /// Direct ASCII/Unicode word-run limits. Scratch must be zero because the
-    /// reducer is allocation-free.
-    pub word_run: SearchLimits,
     /// Continuation whole-operation limits.
     pub continuation: AggregateOperationLimits,
 }
@@ -556,8 +531,6 @@ pub enum AggregateExecutionSource {
     UnicodeScalar(UnicodeScalarAggregateReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
-    /// Direct word-run reducer refusal.
-    WordRun(unicode_word_run::Error),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -570,7 +543,6 @@ impl fmt::Display for AggregateExecutionSource {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
-            Self::WordRun(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -585,7 +557,6 @@ impl std::error::Error for AggregateExecutionSource {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
-            Self::WordRun(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
         }
@@ -631,8 +602,6 @@ pub enum AggregateExecutionDetails {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
-    /// Exact direct word-run counters.
-    WordRun(unicode_word_run::Accounting),
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -1075,51 +1044,6 @@ impl AggregateBuilder {
             Some(UnicodeScalarInspection::Ineligible { work }) => work,
             None => 0,
         };
-        if selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
-            && let Some((engine, hir_nodes, captures)) =
-                unicode_word_run::extract_accounted(&rust.hir)
-        {
-            if hir_nodes != expected_nodes || captures != expected_captures {
-                return Err(AggregateBuildError::InternalInvariant {
-                    operation,
-                    selection,
-                    detail: "syntax summary differs from word-run inspection",
-                });
-            }
-            let build = AggregateWordRunBuildAccounting {
-                hir_nodes,
-                captures_erased: captures,
-                persistent_bytes: size_of::<unicode_word_run::Plan>(),
-                scratch_bytes: 0,
-            };
-            let report = AggregateBuildReport {
-                schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                syntax_key,
-                admission,
-                syntax,
-                operation,
-                selection,
-                plan: AggregatePlanKind::WordRun,
-                continuation_strategy: None,
-                capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
-                planner_work,
-                unicode_scalar_planner_work,
-                finite_planner_work: 0,
-                capture_erasure_work: captures,
-                captures_erased: captures,
-                build: AggregateBuildAccounting::WordRun(build),
-                plan_identity: AggregatePlanIdentity::WordRun(AggregateWordRunIdentity {
-                    implementation: engine.plan_id(),
-                }),
-                retained_capacity_bytes: build.persistent_bytes,
-            };
-            return Ok(AggregatePlan {
-                engine: AggregateEngine::WordRun(engine),
-                limits,
-                report,
-            });
-        }
         let finite = if !unicode
             && selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
@@ -1305,7 +1229,6 @@ enum AggregateEngine {
     UnicodeScalar(UnicodeScalarAggregatePlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
-    WordRun(unicode_word_run::Plan),
     Continuation(CompiledRegex),
 }
 
@@ -1400,20 +1323,6 @@ impl AggregatePlan {
                     "count operation retained a finite span-sum plan",
                 ),
             )),
-            AggregateEngine::WordRun(engine) => {
-                let accounting = engine.reduce(haystack, limits.word_run).map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
-                })?;
-                let value = u64::try_from(accounting.matches()).map_err(|_| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "word-run count does not fit u64",
-                        ),
-                    )
-                })?;
-                Ok(AggregateCountExecution::WordRun { accounting, value })
-            }
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1480,20 +1389,6 @@ impl AggregatePlan {
                     "span-sum operation retained a finite count plan",
                 ),
             )),
-            AggregateEngine::WordRun(engine) => {
-                let accounting = engine.reduce(haystack, limits.word_run).map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
-                })?;
-                let value = u64::try_from(accounting.matched_bytes()).map_err(|_| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "word-run span sum does not fit u64",
-                        ),
-                    )
-                })?;
-                Ok(AggregateSpanSumExecution::WordRun { accounting, value })
-            }
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1530,10 +1425,6 @@ impl AggregatePlan {
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
-    WordRun {
-        accounting: unicode_word_run::Accounting,
-        value: u64,
-    },
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -1550,9 +1441,7 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
-            Self::FiniteLiteral { value, .. }
-            | Self::WordRun { value, .. }
-            | Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1572,7 +1461,6 @@ impl AggregateCountExecution {
                 upper_bounds,
                 actual,
             },
-            Self::WordRun { accounting, .. } => AggregateExecutionDetails::WordRun(accounting),
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),
@@ -1584,10 +1472,6 @@ impl AggregateCountExecution {
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
-    WordRun {
-        accounting: unicode_word_run::Accounting,
-        value: u64,
-    },
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -1604,9 +1488,7 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
-            Self::FiniteLiteral { value, .. }
-            | Self::WordRun { value, .. }
-            | Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1626,7 +1508,6 @@ impl AggregateSpanSumExecution {
                 upper_bounds,
                 actual,
             },
-            Self::WordRun { accounting, .. } => AggregateExecutionDetails::WordRun(accounting),
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),
