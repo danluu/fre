@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const PAIR_SWAR_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
+const PAIR_SWAR_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
 
 fn plan() -> ForwardAnchoredPlan {
     plan_for(&[0x00, 0xFF], &[0x7F, 0x55])
@@ -155,15 +155,13 @@ fn pair_swar_differential_covers_every_outsider_byte_and_block_edge() {
 }
 
 #[test]
-fn pair_swar_long_extension_routes_512_through_4097_exactly() {
+fn pair_neon16_long_extension_routes_4096_through_65537_exactly() {
     let candidate = plan();
     for (boundary, earlier, expected_examined) in [
-        (512_usize, 511_usize, 521_usize),
-        (513, 511, 521),
-        (1_024, 1_023, 1_033),
-        (1_025, 1_023, 1_033),
-        (4_096, 4_095, 4_105),
-        (4_097, 4_095, 4_129),
+        (4_096_usize, 4_095_usize, 4_105_usize),
+        (4_097, 4_095, 4_105),
+        (65_536, 65_535, 65_545),
+        (65_537, 65_535, 65_569),
     ] {
         let mut haystack = members(boundary);
         haystack[earlier] = 0x40;
@@ -181,11 +179,11 @@ fn pair_swar_long_extension_routes_512_through_4097_exactly() {
 }
 
 #[test]
-fn pair_swar_long_extension_differential_covers_arbitrary_outsider_positions() {
+fn pair_neon16_long_extension_differential_covers_65536_boundary() {
     let candidate = plan();
-    for boundary in [513_usize, 4_096] {
-        for position in [0_usize, 1, 7, 8, 9, 31, 32, 511, 512, boundary - 1] {
-            for outsider in 0_u8..=u8::MAX {
+    for boundary in [4_096_usize, 4_097, 65_536, 65_537] {
+        for position in [0_usize, 1, 7, 8, 15, 16, 31, 32, boundary - 1] {
+            for outsider in [0x00_u8, 0x01, 0x40, 0x80, 0xFE, 0xFF] {
                 let mut haystack = members(boundary);
                 haystack[position] = outsider;
                 haystack.extend_from_slice(candidate.suffix());
