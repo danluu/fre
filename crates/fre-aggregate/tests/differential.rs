@@ -166,14 +166,16 @@ fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
 }
 
 #[test]
-fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_unicode_classes() {
-    let cases: [(&str, &[u8]); 6] = [
+fn unicode_on_hir_matches_rebar_profile_with_scalar_classes() {
+    let cases: [(&str, &[u8]); 8] = [
         ("", &[0xFF, 0x80]),
         ("雪+", "x雪雪y☃".as_bytes()),
         ("(?:雪a|☃b)", "☃b雪a雪b".as_bytes()),
         (r"[a-c]+", &[0xFF, b'a', b'b', b'd', b'c']),
         (r"(?-u:\xFF+)", &[b'a', 0xFF, 0xFF, b'b']),
         (r"\A(?:a|雪)+\z", "a雪a".as_bytes()),
+        (r"\pL", "A1雪!".as_bytes()),
+        ("[雪-雫]", "雨雪雫電".as_bytes()),
     ];
     for (pattern, haystack) in cases {
         let regex = compile_unicode_byte_stable(pattern)
@@ -192,14 +194,6 @@ fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_unicode_classes(
         }
     }
 
-    assert!(matches!(
-        compile_unicode_byte_stable(r"\pL"),
-        Err(Error::Unsupported(Unsupported::UnicodeClass))
-    ));
-    assert!(matches!(
-        compile_unicode_byte_stable("[雪-雫]"),
-        Err(Error::Unsupported(Unsupported::UnicodeClass))
-    ));
 }
 
 #[test]
