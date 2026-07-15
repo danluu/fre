@@ -164,8 +164,12 @@ exact-span replay. Replay storage is bounded by program states times the
 longest already-selected match, with capture slots, history nodes, output,
 peak bytes, and cumulative grep work checked independently. The projected
 Rebar evaluation universe is 37 rows (15 `count-captures`, 22
-`grep-captures`), not 37 passes: Unicode-on capture execution remains outside
-this candidate, and no qualification command was run in the source-only lane.
+`grep-captures`), not 37 passes. Static Unicode/cardinality preflight narrows
+the exact maximum candidate universe to 22 rows (11 per model); syntax and
+resource classification can narrow it further. Unicode-on and multi-pattern
+capture execution remain outside this candidate, and no qualification command
+was run in the source-only lane. Exact IDs and invariants are recorded in
+`research/rebar/comparison/CAPTURE_HISTORY_CANDIDATE.md`.
 The red mutation witness `(a|(ab))(b)?` on `ab` kills fallback-first replay by
 requiring group 1=`0..1`, group 2 unmatched, and group 3=`1..2`; separate
 witnesses cover repeated-group last capture, optional groups, absolute range

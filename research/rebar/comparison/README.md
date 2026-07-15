@@ -13,6 +13,9 @@ Every non-pass remains in the report with one of four distinct states:
 
 `COVERAGE_FRONTIER.md` indexes the exact receipts by operation and benchmark
 family and ties the next coverage gates to concrete Rebar job IDs.
+`CAPTURE_HISTORY_CANDIDATE.md` separately records the source-only bounded
+capture mechanism and its exact static evaluation universe; it does not alter
+the authenticated frontier.
 
 ## Retained report coverage
 
