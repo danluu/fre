@@ -53,7 +53,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v3";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -337,10 +337,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep plus construction-selected exact-literal or continuation count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep plus construction-selected exact-literal or continuation compile/count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; existing portable grep executes when bounded construction and operation admission succeed; all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; compile constructs a fresh complete artifact before untimed verification; existing portable grep executes when bounded construction and operation admission succeed; all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1716,6 +1716,7 @@ fn fre_reducer(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     match request.model {
+        "compile" => fre_compile_verify(request, limits),
         "count" => fre_aggregate_count(request, limits),
         "count-spans" => fre_aggregate_span_sum(request, limits),
         "grep" => fre_grep(request, limits),
@@ -1723,6 +1724,46 @@ fn fre_reducer(
             "current FRE facade has no certified {other} operation"
         ))),
     }
+}
+
+/// Construct a fresh complete production artifact, then use it only for the
+/// compile model's untimed semantic verification. Candidate adapter calls do
+/// not retain this value, so samples cannot share warmed state.
+fn fre_compile_verify(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let pattern = one_fre_pattern(request)?;
+    let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(aggregate_build_limits(limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_compile()
+        .map_err(|error| aggregate_build_error(&error))?;
+    require_unicode_exact_identity(
+        regex.build_report(),
+        request.unicode,
+        LiteralAggregateOperation::Count,
+    )?;
+    let operation_limits =
+        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let result = regex
+        .verify_count(request.haystack, operation_limits)
+        .map_err(|error| {
+            let message = format!("FRE compiled artifact failed untimed verification: {error}");
+            aggregate_execution_error(&error.source, message)
+        })?;
+    let plan = match regex.build_report().plan {
+        AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
+        AggregatePlanKind::ContinuationProgram => "compile-aggregate-continuation-program",
+    };
+    Ok(FreReduction {
+        actual: result.value(),
+        plan,
+    })
 }
 
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
@@ -3506,6 +3547,60 @@ mod tests {
                 "aggregate-continuation-program",
             );
         }
+    }
+
+    #[test]
+    fn current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed() {
+        let limits = RunLimits::default();
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &["aba".to_string()],
+                b"abaaba",
+                false,
+                false,
+                &limits,
+            ),
+            2,
+            "compile-aggregate-exact-literal",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"(?:a+b|a)".to_string()],
+                b"aaaab",
+                false,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-aggregate-continuation-program",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"(?P<word>[a-z]+)".to_string()],
+                b"Ab C",
+                false,
+                true,
+                &limits,
+            ),
+            2,
+            "compile-aggregate-continuation-program",
+        );
+
+        let many = current_fre(
+            "compile",
+            &["a".to_string(), "b".to_string()],
+            b"ab",
+            false,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(many, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
+            "unexpected compile build-many outcome: {many:?}"
+        );
     }
 
     #[test]

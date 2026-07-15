@@ -25,11 +25,14 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 3;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 4;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateOperation {
+    /// Compile a reusable whole-match artifact. Construction is the measured
+    /// operation; complete match counting exists only to verify the artifact.
+    Compile,
     /// Complete Rust-compatible non-overlapping match spans.
     Spans,
     /// Number of complete non-overlapping matches.
@@ -492,6 +495,15 @@ impl AggregateBuilder {
         self
     }
 
+    /// Compile a reusable artifact whose construction boundary includes
+    /// syntax parsing, plan selection, lowering, allocation and publication.
+    /// [`AggregateCompileRegex::verify_count`] is deliberately separate so a
+    /// compile benchmark can keep semantic verification outside its timer.
+    pub fn build_compile(self) -> Result<AggregateCompileRegex, AggregateBuildError> {
+        self.build(AggregateOperation::Compile)
+            .map(AggregateCompileRegex)
+    }
+
     /// Compile a complete non-overlapping span operation.
     pub fn build_spans(self) -> Result<AggregateSpansRegex, AggregateBuildError> {
         self.build(AggregateOperation::Spans)
@@ -639,7 +651,9 @@ impl AggregateBuilder {
                 })?;
             let build = engine.build_accounting();
             let kernel_identity = match operation {
-                AggregateOperation::Count => engine.count_identity(),
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    engine.count_identity()
+                }
                 AggregateOperation::SpanSum => engine.span_sum_identity(),
                 AggregateOperation::Spans => {
                     return Err(AggregateBuildError::InternalInvariant {
@@ -1051,6 +1065,43 @@ fn inspect_exact_literal(
                 });
             }
         }
+    }
+}
+
+/// Reusable production compile artifact with an explicit verification seam.
+///
+/// The retained plan is complete when this value is returned: no parser,
+/// lowerer, planner or plan allocation is deferred until verification.
+#[derive(Debug)]
+pub struct AggregateCompileRegex(AggregatePlan);
+
+impl AggregateCompileRegex {
+    /// Complete construction report and retained-plan identity.
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateBuildReport {
+        self.0.build_report()
+    }
+
+    /// Complete cache identity for later use under the supplied run policy.
+    #[must_use]
+    pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits)
+    }
+
+    /// Untimed semantic verification for compile-model qualification.
+    ///
+    /// This traverses the complete original haystack with the already
+    /// published plan and performs no compilation or fallback.
+    pub fn verify_count(
+        &self,
+        haystack: &[u8],
+        limits: AggregateRunLimits,
+    ) -> Result<AggregateCountResult, AggregateExecutionError> {
+        let execution = self.0.execute_count(haystack, limits)?;
+        let value = execution.value();
+        let details = execution.into_details();
+        let report = self.0.execution_report(limits, details);
+        Ok(AggregateCountResult { value, report })
     }
 }
 

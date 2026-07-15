@@ -3,8 +3,9 @@ use fre::{
     AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionSource, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError, LiteralAggregateOperation,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
+    AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile,
+    SearchLimits,
 };
 
 const STRATEGIES: [AggregateStrategy; 2] = [
@@ -14,6 +15,126 @@ const STRATEGIES: [AggregateStrategy; 2] = [
 
 fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
     AggregateBuilder::new(pattern).profile(RustProfile::rebar_1_12_4())
+}
+
+#[test]
+fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families() {
+    let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 3] = [
+        ("aba", b"abaaba", false, 2, AggregatePlanKind::ExactLiteral),
+        (
+            r"(?:a+b|a)",
+            b"aaaab",
+            false,
+            1,
+            AggregatePlanKind::ContinuationProgram,
+        ),
+        (
+            r"(?P<word>[a-z]+)",
+            b"Ab C",
+            true,
+            2,
+            AggregatePlanKind::ContinuationProgram,
+        ),
+    ];
+    for (pattern, haystack, case_insensitive, expected, plan) in cases {
+        let first = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .build_compile()
+            .expect("fresh compile artifact");
+        let second = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .build_compile()
+            .expect("independent compile artifact");
+        assert_eq!(first.build_report().operation, AggregateOperation::Compile);
+        assert_eq!(first.build_report().plan, plan);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.build_report().syntax_key,
+            &second.build_report().syntax_key,
+        ));
+        assert_eq!(first.build_report(), second.build_report());
+
+        let verified = first
+            .verify_count(haystack, AggregateRunLimits::default())
+            .expect("untimed verification");
+        assert_eq!(verified.value(), expected);
+        assert_eq!(
+            verified.report().identity.operation,
+            AggregateOperation::Compile
+        );
+    }
+}
+
+#[test]
+fn compile_artifact_preserves_typed_failure_and_work_accounting() {
+    assert!(matches!(
+        aggregate_builder("(").unicode(false).build_compile(),
+        Err(AggregateBuildError::Syntax {
+            operation: AggregateOperation::Compile,
+            ..
+        })
+    ));
+    let no_planner_work = AggregateBuildLimits {
+        max_literal_planner_work: 0,
+        ..AggregateBuildLimits::default()
+    };
+    assert!(matches!(
+        aggregate_builder("literal")
+            .unicode(false)
+            .limits(no_planner_work)
+            .build_compile(),
+        Err(AggregateBuildError::LiteralPlannerWorkLimit {
+            operation: AggregateOperation::Compile,
+            needed: 1,
+            limit: 0,
+            ..
+        })
+    ));
+
+    let compiled = aggregate_builder(r"a(?:b|c)+")
+        .unicode(false)
+        .build_compile()
+        .expect("accounted continuation compile");
+    let AggregateBuildAccounting::Continuation(accounting) = compiled.build_report().build else {
+        panic!("non-literal family should retain continuation accounting")
+    };
+    assert!(accounting.hir_nodes > 0);
+    assert!(accounting.program_states > 0);
+    assert!(accounting.program_bytes > 0);
+    assert!(accounting.work >= accounting.hir_nodes);
+    assert_eq!(
+        compiled.build_report().retained_capacity_bytes,
+        accounting.program_bytes
+    );
+
+    let literal = aggregate_builder("needle")
+        .unicode(false)
+        .build_compile()
+        .expect("baseline literal compile");
+    let AggregateBuildAccounting::ExactLiteral(literal_accounting) = literal.build_report().build
+    else {
+        panic!("literal family should retain exact allocation accounting")
+    };
+    assert!(literal_accounting.persistent_bytes > 0);
+    let one_below_persistent = AggregateBuildLimits {
+        exact_literal: LiteralAggregateBuildLimits {
+            max_persistent_bytes: literal_accounting.persistent_bytes - 1,
+            ..LiteralAggregateBuildLimits::default()
+        },
+        ..AggregateBuildLimits::default()
+    };
+    assert!(matches!(
+        aggregate_builder("needle")
+            .unicode(false)
+            .limits(one_below_persistent)
+            .build_compile(),
+        Err(AggregateBuildError::ExactLiteralBuild {
+            operation: AggregateOperation::Compile,
+            source: LiteralAggregateBuildError::PersistentLimit { .. },
+            ..
+        })
+    ));
 }
 
 fn portable_builder(pattern: impl Into<String>) -> PortableBuilder {

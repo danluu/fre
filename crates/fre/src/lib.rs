@@ -20,7 +20,7 @@ mod required_literal;
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
-    AggregateCaptureSemantics, AggregateCountRegex, AggregateCountResult,
+    AggregateCaptureSemantics, AggregateCompileRegex, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
     AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
