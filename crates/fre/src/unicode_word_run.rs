@@ -461,7 +461,7 @@ fn count_hir(hir: &Hir) -> Option<(usize, usize)> {
             captures = captures.checked_add(1)?.checked_add(child.1)?;
         }
         HirKind::Concat(children) | HirKind::Alternation(children) => {
-            for child in children.iter() {
+            for child in children {
                 let child = count_hir(child)?;
                 nodes = nodes.checked_add(child.0)?;
                 captures = captures.checked_add(child.1)?;
