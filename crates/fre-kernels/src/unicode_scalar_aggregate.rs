@@ -1702,7 +1702,8 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, PLAN_ID, ReduceError, ReduceLimits, Repetition,
+        BuildError, BuildLimits, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
+        REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceError, ReduceLimits, Repetition,
         UnicodeScalarAggregatePlan, binary_search_comparison_bound,
     };
     use crate::Window;
