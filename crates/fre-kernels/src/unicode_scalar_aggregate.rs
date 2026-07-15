@@ -1323,18 +1323,19 @@ impl UnicodeScalarAggregatePlan {
                         *previous_scalar = Some(scalar);
                         return Ok((false, comparisons));
                     }
-                    let next = index.checked_add(1).ok_or(
-                        ReduceError::ArithmeticOverflow {
+                    let next = index
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "cached non-ASCII range successor",
-                        },
-                    )?;
+                        })?;
                     *cached_range = Some(next);
                     if let Some(range) = self.non_ascii.get(next) {
-                        comparisons = comparisons.checked_add(1).ok_or(
-                            ReduceError::ArithmeticOverflow {
-                                computation: "monotone range comparisons",
-                            },
-                        )?;
+                        comparisons =
+                            comparisons
+                                .checked_add(1)
+                                .ok_or(ReduceError::ArithmeticOverflow {
+                                    computation: "monotone range comparisons",
+                                })?;
                         if scalar < range.start {
                             *previous_scalar = Some(scalar);
                             return Ok((false, comparisons));
