@@ -1,53 +1,50 @@
 # Rebar semantic coverage frontier
 
 This is the compact source checkpoint for the latest authenticated per-job
-frontier. Two full generations from exact source
-`88df8ae1fc77523d241ef1da85292957273e5544` (tree
-`184075c81cc36a536f012f4dfcbb7cd935bc0e12`) are byte-identical, each with
-SHA-256
-`f42d288a93fa9042f2f0b6cfac0149f794a95dc4e8fbe93b45f2c313128a7b23`.
+frontier. A full generation from exact source
+`793c0a9849c227ba8407ee7dbb168b32e3465c47` (tree
+`99869cd80ee9c210520fa889b7439e0aa1f6b8f5`) has SHA-256
+`a3361ccd8a714dbf2c945c204c7ae4f53dfb3433fa7d1f6058e334fa71edccda`.
 They used the immutable expanded manifest with SHA-256
 `09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43`,
 clean Rebar revision `463d00f31887e84c38467805b9e3122c314b9521`,
 and the exact Rust and RE2 runners recorded below. The raw generated report
-copies remain outside Git at
-`/tmp/fre-control/results/G0-CAPTURE-UNICODE-88DF8AE-BF53-FULL344-R{1,2}.json`.
+copy remains outside Git at
+`/tmp/fre-control/results/G0-REBAR-CAPTURE-V10-793C0A9-FRONTIER-002.json`.
 The checked-in `report.json` continues to preserve the
 preceding 144-pass baseline rather than being silently replaced by generated
 evidence.
 
-The authenticated current figure is 222: every pass in the independently
-authenticated 214-row direct-Unicode frontier plus exactly eight capture rows.
-It is not the earlier 200-row capture screening figure, which incorrectly reset
-public-job selector budgets for each line, and it does not include the reverted
-Unicode-compile serializer experiment. Neither earlier result is current
-promotion evidence.
+The authenticated current figure is 230: every pass in the independently
+authenticated 222-row capture frontier plus seven positive Unicode-word
+boundary rows and one ordered compile-many row. The malformed-UTF-8 boundary,
+Nosey Parker repeat-bound, and all other prior refusals remain typed.
 
 ## By operation model
 
 | Rebar model | Rust jobs | FRE pass | FRE unsupported | RE2 jobs | RE2 pass |
 |---|---:|---:|---:|---:|---:|
-| `compile` | 33 | 19 | 14 | 26 | 26 |
-| `count` | 133 | 81 | 52 | 109 | 109 |
-| `count-spans` | 129 | 105 | 24 | 110 | 110 |
+| `compile` | 33 | 20 | 13 | 26 | 26 |
+| `count` | 133 | 86 | 47 | 109 | 109 |
+| `count-spans` | 129 | 107 | 22 | 110 | 110 |
 | `count-captures` | 15 | 3 | 12 | 12 | 12 |
 | `grep` | 11 | 9 | 2 | 10 | 10 |
 | `grep-captures` | 22 | 5 | 17 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **222** | **122** | **285** | **285** |
+| **Total** | **344** | **230** | **114** | **285** | **285** |
 
-FRE has no `fail`, `fault`, or unresolved receipt. Its 205 aggregate-facade
-passes comprise 19 `compile`, 81 `count`, and 105 `count-spans` jobs; another
+FRE has no `fail`, `fault`, or unresolved receipt. Its 213 aggregate-facade
+passes comprise 20 `compile`, 86 `count`, and 107 `count-spans` jobs; another
 nine use the portable `grep` path and eight use the linear selector plus
 persistent capture-history path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
 The optional v2 executed-plan field splits those passes into 29 exact-literal
-aggregates, 132 continuation-program aggregates, 23 direct Unicode-scalar
+aggregates, 139 continuation-program aggregates, 23 direct Unicode-scalar
 aggregates, two ordered build-many literal aggregates, 17 continuation compile
-artifacts, two direct Unicode-scalar compile artifacts, nine portable-search
-rows, and eight selector/history capture rows. It is
+artifacts, two direct Unicode-scalar compile artifacts, one ordered compile-many
+artifact, nine portable-search rows, and eight selector/history capture rows. It is
 populated only after successful candidate execution and does not infer a plan
 for any unsupported receipt.
 
@@ -65,24 +62,38 @@ baseline, with no removed baseline pass:
 - `unicode/overlapping-words/ascii@rust/regex`
 - `wild/caddy/caddy@rust/regex`
 
+## Authenticated Unicode-boundary and compile-many delta
+
+The current source adds exactly these eight rows to the 222-pass capture
+frontier, with no removed pass:
+
+- `curated/12-dictionary/compile-multi@rust/regex`
+- `reported/i787-keywords/opt-unicode@rust/regex`
+- `reported/i787-keywords/unicode@rust/regex`
+- `test/unicode/word-boundary/unicode-alphabetic@rust/regex`
+- `test/unicode/word-boundary/unicode-connector-punctuation@rust/regex`
+- `test/unicode/word-boundary/unicode-decimal-number@rust/regex`
+- `test/unicode/word-boundary/unicode-join-control@rust/regex`
+- `test/unicode/word-boundary/unicode-mark@rust/regex`
+
 ## By benchmark/pattern family
 
 | Family | FRE pass | FRE unsupported | RE2 pass |
 |---|---:|---:|---:|
 | `captures` | 1 | 0 | 1 |
-| `curated` | 29 | 23 | 41 |
+| `curated` | 30 | 22 | 41 |
 | `dictionary` | 1 | 6 | 4 |
 | `folly` | 4 | 0 | 4 |
 | `grep` | 2 | 1 | 2 |
 | `hyperscan` | 14 | 1 | 0 |
 | `imported` | 84 | 23 | 107 |
 | `opt` | 21 | 14 | 26 |
-| `reported` | 7 | 12 | 17 |
+| `reported` | 9 | 10 | 17 |
 | `slow` | 4 | 0 | 4 |
-| `test` | 45 | 5 | 46 |
+| `test` | 50 | 0 | 46 |
 | `unicode` | 9 | 13 | 16 |
 | `wild` | 1 | 24 | 17 |
-| **Total** | **222** | **122** | **285** |
+| **Total** | **230** | **114** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
@@ -190,10 +201,9 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    currently supported regimes before optimizing a favorite subset. Use
    allocations and selector/history counters to choose shared improvements;
    do not publish a four-cell suite geomean.
-4. Validate the ordered compile-many artifact against the exact frontier.
-   Never emulate priority by concatenating patterns; retain the typed repeat
-   cap and the named adverse performance follow-up for admitted rows.
-5. Qualify cold and allocator-warm construction performance for the nineteen
+4. Extend ordered compile-many without raising the frozen repeat cap or
+   emulating priority by source concatenation.
+5. Qualify cold and allocator-warm construction performance for the twenty
    supported compile rows, keeping construction separate from untimed semantic
    verification. Extend only the reusable Unicode/resource/build-many mechanisms
    to the other fourteen rows.
@@ -204,7 +214,7 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 7. Admit the composite `regex-redux` job only after its complete report,
    replacement, and non-empty iteration semantics are implemented.
 
-Each retained generated report has SHA-256
-`f42d288a93fa9042f2f0b6cfac0149f794a95dc4e8fbe93b45f2c313128a7b23`,
+The current generated report has SHA-256
+`a3361ccd8a714dbf2c945c204c7ae4f53dfb3433fa7d1f6058e334fa71edccda`,
 and its sorted-receipts SHA-256 is
-`eb312c113c7bfca151786742e15eb8fa7c88a644edb6cc994926a04b5f70e30e`.
+`16197be8e0196cece02c793a98402fb75ee84127bf2077cf5ccf06643fa13246`.
