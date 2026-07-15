@@ -4740,7 +4740,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(Status::Fault, mismatch.status);
-        assert!(mismatch.message.contains("profile/operation identity mismatch"));
+        assert!(
+            mismatch
+                .message
+                .contains("profile/operation identity mismatch")
+        );
 
         let nosey_repeat = current_fre(
             "compile",
