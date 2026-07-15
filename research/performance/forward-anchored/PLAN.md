@@ -86,7 +86,7 @@ search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains
-`anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13`, and `Auto`
+`anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14`, and `Auto`
 retains its pre-existing strategy for both shapes. Exact singleton-class
 candidate prefixes from 73 through 4,096 bytes use the same dedicated
 equality-only 32-byte verifier used below the former ceiling. Pair candidate
@@ -95,8 +95,10 @@ eight-byte SWAR membership words with exact scalar recovery inside only a
 failing word. Triple candidate prefixes use four safe eight-byte SWAR
 membership words per 32-byte block with scalar recovery only after a failing
 block; that exact 32-byte recovery is isolated in a cold non-inlined helper.
-Other ranges, remaining class shapes, and fixed-end verification retain their
-prior leaves. The direct legacy kernel constructor is unchanged.
+Non-single inclusive ranges at 32 bytes and above use native-word
+SWAR membership with exact scalar recovery inside only a failing word. Other
+class shapes and fixed-end verification retain their prior leaves. The direct
+legacy kernel constructor is unchanged.
 
 Extraction borrows the suffix from the parsed HIR and preserves its checked
 planner-work charge. The selected fixed plan performs one preflighted exact

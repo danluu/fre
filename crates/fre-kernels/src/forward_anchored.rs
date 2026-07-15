@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1114,7 +1114,7 @@ impl ForwardAnchoredPlan {
     }
 
     fn scan_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
-        scan_class_prefix(bytes, self.class, self.implementation)
+        scan_start_class_prefix(bytes, self.class, self.implementation)
     }
 
     #[inline]
@@ -1168,7 +1168,13 @@ impl ForwardAnchoredPlan {
                 | ClassImplementation::Quad { .. }
                 | ClassImplementation::Quint { .. }
         );
-        let rescan_margin = if block_scanner && window_bytes >= RANGE_BLOCK {
+        let range_swar_bound = matches!(
+            self.implementation,
+            ClassImplementation::InclusiveRange { start, end } if start != end
+        ) && window_bytes > START_RANGE_SWAR_MIN;
+        let rescan_margin = if range_swar_bound {
+            WORD_BYTES
+        } else if block_scanner && window_bytes >= RANGE_BLOCK {
             RANGE_BLOCK
         } else {
             0
@@ -1286,6 +1292,21 @@ fn scan_class_prefix(
     }
 }
 
+fn scan_start_class_prefix(
+    bytes: &[u8],
+    class: ByteClass,
+    implementation: ClassImplementation,
+) -> Result<(usize, usize), SearchError> {
+    match implementation {
+        ClassImplementation::InclusiveRange { start, end }
+            if start != end && bytes.len() >= START_RANGE_SWAR_MIN =>
+        {
+            scan_swar_range_prefix(bytes, start, end)
+        }
+        _ => scan_class_prefix(bytes, class, implementation),
+    }
+}
+
 fn scan_fixed_class_prefix(
     bytes: &[u8],
     class: ByteClass,
@@ -1322,6 +1343,11 @@ const PAIR_SWAR_MAX: usize = 4_096;
 const SWAR_BYTES: usize = size_of::<u64>();
 const SWAR_LOW: u64 = u64::MAX / 0xFF;
 const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
+const START_RANGE_SWAR_MIN: usize = 32;
+const WORD_BYTES: usize = size_of::<usize>();
+const BYTE_ONES: usize = usize::MAX / 0xFF;
+const BYTE_HIGH: usize = BYTE_ONES * 0x80;
+const BYTE_LOW: usize = BYTE_ONES * 0x7F;
 const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
 const EDGE_WITNESS_MEDIUM_END: usize = 64;
@@ -2267,6 +2293,83 @@ fn scan_single_candidate_prefix(bytes: &[u8], member: u8) -> Result<(usize, usiz
     Ok((boundary, examined))
 }
 
+fn repeat_byte(byte: u8) -> usize {
+    BYTE_ONES.wrapping_mul(usize::from(byte))
+}
+
+fn packed_ge_mask(word: usize, threshold: u8) -> usize {
+    let threshold_low = repeat_byte(threshold & 0x7F);
+    let low_ge = (((word & BYTE_LOW) | BYTE_HIGH).wrapping_sub(threshold_low)) & BYTE_HIGH;
+    if threshold & 0x80 == 0 {
+        (word & BYTE_HIGH) | low_ge
+    } else {
+        (word & BYTE_HIGH) & low_ge
+    }
+}
+
+fn packed_outside_mask(word: usize, start: u8, end: u8) -> usize {
+    let below_start = BYTE_HIGH ^ packed_ge_mask(word, start);
+    let above_end = end
+        .checked_add(1)
+        .map_or(0, |threshold| packed_ge_mask(word, threshold));
+    below_start | above_end
+}
+
+fn scan_swar_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize), SearchError> {
+    let width = end.wrapping_sub(start);
+    let mut consumed = 0_usize;
+    let mut words = bytes.chunks_exact(WORD_BYTES);
+    for word_bytes in &mut words {
+        let packed = <[u8; WORD_BYTES]>::try_from(word_bytes).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "SWAR word partition",
+            }
+        })?;
+        if packed_outside_mask(usize::from_ne_bytes(packed), start, end) != 0 {
+            let within_word = word_bytes
+                .iter()
+                .position(|&byte| byte.wrapping_sub(start) > width)
+                .unwrap_or(WORD_BYTES);
+            let boundary =
+                consumed
+                    .checked_add(within_word)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "SWAR range boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(WORD_BYTES)
+                .and_then(|value| value.checked_add(within_word))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed SWAR word examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(WORD_BYTES)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed SWAR words",
+            })?;
+    }
+    let remainder = words.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte.wrapping_sub(start) > width)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "SWAR remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "SWAR remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
 /// Scan fixed-end range prefixes in four independent vector-width lanes.
 /// A failing 64-byte block rescans only its first failing 32-byte half, so the
 /// existing `prefix_len + 32` preflight bound remains conservative.
@@ -2348,9 +2451,10 @@ fn scan_fixed_range_prefix(
 mod tests {
     use super::{
         ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits,
-        ByteClass, ClassImplementation, ForwardAnchoredPlan, SearchError, SearchLimits,
-        asymmetric_suffix_witness, begin_edge_witness_trace, copy_suffix_exact,
-        exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
+        ByteClass, ClassImplementation, ForwardAnchoredPlan, RANGE_BLOCK, SearchError,
+        SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
+        copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
+        packed_outside_mask, repeat_byte, scan_swar_range_prefix,
     };
     use crate::Window;
     use core::mem::size_of;
@@ -2686,7 +2790,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13"
+            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14"
         );
         assert_eq!(
             pair.implementation(),
@@ -3041,10 +3145,12 @@ mod tests {
         haystack[63] = b'Z';
         let (_, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
         assert_eq!(accounting.prefilter_calls, 1);
-        assert_eq!(accounting.prefix_bytes_examined, 65);
+        let failed_word_examined =
+            (31 / WORD_BYTES) * WORD_BYTES + WORD_BYTES + 31 % WORD_BYTES + 1;
+        assert_eq!(accounting.prefix_bytes_examined, 1 + failed_word_examined);
         assert_eq!(
             accounting.prefix_bytes_upper_bound,
-            haystack.len().checked_add(32).unwrap()
+            haystack.len().checked_add(WORD_BYTES).unwrap()
         );
         assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
 
@@ -3892,6 +3998,138 @@ mod tests {
             assert_eq!(span, None);
             assert_eq!(accounting.prefilter_calls, 1);
             assert!(!accounting.suffix_confirmation_attempted);
+        }
+    }
+
+    #[test]
+    fn start_range_swar_threshold_and_failed_word_lanes_are_exact() {
+        let plan = plan(ByteClass::inclusive(b'a', b'z'), b"Z", false);
+        for prefix_len in [31_usize, 32, 33, 72, 73] {
+            let mut valid = vec![b'a'; prefix_len];
+            valid.push(b'Z');
+            let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
+            assert_eq!(matched, Some((0, valid.len())), "N={prefix_len}");
+            assert_eq!(accounting.prefix_bytes_examined, prefix_len + 1);
+            let expected_bound = if prefix_len < 32 {
+                valid.len() + 32
+            } else {
+                valid.len() + size_of::<usize>()
+            };
+            assert_eq!(accounting.prefix_bytes_upper_bound, expected_bound);
+        }
+
+        let prefix_len = 32_usize;
+        let mut valid = vec![b'a'; prefix_len];
+        valid.push(b'Z');
+        let word_bytes = size_of::<usize>();
+        for lane in 0..word_bytes {
+            let outsider = word_bytes + lane;
+            let mut invalid = valid.clone();
+            invalid[outsider] = b'!';
+            let (matched, accounting) = plan.find(&invalid, SearchLimits::unlimited()).unwrap();
+            assert_eq!(matched, None, "lane={lane}");
+            assert_eq!(accounting.prefix_bytes_examined, 2 * word_bytes + lane + 2);
+            assert_eq!(
+                accounting.prefix_bytes_upper_bound,
+                valid.len() + word_bytes
+            );
+            assert!(!accounting.suffix_confirmation_attempted);
+        }
+    }
+
+    #[test]
+    fn start_range_swar32_high_bit_ranges_preserve_boundary_and_accounting() {
+        let word_bytes = size_of::<usize>();
+        for (start, end, member, outsider, suffix) in [
+            (0x80_u8, 0xFE_u8, 0xC0_u8, 0x7F_u8, b'Z'),
+            (0x40, 0xC0, 0x80, 0xFF, 0x20),
+            (0x00, 0x7F, 0x40, 0x80, 0xFF),
+        ] {
+            let plan = plan(ByteClass::inclusive(start, end), &[suffix], false);
+            for prefix_len in [31_usize, 32, 33, 72, 73] {
+                let mut valid = vec![member; prefix_len];
+                valid.push(suffix);
+                let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
+                assert_eq!(matched, Some((0, valid.len())));
+                assert_eq!(accounting.prefix_bytes_examined, prefix_len + 1);
+                assert_eq!(
+                    accounting.prefix_bytes_upper_bound,
+                    valid.len()
+                        + if prefix_len < 32 {
+                            RANGE_BLOCK
+                        } else {
+                            word_bytes
+                        }
+                );
+
+                for position in [0_usize, word_bytes - 1, word_bytes, prefix_len - 1] {
+                    if position >= prefix_len {
+                        continue;
+                    }
+                    let mut invalid = valid.clone();
+                    invalid[position] = outsider;
+                    let (matched, accounting) =
+                        plan.find(&invalid, SearchLimits::unlimited()).unwrap();
+                    assert_eq!(
+                        matched, None,
+                        "range={start:02x}-{end:02x} position={position}"
+                    );
+                    assert!(!accounting.suffix_confirmation_attempted);
+                    assert!(accounting.prefix_bytes_examined <= valid.len() + word_bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_range_mask_is_exhaustive_for_every_u8_interval_and_byte() {
+        for start in 0_u16..=u16::from(u8::MAX) {
+            for end in start..=u16::from(u8::MAX) {
+                for byte in 0_u16..=u16::from(u8::MAX) {
+                    let start = u8::try_from(start).unwrap();
+                    let end = u8::try_from(end).unwrap();
+                    let byte = u8::try_from(byte).unwrap();
+                    let actual = packed_outside_mask(repeat_byte(byte), start, end) != 0;
+                    let expected = byte < start || byte > end;
+                    assert_eq!(actual, expected, "start={start}, end={end}, byte={byte}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swar_range_scanner_matches_scalar_at_every_word_lane_and_tail() {
+        let word_bytes = size_of::<usize>();
+        for (start, end, member, outsider) in [
+            (0x00_u8, 0x7F_u8, 0x40_u8, 0xFF_u8),
+            (0x80, 0xFF, 0xC0, 0x00),
+            (0x40, 0xC0, 0x80, 0xFF),
+            (0x80, 0x80, 0x80, 0x7F),
+            (0x00, 0x00, 0x00, 0x01),
+            (0xFF, 0xFF, 0xFF, 0xFE),
+        ] {
+            for length in [0_usize, 1, 7, 8, 9, 72, 73, 74, 511, 512, 513] {
+                let valid = vec![member; length];
+                assert_eq!(
+                    scan_swar_range_prefix(&valid, start, end).unwrap(),
+                    (length, length)
+                );
+                for position in 0..length {
+                    let mut invalid = valid.clone();
+                    invalid[position] = outsider;
+                    let (boundary, examined) =
+                        scan_swar_range_prefix(&invalid, start, end).unwrap();
+                    assert_eq!(boundary, position);
+                    let completed_words = position / word_bytes;
+                    let expected_examined = if completed_words < length / word_bytes {
+                        completed_words * word_bytes + word_bytes + position % word_bytes + 1
+                    } else {
+                        position + 1
+                    };
+                    assert_eq!(examined, expected_examined);
+                    assert!(examined <= length + word_bytes);
+                }
+            }
         }
     }
 
