@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v17";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1130,11 +1130,18 @@ impl ForwardAnchoredPlan {
                     self.scan_prefix(bytes)
                 }
             }
+            ClassImplementation::Pair { first, second }
+                if (PAIR_SWAR_MIN..=PAIR_SWAR_FAST_MAX).contains(&bytes.len()) =>
+            {
+                scan_pair_swar_candidate_prefix(bytes, first, second)
+            }
+            ClassImplementation::Pair { first, second }
+                if (PAIR_SWAR_EXTENSION_MIN..=PAIR_SWAR_MAX).contains(&bytes.len()) =>
+            {
+                self.scan_pair_candidate_prefix_extended(bytes, first, second)
+            }
             ClassImplementation::Pair { .. } if bytes.len() > PAIR_SWAR_MAX => {
                 self.scan_pair_candidate_prefix_too_long(bytes)
-            }
-            ClassImplementation::Pair { first, second } if bytes.len() >= PAIR_SWAR_MIN => {
-                scan_pair_swar_candidate_prefix(bytes, first, second)
             }
             ClassImplementation::Triple {
                 first,
@@ -1150,6 +1157,17 @@ impl ForwardAnchoredPlan {
             } => scan_quint_candidate_prefix(bytes, first, second, third, fourth, fifth),
             _ => self.scan_prefix(bytes),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn scan_pair_candidate_prefix_extended(
+        &self,
+        bytes: &[u8],
+        first: u8,
+        second: u8,
+    ) -> Result<(usize, usize), SearchError> {
+        scan_pair_swar_candidate_prefix(bytes, first, second)
     }
 
     #[cold]
@@ -1353,6 +1371,8 @@ const FIXED_RANGE_WIDE_BLOCK: usize = 128;
 const SINGLE_CANDIDATE_MIN: usize = 73;
 const SINGLE_CANDIDATE_MAX: usize = 65_536;
 const PAIR_SWAR_MIN: usize = 73;
+const PAIR_SWAR_FAST_MAX: usize = 4_096;
+const PAIR_SWAR_EXTENSION_MIN: usize = PAIR_SWAR_FAST_MAX + 1;
 const PAIR_SWAR_MAX: usize = 65_536;
 const PAIR_NEON_BLOCK: usize = 16;
 const SWAR_BYTES: usize = size_of::<u64>();
@@ -2879,7 +2899,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16"
+            "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v17"
         );
         assert_eq!(
             pair.implementation(),
