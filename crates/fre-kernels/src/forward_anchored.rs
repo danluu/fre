@@ -18,7 +18,7 @@ pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middl
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
-    "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
+    "anchored-class-suffix.absolute-end-fixed-range64-suffix-first-hybrid.v3";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -758,7 +758,8 @@ impl AbsoluteEndFixedPlan {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "fixed-end prefix partition",
             })?;
-        let (boundary, examined) = scan_class_prefix(prefix, self.class, self.implementation)?;
+        let (boundary, examined) =
+            scan_fixed_class_prefix(prefix, self.class, self.implementation)?;
         accounting.prefix_bytes_examined = examined;
         if boundary != prefix_len {
             return Ok((None, accounting));
@@ -1251,10 +1252,24 @@ fn scan_class_prefix(
     }
 }
 
+fn scan_fixed_class_prefix(
+    bytes: &[u8],
+    class: ByteClass,
+    implementation: ClassImplementation,
+) -> Result<(usize, usize), SearchError> {
+    match implementation {
+        ClassImplementation::InclusiveRange { start, end } => {
+            scan_fixed_range_prefix(bytes, start, end)
+        }
+        _ => scan_class_prefix(bytes, class, implementation),
+    }
+}
+
 /// Fixed blocks expose branch-free membership reductions to LLVM. These are
 /// safe scalar source loops, not SIMD claims; retained assembly decides which
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
+const FIXED_RANGE_BLOCK: usize = 64;
 const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
 const EDGE_WITNESS_MEDIUM_END: usize = 64;
@@ -1787,6 +1802,83 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "range remainder examinations",
         })?;
+    Ok((boundary, examined))
+}
+
+/// Scan fixed-end range prefixes in four independent vector-width lanes.
+/// A failing 64-byte block rescans only its first failing 32-byte half, so the
+/// existing `prefix_len + 32` preflight bound remains conservative.
+fn scan_fixed_range_prefix(
+    bytes: &[u8],
+    start: u8,
+    end: u8,
+) -> Result<(usize, usize), SearchError> {
+    let width = end.wrapping_sub(start);
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(FIXED_RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK);
+        let (low_left, low_right) = low.split_at(RANGE_BLOCK / 2);
+        let (high_left, high_right) = high.split_at(RANGE_BLOCK / 2);
+        let low_left_outside = low_left.iter().fold(0_u8, |outside, &byte| {
+            outside | u8::from(byte.wrapping_sub(start) > width)
+        });
+        let low_right_outside = low_right.iter().fold(0_u8, |outside, &byte| {
+            outside | u8::from(byte.wrapping_sub(start) > width)
+        });
+        let high_left_outside = high_left.iter().fold(0_u8, |outside, &byte| {
+            outside | u8::from(byte.wrapping_sub(start) > width)
+        });
+        let high_right_outside = high_right.iter().fold(0_u8, |outside, &byte| {
+            outside | u8::from(byte.wrapping_sub(start) > width)
+        });
+        let low_outside = low_left_outside | low_right_outside;
+        let high_outside = high_left_outside | high_right_outside;
+        if low_outside | high_outside != 0 {
+            let (failing_half, half_offset) = if low_outside != 0 {
+                (low, 0_usize)
+            } else {
+                (high, RANGE_BLOCK)
+            };
+            let within_half = failing_half
+                .iter()
+                .position(|&byte| byte.wrapping_sub(start) > width)
+                .unwrap_or(RANGE_BLOCK);
+            let boundary = consumed
+                .checked_add(half_offset)
+                .and_then(|value| value.checked_add(within_half))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fixed range boundary",
+                })?;
+            let examined = consumed
+                .checked_add(FIXED_RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_half))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed fixed range block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed =
+            consumed
+                .checked_add(FIXED_RANGE_BLOCK)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "completed fixed range blocks",
+                })?;
+    }
+    let (relative_boundary, relative_examined) = scan_range_prefix(blocks.remainder(), start, end)?;
+    let boundary =
+        consumed
+            .checked_add(relative_boundary)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "fixed range remainder boundary",
+            })?;
+    let examined =
+        consumed
+            .checked_add(relative_examined)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "fixed range remainder examinations",
+            })?;
     Ok((boundary, examined))
 }
 

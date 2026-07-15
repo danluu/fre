@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardAnchoredSearchLimits, ForwardClassImplementation, Window,
 };
 
-const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
+const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-range64-suffix-first-hybrid.v3";
 
 fn plan(class: &[u8], suffix: &[u8]) -> CandidatePlan {
     CandidatePlan::build(
@@ -397,7 +397,9 @@ fn every_prefix_outsider_position_and_partition_edge_returns_the_first_outsider(
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
             .unwrap();
         assert_eq!(matched, None, "outsider={outsider}");
-        let expected_examined = if outsider < 64 {
+        let expected_examined = if outsider < 32 {
+            outsider + 65
+        } else if outsider < 64 {
             outsider + 33
         } else {
             outsider + 1
