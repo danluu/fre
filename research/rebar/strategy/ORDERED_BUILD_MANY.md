@@ -41,7 +41,7 @@ outputs are typed preflight refusals.
 
 ## Exact qualified cluster
 
-The exact current frontier is 204 pass / 140 unsupported. Two of the five
+The accepted finite-history frontier is 204 pass / 140 unsupported. Two of the five
 execution candidates pass; the other three now reach later typed resource
 gates instead of being rejected for pattern cardinality:
 
