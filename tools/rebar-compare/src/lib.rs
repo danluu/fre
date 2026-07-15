@@ -1900,7 +1900,7 @@ fn fre_compile_verify(
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
     let result = regex
-        .verify_count(request.haystack, operation_limits)
+        .verify_count(request.haystack, &operation_limits)
         .map_err(|error| {
             let message = format!("FRE compiled artifact failed untimed verification: {error}");
             aggregate_execution_error(&error.source, message)
@@ -2775,7 +2775,7 @@ fn fre_aggregate_count(
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
     let result = regex
-        .count(request.haystack, operation_limits)
+        .count(request.haystack, &operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate count refused execution: {error}");
             aggregate_execution_error(&error.source, message)
@@ -2817,7 +2817,7 @@ fn fre_aggregate_span_sum(
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
     let result = regex
-        .span_sum(request.haystack, operation_limits)
+        .span_sum(request.haystack, &operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate span-sum refused execution: {error}");
             aggregate_execution_error(&error.source, message)
@@ -3281,7 +3281,7 @@ impl TimedFreAggregate {
             Self::Count { regex, limits }
                 if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
             {
-                let result = regex.count(haystack, *limits).map_err(|error| {
+                let result = regex.count(haystack, limits).map_err(|error| {
                     aggregate_execution_error(
                         &error.source,
                         format!("FRE timed count refused execution: {error}"),
@@ -3296,7 +3296,7 @@ impl TimedFreAggregate {
             Self::SpanSum { regex, limits }
                 if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
             {
-                let result = regex.span_sum(haystack, *limits).map_err(|error| {
+                let result = regex.span_sum(haystack, limits).map_err(|error| {
                     aggregate_execution_error(
                         &error.source,
                         format!("FRE timed span-sum refused execution: {error}"),
@@ -3307,7 +3307,7 @@ impl TimedFreAggregate {
                 Ok(value)
             }
             Self::Count { regex, limits } => {
-                regex.count_value(haystack, *limits).map_err(|error| {
+                regex.count_value(haystack, limits).map_err(|error| {
                     aggregate_execution_error(
                         &error.source,
                         format!("FRE timed value-only count refused execution: {error}"),
@@ -3315,7 +3315,7 @@ impl TimedFreAggregate {
                 })
             }
             Self::SpanSum { regex, limits } => {
-                regex.span_sum_value(haystack, *limits).map_err(|error| {
+                regex.span_sum_value(haystack, limits).map_err(|error| {
                     aggregate_execution_error(
                         &error.source,
                         format!("FRE timed value-only span-sum refused execution: {error}"),

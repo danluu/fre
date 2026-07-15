@@ -403,7 +403,7 @@ fn model_compile(
         )?;
         let limits =
             current_fre_rebar_aggregate_run_limits(haystack.len(), artifact.build_report())?;
-        let _ = artifact.verify_count(haystack, limits)?;
+        let _ = artifact.verify_count(haystack, &limits)?;
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
             break;
         }
@@ -425,7 +425,7 @@ fn model_compile(
         )?;
         let limits =
             current_fre_rebar_aggregate_run_limits(haystack.len(), artifact.build_report())?;
-        let count = artifact.verify_count(haystack, limits)?.value();
+        let count = artifact.verify_count(haystack, &limits)?.value();
         samples.push(Sample { duration, count });
         if run_start.elapsed() >= benchmark.max_time {
             break;
@@ -451,7 +451,7 @@ fn model_count(
         benchmark,
         || {
             regex
-                .count_value(&benchmark.haystack, limits)
+                .count_value(&benchmark.haystack, &limits)
                 .map_err(Into::into)
         },
         Ok,
@@ -475,7 +475,7 @@ fn model_count_spans(
         benchmark,
         || {
             regex
-                .span_sum_value(&benchmark.haystack, limits)
+                .span_sum_value(&benchmark.haystack, &limits)
                 .map_err(Into::into)
         },
         Ok,

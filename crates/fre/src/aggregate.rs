@@ -1695,8 +1695,11 @@ impl AggregateCompileRegex {
 
     /// Complete cache identity for later use under the supplied run policy.
     #[must_use]
-    pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(&limits)
+    pub fn cache_identity(
+        &self,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits.borrow())
     }
 
     /// Untimed semantic verification for compile-model qualification.
@@ -1706,12 +1709,13 @@ impl AggregateCompileRegex {
     pub fn verify_count(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<AggregateCountResult, AggregateExecutionError> {
-        let execution = self.0.execute_count(haystack, &limits)?;
+        let limits = limits.borrow();
+        let execution = self.0.execute_count(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(&limits, details);
+        let report = self.0.execution_report(limits, details);
         Ok(AggregateCountResult { value, report })
     }
 }
@@ -1727,8 +1731,11 @@ impl AggregateSpansRegex {
     }
 
     #[must_use]
-    pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(&limits)
+    pub fn cache_identity(
+        &self,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits.borrow())
     }
 
     /// Execute once on the complete original haystack. Absolute anchors are
@@ -1736,11 +1743,12 @@ impl AggregateSpansRegex {
     pub fn spans(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<AggregateSpans, AggregateExecutionError> {
+        let limits = limits.borrow();
         let AggregateEngine::Continuation(engine) = &self.0.engine else {
             return Err(self.0.execution_error(
-                &limits,
+                limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span operation retained a non-continuation plan",
                 ),
@@ -1748,7 +1756,7 @@ impl AggregateSpansRegex {
         };
         let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
             self.0.execution_error(
-                &limits,
+                limits,
                 AggregateExecutionSource::InternalInvariant(
                     "continuation span plan lacks storage strategy",
                 ),
@@ -1763,13 +1771,13 @@ impl AggregateSpansRegex {
             )
             .map_err(|source| {
                 self.0
-                    .execution_error(&limits, AggregateExecutionSource::Continuation(source))
+                    .execution_error(limits, AggregateExecutionSource::Continuation(source))
             })?;
         let details = AggregateExecutionDetails::Continuation {
             certificate: admitted.certificate().clone(),
             accounting: admitted.accounting(),
         };
-        let report = self.0.execution_report(&limits, details);
+        let report = self.0.execution_report(limits, details);
         Ok(AggregateSpans { admitted, report })
     }
 }
@@ -1849,20 +1857,24 @@ impl AggregateCountRegex {
     }
 
     #[must_use]
-    pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(&limits)
+    pub fn cache_identity(
+        &self,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits.borrow())
     }
 
     /// Count the complete non-overlapping sequence on the original haystack.
     pub fn count(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<AggregateCountResult, AggregateExecutionError> {
-        let execution = self.0.execute_count(haystack, &limits)?;
+        let limits = limits.borrow();
+        let execution = self.0.execute_count(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(&limits, details);
+        let report = self.0.execution_report(limits, details);
         Ok(AggregateCountResult { value, report })
     }
 
@@ -1873,10 +1885,11 @@ impl AggregateCountRegex {
     pub fn count_value(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<u64, AggregateExecutionError> {
+        let limits = limits.borrow();
         self.0
-            .execute_count(haystack, &limits)
+            .execute_count(haystack, limits)
             .map(|execution| execution.value())
     }
 }
@@ -1911,20 +1924,24 @@ impl AggregateSpanSumRegex {
     }
 
     #[must_use]
-    pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(&limits)
+    pub fn cache_identity(
+        &self,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> AggregateCacheIdentity {
+        self.0.cache_identity(limits.borrow())
     }
 
     /// Sum complete non-overlapping match lengths on the original haystack.
     pub fn span_sum(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<AggregateSpanSumResult, AggregateExecutionError> {
-        let execution = self.0.execute_span_sum(haystack, &limits)?;
+        let limits = limits.borrow();
+        let execution = self.0.execute_span_sum(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(&limits, details);
+        let report = self.0.execution_report(limits, details);
         Ok(AggregateSpanSumResult { value, report })
     }
 
@@ -1935,10 +1952,11 @@ impl AggregateSpanSumRegex {
     pub fn span_sum_value(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<u64, AggregateExecutionError> {
+        let limits = limits.borrow();
         self.0
-            .execute_span_sum(haystack, &limits)
+            .execute_span_sum(haystack, limits)
             .map(|execution| execution.value())
     }
 }
