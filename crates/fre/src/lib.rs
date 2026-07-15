@@ -2037,7 +2037,7 @@ mod tests {
         let span = regex
             .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
             .unwrap();
-        assert_eq!(span.plan_id, fre_kernels::FORWARD_ANCHORED_PLAN_ID);
+        assert_eq!(span.plan_id, fre_kernels::ABSOLUTE_END_FIXED_PLAN_ID);
         assert_eq!(span.build_limits, BuildLimits::default());
         assert_eq!(span.search_limits, limits);
         assert_eq!(
