@@ -4139,7 +4139,10 @@ mod tests {
             let (matched, accounting) = plan.find(&invalid, SearchLimits::unlimited()).unwrap();
             assert_eq!(matched, None, "lane={lane}");
             assert_eq!(accounting.prefix_bytes_examined, 2 * word_bytes + lane + 2);
-            assert_eq!(accounting.prefix_bytes_upper_bound, valid.len() + word_bytes);
+            assert_eq!(
+                accounting.prefix_bytes_upper_bound,
+                valid.len() + word_bytes
+            );
             assert!(!accounting.suffix_confirmation_attempted);
         }
     }

@@ -82,7 +82,10 @@ fn range_min8_direct_words_remainders_byte_zero_and_high_bits_are_exact() {
                 expected_failed_word_examinations(prefix_len, valid.len()),
                 "range={start:#04x}-{end:#04x} N={prefix_len}"
             );
-            assert_eq!(accounting.prefix_bytes_upper_bound, valid.len() + word_bytes);
+            assert_eq!(
+                accounting.prefix_bytes_upper_bound,
+                valid.len() + word_bytes
+            );
             assert!(accounting.suffix_confirmation_attempted);
 
             for position in [0_usize, prefix_len - 1] {
