@@ -35,8 +35,7 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
     );
 
     for boundary in [
-        72_usize, 73, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535, 65_536,
-        65_537,
+        72_usize, 73, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535, 65_536, 65_537,
     ] {
         let mut haystack = vec![0x80; boundary];
         haystack.extend_from_slice(candidate.suffix());
@@ -62,8 +61,8 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
 fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes() {
     let candidate = plan();
     for boundary in [
-        73_usize, 74, 127, 128, 255, 256, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535,
-        65_536, 65_537,
+        73_usize, 74, 127, 128, 255, 256, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535, 65_536,
+        65_537,
     ] {
         for earlier in [0_usize, 1, 31, 32, 33, boundary / 2, boundary - 1] {
             if earlier >= boundary {

@@ -1120,9 +1120,7 @@ impl ForwardAnchoredPlan {
     #[inline]
     fn scan_candidate_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
         match self.implementation {
-            ClassImplementation::InclusiveRange { start, end }
-                if start == end =>
-            {
+            ClassImplementation::InclusiveRange { start, end } if start == end => {
                 if bytes.len() > SINGLE_CANDIDATE_MAX {
                     return self.scan_prefix(bytes);
                 }
