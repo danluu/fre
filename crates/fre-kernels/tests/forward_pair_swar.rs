@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const PAIR_SWAR_ID: &str = "anchored-class-suffix.pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8";
+const PAIR_SWAR_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9";
 
 fn plan() -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -78,9 +78,7 @@ fn pair_swar_failed_words_recover_the_exact_first_outsider() {
                 earlier + 10,
                 "earlier={earlier} outsider={outsider:#04x}"
             );
-            assert!(
-                accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound
-            );
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             assert!(accounting.suffix_confirmation_attempted);
         }
     }
@@ -110,9 +108,7 @@ fn pair_swar_differential_covers_every_outsider_byte_and_block_edge() {
                     actual, expected,
                     "boundary={boundary} position={position} outsider={outsider:#04x}"
                 );
-                assert!(
-                    accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound
-                );
+                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             }
         }
     }

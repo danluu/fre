@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1126,6 +1126,11 @@ impl ForwardAnchoredPlan {
             {
                 scan_single_candidate_prefix(bytes, start)
             }
+            ClassImplementation::Pair { first, second }
+                if (PAIR_SWAR_MIN..=PAIR_SWAR_MAX).contains(&bytes.len()) =>
+            {
+                scan_pair_swar_candidate_prefix(bytes, first, second)
+            }
             ClassImplementation::Quint {
                 first,
                 second,
@@ -1303,6 +1308,12 @@ const FIXED_RANGE_BLOCK: usize = 64;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
 const SINGLE_CANDIDATE_MIN: usize = 73;
 const SINGLE_CANDIDATE_MAX: usize = 1_024;
+const PAIR_SWAR_MIN: usize = 73;
+const PAIR_SWAR_MAX: usize = 512;
+const SWAR_BYTES: usize = size_of::<u64>();
+const SWAR_LOW: u64 = u64::MAX / 0xFF;
+const SWAR_LOW_SEVEN: u64 = SWAR_LOW * 0x7F;
+const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
 const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
 const EDGE_WITNESS_MEDIUM_END: usize = 64;
@@ -1558,6 +1569,74 @@ fn scan_pair_prefix(bytes: &[u8], first: u8, second: u8) -> Result<(usize, usize
         .checked_add(usize::from(within_remainder < remainder.len()))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "pair remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+#[inline]
+fn swar_zero_high_bits(value: u64) -> u64 {
+    let low_seven = value & SWAR_LOW_SEVEN;
+    !(low_seven.wrapping_add(SWAR_LOW_SEVEN) | value | SWAR_LOW_SEVEN) & SWAR_HIGH
+}
+
+fn scan_pair_swar_candidate_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+) -> Result<(usize, usize), SearchError> {
+    let first_word = SWAR_LOW.wrapping_mul(u64::from(first));
+    let second_word = SWAR_LOW.wrapping_mul(u64::from(second));
+    let mut consumed = 0_usize;
+    let mut words = bytes.chunks_exact(SWAR_BYTES);
+    for word_bytes in &mut words {
+        let word = u64::from_ne_bytes(word_bytes.try_into().map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "pair SWAR word load",
+            }
+        })?);
+        let member_bits =
+            swar_zero_high_bits(word ^ first_word) | swar_zero_high_bits(word ^ second_word);
+        if member_bits != SWAR_HIGH {
+            let within_word = word_bytes
+                .iter()
+                .position(|&byte| byte != first && byte != second)
+                .unwrap_or(SWAR_BYTES);
+            let boundary =
+                consumed
+                    .checked_add(within_word)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "pair SWAR candidate boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(SWAR_BYTES)
+                .and_then(|value| value.checked_add(within_word))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed pair SWAR candidate word examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(SWAR_BYTES)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed pair SWAR candidate words",
+            })?;
+    }
+    let remainder = words.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte != first && byte != second)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "pair SWAR candidate remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "pair SWAR candidate remainder examinations",
         })?;
     Ok((boundary, examined))
 }
@@ -2475,7 +2554,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-1024-equality32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8"
+            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9"
         );
         assert_eq!(
             pair.implementation(),
