@@ -1989,6 +1989,16 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap();
+        assert_eq!(plan.count_identity().plan_id, REPEATED_RUN_PLAN_ID);
+        assert_eq!(
+            plan.count_identity().operation_id,
+            REPEATED_RUN_COUNT_OPERATION_ID
+        );
+        assert_eq!(
+            plan.span_sum_identity().operation_id,
+            REPEATED_RUN_SPAN_SUM_OPERATION_ID
+        );
+        assert_ne!(plan.count_identity().plan_id, RUN_PLAN_ID);
         let unit = b"abcd!\xCE\xB1\xCE\xB2\xFF-";
         let rows = [8_usize, 16, 32].map(|copies| {
             plan.count(&unit.repeat(copies), ReduceLimits::unlimited())
