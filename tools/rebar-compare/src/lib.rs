@@ -66,7 +66,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-structural-quota-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-structural-quota-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -2874,6 +2874,9 @@ fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         continuation: fre::AggregateCompileLimits {
+            max_hir_nodes: limits.fre_aggregate_hir_nodes,
+            max_hir_stack_items: limits.fre_aggregate_hir_stack_items,
+            max_repeat_bound: limits.fre_aggregate_repeat_bound,
             max_work: limits.fre_aggregate_compile_work,
             max_program_bytes: limits.fre_aggregate_program_bytes,
             ..fre::AggregateCompileLimits::default()
@@ -4567,7 +4570,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-structural-quota-v1"
+            "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-structural-quota-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("positive-Unicode-word"));
@@ -4951,17 +4954,17 @@ mod tests {
                 .contains("profile/operation identity mismatch")
         );
 
-        let nosey_repeat = current_fre(
-            "compile",
-            &[r"[A-Za-z0-9_-]{20,1024}".to_string(), "never".to_string()],
-            b"TWITTER_API_KEY",
-            false,
-            false,
-            &RunLimits::default(),
-        );
-        assert!(
-            matches!(nosey_repeat, CandidateOutcome::Unsupported(ref reason) if reason.contains("RepeatBound")),
-            "compile-many must retain the frozen repeat cap: {nosey_repeat:?}"
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"[A-Za-z0-9_-]{20,1024}".to_string(), "never".to_string()],
+                b"TWITTER_API_KEY",
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            0,
+            "compile-many-continuation-program",
         );
     }
 
@@ -5193,6 +5196,13 @@ mod tests {
         assert_eq!(continuation.max_hir_stack_items, 13);
         assert_eq!(continuation.max_repeat_bound, 14);
         assert_eq!(continuation.max_program_bytes, 15);
+
+        let many_continuation = aggregate_many_build_limits(&run).continuation;
+        assert_eq!(many_continuation.max_work, 11);
+        assert_eq!(many_continuation.max_hir_nodes, 12);
+        assert_eq!(many_continuation.max_hir_stack_items, 13);
+        assert_eq!(many_continuation.max_repeat_bound, 14);
+        assert_eq!(many_continuation.max_program_bytes, 15);
     }
 
     #[test]
@@ -5209,24 +5219,39 @@ mod tests {
                 .unwrap_err()
                 .to_string()
         };
+        let build_many = |pattern: &str, run: &RunLimits| {
+            let patterns = vec![pattern.to_string(), "never".to_string()];
+            AggregateManyBuilder::new(&patterns)
+                .profile(rebar_profile())
+                .unicode(false)
+                .case_insensitive(false)
+                .limits(aggregate_many_build_limits(run))
+                .strategy(AggregateStrategy::ReverseSequentialRows)
+                .build_count()
+                .unwrap_err()
+                .to_string()
+        };
 
         let nodes = RunLimits {
             fre_aggregate_hir_nodes: 0,
             ..RunLimits::default()
         };
         assert!(build("a.*b", &nodes).contains("HirNodes"));
+        assert!(build_many("a.*b", &nodes).contains("HirNodes"));
 
         let stack = RunLimits {
             fre_aggregate_hir_stack_items: 0,
             ..RunLimits::default()
         };
         assert!(build("a.*b", &stack).contains("HirStackItems"));
+        assert!(build_many("a.*b", &stack).contains("HirStackItems"));
 
         let repetition = RunLimits {
             fre_aggregate_repeat_bound: 1,
             ..RunLimits::default()
         };
         assert!(build("a{2}", &repetition).contains("RepeatBound"));
+        assert!(build_many("a{2}", &repetition).contains("RepeatBound"));
     }
 
     #[test]
