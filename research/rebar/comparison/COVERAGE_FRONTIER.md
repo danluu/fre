@@ -2,47 +2,47 @@
 
 This is the compact source checkpoint for the latest authenticated per-job
 frontier. A full generation from exact source
-`793c0a9849c227ba8407ee7dbb168b32e3465c47` (tree
-`99869cd80ee9c210520fa889b7439e0aa1f6b8f5`) has SHA-256
-`a3361ccd8a714dbf2c945c204c7ae4f53dfb3433fa7d1f6058e334fa71edccda`.
+`9eba542c696ab497bb21e401f224776edec77876` (tree
+`97248f11affe25eadcb39ab1abe10cea347f05a5`) has SHA-256
+`bbc1895371db9bf744ecfe456ccc213e03bc614d5365ace60066a2acb531ae04`.
 They used the immutable expanded manifest with SHA-256
 `09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43`,
 clean Rebar revision `463d00f31887e84c38467805b9e3122c314b9521`,
 and the exact Rust and RE2 runners recorded below. The raw generated report
 copy remains outside Git at
-`/tmp/fre-control/results/G0-REBAR-CAPTURE-V10-793C0A9-FRONTIER-002.json`.
+`/tmp/fre-control/results/G0-REBAR-UNICODE-CONT-9EBA542-FRONTIER-001.json`.
 The checked-in `report.json` continues to preserve the
 preceding 144-pass baseline rather than being silently replaced by generated
 evidence.
 
-The authenticated current figure is 230: every pass in the independently
-authenticated 222-row capture frontier plus seven positive Unicode-word
-boundary rows and one ordered compile-many row. The malformed-UTF-8 boundary,
-Nosey Parker repeat-bound, and all other prior refusals remain typed.
+The authenticated current figure is 236: the 230-row Unicode-boundary and
+compile-many frontier plus six variable-width Unicode continuation rows. The
+malformed-UTF-8 boundary, Nosey Parker repeat-bound, and all other prior
+refusals remain typed.
 
 ## By operation model
 
 | Rebar model | Rust jobs | FRE pass | FRE unsupported | RE2 jobs | RE2 pass |
 |---|---:|---:|---:|---:|---:|
-| `compile` | 33 | 20 | 13 | 26 | 26 |
-| `count` | 133 | 86 | 47 | 109 | 109 |
-| `count-spans` | 129 | 107 | 22 | 110 | 110 |
+| `compile` | 33 | 22 | 11 | 26 | 26 |
+| `count` | 133 | 89 | 44 | 109 | 109 |
+| `count-spans` | 129 | 108 | 21 | 110 | 110 |
 | `count-captures` | 15 | 3 | 12 | 12 | 12 |
 | `grep` | 11 | 9 | 2 | 10 | 10 |
 | `grep-captures` | 22 | 5 | 17 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **230** | **114** | **285** | **285** |
+| **Total** | **344** | **236** | **108** | **285** | **285** |
 
-FRE has no `fail`, `fault`, or unresolved receipt. Its 213 aggregate-facade
-passes comprise 20 `compile`, 86 `count`, and 107 `count-spans` jobs; another
+FRE has no `fail`, `fault`, or unresolved receipt. Its 219 aggregate-facade
+passes comprise 22 `compile`, 89 `count`, and 108 `count-spans` jobs; another
 nine use the portable `grep` path and eight use the linear selector plus
 persistent capture-history path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
 The optional v2 executed-plan field splits those passes into 29 exact-literal
-aggregates, 139 continuation-program aggregates, 23 direct Unicode-scalar
-aggregates, two ordered build-many literal aggregates, 17 continuation compile
+aggregates, 143 continuation-program aggregates, 23 direct Unicode-scalar
+aggregates, two ordered build-many literal aggregates, 19 continuation compile
 artifacts, two direct Unicode-scalar compile artifacts, one ordered compile-many
 artifact, nine portable-search rows, and eight selector/history capture rows. It is
 populated only after successful candidate execution and does not infer a plan
@@ -76,6 +76,18 @@ frontier, with no removed pass:
 - `test/unicode/word-boundary/unicode-join-control@rust/regex`
 - `test/unicode/word-boundary/unicode-mark@rust/regex`
 
+## Authenticated variable-width Unicode continuation delta
+
+The current source adds exactly these six rows to the 230-pass frontier, with
+no removed pass:
+
+- `imported/sherlock/everything-greedy-nl@rust/regex`
+- `opt/fixed-length/go33484-3@rust/regex`
+- `opt/fixed-length/too-big-unicode@rust/regex`
+- `opt/fixed-length/too-small-unicode@rust/regex`
+- `unicode/compile/match-every-line@rust/regex`
+- `wild/grapheme/compile@rust/regex`
+
 ## By benchmark/pattern family
 
 | Family | FRE pass | FRE unsupported | RE2 pass |
@@ -86,33 +98,26 @@ frontier, with no removed pass:
 | `folly` | 4 | 0 | 4 |
 | `grep` | 2 | 1 | 2 |
 | `hyperscan` | 14 | 1 | 0 |
-| `imported` | 84 | 23 | 107 |
-| `opt` | 21 | 14 | 26 |
+| `imported` | 85 | 22 | 107 |
+| `opt` | 24 | 11 | 26 |
 | `reported` | 9 | 10 | 17 |
 | `slow` | 4 | 0 | 4 |
 | `test` | 50 | 0 | 46 |
-| `unicode` | 9 | 13 | 16 |
-| `wild` | 1 | 24 | 17 |
-| **Total** | **230** | **114** | **285** |
+| `unicode` | 10 | 12 | 16 |
+| `wild` | 2 | 23 | 17 |
+| **Total** | **236** | **108** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
 
 ## Exact FRE refusal split
 
-The 90 aggregate compile/count/span refusals are fully typed:
-
-- 43 Unicode-feature jobs: 7 `compile`, 23 `count`, and 13 `count-spans`.
-  Unicode-on continuation admits empty/literal/ASCII-range and singleton scalar
-  classes, including finite singleton case folds. A separate direct plan now
-  executes canonical nonempty root scalar classes in one UTF-8 pass.
-  Composed/non-root scalar classes and Unicode-word assertions remain typed
-  unsupported.
-- 2 ordered build-many `compile` jobs. Pattern cardinality is checked before
-  any candidate compilation.
-- 45 bounded resource refusals: 5 `compile`, 29 `count`, and 11 `count-spans`.
-  These retain exact construction or execution quota diagnostics. Resource
-  refusals are not faults and require a better plan, not a silent quota raise.
+The 76 aggregate compile/count/span refusals are all bounded resources: 11
+`compile`, 44 `count`, and 21 `count-spans`. Unicode-on continuation now lowers
+all scalar classes to canonical UTF-8 paths, while the direct plan still
+executes canonical nonempty root scalar classes in one UTF-8 pass. Rows that do
+not fit retain exact HIR/state/log/work or repeat-bound diagnostics. Resource
+refusals are not faults and require a better plan, not a silent quota raise.
 
 The other 32 refusals are operation/surface gaps: 29 capture rows, two portable
 `grep` syntax gaps, and one `regex-redux`. Capture refusals split exactly into
@@ -145,7 +150,7 @@ unit public-job limit. These are typed refusals; the limit was not raised.
 ## Correctness adversaries now admitted
 
 Every executed candidate receipt passes, including the prior Unicode
-exact-literal rows, eight newly admitted byte-stable Unicode continuation rows,
+exact-literal rows, six newly admitted variable-width Unicode continuation rows,
 twelve aggregate ASCII-word/LF assertion rows, the two corresponding portable
 `grep` rows, two ordered build-many rows, 25 direct Unicode-scalar rows, the
 eight capture-history rows, and all selected
@@ -186,13 +191,10 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 
 ## Prioritized exact frontier
 
-1. Extend the reusable Unicode-on continuation, direct scalar plan, and capture
-   compiler with
-   explicit variable-width
-   UTF-8 semantics and independent differential qualification for the remaining
-   43 aggregate and 17 capture Unicode-feature refusals. Do not weaken
-   singleton-only admission.
-2. Introduce faster bounded aggregate plans for the 45 aggregate resource
+1. Extend explicit variable-width UTF-8 semantics to the 17 capture Unicode
+   refusals and the remaining portable `grep` scalar-class refusal without
+   weakening malformed-input or offset semantics.
+2. Introduce faster bounded aggregate plans for the 76 aggregate resource
    refusals. The
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
    quota and preserves the construction-time choice/no-fallback contract; the
@@ -215,6 +217,6 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    replacement, and non-empty iteration semantics are implemented.
 
 The current generated report has SHA-256
-`a3361ccd8a714dbf2c945c204c7ae4f53dfb3433fa7d1f6058e334fa71edccda`,
+`bbc1895371db9bf744ecfe456ccc213e03bc614d5365ace60066a2acb531ae04`,
 and its sorted-receipts SHA-256 is
-`16197be8e0196cece02c793a98402fb75ee84127bf2077cf5ccf06643fa13246`.
+`bd900e4b695dc898a085b75381274515298da7e192c8879159cebffd57df80ad`.
