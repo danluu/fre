@@ -1,30 +1,34 @@
 # Rebar semantic coverage frontier
 
-This is a compact index into the exact per-job receipts in `report.json`.
-Counts below are derived from that report; it remains authoritative for every
-job ID, expected result, actual result, and refusal reason.
+This is the compact source checkpoint for the latest authenticated per-job
+frontier. Two full generations from source commit `bf434520665c2a606216b7a4acbf611270fd5784`
+were byte-identical with SHA-256
+`a2e9e7364da1bb2962f868edad44aeb1a1bd346536eac848adde818c767e37c0`.
+Those raw generated reports remain outside Git. The checked-in `report.json`
+continues to preserve the preceding 144-pass baseline rather than being
+silently replaced by generated evidence.
 
 ## By operation model
 
 | Rebar model | Rust jobs | FRE pass | FRE unsupported | RE2 jobs | RE2 pass |
 |---|---:|---:|---:|---:|---:|
 | `compile` | 33 | 0 | 33 | 26 | 26 |
-| `count` | 133 | 48 | 85 | 109 | 109 |
-| `count-spans` | 129 | 89 | 40 | 110 | 110 |
+| `count` | 133 | 54 | 79 | 109 | 109 |
+| `count-spans` | 129 | 100 | 29 | 110 | 110 |
 | `count-captures` | 15 | 0 | 15 | 12 | 12 |
 | `grep` | 11 | 7 | 4 | 10 | 10 |
 | `grep-captures` | 22 | 0 | 22 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **144** | **200** | **285** | **285** |
+| **Total** | **344** | **161** | **183** | **285** | **285** |
 
-FRE has no `fail` or `fault` receipt. Its 137 aggregate passes comprise 48
-`count` and 89 `count-spans` jobs; the other seven passes are the pre-existing
+FRE has no `fail` or `fault` receipt. Its 154 aggregate passes comprise 54
+`count` and 100 `count-spans` jobs; the other seven passes are the pre-existing
 portable `grep` path. All 285 RE2 jobs execute through the exact pinned Rebar
 adapter and pass. The Rust reference executes all 344 Rust jobs, with 342 pass
 and two retained failures.
 
-The optional v2 executed-plan field splits those passes into 24 exact-literal
-aggregate, 113 continuation-program aggregate, and seven portable-search rows.
+The optional v2 executed-plan field splits those passes into 29 exact-literal
+aggregate, 125 continuation-program aggregate, and seven portable-search rows.
 It is populated only after successful candidate execution and does not infer a
 plan for any unsupported receipt.
 
@@ -33,40 +37,40 @@ plan for any unsupported receipt.
 | Family | FRE pass | FRE unsupported | RE2 pass |
 |---|---:|---:|---:|
 | `captures` | 0 | 1 | 1 |
-| `curated` | 12 | 40 | 41 |
+| `curated` | 16 | 36 | 41 |
 | `dictionary` | 0 | 7 | 4 |
 | `folly` | 4 | 0 | 4 |
 | `grep` | 1 | 2 | 2 |
-| `hyperscan` | 8 | 7 | 0 |
-| `imported` | 77 | 30 | 107 |
-| `opt` | 15 | 20 | 26 |
-| `reported` | 1 | 18 | 17 |
+| `hyperscan` | 12 | 3 | 0 |
+| `imported` | 79 | 28 | 107 |
+| `opt` | 16 | 19 | 26 |
+| `reported` | 3 | 16 | 17 |
 | `slow` | 4 | 0 | 4 |
-| `test` | 22 | 28 | 46 |
-| `unicode` | 0 | 22 | 16 |
+| `test` | 23 | 27 | 46 |
+| `unicode` | 3 | 19 | 16 |
 | `wild` | 0 | 25 | 17 |
-| **Total** | **144** | **200** | **285** |
+| **Total** | **161** | **183** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
 
 ## Exact FRE refusal split
 
-The 125 aggregate refusals are fully typed:
+The 108 aggregate refusals are fully typed:
 
-- 78 Unicode-enabled jobs: 55 `count`, 23 `count-spans`. The byte-only
-  production boundary refuses Unicode mode before parsing, including empty or
-  ASCII-looking patterns.
+- 73 general Unicode-enabled jobs: 51 `count`, 22 `count-spans`. Five of the
+  original 78 Unicode-gated rows now pass through the independently checked
+  nonempty exact-UTF-8-literal path; broader Unicode continuation execution
+  remains typed unsupported.
 - 5 ordered build-many jobs: 3 `count`, 2 `count-spans`. Pattern cardinality is
   checked before any candidate compilation.
-- 14 unsupported assertion jobs: four `count` ASCII word-boundary jobs and ten
-  `count-spans` jobs (nine ASCII word boundaries and one LF-aware end anchor).
-- 28 bounded resource refusals. For `count`, 21 exceed the 536,870,912 operation
-  work quota and two exceed the 134,217,728-byte row-log quota. For
-  `count-spans`, three exceed operation work and two exceed the 4,096-node
-  compile quota. These are not faults and must be addressed by a better plan or
-  an explicitly re-qualified policy, not by silently retrying with larger
-  limits.
+- 30 bounded resource refusals. For `count`, 22 exceed the 536,870,912
+  operation-work quota, two exceed the 134,217,728-byte row-log quota, and one
+  exceeds the 1,000 repeat bound. For `count-spans`, three exceed operation
+  work and two exceed the 4,096-node compile quota. Twelve of the fourteen
+  former assertion refusals now pass; `imported/leipzig/word-ending-nn` and
+  `curated/13-noseyparker/single` reach these later resource gates. Resource
+  refusals are not faults and require a better plan, not a silent quota raise.
 
 The other 75 refusals are operation/surface gaps: 33 `compile`, 22
 `grep-captures`, 15 `count-captures`, four portable `grep` syntax gaps, and one
@@ -80,7 +84,8 @@ The other 75 refusals are operation/surface gaps: 33 `compile`, 22
 
 ## Correctness adversaries now admitted
 
-Every newly executed candidate receipt passes, including all selected
+Every newly executed candidate receipt passes, including five Unicode exact
+literal rows, twelve ASCII-word/LF assertion rows, and all selected
 `curated/14-quadratic`, `slow/quadratic-*`, `opt/reverse-inner/no-quadratic-*`,
 and `opt/reverse-suffix/no-quadratic` jobs. The directed facade suite also locks
 nullable/empty iteration, late priority fallback `(?:a+b|a)` over `a^N`,
@@ -113,13 +118,16 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 ## Prioritized exact frontier
 
 1. Add Unicode-enabled Rust-byte lowering with explicit variable-width UTF-8
-   semantics and independent differential qualification (78 jobs).
-2. Introduce faster bounded aggregate plans for the 28 resource refusals. The
+   semantics and independent differential qualification for the remaining 73
+   general-Unicode refusals.
+2. Introduce faster bounded aggregate plans for the 30 current resource
+   refusals. The
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
    quota and preserves the construction-time choice/no-fallback contract; the
    remaining refusals require other semantic shapes.
-3. Implement ASCII word boundaries and LF-aware anchors for the 14 aggregate
-   assertion refusals and four portable grep gaps.
+3. Reuse the authenticated ASCII-word/LF semantics for the two eligible
+   portable `grep` gaps; retain typed refusals for Unicode word state and
+   variable-width Unicode scalar lowering until their own gates pass.
 4. Add ordered build-many as its own semantic plan/API, beginning with the five
    aggregate jobs. Never emulate priority by concatenating patterns.
 5. Add the 33 compile-model receipts without hiding candidate work outside the
@@ -129,7 +137,8 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 7. Admit the composite `regex-redux` job only after its complete report,
    replacement, and non-empty iteration semantics are implemented.
 
-Two consecutive full generations were byte-identical. The report SHA-256 is
-`6a9e599ef7b3e2edeeec42dbad208e4a10f206a321f8f36e76bff3871f26b336` and its
-sorted-receipts SHA-256 is
-`23b072ac9cbcd6798bf76eaa39ffc7d45aea26115036f18dd2c185566f40f3d4`.
+Two consecutive full generations were byte-identical. The retained generated
+report SHA-256 is
+`a2e9e7364da1bb2962f868edad44aeb1a1bd346536eac848adde818c767e37c0`,
+and its sorted-receipts SHA-256 is
+`8ec48cc3a785349324acffe5ad794bb64d9ebb478e7f43a0d8cb533d84b383b9`.
