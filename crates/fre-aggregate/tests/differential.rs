@@ -4,8 +4,8 @@
 )]
 
 use fre_aggregate::{
-    CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Span,
-    Strategy, Unsupported,
+    CaptureLimits, CompileLimits, CompiledCaptureRegex, CompiledRegex, Error, OperationLimits,
+    Resource, RustByteProfile, Span, Strategy, Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{
@@ -34,6 +34,85 @@ fn compile(pattern: &str) -> CompiledRegex {
         CompileLimits::default(),
     )
     .unwrap_or_else(|error| panic!("failed to compile {pattern:?}: {error}"))
+}
+
+fn compile_captures(pattern: &str) -> CompiledCaptureRegex {
+    CompiledCaptureRegex::from_hir(
+        &parse(pattern),
+        RustByteProfile::PINNED_1_12_4,
+        CompileLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("failed to compile captures {pattern:?}: {error}"))
+}
+
+#[test]
+fn capture_history_preserves_priority_optional_last_iteration_and_absolute_bytes() {
+    let priority = compile_captures(r"(a|(ab))(b)?");
+    let selected = priority
+        .admit_captures(
+            b"xxabyy",
+            2..4,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            CaptureLimits::default(),
+        )
+        .unwrap();
+    let [matched] = selected.as_slice() else {
+        panic!("expected one selected capture match");
+    };
+    assert_eq!(matched.span(), Span { start: 2, end: 4 });
+    assert_eq!(matched.group(0), Some(Span { start: 2, end: 4 }));
+    assert_eq!(matched.group(1), Some(Span { start: 2, end: 3 }));
+    assert_eq!(matched.group(2), None);
+    assert_eq!(matched.group(3), Some(Span { start: 3, end: 4 }));
+
+    let repeated = compile_captures(r"(a)+");
+    let selected = repeated
+        .admit_captures(
+            b"aaa",
+            0..3,
+            Strategy::FullTable,
+            OperationLimits::default(),
+            CaptureLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(selected.as_slice()[0].group(1), Some(Span { start: 2, end: 3 }));
+}
+
+#[test]
+fn capture_history_retains_empty_progress_and_refuses_slots_before_replay_allocation() {
+    let regex = compile_captures(r"(a)?");
+    let selected = regex
+        .admit_captures(
+            b"b",
+            0..1,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            CaptureLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(selected.as_slice().len(), 2);
+    assert_eq!(selected.as_slice()[0].group(0), Some(Span { start: 0, end: 0 }));
+    assert_eq!(selected.as_slice()[0].group(1), None);
+    assert_eq!(selected.as_slice()[1].group(0), Some(Span { start: 1, end: 1 }));
+
+    assert!(matches!(
+        regex.admit_captures(
+            b"b",
+            0..1,
+            Strategy::FullTable,
+            OperationLimits::default(),
+            CaptureLimits {
+                max_capture_slots: 1,
+                ..CaptureLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimit {
+            resource: Resource::CaptureSlots,
+            required: 2,
+            limit: 1,
+        })
+    ));
 }
 
 fn upstream(pattern: &str, haystack: &[u8]) -> Vec<Span> {
