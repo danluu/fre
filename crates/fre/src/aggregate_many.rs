@@ -253,7 +253,7 @@ impl std::error::Error for AggregateManyBuildError {
 }
 
 /// Complete per-invocation limits for either selected plan family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AggregateManyRunLimits {
     pub ordered_literal: OrderedLiteralAggregateReduceLimits,
     pub continuation: OperationLimits,
@@ -278,15 +278,6 @@ impl AggregateManyRunLimits {
                 max_peak_bytes: usize::MAX,
                 max_work: usize::MAX,
             },
-        }
-    }
-}
-
-impl Default for AggregateManyRunLimits {
-    fn default() -> Self {
-        Self {
-            ordered_literal: OrderedLiteralAggregateReduceLimits::default(),
-            continuation: OperationLimits::default(),
         }
     }
 }
