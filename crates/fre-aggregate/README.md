@@ -7,11 +7,11 @@ whole-match spans, count, and matched-byte sum.
 The input contract is canonical `regex-syntax` 0.8.11 HIR plus an explicit
 `RustByteProfile` token. `PINNED_1_12_4` asserts Unicode-off `regex::bytes`
 semantics. `PINNED_1_12_4_UNICODE_ON_BYTE_STABLE` asserts the pinned
-Unicode-on, `utf8(false)`, byte-boundary-empty profile while retaining the same
-validated byte-stable HIR subset. The exact admitted subset is:
+Unicode-on, `utf8(false)`, byte-boundary-empty profile. The exact admitted
+subset is:
 
-- empty, byte literals, byte classes, ASCII Unicode ranges, and singleton
-  non-ASCII Unicode scalar classes produced by HIR optimization;
+- empty, byte literals, byte classes, and Unicode scalar classes lowered to
+  bounded canonical one- through four-byte UTF-8 paths;
 - concatenation and ordered alternation;
 - absolute `Start` and `End`, LF-aware `StartLF` and `EndLF`, and all six
   ASCII word assertion variants;
@@ -20,9 +20,9 @@ validated byte-stable HIR subset. The exact admitted subset is:
 The default compiler entry point rejects capture nodes. The explicit
 whole-match entry point treats capture children transparently inside the
 bounded validation/lowering traversals and reports exact erased annotations
-and work; it does not implement a capture API. Non-singleton non-ASCII Unicode
-classes, Unicode word assertions, and CRLF-aware line assertions are typed refusals.
-This crate makes no RE2, variable-width Unicode, or capture-history claim.
+and work; it does not implement a capture API. Unicode word assertion forms
+other than the positive boundary and CRLF-aware line assertions are typed
+refusals. This crate makes no RE2 or capture-history claim.
 
 ## Construction
 

@@ -30,7 +30,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 7;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 8;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -124,11 +124,11 @@ pub enum AggregateContinuationSemantics {
     /// Rust bytes with Unicode disabled and empty matches at every byte
     /// boundary.
     UnicodeOffByteBoundaries,
-    /// Rust bytes with Unicode enabled, `utf8(false)` and
-    /// `utf8_empty(false)`, restricted to canonical HIR whose consuming and
-    /// assertion transitions are byte-stable. Positive Unicode word-boundary
-    /// plans additionally make a typed admission refusal on malformed UTF-8.
-    UnicodeOnByteStableHir,
+    /// Rust bytes with Unicode enabled, `utf8(false)` and `utf8_empty(false)`.
+    /// Scalar classes use canonical UTF-8 paths; raw byte HIR stays byte
+    /// oriented. Positive Unicode word-boundary plans additionally make a
+    /// typed admission refusal on malformed UTF-8.
+    UnicodeOnUtf8ScalarHir,
 }
 
 /// Facade identity that prevents the same byte program from erasing the
@@ -528,8 +528,8 @@ pub struct AggregateBuilder {
 
 impl AggregateBuilder {
     /// Start from the pinned Rust byte profile. Unicode defaults to enabled;
-    /// exact literals and byte-stable continuation HIR are admitted in that
-    /// mode; variable-width Unicode transitions remain typed refusals.
+    /// exact literals and bounded UTF-8 scalar continuation HIR are admitted
+    /// in that mode.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {
@@ -549,7 +549,7 @@ impl AggregateBuilder {
     }
 
     /// Set Unicode syntax mode. `true` admits nonempty exact literals and the
-    /// separately certified byte-stable continuation subset.
+    /// separately certified UTF-8 scalar continuation subset.
     #[must_use]
     pub fn unicode(mut self, enabled: bool) -> Self {
         self.profile.options.unicode = enabled;
@@ -934,7 +934,7 @@ impl AggregateBuilder {
             build: AggregateBuildAccounting::Continuation(compile),
             plan_identity: AggregatePlanIdentity::Continuation(AggregateContinuationIdentity {
                 semantics: if unicode {
-                    AggregateContinuationSemantics::UnicodeOnByteStableHir
+                    AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
                 } else {
                     AggregateContinuationSemantics::UnicodeOffByteBoundaries
                 },

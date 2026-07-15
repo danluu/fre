@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
+use regex_syntax::utf8::Utf8Sequences;
 
 use crate::accounting::CompileAccounting;
 use crate::error::{add, enforce, mul};
@@ -12,11 +13,10 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 /// HIR intentionally does not retain every parser option. In particular, an
 /// empty HIR cannot reveal whether Unicode mode was enabled. Passing this
 /// token asserts both the pinned parser configuration and the empty-match
-/// boundary policy. Unicode-on callers receive only the byte-stable HIR
-/// subset: literals, byte classes, ASCII Unicode ranges, singleton Unicode
-/// scalar classes, byte-oriented assertions, positive Unicode word boundaries,
-/// and their regular composition. Non-singleton non-ASCII Unicode classes and
-/// the other Unicode word assertion forms remain typed refusals.
+/// boundary policy. Unicode-on callers receive literals, byte classes, Unicode
+/// scalar classes lowered to canonical UTF-8 paths, byte-oriented assertions,
+/// positive Unicode word boundaries, and their regular composition. The other
+/// Unicode word assertion forms remain typed refusals.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
     unicode: bool,
@@ -28,14 +28,14 @@ impl RustByteProfile {
     pub const PINNED_1_12_4: Self = Self { unicode: false };
 
     /// Pinned Unicode-on Rust-bytes profile with `utf8(false)` and
-    /// `utf8_empty(false)`, restricted by validation to byte-stable HIR.
+    /// `utf8_empty(false)`, with scalar classes lowered to canonical UTF-8.
     /// Positive Unicode word boundaries additionally require valid UTF-8 at
     /// operation admission.
     pub const PINNED_1_12_4_UNICODE_ON_BYTE_STABLE: Self = Self { unicode: true };
 
     const fn identity_domain(self) -> &'static [u8] {
         if self.unicode {
-            b"fre.aggregate.rust.bytes.unicode-on-byte-stable.v1"
+            b"fre.aggregate.rust.bytes.unicode-on-utf8-scalar.v2"
         } else {
             // Preserve the pre-existing Unicode-off identities exactly.
             b"fre.aggregate.rust.bytes.unicode-off.v2"
@@ -193,6 +193,8 @@ impl CompileBudget {
                 capture_erasure_work: 0,
                 literal_bytes: 0,
                 class_ranges: 0,
+                utf8_sequences: 0,
+                utf8_byte_ranges: 0,
                 look_assertions: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
@@ -355,24 +357,8 @@ fn validate_unicode_class(
     profile: RustByteProfile,
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
-    for range in class.ranges() {
-        if !range.end().is_ascii() {
-            if !profile.unicode || range.start() != range.end() {
-                return Err(Error::Unsupported(Unsupported::UnicodeClass));
-            }
-            let encoded_bytes = range.start().len_utf8();
-            budget.charge(encoded_bytes)?;
-            budget.accounting.literal_bytes = add(
-                budget.accounting.literal_bytes,
-                encoded_bytes,
-                Resource::LiteralBytes,
-            )?;
-            enforce(
-                budget.accounting.literal_bytes,
-                budget.limits.max_literal_bytes,
-                Resource::LiteralBytes,
-            )?;
-        }
+    if !profile.unicode && class.ranges().iter().any(|range| !range.end().is_ascii()) {
+        return Err(Error::Unsupported(Unsupported::UnicodeClass));
     }
     let ranges = class.ranges().len();
     budget.charge(ranges)?;
@@ -385,7 +371,37 @@ fn validate_unicode_class(
         budget.accounting.class_ranges,
         budget.limits.max_class_ranges,
         Resource::ClassRanges,
-    )
+    )?;
+    if profile.unicode {
+        for range in class.ranges() {
+            for sequence in Utf8Sequences::new(range.start(), range.end()) {
+                budget.charge(1)?;
+                budget.accounting.utf8_sequences = add(
+                    budget.accounting.utf8_sequences,
+                    1,
+                    Resource::Utf8Sequences,
+                )?;
+                enforce(
+                    budget.accounting.utf8_sequences,
+                    budget.limits.max_utf8_sequences,
+                    Resource::Utf8Sequences,
+                )?;
+                let byte_ranges = sequence.as_slice().len();
+                budget.charge(byte_ranges)?;
+                budget.accounting.utf8_byte_ranges = add(
+                    budget.accounting.utf8_byte_ranges,
+                    byte_ranges,
+                    Resource::Utf8ByteRanges,
+                )?;
+                enforce(
+                    budget.accounting.utf8_byte_ranges,
+                    budget.limits.max_utf8_byte_ranges,
+                    Resource::Utf8ByteRanges,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn push_children<'a>(
@@ -560,35 +576,47 @@ impl<'a> Builder<'a> {
         class: &regex_syntax::hir::ClassUnicode,
         continuation: usize,
     ) -> Result<usize, Error> {
+        if self.profile.unicode {
+            let mut fallback = None;
+            for range in class.ranges() {
+                // These paths are disjoint. Stable source order affects only
+                // plan identity, not leftmost-first selection.
+                for sequence in Utf8Sequences::new(range.start(), range.end()) {
+                    let mut next = continuation;
+                    for byte_range in sequence.as_slice().iter().rev() {
+                        self.budget.charge(inclusive_byte_width(
+                            byte_range.start,
+                            byte_range.end,
+                        )?)?;
+                        let mut bytes = ByteSet::empty();
+                        bytes.insert_range(byte_range.start, byte_range.end);
+                        next = self.push(Inst::Consume { bytes, next })?;
+                    }
+                    fallback = Some(match fallback {
+                        None => next,
+                        Some(previous) => self.push(Inst::Split {
+                            preferred: next,
+                            fallback: previous,
+                        })?,
+                    });
+                }
+            }
+            return fallback.ok_or(Error::InternalInvariant("empty Unicode scalar class"));
+        }
+
         let mut entry = None;
         for range in class.ranges() {
-            let next = if range.end().is_ascii() {
-                let start = u8::try_from(u32::from(range.start()))
-                    .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
-                let end = u8::try_from(u32::from(range.end()))
-                    .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
-                self.budget.charge(inclusive_byte_width(start, end)?)?;
-                let mut bytes = ByteSet::empty();
-                bytes.insert_range(start, end);
-                self.push(Inst::Consume {
-                    bytes,
-                    next: continuation,
-                })?
-            } else {
-                if !self.profile.unicode || range.start() != range.end() {
-                    return Err(Error::Unsupported(Unsupported::UnicodeClass));
-                }
-                let mut encoded = [0_u8; 4];
-                let scalar = range.start().encode_utf8(&mut encoded);
-                let mut next = continuation;
-                for &byte in scalar.as_bytes().iter().rev() {
-                    self.budget.charge(1)?;
-                    let mut bytes = ByteSet::empty();
-                    bytes.insert(byte);
-                    next = self.push(Inst::Consume { bytes, next })?;
-                }
-                next
-            };
+            let start = u8::try_from(u32::from(range.start()))
+                .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
+            let end = u8::try_from(u32::from(range.end()))
+                .map_err(|_| Error::Unsupported(Unsupported::UnicodeClass))?;
+            self.budget.charge(inclusive_byte_width(start, end)?)?;
+            let mut bytes = ByteSet::empty();
+            bytes.insert_range(start, end);
+            let next = self.push(Inst::Consume {
+                bytes,
+                next: continuation,
+            })?;
             entry = Some(match entry {
                 None => next,
                 Some(preferred) => self.push(Inst::Split {

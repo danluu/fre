@@ -6,7 +6,8 @@ use regex_syntax::hir::Look;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// Unicode scalar classes require a variable-width UTF-8 construction.
+    /// A non-ASCII Unicode scalar class was supplied under the Unicode-off
+    /// direct-HIR profile.
     UnicodeClass,
     /// Captures are not erased by this capture-free operation boundary.
     Capture,
@@ -35,6 +36,8 @@ pub enum Resource {
     HirStackItems,
     LiteralBytes,
     ClassRanges,
+    Utf8Sequences,
+    Utf8ByteRanges,
     LookAssertions,
     RepeatBound,
     ProgramStates,

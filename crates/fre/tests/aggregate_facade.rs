@@ -664,7 +664,7 @@ fn unicode_empty_bytes_oracle_and_facade_use_every_byte_boundary() {
             count.build_report().plan_identity,
             AggregatePlanIdentity::Continuation(identity)
                 if identity.semantics
-                    == AggregateContinuationSemantics::UnicodeOnByteStableHir
+                    == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
         ));
         assert_eq!(
             count
@@ -731,7 +731,7 @@ fn unicode_byte_stable_continuations_match_pinned_bytes_oracle_for_all_operation
                 spans.report().identity.plan_identity,
                 AggregatePlanIdentity::Continuation(identity)
                     if identity.semantics
-                        == AggregateContinuationSemantics::UnicodeOnByteStableHir
+                        == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
             ));
 
             let count = builder()
@@ -823,7 +823,7 @@ fn unicode_profile_local_raw_byte_literal_uses_byte_stable_continuation() {
     assert!(matches!(
         count.build_report().plan_identity,
         AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
     ));
     assert_eq!(
         count
@@ -868,7 +868,7 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             continuation.build_report().plan_identity,
             AggregatePlanIdentity::Continuation(identity)
                 if identity.semantics
-                    == AggregateContinuationSemantics::UnicodeOnByteStableHir
+                    == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
         ));
         assert!(matches!(
             aggregate_builder(pattern)
@@ -897,7 +897,7 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
     assert!(matches!(
         local_case_sensitive.build_report().plan_identity,
         AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
     ));
     assert!(matches!(
         aggregate_builder(r"(?-i:a)")
@@ -933,7 +933,7 @@ fn unicode_singleton_case_folds_use_byte_stable_continuation() {
     assert!(matches!(
         folded_russian.build_report().plan_identity,
         AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
     ));
     assert_eq!(
         folded_russian

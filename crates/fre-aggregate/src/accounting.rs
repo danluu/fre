@@ -12,6 +12,10 @@ pub struct CompileAccounting {
     pub capture_erasure_work: usize,
     pub literal_bytes: usize,
     pub class_ranges: usize,
+    /// Canonical variable-width UTF-8 paths produced from scalar ranges.
+    pub utf8_sequences: usize,
+    /// Byte ranges across the canonical UTF-8 paths.
+    pub utf8_byte_ranges: usize,
     /// Supported zero-width look nodes observed exactly once during bounded
     /// validation. Repetition expansion is accounted separately by states.
     pub look_assertions: usize,

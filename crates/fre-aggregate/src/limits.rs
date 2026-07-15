@@ -6,6 +6,10 @@ pub struct CompileLimits {
     pub max_hir_stack_items: usize,
     pub max_literal_bytes: usize,
     pub max_class_ranges: usize,
+    /// Maximum canonical UTF-8 paths emitted from Unicode scalar ranges.
+    pub max_utf8_sequences: usize,
+    /// Maximum byte ranges across all canonical UTF-8 paths.
+    pub max_utf8_byte_ranges: usize,
     pub max_look_assertions: usize,
     pub max_repeat_bound: u32,
     pub max_program_states: usize,
@@ -22,6 +26,8 @@ impl Default for CompileLimits {
             max_hir_stack_items: 4_096,
             max_literal_bytes: 1 << 20,
             max_class_ranges: 1 << 16,
+            max_utf8_sequences: 1 << 18,
+            max_utf8_byte_ranges: 1 << 20,
             max_look_assertions: 1 << 16,
             max_repeat_bound: 1_000,
             max_program_states: 1 << 16,
