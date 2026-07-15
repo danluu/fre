@@ -4306,6 +4306,35 @@ mod tests {
     }
 
     #[test]
+    fn current_fre_capture_models_preserve_priority_optional_and_per_line_boundaries() {
+        let limits = RunLimits::default();
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[r"(a|(ab))(b)?".to_string()],
+                b"ab ab",
+                false,
+                false,
+                &limits,
+            ),
+            6,
+            "aggregate-capture-history",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "grep-captures",
+                &[r"(a)(b)?".to_string()],
+                b"a\nab\nx",
+                false,
+                false,
+                &limits,
+            ),
+            5,
+            "aggregate-capture-history",
+        );
+    }
+
+    #[test]
     fn current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
