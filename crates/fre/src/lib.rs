@@ -35,7 +35,7 @@ pub use aggregate::{
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
     AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult, AggregateSpans,
     AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarIdentity,
-    AggregateUnicodeScalarSemantics,
+    AggregateUnicodeScalarSemantics, AggregateWordRunBuildAccounting, AggregateWordRunIdentity,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,

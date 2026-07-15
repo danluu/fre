@@ -1002,7 +1002,7 @@ fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
     let required = [
         "fre.rebar.klv-runner.v1",
         "protocol=stratified-v1",
-        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v2",
+        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v3",
         "report=fre.rebar.comparison.v2",
         "rebar=463d00f31887e84c38467805b9e3122c314b9521",
         "canonical-sha=",

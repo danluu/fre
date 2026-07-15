@@ -658,6 +658,37 @@ fn unicode_word_runs_select_a_linear_plan_and_match_pinned_ranges() {
 }
 
 #[test]
+fn unicode_word_run_windows_observe_outside_context_and_invalid_bytes() {
+    let regex = PortableBuilder::new(r"\b\w{2,}\b")
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(true)
+        .plan_selection(PlanSelection::Auto)
+        .build()
+        .unwrap();
+    let haystack: &[u8] = &[0xFF, b'a', b'b', 0xFF, 0xCE, 0xB1, 0xCE, 0xB2, 0xCE];
+    let cases = [
+        (SearchWindow::new(0, haystack.len()), Some((1, 3))),
+        (SearchWindow::new(1, 3), Some((1, 3))),
+        (SearchWindow::new(2, 3), None),
+        (SearchWindow::new(1, 2), None),
+        (SearchWindow::new(4, 8), Some((4, 8))),
+        (SearchWindow::new(5, 8), None),
+        (SearchWindow::new(4, 7), None),
+    ];
+    for (window, expected) in cases {
+        let (actual, accounting) = regex
+            .find_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            actual.map(|matched| (matched.start(), matched.end())),
+            expected,
+            "window {window:?}"
+        );
+        assert!(accounting.work_or_linear_terms() <= 2 * u64::try_from(haystack.len()).unwrap());
+    }
+}
+
+#[test]
 fn ascii_word_runs_select_a_byte_linear_plan_and_match_pinned_ranges() {
     const PATTERNS: &[&str] = &[r"\b\w{1,}\b", r"\b\w{8,}\b", r"\b\w{25,}\b"];
     let haystacks: &[&[u8]] = &[
