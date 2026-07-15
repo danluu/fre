@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1122,7 +1122,8 @@ impl ForwardAnchoredPlan {
         match self.implementation {
             ClassImplementation::InclusiveRange { start, end }
                 if start == end
-                    && (SINGLE_CANDIDATE_MIN..=SINGLE_CANDIDATE_MAX).contains(&bytes.len()) =>
+                    && bytes.len() >= SINGLE_CANDIDATE_MIN
+                    && bytes.len() <= SINGLE_CANDIDATE_MAX =>
             {
                 scan_single_candidate_prefix(bytes, start)
             }
@@ -1347,7 +1348,7 @@ const SWAR_LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const SWAR_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
 const SINGLE_CANDIDATE_MIN: usize = 73;
-const SINGLE_CANDIDATE_MAX: usize = 4_096;
+const SINGLE_CANDIDATE_MAX: usize = 65_536;
 const PAIR_SWAR_MIN: usize = 73;
 const PAIR_SWAR_MAX: usize = 65_536;
 const PAIR_NEON_BLOCK: usize = 16;
@@ -2875,7 +2876,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15"
+            "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16"
         );
         assert_eq!(
             pair.implementation(),

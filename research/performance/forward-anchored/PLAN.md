@@ -86,9 +86,9 @@ search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains
-`anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15`, and `Auto`
+`anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16`, and `Auto`
 retains its pre-existing strategy for both shapes. Exact singleton-class
-candidate prefixes from 73 through 4,096 bytes use the same dedicated
+candidate prefixes from 73 through 65,536 bytes use the same dedicated
 equality-only 32-byte verifier used below the former ceiling. Pair candidate
 prefixes from 73 through 65,536 bytes use safe 16-byte membership blocks that
 lower to AArch64 NEON; a failure-only cold helper preserves prior native-word
