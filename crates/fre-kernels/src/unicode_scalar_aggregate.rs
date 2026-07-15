@@ -858,9 +858,21 @@ impl UnicodeScalarAggregatePlan {
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
         match self.repetition {
-            Repetition::ExactlyOne => self.execute_mode::<false, false>(haystack, window, upper),
-            Repetition::OneOrMoreGreedy => self.execute_mode::<true, true>(haystack, window, upper),
-            Repetition::OneOrMoreLazy => self.execute_mode::<true, false>(haystack, window, upper),
+            Repetition::ExactlyOne => {
+                self.execute_mode::<false, false, false>(haystack, window, upper)
+            }
+            Repetition::OneOrMoreGreedy if self.non_ascii.is_empty() => {
+                self.execute_mode::<true, true, false>(haystack, window, upper)
+            }
+            Repetition::OneOrMoreGreedy => {
+                self.execute_mode::<true, true, true>(haystack, window, upper)
+            }
+            Repetition::OneOrMoreLazy if self.non_ascii.is_empty() => {
+                self.execute_mode::<true, false, false>(haystack, window, upper)
+            }
+            Repetition::OneOrMoreLazy => {
+                self.execute_mode::<true, false, true>(haystack, window, upper)
+            }
         }
     }
 
@@ -869,7 +881,7 @@ impl UnicodeScalarAggregatePlan {
         clippy::arithmetic_side_effects,
         reason = "the monomorphized streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled while removing all repetition-mode branches from execution"
     )]
-    fn execute_mode<const RUN: bool, const GREEDY: bool>(
+    fn execute_mode<const RUN: bool, const GREEDY: bool, const CACHE_RANGE: bool>(
         &self,
         haystack: &[u8],
         window: Window,
@@ -1017,7 +1029,7 @@ impl UnicodeScalarAggregatePlan {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual non-ASCII membership tests",
                         })?;
-                    let (contains, comparisons) = if RUN {
+                    let (contains, comparisons) = if CACHE_RANGE {
                         self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
                     } else {
                         self.contains_non_ascii(scalar)?
