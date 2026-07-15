@@ -3,7 +3,7 @@ use core::fmt::Write as _;
 use crate::{
     AggregateBuildError, AggregateBuildLimits, AggregateBuilder, AggregateCountRegex,
     AggregateExecutionError, AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits,
-    AggregateSpans, AggregateSpansRegex, AggregateStrategy, Match, RustProfile,
+    AggregateSpans, AggregateSpansRegex, AggregateStrategy, RustProfile,
 };
 
 const FLATTEN_PATTERN: &str = r">[^\n]*\n|\n";
@@ -577,7 +577,7 @@ impl RegexReduxBuilder {
                     "regex-redux component is not a continuation plan",
                 ));
             };
-            component_ids.push(identity.bytes());
+            component_ids.push(identity.program.bytes());
         }
         let (pipeline_id, observed_identity_work) = pipeline_identity(&component_ids)?;
         if observed_identity_work != identity_work {
