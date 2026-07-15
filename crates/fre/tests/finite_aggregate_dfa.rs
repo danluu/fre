@@ -3,8 +3,7 @@ use std::fmt::Write as _;
 use fre::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanKind,
-    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateReduceError, RustProfile,
+    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -106,7 +105,7 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
 }
 
 #[test]
-fn finite_dfa_planner_and_kernel_limits_fail_with_typed_ownership() {
+fn finite_dfa_planner_limit_fails_with_typed_ownership() {
     let pattern = r"(?:cat|dog|mouse)";
     let baseline = builder(pattern).build_count().unwrap();
     let work = baseline.build_report().finite_planner_work;
@@ -124,20 +123,48 @@ fn finite_dfa_planner_and_kernel_limits_fail_with_typed_ownership() {
         planner_error,
         AggregateBuildError::FinitePlannerWorkLimit { .. }
     ));
+}
 
-    let mut kernel_limits = AggregateBuildLimits::default();
-    kernel_limits.finite_literal.max_trie_states = 1;
-    let kernel_error = builder(pattern)
-        .limits(kernel_limits)
-        .build_count()
-        .unwrap_err();
-    assert!(matches!(
-        kernel_error,
-        AggregateBuildError::FiniteLiteralBuild {
-            source: OrderedLiteralAggregateBuildError::TrieStatesLimit { .. },
-            ..
-        }
-    ));
+#[test]
+fn finite_dfa_auto_falls_back_on_count_and_span_sum_kernel_limits() {
+    let pattern = r"(?P<word>cat|dog|mouse)";
+    let haystack = b"cat mouse dog cat";
+    let expected = oracle(pattern, haystack);
+
+    let mut count_limits = AggregateBuildLimits::default();
+    count_limits.finite_literal.max_trie_states = 1;
+    let count = builder(pattern).limits(count_limits).build_count().unwrap();
+    assert_eq!(
+        count.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert!(count.build_report().finite_planner_work > 0);
+    assert_eq!(count.build_report().captures_erased, 1);
+    assert_eq!(
+        count
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected.0
+    );
+
+    let mut span_limits = AggregateBuildLimits::default();
+    span_limits.finite_literal.max_dfa_cells = 1;
+    let span_sum = builder(pattern)
+        .limits(span_limits)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        span_sum.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert!(span_sum.build_report().finite_planner_work > 0);
+    assert_eq!(span_sum.build_report().captures_erased, 1);
+    assert_eq!(
+        span_sum
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected.1
+    );
 }
 
 fn alternation(count: usize) -> String {

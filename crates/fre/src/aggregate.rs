@@ -272,6 +272,11 @@ pub struct AggregateBuildReport {
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
     /// Checked finite-language analysis/expansion work, or zero when skipped.
+    /// This remains nonzero when `Auto` proves a finite language but a typed
+    /// caller limit rejects the optional DFA preflight and continuation is
+    /// selected. A rejected DFA publishes neither build accounting nor plan
+    /// identity; its caller-bounded preflight is not double-counted as work of
+    /// the selected continuation artifact.
     pub finite_planner_work: u64,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
@@ -619,6 +624,26 @@ pub struct AggregateBuilder {
     limits: AggregateBuildLimits,
     selection: AggregatePlanSelection,
     strategy: AggregateStrategy,
+}
+
+/// `Auto` treats the finite DFA as an optional specialization only when its
+/// checked preflight reaches a caller-selected resource ceiling. Errors that
+/// can indicate a broken proof, arithmetic bug, allocator failure, or an
+/// unrepresentable construction stay visible instead of being disguised by a
+/// continuation retry.
+fn finite_build_limit_allows_continuation(source: &OrderedLiteralAggregateBuildError) -> bool {
+    matches!(
+        source,
+        OrderedLiteralAggregateBuildError::PatternLimit { .. }
+            | OrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
+            | OrderedLiteralAggregateBuildError::IdentityBytesLimit { .. }
+            | OrderedLiteralAggregateBuildError::TrieStatesLimit { .. }
+            | OrderedLiteralAggregateBuildError::DfaCellsLimit { .. }
+            | OrderedLiteralAggregateBuildError::WorkLimit { .. }
+            | OrderedLiteralAggregateBuildError::ScratchLimit { .. }
+            | OrderedLiteralAggregateBuildError::PersistentLimit { .. }
+            | OrderedLiteralAggregateBuildError::PeakLimit { .. }
+    )
 }
 
 impl AggregateBuilder {
@@ -1069,34 +1094,26 @@ impl AggregateBuilder {
                         selection,
                         detail: "finite capture-erasure accounting overflow",
                     })?;
-            let (engine, build, operation_id) = match operation {
+            let finite_build = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
-                    let engine = OrderedLiteralCountPlan::build(&words, limits.finite_literal)
-                        .map_err(|source| AggregateBuildError::FiniteLiteralBuild {
-                            operation,
-                            selection,
-                            source,
-                        })?;
-                    let build = engine.build_accounting();
-                    (
-                        AggregateEngine::FiniteCount(engine),
-                        build,
-                        ORDERED_LITERAL_COUNT_PLAN_ID,
-                    )
+                    OrderedLiteralCountPlan::build(&words, limits.finite_literal).map(|engine| {
+                        let build = engine.build_accounting();
+                        (
+                            AggregateEngine::FiniteCount(engine),
+                            build,
+                            ORDERED_LITERAL_COUNT_PLAN_ID,
+                        )
+                    })
                 }
                 AggregateOperation::SpanSum => {
-                    let engine = OrderedLiteralSpanSumPlan::build(&words, limits.finite_literal)
-                        .map_err(|source| AggregateBuildError::FiniteLiteralBuild {
-                            operation,
-                            selection,
-                            source,
-                        })?;
-                    let build = engine.build_accounting();
-                    (
-                        AggregateEngine::FiniteSpanSum(engine),
-                        build,
-                        ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-                    )
+                    OrderedLiteralSpanSumPlan::build(&words, limits.finite_literal).map(|engine| {
+                        let build = engine.build_accounting();
+                        (
+                            AggregateEngine::FiniteSpanSum(engine),
+                            build,
+                            ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                        )
+                    })
                 }
                 AggregateOperation::Spans => {
                     return Err(AggregateBuildError::InternalInvariant {
@@ -1106,35 +1123,47 @@ impl AggregateBuilder {
                     });
                 }
             };
-            let report = AggregateBuildReport {
-                schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                syntax_key,
-                admission,
-                syntax,
-                operation,
-                selection,
-                plan: AggregatePlanKind::FiniteLiteralDfa,
-                continuation_strategy: None,
-                capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
-                planner_work,
-                unicode_scalar_planner_work,
-                finite_planner_work,
-                capture_erasure_work,
-                captures_erased: expected_captures,
-                build: AggregateBuildAccounting::FiniteLiteral(build),
-                plan_identity: AggregatePlanIdentity::FiniteLiteral(
-                    AggregateFiniteLiteralIdentity {
-                        algorithm: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-                        operation: operation_id,
-                    },
-                ),
-                retained_capacity_bytes: build.persistent_bytes,
-            };
-            return Ok(AggregatePlan {
-                engine,
-                limits,
-                report,
-            });
+            match finite_build {
+                Ok((engine, build, operation_id)) => {
+                    let report = AggregateBuildReport {
+                        schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        syntax_key,
+                        admission,
+                        syntax,
+                        operation,
+                        selection,
+                        plan: AggregatePlanKind::FiniteLiteralDfa,
+                        continuation_strategy: None,
+                        capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                        planner_work,
+                        unicode_scalar_planner_work,
+                        finite_planner_work,
+                        capture_erasure_work,
+                        captures_erased: expected_captures,
+                        build: AggregateBuildAccounting::FiniteLiteral(build),
+                        plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                            AggregateFiniteLiteralIdentity {
+                                algorithm: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                                operation: operation_id,
+                            },
+                        ),
+                        retained_capacity_bytes: build.persistent_bytes,
+                    };
+                    return Ok(AggregatePlan {
+                        engine,
+                        limits,
+                        report,
+                    });
+                }
+                Err(source) if finite_build_limit_allows_continuation(&source) => {}
+                Err(source) => {
+                    return Err(AggregateBuildError::FiniteLiteralBuild {
+                        operation,
+                        selection,
+                        source,
+                    });
+                }
+            }
         }
         let continuation_profile = if unicode {
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
@@ -1982,7 +2011,10 @@ impl AggregateSpanSumResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{UnicodeScalarInspectionError, charge_unicode_scalar_inspection_work};
+    use super::{
+        OrderedLiteralAggregateBuildError, UnicodeScalarInspectionError,
+        charge_unicode_scalar_inspection_work, finite_build_limit_allows_continuation,
+    };
 
     #[test]
     fn unicode_scalar_inspection_overflow_leaves_counter_unchanged() {
@@ -1992,5 +2024,67 @@ mod tests {
             Err(UnicodeScalarInspectionError::Overflow)
         ));
         assert_eq!(work, usize::MAX);
+    }
+
+    #[test]
+    fn finite_auto_fallback_classifies_only_caller_resource_limits() {
+        for limit in [
+            OrderedLiteralAggregateBuildError::PatternLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::PatternBytesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::IdentityBytesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::TrieStatesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::DfaCellsLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::WorkLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::ScratchLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::PersistentLimit {
+                needed: 2,
+                limit: 1,
+            },
+            OrderedLiteralAggregateBuildError::PeakLimit {
+                needed: 2,
+                limit: 1,
+            },
+        ] {
+            assert!(finite_build_limit_allows_continuation(&limit));
+        }
+
+        for hard_error in [
+            OrderedLiteralAggregateBuildError::EmptyPatternSet,
+            OrderedLiteralAggregateBuildError::RepresentationLimit {
+                structure: "test",
+                needed: 2,
+            },
+            OrderedLiteralAggregateBuildError::AllocationFailed {
+                structure: "test",
+                additional: 1,
+            },
+            OrderedLiteralAggregateBuildError::InternalInvariant { detail: "test" },
+            OrderedLiteralAggregateBuildError::ArithmeticOverflow {
+                computation: "test",
+            },
+        ] {
+            assert!(!finite_build_limit_allows_continuation(&hard_error));
+        }
     }
 }

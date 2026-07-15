@@ -19,6 +19,17 @@ ordered word beginning at each byte. A bounded initial/progressed DP ring then
 implements leftmost-first non-overlap and adjacent-empty suppression without
 restarting the search.
 
+Finite selection is opportunistic under `Auto`. If the extracted language is
+eligible but DFA preflight crosses a caller-supplied pattern, byte, identity,
+trie-state, cell, work, scratch, persistent, or peak limit, construction falls
+through to the already certified continuation plan. The report retains the
+nonzero finite extraction work, but publishes only continuation build
+accounting and identity; no partial DFA can escape. Empty-language,
+representation, allocation, arithmetic, and internal-invariant errors remain
+hard failures because they are not evidence that a configured resource ceiling
+merely rejected an optional specialization. `ForceContinuation` still skips
+the finite attempt entirely.
+
 ## Certificate and bounds
 
 Let:
