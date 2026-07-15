@@ -658,28 +658,28 @@ impl PortableBuilder {
                 },
             });
         }
-        if self.selection == PlanSelection::Auto {
-            if let Some(plan) = unicode_word_run::extract(&rust.hir) {
-                return Ok(PortableRegex {
-                    plan: PortablePlan::UnicodeWordRun(plan),
+        if self.selection == PlanSelection::Auto
+            && let Some(plan) = unicode_word_run::extract(&rust.hir)
+        {
+            return Ok(PortableRegex {
+                plan: PortablePlan::UnicodeWordRun(plan),
+                profile: profile.clone(),
+                limits: self.limits,
+                report: BuildReport {
                     profile: profile.clone(),
-                    limits: self.limits,
-                    report: BuildReport {
-                        profile: profile.clone(),
-                        admission,
-                        syntax,
-                        plan: PlanKind::UnicodeWordRun,
-                        planner_work: 1,
-                        lowering: None,
-                        states: 0,
-                        edges: 0,
-                        plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
-                        minimum_match_bytes,
-                        required_literal: None,
-                        forward_anchored: None,
-                    },
-                });
-            }
+                    admission,
+                    syntax,
+                    plan: PlanKind::UnicodeWordRun,
+                    planner_work: 1,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
+                    minimum_match_bytes,
+                    required_literal: None,
+                    forward_anchored: None,
+                },
+            });
         }
         let mut planner_work = 0_u64;
         if matches!(

@@ -20,14 +20,17 @@ pub struct Accounting {
 }
 
 impl Accounting {
+    #[must_use]
     pub const fn work(self) -> u64 {
         self.work
     }
 
+    #[must_use]
     pub const fn bytes_examined(self) -> usize {
         self.bytes_examined
     }
 
+    #[must_use]
     pub const fn scalars_decoded(self) -> usize {
         self.scalars_decoded
     }
@@ -73,7 +76,7 @@ impl Plan {
     }
 
     pub(crate) fn find_window(
-        &self,
+        self,
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
@@ -202,7 +205,7 @@ fn parse_word_class() -> Option<regex_syntax::hir::ClassUnicode> {
 }
 
 fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error> {
-    let needed = accounting.work.checked_add(1).unwrap_or(u64::MAX);
+    let needed = accounting.work.saturating_add(1);
     if needed > limits.max_work {
         return Err(Error::WorkLimitExceeded {
             needed,
