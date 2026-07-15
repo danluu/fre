@@ -813,11 +813,10 @@ impl UnicodeScalarAggregatePlan {
                         computation: "actual ASCII-run match events",
                     },
                 )?;
-                let run_matches = u64::try_from(run_matches).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
+                let run_matches =
+                    u64::try_from(run_matches).map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "actual ASCII-run matches",
-                    }
-                })?;
+                    })?;
                 actual.count = actual.count.checked_add(run_matches).ok_or(
                     ReduceError::ArithmeticOverflow {
                         computation: "actual ASCII-run count",
@@ -1584,12 +1583,8 @@ mod tests {
             for scale in [1_usize, 2, 4] {
                 let haystack = unit.repeat(scale);
                 let expected = matches_per_unit * u64::try_from(scale).unwrap();
-                let count = plan
-                    .count(&haystack, ReduceLimits::unlimited())
-                    .unwrap();
-                let sum = plan
-                    .span_sum(&haystack, ReduceLimits::unlimited())
-                    .unwrap();
+                let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                let sum = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
                 assert_eq!(count.count, expected);
                 assert_eq!(sum.span_sum, expected);
                 let actual = count.accounting.actual;
