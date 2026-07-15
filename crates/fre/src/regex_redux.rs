@@ -160,7 +160,14 @@ impl core::fmt::Display for RegexReduxBuildError {
     }
 }
 
-impl std::error::Error for RegexReduxBuildError {}
+impl std::error::Error for RegexReduxBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Component { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Typed replacement or composite execution refusal.
 #[derive(Debug)]
@@ -226,7 +233,14 @@ impl core::fmt::Display for RegexReduxRunError {
     }
 }
 
-impl std::error::Error for RegexReduxRunError {}
+impl std::error::Error for RegexReduxRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Aggregate { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Generic bounded non-empty global replacement component.
 #[derive(Debug)]
@@ -277,13 +291,10 @@ impl RegexReduxReplacementPlan {
             .strategy(AggregateStrategy::ReverseSequentialRows)
             .build_spans()
             .map_err(|source| RegexReduxBuildError::Component { stage, source })?;
-        let mut replacement_bytes = Vec::new();
-        replacement_bytes
-            .try_reserve_exact(replacement.len())
+        let replacement_bytes = fre_exact_alloc::copy_exact(replacement.as_bytes())
             .map_err(|_| RegexReduxBuildError::ReplacementAllocationFailed {
                 bytes: replacement.len(),
             })?;
-        replacement_bytes.extend_from_slice(replacement.as_bytes());
         let replacement = replacement_bytes.into_boxed_slice();
         Ok(Self {
             regex,
@@ -352,17 +363,9 @@ impl RegexReduxReplacementPlan {
                 limit: limits.max_copy_work,
             });
         }
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_len)
+        let mut output = fre_exact_alloc::vec_with_exact_capacity(output_len)
             .map_err(|_| RegexReduxRunError::AllocationFailed { bytes: output_len })?;
-        let allocated = output.capacity();
-        if allocated > limits.max_output_bytes {
-            return Err(RegexReduxRunError::OutputBytes {
-                required: allocated,
-                limit: limits.max_output_bytes,
-            });
-        }
+        let allocated = output_len;
         let mut cursor = 0_usize;
         for matched in &matches {
             if matched.start < cursor || matched.end > input.len() {
@@ -458,7 +461,8 @@ impl CountPlan {
                 source: Box::new(source),
             }
         })?;
-        let value = usize::try_from(result.value()).map_err(|_| RegexReduxRunError::ArithmeticOverflow)?;
+        let value = usize::try_from(result.value())
+            .map_err(|_| RegexReduxRunError::ArithmeticOverflow)?;
         enforce_events(value, limits.max_stage_events)?;
         Ok(value)
     }
@@ -528,9 +532,7 @@ impl RegexReduxBuilder {
             self.limits.aggregate,
             "flatten",
         )?;
-        let mut variants = Vec::new();
-        variants
-            .try_reserve_exact(VARIANTS.len())
+        let mut variants = fre_exact_alloc::vec_with_exact_capacity(VARIANTS.len())
             .map_err(|_| RegexReduxBuildError::AllocationFailed {
                 components: VARIANTS.len(),
             })?;
@@ -541,9 +543,7 @@ impl RegexReduxBuilder {
                 self.limits.aggregate,
             )?);
         }
-        let mut substitutions = Vec::new();
-        substitutions
-            .try_reserve_exact(SUBSTITUTIONS.len())
+        let mut substitutions = fre_exact_alloc::vec_with_exact_capacity(SUBSTITUTIONS.len())
             .map_err(|_| RegexReduxBuildError::AllocationFailed {
                 components: SUBSTITUTIONS.len(),
             })?;
@@ -561,9 +561,7 @@ impl RegexReduxBuilder {
             .chain(substitutions.iter().map(|plan| plan.regex.build_report()));
         let mut retained_capacity_bytes = 0_usize;
         let mut max_component_states = 0_usize;
-        let mut component_ids = Vec::new();
-        component_ids
-            .try_reserve_exact(COMPONENTS)
+        let mut component_ids = fre_exact_alloc::vec_with_exact_capacity(COMPONENTS)
             .map_err(|_| RegexReduxBuildError::AllocationFailed {
                 components: COMPONENTS,
             })?;
@@ -636,8 +634,13 @@ impl RegexReduxPlan {
     ) -> Result<RegexReduxResult, RegexReduxRunError> {
         enforce_input(input.len(), limits.max_input_bytes)?;
         core::str::from_utf8(input).map_err(|_| RegexReduxRunError::InvalidUtf8)?;
+        let stage_limits = RegexReduxRunLimits {
+            // Intermediate input was already produced under the output cap.
+            max_input_bytes: limits.max_output_bytes,
+            ..limits
+        };
         let input_length = input.len();
-        let flattened = self.flatten.replace(input, limits)?;
+        let flattened = self.flatten.replace(input, stage_limits)?;
         let (mut sequence, flatten_events, flatten_copy, flatten_allocated) =
             flattened.into_parts();
         let clean_length = sequence.len();
@@ -647,13 +650,13 @@ impl RegexReduxPlan {
         let mut peak_output_bytes = flatten_allocated;
         let mut variant_counts = [0_usize; 9];
         for (index, plan) in self.variants.iter().enumerate() {
-            let count = plan.count(&sequence, limits)?;
+            let count = plan.count(&sequence, stage_limits)?;
             variant_counts[index] = count;
             total_events = checked_add(total_events, count)?;
             enforce_events(total_events, limits.max_total_events)?;
         }
         for plan in &self.substitutions {
-            let replaced = plan.replace(&sequence, limits)?;
+            let replaced = plan.replace(&sequence, stage_limits)?;
             let (next, events, copied, allocated) = replaced.into_parts();
             total_events = checked_add(total_events, events)?;
             enforce_events(total_events, limits.max_total_events)?;
@@ -667,23 +670,23 @@ impl RegexReduxPlan {
             peak_output_bytes = peak_output_bytes.max(allocated);
             sequence = next;
         }
-        let report_bytes = report_length(&variant_counts, input_length, clean_length, sequence.len())?;
+        let report_bytes = report_length(
+            &variant_counts,
+            input_length,
+            clean_length,
+            sequence.len(),
+        )?;
         if report_bytes > limits.max_report_bytes {
             return Err(RegexReduxRunError::ReportBytes {
                 required: report_bytes,
                 limit: limits.max_report_bytes,
             });
         }
-        let mut report = String::new();
-        report
-            .try_reserve_exact(report_bytes)
+        let report_storage = fre_exact_alloc::vec_with_exact_capacity(report_bytes)
             .map_err(|_| RegexReduxRunError::AllocationFailed { bytes: report_bytes })?;
-        if report.capacity() > limits.max_report_bytes {
-            return Err(RegexReduxRunError::ReportBytes {
-                required: report.capacity(),
-                limit: limits.max_report_bytes,
-            });
-        }
+        let mut report = String::from_utf8(report_storage).map_err(|_| {
+            RegexReduxRunError::InternalInvariant("empty report allocation is not UTF-8")
+        })?;
         for (pattern, count) in VARIANTS.into_iter().zip(variant_counts) {
             writeln!(&mut report, "{pattern} {count}")
                 .map_err(|_| RegexReduxRunError::InternalInvariant("format report variant"))?;
@@ -719,10 +722,15 @@ impl RegexReduxPlan {
 /// Exact observed composite counters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegexReduxAccounting {
+    /// Number of built-in component plans executed.
     pub component_executions: usize,
+    /// Total selected matches across all ordered stages.
     pub match_events: usize,
+    /// Sum of replacement input and output bytes copied.
     pub copy_work: usize,
+    /// Largest exact replacement-output allocation.
     pub peak_output_bytes: usize,
+    /// Exact formatted report bytes.
     pub report_bytes: usize,
 }
 
@@ -738,36 +746,43 @@ pub struct RegexReduxResult {
 }
 
 impl RegexReduxResult {
+    /// Original input byte length.
     #[must_use]
     pub const fn input_length(&self) -> usize {
         self.input_length
     }
 
+    /// Byte length after header and newline removal.
     #[must_use]
     pub const fn clean_length(&self) -> usize {
         self.clean_length
     }
 
+    /// Byte length after all five ordered substitutions.
     #[must_use]
     pub fn final_length(&self) -> usize {
         self.sequence.len()
     }
 
+    /// Final transformed sequence bytes.
     #[must_use]
     pub fn final_sequence(&self) -> &[u8] {
         &self.sequence
     }
 
+    /// Nine variant counts in protocol order.
     #[must_use]
     pub const fn variant_counts(&self) -> &[usize; 9] {
         &self.variant_counts
     }
 
+    /// Complete exact protocol report, including its trailing newline.
     #[must_use]
     pub fn report(&self) -> &str {
         &self.report
     }
 
+    /// Observed bounded composite counters.
     #[must_use]
     pub const fn accounting(&self) -> RegexReduxAccounting {
         self.accounting
@@ -775,12 +790,10 @@ impl RegexReduxResult {
 }
 
 fn require_profile(profile: &RustProfile) -> Result<(), RegexReduxBuildError> {
-    if !matches!(
-        &profile.constructor,
-        fre_syntax::RustConstructor::RebarMeta { .. }
-    ) || profile.options.unicode
-        || profile.options.case_insensitive
-    {
+    let mut required = RustProfile::rebar_1_12_4();
+    required.options.unicode = false;
+    required.options.case_insensitive = false;
+    if profile != &required {
         return Err(RegexReduxBuildError::ProfileMismatch);
     }
     Ok(())

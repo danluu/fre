@@ -99,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "fre-aggregate",
  "fre-automata",
+ "fre-exact-alloc",
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
@@ -111,6 +112,7 @@ dependencies = [
 name = "fre-aggregate"
 version = "0.1.0"
 dependencies = [
+ "fre-exact-alloc",
  "fre-iterator-lab",
  "fre-reference",
  "regex",

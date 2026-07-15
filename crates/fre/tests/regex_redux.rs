@@ -1,6 +1,6 @@
 use fre::{
-    AggregateBuildLimits, AggregateRunLimits, Match, RegexReduxBuilder,
-    RegexReduxReplacementPlan, RegexReduxRunError, RegexReduxRunLimits, RustProfile,
+    AggregateBuildLimits, AggregateRunLimits, RegexReduxBuilder, RegexReduxReplacementPlan,
+    RegexReduxRunError, RegexReduxRunLimits, RustProfile,
 };
 
 fn replacement(pattern: &str, replacement: &str) -> RegexReduxReplacementPlan {
@@ -21,8 +21,12 @@ fn replacement_component_preserves_unmatched_bytes_and_exact_offsets() {
         .expect("bounded replacement");
     assert_eq!(result.output(), b"z<A>-x<A>");
     assert_eq!(
-        result.matches().iter().collect::<Vec<_>>(),
-        vec![Match { start: 1, end: 3 }, Match { start: 5, end: 6 }]
+        result
+            .matches()
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        vec![(1, 3), (5, 6)]
     );
 }
 

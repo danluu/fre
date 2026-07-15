@@ -33,7 +33,9 @@ use fre::{
     LiteralAggregateReduceError, LiteralAggregateReduceLimits,
     OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
+    OrderedLiteralAggregateReduceLimits, PortableBuilder, RegexReduxBuildError,
+    RegexReduxBuildLimits, RegexReduxBuilder, RegexReduxRunError, RegexReduxRunLimits, RustProfile,
+    SearchLimits,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
     UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
@@ -65,7 +67,8 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v9";
+const REGEX_REDUX_EXPECTED_REPORT: &str = "agggtaaa|tttaccct 6\n[cgt]gggtaaa|tttaccc[acg] 26\na[act]ggtaaa|tttacc[agt]t 86\nag[act]gtaaa|tttac[agt]ct 58\nagg[act]taaa|ttta[agt]cct 113\naggg[acg]aaa|ttt[cgt]ccct 31\nagggt[cgt]aa|tt[acg]accct 31\nagggta[cgt]a|t[acg]taccct 32\nagggtaa[cgt]|[acg]ttaccct 43\n\n1016745\n1000000\n547899\n";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 
 const fn default_fre_unicode_compile_artifact_bytes() -> usize {
@@ -357,10 +360,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with valid-UTF-8 Unicode scalar classes and absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum, compile-only canonical Unicode artifacts, ordered build-many count/span-sum, and Unicode-off bounded capture-history count-captures/grep-captures; exact literal, direct Unicode scalar-class, finite ordered literal, ordered build-many literal, or reverse-sequential-rows continuation; compact canonical scalar ranges plus reverse-dense-AC/DP finite reduction; capture preservation is isolated from whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with valid-UTF-8 Unicode scalar classes and absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum, compile-only canonical Unicode artifacts, ordered build-many count/span-sum, Unicode-off bounded capture-history count-captures/grep-captures, and the complete ordered regex-redux composite; exact literal, direct Unicode scalar-class, finite ordered literal, ordered build-many literal, or reverse-sequential-rows continuation; compact canonical scalar ranges plus reverse-dense-AC/DP finite reduction; capture preservation is isolated from whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, bounded Unicode-off finite ordered languages, or a bounded continuation program; scalar root-class routing takes precedence for its Unicode execution shape, while compile alone may fall back to a canonical Unicode artifact under its separate bound when no reusable Unicode execution plan is available; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; Unicode-off one-pattern count-captures/grep-captures use separately compiled exact-span prioritized capture-history replay with independent slot/replay/history/output/work/peak limits; portable grep executes the certified byte-stable K0 subset including canonical valid-UTF-8 Unicode scalar-class paths and absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed, while Unicode-word/CRLF assertions remain typed refusals; multi-pattern or Unicode capture requests, span/capture-history surfaces outside the named reducers, and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, bounded Unicode-off finite ordered languages, or a bounded continuation program; scalar root-class routing takes precedence for its Unicode execution shape, while compile alone may fall back to a canonical Unicode artifact under its separate bound when no reusable Unicode execution plan is available; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; Unicode-off one-pattern count-captures/grep-captures use separately compiled exact-span prioritized capture-history replay with independent slot/replay/history/output/work/peak limits; regex-redux freshly constructs all fifteen fixed Unicode-off continuation components and executes the complete ordered report/replacement protocol; portable grep executes the certified byte-stable K0 subset including canonical valid-UTF-8 Unicode scalar-class paths and absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed, while Unicode-word/CRLF assertions remain typed refusals; multi-pattern or Unicode capture requests, span/capture-history surfaces outside the named reducers, and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1852,6 +1855,7 @@ fn fre_reducer(
         "count-captures" => fre_aggregate_capture_count(request, limits),
         "grep" => fre_grep(request, limits),
         "grep-captures" => fre_aggregate_grep_captures(request, limits),
+        "regex-redux" => fre_regex_redux(request, limits),
         other => Err(ExecutionError::unsupported(format!(
             "current FRE facade has no certified {other} operation"
         ))),
@@ -2165,6 +2169,73 @@ fn continuation_operation_limits(
         max_match_events: event_upper.min(reducer_event_limit),
         max_output_matches: boundaries.min(reducer_matches),
         max_output_bytes: 0,
+        max_span_sum: haystack_len,
+        max_peak_bytes: peak_upper.min(limits.fre_aggregate_peak_bytes),
+        max_work: work_upper.min(limits.fre_aggregate_operation_work),
+    })
+}
+
+/// Derive the stricter two-scan continuation allowance required by complete
+/// span materialization. The output allocation is part of the peak bound and
+/// is admitted before the second scan publishes any span.
+fn continuation_span_operation_limits(
+    haystack_len: usize,
+    program_states: usize,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
+    if program_states == 0 {
+        return Err(ExecutionError::fault(
+            "FRE aggregate span compiler reported a zero-state program",
+        ));
+    }
+    let boundaries = checked_aggregate_add(haystack_len, 1, "span boundary count")?;
+    let record_bytes = checked_aggregate_add(program_states, 1, "span row decision bits")?
+        .div_ceil(8);
+    let row_words = checked_aggregate_mul(program_states, 2, "span row words")?;
+    let row_bytes = checked_aggregate_mul(
+        row_words,
+        core::mem::size_of::<usize>(),
+        "span row bytes",
+    )?;
+    let random_access_upper =
+        checked_aggregate_add(row_bytes, record_bytes, "span random-access bytes")?;
+    let log_upper = checked_aggregate_mul(record_bytes, boundaries, "span row-log bytes")?;
+    let sequential_upper = checked_aggregate_mul(log_upper, 3, "span sequential bytes")?;
+    let output_upper = checked_aggregate_mul(
+        boundaries,
+        core::mem::size_of::<fre::Match>(),
+        "span output bytes",
+    )?;
+    let peak_without_output =
+        checked_aggregate_add(log_upper, random_access_upper, "span engine peak bytes")?;
+    let peak_upper =
+        checked_aggregate_add(peak_without_output, output_upper, "span peak bytes")?;
+
+    // Requirements construction plus the two exact scans contribute at most
+    // eleven state steps per state/boundary cell and eight scan steps per
+    // boundary. These are conservative upper bounds, not observed counters.
+    let state_boundaries =
+        checked_aggregate_mul(program_states, boundaries, "span state-boundary cells")?;
+    let state_work = checked_aggregate_mul(state_boundaries, 11, "span state work")?;
+    let scan_work = checked_aggregate_mul(boundaries, 8, "span scan work")?;
+    let work_upper = checked_aggregate_add(state_work, scan_work, "span operation work")?;
+
+    let reducer_matches = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let event_upper = checked_aggregate_mul(boundaries, 2, "span match events")?;
+    let reducer_event_limit =
+        checked_aggregate_mul(reducer_matches, 2, "span reducer-derived match events")?;
+
+    Ok(AggregateOperationLimits {
+        max_boundaries: boundaries,
+        max_table_cells: 0,
+        max_random_access_bytes: random_access_upper.min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: random_access_upper.min(limits.fre_aggregate_scratch_bytes),
+        max_log_bytes: log_upper.min(limits.fre_aggregate_log_bytes),
+        max_sequential_bytes: sequential_upper.min(limits.fre_aggregate_sequential_bytes),
+        max_match_events: event_upper.min(reducer_event_limit),
+        max_output_matches: boundaries.min(reducer_matches),
+        max_output_bytes: output_upper.min(limits.fre_aggregate_peak_bytes),
         max_span_sum: haystack_len,
         max_peak_bytes: peak_upper.min(limits.fre_aggregate_peak_bytes),
         max_work: work_upper.min(limits.fre_aggregate_operation_work),
@@ -3450,6 +3521,121 @@ fn fre_grep(
     })
 }
 
+fn regex_redux_build_error(error: &RegexReduxBuildError) -> ExecutionError {
+    let message = format!("FRE regex-redux build refused input: {error}");
+    match error {
+        RegexReduxBuildError::ProfileMismatch
+        | RegexReduxBuildError::ComponentLimit { .. }
+        | RegexReduxBuildError::IdentityWork { .. }
+        | RegexReduxBuildError::ReplacementBytes { .. } => ExecutionError::unsupported(message),
+        RegexReduxBuildError::Component { source, .. } => aggregate_build_error(source),
+        RegexReduxBuildError::AllocationFailed { .. }
+        | RegexReduxBuildError::ReplacementAllocationFailed { .. }
+        | RegexReduxBuildError::ArithmeticOverflow
+        | RegexReduxBuildError::InternalInvariant(_) => ExecutionError::fault(message),
+    }
+}
+
+fn regex_redux_run_error(error: &RegexReduxRunError) -> ExecutionError {
+    let message = format!("FRE regex-redux execution refused input: {error}");
+    match error {
+        RegexReduxRunError::InputBytes { .. }
+        | RegexReduxRunError::OutputBytes { .. }
+        | RegexReduxRunError::MatchEvents { .. }
+        | RegexReduxRunError::CopyWork { .. }
+        | RegexReduxRunError::ReportBytes { .. } => ExecutionError::unsupported(message),
+        RegexReduxRunError::Aggregate { source, .. } => {
+            aggregate_execution_error(&source.source, message)
+        }
+        RegexReduxRunError::InvalidUtf8
+        | RegexReduxRunError::EmptyMatch { .. }
+        | RegexReduxRunError::AllocationFailed { .. }
+        | RegexReduxRunError::ArithmeticOverflow
+        | RegexReduxRunError::InternalInvariant(_) => ExecutionError::fault(message),
+    }
+}
+
+fn regex_redux_run_limits(
+    input_bytes: usize,
+    max_component_states: usize,
+    limits: &RunLimits,
+) -> Result<RegexReduxRunLimits, ExecutionError> {
+    // Only the `BY -> <2>` stage can expand. Its disjoint two-byte matches
+    // make three-halves of the flattened input an exact complete upper bound.
+    let expanded_output = checked_aggregate_add(
+        input_bytes,
+        input_bytes.div_ceil(2),
+        "regex-redux expanded output bytes",
+    )?;
+    let boundaries = checked_aggregate_add(expanded_output, 1, "regex-redux boundaries")?;
+    let reducer_events = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("regex-redux reducer limit does not fit usize"))?;
+    let total_event_upper = checked_aggregate_mul(15, boundaries, "regex-redux total events")?;
+    // Flatten plus five substitutions each copy their input and output. The
+    // only expansion can raise the final three pairs to 3n, yielding a bound
+    // below 15n for all six ordered stages.
+    let copy_upper = checked_aggregate_mul(input_bytes, 15, "regex-redux copy work")?;
+    Ok(RegexReduxRunLimits {
+        aggregate: AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            continuation: continuation_span_operation_limits(
+                expanded_output,
+                max_component_states,
+                limits,
+            )?,
+        },
+        max_input_bytes: input_bytes,
+        max_output_bytes: expanded_output,
+        max_stage_events: boundaries.min(reducer_events),
+        max_total_events: total_event_upper.min(reducer_events),
+        max_copy_work: copy_upper,
+        max_report_bytes: 16 << 10,
+    })
+}
+
+fn fre_regex_redux(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    if !request.patterns.is_empty() {
+        return Err(ExecutionError::unsupported(
+            "regex-redux owns its exact ordered built-in patterns and accepts no external patterns",
+        ));
+    }
+    if request.unicode || request.case_insensitive {
+        return Err(ExecutionError::unsupported(
+            "regex-redux requires its model-fixed Unicode-off case-sensitive profile",
+        ));
+    }
+    let plan = RegexReduxBuilder::new()
+        .profile(rebar_profile())
+        .limits(RegexReduxBuildLimits {
+            aggregate: aggregate_build_limits(limits),
+            ..RegexReduxBuildLimits::default()
+        })
+        .build()
+        .map_err(|error| regex_redux_build_error(&error))?;
+    let run_limits = regex_redux_run_limits(
+        request.haystack.len(),
+        plan.build_report().max_component_states,
+        limits,
+    )?;
+    let result = plan
+        .execute(request.haystack, run_limits)
+        .map_err(|error| regex_redux_run_error(&error))?;
+    if result.report() != REGEX_REDUX_EXPECTED_REPORT {
+        return Err(ExecutionError::fault(
+            "FRE regex-redux complete canonical report differs",
+        ));
+    }
+    let actual = u64::try_from(result.final_length())
+        .map_err(|_| ExecutionError::fault("FRE regex-redux length does not fit u64"))?;
+    Ok(FreReduction {
+        actual,
+        plan: "regex-redux-composite-v1",
+    })
+}
+
 fn candidate_reducer(
     adapter: &dyn CandidateAdapter,
     job: &Job,
@@ -3522,8 +3708,7 @@ fn regex_redux(job: &Job, haystack: &[u8], limits: &RunLimits) -> Result<u64, Ex
         sequence.len()
     )
     .map_err(|error| ExecutionError::fault(format!("format regex-redux: {error}")))?;
-    let expected_report = "agggtaaa|tttaccct 6\n[cgt]gggtaaa|tttaccc[acg] 26\na[act]ggtaaa|tttacc[agt]t 86\nag[act]gtaaa|tttac[agt]ct 58\nagg[act]taaa|ttta[agt]cct 113\naggg[acg]aaa|ttt[cgt]ccct 31\nagggt[cgt]aa|tt[acg]accct 31\nagggta[cgt]a|t[acg]taccct 32\nagggtaa[cgt]|[acg]ttaccct 43\n\n1016745\n1000000\n547899\n";
-    if report != expected_report {
+    if report != REGEX_REDUX_EXPECTED_REPORT {
         return Err(ExecutionError::fault(
             "regex-redux complete canonical report differs",
         ));
@@ -4789,6 +4974,37 @@ mod tests {
             matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
             "multi-pattern capture output must remain typed unsupported: {captures:?}"
         );
+    }
+
+    #[test]
+    fn current_fre_regex_redux_refuses_external_patterns_and_flag_mutations() {
+        let limits = RunLimits::default();
+        let external = current_fre(
+            "regex-redux",
+            &["fixture-recognition-is-not-a-protocol".to_string()],
+            b"",
+            false,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(external, CandidateOutcome::Unsupported(ref reason) if reason.contains("no external patterns")),
+            "unexpected external-pattern outcome: {external:?}"
+        );
+        for (unicode, case_insensitive) in [(true, false), (false, true)] {
+            let changed = current_fre(
+                "regex-redux",
+                &[],
+                b"",
+                unicode,
+                case_insensitive,
+                &limits,
+            );
+            assert!(
+                matches!(changed, CandidateOutcome::Unsupported(ref reason) if reason.contains("model-fixed")),
+                "unexpected flag-mutation outcome: {changed:?}"
+            );
+        }
     }
 
     #[test]

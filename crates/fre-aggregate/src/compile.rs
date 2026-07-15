@@ -333,18 +333,17 @@ fn validate_hir(
     capture_policy: CapturePolicy,
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
-    let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(1)
-        .map_err(|_| Error::AllocationFailed {
-            resource: Resource::HirStackItems,
-            items: 1,
-        })?;
     enforce(
         1,
         budget.limits.max_hir_stack_items,
         Resource::HirStackItems,
     )?;
+    let mut stack = fre_exact_alloc::vec_with_exact_capacity(1).map_err(|_| {
+        Error::AllocationFailed {
+            resource: Resource::HirStackItems,
+            items: 1,
+        }
+    })?;
     stack.push((hir, 1_usize));
     budget.accounting.peak_hir_stack_items = 1;
     while let Some((node, depth)) = stack.pop() {
@@ -1088,14 +1087,10 @@ impl StableHash {
 }
 
 fn reserved_vec<T>(length: usize, resource: Resource) -> Result<Vec<T>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
-            resource,
-            items: length,
-        })?;
-    Ok(values)
+    fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
+        resource,
+        items: length,
+    })
 }
 
 fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {

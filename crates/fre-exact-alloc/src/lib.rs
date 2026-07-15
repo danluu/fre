@@ -14,6 +14,61 @@ pub enum CopyError {
     AllocationFailed,
 }
 
+/// Failure to create a vector with exactly the requested element capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapacityError {
+    /// The requested element count cannot be represented as an allocation layout.
+    LayoutOverflow,
+    /// Exact capacity has no meaningful representation for a zero-sized type.
+    ZeroSizedType,
+    /// The global allocator rejected the exact layout.
+    AllocationFailed,
+}
+
+impl fmt::Display for CapacityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LayoutOverflow => formatter.write_str("exact capacity layout overflow"),
+            Self::ZeroSizedType => formatter.write_str("exact capacity rejects zero-sized types"),
+            Self::AllocationFailed => formatter.write_str("exact capacity allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for CapacityError {}
+
+/// Allocate an empty vector whose capacity is exactly `capacity`.
+///
+/// This is the fallible policy boundary used when allocator capacity rounding
+/// would make a post-allocation limit check too late. Zero-sized element types
+/// are rejected because `Vec` represents their capacity as `usize::MAX`.
+pub fn vec_with_exact_capacity<T>(capacity: usize) -> Result<Vec<T>, CapacityError> {
+    if capacity == 0 {
+        return Ok(Vec::new());
+    }
+    if core::mem::size_of::<T>() == 0 {
+        return Err(CapacityError::ZeroSizedType);
+    }
+    vec_with_exact_capacity_nonzero(capacity)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's generic exact-layout vector allocation boundary"
+)]
+fn vec_with_exact_capacity_nonzero<T>(capacity: usize) -> Result<Vec<T>, CapacityError> {
+    let layout = Layout::array::<T>(capacity).map_err(|_| CapacityError::LayoutOverflow)?;
+    let allocation = unsafe { alloc(layout) }.cast::<T>();
+    if allocation.is_null() {
+        return Err(CapacityError::AllocationFailed);
+    }
+
+    // SAFETY: `alloc` returned a fresh allocation with the exact layout for
+    // `capacity` values of `T`. The vector owns no initialized elements yet,
+    // and its eventual deallocation uses the identical layout.
+    unsafe { Ok(Vec::from_raw_parts(allocation, 0, capacity)) }
+}
+
 impl fmt::Display for CopyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -65,7 +120,7 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
 
 #[cfg(test)]
 mod tests {
-    use super::{CopyError, copy_exact, copy_exact_with};
+    use super::{CapacityError, CopyError, copy_exact, copy_exact_with, vec_with_exact_capacity};
 
     #[test]
     fn empty_and_nonempty_copies_have_exact_capacity() {
@@ -84,6 +139,20 @@ mod tests {
         assert_eq!(
             copy_exact_with(b"forced allocation failure", true),
             Err(CopyError::AllocationFailed)
+        );
+    }
+
+    #[test]
+    fn generic_vectors_have_exact_capacity_before_initialization() {
+        let empty = vec_with_exact_capacity::<u64>(0).unwrap();
+        assert_eq!(empty.capacity(), 0);
+        let mut values = vec_with_exact_capacity::<u64>(17).unwrap();
+        assert_eq!(values.capacity(), 17);
+        values.extend(0..17);
+        assert_eq!(values.len(), 17);
+        assert_eq!(
+            vec_with_exact_capacity::<()>(1),
+            Err(CapacityError::ZeroSizedType)
         );
     }
 }

@@ -334,12 +334,12 @@ impl CompiledRegex {
         enforce(requested_peak, limits.max_peak_bytes, Resource::PeakBytes)?;
         let mut spans = Vec::new();
         if kind == OperationKind::Spans {
-            spans
-                .try_reserve_exact(summary.matches)
-                .map_err(|_| Error::AllocationFailed {
+            spans = fre_exact_alloc::vec_with_exact_capacity(summary.matches).map_err(|_| {
+                Error::AllocationFailed {
                     resource: Resource::OutputBytes,
                     items: summary.matches,
-                })?;
+                }
+            })?;
             let allocated_output_bytes = mul(
                 spans.capacity(),
                 core::mem::size_of::<Span>(),
@@ -1179,25 +1179,23 @@ fn read_bit(bytes: &[u8], index: usize) -> Result<bool, Error> {
 }
 
 fn zeroed_usizes(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
+    let mut values = fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| {
+        Error::AllocationFailed {
             resource,
             items: length,
-        })?;
+        }
+    })?;
     values.resize(length, 0);
     Ok(values)
 }
 
 fn zeroed_bytes(length: usize, resource: Resource) -> Result<Vec<u8>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
+    let mut values = fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| {
+        Error::AllocationFailed {
             resource,
             items: length,
-        })?;
+        }
+    })?;
     values.resize(length, 0);
     Ok(values)
 }
