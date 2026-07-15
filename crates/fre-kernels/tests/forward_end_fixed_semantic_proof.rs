@@ -413,6 +413,57 @@ fn every_prefix_outsider_position_and_partition_edge_returns_the_first_outsider(
 }
 
 #[test]
+fn fixed_range_thresholds_retain_exact_first_outsider_and_accounting() {
+    let candidate = plan(b"abcdefghijklmnopqrstuvwxyz", b"Z");
+    for (prefix_len, outsider, expected_examined) in [
+        (63_usize, 62_usize, 63_usize),
+        (64, 63, 96),
+        (65, 64, 65),
+        (127, 126, 127),
+        (128, 127, 160),
+        (129, 128, 129),
+    ] {
+        let mut haystack = vec![b'a'; prefix_len];
+        haystack.push(b'Z');
+        let (matched, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, Some((0, haystack.len())), "N={prefix_len}");
+        assert_eq!(accounting.prefix_bytes_examined, prefix_len);
+        assert_eq!(accounting.prefix_bytes_upper_bound, prefix_len + 32);
+
+        haystack[outsider] = b'!';
+        let (matched, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, None, "N={prefix_len}, outsider={outsider}");
+        assert_eq!(accounting.prefix_bytes_examined, expected_examined);
+        assert_eq!(accounting.prefix_bytes_upper_bound, prefix_len + 32);
+        assert!(accounting.suffix_confirmation_attempted);
+    }
+}
+
+#[test]
+fn fixed_range128_failure_in_each_quarter_has_one_bounded_rescan() {
+    let candidate = plan(b"abcdefghijklmnopqrstuvwxyz", b"Z");
+    let prefix_len = 128_usize;
+    let mut valid = vec![b'a'; prefix_len];
+    valid.push(b'Z');
+
+    for outsider in [31_usize, 63, 95, 127] {
+        let mut haystack = valid.clone();
+        haystack[outsider] = b'!';
+        let (matched, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, None, "outsider={outsider}");
+        assert_eq!(accounting.prefix_bytes_examined, 160);
+        assert_eq!(accounting.prefix_bytes_upper_bound, 160);
+        assert!(accounting.suffix_confirmation_attempted);
+    }
+}
+
+#[test]
 fn earlier_suffix_lookalike_never_restarts_and_borders_never_move_the_split() {
     let candidate = plan(b"ab", b"ZQ");
     let (matched, accounting) = candidate
