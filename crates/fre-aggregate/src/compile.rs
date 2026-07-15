@@ -376,11 +376,8 @@ fn validate_unicode_class(
         for range in class.ranges() {
             for sequence in Utf8Sequences::new(range.start(), range.end()) {
                 budget.charge(1)?;
-                budget.accounting.utf8_sequences = add(
-                    budget.accounting.utf8_sequences,
-                    1,
-                    Resource::Utf8Sequences,
-                )?;
+                budget.accounting.utf8_sequences =
+                    add(budget.accounting.utf8_sequences, 1, Resource::Utf8Sequences)?;
                 enforce(
                     budget.accounting.utf8_sequences,
                     budget.limits.max_utf8_sequences,
@@ -584,10 +581,8 @@ impl<'a> Builder<'a> {
                 for sequence in Utf8Sequences::new(range.start(), range.end()) {
                     let mut next = continuation;
                     for byte_range in sequence.as_slice().iter().rev() {
-                        self.budget.charge(inclusive_byte_width(
-                            byte_range.start,
-                            byte_range.end,
-                        )?)?;
+                        self.budget
+                            .charge(inclusive_byte_width(byte_range.start, byte_range.end)?)?;
                         let mut bytes = ByteSet::empty();
                         bytes.insert_range(byte_range.start, byte_range.end);
                         next = self.push(Inst::Consume { bytes, next })?;

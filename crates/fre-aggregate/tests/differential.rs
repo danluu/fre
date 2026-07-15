@@ -71,9 +71,7 @@ fn upstream_unicode_range(
         .configure(config)
         .syntax(syntax)
         .build(pattern)
-        .unwrap_or_else(|error| {
-            panic!("pinned Unicode range oracle rejected {pattern:?}: {error}")
-        })
+        .unwrap_or_else(|error| panic!("pinned Unicode range oracle rejected {pattern:?}: {error}"))
         .find_iter(Input::new(haystack).span(range))
         .map(|matched| Span {
             start: matched.start(),
@@ -193,7 +191,6 @@ fn unicode_on_hir_matches_rebar_profile_with_scalar_classes() {
             assert_eq!(actual.as_slice(), expected, "{strategy:?}/{pattern:?}");
         }
     }
-
 }
 
 #[test]
@@ -453,8 +450,7 @@ fn unicode_profile_and_utf8_expansion_are_identity_and_resource_dimensions() {
 #[test]
 fn unicode_ranges_keep_byte_offsets_and_original_anchor_context() {
     let haystack = [
-        b'x', 0xC3, 0xA9, b'/', 0xE9, 0x9B, 0xAA, b'/', 0xF0, 0x9F, 0xA6, 0x80, 0xFF,
-        b'z',
+        b'x', 0xC3, 0xA9, b'/', 0xE9, 0x9B, 0xAA, b'/', 0xF0, 0x9F, 0xA6, 0x80, 0xFF, b'z',
     ];
     let ranges = [
         0..haystack.len(),
