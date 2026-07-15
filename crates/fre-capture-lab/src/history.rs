@@ -6,9 +6,13 @@ use crate::ast::Ast;
 use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
-use crate::model::{AggregateOutcome, CandidateKind, RunReport, SearchOutcome, Window};
+use crate::model::{
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, RunReport, SearchOutcome, Span, Window,
+};
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
-use crate::runtime::{admit_history, canonicalize, check, checked_add, validate_window};
+use crate::runtime::{
+    admit_history, admit_history_exact, canonicalize, check, checked_add, validate_window,
+};
 
 #[derive(Clone, Copy, Debug)]
 struct Thread {
@@ -129,6 +133,142 @@ impl HistoryRegex {
         self.search_from(haystack, window, window.start, limits)
     }
 
+    /// Replay one selector-certified exact span while preserving assertion
+    /// context from the original logical window.
+    ///
+    /// The start thread is injected exactly once. Match states before
+    /// `span.end` are ignored, and the first prioritized match at `span.end`
+    /// supplies captures. This is not a search API: the caller must first
+    /// certify the complete non-overlapping span sequence independently.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact-span tagged replay keeps its one-pass state transition auditable"
+    )]
+    pub fn captures_exact(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        validate_window(haystack, window, span.start)?;
+        if span.start > span.end || span.start < window.start || span.end > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        let admission = admit_history_exact(&self.program, span, limits)?;
+        let state_count = self.program.states.len();
+        let mut current = reserve_threads(state_count)?;
+        let mut next = reserve_threads(state_count)?;
+        let mut stack = reserve_threads(state_count)?;
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(state_count)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        seen.resize(state_count, 0_usize);
+        let mut histories = HistoryArena::new(admission.history_node_bound)?;
+        let mut generation = 1_usize;
+        let mut counters = Counters {
+            state_visits: 0,
+            history_walk: 0,
+            starts_injected: 1,
+            bytes_examined: 0,
+            peak_threads: 0,
+        };
+        let mut pos = span.start;
+        add_thread(
+            &self.program,
+            &mut current,
+            &mut stack,
+            &mut seen,
+            &mut histories,
+            generation,
+            Thread {
+                pc: self.program.start,
+                history: None,
+            },
+            pos,
+            window,
+            &mut counters,
+            limits,
+        )?;
+
+        while pos < span.end {
+            current
+                .retain(|thread| !matches!(self.program.states.get(thread.pc), Some(State::Match)));
+            next.clear();
+            generation = generation
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+            let next_pos = pos
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+            let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+            for thread in current.drain(..) {
+                let State::Byte {
+                    ranges,
+                    next: target,
+                } = self
+                    .program
+                    .states
+                    .get(thread.pc)
+                    .ok_or(SearchError::InvalidProgram)?
+                else {
+                    return Err(SearchError::InvalidProgram);
+                };
+                if ranges
+                    .iter()
+                    .any(|&(start, end)| start <= byte && byte <= end)
+                {
+                    add_thread(
+                        &self.program,
+                        &mut next,
+                        &mut stack,
+                        &mut seen,
+                        &mut histories,
+                        generation,
+                        Thread {
+                            pc: *target,
+                            history: thread.history,
+                        },
+                        next_pos,
+                        window,
+                        &mut counters,
+                        limits,
+                    )?;
+                }
+            }
+            counters.bytes_examined =
+                checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
+            std::mem::swap(&mut current, &mut next);
+            pos = next_pos;
+        }
+
+        counters.peak_threads = counters.peak_threads.max(current.len());
+        let winner = current
+            .iter()
+            .find(|thread| matches!(self.program.states.get(thread.pc), Some(State::Match)))
+            .and_then(|thread| thread.history)
+            .ok_or(SearchError::InvalidProgram)?;
+        let slots = materialize(&self.program, &histories, winner, &mut counters, limits)?;
+        let captures = canonicalize(&self.program, &slots)?;
+        if captures.overall() != Some(span) {
+            return Err(SearchError::InvalidProgram);
+        }
+        Ok(SearchOutcome {
+            captures: Some(captures),
+            report: RunReport {
+                candidate: CandidateKind::PersistentHistory,
+                state_visits: counters.state_visits,
+                slot_copies: 0,
+                history_nodes: histories.len(),
+                history_walk: counters.history_walk,
+                starts_injected: counters.starts_injected,
+                bytes_examined: counters.bytes_examined,
+                peak_threads: counters.peak_threads,
+                admitted_scratch_bytes: admission.scratch_bytes,
+            },
+        })
+    }
+
     /// Bounded repeated-search iterator with Rust byte-regex empty suppression.
     ///
     /// This is deliberately a quadratic-capable correctness formulation. Its
@@ -217,6 +357,111 @@ impl HistoryRegex {
             total_state_visits,
             total_slot_copies: 0,
             total_history_nodes,
+        })
+    }
+
+    /// Sum participating groups over non-overlapping, non-empty matches.
+    ///
+    /// This is the capture-preserving reducer used by models whose public
+    /// result is participation count rather than capture records. It never
+    /// retains prior winners and never clones a slot vector for speculative
+    /// threads. Empty selection is rejected because silently applying an
+    /// iterator progress policy would change this operation's contract.
+    pub fn count_captures_nonempty(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: AggregateLimits,
+    ) -> Result<CaptureCountOutcome, SearchError> {
+        validate_window(haystack, window, window.start)?;
+        let mut count = 0_usize;
+        let mut matches = 0_usize;
+        let mut searches = 0_usize;
+        let mut capture_events = 0_usize;
+        let mut total_state_visits = 0_usize;
+        let mut total_history_nodes = 0_usize;
+        let mut total_history_walk = 0_usize;
+        let mut peak_threads = 0_usize;
+        let mut cursor = window.start;
+        loop {
+            searches = checked_add(searches, 1, ResourceKind::Searches)?;
+            check(ResourceKind::Searches, searches, limits.max_searches)?;
+
+            let mut per_search = limits.per_search;
+            per_search.max_state_visits = per_search.max_state_visits.min(
+                limits
+                    .max_total_state_visits
+                    .checked_sub(total_state_visits)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?,
+            );
+            per_search.max_history_nodes = per_search.max_history_nodes.min(
+                limits
+                    .max_total_history_nodes
+                    .checked_sub(total_history_nodes)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateHistoryNodes,
+                    ))?,
+            );
+            per_search.max_history_walk = per_search.max_history_walk.min(
+                limits
+                    .max_total_history_walk
+                    .checked_sub(total_history_walk)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateHistoryWalk,
+                    ))?,
+            );
+
+            let outcome = self.search_from(haystack, window, cursor, per_search)?;
+            total_state_visits = checked_add(
+                total_state_visits,
+                outcome.report.state_visits,
+                ResourceKind::AggregateStateVisits,
+            )?;
+            total_history_nodes = checked_add(
+                total_history_nodes,
+                outcome.report.history_nodes,
+                ResourceKind::AggregateHistoryNodes,
+            )?;
+            total_history_walk = checked_add(
+                total_history_walk,
+                outcome.report.history_walk,
+                ResourceKind::AggregateHistoryWalk,
+            )?;
+            peak_threads = peak_threads.max(outcome.report.peak_threads);
+
+            let Some(record) = outcome.captures else {
+                break;
+            };
+            let overall = record.overall().ok_or(SearchError::InvalidProgram)?;
+            if overall.start == overall.end {
+                return Err(SearchError::EmptyMatch);
+            }
+            matches = checked_add(matches, 1, ResourceKind::Results)?;
+            check(ResourceKind::Results, matches, limits.max_results)?;
+            for group in record.groups {
+                capture_events = checked_add(capture_events, 1, ResourceKind::CaptureEvents)?;
+                check(
+                    ResourceKind::CaptureEvents,
+                    capture_events,
+                    limits.max_capture_events,
+                )?;
+                if group.span.is_some() {
+                    count = checked_add(count, 1, ResourceKind::CaptureCount)?;
+                    check(ResourceKind::CaptureCount, count, limits.max_capture_count)?;
+                }
+            }
+            cursor = overall.end;
+        }
+        Ok(CaptureCountOutcome {
+            count,
+            matches,
+            searches,
+            total_state_visits,
+            total_history_nodes,
+            total_history_walk,
+            peak_threads,
         })
     }
 

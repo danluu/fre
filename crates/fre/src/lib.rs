@@ -8,9 +8,11 @@
 //! span-sum plans without source concatenation. Whole-match aggregate plans
 //! may erase capture annotations. The explicit Unicode-off capture plan
 //! instead retains bounded capture history and exposes absolute group spans.
-//! None of these types is named `Regex`: unsupported syntax/profile/operation
-//! combinations are typed build errors, and there is no full Rust-regex/RE2 or
-//! JIT claim.
+//! [`CaptureBuilder`] separately preserves capture
+//! histories for the participating-group reducer on its certified Rust-byte
+//! subset; it is not a general capture-record facade. None of these types is
+//! named `Regex`: unsupported syntax/profile/operation combinations are typed
+//! build errors, and there is no full Rust-regex/RE2 or JIT claim.
 
 #![forbid(unsafe_code)]
 
@@ -18,6 +20,7 @@ use core::fmt;
 
 mod aggregate;
 mod aggregate_many;
+mod captures;
 mod finite;
 mod forward_anchored;
 mod regex_redux;
@@ -48,6 +51,12 @@ pub use aggregate_many::{
     AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
     AggregateManySpanSumResult,
 };
+pub use captures::{
+    CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
+    CaptureCacheIdentity, CaptureExecutionError, CaptureExecutionReport, CaptureExecutionSource,
+    CaptureHirAccounting, CaptureOperation, CapturePlanIdentity, CapturePlanKind, CaptureRegex,
+    CaptureRunLimits, CaptureUnsupported,
+};
 pub use fre_aggregate::{
     AdmittedCaptures as AggregateCaptures, CaptureLimits as AggregateCaptureLimits,
     CaptureMatch as AggregateCaptureMatch,
@@ -56,7 +65,13 @@ pub use fre_aggregate::{
     Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
     OperationLimits as AggregateOperationLimits, PlanId as AggregatePlanId,
-    Resource as AggregateResource, Unsupported as AggregateUnsupported,
+    Resource as AggregateResource, Span as AggregateSpan, Unsupported as AggregateUnsupported,
+};
+pub use fre_capture_lab::{
+    AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
+    BuildLimits as CaptureEngineBuildLimits, BuildReport as CaptureEngineBuildReport,
+    CaptureCountOutcome, ResourceKind as CaptureResource, SearchError as CaptureSearchError,
+    SearchLimits as CaptureSearchLimits,
 };
 pub use fre_kernels::{
     LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,

@@ -78,6 +78,12 @@ pub struct AggregateLimits {
     pub max_total_slot_copies: usize,
     /// Maximum history nodes accumulated over all searches.
     pub max_total_history_nodes: usize,
+    /// Maximum history reconstruction steps accumulated over all searches.
+    pub max_total_history_walk: usize,
+    /// Maximum group entries inspected by a capture reducer.
+    pub max_capture_events: usize,
+    /// Maximum participating-group sum returned by a capture reducer.
+    pub max_capture_count: usize,
 }
 
 impl Default for AggregateLimits {
@@ -89,6 +95,9 @@ impl Default for AggregateLimits {
             max_total_state_visits: 1_000_000_000,
             max_total_slot_copies: 10_000_000_000,
             max_total_history_nodes: 1_000_000_000,
+            max_total_history_walk: 1_000_000_000,
+            max_capture_events: 1_000_000_000,
+            max_capture_count: 1_000_000_000,
         }
     }
 }

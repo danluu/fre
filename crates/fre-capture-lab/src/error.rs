@@ -43,6 +43,12 @@ pub enum ResourceKind {
     AggregateSlotCopies,
     /// Total history nodes in aggregate iteration.
     AggregateHistoryNodes,
+    /// Total persistent history reconstruction steps in aggregate iteration.
+    AggregateHistoryWalk,
+    /// Capture group entries inspected by an aggregate reducer.
+    CaptureEvents,
+    /// Participating capture groups accumulated by an aggregate reducer.
+    CaptureCount,
 }
 
 /// A checked compiler admission failure.
@@ -85,6 +91,8 @@ pub enum SearchError {
     Allocation(ResourceKind),
     /// The logical window is not contained in the haystack.
     InvalidWindow,
+    /// A non-empty-only reducer selected an empty match.
+    EmptyMatch,
     /// The immutable program failed an internal invariant check.
     InvalidProgram,
 }

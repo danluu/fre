@@ -112,3 +112,28 @@ pub struct AggregateOutcome {
     /// Total persistent history nodes.
     pub total_history_nodes: usize,
 }
+
+/// Result of a capture-participation reduction over non-empty matches.
+///
+/// Unlike [`AggregateOutcome`], this does not retain one capture record per
+/// match. Each selected winner is materialized once, reduced immediately and
+/// then dropped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureCountOutcome {
+    /// Sum of participating groups, including group zero.
+    pub count: usize,
+    /// Number of selected non-overlapping matches.
+    pub matches: usize,
+    /// Number of independently bounded searches or exact-span replays. The
+    /// legacy restarted reducer includes its final miss; selector-driven
+    /// replay has one invocation per certified non-empty match and no miss.
+    pub searches: usize,
+    /// Total Thompson state visits.
+    pub total_state_visits: usize,
+    /// Total persistent history nodes allocated.
+    pub total_history_nodes: usize,
+    /// Total history nodes walked while materializing winners.
+    pub total_history_walk: usize,
+    /// Maximum live consuming/match threads in any search.
+    pub peak_threads: usize,
+}

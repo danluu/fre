@@ -99,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "fre-aggregate",
  "fre-automata",
+ "fre-capture-lab",
  "fre-exact-alloc",
  "fre-kernels",
  "fre-lower",
