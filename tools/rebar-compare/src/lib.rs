@@ -24,13 +24,13 @@ use fre::{
     AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
     AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy,
-    CompatibilityProfile, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits, PortableBuilder,
-    RustProfile, SearchLimits,
+    AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
+    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
+    AggregateStrategy, CompatibilityProfile, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -809,6 +809,108 @@ pub fn read_authenticated_report(path: &Path) -> Result<Report, CompareError> {
         ));
     }
     Ok(report)
+}
+
+/// Return the exact single-search limits used by the authenticated current-FRE
+/// Rebar adapter.
+#[must_use]
+pub fn current_fre_rebar_search_limits() -> SearchLimits {
+    let limits = RunLimits::default();
+    SearchLimits {
+        max_work: limits.fre_search_work,
+        max_scratch_bytes: limits.fre_scratch_bytes,
+    }
+}
+
+/// Construct the exact aggregate builder used by the authenticated
+/// current-FRE Rebar adapter.
+#[must_use]
+pub fn current_fre_rebar_aggregate_builder(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+) -> AggregateBuilder {
+    let limits = RunLimits::default();
+    AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(aggregate_build_limits(&limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+}
+
+/// Construct the exact portable-search builder used by the authenticated
+/// current-FRE Rebar adapter.
+///
+/// # Errors
+///
+/// Returns an error for the case-insensitive inputs the semantic adapter
+/// currently refuses rather than silently widening timing coverage.
+pub fn current_fre_rebar_portable_builder(
+    pattern: impl Into<String>,
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<PortableBuilder, CompareError> {
+    if case_insensitive {
+        return Err(CompareError::new(
+            "current FRE facade has no case-insensitive builder option",
+        ));
+    }
+    Ok(PortableBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode))
+}
+
+/// Derive the exact whole-operation limits used by the authenticated
+/// current-FRE Rebar adapter for one already-published aggregate plan.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if a bound cannot be represented.
+pub fn current_fre_rebar_aggregate_run_limits(
+    haystack_len: usize,
+    report: &AggregateBuildReport,
+) -> Result<AggregateRunLimits, CompareError> {
+    aggregate_run_limits(haystack_len, report, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
+}
+
+/// Check the aggregate semantic identity required by the authenticated adapter
+/// for one operation model.
+///
+/// # Errors
+///
+/// Returns an identity error for an unexpected model or semantic certificate.
+pub fn current_fre_rebar_validate_aggregate_identity(
+    report: &AggregateBuildReport,
+    unicode: bool,
+    model: &str,
+) -> Result<(), CompareError> {
+    let (facade_operation, literal_operation) = match model {
+        "compile" => (
+            AggregateOperation::Compile,
+            LiteralAggregateOperation::Count,
+        ),
+        "count" => (AggregateOperation::Count, LiteralAggregateOperation::Count),
+        "count-spans" => (
+            AggregateOperation::SpanSum,
+            LiteralAggregateOperation::SpanSum,
+        ),
+        other => {
+            return Err(CompareError::new(format!(
+                "unexpected aggregate model {other}"
+            )));
+        }
+    };
+    if report.operation != facade_operation {
+        return Err(CompareError::new(format!(
+            "aggregate operation identity mismatch for {model}: expected {facade_operation:?}, got {:?}",
+            report.operation
+        )));
+    }
+    require_unicode_plan_identity(report, unicode, literal_operation)
+        .map_err(|error| CompareError::new(error.message))
 }
 
 #[derive(Clone, Copy)]
