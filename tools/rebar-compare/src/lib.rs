@@ -4107,17 +4107,17 @@ mod tests {
             1,
             "compile-aggregate-continuation-program",
         );
-        let variable_width = current_fre(
-            "compile",
-            &[r"\pL".to_string()],
-            "雪".as_bytes(),
-            true,
-            false,
-            &limits,
-        );
-        assert!(
-            matches!(variable_width, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
-            "unexpected Unicode compile outcome: {variable_width:?}"
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"\pL".to_string()],
+                "雪".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-unicode-canonical-artifact",
         );
 
         let many = current_fre(
@@ -4137,12 +4137,30 @@ mod tests {
     #[test]
     fn current_fre_unicode_compile_artifact_covers_scalar_and_line_shapes() {
         let limits = RunLimits::default();
-        let cases: [(&str, &[u8], bool, u64); 3] = [
-            (r"\p{Greek}+", "αβ x Γ".as_bytes(), false, 2),
-            (r"(?:é|水|😀)+", "é水 x 😀".as_bytes(), false, 2),
-            (r"(?m:^水+$)", "水\nx\n水水".as_bytes(), false, 2),
+        let cases: [(&str, &[u8], bool, u64, &str); 3] = [
+            (
+                r"\p{Greek}+",
+                "αβ x Γ".as_bytes(),
+                false,
+                2,
+                "compile-unicode-canonical-artifact",
+            ),
+            (
+                r"(?:é|水|😀)+",
+                "é水 x 😀".as_bytes(),
+                false,
+                2,
+                "compile-aggregate-continuation-program",
+            ),
+            (
+                r"(?m:^水+$)",
+                "水\nx\n水水".as_bytes(),
+                false,
+                2,
+                "compile-aggregate-continuation-program",
+            ),
         ];
-        for (pattern, haystack, case_insensitive, expected) in cases {
+        for (pattern, haystack, case_insensitive, expected, plan) in cases {
             assert_current_fre_execution(
                 current_fre(
                     "compile",
@@ -4153,7 +4171,7 @@ mod tests {
                     &limits,
                 ),
                 expected,
-                "compile-unicode-canonical-artifact",
+                plan,
             );
         }
         let invalid = current_fre(
