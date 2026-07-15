@@ -38,21 +38,6 @@ fn find(pattern: &str, haystack: &[u8]) -> Option<MatchSpan> {
     .into_output()
 }
 
-fn find_unicode(pattern: &str, haystack: &[u8]) -> Option<MatchSpan> {
-    let parsed = parsed(pattern, true);
-    lower(
-        &parsed,
-        OperationSemantics::CaptureFree,
-        LowerLimits::default(),
-    )
-    .expect("supported Unicode pattern lowers")
-    .automaton()
-    .prepare::<Span>()
-    .search(haystack, SearchLimits::unlimited())
-    .expect("K0 Unicode search succeeds")
-    .into_output()
-}
-
 fn tuple(span: Option<MatchSpan>) -> Option<(usize, usize)> {
     span.map(|span| (span.start(), span.end()))
 }
@@ -81,45 +66,6 @@ fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
     assert_eq!(tuple(find(r"(?-u:\xFF)", &[0xFF])), Some((0, 1)));
     assert_eq!(tuple(find("(?:ab|cd)+", b"xcdabz")), Some((1, 5)));
     assert_eq!(tuple(find("a{2,4}", b"zaaaaax")), Some((1, 5)));
-}
-
-#[test]
-fn unicode_scalar_classes_lower_to_exact_utf8_byte_paths() {
-    assert_eq!(
-        tuple(find_unicode("[α-ω]+", "xαβz".as_bytes())),
-        Some((1, 5))
-    );
-    assert_eq!(tuple(find_unicode(".", "😀".as_bytes())), Some((0, 4)));
-    assert_eq!(tuple(find_unicode(".", &[0xFF, b'x'])), Some((1, 2)));
-    assert_eq!(tuple(find_unicode(".", &[0xCE])), None);
-    assert_eq!(tuple(find_unicode(".", &[0xC0, 0x80])), None);
-    assert_eq!(tuple(find_unicode(".", &[0xED, 0xA0, 0x80])), None);
-
-    let ruff = r"^[ \t\f]*#.*?coding[:=][ \t]*utf-?8";
-    assert_eq!(
-        tuple(find_unicode(ruff, b"# -*- coding: utf-8 -*-")),
-        Some((0, b"# -*- coding: utf-8".len()))
-    );
-    assert_eq!(tuple(find_unicode(ruff, b"x # coding: utf-8")), None);
-}
-
-#[test]
-fn unicode_class_expansion_retains_typed_construction_limits() {
-    let unicode = parsed(".", true);
-    let limits = LowerLimits {
-        automata: fre_automata::CompileLimits {
-            max_states: 1,
-            ..fre_automata::CompileLimits::default()
-        },
-        ..LowerLimits::default()
-    };
-    assert!(matches!(
-        lower_raw(&unicode, OperationSemantics::CaptureFree, limits),
-        Err(LowerError::ResourceLimit {
-            resource: LowerResource::States,
-            ..
-        })
-    ));
 }
 
 #[test]
@@ -299,6 +245,16 @@ fn lf_and_ascii_word_assertions_retain_original_haystack_context() {
 
 #[test]
 fn unsupported_semantics_are_never_silently_approximated() {
+    let unicode = parsed("[α-ω]", true);
+    assert!(matches!(
+        lower_raw(
+            &unicode,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default()
+        ),
+        Err(LowerError::Unsupported(UnsupportedFeature::UnicodeClass))
+    ));
+
     let crlf = parsed("(?mR:$)", false);
     assert!(matches!(
         lower_raw(

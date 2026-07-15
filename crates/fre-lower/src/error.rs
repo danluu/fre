@@ -32,8 +32,7 @@ impl fmt::Display for LowerResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum UnsupportedFeature {
-    /// Legacy source-compatible identity; current scalar-class lowering emits
-    /// exact UTF-8 byte paths or a typed resource/allocation error instead.
+    /// A Unicode scalar class requires a variable-width UTF-8 lowering.
     UnicodeClass,
     /// CRLF-aware and Unicode look assertions are not represented.
     LookAssertion(Look),
@@ -46,7 +45,9 @@ pub enum UnsupportedFeature {
 impl fmt::Display for UnsupportedFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnicodeClass => f.write_str("Unicode scalar class (legacy unsupported identity)"),
+            Self::UnicodeClass => f.write_str(
+                "Unicode scalar class (variable-width UTF-8 lowering is not implemented)",
+            ),
             Self::LookAssertion(look) => {
                 write!(
                     f,

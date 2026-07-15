@@ -1,10 +1,7 @@
 use core::mem::size_of;
 
 use fre_automata::{EdgeKind, RawPlan, StateRole};
-use regex_syntax::{
-    hir::{Class, ClassUnicode, Hir, HirKind, Look},
-    utf8::Utf8Sequences,
-};
+use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::{
     LowerError, LowerLimits, LowerResource, LowerStats, OperationSemantics, UnsupportedFeature,
@@ -74,11 +71,6 @@ struct Compiler<'h> {
 }
 
 impl<'h> Compiler<'h> {
-    // regex-syntax 0.8.11 partitions one scalar interval with a fixed-width
-    // four-byte decomposition. Precharge its bounded private split stack; each
-    // yielded sequence and all emitted graph work are charged separately.
-    const UTF8_SCALAR_RANGE_PARTITION_WORK: u64 = 64;
-
     const fn new(limits: LowerLimits, erased_captures: usize) -> Self {
         Self {
             limits,
@@ -151,9 +143,8 @@ impl<'h> Compiler<'h> {
                 let fragment = self.class_fragment(ranges)?;
                 self.push_fragment(fragment)
             }
-            HirKind::Class(Class::Unicode(class)) => {
-                let fragment = self.unicode_class_fragment(class)?;
-                self.push_fragment(fragment)
+            HirKind::Class(Class::Unicode(_)) => {
+                Err(LowerError::Unsupported(UnsupportedFeature::UnicodeClass))
             }
             HirKind::Look(look) => {
                 let kind = match look {
@@ -238,18 +229,13 @@ impl<'h> Compiler<'h> {
                 detail: "HIR alternation had no branches",
             });
         }
-        let fragment = self.alternation_fragment(branches)?;
-        self.push_fragment(fragment)
-    }
-
-    fn alternation_fragment(&mut self, branches: Vec<Fragment>) -> Result<Fragment, LowerError> {
         let split = self.add_state(StateRole::Split)?;
         let mut outs = Vec::new();
         for branch in branches {
             self.add_edge(split, EdgeKind::Epsilon, 0, 0, Some(branch.start))?;
             self.append_patches(&mut outs, branch.outs, "alternation patch list")?;
         }
-        Ok(Fragment { start: split, outs })
+        self.push_fragment(Fragment { start: split, outs })
     }
 
     fn finish_repetition(
@@ -358,43 +344,6 @@ impl<'h> Compiler<'h> {
             outs.push(patch);
         }
         Ok(Fragment { start: state, outs })
-    }
-
-    fn unicode_class_fragment(&mut self, class: &ClassUnicode) -> Result<Fragment, LowerError> {
-        let mut branches = Vec::new();
-        for scalar_range in class.ranges() {
-            self.charge(
-                Self::UTF8_SCALAR_RANGE_PARTITION_WORK,
-                "Unicode scalar range partition",
-            )?;
-            for sequence in Utf8Sequences::new(scalar_range.start(), scalar_range.end()) {
-                self.charge(1, "UTF-8 sequence traversal")?;
-                let mut parts = Vec::new();
-                self.charge_vector_growth(
-                    parts.len(),
-                    parts.capacity(),
-                    sequence.len(),
-                    "UTF-8 sequence fragment list",
-                )?;
-                reserve(&mut parts, sequence.len(), "UTF-8 sequence fragment list")?;
-                for range in sequence.as_slice() {
-                    parts.push(self.class_fragment(core::iter::once((range.start, range.end)))?);
-                }
-                let branch = self.concat_fragments(parts)?;
-                self.charge_vector_growth(
-                    branches.len(),
-                    branches.capacity(),
-                    1,
-                    "Unicode class branch list",
-                )?;
-                reserve(&mut branches, 1, "Unicode class branch list")?;
-                branches.push(branch);
-            }
-        }
-        if branches.is_empty() {
-            return self.class_fragment(core::iter::empty());
-        }
-        self.alternation_fragment(branches)
     }
 
     fn optional_fragment(&mut self, child: Fragment, greedy: bool) -> Result<Fragment, LowerError> {

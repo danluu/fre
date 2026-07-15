@@ -135,11 +135,8 @@ patterns.
 
 `grep/long-words-unicode@rust/regex` must remain refused because Unicode word
 classification is outside this slice.
-At this historical checkpoint,
-`wild/ruff/unnecessary-coding-comment@rust/regex` remained refused because its
-variable-width Unicode scalar lowering was outside this slice. The later
-qualified `research/portable-unicode-classes/PROOF.md` mechanism admits that
-row; it does not change this checkpoint's evidence.
+`wild/ruff/unnecessary-coding-comment@rust/regex` must remain refused because
+its variable-width Unicode scalar lowering is outside this slice.
 
 After source validation, representative performance work should measure the
 two newly admitted rows against pinned Rust and against RE2 where that row has a
