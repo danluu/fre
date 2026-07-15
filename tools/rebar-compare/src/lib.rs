@@ -4565,7 +4565,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed() {
+    fn current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
             current_fre(
@@ -4628,17 +4628,57 @@ mod tests {
             "compile-aggregate-unicode-scalar-class",
         );
 
-        let many = current_fre(
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &["ab".to_string(), "a".to_string()],
+                b"ab a",
+                false,
+                false,
+                &limits,
+            ),
+            2,
+            "compile-many-ordered-literal",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"a+".to_string(), "a".to_string()],
+                b"aa",
+                false,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-many-continuation-program",
+        );
+
+        let unicode_profile_refusal = current_fre(
             "compile",
-            &["a".to_string(), "b".to_string()],
-            b"ab",
-            false,
+            &["snow".to_string(), r"\w+".to_string()],
+            "snow 雪".as_bytes(),
+            true,
             false,
             &limits,
         );
         assert!(
-            matches!(many, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
-            "unexpected compile build-many outcome: {many:?}"
+            matches!(unicode_profile_refusal, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode ordered build-many pattern 1")),
+            "unexpected Unicode compile-many outcome: {unicode_profile_refusal:?}"
+        );
+
+        let mut bounded = limits;
+        bounded.patterns_per_job = 1;
+        let resource_refusal = current_fre(
+            "compile",
+            &["a".to_string(), "(".to_string()],
+            b"a",
+            false,
+            false,
+            &bounded,
+        );
+        assert!(
+            matches!(resource_refusal, CandidateOutcome::Unsupported(ref reason) if reason.contains("needs 2 patterns, limit is 1")),
+            "unexpected compile-many resource outcome: {resource_refusal:?}"
         );
     }
 
