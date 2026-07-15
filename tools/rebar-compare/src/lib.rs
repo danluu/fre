@@ -2612,6 +2612,7 @@ fn require_unicode_plan_identity(
                 AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
                     | AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
                     | AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
+                    | AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
             )
                 && identity.kernel.operation
                     == match operation {
@@ -4576,6 +4577,20 @@ mod tests {
             3,
             "aggregate-unicode-scalar-class",
         );
+        for (model, expected) in [("count", 2), ("count-spans", 8)] {
+            assert_current_fre_execution(
+                current_fre(
+                    model,
+                    &[r"[A-Za-zα-ω]{2,4}".to_string()],
+                    "ab αβγ x".as_bytes(),
+                    true,
+                    false,
+                    &limits,
+                ),
+                expected,
+                "aggregate-unicode-scalar-class",
+            );
+        }
         assert_current_fre_execution(
             current_fre(
                 "count-captures",
