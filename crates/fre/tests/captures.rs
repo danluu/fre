@@ -136,9 +136,7 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
         admitted.combined_peak_bytes > admitted.selector_accounting.peak_bytes,
         "fixture must expose retained spans plus replay scratch"
     );
-    assert!(
-        admitted.combined_peak_bytes <= CaptureRunLimits::default().max_combined_peak_bytes
-    );
+    assert!(admitted.combined_peak_bytes <= CaptureRunLimits::default().max_combined_peak_bytes);
 
     let constrained = CaptureRunLimits {
         max_combined_peak_bytes: admitted.selector_accounting.peak_bytes,

@@ -2030,9 +2030,7 @@ impl CaptureSelectorLedger {
         let sequential = limits
             .fre_aggregate_sequential_bytes
             .checked_sub(self.sequential_bytes)
-            .ok_or_else(|| {
-                ExecutionError::fault("FRE selector sequential accounting underflow")
-            })?;
+            .ok_or_else(|| ExecutionError::fault("FRE selector sequential accounting underflow"))?;
         Ok((work, sequential))
     }
 

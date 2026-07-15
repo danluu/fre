@@ -509,9 +509,7 @@ impl CaptureRegex {
                 limits.aggregate.max_results,
             )?;
             let mut per_search = limits.aggregate.per_search;
-            per_search.max_scratch_bytes = per_search
-                .max_scratch_bytes
-                .min(replay_scratch_limit);
+            per_search.max_scratch_bytes = per_search.max_scratch_bytes.min(replay_scratch_limit);
             per_search.max_state_visits = per_search.max_state_visits.min(capture_remaining(
                 &identity,
                 limits.aggregate.max_total_state_visits,
