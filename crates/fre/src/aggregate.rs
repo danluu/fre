@@ -1740,7 +1740,7 @@ impl AggregateSpansRegex {
     ) -> Result<AggregateSpans, AggregateExecutionError> {
         let AggregateEngine::Continuation(engine) = &self.0.engine else {
             return Err(self.0.execution_error(
-                limits,
+                &limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span operation retained a non-continuation plan",
                 ),
@@ -1748,7 +1748,7 @@ impl AggregateSpansRegex {
         };
         let strategy = self.0.report.continuation_strategy.ok_or_else(|| {
             self.0.execution_error(
-                limits,
+                &limits,
                 AggregateExecutionSource::InternalInvariant(
                     "continuation span plan lacks storage strategy",
                 ),
@@ -1763,7 +1763,7 @@ impl AggregateSpansRegex {
             )
             .map_err(|source| {
                 self.0
-                    .execution_error(limits, AggregateExecutionSource::Continuation(source))
+                    .execution_error(&limits, AggregateExecutionSource::Continuation(source))
             })?;
         let details = AggregateExecutionDetails::Continuation {
             certificate: admitted.certificate().clone(),
