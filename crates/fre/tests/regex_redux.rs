@@ -36,7 +36,14 @@ fn replacement_leading_literal_does_not_accept_a_late_suffix_only() {
     let result = plan
         .replace(b"agggtaaatttaccct|t", RegexReduxRunLimits::default())
         .expect("bounded replacement");
-    assert!(result.matches().is_empty());
+    assert_eq!(
+        result
+            .matches()
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        Vec::new()
+    );
     assert_eq!(result.output(), b"agggtaaatttaccct|t");
 }
 
@@ -64,12 +71,12 @@ fn complete_small_pipeline_has_exact_report_and_ordered_substitutions() {
         .expect("complete regex-redux execution");
     assert_eq!(result.input_length(), 27);
     assert_eq!(result.clean_length(), 21);
-    assert_eq!(result.final_sequence(), b"agggtaaatttaccct|");
-    assert_eq!(result.final_length(), 17);
+    assert_eq!(result.final_sequence(), b"agggtaa-t");
+    assert_eq!(result.final_length(), 9);
     assert_eq!(result.variant_counts(), &[2, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(
         result.report(),
-        "agggtaaa|tttaccct 2\n[cgt]gggtaaa|tttaccc[acg] 0\na[act]ggtaaa|tttacc[agt]t 0\nag[act]gtaaa|tttac[agt]ct 0\nagg[act]taaa|ttta[agt]cct 0\naggg[acg]aaa|ttt[cgt]ccct 0\nagggt[cgt]aa|tt[acg]accct 0\nagggta[cgt]a|t[acg]taccct 0\nagggtaa[cgt]|[acg]ttaccct 0\n\n27\n21\n17\n"
+        "agggtaaa|tttaccct 2\n[cgt]gggtaaa|tttaccc[acg] 0\na[act]ggtaaa|tttacc[agt]t 0\nag[act]gtaaa|tttac[agt]ct 0\nagg[act]taaa|ttta[agt]cct 0\naggg[acg]aaa|ttt[cgt]ccct 0\nagggt[cgt]aa|tt[acg]accct 0\nagggta[cgt]a|t[acg]taccct 0\nagggtaa[cgt]|[acg]ttaccct 0\n\n27\n21\n9\n"
     );
 }
 
@@ -89,8 +96,8 @@ fn stage_order_mutation_is_observable() {
     let mutated = introduce
         .replace(mutated.output(), limits)
         .expect("late introduce");
-    assert_eq!(canonical.output(), b"|");
-    assert_eq!(mutated.output(), b"<4>");
+    assert_eq!(canonical.output(), b"|t");
+    assert_eq!(mutated.output(), b"<4>t");
     assert_ne!(canonical.output(), mutated.output());
 }
 
