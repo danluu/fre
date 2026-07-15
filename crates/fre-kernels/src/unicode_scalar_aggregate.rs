@@ -59,15 +59,9 @@ pub enum Repetition {
     OneOrMoreLazy,
     /// A non-nullable repetition not represented by the two common `+`
     /// variants. `maximum == None` denotes an unbounded upper limit.
-    RepeatedGreedy {
-        minimum: u32,
-        maximum: Option<u32>,
-    },
+    RepeatedGreedy { minimum: u32, maximum: Option<u32> },
     /// Lazy form of [`Repetition::RepeatedGreedy`].
-    RepeatedLazy {
-        minimum: u32,
-        maximum: Option<u32>,
-    },
+    RepeatedLazy { minimum: u32, maximum: Option<u32> },
 }
 
 impl Repetition {
@@ -320,10 +314,7 @@ pub struct SpanSumResult {
 #[non_exhaustive]
 pub enum BuildError {
     EmptyClass,
-    InvalidRepetition {
-        minimum: u32,
-        maximum: Option<u32>,
-    },
+    InvalidRepetition { minimum: u32, maximum: Option<u32> },
     ReversedRange { start: char, end: char },
     NonCanonicalRanges,
     RangeLimit { needed: usize, limit: usize },
@@ -931,13 +922,7 @@ impl UnicodeScalarAggregatePlan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         match self.repetition {
             Repetition::ExactlyOne => {
-                self.execute_mode::<false, false, false, false>(
-                    haystack,
-                    window,
-                    upper,
-                    1,
-                    Some(1),
-                )
+                self.execute_mode::<false, false, false, false>(haystack, window, upper, 1, Some(1))
             }
             Repetition::OneOrMoreGreedy if self.non_ascii.is_empty() => {
                 self.execute_mode::<true, true, false, false>(haystack, window, upper, 1, None)
@@ -951,9 +936,7 @@ impl UnicodeScalarAggregatePlan {
             Repetition::OneOrMoreLazy => {
                 self.execute_mode::<true, false, true, false>(haystack, window, upper, 1, None)
             }
-            repetition
-                @ (Repetition::RepeatedGreedy { .. } | Repetition::RepeatedLazy { .. }) =>
-            {
+            repetition @ (Repetition::RepeatedGreedy { .. } | Repetition::RepeatedLazy { .. }) => {
                 let (minimum, maximum, greedy) = repetition
                     .bounds()
                     .expect("repeated variants always have bounds");
@@ -1442,11 +1425,13 @@ fn reduce_repeated_scalar(
     };
     if complete {
         record_match(actual, *pending_bytes)?;
-        actual.run_flushes = actual.run_flushes.checked_add(1).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "actual repeated-run flushes",
-            },
-        )?;
+        actual.run_flushes =
+            actual
+                .run_flushes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual repeated-run flushes",
+                })?;
         *pending_bytes = 0;
         *pending_scalars = 0;
     }
@@ -1462,11 +1447,13 @@ fn finish_repeated_run(
 ) -> Result<(), ReduceError> {
     if greedy && *pending_scalars >= u64::from(minimum) {
         record_match(actual, *pending_bytes)?;
-        actual.run_flushes = actual.run_flushes.checked_add(1).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "actual repeated-run terminal flushes",
-            },
-        )?;
+        actual.run_flushes =
+            actual
+                .run_flushes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual repeated-run terminal flushes",
+                })?;
     }
     *pending_bytes = 0;
     *pending_scalars = 0;
@@ -1969,11 +1956,7 @@ mod tests {
                 );
                 assert_eq!(
                     window_plan
-                        .span_sum_in(
-                            windowed,
-                            Window::new(start, end),
-                            ReduceLimits::unlimited(),
-                        )
+                        .span_sum_in(windowed, Window::new(start, end), ReduceLimits::unlimited(),)
                         .unwrap()
                         .span_sum,
                     expected_sum,
@@ -2012,18 +1995,12 @@ mod tests {
                 pair[1].input_bytes_advanced,
                 pair[0].input_bytes_advanced * 2
             );
-            assert_eq!(
-                pair[1].decode_byte_checks,
-                pair[0].decode_byte_checks * 2
-            );
+            assert_eq!(pair[1].decode_byte_checks, pair[0].decode_byte_checks * 2);
             assert_eq!(
                 pair[1].range_comparisons - 1,
                 (pair[0].range_comparisons - 1) * 2
             );
-            assert_eq!(
-                pair[1].reducer_steps - 1,
-                (pair[0].reducer_steps - 1) * 2
-            );
+            assert_eq!(pair[1].reducer_steps - 1, (pair[0].reducer_steps - 1) * 2);
             assert_eq!(pair[1].match_events, pair[0].match_events * 2);
             assert_eq!(pair[1].scratch_bytes, 0);
         }
