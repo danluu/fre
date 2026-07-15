@@ -1282,8 +1282,7 @@ impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.count,
-            Self::FiniteOrderedLiterals { value, .. } => *value,
-            Self::Continuation { value, .. } => *value,
+            Self::FiniteOrderedLiterals { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1325,8 +1324,7 @@ impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
-            Self::FiniteOrderedLiterals { value, .. } => *value,
-            Self::Continuation { value, .. } => *value,
+            Self::FiniteOrderedLiterals { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
