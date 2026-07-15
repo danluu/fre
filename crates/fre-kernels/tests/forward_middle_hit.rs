@@ -4,7 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v11";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -201,28 +201,37 @@ fn triple_swar_candidate_boundaries_have_exact_accounting() {
 fn triple_swar_candidate_recovers_every_arbitrary_byte_outsider() {
     let candidate = plan(&[0x00, 0x80, 0xFF], &[0x7F]);
     let prefix_len = 256_usize;
-    for outsider in 0..prefix_len {
-        let mut haystack: Vec<u8> = [0x00, 0x80, 0xFF]
-            .into_iter()
-            .cycle()
-            .take(prefix_len)
-            .collect();
-        haystack[outsider] = 0x01;
-        haystack.push(0x7F);
-        let (span, accounting) = candidate
-            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
-            .unwrap();
-        let expected_examined = if outsider == 0 {
-            1
-        } else {
-            let block_start = outsider / 32 * 32;
-            1 + block_start + 32 + outsider % 32 + 1
-        };
-        assert_eq!(span, None, "outsider={outsider}");
-        assert_eq!(
-            accounting.prefix_bytes_examined, expected_examined,
-            "outsider={outsider}"
-        );
-        assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+    for outsider_byte in [0x01_u8, 0x40, 0x7E, 0x81, 0xFE] {
+        for outsider in 0..prefix_len {
+            let mut haystack: Vec<u8> = [0x00, 0x80, 0xFF]
+                .into_iter()
+                .cycle()
+                .take(prefix_len)
+                .collect();
+            haystack[outsider] = outsider_byte;
+            haystack.push(0x7F);
+            let (span, accounting) = candidate
+                .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap();
+            let expected_examined = if outsider == 0 {
+                1
+            } else {
+                let block_start = outsider / 32 * 32;
+                1 + block_start + 32 + outsider % 32 + 1
+            };
+            assert_eq!(
+                span,
+                None,
+                "byte={outsider_byte:#04x} outsider={outsider} lane={}",
+                outsider % 32
+            );
+            assert_eq!(
+                accounting.prefix_bytes_examined,
+                expected_examined,
+                "byte={outsider_byte:#04x} outsider={outsider} lane={}",
+                outsider % 32
+            );
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+        }
     }
 }
