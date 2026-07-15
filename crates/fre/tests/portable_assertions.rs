@@ -556,7 +556,7 @@ fn positive_unicode_word_boundaries_match_pinned_ranges_on_arbitrary_bytes() {
         &[0xED, 0xA0, 0x80],
     ];
 
-    for pattern in PATTERNS {
+    for &pattern in PATTERNS {
         let fre = PortableBuilder::new(pattern)
             .profile(RustProfile::rebar_1_12_4())
             .unicode(true)
