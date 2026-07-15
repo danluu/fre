@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v12";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1316,7 +1316,7 @@ const SWAR_LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const SWAR_HIGH_BITS: u64 = 0x8080_8080_8080_8080;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
 const SINGLE_CANDIDATE_MIN: usize = 73;
-const SINGLE_CANDIDATE_MAX: usize = 1_024;
+const SINGLE_CANDIDATE_MAX: usize = 4_096;
 const PAIR_SWAR_MIN: usize = 73;
 const PAIR_SWAR_MAX: usize = 4_096;
 const SWAR_BYTES: usize = size_of::<u64>();
@@ -2686,7 +2686,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v12"
+            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13"
         );
         assert_eq!(
             pair.implementation(),
