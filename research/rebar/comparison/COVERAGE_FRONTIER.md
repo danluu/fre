@@ -32,6 +32,22 @@ the portable `grep` path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
+### Unvalidated regex-redux source projection
+
+The isolated composition on exact frontier head
+`5f4da7b5536c42bbcdc467ea9c897bf990577938` adds a complete reusable
+`regex-redux` candidate but has not generated a comparison report. Its exact
+projected delta is one row from unsupported to pass: `regex-redux +1`, total
+pass `+1`, total unsupported `-1`. Applying that arithmetic to the recorded
+base would yield 201 pass / 143 unsupported, but those are projected values,
+not observed coverage.
+
+The candidate freshly constructs all fifteen ordered Unicode-off continuation
+components, retains the nine report patterns and five substitutions in exact
+protocol order, rejects empty replacement matches, and preflights bounded work
+and exact-capacity allocation. It does not inspect a job ID, fixture hash, or
+expected reducer.
+
 The optional v2 executed-plan field splits those passes into 29 exact-literal
 aggregate, 132 continuation-program aggregate, two ordered build-many literal
 plans, 17 fresh complete compile artifacts using the continuation program, and
@@ -158,8 +174,9 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    to the other sixteen rows.
 6. Add capture histories for the 37 capture reducer jobs; whole-match capture
    erasure is not a capture API.
-7. Admit the composite `regex-redux` job only after its complete report,
-   replacement, and non-empty iteration semantics are implemented.
+7. Authenticate the source-complete composite `regex-redux` projection with a
+   fresh full comparison, then qualify its whole fresh-build operation rather
+   than diagnostic component timings.
 
 The retained generated report SHA-256 is
 `132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`,
