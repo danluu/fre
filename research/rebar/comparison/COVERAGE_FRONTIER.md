@@ -40,7 +40,8 @@ union, but has not generated a comparison report. Its exact projected delta is
 one row from unsupported to pass: `regex-redux +1`, total pass `+1`, total
 unsupported `-1`. The scalar-plus-breadth ceiling is 228 rows, and capture has
 at most 22 statically eligible rows before syntax/resource classification, so
-the combined arithmetic ceiling including redux is at most 251 pass / 93
+the positive Unicode-word boundary contributes exactly one additional projected
+`grep` row. The combined arithmetic ceiling is therefore at most 252 pass / 92
 unsupported. This is an evaluation bound, not observed coverage and not a
 claim that all 22 capture rows pass.
 

@@ -22,10 +22,10 @@ The replay had five textual conflicts and three clean semantic overlaps:
   that route and add only positive Unicode-word boundary admission.
 - `research/portable-assertions/PROOF.md` retains the historical refusal and
   records that later class and boundary mechanisms jointly project the target.
-- `tools/rebar-compare/src/lib.rs` retains every aggregate v7 route: direct
+- `tools/rebar-compare/src/lib.rs` retains every aggregate route: direct
   scalar execution, Unicode compile fallback, finite-language reduction,
   ordered build-many, continuation, and portable scalar classes. The composed
-  capability bumps the adapter to `fre-current-aggregate-v8` and adds only
+  combined capability uses `fre-current-aggregate-v10` and adds only
   positive Unicode-word boundary admission.
 - `crates/fre-lower/src/compiler.rs` merged cleanly: the existing
   `Utf8Sequences` class expansion is unchanged and `WordUnicode` alone moves
