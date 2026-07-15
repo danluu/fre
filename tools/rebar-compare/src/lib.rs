@@ -5197,6 +5197,40 @@ mod tests {
     }
 
     #[test]
+    fn continuation_structural_quotas_refuse_before_plan_publication() {
+        let build = |pattern: &str, run: &RunLimits| {
+            AggregateBuilder::new(pattern)
+                .profile(rebar_profile())
+                .unicode(false)
+                .case_insensitive(false)
+                .limits(aggregate_build_limits(run))
+                .plan_selection(AggregatePlanSelection::ForceContinuation)
+                .strategy(AggregateStrategy::ReverseSequentialRows)
+                .build_count()
+                .unwrap_err()
+                .to_string()
+        };
+
+        let nodes = RunLimits {
+            fre_aggregate_hir_nodes: 0,
+            ..RunLimits::default()
+        };
+        assert!(build("a.*b", &nodes).contains("HirNodes"));
+
+        let stack = RunLimits {
+            fre_aggregate_hir_stack_items: 0,
+            ..RunLimits::default()
+        };
+        assert!(build("a.*b", &stack).contains("HirStackItems"));
+
+        let repetition = RunLimits {
+            fre_aggregate_repeat_bound: 1,
+            ..RunLimits::default()
+        };
+        assert!(build("a{2}", &repetition).contains("RepeatBound"));
+    }
+
+    #[test]
     fn legacy_run_limits_default_new_continuation_structural_quotas() {
         let mut legacy = serde_json::to_value(RunLimits::default()).unwrap();
         let object = legacy.as_object_mut().unwrap();
