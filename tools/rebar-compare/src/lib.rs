@@ -4603,6 +4603,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single/ordered compile routing and refusal matrix shares one identity setup"
+    )]
     fn current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
