@@ -1219,7 +1219,7 @@ impl AggregatePlan {
         &self.report
     }
 
-    fn cache_identity(&self, execution_limits: AggregateRunLimits) -> AggregateCacheIdentity {
+    fn cache_identity(&self, execution_limits: &AggregateRunLimits) -> AggregateCacheIdentity {
         AggregateCacheIdentity {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
             syntax_key: Arc::clone(&self.report.syntax_key),
@@ -1230,13 +1230,13 @@ impl AggregatePlan {
             capture_semantics: self.report.capture_semantics,
             plan_identity: self.report.plan_identity,
             build_limits: self.limits,
-            execution_limits,
+            execution_limits: *execution_limits,
         }
     }
 
     fn execution_error(
         &self,
-        execution_limits: AggregateRunLimits,
+        execution_limits: &AggregateRunLimits,
         source: AggregateExecutionSource,
     ) -> AggregateExecutionError {
         AggregateExecutionError {
@@ -1247,7 +1247,7 @@ impl AggregatePlan {
 
     fn execution_report(
         &self,
-        execution_limits: AggregateRunLimits,
+        execution_limits: &AggregateRunLimits,
         details: AggregateExecutionDetails,
     ) -> AggregateExecutionReport {
         AggregateExecutionReport {
@@ -1263,7 +1263,7 @@ impl AggregatePlan {
     fn execute_count(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: &AggregateRunLimits,
     ) -> Result<AggregateCountExecution, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => engine
@@ -1329,7 +1329,7 @@ impl AggregatePlan {
     fn execute_span_sum(
         &self,
         haystack: &[u8],
-        limits: AggregateRunLimits,
+        limits: &AggregateRunLimits,
     ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => engine
@@ -1412,8 +1412,7 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
-            Self::FiniteLiteral { value, .. } => *value,
-            Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1460,8 +1459,7 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
-            Self::FiniteLiteral { value, .. } => *value,
-            Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1698,7 +1696,7 @@ impl AggregateCompileRegex {
     /// Complete cache identity for later use under the supplied run policy.
     #[must_use]
     pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(limits)
+        self.0.cache_identity(&limits)
     }
 
     /// Untimed semantic verification for compile-model qualification.
@@ -1710,10 +1708,10 @@ impl AggregateCompileRegex {
         haystack: &[u8],
         limits: AggregateRunLimits,
     ) -> Result<AggregateCountResult, AggregateExecutionError> {
-        let execution = self.0.execute_count(haystack, limits)?;
+        let execution = self.0.execute_count(haystack, &limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.execution_report(&limits, details);
         Ok(AggregateCountResult { value, report })
     }
 }
@@ -1730,7 +1728,7 @@ impl AggregateSpansRegex {
 
     #[must_use]
     pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(limits)
+        self.0.cache_identity(&limits)
     }
 
     /// Execute once on the complete original haystack. Absolute anchors are
@@ -1771,7 +1769,7 @@ impl AggregateSpansRegex {
             certificate: admitted.certificate().clone(),
             accounting: admitted.accounting(),
         };
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.execution_report(&limits, details);
         Ok(AggregateSpans { admitted, report })
     }
 }
@@ -1852,7 +1850,7 @@ impl AggregateCountRegex {
 
     #[must_use]
     pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(limits)
+        self.0.cache_identity(&limits)
     }
 
     /// Count the complete non-overlapping sequence on the original haystack.
@@ -1861,10 +1859,10 @@ impl AggregateCountRegex {
         haystack: &[u8],
         limits: AggregateRunLimits,
     ) -> Result<AggregateCountResult, AggregateExecutionError> {
-        let execution = self.0.execute_count(haystack, limits)?;
+        let execution = self.0.execute_count(haystack, &limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.execution_report(&limits, details);
         Ok(AggregateCountResult { value, report })
     }
 
@@ -1878,7 +1876,7 @@ impl AggregateCountRegex {
         limits: AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
         self.0
-            .execute_count(haystack, limits)
+            .execute_count(haystack, &limits)
             .map(|execution| execution.value())
     }
 }
@@ -1914,7 +1912,7 @@ impl AggregateSpanSumRegex {
 
     #[must_use]
     pub fn cache_identity(&self, limits: AggregateRunLimits) -> AggregateCacheIdentity {
-        self.0.cache_identity(limits)
+        self.0.cache_identity(&limits)
     }
 
     /// Sum complete non-overlapping match lengths on the original haystack.
@@ -1923,10 +1921,10 @@ impl AggregateSpanSumRegex {
         haystack: &[u8],
         limits: AggregateRunLimits,
     ) -> Result<AggregateSpanSumResult, AggregateExecutionError> {
-        let execution = self.0.execute_span_sum(haystack, limits)?;
+        let execution = self.0.execute_span_sum(haystack, &limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.execution_report(&limits, details);
         Ok(AggregateSpanSumResult { value, report })
     }
 
@@ -1940,7 +1938,7 @@ impl AggregateSpanSumRegex {
         limits: AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
         self.0
-            .execute_span_sum(haystack, limits)
+            .execute_span_sum(haystack, &limits)
             .map(|execution| execution.value())
     }
 }
