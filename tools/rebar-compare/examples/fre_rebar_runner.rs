@@ -52,7 +52,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-v7 report={REPORT_SCHEMA} aggregate-explain=7 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v10-portable-word-run-v1 report={REPORT_SCHEMA} aggregate-explain=7 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -494,9 +494,7 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
         expectations.runtime.as_deref(),
         regex.runtime_implementation_id(),
     )?;
-    if regex.runtime_implementation_id() != "k0" || regex.build_report().plan != PlanKind::K0 {
-        return Err("expected K0 runtime but build report selected another plan".into());
-    }
+    require_grep_runtime_plan(regex.runtime_implementation_id(), regex.build_report().plan)?;
     let haystack = benchmark.haystack.as_slice();
     let limits = current_fre_rebar_search_limits();
     let mut session = regex.search_session(SearchSessionLimits {
@@ -516,6 +514,16 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
         },
         Ok,
     )
+}
+
+fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), DynError> {
+    match (runtime, plan) {
+        ("k0", PlanKind::K0) | ("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => Ok(()),
+        _ => Err(format!(
+            "grep runtime {runtime:?} and selected plan {plan:?} are not an authenticated pair"
+        )
+        .into()),
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +558,17 @@ mod tests {
         assert_eq!(benchmark.pattern(), "a:b");
         assert_eq!(benchmark.haystack, b"a:b\n\xFF");
         assert_eq!(benchmark.max_iters, 1);
+    }
+
+    #[test]
+    fn authenticates_each_timed_grep_runtime_against_its_plan() {
+        assert!(require_grep_runtime_plan("k0", PlanKind::K0).is_ok());
+        assert!(
+            require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun,)
+                .is_ok()
+        );
+        assert!(require_grep_runtime_plan("k0", PlanKind::UnicodeWordRun).is_err());
+        assert!(require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::K0).is_err());
     }
 
     #[test]

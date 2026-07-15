@@ -10,20 +10,21 @@ boundaries without branching on benchmark names:
   `build_compile`; semantic verification is untimed;
 - `count` and `count-spans` build once, then time the public `count_value` and
   `span_sum_value` reducers respectively;
-- `grep` builds once, requires both the K0 plan and runtime ID, and times the
-  complete `bstr` line loop plus every public `is_match` call.
+- `grep` builds once, requires an authenticated runtime/plan pair (K0 or the
+  linear Unicode word-run plan), and times the complete `bstr` line loop plus
+  every public session `is_match` call.
 
-The runner requires the exact benchmark, model, plan, reducer and K0 runtime
+The runner requires the exact benchmark, model, plan, reducer and runtime
 identities supplied by the scheduler. It accepts exactly one measured
 iteration, zero warmup iterations, one pattern and at most 64 MiB of KLV. Its
 version string fails closed unless canonical, engine, runner, lockfile,
 toolchain, target and release-profile identities were bound at build time.
 
-`stratified_gate` is a separate scheduler. It is pinned to the 189-pass report
+`stratified_gate` is a separate scheduler. It is pinned to the 238-pass report
 with SHA-256
-`132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`,
+`f1f40ff23aa316fc69fd32b5bb9c508d7085f0b91b360baea7387dd66c23273e`,
 receipt digest
-`106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`,
+`6122094efae0d307e458ca8f07243f73bee0a1e31938610b4b386bbebd2d6fca`,
 manifest digest
 `09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43`
 and clean Rebar revision `463d00f`. It authenticates canonical report bytes,
@@ -43,6 +44,11 @@ coverage is accepted only when the authenticated Rebar report has no RE2 job,
 and is recorded explicitly.
 
 ## Preregistered campaigns
+
+- `breadth-current`: the new Unicode word-run grep row, its ASCII grep
+  neighbor, a direct Unicode scalar-class row, an exact-literal aggregate row
+  and a continuation/assertion aggregate row (five rows). Results are
+  pointwise only; missing authenticated RE2 coverage is recorded per row.
 
 - `assertion-focused`: the two new ASCII-word/LF grep rows, the shared email
   and line-boundary neighbors, and the zero-result grep row (five rows).

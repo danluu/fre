@@ -28,19 +28,19 @@ type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 const SCHEMA: &str = "fre.rebar.stratified-performance.v2";
 const PAIRS: usize = 6;
 const PARTS_PER_MILLION: u128 = 1_000_000;
-const FRE_ADAPTER: &str = "fre-current-aggregate-v5";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v1";
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
 const SEMANTIC_REPORT_SHA256: &str =
-    "132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607";
+    "f1f40ff23aa316fc69fd32b5bb9c508d7085f0b91b360baea7387dd66c23273e";
 const SEMANTIC_RECEIPTS_SHA256: &str =
-    "106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48";
+    "6122094efae0d307e458ca8f07243f73bee0a1e31938610b4b386bbebd2d6fca";
 const MANIFEST_SHA256: &str = "09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43";
 const REBAR_REVISION: &str = "463d00f31887e84c38467805b9e3122c314b9521";
 const REBAR_TREE: &str = "16dfbb450d4729afb6065664d0ce48fe24a3aecc";
 const REBAR_BINARY_SHA256: &str =
-    "8509c6b0370afe05fe1fc339566b7212706937ab28bbbc9c9da406cb320d68ed";
+    "fcc477903b5b6a91eb140121a789ca1fbff9a7c6d99a317d036bc11c5784f4c0";
 const RUST_BINARY_SHA256: &str = "8ef7a4a47264c584c02432a70f7e917c1aab2639451f0ba42da0ef04041951fc";
 const RE2_BINARY_SHA256: &str = "42a53794bc7a1a911484b84dd239b625e7241c8aca41b28d677ca76686266d4b";
 const MIN_FREE_KIB: u64 = 20 * 1_048_576;
@@ -115,6 +115,14 @@ const UNICODE_DELTA_ROWS: [&str; 8] = [
     "opt/prefilter/literal-casei-russian@rust/regex",
     "test/unicode/case/ascii-with-unicode@rust/regex",
     "test/unicode/case/unicode@rust/regex",
+];
+
+const BREADTH_CURRENT_ROWS: [&str; 5] = [
+    "grep/long-words-unicode@rust/regex",
+    "grep/long-words-ascii@rust/regex",
+    "imported/rsc/match-class-unicode@rust/regex",
+    "curated/01-literal/sherlock-en@rust/regex",
+    "unicode/word/boundary-any-english@rust/regex",
 ];
 
 #[allow(
@@ -248,6 +256,7 @@ fn main() -> Result<(), DynError> {
 
 #[derive(Clone, Copy, Debug)]
 enum Campaign {
+    BreadthCurrent,
     AssertionFocused,
     AssertionFull,
     CompileSmoke,
@@ -260,6 +269,7 @@ enum Campaign {
 impl Campaign {
     fn parse(value: &str) -> Result<Self, DynError> {
         match value {
+            "breadth-current" => Ok(Self::BreadthCurrent),
             "assertion-focused" => Ok(Self::AssertionFocused),
             "assertion-full" => Ok(Self::AssertionFull),
             "compile-smoke" => Ok(Self::CompileSmoke),
@@ -273,6 +283,7 @@ impl Campaign {
 
     const fn name(self) -> &'static str {
         match self {
+            Self::BreadthCurrent => "breadth-current-v1",
             Self::AssertionFocused => "assertion-focused-v1",
             Self::AssertionFull => "assertion-full-v1",
             Self::CompileSmoke => "compile-smoke-v1",
@@ -285,6 +296,7 @@ impl Campaign {
 
     fn rows(self) -> Vec<&'static str> {
         match self {
+            Self::BreadthCurrent => BREADTH_CURRENT_ROWS.to_vec(),
             Self::AssertionFocused => ASSERTION_FOCUSED_ROWS.to_vec(),
             Self::AssertionFull => {
                 let mut rows = vec![
@@ -840,7 +852,7 @@ fn run_pair(
             .candidate_plan
             .as_deref()
             .ok_or("FRE receipt lacks plan")?,
-        runtime: (row.selected.fre.model == "grep").then_some("k0"),
+        runtime: expected_grep_runtime(&row.selected.fre.model, &row.selected.fre.job_id),
     };
     let (fre, reference_sample) = if fre_first {
         (
@@ -868,6 +880,16 @@ fn run_pair(
         reference: reference_sample,
         ratio_ppm: ratio_ppm(fre.duration_ns, reference_sample.duration_ns)?,
     })
+}
+
+fn expected_grep_runtime(model: &str, job_id: &str) -> Option<&'static str> {
+    if model != "grep" {
+        return None;
+    }
+    match job_id {
+        "grep/long-words-unicode@rust/regex" => Some("unicode-word-run-linear-v1"),
+        _ => Some("k0"),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -976,7 +998,7 @@ fn authenticate_fre_version(version: &str) -> Result<(), DynError> {
     let required = [
         "fre.rebar.klv-runner.v1",
         "protocol=stratified-v1",
-        "adapter=fre-current-aggregate-v5",
+        "adapter=fre-current-aggregate-capture-v10-portable-word-run-v1",
         "report=fre.rebar.comparison.v2",
         "rebar=463d00f31887e84c38467805b9e3122c314b9521",
         "canonical-sha=",
@@ -1109,6 +1131,7 @@ impl PreparedRow<'_> {
             (None, "not-selected-by-rebar-definition")
         };
         let model = self.selected.fre.model.clone();
+        let expected_runtime = expected_grep_runtime(&model, &self.selected.fre.job_id);
         Ok(TimingRow {
             job_id: self.selected.fre.job_id.clone(),
             benchmark: self.selected.fre.benchmark.clone(),
@@ -1119,7 +1142,7 @@ impl PreparedRow<'_> {
                 .candidate_plan
                 .clone()
                 .ok_or("FRE receipt lacks plan")?,
-            expected_runtime: (model == "grep").then(|| "k0".to_owned()),
+            expected_runtime: expected_runtime.map(str::to_owned),
             timed_api: match model.as_str() {
                 "compile" => "build_compile",
                 "count" => "count_value",
@@ -1329,6 +1352,7 @@ mod tests {
     #[test]
     fn campaigns_are_nonempty_and_unique() {
         for campaign in [
+            Campaign::BreadthCurrent,
             Campaign::AssertionFocused,
             Campaign::AssertionFull,
             Campaign::CompileSmoke,
@@ -1345,5 +1369,21 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(rows.len(), unique.len());
         }
+    }
+
+    #[test]
+    fn breadth_grep_rows_bind_exact_runtime_implementations() {
+        assert_eq!(
+            expected_grep_runtime("grep", "grep/long-words-unicode@rust/regex"),
+            Some("unicode-word-run-linear-v1")
+        );
+        assert_eq!(
+            expected_grep_runtime("grep", "grep/long-words-ascii@rust/regex"),
+            Some("k0")
+        );
+        assert_eq!(
+            expected_grep_runtime("count", "curated/01-literal/sherlock-en@rust/regex"),
+            None
+        );
     }
 }
