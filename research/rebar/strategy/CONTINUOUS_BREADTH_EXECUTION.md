@@ -113,6 +113,12 @@ onto current main, runs its focused gates, and either launches full evidence or
 records a specific kill reason. A candidate that needs a redesign goes back to
 an implementation lane rather than occupying the integrator indefinitely.
 
+Before source review, run the mechanical
+[candidate integrity guard](CANDIDATE_INTEGRITY_GUARD.md) against the exact safe
+baseline, candidate ref, and clean candidate worktree. Its ancestry, identity,
+and known-invalid Unicode compile checks are an early deny gate only; a passing
+receipt never substitutes for semantic or performance review.
+
 ## Qualification and performance
 
 Every assignment and promotion records:
