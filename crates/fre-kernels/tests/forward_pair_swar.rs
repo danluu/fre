@@ -113,3 +113,65 @@ fn pair_swar_differential_covers_every_outsider_byte_and_block_edge() {
         }
     }
 }
+
+#[test]
+fn pair_swar_long_extension_routes_512_through_4097_exactly() {
+    let candidate = plan();
+    for (boundary, earlier, expected_examined) in [
+        (512_usize, 511_usize, 521_usize),
+        (513, 511, 521),
+        (4_096, 4_095, 4_105),
+        (4_097, 4_095, 4_129),
+    ] {
+        let mut haystack = members(boundary);
+        haystack[earlier] = 0x40;
+        haystack.extend_from_slice(candidate.suffix());
+        let (span, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(span, None, "boundary={boundary}");
+        assert_eq!(
+            accounting.prefix_bytes_examined, expected_examined,
+            "boundary={boundary} earlier={earlier}"
+        );
+        assert!(accounting.suffix_confirmation_attempted);
+    }
+}
+
+#[test]
+fn pair_swar_long_extension_differential_covers_arbitrary_outsider_positions() {
+    let candidate = plan();
+    for boundary in [513_usize, 4_096] {
+        for position in [
+            0_usize,
+            1,
+            7,
+            8,
+            9,
+            31,
+            32,
+            511,
+            512,
+            boundary - 1,
+        ] {
+            for outsider in 0_u8..=u8::MAX {
+                let mut haystack = members(boundary);
+                haystack[position] = outsider;
+                haystack.extend_from_slice(candidate.suffix());
+                let expected = if outsider == 0x00 || outsider == 0xFF {
+                    Some((0, haystack.len()))
+                } else {
+                    None
+                };
+                let (actual, accounting) = candidate
+                    .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "boundary={boundary} position={position} outsider={outsider:#04x}"
+                );
+                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+            }
+        }
+    }
+}
