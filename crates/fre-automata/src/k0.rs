@@ -738,8 +738,8 @@ fn zero_width_edge_enabled(
             })
         }
         EdgeKind::AssertWordUnicode => {
-            let word_before = decode_last_utf8(&haystack[..position])
-                .is_some_and(is_unicode_word_character);
+            let word_before =
+                decode_last_utf8(&haystack[..position]).is_some_and(is_unicode_word_character);
             let word_after =
                 decode_utf8(&haystack[position..]).is_some_and(is_unicode_word_character);
             Ok(word_before != word_after)

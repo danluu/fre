@@ -168,7 +168,10 @@ fn lowering_maps_positive_unicode_word_boundary_without_approximating_it() {
         lowered.plan().edge_kinds.as_slice(),
         &[EdgeKind::AssertWordUnicode]
     );
-    assert_eq!(tuple(find_unicode(r"\b\w{2,}\b", "-αβ-".as_bytes())), Some((1, 5)));
+    assert_eq!(
+        tuple(find_unicode(r"\b\w{2,}\b", "-αβ-".as_bytes())),
+        Some((1, 5))
+    );
     assert_eq!(
         tuple(find_unicode(r"\b\w{2,}\b", &[0xFF, b'a', b'b', 0xFF])),
         Some((1, 3))

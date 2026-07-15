@@ -301,13 +301,23 @@ fn positive_unicode_word_boundary_is_scalar_exact_on_arbitrary_bytes() {
         ("α".as_bytes(), &[(0, true), (1, false), (2, true)]),
         (
             " α-β ".as_bytes(),
-            &[(0, false), (1, true), (3, true), (4, true), (6, true), (7, false)],
+            &[
+                (0, false),
+                (1, true),
+                (3, true),
+                (4, true),
+                (6, true),
+                (7, false),
+            ],
         ),
         ("\u{301}".as_bytes(), &[(0, true), (2, true)]),
         ("\u{203F}".as_bytes(), &[(0, true), (3, true)]),
         ("\u{200C}".as_bytes(), &[(0, true), (3, true)]),
         ("😀".as_bytes(), &[(0, false), (1, false), (4, false)]),
-        (&[0xFF, b'a', 0xFF], &[(0, false), (1, true), (2, true), (3, false)]),
+        (
+            &[0xFF, b'a', 0xFF],
+            &[(0, false), (1, true), (2, true), (3, false)],
+        ),
         (&[0xCE], &[(0, false), (1, false)]),
         (&[0xC0, 0x80], &[(0, false), (1, false), (2, false)]),
     ];
