@@ -49,6 +49,9 @@ pub struct CaptureOperationCertificate {
     pub history_nodes_bound: usize,
     pub output_bytes: usize,
     pub peak_bytes: usize,
+    /// Preflight upper bound enforced before replay allocation or execution.
+    pub work_bound: usize,
+    /// Actual replay and materialization work consumed.
     pub work: usize,
 }
 
@@ -230,7 +233,14 @@ impl CompiledCaptureRegex {
         )?;
         enforce(work_bound, capture_limits.max_work, Resource::CaptureWork)?;
 
-        let mut visited = vec![usize::MAX; replay_cells].into_boxed_slice();
+        let mut visited = Vec::new();
+        visited
+            .try_reserve_exact(replay_cells)
+            .map_err(|_| Error::AllocationFailed {
+                resource: Resource::CaptureReplayCells,
+                items: replay_cells,
+            })?;
+        visited.resize(replay_cells, usize::MAX);
         let mut stack = Vec::new();
         stack
             .try_reserve_exact(stack_items)
@@ -312,6 +322,7 @@ impl CompiledCaptureRegex {
             history_nodes_bound: replay_cells,
             output_bytes,
             peak_bytes,
+            work_bound,
             work,
         };
         Ok(AdmittedCaptures {
@@ -490,7 +501,14 @@ fn materialize_groups(
     limits: CaptureLimits,
     work: &mut usize,
 ) -> Result<Box<[Option<Span>]>, Error> {
-    let mut offsets = vec![(None, None); capture_slots];
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(capture_slots)
+        .map_err(|_| Error::AllocationFailed {
+            resource: Resource::CaptureOutputBytes,
+            items: capture_slots,
+        })?;
+    offsets.resize(capture_slots, (None, None));
     let mut cursor = accepted;
     while let Some(index) = cursor {
         charge(work, 1, limits.max_work)?;
