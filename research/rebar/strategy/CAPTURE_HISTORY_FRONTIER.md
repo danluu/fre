@@ -2,9 +2,10 @@
 
 This checkpoint replaces the rejected suffix-restarted capture reducer with a
 whole-operation selector followed by exact-span tagged-history replay. It is a
-source and counter checkpoint, not a performance result. No timing is allowed
-until the current source has passed the full authenticated Rebar differential
-twice with byte-identical reports.
+source, semantic, and counter checkpoint, not a performance result. Exact
+source `785cc1eecf05bea484d2be1a54206152c4108685` passed the full authenticated
+Rebar differential twice with byte-identical reports. No capture timing has
+been run.
 
 ## Certified mechanism and progress invariant
 
@@ -73,45 +74,80 @@ commands pass:
 
 ```text
 cargo test -p fre-capture-lab --test conformance
-cargo test -p fre --test captures
-cargo test -p fre --test portable_assertions
-cargo test -p rebar-compare fre_capture_reducers_cover_optional_repeated_and_line_models
-cargo test -p rebar-compare grep_capture_selector_ledgers_are_cumulative_across_lines
-cargo test -p rebar-compare current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed
+cargo test -p fre --test captures --test portable_assertions --test aggregate_many_facade
+cargo test -p rebar-compare --lib
+cargo clippy -p fre-capture-lab --all-targets -- -D warnings
+cargo clippy -p fre -p rebar-compare --all-targets --no-deps -- -D warnings
+RUSTDOCFLAGS=-Dwarnings cargo doc -p fre-capture-lab -p fre --no-deps
 ```
 
 The prior suffix-restarted semantic experiment added ten rows to its then-179
 baseline, but it was killed because its aggregate work was quadratic. Those
-receipts do not qualify this replacement. Promotion requires, on the current
-baseline:
+receipts do not qualify this replacement. The replacement satisfies the
+semantic promotion gate:
 
-1. two byte-identical full 344-row comparison reports;
-2. no removed pass, semantic failure, unresolved result or fault;
-3. an exact unique supported-row delta and refusal-reason inventory;
-4. focused static and documentation gates; and
-5. preservation of the specialized non-capture dispatch identities.
+- Two full 344-Rust-row reports are byte-identical at SHA-256
+  `fc8a34677a6a7e8e4ae276c24f41339677247887901a98e824506b2fd5be26c8`;
+  their sorted-receipts SHA-256 is
+  `e108451aeef37bf0dacd3bfded66f0a5cd8a77fde3e832476acd26a1b27c791b`.
+- FRE has 197 passes and 147 typed unsupported receipts, with no failure,
+  fault, unresolved result, or removed pass relative to the authenticated
+  189-pass baseline.
+- The exact delta is eight capture rows: three `count-captures` and five
+  `grep-captures`.
+- The existing 29 exact-literal, 132 continuation, two ordered build-many, 17
+  compile-artifact, and nine portable-search dispatch identities are
+  preserved. Eight new receipts identify the selector/history capture path.
 
-The known capture-gap families must be reported rather than hidden by a total:
-Unicode lowering, unsupported looks, ordered build-many, selector construction
-limits, selector operation limits, and tagged replay/history limits. In
-particular, the seven large rows refused by the rejected replay must be
-reclassified using this mechanism's exact selector and exact-span bounds.
+The eight newly supported IDs are:
+
+- `captures/contiguous-letters@rust/regex`
+- `curated/07-unicode-character-data/parse-line@rust/regex`
+- `curated/11-unstructured-to-json/extract@rust/regex`
+- `opt/onepass/first-three-words-english@rust/regex`
+- `test/model/count-captures@rust/regex`
+- `test/model/grep-captures@rust/regex`
+- `unicode/overlapping-words/ascii@rust/regex`
+- `wild/caddy/caddy@rust/regex`
+
+The 29 remaining capture refusals are not hidden by the total: 17 require
+Unicode lowering, two require unsupported looks, one requires ordered
+build-many capture semantics, and nine exceed selector-work limits. Of the
+seven large count-capture probe rows from the rejected experiment,
+`captures/contiguous-letters` now passes and the other six remain exact bounded
+resource refusals. Cumulative public-job ledger hardening also corrected three
+line reducers that a pre-hardening screen admitted by resetting the quota per
+line:
+
+- `curated/04-ruff-noqa/real`: 154,000 units required with 87,810 remaining;
+- `curated/04-ruff-noqa/tweaked`: 87,138 required with 62,472 remaining; and
+- `opt/onepass/fn-predicate`: 43,529 required with 42,796 remaining.
+
+The authenticated reports are
+`/tmp/fre-control/results/P34-CAPTURE-785CC1E-85D-FULL344-R{1,2}.json`.
+The earlier headline 200 screen reset line budgets and is not promotion
+evidence. The separately reverted Unicode-compile experiment is also excluded.
 
 ## Preregistered pointwise performance matrix
 
-Run no timings before the semantic and counter gates above pass. After they do,
-measure the complete public reducer boundary against pinned Rust regex on these
-four cells. RE2 is a secondary comparator only: equal expected reductions make
-these cells useful comparisons, but do not establish general RE2-profile
-capture conformance.
+The semantic and counter gates now permit timing, but no timing has yet run.
+Measure the complete public reducer boundary against pinned Rust regex on these
+four supported cells. RE2 is a secondary comparator only: equal expected
+reductions make these cells useful comparisons, but do not establish general
+RE2-profile capture conformance.
 
 | Regime | Row | Haystack bytes | Expected reduction |
 |---|---|---:|---:|
 | dense line captures | `curated/07-unicode-character-data/parse-line` | 1,913,704 | 558,784 |
-| long sparse line captures | `curated/04-ruff-noqa/real` | 32,514,634 | 84 |
-| medium line captures | `opt/onepass/fn-predicate` | 7,384,531 | 916 |
+| short structured line captures | `curated/11-unstructured-to-json/extract` | 23,952 | 600 |
+| medium line captures | `opt/onepass/first-three-words-english` | 613,357 | 35,128 |
 | short whole-haystack captures | `test/model/count-captures` | 37 | 3 |
 
 Report pointwise medians, dispersion, allocations and work counters. Do not
 publish a suite geomean from four hand-selected cells, and do not select a
-different timing subset after seeing results.
+different timing subset after seeing results. This matrix was corrected before
+any timing because `ruff-noqa/real` and `fn-predicate` became typed unsupported
+when the semantic gate made selector ledgers cumulative across lines. Keep
+those two rows as refusal/work-counter diagnostics until an implementation
+earns admission within the existing limits; do not time them as supported FRE
+cells and do not raise their quotas.
