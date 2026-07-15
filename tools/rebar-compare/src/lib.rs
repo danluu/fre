@@ -67,7 +67,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v10";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v11";
 const REGEX_REDUX_EXPECTED_REPORT: &str = "agggtaaa|tttaccct 6\n[cgt]gggtaaa|tttaccc[acg] 26\na[act]ggtaaa|tttacc[agt]t 86\nag[act]gtaaa|tttac[agt]ct 58\nagg[act]taaa|ttta[agt]cct 113\naggg[acg]aaa|ttt[cgt]ccct 31\nagggt[cgt]aa|tt[acg]accct 31\nagggta[cgt]a|t[acg]taccct 32\nagggtaa[cgt]|[acg]ttaccct 43\n\n1016745\n1000000\n547899\n";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 
@@ -360,10 +360,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with valid-UTF-8 Unicode scalar classes, positive Unicode-word, and absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum, compile-only canonical Unicode artifacts, ordered build-many count/span-sum, Unicode-off bounded capture-history count-captures/grep-captures, and the complete ordered regex-redux composite; exact literal, direct Unicode scalar-class, finite ordered literal, ordered build-many literal, or reverse-sequential-rows continuation; compact canonical scalar ranges plus reverse-dense-AC/DP finite reduction; capture preservation is isolated from whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with valid-UTF-8 Unicode scalar classes, positive Unicode-word, and absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum, compile-only canonical Unicode artifacts, ordered build-many compile/count/span-sum, Unicode-off bounded capture-history count-captures/grep-captures, and the complete ordered regex-redux composite; exact literal, direct Unicode scalar-class, finite ordered literal, ordered build-many literal, or reverse-sequential-rows continuation; compact canonical scalar ranges plus reverse-dense-AC/DP finite reduction; capture preservation is isolated from whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, bounded Unicode-off finite ordered languages, or a bounded continuation program; scalar root-class routing takes precedence for its Unicode execution shape, while compile alone may fall back to a canonical Unicode artifact under its separate bound when no reusable Unicode execution plan is available; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; Unicode-off one-pattern count-captures/grep-captures use separately compiled exact-span prioritized capture-history replay with independent slot/replay/history/output/work/peak limits; regex-redux freshly constructs all fifteen fixed Unicode-off continuation components and executes the complete ordered report/replacement protocol; portable grep executes the certified K0 subset including canonical valid-UTF-8 Unicode scalar-class paths, positive Unicode word boundaries, and absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed, while negated/start/end/half Unicode-word and CRLF assertions remain typed refusals; multi-pattern or Unicode capture requests, span/capture-history surfaces outside the named reducers, and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, bounded Unicode-off finite ordered languages, or a bounded continuation program; scalar root-class routing takes precedence for its Unicode execution shape, while compile alone may fall back to a canonical Unicode artifact under its separate bound when no reusable Unicode execution plan is available; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; compile publishes a fresh complete immutable artifact before untimed verification and cannot fall back after selection; Unicode-off one-pattern count-captures/grep-captures use separately compiled exact-span prioritized capture-history replay with independent slot/replay/history/output/work/peak limits; regex-redux freshly constructs all fifteen fixed Unicode-off continuation components and executes the complete ordered report/replacement protocol; portable grep executes the certified K0 subset including canonical valid-UTF-8 Unicode scalar-class paths, positive Unicode word boundaries, and absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed, while negated/start/end/half Unicode-word and CRLF assertions remain typed refusals; multi-pattern or Unicode capture requests, span/capture-history surfaces outside the named reducers, and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1869,6 +1869,9 @@ fn fre_compile_verify(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return fre_aggregate_many_compile(request, limits);
+    }
     let pattern = one_fre_pattern(request)?;
     let built = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
@@ -3003,6 +3006,41 @@ fn fre_aggregate_many_count(
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
+    };
+    Ok(FreReduction {
+        actual: result.value(),
+        plan,
+    })
+}
+
+fn fre_aggregate_many_compile(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex = AggregateManyBuilder::new(request.patterns)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(aggregate_many_build_limits(limits))
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_compile()
+        .map_err(|error| aggregate_many_build_error(&error))?;
+    require_aggregate_many_identity(
+        request,
+        regex.build_report(),
+        AggregateManyOperation::Compile,
+    )?;
+    let operation_limits =
+        aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let result = regex
+        .verify_count(request.haystack, operation_limits)
+        .map_err(|error| {
+            let message = format!("FRE ordered compile-many refused verification: {error}");
+            aggregate_many_execution_error(&error.source, message)
+        })?;
+    let plan = match regex.build_report().plan {
+        AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
+        AggregateManyPlanKind::ContinuationProgram => "compile-many-continuation-program",
     };
     Ok(FreReduction {
         actual: result.value(),
