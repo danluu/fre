@@ -6,12 +6,16 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const PAIR_SWAR_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14";
+const PAIR_SWAR_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
 
 fn plan() -> ForwardAnchoredPlan {
+    plan_for(&[0x00, 0xFF], &[0x7F, 0x55])
+}
+
+fn plan_for(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
-        ForwardAnchoredByteClass::from_bytes(&[0x00, 0xFF]),
-        &[0x7F, 0x55],
+        ForwardAnchoredByteClass::from_bytes(members),
+        suffix,
         ForwardAnchoredAnchors {
             start: true,
             end: false,
@@ -19,6 +23,40 @@ fn plan() -> ForwardAnchoredPlan {
         ForwardAnchoredBuildLimits::default(),
     )
     .unwrap()
+}
+
+#[test]
+fn pair_neon16_threshold_lanes_and_high_bits_are_exact() {
+    let candidate = plan_for(&[0x7E, 0x80], &[0xFE, 0x55]);
+    for boundary in [72_usize, 73, 74, 79, 80, 81, 95, 96, 97] {
+        let mut haystack: Vec<u8> = [0x7E, 0x80].into_iter().cycle().take(boundary).collect();
+        haystack.extend_from_slice(candidate.suffix());
+        let (span, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(span, Some((0, haystack.len())), "boundary={boundary}");
+        assert_eq!(accounting.prefix_bytes_examined, boundary + 1);
+    }
+
+    const BOUNDARY: usize = 96;
+    for lane in 0..16 {
+        let position = 16 + lane;
+        for outsider in [0x00_u8, 0x40, 0x81, 0xFF] {
+            let mut haystack: Vec<u8> = [0x7E, 0x80].into_iter().cycle().take(BOUNDARY).collect();
+            haystack[position] = outsider;
+            haystack.extend_from_slice(candidate.suffix());
+            let (span, accounting) = candidate
+                .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(span, None, "lane={lane} outsider={outsider:#04x}");
+            assert_eq!(
+                accounting.prefix_bytes_examined,
+                position + 10,
+                "lane={lane} outsider={outsider:#04x}"
+            );
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+        }
+    }
 }
 
 fn members(length: usize) -> Vec<u8> {
