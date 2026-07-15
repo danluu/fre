@@ -4599,6 +4599,30 @@ mod tests {
             2,
             "aggregate-many-ordered-literal",
         );
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &[r"(?:cat|dog)".to_string()],
+                b"cat x dog",
+                false,
+                false,
+                &limits,
+            ),
+            2,
+            "aggregate-finite-literal-dfa",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &[r"(?:cat|dog)".to_string()],
+                b"cat x dog",
+                false,
+                false,
+                &limits,
+            ),
+            6,
+            "aggregate-finite-literal-dfa",
+        );
 
         let unicode_capture = current_fre(
             "count-captures",
