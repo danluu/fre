@@ -5,7 +5,7 @@ Status: source-only candidate recomposed on exact canonical base
 `57565e86fb8abf59a58c0ebb575a86916db829ca`). No compiler, formatter,
 executable test, report generation, assembly, or timing command was run in this
 lane. The candidate adapter identity advances to
-`fre-current-aggregate-v6` only for the composed capture route; the direct
+`fre-current-aggregate-v7` for the composed scalar-plus-capture route; the direct
 Unicode scalar plan plus the ordered build-many and timing surfaces retain
 their existing plan, schema, and timing identities. The authenticated frontier
 remains 214 pass / 130 unsupported, and this document claims no additional
