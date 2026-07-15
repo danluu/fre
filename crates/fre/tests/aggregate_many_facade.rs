@@ -25,13 +25,22 @@ fn compile_artifact_preserves_order_profile_and_priority_before_verification() {
         .build_compile()
         .unwrap();
 
-    assert_eq!(AggregateManyOperation::Compile, longer.build_report().operation);
-    assert_eq!(AggregateManyPlanKind::ContinuationProgram, longer.build_report().plan);
+    assert_eq!(
+        AggregateManyOperation::Compile,
+        longer.build_report().operation
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        longer.build_report().plan
+    );
     assert_eq!(1, longer.verify_count(b"aa", limits).unwrap().value());
     assert_eq!(2, shorter.verify_count(b"aa", limits).unwrap().value());
     for (ordinal, report) in longer.build_report().patterns.iter().enumerate() {
         assert_eq!(ordinal, report.ordinal);
-        assert_eq!(longer_first[ordinal].as_bytes(), report.syntax_key.pattern.as_bytes());
+        assert_eq!(
+            longer_first[ordinal].as_bytes(),
+            report.syntax_key.pattern.as_bytes()
+        );
         assert_eq!(
             CompatibilityProfile::RustBytes(longer.build_report().profile.clone()),
             report.syntax_key.profile

@@ -190,9 +190,9 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    currently supported regimes before optimizing a favorite subset. Use
    allocations and selector/history counters to choose shared improvements;
    do not publish a four-cell suite geomean.
-4. Extend the ordered build-many plan/API to the two remaining compile jobs.
-   Never emulate priority by concatenating patterns; retain the named adverse
-   performance follow-up for the two admitted execution rows.
+4. Validate the ordered compile-many artifact against the exact frontier.
+   Never emulate priority by concatenating patterns; retain the typed repeat
+   cap and the named adverse performance follow-up for admitted rows.
 5. Qualify cold and allocator-warm construction performance for the nineteen
    supported compile rows, keeping construction separate from untimed semantic
    verification. Extend only the reusable Unicode/resource/build-many mechanisms
