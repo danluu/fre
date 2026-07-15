@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1120,6 +1120,12 @@ impl ForwardAnchoredPlan {
     #[inline]
     fn scan_candidate_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
         match self.implementation {
+            ClassImplementation::InclusiveRange { start, end }
+                if start == end
+                    && (SINGLE_CANDIDATE_MIN..=SINGLE_CANDIDATE_MAX).contains(&bytes.len()) =>
+            {
+                scan_single_candidate_prefix(bytes, start)
+            }
             ClassImplementation::Quint {
                 first,
                 second,
@@ -1295,6 +1301,8 @@ fn scan_fixed_class_prefix(
 const RANGE_BLOCK: usize = 32;
 const FIXED_RANGE_BLOCK: usize = 64;
 const FIXED_RANGE_WIDE_BLOCK: usize = 128;
+const SINGLE_CANDIDATE_MIN: usize = 73;
+const SINGLE_CANDIDATE_MAX: usize = 1_024;
 const EDGE_WITNESS_FRONT: usize = 8;
 const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
 const EDGE_WITNESS_MEDIUM_END: usize = 64;
@@ -1992,6 +2000,62 @@ fn scan_fixed_wide_range_prefix(
     Ok((boundary, examined))
 }
 
+fn scan_single_candidate_prefix(bytes: &[u8], member: u8) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK / 2);
+        let low_outside = low
+            .iter()
+            .fold(0_u8, |outside, &byte| outside | u8::from(byte != member));
+        let high_outside = high
+            .iter()
+            .fold(0_u8, |outside, &byte| outside | u8::from(byte != member));
+        if low_outside | high_outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| byte != member)
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "single candidate boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed single candidate block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed single candidate blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| byte != member)
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "single candidate remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "single candidate remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
 /// Scan fixed-end range prefixes in four independent vector-width lanes.
 /// A failing 64-byte block rescans only its first failing 32-byte half, so the
 /// existing `prefix_len + 32` preflight bound remains conservative.
@@ -2411,7 +2475,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7"
+            "anchored-class-suffix.single-candidate73-1024-equality32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8"
         );
         assert_eq!(
             pair.implementation(),

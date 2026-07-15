@@ -4,7 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v8";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(

@@ -43,10 +43,7 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
         assert_eq!(span, Some((0, haystack.len())), "boundary={boundary}");
         assert_eq!(accounting.prefilter_calls, 1);
         assert_eq!(accounting.prefix_bytes_examined, boundary + 1);
-        assert_eq!(
-            accounting.prefix_bytes_upper_bound,
-            haystack.len() + 32
-        );
+        assert_eq!(accounting.prefix_bytes_upper_bound, haystack.len() + 32);
         assert!(accounting.suffix_confirmation_attempted);
 
         let exact = ForwardAnchoredSearchLimits {
@@ -74,10 +71,7 @@ fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes
                     .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
                     .unwrap();
                 assert_eq!(span, None, "boundary={boundary} earlier={earlier}");
-                assert!(
-                    accounting.prefix_bytes_examined
-                        <= accounting.prefix_bytes_upper_bound
-                );
+                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
                 if earlier == 0 {
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                     assert!(!accounting.suffix_confirmation_attempted);
