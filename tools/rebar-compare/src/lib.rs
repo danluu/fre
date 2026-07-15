@@ -4174,19 +4174,18 @@ mod tests {
                 plan,
             );
         }
-        let invalid = current_fre(
-            "compile",
-            &[r"(?-u:\xFF)".to_string()],
-            &[0xFF],
-            true,
-            false,
-            &limits,
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"(?-u:\xFF)".to_string()],
+                &[0xFF],
+                true,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-aggregate-continuation-program",
         );
-        assert!(matches!(
-            invalid,
-            CandidateOutcome::Unsupported(reason)
-                if reason.contains("invalid UTF-8") || reason.contains("byte class")
-        ));
     }
 
     #[test]
