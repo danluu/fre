@@ -1,9 +1,14 @@
-# Ordered build-many projection
+# Ordered build-many frontier
 
-Status: source-only projection from canonical base
-`c25f8c2ad4356c148256d8000cd483a9410c66a5`. No compiler, test executable,
-generated report, assembly inspection, or timing command was run for this
-composition.
+Status: semantic qualification from canonical base
+`109409aaca9ce5acf5d35cd7b4cbc0c8c7c78152`. Exact candidate source
+`35b22acf7db5ebf63992085a4ad3782a9e46f139` (tree
+`b63266c7be97e82b565bf2b9ce78d9608536a2a9`) passed its focused facade,
+comparator, strict Clippy, and format gates. The full Rebar report has SHA-256
+`132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`
+and sorted-receipts SHA-256
+`106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
+No timing or assembly command was run.
 
 ## Semantic construction
 
@@ -30,30 +35,25 @@ original whole-haystack context. Captures may be erased only for whole-match
 count and span-sum values. Span materialization and capture-count/history
 outputs are typed preflight refusals.
 
-## Exact projected cluster
+## Exact qualified cluster
 
-The authenticated frontier remains 179 pass / 165 unsupported until fresh
-canonical receipts exist. This source projects the following five existing
-ordered build-many refusals:
+The exact composed frontier is 189 pass / 155 unsupported. Two of the five
+execution candidates pass; the other three now reach later typed resource
+gates instead of being rejected for pattern cardinality:
 
-| Rust-target row | Operation | Projected plan family |
+| Rust-target row | Operation | Exact result |
 |---|---|---|
-| `curated/13-noseyparker/multi@rust/regex` | `count` | continuation program |
-| `curated/12-dictionary/multi@rust/regex` | `count` | ordered literal |
-| `opt/literal-alt/pattern-per-word@rust/regex` | `count` | ordered literal with Unicode literal proof |
-| `curated/05-lexer-veryl/multi@rust/regex` | `count-spans` | continuation program |
-| `wild/parol-veryl/multi-patternid-ascii@rust/regex` | `count-spans` | continuation program |
+| `curated/13-noseyparker/multi@rust/regex` | `count` | repeat-bound refusal |
+| `curated/12-dictionary/multi@rust/regex` | `count` | pass, ordered literal |
+| `opt/literal-alt/pattern-per-word@rust/regex` | `count` | pass, ordered literal with Unicode literal proof |
+| `curated/05-lexer-veryl/multi@rust/regex` | `count-spans` | execution-work refusal |
+| `wild/parol-veryl/multi-patternid-ascii@rust/regex` | `count-spans` | execution-work refusal |
 
-If and only if all five fresh semantic receipts pass every bounded gate, the
-projected operation counts become 57 `count` and 102 `count-spans`, with a
-projected total of 184 pass / 160 unsupported. The authenticated 16 `compile`
-passes remain unchanged. These are projections, not
-promotion evidence.
-
-This five-row build-many projection is additive to any Unicode-continuation
-rows separately qualified from the base candidate. Because that candidate has
-no regenerated canonical receipt, this document does not claim a larger exact
-composed total.
+The exact operation counts are 62 `count` and 101 `count-spans`; the two new
+passes are additive to the independently authenticated Unicode and portable
+rows. The 17 `compile` passes remain unchanged. The two multi-pattern compile
+jobs remain typed unsupported until the compile facade publishes a complete
+ordered artifact.
 
 ## Required follow-up
 
@@ -61,7 +61,8 @@ The representative construction row is
 `curated/12-dictionary/compile-multi@rust/regex`; it remains unsupported until
 compile-model timing and work publication are defined. Its paired execution
 row, `curated/12-dictionary/multi@rust/regex`, is the representative count
-measurement. Qualification must also measure adverse cases: reversed-priority
+measurement. The named performance follow-up must also measure adverse cases:
+reversed-priority
 prefixes such as `[a{M}b, a]` over `a^N`, duplicate and empty alternatives,
 late matches, no matches, thousands of literals, and large heterogeneous lexer
 sets. Compile cost, retained capacity, cold count, and hot count must be
