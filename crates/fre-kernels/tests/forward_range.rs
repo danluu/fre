@@ -24,11 +24,17 @@ fn plan(start: u8, end: u8, suffix: &[u8]) -> ForwardAnchoredPlan {
 
 fn expected_failed_word_examinations(boundary: usize, scanned_len: usize) -> usize {
     let word_bytes = size_of::<usize>();
-    let completed_words = boundary / word_bytes;
-    if completed_words < scanned_len / word_bytes {
-        completed_words * word_bytes + word_bytes + boundary % word_bytes + 1
+    let completed_words = boundary.checked_div(word_bytes).unwrap();
+    let scanned_words = scanned_len.checked_div(word_bytes).unwrap();
+    if completed_words < scanned_words {
+        completed_words
+            .checked_mul(word_bytes)
+            .and_then(|value| value.checked_add(word_bytes))
+            .and_then(|value| value.checked_add(boundary.checked_rem(word_bytes).unwrap()))
+            .and_then(|value| value.checked_add(1))
+            .unwrap()
     } else {
-        boundary + 1
+        boundary.checked_add(1).unwrap()
     }
 }
 
