@@ -1,11 +1,14 @@
 # Portable positive Unicode word boundaries
 
-Status: source checkpoint from exact canonical base
+Status: semantically green source checkpoint, stopped before promotion for
+predictably slow broad-path execution, from exact canonical base
 `60e97792ae69c00b052ae268ba99470cf87bf995`. Tests were committed red-first at
 `0419762`; implementation and dependency checkpoints are `a9ce782` and
-`8150eca`. Validation is pending resource admission because host free space was
-below the mandatory 20 GiB floor. No benchmark or generated Rebar report has
-been run for this checkpoint.
+`8150eca`; the final comparator-bound source is `9285701`. Focused and full
+owned tests, strict affected Clippy, and formatting pass. A full Rebar
+generation was stopped after 16 minutes 38 seconds at 100% CPU without an
+atomic report, so the projected frontier remains unauthenticated. No benchmark
+was run.
 
 ## Reusable mechanism
 
@@ -51,8 +54,10 @@ The candidate projects exactly one newly supported row and no removed pass:
   `7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36`;
   7,384,531 haystack bytes; authenticated expected grep count 5,075.
 
-If focused semantics, strict affected Clippy, formatting, and fresh complete
-generation pass, the projected frontier is 238 pass / 106 unsupported, with
-`grep` 11/0. Promotion additionally requires a representative performance
-receipt because this broad K0 path is not assumed fast merely because it is
-correct.
+The projected frontier is 238 pass / 106 unsupported, with `grep` 11/0, but it
+is not authenticated and must not replace canonical 237/344. The exact STOP
+receipt is
+`/tmp/fre-control/results/G0-REBAR-PORTABLE-WORD-9285701-STOP-001.md`.
+Promotion requires a reusable bounded Unicode word-run/scalar execution plan,
+a fresh complete generation, and representative performance evidence; this
+generic K0 expansion is retained only as semantic evidence.
