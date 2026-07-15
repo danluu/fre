@@ -72,12 +72,11 @@ use fre_kernels::{
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ParseSummary,
-    SafetyEnvelope,
+    AdmissionPolicy, AdmissionStatus, CanonicalPattern, ParseSummary, SafetyEnvelope,
 };
 use regex_syntax::hir::Look;
 
-pub use fre_syntax::RustProfile;
+pub use fre_syntax::{CompatibilityProfile, RustProfile};
 
 pub use fre_automata::{SearchError as K0SearchError, SearchLimits, SearchWindow};
 
