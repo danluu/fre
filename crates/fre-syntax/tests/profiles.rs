@@ -143,7 +143,7 @@ fn rebar_profile_rejects_every_runner_fixed_option_override() {
     type Mutation = fn(&mut RustProfile);
     let cases: [(&str, &str, Mutation); 8] = [
         ("multi_line", "a", |profile| {
-            profile.options.multi_line = true
+            profile.options.multi_line = true;
         }),
         ("dot_matches_new_line", "a", |profile| {
             profile.options.dot_matches_new_line = true;
