@@ -124,6 +124,39 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
 }
 
 #[test]
+fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
+    let regex = CaptureBuilder::new(r"(a)")
+        .unicode(false)
+        .build()
+        .expect("combined-peak build");
+    let admitted = regex
+        .count_captures(b"a", CaptureRunLimits::default())
+        .expect("combined-peak baseline");
+    assert!(
+        admitted.combined_peak_bytes > admitted.selector_accounting.peak_bytes,
+        "fixture must expose retained spans plus replay scratch"
+    );
+    assert!(
+        admitted.combined_peak_bytes <= CaptureRunLimits::default().max_combined_peak_bytes
+    );
+
+    let constrained = CaptureRunLimits {
+        max_combined_peak_bytes: admitted.selector_accounting.peak_bytes,
+        ..CaptureRunLimits::default()
+    };
+    let error = regex
+        .count_captures(b"a", constrained)
+        .expect_err("combined peak must constrain replay before allocation");
+    assert!(matches!(
+        error.source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::ScratchBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn uncertified_unicode_and_word_look_remain_typed_refusals() {
     assert!(
         CaptureBuilder::new(r"(\p{L}+)")

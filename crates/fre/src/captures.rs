@@ -92,12 +92,25 @@ impl Default for CaptureBuildLimits {
 }
 
 /// Execution limits included verbatim in the execution cache identity.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureRunLimits {
     /// Limits for exact-span tagged replay and capture reduction.
     pub aggregate: AggregateLimits,
     /// Limits for the complete operation-wide span selection.
     pub selector: SelectorOperationLimits,
+    /// Maximum logical dynamic bytes across selector execution or retained
+    /// selector output plus one exact-span replay.
+    pub max_combined_peak_bytes: usize,
+}
+
+impl Default for CaptureRunLimits {
+    fn default() -> Self {
+        Self {
+            aggregate: AggregateLimits::default(),
+            selector: SelectorOperationLimits::default(),
+            max_combined_peak_bytes: 512 * 1_048_576,
+        }
+    }
 }
 
 /// Immutable plan identity. Source syntax remains distinct even when HIRs agree.
@@ -281,6 +294,8 @@ pub struct CaptureExecutionReport {
     pub selector_certificate: SelectorOperationCertificate,
     /// Exact selector work and storage accounting.
     pub selector_accounting: SelectorExecutionAccounting,
+    /// Conservative logical dynamic peak across selection and exact replay.
+    pub combined_peak_bytes: usize,
 }
 
 /// Builder for the capture-preserving persistent-history plan.
@@ -434,18 +449,33 @@ impl CaptureRegex {
         limits: CaptureRunLimits,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let identity = self.cache_identity(limits);
+        let mut selector_limits = limits.selector;
+        selector_limits.max_peak_bytes = selector_limits
+            .max_peak_bytes
+            .min(limits.max_combined_peak_bytes);
         let selected = self
             .selector
             .admit_spans(
                 haystack,
                 0..haystack.len(),
                 SelectorStrategy::ReverseSequentialRows,
-                limits.selector,
+                selector_limits,
             )
             .map_err(|source| CaptureExecutionError {
                 identity: Box::new(identity.clone()),
                 source: CaptureExecutionSource::Selector(source),
             })?;
+        let selector_accounting = selected.accounting();
+        let replay_scratch_limit = limits
+            .max_combined_peak_bytes
+            .checked_sub(selector_accounting.output_bytes)
+            .ok_or_else(|| CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "selector output exceeded the admitted combined peak",
+                ),
+            })?;
+        let mut combined_peak_bytes = selector_accounting.peak_bytes;
         let mut accounting = CaptureCountOutcome {
             count: 0,
             matches: 0,
@@ -479,6 +509,9 @@ impl CaptureRegex {
                 limits.aggregate.max_results,
             )?;
             let mut per_search = limits.aggregate.per_search;
+            per_search.max_scratch_bytes = per_search
+                .max_scratch_bytes
+                .min(replay_scratch_limit);
             per_search.max_state_visits = per_search.max_state_visits.min(capture_remaining(
                 &identity,
                 limits.aggregate.max_total_state_visits,
@@ -505,6 +538,16 @@ impl CaptureRegex {
                 .engine
                 .captures_exact(haystack, window, span, per_search)
                 .map_err(|source| Self::history_error(&identity, source))?;
+            let replay_combined_peak = selector_accounting
+                .output_bytes
+                .checked_add(replay.report.admitted_scratch_bytes)
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "combined selector/replay peak overflowed usize",
+                    ),
+                })?;
+            combined_peak_bytes = combined_peak_bytes.max(replay_combined_peak);
             let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
                 identity: Box::new(identity.clone()),
                 source: CaptureExecutionSource::InternalInvariant(
@@ -556,7 +599,8 @@ impl CaptureRegex {
             identity,
             accounting,
             selector_certificate: selected.certificate().clone(),
-            selector_accounting: selected.accounting(),
+            selector_accounting,
+            combined_peak_bytes,
         })
     }
 

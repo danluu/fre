@@ -124,7 +124,9 @@ pub struct CaptureCountOutcome {
     pub count: usize,
     /// Number of selected non-overlapping matches.
     pub matches: usize,
-    /// Number of independently bounded searches, including the final miss.
+    /// Number of independently bounded searches or exact-span replays. The
+    /// legacy restarted reducer includes its final miss; selector-driven
+    /// replay has one invocation per certified non-empty match and no miss.
     pub searches: usize,
     /// Total Thompson state visits.
     pub total_state_visits: usize,

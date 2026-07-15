@@ -39,6 +39,11 @@ disjoint lengths, then:
 
 Every selector and tagged-history work, scratch, output, history-node, winner
 walk, group-event, match, and result dimension has a checked admission limit.
+Line-oriented `grep-captures` invocations debit selector work and sequential
+bytes from one public-job ledger rather than resetting either quota per line.
+The operation peak is the larger of the selector peak and retained selector
+spans plus one replay's admitted scratch; the combined cap constrains replay
+before its history arena is allocated.
 Construction identity includes both program identities and their limits;
 execution identity includes both operation limit sets. Existing exact-literal,
 continuation, and portable-grep dispatch is unchanged.
@@ -71,6 +76,7 @@ cargo test -p fre-capture-lab --test conformance
 cargo test -p fre --test captures
 cargo test -p fre --test portable_assertions
 cargo test -p rebar-compare fre_capture_reducers_cover_optional_repeated_and_line_models
+cargo test -p rebar-compare grep_capture_selector_ledgers_are_cumulative_across_lines
 cargo test -p rebar-compare current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed
 ```
 

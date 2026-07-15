@@ -1963,6 +1963,8 @@ fn capture_regex(
 fn capture_run_limits(
     haystack_len: usize,
     selector_states: usize,
+    selector_work: usize,
+    selector_sequential_bytes: usize,
     reducer_events: usize,
     reducer_count: usize,
     state_visits: usize,
@@ -1981,9 +1983,9 @@ fn capture_run_limits(
         "capture selector output bytes",
     )?
     .min(limits.fre_aggregate_peak_bytes);
-    selector.max_sequential_bytes = limits.fre_aggregate_sequential_bytes;
+    selector.max_sequential_bytes = selector_sequential_bytes;
     selector.max_peak_bytes = limits.fre_aggregate_peak_bytes;
-    selector.max_work = limits.fre_aggregate_operation_work;
+    selector.max_work = selector_work;
     Ok(CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
@@ -2003,6 +2005,7 @@ fn capture_run_limits(
             max_capture_count: reducer_count,
         },
         selector,
+        max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
     })
 }
 
@@ -2010,6 +2013,53 @@ fn capture_reducer_budget(limits: &RunLimits) -> Result<(usize, usize), Executio
     let reducer = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE capture reducer limit does not fit usize"))?;
     Ok((reducer, limits.fre_aggregate_operation_work))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CaptureSelectorLedger {
+    work: usize,
+    sequential_bytes: usize,
+}
+
+impl CaptureSelectorLedger {
+    fn remaining(self, limits: &RunLimits) -> Result<(usize, usize), ExecutionError> {
+        let work = limits
+            .fre_aggregate_operation_work
+            .checked_sub(self.work)
+            .ok_or_else(|| ExecutionError::fault("FRE selector work accounting underflow"))?;
+        let sequential = limits
+            .fre_aggregate_sequential_bytes
+            .checked_sub(self.sequential_bytes)
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE selector sequential accounting underflow")
+            })?;
+        Ok((work, sequential))
+    }
+
+    fn charge(
+        &mut self,
+        work: usize,
+        written: usize,
+        read: usize,
+        limits: &RunLimits,
+    ) -> Result<(), ExecutionError> {
+        self.work = checked_aggregate_add(self.work, work, "capture selector work")?;
+        let line_sequential =
+            checked_aggregate_add(written, read, "capture selector line sequential bytes")?;
+        self.sequential_bytes = checked_aggregate_add(
+            self.sequential_bytes,
+            line_sequential,
+            "capture selector sequential bytes",
+        )?;
+        if self.work > limits.fre_aggregate_operation_work
+            || self.sequential_bytes > limits.fre_aggregate_sequential_bytes
+        {
+            return Err(ExecutionError::fault(
+                "FRE selector exceeded its cumulative public-operation ledger",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn fre_count_captures(
@@ -2021,6 +2071,8 @@ fn fre_count_captures(
     let run_limits = capture_run_limits(
         request.haystack.len(),
         regex.build_report().selector.program_states,
+        work,
+        limits.fre_aggregate_sequential_bytes,
         reducer,
         reducer,
         work,
@@ -2058,6 +2110,7 @@ fn fre_grep_captures(
         .ok_or_else(|| ExecutionError::fault("FRE capture group count overflow"))?;
     let mut reducer_events = 0_usize;
     let mut count = 0_usize;
+    let mut selector = CaptureSelectorLedger::default();
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
@@ -2074,6 +2127,8 @@ fn fre_grep_captures(
         let count_remaining = reducer_limit
             .checked_sub(count)
             .ok_or_else(|| ExecutionError::fault("FRE grep-capture count underflow"))?;
+        let (selector_work_remaining, selector_sequential_remaining) =
+            selector.remaining(limits)?;
         let state_remaining = work_limit
             .checked_sub(state_visits)
             .ok_or_else(|| ExecutionError::fault("FRE capture state accounting underflow"))?;
@@ -2086,6 +2141,8 @@ fn fre_grep_captures(
         let run_limits = capture_run_limits(
             line.len(),
             regex.build_report().selector.program_states,
+            selector_work_remaining,
+            selector_sequential_remaining,
             event_remaining,
             count_remaining,
             state_remaining,
@@ -2112,6 +2169,12 @@ fn fre_grep_captures(
             )));
         }
         count = checked_aggregate_add(count, result.accounting.count, "capture count")?;
+        selector.charge(
+            result.selector_accounting.work,
+            result.selector_accounting.sequential_bytes_written,
+            result.selector_accounting.sequential_bytes_read,
+            limits,
+        )?;
         state_visits = checked_aggregate_add(
             state_visits,
             result.accounting.total_state_visits,
@@ -4184,6 +4247,25 @@ mod tests {
         .expect("FRE grep capture count");
         assert_eq!(grep.actual, 12);
         assert_eq!(grep.plan, "capture-linear-selector-persistent-history");
+    }
+
+    #[test]
+    fn grep_capture_selector_ledgers_are_cumulative_across_lines() {
+        let mut limits = RunLimits::default();
+        limits.fre_aggregate_operation_work = 10;
+        limits.fre_aggregate_sequential_bytes = 20;
+
+        let mut work = CaptureSelectorLedger::default();
+        assert_eq!(work.remaining(&limits).expect("initial ledger"), (10, 20));
+        work.charge(6, 5, 4, &limits).expect("first line");
+        assert_eq!(work.remaining(&limits).expect("remaining ledger"), (4, 11));
+        assert!(work.charge(5, 0, 0, &limits).is_err());
+
+        let mut sequential = CaptureSelectorLedger::default();
+        sequential
+            .charge(1, 8, 9, &limits)
+            .expect("first sequential line");
+        assert!(sequential.charge(1, 2, 2, &limits).is_err());
     }
 
     #[test]
