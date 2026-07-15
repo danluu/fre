@@ -173,6 +173,7 @@ fn emit(
         PlanKind::RequiredLiteral => "required-literal-v1",
         PlanKind::ForwardAnchored => "anchored-class-suffix-forward-v1",
         PlanKind::K0 => "k0",
+        PlanKind::UnicodeWordRun => "unicode-word-run-linear-v1",
     };
     let per_iteration = elapsed_ns / u128::try_from(ITERATIONS).unwrap();
     let (start, end) = matched.map_or((String::new(), String::new()), |(start, end)| {

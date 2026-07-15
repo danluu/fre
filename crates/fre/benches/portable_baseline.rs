@@ -125,6 +125,7 @@ fn compare_search(case: &Case) {
         PlanKind::RequiredLiteral => "fre-required-literal",
         PlanKind::ForwardAnchored => "fre-forward-anchored",
         PlanKind::K0 => "fre-k0",
+        PlanKind::UnicodeWordRun => "fre-unicode-word-run",
     };
 
     warm(|| {
