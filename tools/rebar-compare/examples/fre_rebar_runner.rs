@@ -12,7 +12,9 @@ use std::{
 };
 
 use bstr::ByteSlice;
-use fre::{AggregateBuildReport, AggregateBuilder, AggregatePlanKind, PlanKind};
+use fre::{
+    AggregateBuildReport, AggregateBuilder, AggregatePlanKind, PlanKind, SearchSessionLimits,
+};
 use rebar_compare::{
     AUDITED_REBAR_REVISION, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_portable_builder,
@@ -50,7 +52,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-v5 report={REPORT_SCHEMA} aggregate-explain=4 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-v7 report={REPORT_SCHEMA} aggregate-explain=7 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -354,10 +356,14 @@ fn aggregate_builder(benchmark: &Benchmark) -> AggregateBuilder {
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     match (model, report.plan) {
         ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
+        ("compile", AggregatePlanKind::UnicodeScalarClass) => {
+            "compile-aggregate-unicode-scalar-class"
+        }
         ("compile", AggregatePlanKind::ContinuationProgram) => {
             "compile-aggregate-continuation-program"
         }
         (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
+        (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
     }
 }
@@ -493,12 +499,16 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     }
     let haystack = benchmark.haystack.as_slice();
     let limits = current_fre_rebar_search_limits();
+    let mut session = regex.search_session(SearchSessionLimits {
+        max_setup_work: limits.max_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+    })?;
     run(
         benchmark,
         || {
             let mut count = 0_u64;
             for line in haystack.lines() {
-                if regex.is_match(line, limits)?.0 {
+                if session.is_match(line, limits)?.0 {
                     count = count.checked_add(1).ok_or("grep count overflow")?;
                 }
             }
@@ -564,5 +574,50 @@ mod tests {
             .unwrap();
         nonformal.splice(start..start + needle.len(), replacement.iter().copied());
         assert!(Benchmark::parse(&nonformal).is_err());
+    }
+
+    #[test]
+    fn authenticates_direct_unicode_scalar_plan_names() {
+        let benchmark = Benchmark {
+            name: "test/unicode-scalar".to_owned(),
+            model: "count".to_owned(),
+            patterns: vec![r"\pL".to_owned()],
+            case_insensitive: false,
+            unicode: true,
+            haystack: "aΔ".as_bytes().to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_secs(1),
+            max_warmup_time: Duration::ZERO,
+        };
+        let count = aggregate_builder(&benchmark)
+            .build_count()
+            .expect("Unicode scalar count plan");
+        assert_eq!(
+            aggregate_plan("count", count.build_report()),
+            "aggregate-unicode-scalar-class"
+        );
+        current_fre_rebar_validate_aggregate_identity(count.build_report(), true, "count")
+            .expect("Unicode scalar count identity");
+
+        let span_sum = aggregate_builder(&benchmark)
+            .build_span_sum()
+            .expect("Unicode scalar span-sum plan");
+        assert_eq!(
+            aggregate_plan("count-spans", span_sum.build_report()),
+            "aggregate-unicode-scalar-class"
+        );
+        current_fre_rebar_validate_aggregate_identity(span_sum.build_report(), true, "count-spans")
+            .expect("Unicode scalar span-sum identity");
+
+        let compile = aggregate_builder(&benchmark)
+            .build_compile()
+            .expect("Unicode scalar compile plan");
+        assert_eq!(
+            aggregate_plan("compile", compile.build_report()),
+            "compile-aggregate-unicode-scalar-class"
+        );
+        current_fre_rebar_validate_aggregate_identity(compile.build_report(), true, "compile")
+            .expect("Unicode scalar compile identity");
     }
 }
