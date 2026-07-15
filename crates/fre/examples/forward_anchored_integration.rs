@@ -390,7 +390,7 @@ mod tests {
             ),
             (
                 r"\A[a-z]+Z",
-                "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4",
+                "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5",
             ),
         ] {
             let regex = build_fre("forward", pattern).unwrap();

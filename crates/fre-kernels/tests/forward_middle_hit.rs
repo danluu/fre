@@ -4,8 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str =
-    "anchored-class-suffix.short72-forward-middle-equality5-isolated-asymmetric-scalar8-reverse32-inline.v4";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-forward-middle-equality5-isolated-asymmetric-scalar8-reverse32-inline.v4";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -59,12 +58,8 @@ fn short_middle_hits_use_one_forward_witness_for_pair_triple_and_quad() {
         for tail_len in 41_usize..=72 {
             let middle = 8 + (tail_len - 41) / 2;
             let boundary = middle + 1;
-            let mut haystack: Vec<u8> = members
-                .iter()
-                .copied()
-                .cycle()
-                .take(tail_len + 1)
-                .collect();
+            let mut haystack: Vec<u8> =
+                members.iter().copied().cycle().take(tail_len + 1).collect();
             let suffix_end = boundary + suffix.len();
             haystack[boundary..suffix_end].copy_from_slice(suffix);
 
@@ -88,12 +83,7 @@ fn quint_and_long_small_classes_keep_the_edge_witness_geometry() {
         (&quint, b"acegi".as_slice(), 64_usize),
         (&triple, b"ace".as_slice(), 73_usize),
     ] {
-        let mut haystack: Vec<u8> = members
-            .iter()
-            .copied()
-            .cycle()
-            .take(tail_len + 1)
-            .collect();
+        let mut haystack: Vec<u8> = members.iter().copied().cycle().take(tail_len + 1).collect();
         haystack[tail_len] = b'Z';
         let (span, accounting) = candidate
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())

@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
+pub const PLAN_ID: &str = "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -1040,7 +1040,23 @@ impl ForwardAnchoredPlan {
                     | ClassImplementation::Quad { .. }
                     | ClassImplementation::Quint { .. }
             );
-            let (relative_candidate, prefilter_calls) = if uses_edge_witness {
+            // On short Pair/Triple/Quad tails, a suffix-first byte in the
+            // middle is common enough that searching the reverse 32-byte
+            // edge first is pure extra work. One forward native search also
+            // returns the authoritative first outsider. Keep Quint isolated
+            // on its measured edge geometry and retain that geometry for all
+            // longer tails.
+            let uses_short_forward_witness = searched.len().saturating_sub(1)
+                <= SHORT_FORWARD_WITNESS_MAX
+                && matches!(
+                    self.implementation,
+                    ClassImplementation::Pair { .. }
+                        | ClassImplementation::Triple { .. }
+                        | ClassImplementation::Quad { .. }
+                );
+            let (relative_candidate, prefilter_calls) = if uses_short_forward_witness {
+                (memchr(self.suffix[0], &searched[1..]), 1)
+            } else if uses_edge_witness {
                 asymmetric_suffix_witness(self.suffix[0], &searched[1..])?
             } else {
                 (memchr(self.suffix[0], &searched[1..]), 1)
@@ -1069,7 +1085,7 @@ impl ForwardAnchoredPlan {
             // A forward witness is the first suffix-first byte, so an earlier
             // outsider cannot begin the suffix. An edge witness may be later;
             // there the scanner's returned first outsider is authoritative.
-            if !uses_edge_witness && boundary != candidate {
+            if (!uses_edge_witness || uses_short_forward_witness) && boundary != candidate {
                 return Ok((None, accounting));
             }
             boundary
@@ -1246,6 +1262,7 @@ const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
 const EDGE_WITNESS_MEDIUM_END: usize = 64;
 const EDGE_WITNESS_BACK: usize = 32;
 const EDGE_WITNESS_DISJOINT: usize = EDGE_WITNESS_FRONT + EDGE_WITNESS_BACK;
+const SHORT_FORWARD_WITNESS_MAX: usize = 72;
 
 #[cfg(test)]
 std::thread_local! {
@@ -2117,7 +2134,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4"
+            "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5"
         );
         assert_eq!(
             pair.implementation(),
@@ -2726,7 +2743,18 @@ mod tests {
                     assert_eq!(accounting.prefilter_calls, 0);
                     assert_eq!(accounting.prefix_bytes_examined, length);
                 } else {
-                    let expected_prefilter_calls = if length <= 64 { 1 } else { 2 };
+                    let uses_short_forward_witness = length <= 73
+                        && matches!(
+                        plan.implementation(),
+                        ClassImplementation::Pair { .. }
+                            | ClassImplementation::Triple { .. }
+                            | ClassImplementation::Quad { .. }
+                    );
+                    let expected_prefilter_calls = if uses_short_forward_witness || length <= 64 {
+                        1
+                    } else {
+                        2
+                    };
                     assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                 }
@@ -2743,7 +2771,10 @@ mod tests {
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, None);
                 assert_eq!(accounting.prefilter_calls, 1);
-                assert!(accounting.suffix_confirmation_attempted);
+                assert_eq!(
+                    accounting.suffix_confirmation_attempted,
+                    matches!(plan.implementation(), ClassImplementation::Quint { .. })
+                );
                 assert!(accounting.prefix_bytes_examined > wrong_outsider);
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             }
@@ -2769,12 +2800,11 @@ mod tests {
             assert_eq!(span, None);
             assert_eq!(accounting.prefilter_calls, 0);
             assert!(accounting.suffix_confirmation_attempted);
-            // At the exact disjoint threshold, reverse search selects the
-            // final border byte. The class scan still recovers the first
-            // outsider and charges that bounded recovery exactly.
+            // The bounded short path selects the first suffix-first byte, so
+            // the known outsider itself is excluded from the prefix scan.
             assert_eq!(
                 accounting.prefix_bytes_examined,
-                first_candidate.checked_add(2).unwrap()
+                first_candidate.checked_add(1).unwrap()
             );
 
             haystack[first_candidate + 1] = suffix[1];

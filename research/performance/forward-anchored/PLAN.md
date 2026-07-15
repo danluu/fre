@@ -86,7 +86,7 @@ search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains
-`anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4`, and `Auto`
+`anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5`, and `Auto`
 retains its pre-existing strategy for both shapes. The direct legacy kernel
 constructor is unchanged.
 
