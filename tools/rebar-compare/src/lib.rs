@@ -1899,8 +1899,9 @@ fn fre_compile_verify(
     )?;
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let operation_limits = &operation_limits;
     let result = regex
-        .verify_count(request.haystack, &operation_limits)
+        .verify_count(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE compiled artifact failed untimed verification: {error}");
             aggregate_execution_error(&error.source, message)
@@ -2774,8 +2775,9 @@ fn fre_aggregate_count(
     )?;
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let operation_limits = &operation_limits;
     let result = regex
-        .count(request.haystack, &operation_limits)
+        .count(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate count refused execution: {error}");
             aggregate_execution_error(&error.source, message)
@@ -2816,8 +2818,9 @@ fn fre_aggregate_span_sum(
     )?;
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let operation_limits = &operation_limits;
     let result = regex
-        .span_sum(request.haystack, &operation_limits)
+        .span_sum(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate span-sum refused execution: {error}");
             aggregate_execution_error(&error.source, message)
