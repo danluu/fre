@@ -304,37 +304,7 @@ fn validate_hir(
                 )?;
             }
             HirKind::Class(Class::Unicode(class)) => {
-                for range in class.ranges() {
-                    if !range.end().is_ascii() {
-                        if !profile.unicode || range.start() != range.end() {
-                            return Err(Error::Unsupported(Unsupported::UnicodeClass));
-                        }
-                        let encoded_bytes = range.start().len_utf8();
-                        budget.charge(encoded_bytes)?;
-                        budget.accounting.literal_bytes = add(
-                            budget.accounting.literal_bytes,
-                            encoded_bytes,
-                            Resource::LiteralBytes,
-                        )?;
-                        enforce(
-                            budget.accounting.literal_bytes,
-                            budget.limits.max_literal_bytes,
-                            Resource::LiteralBytes,
-                        )?;
-                    }
-                }
-                let ranges = class.ranges().len();
-                budget.charge(ranges)?;
-                budget.accounting.class_ranges = add(
-                    budget.accounting.class_ranges,
-                    ranges,
-                    Resource::ClassRanges,
-                )?;
-                enforce(
-                    budget.accounting.class_ranges,
-                    budget.limits.max_class_ranges,
-                    Resource::ClassRanges,
-                )?;
+                validate_unicode_class(class, profile, budget)?;
             }
             HirKind::Class(Class::Bytes(class)) => {
                 let ranges = class.ranges().len();
@@ -376,6 +346,44 @@ fn validate_hir(
         }
     }
     Ok(())
+}
+
+fn validate_unicode_class(
+    class: &regex_syntax::hir::ClassUnicode,
+    profile: RustByteProfile,
+    budget: &mut CompileBudget,
+) -> Result<(), Error> {
+    for range in class.ranges() {
+        if !range.end().is_ascii() {
+            if !profile.unicode || range.start() != range.end() {
+                return Err(Error::Unsupported(Unsupported::UnicodeClass));
+            }
+            let encoded_bytes = range.start().len_utf8();
+            budget.charge(encoded_bytes)?;
+            budget.accounting.literal_bytes = add(
+                budget.accounting.literal_bytes,
+                encoded_bytes,
+                Resource::LiteralBytes,
+            )?;
+            enforce(
+                budget.accounting.literal_bytes,
+                budget.limits.max_literal_bytes,
+                Resource::LiteralBytes,
+            )?;
+        }
+    }
+    let ranges = class.ranges().len();
+    budget.charge(ranges)?;
+    budget.accounting.class_ranges = add(
+        budget.accounting.class_ranges,
+        ranges,
+        Resource::ClassRanges,
+    )?;
+    enforce(
+        budget.accounting.class_ranges,
+        budget.limits.max_class_ranges,
+        Resource::ClassRanges,
+    )
 }
 
 fn push_children<'a>(

@@ -867,22 +867,6 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             })
         ));
     }
-    let folded_russian = aggregate_builder("рус")
-        .case_insensitive(true)
-        .build_count()
-        .unwrap();
-    assert!(matches!(
-        folded_russian.build_report().plan_identity,
-        AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
-    ));
-    assert_eq!(
-        folded_russian
-            .count("РУС рус".as_bytes(), AggregateRunLimits::default())
-            .unwrap()
-            .value(),
-        2
-    );
     assert!(matches!(
         aggregate_builder("рус")
             .case_insensitive(true)
@@ -890,21 +874,6 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             .build_count(),
         Err(AggregateBuildError::ExactLiteralIneligible {
             reason: AggregateLiteralIneligibility::UnicodeCaseInsensitiveOutsideAdmission,
-            ..
-        })
-    ));
-    let folded_kelvin = aggregate_builder(r"(?i:k)").build_count().unwrap();
-    assert_eq!(
-        folded_kelvin
-            .count("KkK".as_bytes(), AggregateRunLimits::default())
-            .unwrap()
-            .value(),
-        3
-    );
-    assert!(matches!(
-        aggregate_builder(r"(?i:\pL)").build_count(),
-        Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
             ..
         })
     ));
@@ -940,6 +909,43 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         spans.build_report().plan,
         AggregatePlanKind::ContinuationProgram
     );
+}
+
+#[test]
+fn unicode_singleton_case_folds_use_byte_stable_continuation() {
+    let folded_russian = aggregate_builder("рус")
+        .case_insensitive(true)
+        .build_count()
+        .unwrap();
+    assert!(matches!(
+        folded_russian.build_report().plan_identity,
+        AggregatePlanIdentity::Continuation(identity)
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
+    ));
+    assert_eq!(
+        folded_russian
+            .count("РУС рус".as_bytes(), AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        2
+    );
+
+    let folded_kelvin = aggregate_builder(r"(?i:k)").build_count().unwrap();
+    let kelvin_haystack = [b'K', b'k', 0xE2, 0x84, 0xAA];
+    assert_eq!(
+        folded_kelvin
+            .count(&kelvin_haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        3
+    );
+    assert!(matches!(
+        aggregate_builder(r"(?i:\pL)").build_count(),
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
+            ..
+        })
+    ));
 }
 
 fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
