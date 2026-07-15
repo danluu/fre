@@ -39,6 +39,23 @@ nine portable-search rows. It is
 populated only after successful candidate execution and does not infer a plan
 for any unsupported receipt.
 
+### Unvalidated scalar-plus-breadth projection
+
+Canonical base `bf53ce82a17df0351d9e7a936271e5ebfa8c9635` has an independently
+authenticated direct-scalar frontier of 214 pass / 130 unsupported, recorded
+in `../../aggregate/UNICODE_SCALAR_STREAM.md`. The accepted breadth source at
+`0b1c15b0792983f42a194ad33a936185d7e5acb7` contributes three separately
+qualified mechanisms, but this composition has not generated a report.
+
+The overlap-aware arithmetic ceiling is 228 pass / 116 unsupported. It adds
+nine compile-artifact rows after excluding the two compile rows already owned
+by the direct scalar plan (`unicode/compile/negated-class-matches-codepoint`
+and `unicode/compile/one-letter`), four cardinality-disjoint Unicode-off finite
+`count` rows, and one portable Unicode-class `grep` row: `214 + 9 + 4 + 1`.
+This is a projected ceiling only. It assumes no lost disposition and is not
+observed coverage, semantic qualification of the composition, or benchmark
+evidence.
+
 ## By benchmark/pattern family
 
 | Family | FRE pass | FRE unsupported | RE2 pass |
