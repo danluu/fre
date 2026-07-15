@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v11";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1750,6 +1750,38 @@ fn load_swar_word(block: &[u8], start: usize) -> Result<u64, SearchError> {
     Ok(u64::from_ne_bytes(bytes))
 }
 
+#[cold]
+#[inline(never)]
+fn recover_triple_candidate_swar_block(
+    block: &[u8],
+    consumed: usize,
+    first: u8,
+    second: u8,
+    third: u8,
+) -> Result<(usize, usize), SearchError> {
+    // This path runs only after the SWAR mask reports a failed block. Keep the
+    // slice opaque here so release code retains one bounded scalar loop instead
+    // of cloning all 32 recovery lanes into the binary.
+    let block = core::hint::black_box(block);
+    let within_block = block
+        .iter()
+        .position(|&byte| byte != first && byte != second && byte != third)
+        .unwrap_or(RANGE_BLOCK);
+    let boundary = consumed
+        .checked_add(within_block)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "triple SWAR candidate boundary",
+        })?;
+    let examined = consumed
+        .checked_add(RANGE_BLOCK)
+        .and_then(|value| value.checked_add(within_block))
+        .and_then(|value| value.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "failed triple SWAR candidate block examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
 /// Candidate verification excludes the known suffix outsider. Four exact
 /// eight-byte membership masks cover each 32-byte block with word operations;
 /// only a failed block enters scalar first-outsider recovery.
@@ -1779,24 +1811,7 @@ fn scan_triple_candidate_swar(
             | (triple_membership_high_bits(word3, first_word, second_word, third_word)
                 ^ SWAR_HIGH_BITS);
         if outside != 0 {
-            let within_block = block
-                .iter()
-                .position(|&byte| byte != first && byte != second && byte != third)
-                .unwrap_or(RANGE_BLOCK);
-            let boundary =
-                consumed
-                    .checked_add(within_block)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "triple SWAR candidate boundary",
-                    })?;
-            let examined = consumed
-                .checked_add(RANGE_BLOCK)
-                .and_then(|value| value.checked_add(within_block))
-                .and_then(|value| value.checked_add(1))
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "failed triple SWAR candidate block examinations",
-                })?;
-            return Ok((boundary, examined));
+            return recover_triple_candidate_swar_block(block, consumed, first, second, third);
         }
         consumed = consumed
             .checked_add(RANGE_BLOCK)
@@ -2671,7 +2686,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10"
+            "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v11"
         );
         assert_eq!(
             pair.implementation(),
