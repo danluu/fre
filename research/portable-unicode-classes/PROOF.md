@@ -1,8 +1,11 @@
 # Portable Unicode scalar-class lowering
 
-Status: source-only candidate from exact frontier head
-`5f4da7b5536c42bbcdc467ea9c897bf990577938`. No compiler, formatter, test,
-assembly, benchmark, or generated Rebar report was run for this checkpoint.
+Status: accepted source at exact qualified head
+`509682249461cd16d2d11fbbc98c72f68b1624d6` (tree
+`aced3773a7e9278e883315792673ae99ff10ed54`). The complete directed and facade
+suites, strict affected Clippy, workspace formatting check, and a full Rebar
+generation all pass. No benchmark was run and this checkpoint makes no
+performance claim.
 
 ## Reusable mechanism
 
@@ -56,8 +59,9 @@ configuration over every search window of valid and invalid byte haystacks.
 Separate assertions retain exact typed refusals for Unicode word and CRLF
 looks.
 
-These are source specifications only at this checkpoint. They were committed
-red-first and have not been executed.
+The specifications were committed red-first. The qualified head passes all 13
+`fre-lower` tests, all nine portable facade assertions, and all 20 comparator
+library tests. The exact Ruff comparator identity test also passes directly.
 
 ## Exact Rebar projection
 
@@ -83,8 +87,16 @@ The other unsupported portable row is not projected:
   Although `\w` now has a scalar-class representation, both `\b` assertions
   remain typed Unicode-word refusals.
 
-Starting from the authenticated 200/144 frontier, future acceptance would
-therefore project 201 pass / 143 unsupported overall, `grep` 10/1, and `wild`
-3/22. These counts require an independent semantic audit and fresh complete
-generation before they may replace the authenticated frontier; they carry no
-performance claim.
+Starting from the authenticated 236/108 frontier, the fresh complete generation
+admits exactly this row and removes no prior pass. The authenticated result is
+therefore 237 pass / 107 unsupported overall, `grep` 10/1, and `wild` 3/22.
+FRE has no fail or fault receipt.
+
+The raw report is
+`/tmp/fre-control/results/G0-REBAR-PORTABLE-UNICODE-5096822-FRONTIER-001.json`,
+SHA-256
+`0bda3dcb0cff6fbe5756f148045f413a645ac2017d3dffd111346cc20a1dca2b`.
+Its sorted-receipts SHA-256 is
+`fed904ca1ff5f62dba13345e8327bb7939d1b53ea8dd1758be162f0ed0ec72cc`.
+The exact comparator executable SHA-256 is
+`78c254b69b932cfcc1dd4e6f387619a508a373c5ec291c99bbbe28c94ea4c640`.

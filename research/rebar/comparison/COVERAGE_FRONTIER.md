@@ -2,23 +2,23 @@
 
 This is the compact source checkpoint for the latest authenticated per-job
 frontier. A full generation from exact source
-`9eba542c696ab497bb21e401f224776edec77876` (tree
-`97248f11affe25eadcb39ab1abe10cea347f05a5`) has SHA-256
-`bbc1895371db9bf744ecfe456ccc213e03bc614d5365ace60066a2acb531ae04`.
+`509682249461cd16d2d11fbbc98c72f68b1624d6` (tree
+`aced3773a7e9278e883315792673ae99ff10ed54`) has SHA-256
+`0bda3dcb0cff6fbe5756f148045f413a645ac2017d3dffd111346cc20a1dca2b`.
 They used the immutable expanded manifest with SHA-256
 `09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43`,
 clean Rebar revision `463d00f31887e84c38467805b9e3122c314b9521`,
 and the exact Rust and RE2 runners recorded below. The raw generated report
 copy remains outside Git at
-`/tmp/fre-control/results/G0-REBAR-UNICODE-CONT-9EBA542-FRONTIER-001.json`.
+`/tmp/fre-control/results/G0-REBAR-PORTABLE-UNICODE-5096822-FRONTIER-001.json`.
 The checked-in `report.json` continues to preserve the
 preceding 144-pass baseline rather than being silently replaced by generated
 evidence.
 
-The authenticated current figure is 236: the 230-row Unicode-boundary and
-compile-many frontier plus six variable-width Unicode continuation rows. The
-malformed-UTF-8 boundary, Nosey Parker repeat-bound, and all other prior
-refusals remain typed.
+The authenticated current figure is 237: the 230-row Unicode-boundary and
+compile-many frontier plus six variable-width Unicode continuation rows and
+one portable Unicode scalar-class row. The malformed-UTF-8 boundary, Nosey
+Parker repeat-bound, and all other prior refusals remain typed.
 
 ## By operation model
 
@@ -28,14 +28,14 @@ refusals remain typed.
 | `count` | 133 | 89 | 44 | 109 | 109 |
 | `count-spans` | 129 | 108 | 21 | 110 | 110 |
 | `count-captures` | 15 | 3 | 12 | 12 | 12 |
-| `grep` | 11 | 9 | 2 | 10 | 10 |
+| `grep` | 11 | 10 | 1 | 10 | 10 |
 | `grep-captures` | 22 | 5 | 17 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **236** | **108** | **285** | **285** |
+| **Total** | **344** | **237** | **107** | **285** | **285** |
 
 FRE has no `fail`, `fault`, or unresolved receipt. Its 219 aggregate-facade
 passes comprise 22 `compile`, 89 `count`, and 108 `count-spans` jobs; another
-nine use the portable `grep` path and eight use the linear selector plus
+ten use the portable `grep` path and eight use the linear selector plus
 persistent capture-history path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
@@ -44,7 +44,7 @@ The optional v2 executed-plan field splits those passes into 29 exact-literal
 aggregates, 143 continuation-program aggregates, 23 direct Unicode-scalar
 aggregates, two ordered build-many literal aggregates, 19 continuation compile
 artifacts, two direct Unicode-scalar compile artifacts, one ordered compile-many
-artifact, nine portable-search rows, and eight selector/history capture rows. It is
+artifact, ten portable-search rows, and eight selector/history capture rows. It is
 populated only after successful candidate execution and does not infer a plan
 for any unsupported receipt.
 
@@ -88,6 +88,13 @@ no removed pass:
 - `unicode/compile/match-every-line@rust/regex`
 - `wild/grapheme/compile@rust/regex`
 
+## Authenticated portable Unicode class delta
+
+The current source adds exactly one row to the 236-pass frontier, with no
+removed pass:
+
+- `wild/ruff/unnecessary-coding-comment@rust/regex`
+
 ## By benchmark/pattern family
 
 | Family | FRE pass | FRE unsupported | RE2 pass |
@@ -104,8 +111,8 @@ no removed pass:
 | `slow` | 4 | 0 | 4 |
 | `test` | 50 | 0 | 46 |
 | `unicode` | 10 | 12 | 16 |
-| `wild` | 2 | 23 | 17 |
-| **Total** | **236** | **108** | **285** |
+| `wild` | 3 | 22 | 17 |
+| **Total** | **237** | **107** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
@@ -119,15 +126,12 @@ executes canonical nonempty root scalar classes in one UTF-8 pass. Rows that do
 not fit retain exact HIR/state/log/work or repeat-bound diagnostics. Resource
 refusals are not faults and require a better plan, not a silent quota raise.
 
-The other 32 refusals are operation/surface gaps: 29 capture rows, two portable
-`grep` syntax gaps, and one `regex-redux`. Capture refusals split exactly into
+The other 31 refusals are operation/surface gaps: 29 capture rows, one portable
+`grep` syntax gap, and one `regex-redux`. Capture refusals split exactly into
 17 Unicode-lowering gaps, two unsupported look assertions, one ordered
-build-many gap, and nine bounded selector-work refusals. The two `grep` jobs
-remain:
+build-many gap, and nine bounded selector-work refusals. The `grep` job remains:
 
 - `grep/long-words-unicode@rust/regex`: Unicode word-boundary assertion.
-- `wild/ruff/unnecessary-coding-comment@rust/regex`: variable-width Unicode
-  scalar class lowering.
 
 The cumulative public-job ledger correctly refuses three `grep-captures` rows
 that the pre-hardening screen admitted by resetting its budget per line:
@@ -152,7 +156,8 @@ unit public-job limit. These are typed refusals; the limit was not raised.
 Every executed candidate receipt passes, including the prior Unicode
 exact-literal rows, six newly admitted variable-width Unicode continuation rows,
 twelve aggregate ASCII-word/LF assertion rows, the two corresponding portable
-`grep` rows, two ordered build-many rows, 25 direct Unicode-scalar rows, the
+ASCII-assertion `grep` rows, the portable Unicode scalar-class row, two ordered
+build-many rows, 25 direct Unicode-scalar rows, the
 eight capture-history rows, and all selected
 `curated/14-quadratic`, `slow/quadratic-*`, `opt/reverse-inner/no-quadratic-*`,
 and `opt/reverse-suffix/no-quadratic` jobs. The directed facade suite also locks
@@ -191,9 +196,9 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 
 ## Prioritized exact frontier
 
-1. Extend explicit variable-width UTF-8 semantics to the 17 capture Unicode
-   refusals and the remaining portable `grep` scalar-class refusal without
-   weakening malformed-input or offset semantics.
+1. Extend exact Unicode scalar and word-boundary semantics to the 17 capture
+   Unicode refusals and the remaining portable Unicode-word `grep` refusal
+   without weakening malformed-input or offset semantics.
 2. Introduce faster bounded aggregate plans for the 76 aggregate resource
    refusals. The
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
@@ -217,6 +222,6 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    replacement, and non-empty iteration semantics are implemented.
 
 The current generated report has SHA-256
-`bbc1895371db9bf744ecfe456ccc213e03bc614d5365ace60066a2acb531ae04`,
+`0bda3dcb0cff6fbe5756f148045f413a645ac2017d3dffd111346cc20a1dca2b`,
 and its sorted-receipts SHA-256 is
-`bd900e4b695dc898a085b75381274515298da7e192c8879159cebffd57df80ad`.
+`fed904ca1ff5f62dba13345e8327bb7939d1b53ea8dd1758be162f0ed0ec72cc`.
