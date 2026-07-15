@@ -442,7 +442,7 @@ fn portable_search_session_preserves_every_native_plan_family() {
 
 #[test]
 fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
-    let cases: &[(&str, &[&[u8]])] = &[
+    let cases: &[(&str, &[&[u8]], PlanKind, &str)] = &[
         (
             r"\b[0-9A-Za-z_]{12,}\b",
             &[
@@ -451,6 +451,8 @@ fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
                 b"joined_sufficiently_long_identifier_tail",
                 &[b'-', 0xFF, b'a', b'b', b'c'],
             ],
+            PlanKind::UnicodeWordRun,
+            "ascii-word-run-linear-v1",
         ),
         (
             r"(?m)^Sherlock Holmes$",
@@ -460,13 +462,16 @@ fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
                 b"prefix\nSherlock Holmes\nsuffix",
                 b"Sherlock Holmes\r\n",
             ],
+            PlanKind::K0,
+            "k0",
         ),
     ];
 
-    for &(pattern, haystacks) in cases {
+    for &(pattern, haystacks, expected_plan, expected_runtime) in cases {
         let fre = portable(pattern, PlanSelection::Auto);
         let upstream = pinned(pattern);
-        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        assert_eq!(fre.build_report().plan, expected_plan);
+        assert_eq!(fre.runtime_implementation_id(), expected_runtime);
         for &haystack in haystacks {
             let expected = upstream
                 .find(haystack)
@@ -474,7 +479,7 @@ fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
             let (actual, accounting) = fre
                 .find(haystack, SearchLimits::unlimited())
                 .unwrap_or_else(|error| panic!("portable search failed for {pattern:?}: {error}"));
-            assert_eq!(accounting.plan(), PlanKind::K0);
+            assert_eq!(accounting.plan(), expected_plan);
             assert_eq!(
                 actual.map(|matched| (matched.start(), matched.end())),
                 expected,
