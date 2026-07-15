@@ -27,6 +27,61 @@ fn parse(pattern: &str) -> Hir {
         .unwrap_or_else(|error| panic!("failed to parse {pattern:?}: {error}"))
 }
 
+fn parse_unicode(pattern: &str) -> Hir {
+    regex_syntax::ParserBuilder::new()
+        .unicode(true)
+        .utf8(false)
+        .build()
+        .parse(pattern)
+        .unwrap_or_else(|error| panic!("failed to parse Unicode {pattern:?}: {error}"))
+}
+
+fn compile_unicode(pattern: &str) -> CompiledRegex {
+    CompiledRegex::from_hir(
+        &parse_unicode(pattern),
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("failed to compile Unicode {pattern:?}: {error}"))
+}
+
+fn upstream_unicode(pattern: &str, haystack: &[u8]) -> Vec<Span> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .unwrap_or_else(|error| panic!("upstream rejected Unicode {pattern:?}: {error}"))
+        .find_iter(haystack)
+        .map(|matched| Span {
+            start: matched.start(),
+            end: matched.end(),
+        })
+        .collect()
+}
+
+fn upstream_unicode_range(
+    pattern: &str,
+    haystack: &[u8],
+    range: core::ops::Range<usize>,
+) -> Vec<Span> {
+    let config = MetaRegex::config().utf8_empty(false);
+    let syntax = regex_automata::util::syntax::Config::new()
+        .unicode(true)
+        .utf8(false);
+    MetaRegex::builder()
+        .configure(config)
+        .syntax(syntax)
+        .build(pattern)
+        .unwrap_or_else(|error| {
+            panic!("pinned Unicode range oracle rejected {pattern:?}: {error}")
+        })
+        .find_iter(Input::new(haystack).span(range))
+        .map(|matched| Span {
+            start: matched.start(),
+            end: matched.end(),
+        })
+        .collect()
+}
+
 fn compile(pattern: &str) -> CompiledRegex {
     CompiledRegex::from_hir(
         &parse(pattern),
@@ -290,6 +345,151 @@ fn directed_nested_nullable_priority_and_invalid_bytes_match_rust_1_12_4() {
                         .map(|span| span.end - span.start)
                         .sum::<usize>(),
                     sum.value()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_scalar_paths_cover_all_widths_invalid_bytes_and_nullable_priority() {
+    let patterns = [
+        r"[Aé雪🦀]",
+        r"(?:🦀|雪|é|a)",
+        r"(?:é|(?-u:\xFF)|.)",
+        r"(?:雪?)*?",
+        r"\A(?:[a-z]|雪|🦀)*\z",
+        r"(?i:σ)",
+    ];
+    let haystacks: [&[u8]; 9] = [
+        b"",
+        b"ASCII",
+        "aé雪🦀z".as_bytes(),
+        "Σσς".as_bytes(),
+        &[0xFF],
+        &[0x80, b'a', 0xC3, 0xA9, 0xFF],
+        &[0xF0, 0x80, 0x80, 0x80],
+        &[0xED, 0xA0, 0x80],
+        &[b'a', 0xFF, b'z'],
+    ];
+    for pattern in patterns {
+        let regex = compile_unicode(pattern);
+        for haystack in haystacks {
+            let expected = upstream_unicode(pattern, haystack);
+            for strategy in STRATEGIES {
+                let actual = regex
+                    .admit_spans(
+                        haystack,
+                        0..haystack.len(),
+                        strategy,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    expected,
+                    actual.as_slice(),
+                    "{strategy:?} {pattern:?} {haystack:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_profile_and_utf8_expansion_are_identity_and_resource_dimensions() {
+    let ascii = Hir::literal(b"a".to_vec());
+    let unicode_on = CompiledRegex::from_hir(
+        &ascii,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let unicode_off = CompiledRegex::from_hir(
+        &ascii,
+        RustByteProfile::PINNED_1_12_4,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    assert_ne!(unicode_on.plan_id(), unicode_off.plan_id());
+
+    let hir = parse_unicode(r"[\x00-\u{10FFFF}]");
+    let baseline = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let accounting = baseline.compile_accounting();
+    assert!(accounting.utf8_sequences >= 4);
+    assert!(accounting.utf8_byte_ranges > accounting.utf8_sequences);
+
+    let mut exact = CompileLimits {
+        max_utf8_sequences: accounting.utf8_sequences,
+        max_utf8_byte_ranges: accounting.utf8_byte_ranges,
+        ..CompileLimits::default()
+    };
+    CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        exact,
+    )
+    .unwrap();
+
+    exact.max_utf8_sequences -= 1;
+    expect_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            exact,
+        ),
+        Resource::Utf8Sequences,
+    );
+    exact.max_utf8_sequences = accounting.utf8_sequences;
+    exact.max_utf8_byte_ranges -= 1;
+    expect_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            exact,
+        ),
+        Resource::Utf8ByteRanges,
+    );
+}
+
+#[test]
+fn unicode_ranges_keep_byte_offsets_and_original_anchor_context() {
+    let haystack = [
+        b'x', 0xC3, 0xA9, b'/', 0xE9, 0x9B, 0xAA, b'/', 0xF0, 0x9F, 0xA6, 0x80, 0xFF,
+        b'z',
+    ];
+    let ranges = [
+        0..haystack.len(),
+        1..3,
+        2..3,
+        4..7,
+        5..7,
+        8..12,
+        9..12,
+        12..13,
+        haystack.len()..haystack.len(),
+    ];
+    for pattern in [r".", r"[é雪🦀]", r"\A(?:.|(?-u:\xFF))*\z", r""] {
+        let regex = compile_unicode(pattern);
+        for range in &ranges {
+            let expected = upstream_unicode_range(pattern, &haystack, range.clone());
+            for strategy in STRATEGIES {
+                let actual = regex
+                    .admit_spans(
+                        &haystack,
+                        range.clone(),
+                        strategy,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    expected,
+                    actual.as_slice(),
+                    "{strategy:?} {pattern:?} {range:?}"
                 );
             }
         }
