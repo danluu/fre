@@ -203,3 +203,17 @@ mechanism. Neither row changes the authenticated tables above. Both require
 fresh combined semantic qualification and a complete authenticated generation
 before any coverage statement; this remains a source projection, not coverage
 or performance evidence.
+
+## Source-only ordered compile-many projection
+
+The authenticated tables, refusal split, and hashes above remain unchanged.
+Relative to exact clean source base
+`a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66`, the generic ordered compile-many
+artifact projects exactly two rows from unsupported to pass:
+
+- `curated/12-dictionary/compile-multi@rust/regex`;
+- `curated/13-noseyparker/compile-multi@rust/regex`.
+
+No other row is included in this increment. Fresh semantic qualification and a
+complete authenticated generation are required before either row changes the
+coverage frontier; no performance result is claimed.
