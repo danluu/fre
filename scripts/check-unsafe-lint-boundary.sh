@@ -83,10 +83,10 @@ fi
 
 cargo check --locked --offline -p fre-kernels --lib -v \
     >"$temporary/kernels.log" 2>&1
-if ! grep -E -- '--crate-name fre_kernels .*--deny=unsafe_code' \
+if ! grep -E -- '--crate-name fre_kernels .*--forbid=unsafe_code' \
     "$temporary/kernels.log" >/dev/null
 then
-    echo "unsafe lint boundary failure: audited library did not receive deny" >&2
+    echo "unsafe lint boundary failure: audited library did not receive forbid" >&2
     cat "$temporary/kernels.log" >&2
     exit 1
 fi
@@ -96,4 +96,4 @@ cargo test --locked --offline -p fre-kernels \
     --lib -- --exact >"$temporary/helper-test.log" 2>&1
 
 printf '%s\n' \
-    'PASS lint-tables=matched workspace-unrelated=forbid target-allow=E0453 audited-library=deny metadata-targets=forbid exceptions=allowlisted mutation-fixtures=pass helper=pass'
+    'PASS lint-tables=matched workspace-unrelated=forbid target-allow=E0453 audited-library=forbid metadata-targets=forbid exceptions=allowlisted mutation-fixtures=pass helper=pass'
