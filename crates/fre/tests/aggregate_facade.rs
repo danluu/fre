@@ -20,8 +20,15 @@ fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
 
 #[test]
 fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families() {
-    let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 3] = [
+    let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 4] = [
         ("aba", b"abaaba", false, 2, AggregatePlanKind::ExactLiteral),
+        (
+            r"a|bc",
+            b"abc",
+            false,
+            2,
+            AggregatePlanKind::FiniteOrderedLiterals,
+        ),
         (
             r"(?:a+b|a)",
             b"aaaab",

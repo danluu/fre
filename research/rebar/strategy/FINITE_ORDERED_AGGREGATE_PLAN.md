@@ -5,12 +5,13 @@ or timing command was run in phase A.
 
 ## Mechanism and semantic boundary
 
-For one-pattern, Unicode-disabled `count` and `count-spans`, the aggregate
-facade now attempts its existing bounded finite-language extraction after the
-direct-root exact-literal proof and before continuation compilation. A
-successful extraction is committed to the operation-typed reversed dense
-Aho-Corasick/DP reducer in `fre-kernels`; a selected build or execution refusal
-does not fall through to the continuation program.
+For one-pattern, Unicode-disabled `compile`, `count`, and `count-spans`, the
+aggregate facade now attempts its existing bounded finite-language extraction
+after the direct-root exact-literal proof and before continuation compilation.
+A successful extraction is committed to the operation-typed reversed dense
+Aho-Corasick/DP reducer in `fre-kernels`; `compile` retains the count plan for
+its separately timed construction and untimed verification seam. A selected
+build or execution refusal does not fall through to continuation.
 
 The reducer consumes the haystack once from right to left, records the lowest
 ordered alternative at every original start, and evaluates non-overlapping
@@ -38,9 +39,9 @@ and its finite-horizon counterexample behavior are unchanged.
 
 ## Coverage accounting
 
-Authenticated coverage remains exactly 144 pass / 200 unsupported until a
-phase-B canonical regeneration runs; this source-only checkpoint claims zero
-authenticated unlocks.
+Authenticated coverage remains exactly 177 pass / 167 unsupported at the
+canonical base until a phase-B regeneration runs; this source-only checkpoint
+claims zero authenticated unlocks.
 
 The committed fast-plan index identifies an exact 36-row finite-language
 candidate universe among the 157 one-pattern construction opportunities:
@@ -60,6 +61,9 @@ intersection—21 `count` operation-work, two `count` row-log, three
 be measured rather than guessed. The phase-B report must publish job IDs,
 families, model counts, prior refusal resource, selected plan, and remaining
 typed refusal. No support count should be promoted from the 36-row upper bound.
+Finite-language `compile` candidates among the 33 compile rows are a separate
+unmeasured projection introduced by the schema-v4 semantic union; no count is
+claimed until the same authenticated regeneration classifies them.
 
 ## Focused phase-B gates
 

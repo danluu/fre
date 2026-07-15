@@ -913,7 +913,7 @@ impl AggregateBuilder {
                         },
                     })?;
                 let (engine, kernel_build, operation_plan_id) = match operation {
-                    AggregateOperation::Count => {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
                         let plan = OrderedLiteralCountPlan::build(
                             &words,
                             kernel_limits,

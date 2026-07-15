@@ -1894,6 +1894,9 @@ fn fre_compile_verify(
         })?;
     let plan = match regex.build_report().plan {
         AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
+        AggregatePlanKind::FiniteOrderedLiterals => {
+            "compile-aggregate-finite-ordered-literals"
+        }
         AggregatePlanKind::ContinuationProgram => "compile-aggregate-continuation-program",
     };
     Ok(FreReduction {
@@ -4194,6 +4197,18 @@ mod tests {
             ),
             2,
             "compile-aggregate-exact-literal",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"a|bc".to_string()],
+                b"abc",
+                false,
+                false,
+                &limits,
+            ),
+            2,
+            "compile-aggregate-finite-ordered-literals",
         );
         assert_current_fre_execution(
             current_fre(

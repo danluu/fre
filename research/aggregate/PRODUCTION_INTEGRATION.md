@@ -2,10 +2,10 @@
 
 Status as of 2026-07-14: the production `fre` facade construction-selects the
 exact-literal reducer, a bounded finite ordered-language reducer, or the
-`fre-aggregate` continuation program for one-pattern Rust-byte `count` and
-`count-spans`. The finite route is a source-only candidate pending the gates in
-`../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not a claim that
-any path is faster than Rust regex or RE2 on every workload.
+`fre-aggregate` continuation program for one-pattern Rust-byte `compile`,
+`count`, and `count-spans`. The finite route is a source-only candidate pending
+the gates in `../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not
+a claim that any path is faster than Rust regex or RE2 on every workload.
 
 ## Modular production boundary
 
@@ -25,7 +25,7 @@ strategy, facade policy, and Rebar reduction independently testable:
    prioritized continuation program with exact work, state, temporary-state,
    and retained program-capacity accounting.
 5. Distinct facade types expose only one operation each:
-   `AggregateSpansRegex`, `AggregateCountRegex`, and
+   `AggregateCompileRegex`, `AggregateSpansRegex`, `AggregateCountRegex`, and
    `AggregateSpanSumRegex`. Operation and storage strategy are fixed before
    compilation and included in reports/cache identity. Count and span-sum
    additionally expose value-only hot APIs; their audited result/report APIs
@@ -34,9 +34,9 @@ strategy, facade policy, and Rebar reduction independently testable:
    anchors therefore retain original-haystack context; it never implements
    global iteration by repeatedly searching sliced suffixes.
 7. `CurrentFreAdapter` compiles exactly once and executes exactly once for an
-   admitted one-pattern `count` or `count-spans` job. Unsupported models and
-   build-many are rejected before candidate compilation. Existing portable
-   single-search/grep routing is unchanged.
+   admitted one-pattern `compile`, `count`, or `count-spans` job. Unsupported
+   models and build-many are rejected before candidate compilation. Existing
+   portable single-search/grep routing is unchanged.
 
 `AggregatePlanSelection::{Auto,ForceExactLiteral,ForceContinuation}` makes the
 plan seam testable. `Auto` publishes a selected exact or finite build refusal
@@ -149,24 +149,15 @@ patterns on `zabb`. Both aggregate strategies return count 1. Pinned Rust
 1.12.4 returns 2 through its unsound optimization; exact receipts deliberately
 retain those Rust failures while FRE passes the canonical definitions.
 
-The exact Rebar report now contains:
-
-- FRE: 144 pass, 200 unsupported, 0 fail, 0 fault;
-- aggregate contribution: 48/133 `count` and 89/129 `count-spans` pass;
-- executed plan labels: 24 exact literal, 113 continuation, 7 portable grep;
-- pinned Rust: 342 pass, two retained reverse-suffix failures; and
-- pinned RE2: 285/285 pass.
-
-All admitted quadratic/no-quadratic adversaries pass. Of the 125 remaining
-aggregate refusals, 78 require Unicode, five require ordered build-many, 14
-require assertions outside the current subset, and 28 cross explicit compile
-or execution quotas. Exact IDs and reasons are in
-`../rebar/comparison/report.json` and `../rebar/comparison/COVERAGE_FRONTIER.md`.
-
-Two complete report generations were byte-identical. Report SHA-256:
-`6a9e599ef7b3e2edeeec42dbad208e4a10f206a321f8f36e76bff3871f26b336`;
-receipts SHA-256:
-`23b072ac9cbcd6798bf76eaa39ffc7d45aea26115036f18dd2c185566f40f3d4`.
+The canonical authenticated frontier remains 177 FRE pass / 167 unsupported,
+zero fail/fault: 16 `compile`, 54 `count`, 100 `count-spans`, and seven
+portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
+reverse-suffix failures; pinned RE2 remains 285/285. The finite plan is absent
+from those receipts and claims no additional support before regeneration.
+Exact per-model counts, refusal classes, source/tree identities, and the two
+byte-identical generation digest are retained in
+`../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
+the older baseline and is not silently relabelled as 177-frontier evidence.
 
 Five fresh local timing processes cover all 24 exact-literal rows at the full
 public facade boundary. Median-of-five-process medians classify 10 jobs as FRE
