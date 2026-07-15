@@ -18,6 +18,7 @@ mod ordered_literal_aggregate;
 mod packed_literal_set;
 mod packed_ordered_literal_aggregate;
 mod required_literal;
+mod unicode_scalar_aggregate;
 
 pub use forward_anchored::{
     ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
@@ -99,6 +100,23 @@ pub use required_literal::{
     ByteClass as RequiredLiteralByteClass, PLAN_ID as REQUIRED_LITERAL_PLAN_ID,
     RequiredLiteralPlan, SearchAccounting as RequiredLiteralSearchAccounting,
     SearchError as RequiredLiteralSearchError, SearchLimits as RequiredLiteralSearchLimits,
+};
+pub use unicode_scalar_aggregate::{
+    BuildAccounting as UnicodeScalarAggregateBuildAccounting,
+    BuildError as UnicodeScalarAggregateBuildError,
+    BuildLimits as UnicodeScalarAggregateBuildLimits,
+    COUNT_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_COUNT_OPERATION_ID,
+    CountResult as UnicodeScalarAggregateCountResult, Operation as UnicodeScalarAggregateOperation,
+    OperationIdentity as UnicodeScalarAggregateOperationIdentity,
+    PLAN_ID as UNICODE_SCALAR_AGGREGATE_PLAN_ID,
+    ReduceAccounting as UnicodeScalarAggregateReduceAccounting,
+    ReduceActualCounters as UnicodeScalarAggregateActualCounters,
+    ReduceError as UnicodeScalarAggregateReduceError,
+    ReduceLimits as UnicodeScalarAggregateReduceLimits,
+    ReduceUpperBounds as UnicodeScalarAggregateUpperBounds,
+    SPAN_SUM_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_SPAN_SUM_OPERATION_ID,
+    ScalarSemantics as UnicodeScalarAggregateSemantics,
+    SpanSumResult as UnicodeScalarAggregateSpanSumResult, UnicodeScalarAggregatePlan,
 };
 
 /// Hard limits for building one exact-literal plan.
