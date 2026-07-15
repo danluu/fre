@@ -3578,6 +3578,8 @@ fn regex_redux_run_limits(
     Ok(RegexReduxRunLimits {
         aggregate: AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            finite_ordered_literals: inactive_ordered_literal_operation_limits(limits),
             continuation: continuation_span_operation_limits(
                 expanded_output,
                 max_component_states,
