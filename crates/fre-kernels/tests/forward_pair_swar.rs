@@ -142,18 +142,7 @@ fn pair_swar_long_extension_routes_512_through_4097_exactly() {
 fn pair_swar_long_extension_differential_covers_arbitrary_outsider_positions() {
     let candidate = plan();
     for boundary in [513_usize, 4_096] {
-        for position in [
-            0_usize,
-            1,
-            7,
-            8,
-            9,
-            31,
-            32,
-            511,
-            512,
-            boundary - 1,
-        ] {
+        for position in [0_usize, 1, 7, 8, 9, 31, 32, 511, 512, boundary - 1] {
             for outsider in 0_u8..=u8::MAX {
                 let mut haystack = members(boundary);
                 haystack[position] = outsider;
