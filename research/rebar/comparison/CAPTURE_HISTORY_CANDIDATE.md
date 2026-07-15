@@ -1,13 +1,15 @@
 # Bounded capture-history candidate
 
 Status: source-only candidate recomposed on exact canonical base
-`31001465fa49998eede9cf860a9be4c09b4d0cd5` (tree
-`1470c2420d1e000caf7cdf57d63a232f792eeb42`). No compiler, formatter,
+`bf53ce82a17df0351d9e7a936271e5ebfa8c9635` (tree
+`57565e86fb8abf59a58c0ebb575a86916db829ca`). No compiler, formatter,
 executable test, report generation, assembly, or timing command was run in this
 lane. The candidate adapter identity advances to
-`fre-current-aggregate-v6` only for the composed capture route; the finite plan
-retains its v5 schema/timing identities. The authenticated frontier remains
-204 pass / 140 unsupported, and this document claims no additional coverage.
+`fre-current-aggregate-v6` only for the composed capture route; the direct
+Unicode scalar plan plus the ordered build-many and timing surfaces retain
+their existing plan, schema, and timing identities. The authenticated frontier
+remains 214 pass / 130 unsupported, and this document claims no additional
+coverage.
 
 ## Semantic boundary
 
@@ -38,8 +40,8 @@ The capture-specific preflight independently checks:
 The certificate publishes both the preflight work bound and actual work.
 Capture replay scratch and group-output allocations are attempted only after
 the capture bounds pass, and allocation failures remain typed. A selected
-capture build or execution refusal never invokes exact-literal, build-many,
-Unicode-artifact, or capture-erasing fallback.
+capture build or execution refusal never invokes exact-literal, direct Unicode
+scalar, build-many, or capture-erasing fallback.
 
 The Rebar route is intentionally narrower than the reusable engine API:
 exactly one pattern, Unicode disabled, and only `count-captures` or
