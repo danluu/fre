@@ -1906,7 +1906,7 @@ fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize),
     Ok((boundary, examined))
 }
 
-#[inline(always)]
+#[inline]
 fn range_lane_outside(bytes: &[u8], start: u8, width: u8) -> u8 {
     bytes.iter().fold(0_u8, |outside, &byte| {
         outside | u8::from(byte.wrapping_sub(start) > width)
