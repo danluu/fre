@@ -156,6 +156,26 @@ fn lowering_maps_each_portable_assertion_to_a_distinct_edge_kind() {
 }
 
 #[test]
+fn lowering_maps_positive_unicode_word_boundary_without_approximating_it() {
+    let parsed = parsed(r"\b", true);
+    let lowered = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("positive Unicode word boundary lowers");
+    assert_eq!(
+        lowered.plan().edge_kinds.as_slice(),
+        &[EdgeKind::AssertWordUnicode]
+    );
+    assert_eq!(tuple(find_unicode(r"\b\w{2,}\b", "-αβ-".as_bytes())), Some((1, 5)));
+    assert_eq!(
+        tuple(find_unicode(r"\b\w{2,}\b", &[0xFF, b'a', b'b', 0xFF])),
+        Some((1, 3))
+    );
+}
+
+#[test]
 fn ordered_priority_and_repeat_greed_are_preserved() {
     assert_eq!(tuple(find("a|ab", b"ab")), Some((0, 1)));
     assert_eq!(tuple(find("ab|a", b"ab")), Some((0, 2)));
@@ -311,7 +331,7 @@ fn unsupported_semantics_are_never_silently_approximated() {
         )))
     ));
 
-    let unicode_word = parsed(r"\b", true);
+    let unicode_word = parsed(r"\B", true);
     assert!(matches!(
         lower_raw(
             &unicode_word,
@@ -319,7 +339,7 @@ fn unsupported_semantics_are_never_silently_approximated() {
             LowerLimits::default()
         ),
         Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::WordUnicode
+            Look::WordUnicodeNegate
         )))
     ));
 

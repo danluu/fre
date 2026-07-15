@@ -540,7 +540,59 @@ fn unicode_scalar_classes_match_pinned_ranges_without_consuming_invalid_utf8() {
 }
 
 #[test]
-fn crlf_and_unicode_word_assertions_remain_exact_typed_refusals() {
+fn positive_unicode_word_boundaries_match_pinned_ranges_on_arbitrary_bytes() {
+    const PATTERNS: &[&str] = &[r"\b", r"\b\w{2,}\b", r"\b\w{25,}\b"];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"--alphabetic_identifier--",
+        "--αβγ--".as_bytes(),
+        "\u{301}\u{301}".as_bytes(),
+        "\u{203F}\u{203F}".as_bytes(),
+        "\u{200C}\u{200C}".as_bytes(),
+        "😀alpha😀".as_bytes(),
+        &[0xFF, b'a', b'b', 0xFF],
+        &[0xCE],
+        &[0xC0, 0x80],
+        &[0xED, 0xA0, 0x80],
+    ];
+
+    for pattern in PATTERNS {
+        let fre = PortableBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(true)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap_or_else(|error| panic!("Unicode K0 build failed for {pattern:?}: {error}"));
+        let upstream = pinned_with_unicode(pattern, true);
+        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = upstream
+                        .find(Input::new(haystack).span(start..end))
+                        .map(|matched| (matched.start(), matched.end()));
+                    let actual = fre
+                        .find_window(
+                            haystack,
+                            SearchWindow::new(start, end),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "Unicode K0 search failed {pattern:?}/{haystack:?}/{start}..{end}: {error}"
+                            )
+                        })
+                        .0
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}..{end}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
     let crlf = PortableBuilder::new(r"(?mR:$)")
         .profile(RustProfile::rebar_1_12_4())
         .unicode(false)
@@ -592,16 +644,16 @@ fn crlf_and_unicode_word_assertions_remain_exact_typed_refusals() {
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(actual, expected);
 
-    let unicode = PortableBuilder::new(r"\b")
+    let unicode = PortableBuilder::new(r"\B")
         .profile(RustProfile::rebar_1_12_4())
         .unicode(true)
         .plan_selection(PlanSelection::ForceK0)
         .build()
-        .expect_err("Unicode word boundary must remain unsupported");
+        .expect_err("negated Unicode word boundary must remain unsupported");
     assert!(matches!(
         unicode,
         BuildError::Lower(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::WordUnicode
+            Look::WordUnicodeNegate
         )))
     ));
 }

@@ -103,6 +103,19 @@ fn assertion(kind: EdgeKind) -> Automaton {
     compile(vec![split(vec![Edge::assertion(1, kind)]), accept()])
 }
 
+fn assertion_at(kind: EdgeKind, haystack: &[u8], at: usize) -> bool {
+    assertion(kind)
+        .prepare::<Span>()
+        .search_window(
+            haystack,
+            SearchWindow::new(at, at),
+            SearchLimits::unlimited(),
+        )
+        .expect("unlimited assertion search")
+        .into_output()
+        .is_some()
+}
+
 fn literal(bytes: &[u8]) -> Automaton {
     let mut states = Vec::with_capacity(bytes.len().saturating_add(1));
     for (index, &byte) in bytes.iter().enumerate() {
@@ -278,6 +291,35 @@ fn anchors_use_original_haystack_context() {
         .unwrap();
     assert_eq!(ranged_start.into_output(), None);
     assert_eq!(ranged_end.into_output(), None);
+}
+
+#[test]
+fn positive_unicode_word_boundary_is_scalar_exact_on_arbitrary_bytes() {
+    let kind = EdgeKind::AssertWordUnicode;
+    let cases: &[(&[u8], &[(usize, bool)])] = &[
+        (b"", &[(0, false)]),
+        ("α".as_bytes(), &[(0, true), (1, false), (2, true)]),
+        (
+            " α-β ".as_bytes(),
+            &[(0, false), (1, true), (3, true), (4, true), (6, true), (7, false)],
+        ),
+        ("\u{301}".as_bytes(), &[(0, true), (2, true)]),
+        ("\u{203F}".as_bytes(), &[(0, true), (3, true)]),
+        ("\u{200C}".as_bytes(), &[(0, true), (3, true)]),
+        ("😀".as_bytes(), &[(0, false), (1, false), (4, false)]),
+        (&[0xFF, b'a', 0xFF], &[(0, false), (1, true), (2, true), (3, false)]),
+        (&[0xCE], &[(0, false), (1, false)]),
+        (&[0xC0, 0x80], &[(0, false), (1, false), (2, false)]),
+    ];
+    for &(haystack, positions) in cases {
+        for &(at, expected) in positions {
+            assert_eq!(
+                assertion_at(kind, haystack, at),
+                expected,
+                "haystack={haystack:?}, at={at}"
+            );
+        }
+    }
 }
 
 const ASSERTION_KINDS: [EdgeKind; 10] = [
