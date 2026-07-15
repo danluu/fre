@@ -52,8 +52,10 @@ fn invalid_byte_capability_is_excluded_from_unicode_artifacts() {
         UnicodeCompileArtifactBuilder::new(r"(?-u:\xFF)")
             .profile(RustProfile::rebar_1_12_4())
             .build(),
-        Err(UnicodeCompileBuildError::InvalidUtf8Literal)
-            | Err(UnicodeCompileBuildError::InvalidByteClass)
+        Err(
+            UnicodeCompileBuildError::InvalidUtf8Literal
+                | UnicodeCompileBuildError::InvalidByteClass
+        )
     ));
     assert!(matches!(
         UnicodeCompileArtifactBuilder::new("α")

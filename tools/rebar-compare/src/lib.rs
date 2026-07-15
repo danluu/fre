@@ -1874,11 +1874,9 @@ fn fre_compile_verify(
     let regex = match built {
         Ok(regex) => regex,
         Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::Unsupported(_),
-            ..
-        })
-        | Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::ResourceLimit { .. },
+            source:
+                AggregateEngineError::Unsupported(_)
+                | AggregateEngineError::ResourceLimit { .. },
             ..
         }) if request.unicode => {
             return fre_unicode_compile_verify(request, pattern, limits);
