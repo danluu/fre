@@ -64,14 +64,19 @@ authenticated Unicode and portable rows. The 28 authenticated `compile` passes
 include the separately qualified Unicode compile artifacts and remain
 unchanged by source-only work.
 
-The new compile facade projects exactly two additional rows:
+The new compile facade projects exactly one additional pass:
 
-- `curated/12-dictionary/compile-multi@rust/regex`;
-- `curated/13-noseyparker/compile-multi@rust/regex`.
+- `curated/12-dictionary/compile-multi@rust/regex`.
 
 It retains the complete ordered artifact, per-pattern identities, and selected
 engine accounting before untimed verification. This is a projected increment,
 not an authenticated change to the counts above.
+
+`curated/13-noseyparker/compile-multi@rust/regex` reaches the same generic
+compile facade but retains its typed `RepeatBound` refusal: `{20,1024}` exceeds
+the frozen per-node cap of 1,000. No cap is raised or reinterpreted in this
+lane. A compact plan or a separately accepted resource model is required
+before that row can become a projected pass.
 
 The finite plan is cardinality-disjoint from build-many and does not alter
 these five dispositions. Its separately authenticated one-pattern intersection

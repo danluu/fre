@@ -1,7 +1,7 @@
 use fre::{
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyOutput,
-    AggregateManyOperation, AggregateManyPlanKind, AggregateManyRunLimits, CompatibilityProfile,
-    RustProfile,
+    AggregateEngineError, AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder,
+    AggregateManyOperation, AggregateManyOutput, AggregateManyPlanKind, AggregateManyRunLimits,
+    AggregateResource, CompatibilityProfile, RustProfile,
 };
 
 fn patterns(values: &[&str]) -> Vec<String> {
@@ -73,6 +73,22 @@ fn compile_artifact_keeps_unicode_and_resource_refusals_before_publication() {
         Err(AggregateManyBuildError::PatternLimit {
             needed: 2,
             limit: 1
+        })
+    ));
+
+    let nosey_repeat = patterns(&[r"[A-Za-z0-9_-]{20,1024}", "never"]);
+    assert!(matches!(
+        AggregateManyBuilder::new(&nosey_repeat)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .build_compile(),
+        Err(AggregateManyBuildError::ContinuationCompile {
+            operation: AggregateManyOperation::Compile,
+            source: AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::RepeatBound,
+                ..
+            },
+            ..
         })
     ));
 }

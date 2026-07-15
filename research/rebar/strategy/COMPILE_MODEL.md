@@ -64,11 +64,16 @@ families plus ordered multi-pattern literals, priority-sensitive continuation,
 Unicode/profile refusal, and cardinality refusal.
 
 Relative to exact base `a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66`,
-the source-only multi-pattern extension projects exactly two additional
-`compile` rows and no others:
+the source-only multi-pattern extension projects exactly one additional
+`compile` pass:
 
-- `curated/12-dictionary/compile-multi@rust/regex`;
-- `curated/13-noseyparker/compile-multi@rust/regex`.
+- `curated/12-dictionary/compile-multi@rust/regex`.
+
+The other compile-multi row,
+`curated/13-noseyparker/compile-multi@rust/regex`, now reaches the generic
+builder but retains the existing typed `RepeatBound` refusal because one input
+contains `{20,1024}` and the frozen per-node cap is 1,000. This lane does not
+raise or reinterpret that cap.
 
 This is a projected increment, not authenticated coverage or performance.
 
@@ -84,13 +89,13 @@ cargo test -p rebar-compare exact_rebar_model_reducers_cover_empty_and_crlf_sema
 cargo run --release -p rebar-compare -- research/rebar/expanded/manifest.json /tmp/rebar-fre research/rebar/comparison/report.json /tmp/rebar-fre/engines/rust/regex/target/release/main /tmp/rebar-fre/engines/re2/target/release/main
 ```
 
-The regenerated report must either confirm exactly the two projected
-compile-multi job IDs above or reject the projection, retain typed unsupported
-receipts for the broader Unicode/syntax/resource frontier, contain no new
-fail/fault, and leave every pass in the authenticated pre-extension frontier
-unchanged. The checked-in historical report must not be mistaken for current
-comparison evidence. Run formatting, lint, test, and full-report gates only
-under separate validation coordination.
+The regenerated report must either confirm the one projected dictionary row or
+reject the projection, retain the named Nosey Parker `RepeatBound` refusal and
+the broader Unicode/syntax/resource frontier, contain no new fail/fault, and
+leave every pass in the authenticated pre-extension frontier unchanged. The
+checked-in historical report must not be mistaken for current comparison
+evidence. Run formatting, lint, test, and full-report gates only under separate
+validation coordination.
 
 ## Preregistered performance matrix
 
@@ -107,6 +112,6 @@ suite geomean.
 | captures/case folding | Unicode off | nested captures; ASCII folded class | first cold sample; later allocator-warm samples |
 | rejection boundary | all relevant profiles | one-below work/storage; invalid syntax; Unicode/profile mismatch | deterministic outcome only, not speed |
 
-Expected effect is the exact two-row source projection above, not authenticated
+Expected effect is the exact one-row source projection above, not authenticated
 coverage or a measured speed claim. FRE may be faster or slower than Rust in
 any matrix cell; this source-only extension established no timing evidence.

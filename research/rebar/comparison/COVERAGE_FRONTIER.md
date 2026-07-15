@@ -168,10 +168,9 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    portable ASCII-word/LF `grep` rows and two relevant unchanged neighbors.
    Retain typed refusals for Unicode word state and variable-width Unicode
    scalar lowering until their own semantic and performance gates pass.
-4. Authenticate the source-only ordered compile-many projection for the two
-   exact rows named below. Never emulate priority by concatenating patterns;
-   retain the named adverse performance follow-up for the two admitted
-   execution rows.
+4. Authenticate the source-only ordered compile-many projection for the exact
+   dictionary row named below, while retaining Nosey Parker's frozen
+   `RepeatBound` refusal. Never emulate priority by concatenating patterns.
 5. Qualify cold and allocator-warm construction performance for the seventeen
    supported compile rows, keeping construction separate from untimed semantic
    verification. Extend only the reusable Unicode/resource/build-many mechanisms
@@ -210,11 +209,13 @@ or performance evidence.
 The authenticated tables, refusal split, and hashes above remain unchanged.
 Relative to exact clean source base
 `a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66`, the generic ordered compile-many
-artifact projects exactly two rows from unsupported to pass:
+artifact projects exactly one row from unsupported to pass:
 
-- `curated/12-dictionary/compile-multi@rust/regex`;
-- `curated/13-noseyparker/compile-multi@rust/regex`.
+- `curated/12-dictionary/compile-multi@rust/regex`.
 
-No other row is included in this increment. Fresh semantic qualification and a
-complete authenticated generation are required before either row changes the
-coverage frontier; no performance result is claimed.
+`curated/13-noseyparker/compile-multi@rust/regex` remains a named typed
+`RepeatBound` refusal because its `{20,1024}` repetition exceeds the unchanged
+1,000 cap. No other row is included in this increment. Fresh semantic
+qualification and a complete authenticated generation are required before the
+dictionary row changes the coverage frontier; no performance result is
+claimed.

@@ -4966,6 +4966,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(Status::Fault, mismatch.status);
         assert!(mismatch.message.contains("profile/operation identity mismatch"));
+
+        let nosey_repeat = current_fre(
+            "compile",
+            &[r"[A-Za-z0-9_-]{20,1024}".to_string(), "never".to_string()],
+            b"TWITTER_API_KEY",
+            false,
+            false,
+            &RunLimits::default(),
+        );
+        assert!(
+            matches!(nosey_repeat, CandidateOutcome::Unsupported(ref reason) if reason.contains("RepeatBound")),
+            "compile-many must retain the frozen repeat cap: {nosey_repeat:?}"
+        );
     }
 
     #[test]
