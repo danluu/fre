@@ -390,7 +390,7 @@ mod tests {
             ),
             (
                 r"\A[a-z]+Z",
-                "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1",
+                "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3",
             ),
         ] {
             let regex = build_fre("forward", pattern).unwrap();

@@ -7,7 +7,8 @@ use fre::{
 use std::fmt::Write as _;
 
 const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
-const ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
+const ES8I_ID: &str =
+    "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3";
 
 fn forced(pattern: &str) -> fre::PortableRegex {
     PortableBuilder::new(pattern)

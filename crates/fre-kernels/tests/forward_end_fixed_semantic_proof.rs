@@ -68,7 +68,16 @@ fn red_fixed_identity_specialized_leaf_and_n_m_p_accounting() {
                 fourth: b'g',
             },
         ),
-        (b"acegi".as_slice(), ForwardClassImplementation::Bitset),
+        (
+            b"acegi".as_slice(),
+            ForwardClassImplementation::Quint {
+                first: b'a',
+                second: b'c',
+                third: b'e',
+                fourth: b'g',
+                fifth: b'i',
+            },
+        ),
     ] {
         let candidate = plan(class, b"ZQ");
         assert_eq!(candidate.plan_id(), FIXED_ID);

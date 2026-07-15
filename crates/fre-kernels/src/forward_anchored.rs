@@ -126,62 +126,62 @@ impl ByteClass {
 }
 
 fn select_class_implementation(class: ByteClass) -> Result<ClassImplementation, BuildError> {
-    let implementation = match class.single_inclusive_range() {
-        Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
-        None => match class.cardinality() {
-            2 => {
-                let [first, second] =
-                    class
-                        .canonical_members::<2>()
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "canonical pair extraction",
-                        })?;
-                ClassImplementation::Pair { first, second }
-            }
-            3 => {
-                let [first, second, third] =
-                    class
-                        .canonical_members::<3>()
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "canonical triple extraction",
-                        })?;
-                ClassImplementation::Triple {
-                    first,
-                    second,
-                    third,
+    let implementation =
+        match class.single_inclusive_range() {
+            Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
+            None => {
+                match class.cardinality() {
+                    2 => {
+                        let [first, second] = class.canonical_members::<2>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical pair extraction",
+                            },
+                        )?;
+                        ClassImplementation::Pair { first, second }
+                    }
+                    3 => {
+                        let [first, second, third] = class.canonical_members::<3>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical triple extraction",
+                            },
+                        )?;
+                        ClassImplementation::Triple {
+                            first,
+                            second,
+                            third,
+                        }
+                    }
+                    4 => {
+                        let [first, second, third, fourth] = class.canonical_members::<4>().ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "canonical quad extraction",
+                            },
+                        )?;
+                        ClassImplementation::Quad {
+                            first,
+                            second,
+                            third,
+                            fourth,
+                        }
+                    }
+                    5 => {
+                        let [first, second, third, fourth, fifth] = class
+                            .canonical_members::<5>()
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "canonical quint extraction",
+                            })?;
+                        ClassImplementation::Quint {
+                            first,
+                            second,
+                            third,
+                            fourth,
+                            fifth,
+                        }
+                    }
+                    _ => ClassImplementation::Bitset,
                 }
             }
-            4 => {
-                let [first, second, third, fourth] =
-                    class
-                        .canonical_members::<4>()
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "canonical quad extraction",
-                        })?;
-                ClassImplementation::Quad {
-                    first,
-                    second,
-                    third,
-                    fourth,
-                }
-            }
-            5 => {
-                let [first, second, third, fourth, fifth] = class
-                    .canonical_members::<5>()
-                    .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "canonical quint extraction",
-                    })?;
-                ClassImplementation::Quint {
-                    first,
-                    second,
-                    third,
-                    fourth,
-                    fifth,
-                }
-            }
-            _ => ClassImplementation::Bitset,
-        },
-    };
+        };
     Ok(implementation)
 }
 
@@ -1802,7 +1802,16 @@ mod tests {
                     fourth: b'g',
                 },
             ),
-            (b"acegi".as_slice(), ClassImplementation::Bitset),
+            (
+                b"acegi".as_slice(),
+                ClassImplementation::Quint {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                    fifth: b'i',
+                },
+            ),
         ] {
             assert_eq!(
                 fixed(ByteClass::from_bytes(class), b"Z").implementation(),
