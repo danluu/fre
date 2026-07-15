@@ -2,7 +2,8 @@ use core::{fmt, ops::Range};
 use std::sync::Arc;
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompiledRegex, RustByteProfile, SpanIter,
+    AdmittedCaptures, AdmittedCount, AdmittedSpanSum, AdmittedSpans, CaptureLimits,
+    CompiledCaptureRegex, CompiledRegex, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
@@ -716,6 +717,60 @@ impl AggregateBuilder {
             .map(AggregateSpanSumRegex)
     }
 
+    /// Compile a capture-preserving continuation plan for the Unicode-off
+    /// pinned Rust byte profile. Exact-literal substitution is intentionally
+    /// unavailable because it cannot reconstruct submatch history.
+    pub fn build_captures(self) -> Result<AggregateCapturesRegex, AggregateCaptureBuildError> {
+        if self.profile.options.unicode {
+            return Err(AggregateCaptureBuildError::UnicodeEnabled);
+        }
+        if self.selection == AggregatePlanSelection::ForceExactLiteral {
+            return Err(AggregateCaptureBuildError::ExactLiteralUnavailable);
+        }
+        let strategy = self.strategy;
+        let limits = self.limits;
+        let profile = CompatibilityProfile::RustBytes(self.profile);
+        let request = fre_syntax::ParseRequest::rust(self.pattern, profile)
+            .with_admission(limits.admission)
+            .with_safety_envelope(limits.syntax_safety);
+        let parsed = fre_syntax::parse(request).map_err(AggregateCaptureBuildError::Syntax)?;
+        let syntax = parsed.summary;
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            return Err(AggregateCaptureBuildError::InternalInvariant(
+                "Rust bytes capture request produced a non-Rust pattern",
+            ));
+        };
+        let engine = CompiledCaptureRegex::from_hir(
+            &rust.hir,
+            RustByteProfile::PINNED_1_12_4,
+            limits.continuation,
+        )
+        .map_err(AggregateCaptureBuildError::Compile)?;
+        let compile = engine.compile_accounting();
+        let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
+            AggregateCaptureBuildError::InternalInvariant("syntax node count does not fit usize")
+        })?;
+        let expected_captures = usize::try_from(syntax.captures).map_err(|_| {
+            AggregateCaptureBuildError::InternalInvariant("capture count does not fit usize")
+        })?;
+        if compile.hir_nodes != expected_nodes || compile.captures_recorded != expected_captures {
+            return Err(AggregateCaptureBuildError::InternalInvariant(
+                "syntax summary differs from capture compiler traversal",
+            ));
+        }
+        let report = AggregateCaptureBuildReport {
+            syntax,
+            compile,
+            plan_id: engine.plan_id(),
+            capture_slots: engine.capture_slots(),
+            strategy,
+        };
+        Ok(AggregateCapturesRegex {
+            engine,
+            report,
+        })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "construction keeps eligibility, no-fallback selection, and both auditable reports together"
@@ -1251,6 +1306,88 @@ impl AggregateBuilder {
             limits,
             report,
         })
+    }
+}
+
+/// Construction failure for the capture-preserving aggregate plan.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AggregateCaptureBuildError {
+    UnicodeEnabled,
+    ExactLiteralUnavailable,
+    Syntax(fre_syntax::ParseError),
+    Compile(AggregateEngineError),
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for AggregateCaptureBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnicodeEnabled => f.write_str(
+                "capture-history continuation currently requires Unicode syntax disabled",
+            ),
+            Self::ExactLiteralUnavailable => {
+                f.write_str("exact-literal plans cannot reconstruct capture history")
+            }
+            Self::Syntax(error) => write!(f, "capture syntax construction failed: {error}"),
+            Self::Compile(error) => write!(f, "capture continuation compilation failed: {error}"),
+            Self::InternalInvariant(detail) => {
+                write!(f, "capture facade internal invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AggregateCaptureBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Syntax(error) => Some(error),
+            Self::Compile(error) => Some(error),
+            Self::UnicodeEnabled
+            | Self::ExactLiteralUnavailable
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+/// Auditable capture-preserving construction facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateCaptureBuildReport {
+    pub syntax: ParseSummary,
+    pub compile: AggregateCompileAccounting,
+    pub plan_id: AggregatePlanId,
+    pub capture_slots: usize,
+    pub strategy: AggregateStrategy,
+}
+
+/// Compiled complete capture-sequence operation.
+#[derive(Debug)]
+pub struct AggregateCapturesRegex {
+    engine: CompiledCaptureRegex,
+    report: AggregateCaptureBuildReport,
+}
+
+impl AggregateCapturesRegex {
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateCaptureBuildReport {
+        &self.report
+    }
+
+    /// Reconstruct captures over one absolute operation range.
+    pub fn captures(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        operation_limits: AggregateOperationLimits,
+        capture_limits: CaptureLimits,
+    ) -> Result<AdmittedCaptures, AggregateEngineError> {
+        self.engine.admit_captures(
+            haystack,
+            range,
+            self.report.strategy,
+            operation_limits,
+            capture_limits,
+        )
     }
 }
 

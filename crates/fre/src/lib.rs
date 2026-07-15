@@ -24,6 +24,7 @@ mod unicode_compile;
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
+    AggregateCaptureBuildError, AggregateCaptureBuildReport, AggregateCapturesRegex,
     AggregateCaptureSemantics, AggregateCompileRegex, AggregateContinuationIdentity,
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
@@ -45,6 +46,10 @@ pub use aggregate_many::{
     AggregateManySpanSumResult,
 };
 pub use fre_aggregate::{
+    AdmittedCaptures as AggregateCaptures,
+    CaptureLimits as AggregateCaptureLimits,
+    CaptureMatch as AggregateCaptureMatch,
+    CaptureOperationCertificate as AggregateCaptureOperationCertificate,
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,
     Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,

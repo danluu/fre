@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
+mod capture;
 mod compile;
 mod error;
 mod limits;
@@ -37,9 +38,10 @@ mod operation;
 mod program;
 
 pub use accounting::{CompileAccounting, ExecutionAccounting};
-pub use compile::{CompiledRegex, PlanId, RustByteProfile};
+pub use capture::{AdmittedCaptures, CaptureMatch, CaptureOperationCertificate};
+pub use compile::{CompiledCaptureRegex, CompiledRegex, PlanId, RustByteProfile};
 pub use error::{Error, Resource, Unsupported};
-pub use limits::{CompileLimits, OperationLimits};
+pub use limits::{CaptureLimits, CompileLimits, OperationLimits};
 pub use operation::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, MatchCount, OperationCertificate, OperationId,
     Span, SpanIter, SpanIteration, SpanSum, Strategy,
