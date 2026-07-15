@@ -86,20 +86,22 @@ search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains
-`anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15`, and `Auto`
+`anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15`, and `Auto`
 retains its pre-existing strategy for both shapes. Exact singleton-class
 candidate prefixes from 73 through 4,096 bytes use the same dedicated
 equality-only 32-byte verifier used below the former ceiling. Pair candidate
-prefixes from 73 through 4,096 bytes use safe 16-byte membership blocks that
+prefixes from 73 through 65,536 bytes use safe 16-byte membership blocks that
 lower to AArch64 NEON; a failure-only cold helper preserves prior native-word
-recovery accounting, and the existing eight-byte SWAR path handles tails.
-Triple candidate prefixes use four safe eight-byte SWAR membership words per
-32-byte block with scalar recovery only after a failing block; that exact
-32-byte recovery is isolated in a cold non-inlined helper. Non-single inclusive
-ranges at 32 bytes and above use native-word SWAR membership with exact scalar
-recovery inside only a failing word. Other class shapes and fixed-end
-verification retain their prior leaves. The direct legacy kernel constructor
-is unchanged.
+recovery accounting, and the existing eight-byte SWAR path handles tails. The
+route uses separate minimum and maximum comparisons so the linked AArch64
+dispatcher can encode the 65,536-byte ceiling directly instead of materializing
+the 65,464-value inclusive-range span. Triple candidate prefixes use four safe
+eight-byte SWAR membership words per 32-byte block with scalar recovery only
+after a failing block; that exact 32-byte recovery is isolated in a cold
+non-inlined helper. Non-single inclusive ranges at 32 bytes and above use
+native-word SWAR membership with exact scalar recovery inside only a failing
+word. Other class shapes and fixed-end verification retain their prior leaves.
+The direct legacy kernel constructor is unchanged.
 
 Extraction borrows the suffix from the parsed HIR and preserves its checked
 planner-work charge. The selected fixed plan performs one preflighted exact
