@@ -340,7 +340,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected exact-literal or continuation compile/count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions; CRLF, Unicode-word, variable-width Unicode scalar features, and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals or a bounded continuation program; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and refuses non-singleton scalar classes plus Unicode-word/CRLF assertions; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }

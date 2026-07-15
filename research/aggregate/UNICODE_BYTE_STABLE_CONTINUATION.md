@@ -33,8 +33,8 @@ uses a new profile-specific hash domain. Unicode-off programs retain their old
 hash domain and IDs exactly. The facade identity also records the Unicode-on
 byte-stable semantic proof, so equal instruction graphs constructed under the
 two profiles cannot alias in reports or caches. The changed facade identity
-shape advances the aggregate explain/cache schema to 4, and the comparator
-candidate adapter identity advances to `fre-current-aggregate-v4`.
+shape advances the composed aggregate explain/cache schema to 5, and the
+comparator candidate adapter identity advances to `fre-current-aggregate-v5`.
 
 ## Equivalence argument
 

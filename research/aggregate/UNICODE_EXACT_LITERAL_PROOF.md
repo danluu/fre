@@ -194,7 +194,7 @@ reading the retained canonical frontier through an explicit legacy
 
 Those schema and adapter identities describe this frozen exact-literal
 checkpoint. The later byte-stable continuation candidate advances them to
-aggregate schema 4 and `fre-current-aggregate-v4`; see the separate candidate
+aggregate schema 5 and `fre-current-aggregate-v5`; see the separate candidate
 document.
 
 The retained sentinel above remains diagnostic evidence only. All semantic,
