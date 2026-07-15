@@ -77,8 +77,8 @@ pub use fre_kernels::{
     UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceAccounting,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSemantics,
+    UnicodeScalarAggregateUpperBounds,
 };
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};

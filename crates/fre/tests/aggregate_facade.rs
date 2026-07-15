@@ -1104,7 +1104,10 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
             .map(|(start, end)| u64::try_from(end - start).unwrap())
             .sum::<u64>();
         let count = aggregate_builder(pattern).build_count().unwrap();
-        assert_eq!(count.build_report().plan, AggregatePlanKind::UnicodeScalarClass);
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass
+        );
         assert!(matches!(
             count.build_report().plan_identity,
             AggregatePlanIdentity::UnicodeScalar(identity)

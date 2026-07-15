@@ -117,8 +117,8 @@ pub use unicode_scalar_aggregate::{
     ReduceError as UnicodeScalarAggregateReduceError,
     ReduceLimits as UnicodeScalarAggregateReduceLimits,
     ReduceUpperBounds as UnicodeScalarAggregateUpperBounds,
-    SPAN_SUM_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_SPAN_SUM_OPERATION_ID,
     Repetition as UnicodeScalarAggregateRepetition,
+    SPAN_SUM_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_SPAN_SUM_OPERATION_ID,
     ScalarSemantics as UnicodeScalarAggregateSemantics,
     SpanSumResult as UnicodeScalarAggregateSpanSumResult, UnicodeScalarAggregatePlan,
 };

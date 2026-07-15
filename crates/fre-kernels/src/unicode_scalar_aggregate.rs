@@ -21,8 +21,7 @@ use crate::Window;
 /// Stable identity for the scalar-stream implementation.
 pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
 /// Stable identity for the deterministic nonempty run reducer.
-pub const RUN_PLAN_ID: &str =
-    "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
+pub const RUN_PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.valid-scalar.v1";
 /// Stable identity for the matched-byte-sum reducer.
@@ -962,11 +961,13 @@ impl UnicodeScalarAggregatePlan {
                 continue;
             }
             if self.repetition.is_run() {
-                actual.reducer_steps = actual.reducer_steps.checked_add(1).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual run reducer transitions",
-                    },
-                )?;
+                actual.reducer_steps =
+                    actual
+                        .reducer_steps
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual run reducer transitions",
+                        })?;
             }
             let decoded = decode_scalar(&local[position..]);
             actual.decode_byte_checks = actual
@@ -1008,11 +1009,10 @@ impl UnicodeScalarAggregatePlan {
                     false
                 };
             if matched {
-                let width = u64::try_from(decoded.width).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
+                let width =
+                    u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "matched scalar width",
-                    }
-                })?;
+                    })?;
                 if self.repetition == Repetition::OneOrMoreGreedy {
                     pending_run_bytes = pending_run_bytes.checked_add(width).ok_or(
                         ReduceError::ArithmeticOverflow {
@@ -1033,11 +1033,13 @@ impl UnicodeScalarAggregatePlan {
                     })?;
         }
         if self.repetition.is_run() {
-            actual.reducer_steps = actual.reducer_steps.checked_add(1).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "final run reducer transition",
-                },
-            )?;
+            actual.reducer_steps =
+                actual
+                    .reducer_steps
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "final run reducer transition",
+                    })?;
         }
         if self.repetition == Repetition::OneOrMoreGreedy {
             flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
@@ -1113,23 +1115,26 @@ impl UnicodeScalarAggregatePlan {
 }
 
 fn record_match(actual: &mut ReduceActualCounters, width: u64) -> Result<(), ReduceError> {
-    actual.match_events = actual
-        .match_events
-        .checked_add(1)
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "actual match events",
-        })?;
+    actual.match_events =
+        actual
+            .match_events
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual match events",
+            })?;
     actual.count = actual
         .count
         .checked_add(1)
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual count",
         })?;
-    actual.matched_bytes = actual.matched_bytes.checked_add(width).ok_or(
-        ReduceError::ArithmeticOverflow {
-            computation: "actual matched bytes",
-        },
-    )?;
+    actual.matched_bytes =
+        actual
+            .matched_bytes
+            .checked_add(width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual matched bytes",
+            })?;
     Ok(())
 }
 
@@ -1141,12 +1146,13 @@ fn flush_greedy_run(
         return Ok(());
     }
     record_match(actual, *pending_run_bytes)?;
-    actual.run_flushes = actual
-        .run_flushes
-        .checked_add(1)
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "actual greedy run flushes",
-        })?;
+    actual.run_flushes =
+        actual
+            .run_flushes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual greedy run flushes",
+            })?;
     *pending_run_bytes = 0;
     Ok(())
 }
@@ -1522,11 +1528,15 @@ mod tests {
                     .map(|matched| u64::try_from(matched.len()).unwrap())
                     .sum::<u64>();
                 let count = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
-                let sum = plan
-                    .span_sum(haystack, ReduceLimits::unlimited())
-                    .unwrap();
-                assert_eq!(count.count, expected_count, "pattern={pattern:?} haystack={haystack:?}");
-                assert_eq!(sum.span_sum, expected_sum, "pattern={pattern:?} haystack={haystack:?}");
+                let sum = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+                assert_eq!(
+                    count.count, expected_count,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    sum.span_sum, expected_sum,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
                 assert_eq!(count.accounting.actual.scratch_bytes, 0);
             }
             let windowed = b"x\xCE\xB1\xCE\xB2!\xE9\x9B\xAAz";
@@ -1540,21 +1550,19 @@ mod tests {
                         .map(|matched| u64::try_from(matched.len()).unwrap())
                         .sum::<u64>();
                     let count = plan
-                        .count_in(
-                            windowed,
-                            Window::new(start, end),
-                            ReduceLimits::unlimited(),
-                        )
+                        .count_in(windowed, Window::new(start, end), ReduceLimits::unlimited())
                         .unwrap();
                     let sum = plan
-                        .span_sum_in(
-                            windowed,
-                            Window::new(start, end),
-                            ReduceLimits::unlimited(),
-                        )
+                        .span_sum_in(windowed, Window::new(start, end), ReduceLimits::unlimited())
                         .unwrap();
-                    assert_eq!(count.count, expected_count, "pattern={pattern:?} window={start}..{end}");
-                    assert_eq!(sum.span_sum, expected_sum, "pattern={pattern:?} window={start}..{end}");
+                    assert_eq!(
+                        count.count, expected_count,
+                        "pattern={pattern:?} window={start}..{end}"
+                    );
+                    assert_eq!(
+                        sum.span_sum, expected_sum,
+                        "pattern={pattern:?} window={start}..{end}"
+                    );
                 }
             }
         }
