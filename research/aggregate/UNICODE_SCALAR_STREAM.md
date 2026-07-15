@@ -56,10 +56,31 @@ comparisons, match events, result values, reducer work, and reducer peak bytes.
 Resource refusals are typed unsupported outcomes; arithmetic and invariant
 violations are faults.
 
+Every scalar quantity named `work` in this lane is a structural work counter,
+not an executed-CPU-instruction estimate. Scalar selection charges one unit for
+every HIR node and every canonical class range it examines. Kernel construction
+charges range validation, ASCII bitmap population, and retained-range copies.
+Traversal work is the sum of decoder byte examinations, membership tests, and
+non-ASCII range comparisons. Loop control, checked counter maintenance,
+allocator-internal operations, and allocator metadata are outside those work
+counters; their input-dependent dimensions remain separately bounded by the
+reported node, range, byte, scalar, match, capacity, and peak-byte limits.
+
+The Rebar comparator exposes each scalar planner and builder quota directly:
+planner structural work, source ranges, build structural work, temporary
+capacity, persistent bytes, and peak bytes. It maps those named values into the
+facade rather than inheriting hidden kernel defaults. The comparator defaults
+reproduce the prior numeric facade and kernel defaults. Row retention remains
+a semantic-report gate because the corrected structural counter can consume
+more of the unchanged planner quota.
+
 The kernel tests authenticate the bounds rather than merely checking outputs:
 
 - every nonzero build and reduce dimension passes at the exact limit and
   refuses one below it;
+- facade selection charges every canonical range examined, including
+  non-qualifying singleton ranges before a late qualifying range, and refuses
+  at exactly one structural unit below the required total;
 - `N` doubling doubles the expected structural counters while scratch remains
   zero; and
 - adversarial range counts from 1 through 511 have exact comparison counters

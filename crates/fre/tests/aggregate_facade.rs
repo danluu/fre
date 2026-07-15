@@ -210,10 +210,8 @@ fn continuation_details(
             certificate,
             accounting,
         } => (certificate, accounting),
-        AggregateExecutionDetails::ExactLiteral(_) => {
-            panic!("expected continuation execution details")
-        }
-        AggregateExecutionDetails::UnicodeScalar(_) => {
+        AggregateExecutionDetails::ExactLiteral(_)
+        | AggregateExecutionDetails::UnicodeScalar(_) => {
             panic!("expected continuation execution details")
         }
     }
@@ -985,7 +983,6 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
             AggregatePlanKind::UnicodeScalarClass
         );
         assert_eq!(count.build_report().continuation_strategy, None);
-        assert_eq!(count.build_report().unicode_scalar_planner_work, 1);
         assert!(matches!(
             count.build_report().plan_identity,
             AggregatePlanIdentity::UnicodeScalar(identity)
@@ -998,6 +995,11 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
         };
         assert!(build.source_ranges > 0);
         assert!(build.retained_non_ascii_ranges > 0);
+        assert!(count.build_report().unicode_scalar_planner_work >= 2);
+        assert!(
+            count.build_report().unicode_scalar_planner_work
+                <= build.source_ranges.checked_add(1).unwrap()
+        );
         assert_eq!(
             build.persistent_bytes,
             count.build_report().retained_capacity_bytes
@@ -1065,7 +1067,8 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     );
     assert_eq!(regex.build_report().captures_erased, 1);
     assert_eq!(regex.build_report().capture_erasure_work, 1);
-    assert_eq!(regex.build_report().unicode_scalar_planner_work, 2);
+    let planner_work = regex.build_report().unicode_scalar_planner_work;
+    assert!(planner_work > 2);
     assert_eq!(
         regex
             .count_value(haystack, AggregateRunLimits::default())
@@ -1073,17 +1076,19 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
         3
     );
 
-    let mut build_limits = AggregateBuildLimits::default();
-    build_limits.max_unicode_scalar_planner_work = 1;
+    let build_limits = AggregateBuildLimits {
+        max_unicode_scalar_planner_work: planner_work - 1,
+        ..AggregateBuildLimits::default()
+    };
     assert!(matches!(
         aggregate_builder(pattern)
             .limits(build_limits)
             .build_count(),
         Err(AggregateBuildError::UnicodeScalarPlannerWorkLimit {
-            needed: 2,
-            limit: 1,
+            needed,
+            limit,
             ..
-        })
+        }) if needed == planner_work && limit == planner_work - 1
     ));
 
     let audited = regex
@@ -1103,6 +1108,86 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
         )
     ));
     assert_eq!(error.identity.plan, AggregatePlanKind::UnicodeScalarClass);
+}
+
+#[test]
+fn unicode_scalar_planner_charges_each_canonical_range_and_has_a_tight_limit() {
+    // The first three canonical ranges are non-ASCII singletons. Only the
+    // fourth and last range proves eligibility, so selection must charge the
+    // root class node and all four range examinations.
+    let late_eligible = r"[\u{100}\u{102}\u{104}\u{106}-\u{107}]";
+    let regex = aggregate_builder(late_eligible).build_count().unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert_eq!(regex.build_report().unicode_scalar_planner_work, 5);
+    let AggregateBuildAccounting::UnicodeScalar(build) = regex.build_report().build else {
+        panic!("late eligible scalar class selected another build family")
+    };
+    assert_eq!(build.source_ranges, 4);
+
+    let mut exact = AggregateBuildLimits {
+        max_unicode_scalar_planner_work: 5,
+        ..AggregateBuildLimits::default()
+    };
+    aggregate_builder(late_eligible)
+        .limits(exact)
+        .build_count()
+        .unwrap();
+    exact.max_unicode_scalar_planner_work = 4;
+    assert!(matches!(
+        aggregate_builder(late_eligible).limits(exact).build_count(),
+        Err(AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+            needed: 5,
+            limit: 4,
+            ..
+        })
+    ));
+
+    // With no qualifying range, every singleton is still examined and
+    // charged before the class is handed to the continuation frontier.
+    let all_singletons = r"[\u{100}\u{102}\u{104}\u{106}]";
+    assert!(matches!(
+        aggregate_builder(all_singletons)
+            .limits(exact)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+            needed: 5,
+            limit: 4,
+            ..
+        })
+    ));
+
+    let nested = format!("(({late_eligible}))");
+    let nested_regex = aggregate_builder(&nested).build_count().unwrap();
+    assert_eq!(
+        nested_regex.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert_eq!(nested_regex.build_report().syntax.hir_nodes, 3);
+    assert_eq!(nested_regex.build_report().syntax.captures, 2);
+    assert_eq!(nested_regex.build_report().captures_erased, 2);
+    assert_eq!(nested_regex.build_report().unicode_scalar_planner_work, 7);
+    let mut nested_limits = AggregateBuildLimits {
+        max_unicode_scalar_planner_work: 7,
+        ..AggregateBuildLimits::default()
+    };
+    aggregate_builder(&nested)
+        .limits(nested_limits)
+        .build_count()
+        .unwrap();
+    nested_limits.max_unicode_scalar_planner_work = 6;
+    assert!(matches!(
+        aggregate_builder(&nested)
+            .limits(nested_limits)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+            needed: 7,
+            limit: 6,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -1154,10 +1239,10 @@ fn unicode_scalar_selection_rejects_composition_and_preserves_existing_paths() {
     ));
 }
 
-fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
+fn unicode_exact_build_error(limits: &AggregateBuildLimits) -> AggregateBuildError {
     aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
-        .limits(limits)
+        .limits(*limits)
         .build_count()
         .unwrap_err()
 }
@@ -1219,7 +1304,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let mut one_below_build = exact_build;
     one_below_build.max_literal_planner_work = 0;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::LiteralPlannerWorkLimit {
             needed: 1,
             limit: 0,
@@ -1229,7 +1314,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_needle_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::NeedleLimit { .. },
             ..
@@ -1238,7 +1323,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_build_work -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::WorkLimit { .. },
             ..
@@ -1247,7 +1332,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_scratch_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::ScratchLimit { .. },
             ..
@@ -1256,7 +1341,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_persistent_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::PersistentLimit { .. },
             ..
@@ -1265,7 +1350,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::PeakLimit { .. },
             ..
@@ -1712,11 +1797,11 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
     }
 }
 
-fn exact_build_error(limits: AggregateBuildLimits) -> LiteralAggregateBuildError {
+fn exact_build_error(limits: &AggregateBuildLimits) -> LiteralAggregateBuildError {
     match aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
-        .limits(limits)
+        .limits(*limits)
         .build_count()
     {
         Err(AggregateBuildError::ExactLiteralBuild { source, .. }) => source,
@@ -1756,31 +1841,31 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
     let mut one_below = limits;
     one_below.exact_literal.max_needle_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::NeedleLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_build_work -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::WorkLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_scratch_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::ScratchLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_persistent_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::PersistentLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::PeakLimit { .. }
     ));
 

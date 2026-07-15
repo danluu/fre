@@ -61,7 +61,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v6";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v7";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -84,6 +84,7 @@ fn rebar_profile() -> RustProfile {
 
 /// Hard deterministic resource limits for one report generation.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 pub struct RunLimits {
     /// Maximum manifest jobs.
     pub jobs: usize,
@@ -117,6 +118,19 @@ pub struct RunLimits {
     pub fre_literal_build_persistent_bytes: usize,
     /// Maximum exact-literal construction peak bytes.
     pub fre_literal_build_peak_bytes: usize,
+    /// Maximum root Unicode scalar planner structural work. One unit is one
+    /// examined HIR node or canonical scalar range, not one CPU instruction.
+    pub fre_unicode_scalar_planner_work: usize,
+    /// Maximum canonical source ranges accepted by one scalar plan build.
+    pub fre_unicode_scalar_build_source_ranges: usize,
+    /// Maximum scalar plan construction structural work.
+    pub fre_unicode_scalar_build_work: usize,
+    /// Maximum temporary scalar plan construction capacity bytes.
+    pub fre_unicode_scalar_build_scratch_bytes: usize,
+    /// Maximum persistent bytes retained by one scalar plan.
+    pub fre_unicode_scalar_build_persistent_bytes: usize,
+    /// Maximum scalar plan construction peak bytes.
+    pub fre_unicode_scalar_build_peak_bytes: usize,
     /// Maximum exact-literal `haystack + needle` linear terms.
     pub fre_literal_linear_terms: usize,
     /// Maximum possible exact-literal match events.
@@ -164,6 +178,12 @@ impl Default for RunLimits {
             fre_literal_build_scratch_bytes: 32 * 1_048_576,
             fre_literal_build_persistent_bytes: 64 * 1_048_576,
             fre_literal_build_peak_bytes: 96 * 1_048_576,
+            fre_unicode_scalar_planner_work: 4_096,
+            fre_unicode_scalar_build_source_ranges: 1 << 16,
+            fre_unicode_scalar_build_work: 1 << 20,
+            fre_unicode_scalar_build_scratch_bytes: 1 << 20,
+            fre_unicode_scalar_build_persistent_bytes: 1 << 20,
+            fre_unicode_scalar_build_peak_bytes: 2 << 20,
             fre_literal_linear_terms: 512 * 1_048_576,
             fre_literal_match_events: 512 * 1_048_576,
             fre_literal_count: 1_000_000_000,
@@ -1889,12 +1909,20 @@ fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError
 fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
     AggregateBuildLimits {
         max_literal_planner_work: limits.fre_literal_planner_work,
+        max_unicode_scalar_planner_work: limits.fre_unicode_scalar_planner_work,
         exact_literal: LiteralAggregateBuildLimits {
             max_needle_bytes: limits.fre_literal_build_needle_bytes,
             max_build_work: limits.fre_literal_build_work,
             max_scratch_bytes: limits.fre_literal_build_scratch_bytes,
             max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
+        },
+        unicode_scalar: fre::UnicodeScalarAggregateBuildLimits {
+            max_source_ranges: limits.fre_unicode_scalar_build_source_ranges,
+            max_build_work: limits.fre_unicode_scalar_build_work,
+            max_scratch_bytes: limits.fre_unicode_scalar_build_scratch_bytes,
+            max_persistent_bytes: limits.fre_unicode_scalar_build_persistent_bytes,
+            max_peak_bytes: limits.fre_unicode_scalar_build_peak_bytes,
         },
         continuation: fre::AggregateCompileLimits {
             max_work: limits.fre_aggregate_compile_work,
@@ -2074,7 +2102,10 @@ fn unicode_scalar_operation_limits(
         comparisons_per_scalar,
         "scalar range comparisons",
     )?;
-    let work = checked_aggregate_add(
+    // This is the kernel's structural bound: byte examinations, membership
+    // tests and range comparisons. It is deliberately not described as an
+    // executed-CPU-instruction count.
+    let structural_work = checked_aggregate_add(
         checked_aggregate_add(
             decode_byte_checks,
             haystack_len,
@@ -2096,7 +2127,7 @@ fn unicode_scalar_operation_limits(
         max_match_events: haystack_len.min(reducer_events),
         max_count: count.min(limits.reducer_steps),
         max_span_sum: count,
-        max_work: work,
+        max_work: structural_work,
         max_scratch_bytes: 0,
         max_peak_bytes: build.persistent_bytes,
     })
@@ -4400,6 +4431,79 @@ mod tests {
         // zero, so a larger policy quota is represented by the tight bound.
         assert_eq!(capped.max_scratch_bytes, 0);
         assert_eq!(capped.max_peak_bytes, 7);
+    }
+
+    #[test]
+    fn unicode_scalar_build_limits_map_every_named_quota() {
+        let run = RunLimits {
+            fre_unicode_scalar_planner_work: 7,
+            fre_unicode_scalar_build_source_ranges: 8,
+            fre_unicode_scalar_build_work: 9,
+            fre_unicode_scalar_build_scratch_bytes: 10,
+            fre_unicode_scalar_build_persistent_bytes: 11,
+            fre_unicode_scalar_build_peak_bytes: 12,
+            ..RunLimits::default()
+        };
+        let build_limits = aggregate_build_limits(&run);
+        assert_eq!(build_limits.max_unicode_scalar_planner_work, 7);
+        assert_eq!(build_limits.unicode_scalar.max_source_ranges, 8);
+        assert_eq!(build_limits.unicode_scalar.max_build_work, 9);
+        assert_eq!(build_limits.unicode_scalar.max_scratch_bytes, 10);
+        assert_eq!(build_limits.unicode_scalar.max_persistent_bytes, 11);
+        assert_eq!(build_limits.unicode_scalar.max_peak_bytes, 12);
+
+        let defaults = aggregate_build_limits(&RunLimits::default());
+        assert_eq!(defaults.max_unicode_scalar_planner_work, 4_096);
+        assert_eq!(
+            defaults.max_unicode_scalar_planner_work,
+            fre::AggregateBuildLimits::default().max_unicode_scalar_planner_work
+        );
+        assert_eq!(
+            defaults.unicode_scalar,
+            fre::UnicodeScalarAggregateBuildLimits::default()
+        );
+    }
+
+    #[test]
+    fn legacy_run_limits_default_new_unicode_scalar_quotas() {
+        let mut legacy = serde_json::to_value(RunLimits::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for field in [
+            "fre_unicode_scalar_planner_work",
+            "fre_unicode_scalar_build_source_ranges",
+            "fre_unicode_scalar_build_work",
+            "fre_unicode_scalar_build_scratch_bytes",
+            "fre_unicode_scalar_build_persistent_bytes",
+            "fre_unicode_scalar_build_peak_bytes",
+        ] {
+            assert!(object.remove(field).is_some());
+        }
+        let decoded: RunLimits = serde_json::from_value(legacy).unwrap();
+        let defaults = RunLimits::default();
+        assert_eq!(
+            decoded.fre_unicode_scalar_planner_work,
+            defaults.fre_unicode_scalar_planner_work
+        );
+        assert_eq!(
+            decoded.fre_unicode_scalar_build_source_ranges,
+            defaults.fre_unicode_scalar_build_source_ranges
+        );
+        assert_eq!(
+            decoded.fre_unicode_scalar_build_work,
+            defaults.fre_unicode_scalar_build_work
+        );
+        assert_eq!(
+            decoded.fre_unicode_scalar_build_scratch_bytes,
+            defaults.fre_unicode_scalar_build_scratch_bytes
+        );
+        assert_eq!(
+            decoded.fre_unicode_scalar_build_persistent_bytes,
+            defaults.fre_unicode_scalar_build_persistent_bytes
+        );
+        assert_eq!(
+            decoded.fre_unicode_scalar_build_peak_bytes,
+            defaults.fre_unicode_scalar_build_peak_bytes
+        );
     }
 
     #[test]

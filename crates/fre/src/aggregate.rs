@@ -30,7 +30,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 6;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 7;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -168,7 +168,9 @@ pub struct AggregateBuildLimits {
     pub syntax_safety: SafetyEnvelope,
     /// Maximum allocation-free direct-root literal inspection work.
     pub max_literal_planner_work: usize,
-    /// Maximum allocation-free root scalar-class inspection work.
+    /// Maximum allocation-free root scalar-class structural inspection work.
+    /// One unit is charged for every HIR node and canonical scalar range
+    /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
     /// Complete exact-literal kernel construction limits.
     pub exact_literal: LiteralAggregateBuildLimits,
@@ -229,7 +231,10 @@ pub struct AggregateBuildReport {
     /// Direct-root exact-literal inspection work. This is zero when forced
     /// continuation skips inspection.
     pub planner_work: usize,
-    /// Root Unicode scalar-class inspection work, zero outside that plan.
+    /// Root Unicode scalar-class structural inspection work. This is zero when
+    /// scalar inspection is skipped; otherwise it records the attempted HIR
+    /// and canonical-range inspection even when continuation is selected. It
+    /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
@@ -296,7 +301,8 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
-    /// Allocation-free root scalar-class inspection crossed its work cap.
+    /// Allocation-free root scalar-class inspection crossed its structural
+    /// work cap.
     UnicodeScalarPlannerWorkLimit {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
@@ -363,7 +369,7 @@ impl fmt::Display for AggregateBuildError {
                 limit,
             } => write!(
                 f,
-                "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} work units, limit is {limit}"
+                "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} structural work units, limit is {limit}"
             ),
             Self::ExactLiteralIneligible {
                 operation,
@@ -818,9 +824,10 @@ impl AggregateBuilder {
             Some(UnicodeScalarInspection::Eligible {
                 class,
                 work,
+                hir_nodes,
                 captures,
             }) => {
-                if work != expected_nodes || captures != expected_captures {
+                if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
@@ -1199,6 +1206,7 @@ enum UnicodeScalarInspection<'a> {
     Eligible {
         class: &'a ClassUnicode,
         work: usize,
+        hir_nodes: usize,
         captures: usize,
     },
     Ineligible {
@@ -1216,15 +1224,13 @@ fn inspect_unicode_scalar_class(
     limit: usize,
 ) -> Result<UnicodeScalarInspection<'_>, UnicodeScalarInspectionError> {
     let mut work = 0_usize;
+    let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
     loop {
-        let needed = work
+        charge_unicode_scalar_inspection_work(&mut work, limit)?;
+        hir_nodes = hir_nodes
             .checked_add(1)
             .ok_or(UnicodeScalarInspectionError::Overflow)?;
-        if needed > limit {
-            return Err(UnicodeScalarInspectionError::WorkLimit { needed, limit });
-        }
-        work = needed;
         match hir.kind() {
             HirKind::Capture(capture) => {
                 captures = captures
@@ -1232,21 +1238,37 @@ fn inspect_unicode_scalar_class(
                     .ok_or(UnicodeScalarInspectionError::Overflow)?;
                 hir = capture.sub.as_ref();
             }
-            HirKind::Class(Class::Unicode(class))
-                if class
-                    .ranges()
-                    .iter()
-                    .any(|range| !range.end().is_ascii() && range.start() != range.end()) =>
-            {
-                return Ok(UnicodeScalarInspection::Eligible {
-                    class,
-                    work,
-                    captures,
-                });
+            HirKind::Class(Class::Unicode(class)) => {
+                for range in class.ranges() {
+                    charge_unicode_scalar_inspection_work(&mut work, limit)?;
+                    if !range.end().is_ascii() && range.start() != range.end() {
+                        return Ok(UnicodeScalarInspection::Eligible {
+                            class,
+                            work,
+                            hir_nodes,
+                            captures,
+                        });
+                    }
+                }
+                return Ok(UnicodeScalarInspection::Ineligible { work });
             }
             _ => return Ok(UnicodeScalarInspection::Ineligible { work }),
         }
     }
+}
+
+fn charge_unicode_scalar_inspection_work(
+    work: &mut usize,
+    limit: usize,
+) -> Result<(), UnicodeScalarInspectionError> {
+    let needed = work
+        .checked_add(1)
+        .ok_or(UnicodeScalarInspectionError::Overflow)?;
+    if needed > limit {
+        return Err(UnicodeScalarInspectionError::WorkLimit { needed, limit });
+    }
+    *work = needed;
+    Ok(())
 }
 
 fn inspect_exact_literal(
@@ -1601,5 +1623,20 @@ impl AggregateSpanSumResult {
     #[must_use]
     pub const fn report(&self) -> &AggregateExecutionReport {
         &self.report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UnicodeScalarInspectionError, charge_unicode_scalar_inspection_work};
+
+    #[test]
+    fn unicode_scalar_inspection_overflow_leaves_counter_unchanged() {
+        let mut work = usize::MAX;
+        assert!(matches!(
+            charge_unicode_scalar_inspection_work(&mut work, usize::MAX),
+            Err(UnicodeScalarInspectionError::Overflow)
+        ));
+        assert_eq!(work, usize::MAX);
     }
 }
