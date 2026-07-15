@@ -522,8 +522,9 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
 fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), DynError> {
     match (runtime, plan) {
         ("k0", PlanKind::K0)
-        | ("ascii-word-run-linear-v1", PlanKind::UnicodeWordRun)
-        | ("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => Ok(()),
+        | ("ascii-word-run-linear-v1" | "unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => {
+            Ok(())
+        }
         _ => Err(format!(
             "grep runtime {runtime:?} and selected plan {plan:?} are not an authenticated pair"
         )
