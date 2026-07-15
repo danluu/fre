@@ -52,26 +52,22 @@ fn pair_neon16_minimum_routes_15_16_31_and_32_exactly() {
         (32, 31, 41),
     ] {
         for outsider in [0x00_u8, 0x40, 0x81, 0xFF] {
-            let mut haystack: Vec<u8> = [0x7E, 0x80]
-                .into_iter()
-                .cycle()
-                .take(boundary)
-                .collect();
+            let mut haystack: Vec<u8> = [0x7E, 0x80].into_iter().cycle().take(boundary).collect();
             haystack[outsider_position] = outsider;
             haystack.extend_from_slice(candidate.suffix());
             let (span, accounting) = candidate
                 .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
                 .unwrap();
-            assert_eq!(
-                span, None,
-                "boundary={boundary} outsider={outsider:#04x}"
-            );
+            assert_eq!(span, None, "boundary={boundary} outsider={outsider:#04x}");
             assert_eq!(
                 accounting.prefix_bytes_examined, expected_examined,
                 "boundary={boundary} outsider={outsider:#04x}"
             );
             assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
-            assert!(accounting.suffix_confirmation_attempted);
+            assert!(
+                !accounting.suffix_confirmation_attempted,
+                "the short forward witness must reject the earlier outsider before suffix confirmation: boundary={boundary} outsider={outsider:#04x}"
+            );
         }
     }
 }
