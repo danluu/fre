@@ -2055,9 +2055,11 @@ mod tests {
                 pair[0].input_bytes_advanced * 2
             );
             assert_eq!(pair[1].decode_byte_checks, pair[0].decode_byte_checks * 2);
+            // The first scalar primes the cursor once. After the first
+            // descent, every repeated unit uses the same binary-search work.
             assert_eq!(
-                pair[1].range_comparisons - 1,
-                (pair[0].range_comparisons - 1) * 2
+                pair[1].range_comparisons + 1,
+                (pair[0].range_comparisons + 1) * 2
             );
             assert_eq!(pair[1].reducer_steps - 1, (pair[0].reducer_steps - 1) * 2);
             assert_eq!(pair[1].match_events, pair[0].match_events * 2);
