@@ -1151,12 +1151,11 @@ impl UnicodeScalarAggregatePlan {
                             computation: "actual non-ASCII membership tests",
                         })?;
                     let (contains, comparisons) = if CACHE_RANGE && monotone_range_cursor {
-                        if previous_non_ascii_scalar.is_none_or(|previous| scalar >= previous) {
-                            self.contains_non_ascii_run(
-                                scalar,
-                                &mut cached_non_ascii_range,
-                                &mut previous_non_ascii_scalar,
-                            )?
+                        let nondecreasing = previous_non_ascii_scalar
+                            .is_none_or(|previous| scalar >= previous);
+                        previous_non_ascii_scalar = Some(scalar);
+                        if nondecreasing {
+                            self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
                         } else {
                             monotone_range_cursor = false;
                             cached_non_ascii_range = None;
@@ -1317,51 +1316,39 @@ impl UnicodeScalarAggregatePlan {
         &self,
         scalar: u32,
         cached_range: &mut Option<usize>,
-        previous_scalar: &mut Option<u32>,
     ) -> Result<(bool, usize), ReduceError> {
         let mut comparisons = 0_usize;
         if let Some(index) = *cached_range {
             if let Some(range) = self.non_ascii.get(index) {
                 comparisons = 1;
                 if scalar >= range.start && scalar <= range.end {
-                    *previous_scalar = Some(scalar);
                     return Ok((true, comparisons));
                 }
-                if previous_scalar.is_some_and(|previous| scalar >= previous) {
-                    if scalar < range.start {
-                        *previous_scalar = Some(scalar);
-                        return Ok((false, comparisons));
-                    }
-                    let next = index
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "cached non-ASCII range successor",
-                        })?;
-                    *cached_range = Some(next);
-                    if let Some(range) = self.non_ascii.get(next) {
-                        comparisons =
-                            comparisons
-                                .checked_add(1)
-                                .ok_or(ReduceError::ArithmeticOverflow {
-                                    computation: "monotone range comparisons",
-                                })?;
-                        if scalar < range.start {
-                            *previous_scalar = Some(scalar);
-                            return Ok((false, comparisons));
-                        }
-                        if scalar <= range.end {
-                            *previous_scalar = Some(scalar);
-                            return Ok((true, comparisons));
-                        }
-                    } else {
-                        *previous_scalar = Some(scalar);
-                        return Ok((false, comparisons));
-                    }
+                if scalar < range.start {
+                    return Ok((false, comparisons));
                 }
-            } else if index == self.non_ascii.len()
-                && previous_scalar.is_some_and(|previous| scalar >= previous)
-            {
-                *previous_scalar = Some(scalar);
+                let next = index
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "cached non-ASCII range successor",
+                    })?;
+                *cached_range = Some(next);
+                if let Some(range) = self.non_ascii.get(next) {
+                    comparisons = comparisons.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "monotone range comparisons",
+                        },
+                    )?;
+                    if scalar < range.start {
+                        return Ok((false, comparisons));
+                    }
+                    if scalar <= range.end {
+                        return Ok((true, comparisons));
+                    }
+                } else {
+                    return Ok((false, comparisons));
+                }
+            } else if index == self.non_ascii.len() {
                 return Ok((false, comparisons));
             }
         }
@@ -1401,7 +1388,6 @@ impl UnicodeScalarAggregatePlan {
             }
         }
         *cached_range = Some(low);
-        *previous_scalar = Some(scalar);
         let contains = self
             .non_ascii
             .get(low)
