@@ -75,9 +75,11 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
 }
 
 fn rebar_options_match_runner_surface(options: &RustOptions) -> bool {
-    let mut exposed = RustOptions::default();
-    exposed.unicode = options.unicode;
-    exposed.case_insensitive = options.case_insensitive;
+    let exposed = RustOptions {
+        unicode: options.unicode,
+        case_insensitive: options.case_insensitive,
+        ..RustOptions::default()
+    };
     options == &exposed
 }
 

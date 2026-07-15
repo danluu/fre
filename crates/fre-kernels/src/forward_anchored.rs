@@ -1138,7 +1138,7 @@ impl ForwardAnchoredPlan {
             ClassImplementation::Pair { first, second }
                 if (PAIR_SWAR_EXTENSION_MIN..=PAIR_SWAR_MAX).contains(&bytes.len()) =>
             {
-                self.scan_pair_candidate_prefix_extended(bytes, first, second)
+                Self::scan_pair_candidate_prefix_extended(bytes, first, second)
             }
             ClassImplementation::Pair { .. } if bytes.len() > PAIR_SWAR_MAX => {
                 self.scan_pair_candidate_prefix_too_long(bytes)
@@ -1162,7 +1162,6 @@ impl ForwardAnchoredPlan {
     #[cold]
     #[inline(never)]
     fn scan_pair_candidate_prefix_extended(
-        &self,
         bytes: &[u8],
         first: u8,
         second: u8,
