@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const SINGLE_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
+const SINGLE_ID: &str = "anchored-class-suffix.single-candidate73-65536-equality32-pair-candidate73-65536-direct-bound-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v16";
 
 fn plan() -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -34,7 +34,10 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
         }
     );
 
-    for boundary in [72_usize, 73, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097] {
+    for boundary in [
+        72_usize, 73, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535, 65_536,
+        65_537,
+    ] {
         let mut haystack = vec![0x80; boundary];
         haystack.extend_from_slice(candidate.suffix());
         let (span, accounting) = candidate
@@ -59,7 +62,8 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
 fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes() {
     let candidate = plan();
     for boundary in [
-        73_usize, 74, 127, 128, 255, 256, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097,
+        73_usize, 74, 127, 128, 255, 256, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535,
+        65_536, 65_537,
     ] {
         for earlier in [0_usize, 1, 31, 32, 33, boundary / 2, boundary - 1] {
             if earlier >= boundary {
@@ -94,7 +98,9 @@ fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes
         }
     }
 
-    for length in [73_usize, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097] {
+    for length in [
+        73_usize, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097, 65_535, 65_536, 65_537,
+    ] {
         let haystack = vec![0x80; length];
         let (span, accounting) = candidate
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
