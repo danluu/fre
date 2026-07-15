@@ -4,7 +4,7 @@ use crate::compile::CompiledCaptureRegex;
 use crate::error::{add, enforce, mul};
 use crate::operation::{OperationCertificate, Span, Strategy};
 use crate::program::{AssertionContext, Inst, Program};
-use crate::{CaptureLimits, Error, OperationLimits, Resource};
+use crate::{CaptureLimits, Error, ExecutionAccounting, OperationLimits, Resource};
 
 /// One whole match and all numbered groups in absolute byte offsets.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +43,7 @@ impl CaptureMatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureOperationCertificate {
     pub whole_matches: OperationCertificate,
+    pub whole_match_accounting: ExecutionAccounting,
     pub capture_slots: usize,
     pub replay_cells: usize,
     pub history_nodes_bound: usize,
@@ -291,6 +292,7 @@ impl CompiledCaptureRegex {
         }
         let certificate = CaptureOperationCertificate {
             whole_matches: admitted.certificate().clone(),
+            whole_match_accounting: admitted.accounting(),
             capture_slots: self.capture_slots,
             replay_cells,
             history_nodes_bound: replay_cells,

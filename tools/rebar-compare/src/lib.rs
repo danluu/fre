@@ -19,7 +19,9 @@ use std::{fmt::Write as _, io::Write as _};
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
+    AggregateBuilder, AggregateCaptureBuildError, AggregateCaptureBuildReport,
+    AggregateCaptureLimits, AggregateCapturesRegex, AggregateContinuationSemantics,
+    AggregateCountRegex, AggregateEngineError,
     AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateManyBuildAccounting,
     AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
@@ -1847,7 +1849,9 @@ fn fre_reducer(
         "compile" => fre_compile_verify(request, limits),
         "count" => fre_aggregate_count(request, limits),
         "count-spans" => fre_aggregate_span_sum(request, limits),
+        "count-captures" => fre_aggregate_capture_count(request, limits),
         "grep" => fre_grep(request, limits),
+        "grep-captures" => fre_aggregate_grep_captures(request, limits),
         other => Err(ExecutionError::unsupported(format!(
             "current FRE facade has no certified {other} operation"
         ))),
@@ -1958,10 +1962,89 @@ fn fre_unicode_compile_verify(
     })
 }
 
+fn capture_span_operation_limits(
+    haystack_len: usize,
+    program_states: usize,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
+    let boundaries = checked_aggregate_add(haystack_len, 1, "capture boundary count")?;
+    let record_bytes = checked_aggregate_add(program_states, 1, "capture row bits")?.div_ceil(8);
+    let row_words = checked_aggregate_mul(program_states, 2, "capture row words")?;
+    let row_bytes = checked_aggregate_mul(
+        row_words,
+        core::mem::size_of::<usize>(),
+        "capture row bytes",
+    )?;
+    let random_access = checked_aggregate_add(row_bytes, record_bytes, "capture random bytes")?;
+    let log_bytes = checked_aggregate_mul(record_bytes, boundaries, "capture row log")?;
+    let sequential = checked_aggregate_mul(log_bytes, 3, "capture sequential bytes")?;
+    let output_bytes = checked_aggregate_mul(
+        boundaries,
+        core::mem::size_of::<fre::Match>(),
+        "capture whole-match span bytes",
+    )?;
+    let peak = checked_aggregate_add(
+        checked_aggregate_add(log_bytes, random_access, "capture engine peak")?,
+        output_bytes,
+        "capture span peak",
+    )?;
+    let state_boundaries = checked_aggregate_mul(
+        program_states,
+        boundaries,
+        "capture state-boundary cells",
+    )?;
+    let state_work = checked_aggregate_mul(state_boundaries, 11, "capture state work")?;
+    let scan_work = checked_aggregate_mul(boundaries, 8, "capture scan work")?;
+    let work = checked_aggregate_add(state_work, scan_work, "capture operation work")?;
+    let reducer_events = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("capture reducer limit does not fit usize"))?;
+    Ok(AggregateOperationLimits {
+        max_boundaries: boundaries,
+        max_table_cells: 0,
+        max_random_access_bytes: random_access.min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: random_access.min(limits.fre_aggregate_scratch_bytes),
+        max_log_bytes: log_bytes.min(limits.fre_aggregate_log_bytes),
+        max_sequential_bytes: sequential.min(limits.fre_aggregate_sequential_bytes),
+        max_match_events: checked_aggregate_mul(boundaries, 2, "capture match events")?
+            .min(checked_aggregate_mul(reducer_events, 2, "capture reducer events")?),
+        max_output_matches: boundaries.min(reducer_events),
+        max_output_bytes: output_bytes.min(64 << 20),
+        max_span_sum: haystack_len,
+        max_peak_bytes: peak.min(limits.fre_aggregate_peak_bytes),
+        max_work: work.min(limits.fre_aggregate_operation_work),
+    })
+}
+
+fn capture_history_limits(
+    haystack_len: usize,
+    report: &AggregateCaptureBuildReport,
+    limits: &RunLimits,
+) -> Result<AggregateCaptureLimits, ExecutionError> {
+    let boundaries = checked_aggregate_add(haystack_len, 1, "capture output boundaries")?;
+    let output_slots = checked_aggregate_mul(
+        boundaries,
+        report.capture_slots,
+        "capture output slots",
+    )?;
+    let output_bytes = checked_aggregate_mul(
+        output_slots,
+        core::mem::size_of::<Option<fre::Match>>(),
+        "capture output bytes",
+    )?;
+    Ok(AggregateCaptureLimits {
+        max_capture_slots: report.capture_slots,
+        max_replay_cells: limits.fre_aggregate_operation_work,
+        max_history_nodes: limits.fre_aggregate_operation_work,
+        max_output_bytes: output_bytes.min(limits.fre_aggregate_peak_bytes),
+        max_work: limits.fre_aggregate_operation_work,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
     if request.patterns.len() != 1 {
         return Err(ExecutionError::unsupported(
-            "current FRE facade requires exactly one pattern and does not expose ordered build-many semantics",
+            "current FRE operation requires exactly one pattern",
         ));
     }
     Ok(request.patterns[0].as_str())
@@ -2878,6 +2961,144 @@ fn fre_aggregate_many_span_sum(
     Ok(FreReduction {
         actual: result.value(),
         plan,
+    })
+}
+
+fn aggregate_capture_build_error(error: &AggregateCaptureBuildError) -> ExecutionError {
+    let message = format!("FRE capture aggregate build refused input: {error}");
+    match error {
+        AggregateCaptureBuildError::UnicodeEnabled
+        | AggregateCaptureBuildError::ExactLiteralUnavailable
+        | AggregateCaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
+        AggregateCaptureBuildError::Compile(source) => aggregate_engine_error(source, message),
+        AggregateCaptureBuildError::InternalInvariant(_) => ExecutionError::fault(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn fre_capture_regex(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<AggregateCapturesRegex, ExecutionError> {
+    let pattern = one_fre_pattern(request)?;
+    AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(aggregate_build_limits(limits))
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_captures()
+        .map_err(|error| aggregate_capture_build_error(&error))
+}
+
+fn capture_group_reduction(
+    regex: &AggregateCapturesRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+    events: &mut u64,
+    aggregate_work: &mut usize,
+) -> Result<u64, ExecutionError> {
+    let report = regex.build_report();
+    let operation_limits =
+        capture_span_operation_limits(haystack.len(), report.compile.program_states, limits)?;
+    let capture_limits = capture_history_limits(haystack.len(), report, limits)?;
+    let captures = regex
+        .captures(
+            haystack,
+            0..haystack.len(),
+            operation_limits,
+            capture_limits,
+        )
+        .map_err(|source| {
+            aggregate_engine_error(
+                &source,
+                format!("FRE capture aggregate refused execution: {source}"),
+            )
+        })?;
+    let operation_work = captures
+        .certificate()
+        .whole_match_accounting
+        .work
+        .checked_add(captures.certificate().work)
+        .ok_or_else(|| ExecutionError::fault("FRE capture aggregate work overflow"))?;
+    *aggregate_work = aggregate_work
+        .checked_add(operation_work)
+        .ok_or_else(|| ExecutionError::fault("FRE capture aggregate cumulative work overflow"))?;
+    if *aggregate_work > limits.fre_aggregate_operation_work {
+        return Err(ExecutionError::unsupported(format!(
+            "FRE capture aggregate needs {} cumulative work units, limit is {}",
+            *aggregate_work, limits.fre_aggregate_operation_work
+        )));
+    }
+    let mut count = 0_u64;
+    for matched in captures.as_slice() {
+        let whole = matched.span();
+        if whole.end == whole.start {
+            return Err(ExecutionError::fault(
+                "FRE capture aggregate violated the Rebar non-empty-match promise",
+            ));
+        }
+        for group in matched.groups() {
+            charge(events, 1, limits.reducer_steps, "FRE capture group events")?;
+            if group.is_some() {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| ExecutionError::fault("FRE capture reducer overflow"))?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn fre_aggregate_capture_count(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex = fre_capture_regex(request, limits)?;
+    let mut events = 0_u64;
+    let mut work = 0_usize;
+    let actual = capture_group_reduction(
+        &regex,
+        request.haystack,
+        limits,
+        &mut events,
+        &mut work,
+    )?;
+    Ok(FreReduction {
+        actual,
+        plan: "aggregate-capture-history",
+    })
+}
+
+fn fre_aggregate_grep_captures(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex = fre_capture_regex(request, limits)?;
+    let mut events = 0_u64;
+    let mut actual = 0_u64;
+    let mut work = 0_usize;
+    for line in request.haystack.lines() {
+        charge(
+            &mut events,
+            1,
+            limits.reducer_steps,
+            "FRE grep-captures line events",
+        )?;
+        actual = actual
+            .checked_add(capture_group_reduction(
+                &regex,
+                line,
+                limits,
+                &mut events,
+                &mut work,
+            )?)
+            .ok_or_else(|| ExecutionError::fault("FRE grep-captures reducer overflow"))?;
+    }
+    Ok(FreReduction {
+        actual,
+        plan: "aggregate-capture-history",
     })
 }
 
@@ -4530,8 +4751,8 @@ mod tests {
             &limits,
         );
         assert!(
-            matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("no certified count-captures operation")),
-            "capture output must remain typed unsupported: {captures:?}"
+            matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
+            "multi-pattern capture output must remain typed unsupported: {captures:?}"
         );
     }
 

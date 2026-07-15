@@ -1351,7 +1351,7 @@ impl std::error::Error for AggregateCaptureBuildError {
 }
 
 /// Auditable capture-preserving construction facts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateCaptureBuildReport {
     pub syntax: ParseSummary,
     pub compile: AggregateCompileAccounting,
