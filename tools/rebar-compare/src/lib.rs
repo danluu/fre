@@ -2138,9 +2138,10 @@ fn fre_grep_captures(
 
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
     if request.patterns.len() != 1 {
-        return Err(ExecutionError::unsupported(
-            "current FRE facade requires exactly one pattern and does not expose ordered build-many semantics",
-        ));
+        return Err(ExecutionError::unsupported(format!(
+            "current FRE facade has no certified {} operation for multiple patterns; requires exactly one pattern",
+            request.model
+        )));
     }
     Ok(request.patterns[0].as_str())
 }
