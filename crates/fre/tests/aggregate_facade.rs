@@ -1357,10 +1357,10 @@ fn unicode_exact_build_error(limits: &AggregateBuildLimits) -> AggregateBuildErr
 fn unicode_exact_count_error(
     regex: &fre::AggregateCountRegex,
     haystack: &[u8],
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
-    let audited = regex.count(haystack, limits).unwrap_err();
-    let value = regex.count_value(haystack, limits).unwrap_err();
+    let audited = regex.count(haystack, *limits).unwrap_err();
+    let value = regex.count_value(haystack, *limits).unwrap_err();
     assert_eq!(value.identity, audited.identity);
     assert_eq!(value.source, audited.source);
     assert!(matches!(
@@ -1500,31 +1500,31 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let mut one_below_run = exact_run;
     one_below_run.exact_literal.max_linear_terms -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_match_events -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_count -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_reducer_steps -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 
@@ -1993,9 +1993,9 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
 
 fn exact_reduce_error(
     regex: &fre::AggregateCountRegex,
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
-    let error = regex.count(b"needleneedleXneedle", limits).unwrap_err();
+    let error = regex.count(b"needleneedleXneedle", *limits).unwrap_err();
     assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
     match error.source {
         AggregateExecutionSource::ExactLiteral(source) => source,
@@ -2005,10 +2005,10 @@ fn exact_reduce_error(
 
 fn exact_reduce_value_error(
     regex: &fre::AggregateCountRegex,
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
     let error = regex
-        .count_value(b"needleneedleXneedle", limits)
+        .count_value(b"needleneedleXneedle", *limits)
         .unwrap_err();
     assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
     match error.source {
@@ -2055,51 +2055,51 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let mut one_below = exact;
     one_below.exact_literal.max_linear_terms -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_match_events -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_count -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_reducer_steps -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 

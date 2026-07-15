@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use fre::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanKind,
@@ -23,7 +25,7 @@ fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
         u64::try_from(spans.len()).unwrap(),
         spans
             .iter()
-            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
             .sum(),
     )
 }
@@ -110,8 +112,10 @@ fn finite_dfa_planner_and_kernel_limits_fail_with_typed_ownership() {
     let work = baseline.build_report().finite_planner_work;
     assert!(work > 0);
 
-    let mut planner_limits = AggregateBuildLimits::default();
-    planner_limits.max_finite_planner_work = work - 1;
+    let planner_limits = AggregateBuildLimits {
+        max_finite_planner_work: work.checked_sub(1).unwrap(),
+        ..AggregateBuildLimits::default()
+    };
     let planner_error = builder(pattern)
         .limits(planner_limits)
         .build_count()
@@ -142,7 +146,7 @@ fn alternation(count: usize) -> String {
         if index != 0 {
             pattern.push('|');
         }
-        pattern.push_str(&format!("p{index:03}"));
+        write!(&mut pattern, "p{index:03}").unwrap();
     }
     pattern.push(')');
     pattern
@@ -163,22 +167,22 @@ fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {
 #[test]
 fn finite_dfa_n_2n_and_query_scaling_rejects_input_times_alternatives() {
     let n = 8_192;
-    let q16_n = counters(16, n);
-    let q64_n = counters(64, n);
-    let q16_2n = counters(16, 2 * n);
-    let q64_2n = counters(64, 2 * n);
+    let small_at_n = counters(16, n);
+    let large_at_n = counters(64, n);
+    let small_at_double_n = counters(16, 2 * n);
+    let large_at_double_n = counters(64, 2 * n);
 
-    assert_eq!(q16_n.0, n);
-    assert_eq!(q64_n.0, n);
-    assert_eq!(q16_2n.0, 2 * n);
-    assert_eq!(q64_2n.0, 2 * n);
-    assert_eq!(q16_n.1, n + 1);
-    assert_eq!(q64_n.1, n + 1);
-    assert_eq!(q16_2n.1, 2 * n + 1);
-    assert_eq!(q64_2n.1, 2 * n + 1);
-    assert_eq!(q16_n.2, q64_n.2);
-    assert_eq!(q16_2n.2, q64_2n.2);
-    assert!(q16_2n.2 < 2 * q16_n.2 + 8);
+    assert_eq!(small_at_n.0, n);
+    assert_eq!(large_at_n.0, n);
+    assert_eq!(small_at_double_n.0, 2 * n);
+    assert_eq!(large_at_double_n.0, 2 * n);
+    assert_eq!(small_at_n.1, n + 1);
+    assert_eq!(large_at_n.1, n + 1);
+    assert_eq!(small_at_double_n.1, 2 * n + 1);
+    assert_eq!(large_at_double_n.1, 2 * n + 1);
+    assert_eq!(small_at_n.2, large_at_n.2);
+    assert_eq!(small_at_double_n.2, large_at_double_n.2);
+    assert!(small_at_double_n.2 < 2 * small_at_n.2 + 8);
 }
 
 #[test]
