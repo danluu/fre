@@ -14,8 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str =
-    "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
+pub const PLAN_ID: &str = "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -1281,6 +1280,51 @@ fn finish_edge_witness_trace() -> Vec<usize> {
     EDGE_WITNESS_VISITS.with(|trace| trace.borrow_mut().take().unwrap())
 }
 
+#[allow(
+    clippy::inline_always,
+    reason = "the medium-tail edge probe must remain scalar and adjacent to its caller"
+)]
+#[inline(always)]
+fn reverse_scalar_back8_candidate(
+    needle: u8,
+    bytes: &[u8],
+    back_start: usize,
+) -> Result<Option<usize>, SearchError> {
+    let back = bytes
+        .get(back_start..)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "medium edge witness back slice",
+        })?;
+    let relative = if back[7] == needle {
+        Some(7)
+    } else if back[6] == needle {
+        Some(6)
+    } else if back[5] == needle {
+        Some(5)
+    } else if back[4] == needle {
+        Some(4)
+    } else if back[3] == needle {
+        Some(3)
+    } else if back[2] == needle {
+        Some(2)
+    } else if back[1] == needle {
+        Some(1)
+    } else if back[0] == needle {
+        Some(0)
+    } else {
+        None
+    };
+    relative
+        .map(|offset| {
+            back_start
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "medium edge witness back candidate",
+                })
+        })
+        .transpose()
+}
+
 /// Find any suffix-first witness while searching each logical byte at most
 /// once on absence. Short tails use one forward search. Medium tails search
 /// disjoint scalar eight-byte edges before one native middle search. Long
@@ -1335,25 +1379,7 @@ fn asymmetric_suffix_witness(
         )?;
         #[cfg(test)]
         record_edge_witness_region(back_start, bytes.len(), true);
-        let back_candidate = if bytes[bytes.len() - 1] == needle {
-            Some(bytes.len() - 1)
-        } else if bytes[bytes.len() - 2] == needle {
-            Some(bytes.len() - 2)
-        } else if bytes[bytes.len() - 3] == needle {
-            Some(bytes.len() - 3)
-        } else if bytes[bytes.len() - 4] == needle {
-            Some(bytes.len() - 4)
-        } else if bytes[bytes.len() - 5] == needle {
-            Some(bytes.len() - 5)
-        } else if bytes[bytes.len() - 6] == needle {
-            Some(bytes.len() - 6)
-        } else if bytes[bytes.len() - 7] == needle {
-            Some(bytes.len() - 7)
-        } else if bytes[back_start] == needle {
-            Some(back_start)
-        } else {
-            None
-        };
+        let back_candidate = reverse_scalar_back8_candidate(needle, bytes, back_start)?;
         if back_candidate.is_some() {
             return Ok((back_candidate, 0));
         }
@@ -2930,13 +2956,11 @@ mod tests {
                 let expected = independent_asymmetric_witness_model(0x7F, &singleton);
                 let expected_calls = if length < 40 {
                     1
-                } else if candidate < 8 {
+                } else if candidate < 8
+                    || (length < 64 && candidate >= length.checked_sub(8).unwrap())
+                {
                     0
-                } else if length < 64 && candidate >= length.checked_sub(8).unwrap() {
-                    0
-                } else if length < 64 {
-                    1
-                } else if candidate >= length.checked_sub(32).unwrap() {
+                } else if length < 64 || candidate >= length.checked_sub(32).unwrap() {
                     1
                 } else {
                     2

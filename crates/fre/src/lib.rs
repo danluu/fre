@@ -2097,8 +2097,7 @@ mod tests {
 
     #[test]
     fn equality5_geometry_runtime_identity_rejects_stale_forward_family_labels() {
-        const EQUALITY5_ID: &str =
-            "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
+        const EQUALITY5_ID: &str = "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
         const STALE_ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
         const STALE_FORWARD_ID: &str = "anchored-class-suffix.forward.v1";
 
