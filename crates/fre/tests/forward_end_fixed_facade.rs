@@ -111,8 +111,8 @@ fn red_build_report_runtime_and_cache_identity_all_come_from_fixed_plan() {
         .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
         .unwrap();
     assert_eq!(identity.plan_id, FIXED_ID);
-    assert_eq!(identity.anchors.start, true);
-    assert_eq!(identity.anchors.end, true);
+    assert!(identity.anchors.start);
+    assert!(identity.anchors.end);
     assert_eq!(
         identity.class_words,
         fre_kernels::ForwardAnchoredByteClass::from_bytes(b"aceg").words()
@@ -249,7 +249,10 @@ fn red_suffix_mismatch_has_fixed_upper_bounds_and_no_prefix_examinations() {
         assert_eq!(accounting.prefix_bytes_upper_bound, 2);
         assert_eq!(accounting.suffix_bytes_upper_bound, 3);
         assert_eq!(accounting.examined_bytes_upper_bound, haystack.len());
-        assert_eq!(accounting.work_upper_bound, haystack.len() as u64);
+        assert_eq!(
+            accounting.work_upper_bound,
+            u64::try_from(haystack.len()).unwrap()
+        );
         assert_eq!(accounting.prefilter_calls, 0);
         assert_eq!(accounting.prefix_bytes_examined, 0);
         assert!(accounting.suffix_confirmation_attempted);

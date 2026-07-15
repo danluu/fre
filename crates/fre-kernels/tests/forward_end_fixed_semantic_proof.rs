@@ -59,7 +59,10 @@ fn red_fixed_identity_leaf_and_exact_n_accounting() {
         assert_eq!(accounting.prefix_bytes_upper_bound, 2);
         assert_eq!(accounting.suffix_bytes_upper_bound, 2);
         assert_eq!(accounting.examined_bytes_upper_bound, haystack.len());
-        assert_eq!(accounting.work_upper_bound, haystack.len() as u64);
+        assert_eq!(
+            accounting.work_upper_bound,
+            u64::try_from(haystack.len()).unwrap()
+        );
         assert_eq!(accounting.scratch_bytes, 0);
         assert_eq!(accounting.prefilter_calls, 0);
         assert_eq!(accounting.prefix_bytes_examined, 2);
@@ -165,12 +168,12 @@ fn red_first_mismatch_still_preflights_full_n() {
     let haystack = b"aaYQ";
     for limits in [
         ForwardAnchoredSearchLimits {
-            max_work_upper_bound: haystack.len() as u64 - 1,
+            max_work_upper_bound: u64::try_from(haystack.len()).unwrap() - 1,
             max_examined_bytes_upper_bound: haystack.len(),
             max_scratch_bytes: 0,
         },
         ForwardAnchoredSearchLimits {
-            max_work_upper_bound: haystack.len() as u64,
+            max_work_upper_bound: u64::try_from(haystack.len()).unwrap(),
             max_examined_bytes_upper_bound: haystack.len() - 1,
             max_scratch_bytes: 0,
         },
@@ -358,18 +361,21 @@ fn exact_n_limits_admit_and_each_one_below_limit_refuses_before_inspection() {
     let candidate = plan(b"a", b"ZQ");
     let haystack = b"aaaZQ";
     let exact = ForwardAnchoredSearchLimits {
-        max_work_upper_bound: haystack.len() as u64,
+        max_work_upper_bound: u64::try_from(haystack.len()).unwrap(),
         max_examined_bytes_upper_bound: haystack.len(),
         max_scratch_bytes: 0,
     };
     let (matched, accounting) = candidate.find(haystack, exact).unwrap();
     assert_eq!(matched, Some((0, haystack.len())));
     assert_eq!(accounting.examined_bytes_upper_bound, haystack.len());
-    assert_eq!(accounting.work_upper_bound, haystack.len() as u64);
+    assert_eq!(
+        accounting.work_upper_bound,
+        u64::try_from(haystack.len()).unwrap()
+    );
 
     for limited in [
         ForwardAnchoredSearchLimits {
-            max_work_upper_bound: haystack.len() as u64 - 1,
+            max_work_upper_bound: u64::try_from(haystack.len()).unwrap() - 1,
             ..exact
         },
         ForwardAnchoredSearchLimits {

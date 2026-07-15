@@ -25,11 +25,11 @@ pub(crate) struct Shape<'hir> {
     clippy::too_many_lines,
     reason = "the complete exact-shape proof keeps every admitted HIR position visible"
 )]
-pub(crate) fn extract<'hir>(
-    hir: &'hir Hir,
+pub(crate) fn extract(
+    hir: &Hir,
     initial_work: u64,
     work_limit: u64,
-) -> Result<Extraction<'hir>, BuildError> {
+) -> Result<Extraction<'_>, BuildError> {
     let mut work = initial_work;
     let root = strip_captures(hir, &mut work, work_limit)?;
     let HirKind::Concat(root_children) = root.kind() else {

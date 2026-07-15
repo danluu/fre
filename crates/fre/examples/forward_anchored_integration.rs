@@ -83,6 +83,10 @@ struct Fixture {
     haystack: Vec<u8>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the release driver keeps every named qualification fixture explicit"
+)]
 fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
     let make_prefix = |bytes: &[u8], length: usize| -> Vec<u8> {
         bytes.iter().copied().cycle().take(length).collect()
@@ -184,7 +188,9 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
             let size = requested_size.max(3);
             let mut haystack = make_prefix(b"aceg", size);
             haystack[1] = b'!';
-            haystack[size - 1] = b'Z';
+            *haystack
+                .last_mut()
+                .ok_or("early-outsider haystack is empty")? = b'Z';
             Fixture {
                 pattern: r"\A[aceg]+Z".into(),
                 haystack,
