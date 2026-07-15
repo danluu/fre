@@ -1160,10 +1160,7 @@ impl UnicodeScalarAggregatePlan {
                         } else {
                             monotone_range_cursor = false;
                             cached_non_ascii_range = None;
-                            self.contains_non_ascii_cached(
-                                scalar,
-                                &mut cached_non_ascii_range,
-                            )?
+                            self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range)?
                         }
                     } else if CACHE_RANGE {
                         self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range)?
