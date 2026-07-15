@@ -27,6 +27,7 @@ fn plan_for(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
 
 #[test]
 fn pair_neon16_threshold_lanes_and_high_bits_are_exact() {
+    const BOUNDARY: usize = 96;
     let candidate = plan_for(&[0x7E, 0x80], &[0xFE, 0x55]);
     for boundary in [72_usize, 73, 74, 79, 80, 81, 95, 96, 97] {
         let mut haystack: Vec<u8> = [0x7E, 0x80].into_iter().cycle().take(boundary).collect();
@@ -38,7 +39,6 @@ fn pair_neon16_threshold_lanes_and_high_bits_are_exact() {
         assert_eq!(accounting.prefix_bytes_examined, boundary + 1);
     }
 
-    const BOUNDARY: usize = 96;
     for lane in 0..16 {
         let position = 16 + lane;
         for outsider in [0x00_u8, 0x40, 0x81, 0xFF] {
