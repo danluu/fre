@@ -68,3 +68,35 @@ qualified against FRE's previous correct routes. See `RESULTS.md` for exhaustive
 differentials, retained release wins and losses, and the deliberately still-open
 project-wide pointwise gate. See `ASSEMBLY.md` for exact partial-vectorization
 evidence. Arbitrary-class SIMD JIT work remains unpromoted.
+
+## Forced absolute-end fixed-boundary strategy
+
+The separate forced-only strategy for `\A CLASS+ SUFFIX \z` has stable runtime
+identity
+`anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1`. Both
+absolute anchors and the fixed literal width determine the only split:
+`p = H.len() - SUFFIX.len()`. For a full original-haystack window and
+`H.len() > SUFFIX.len()`, the verifier preflights exactly `H.len()` logical
+positions, compares the final suffix first, then visits `H[..p]` once through
+the normalized scalar 256-bit membership table. It has no candidate search,
+prefilter, inherited range/Pair/Triple/Quad leaf, rescan, scratch, search
+allocation, or fallback.
+
+This path is selected only by `ForceForwardAnchored` when extraction proves an
+absolute end. Forced start-only construction retains
+`anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1`, and `Auto`
+retains its pre-existing strategy for both shapes. The direct legacy kernel
+constructor is unchanged.
+
+Extraction borrows the suffix from the parsed HIR and preserves its checked
+planner-work charge. The selected fixed plan performs one preflighted exact
+copy with `capacity == len`, stores one immutable plan, and accounts
+`persistent = size_of::<AbsoluteEndFixedPlan>() + suffix capacity`, zero
+scratch, and equal persistent/peak bytes. Every suffix, work, scratch,
+persistent, and peak cap is checked before that copy. The optional cache-key
+snapshot occurs after construction and is not construction scratch, a second
+plan, or search allocation.
+
+This source qualification makes no speed or promotion claim. Independent
+hostile source acceptance, the fixed code-size bounds, and any later separately
+authorized measurement remain mandatory.

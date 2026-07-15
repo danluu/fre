@@ -377,12 +377,27 @@ mod tests {
 
     #[test]
     fn forward_output_field_uses_selected_runtime_implementation_id() {
-        let regex = build_fre("forward", r"\A[a-z]+Z").unwrap();
-        let implementation_id = output_implementation_id("forward", r"\A[a-z]+Z").unwrap();
-        let cache_id = regex
-            .forward_anchored_cache_identity(CaptureFreeOperation::Span, SearchLimits::unlimited())
-            .unwrap()
-            .plan_id;
-        assert_eq!(implementation_id, cache_id);
+        for (pattern, expected) in [
+            (
+                r"\A[a-z]+Z\z",
+                "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1",
+            ),
+            (
+                r"\A[a-z]+Z",
+                "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1",
+            ),
+        ] {
+            let regex = build_fre("forward", pattern).unwrap();
+            let implementation_id = output_implementation_id("forward", pattern).unwrap();
+            let cache_id = regex
+                .forward_anchored_cache_identity(
+                    CaptureFreeOperation::Span,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .plan_id;
+            assert_eq!(implementation_id, cache_id);
+            assert_eq!(implementation_id, expected);
+        }
     }
 }
