@@ -1243,6 +1243,8 @@ fn scan_class_prefix(
 /// label is justified for a particular compiler/target stamp.
 const RANGE_BLOCK: usize = 32;
 const EDGE_WITNESS_FRONT: usize = 8;
+const EDGE_WITNESS_MEDIUM_BACK: usize = 8;
+const EDGE_WITNESS_MEDIUM_END: usize = 64;
 const EDGE_WITNESS_BACK: usize = 32;
 const EDGE_WITNESS_DISJOINT: usize = EDGE_WITNESS_FRONT + EDGE_WITNESS_BACK;
 
@@ -1280,10 +1282,11 @@ fn finish_edge_witness_trace() -> Vec<usize> {
 }
 
 /// Find any suffix-first witness while searching each logical byte at most
-/// once on absence. Short tails use one forward search. Long tails search a
-/// fixed eight-byte front with unrolled scalar comparisons, a disjoint fixed
-/// 32-byte back in reverse, and the untouched middle. The returned call count
-/// includes only native `memchr`/`memrchr` calls, not scalar comparisons.
+/// once on absence. Short tails use one forward search. Medium tails search
+/// disjoint scalar eight-byte edges before one native middle search. Long
+/// tails retain the fixed eight-byte front, disjoint reverse 32-byte back, and
+/// untouched middle. The returned call count includes only native
+/// `memchr`/`memrchr` calls, not scalar comparisons.
 #[allow(
     clippy::inline_always,
     reason = "release linked AArch64 code otherwise retains this helper on the near-front route"
@@ -1322,6 +1325,54 @@ fn asymmetric_suffix_witness(
     };
     if front_candidate.is_some() {
         return Ok((front_candidate, 0));
+    }
+
+    if bytes.len() < EDGE_WITNESS_MEDIUM_END {
+        let back_start = bytes.len().checked_sub(EDGE_WITNESS_MEDIUM_BACK).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "medium edge witness back partition",
+            },
+        )?;
+        #[cfg(test)]
+        record_edge_witness_region(back_start, bytes.len(), true);
+        let back_candidate = if bytes[bytes.len() - 1] == needle {
+            Some(bytes.len() - 1)
+        } else if bytes[bytes.len() - 2] == needle {
+            Some(bytes.len() - 2)
+        } else if bytes[bytes.len() - 3] == needle {
+            Some(bytes.len() - 3)
+        } else if bytes[bytes.len() - 4] == needle {
+            Some(bytes.len() - 4)
+        } else if bytes[bytes.len() - 5] == needle {
+            Some(bytes.len() - 5)
+        } else if bytes[bytes.len() - 6] == needle {
+            Some(bytes.len() - 6)
+        } else if bytes[bytes.len() - 7] == needle {
+            Some(bytes.len() - 7)
+        } else if bytes[back_start] == needle {
+            Some(back_start)
+        } else {
+            None
+        };
+        if back_candidate.is_some() {
+            return Ok((back_candidate, 0));
+        }
+
+        let middle_start = EDGE_WITNESS_FRONT;
+        let middle_end = back_start;
+        #[cfg(test)]
+        record_edge_witness_region(middle_start, middle_end, false);
+        let relative_candidate = memchr(needle, &bytes[middle_start..middle_end]);
+        let candidate = relative_candidate
+            .map(|relative| {
+                middle_start
+                    .checked_add(relative)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "medium edge witness middle candidate",
+                    })
+            })
+            .transpose()?;
+        return Ok((candidate, 1));
     }
 
     let back_start =
@@ -2502,7 +2553,7 @@ mod tests {
             haystack[31] = b'Z';
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, Some((0, 32)));
-            assert_eq!(accounting.prefilter_calls, 2);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert_eq!(accounting.prefix_bytes_examined, 32);
             assert_eq!(
                 accounting.prefix_bytes_upper_bound,
@@ -2649,7 +2700,7 @@ mod tests {
                     assert_eq!(accounting.prefilter_calls, 0);
                     assert_eq!(accounting.prefix_bytes_examined, length);
                 } else {
-                    let expected_prefilter_calls = usize::from(length >= 42) + 1;
+                    let expected_prefilter_calls = if length <= 64 { 1 } else { 2 };
                     assert_eq!(accounting.prefilter_calls, expected_prefilter_calls);
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                 }
@@ -2690,7 +2741,7 @@ mod tests {
 
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, None);
-            assert_eq!(accounting.prefilter_calls, 1);
+            assert_eq!(accounting.prefilter_calls, 0);
             assert!(accounting.suffix_confirmation_attempted);
             // At the exact disjoint threshold, reverse search selects the
             // final border byte. The class scan still recovers the first
@@ -2710,7 +2761,7 @@ mod tests {
 
     #[test]
     fn asymmetric_witness_threshold_is_exact_and_overlap_uses_forward() {
-        for (length, expected_calls) in [(39_usize, 1_usize), (40, 1), (41, 2)] {
+        for (length, expected_calls) in [(39_usize, 1_usize), (40, 1), (41, 1), (63, 1), (64, 2)] {
             let bytes = vec![0x00; length];
             assert_eq!(
                 asymmetric_suffix_witness(0x7F, &bytes).unwrap(),
@@ -2731,8 +2782,36 @@ mod tests {
         adjacent[39] = 0x7F;
         assert_eq!(
             asymmetric_suffix_witness(0x7F, &adjacent).unwrap(),
-            (Some(39), 1)
+            (Some(39), 0)
         );
+    }
+
+    #[test]
+    fn medium_witness_edges_and_middle_have_the_modeled_call_counts() {
+        for length in [40_usize, 55, 63] {
+            let mut back = vec![0x00; length];
+            back[length - 1] = 0x7F;
+            assert_eq!(
+                asymmetric_suffix_witness(0x7F, &back).unwrap(),
+                (Some(length - 1), 0),
+                "back length={length}"
+            );
+
+            let mut middle = vec![0x00; length];
+            middle[8] = 0x7F;
+            assert_eq!(
+                asymmetric_suffix_witness(0x7F, &middle).unwrap(),
+                (Some(8), 1),
+                "middle length={length}"
+            );
+
+            let absent = vec![0x00; length];
+            assert_eq!(
+                asymmetric_suffix_witness(0x7F, &absent).unwrap(),
+                (None, 1),
+                "absence length={length}"
+            );
+        }
     }
 
     #[test]
@@ -2780,6 +2859,16 @@ mod tests {
         if let Some(candidate) = (0..8).find(|&index| bytes[index] == needle) {
             return (Some(candidate), 0);
         }
+        if bytes.len() < 64 {
+            let back_start = bytes.len().checked_sub(8).unwrap();
+            if let Some(candidate) = (back_start..bytes.len())
+                .rev()
+                .find(|&index| bytes[index] == needle)
+            {
+                return (Some(candidate), 0);
+            }
+            return ((8..back_start).find(|&index| bytes[index] == needle), 1);
+        }
         let back_start = bytes.len().checked_sub(32).unwrap();
         if let Some(candidate) = (back_start..bytes.len())
             .rev()
@@ -2795,10 +2884,10 @@ mod tests {
 
     #[test]
     fn asymmetric_witness_matches_independent_model_at_every_directed_position() {
-        for length in [39_usize, 40, 41, 42, 99, 4096] {
+        for length in [39_usize, 40, 41, 42, 55, 63, 64, 99, 4096] {
             let absent = vec![0x11; length];
             let expected_absent = independent_asymmetric_witness_model(0x7F, &absent);
-            let expected_absent_calls = if length <= 40 { 1 } else { 2 };
+            let expected_absent_calls = if length < 64 { 1 } else { 2 };
             assert_eq!(expected_absent, (None, expected_absent_calls));
             assert_eq!(
                 asymmetric_suffix_witness(0x7F, &absent).unwrap(),
@@ -2814,6 +2903,10 @@ mod tests {
                     1
                 } else if candidate < 8 {
                     0
+                } else if length < 64 && candidate >= length.checked_sub(8).unwrap() {
+                    0
+                } else if length < 64 {
+                    1
                 } else if candidate >= length.checked_sub(32).unwrap() {
                     1
                 } else {
@@ -2832,6 +2925,12 @@ mod tests {
     fn trace_proves_ordered_disjoint_complete_partition(length: usize, visits: &[usize]) -> bool {
         let expected: Vec<usize> = if length < 40 {
             (0..length).collect()
+        } else if length < 64 {
+            let back_start = length.checked_sub(8).unwrap();
+            (0..8)
+                .chain((back_start..length).rev())
+                .chain(8..back_start)
+                .collect()
         } else {
             let back_start = length.checked_sub(32).unwrap();
             (0..8)
@@ -2854,7 +2953,7 @@ mod tests {
 
     #[test]
     fn asymmetric_partition_is_ordered_disjoint_complete_and_mutation_effective() {
-        for length in [39_usize, 40, 41, 42, 99, 4096] {
+        for length in [39_usize, 40, 41, 42, 55, 63, 64, 99, 4096] {
             let absent = vec![0x11; length];
             begin_edge_witness_trace();
             let result = asymmetric_suffix_witness(0x7F, &absent).unwrap();
@@ -2864,8 +2963,9 @@ mod tests {
                 length, &visits
             ));
 
-            if length > 40 {
-                let back_start = length.checked_sub(32).unwrap();
+            if length >= 40 {
+                let back_width = if length < 64 { 8 } else { 32 };
+                let back_start = length.checked_sub(back_width).unwrap();
                 let front_middle_overlap: Vec<usize> = (0..8)
                     .chain((back_start..length).rev())
                     .chain(7..back_start)
