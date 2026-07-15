@@ -14,7 +14,8 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline-equality5.v2";
+pub const PLAN_ID: &str =
+    "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -1558,6 +1559,7 @@ fn scan_quad_prefix(
     Ok((boundary, examined))
 }
 
+#[inline(never)]
 fn scan_quint_prefix(
     bytes: &[u8],
     first: u8,
@@ -2029,7 +2031,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.asymmetric-scalar8-reverse32-inline-equality5.v2"
+            "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3"
         );
         assert_eq!(
             pair.implementation(),
