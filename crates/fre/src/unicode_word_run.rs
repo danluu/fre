@@ -150,11 +150,7 @@ impl Plan {
         Ok((matched, accounting))
     }
 
-    pub(crate) fn reduce(
-        self,
-        haystack: &[u8],
-        limits: SearchLimits,
-    ) -> Result<Accounting, Error> {
+    pub(crate) fn reduce(self, haystack: &[u8], limits: SearchLimits) -> Result<Accounting, Error> {
         let mut accounting = Accounting::new();
         let mut start = 0_usize;
         while start < haystack.len() {
@@ -300,9 +296,7 @@ impl Plan {
                 })?;
             while position < window.end() {
                 if !self.require_end_boundary
-                    && self
-                        .maximum_scalars
-                        .is_some_and(|maximum| count >= maximum)
+                    && self.maximum_scalars.is_some_and(|maximum| count >= maximum)
                 {
                     break;
                 }
@@ -389,12 +383,7 @@ fn extract_impl(hir: &Hir, allow_bounded: bool) -> Option<(Plan, usize, usize)> 
             (root, class_mode(&repetition.sub)?, false, false)
         }
         HirKind::Concat(parts) => match parts.as_slice() {
-            [start, repeated, end] => (
-                repeated,
-                boundary_mode(start, end)?,
-                true,
-                true,
-            ),
+            [start, repeated, end] => (repeated, boundary_mode(start, end)?, true, true),
             [first, second] if allow_bounded => {
                 if let Some(mode) = single_boundary_mode(first) {
                     (second, mode, true, false)

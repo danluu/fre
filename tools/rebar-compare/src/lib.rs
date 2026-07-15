@@ -66,8 +66,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str =
-    "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-aggregate-word-run-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v2-finite-dfa-v1-aggregate-word-run-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -2747,9 +2746,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
         }
-        AggregateExecutionSource::WordRun(fre::UnicodeWordRunError::WorkLimitExceeded { .. }) => {
-            ExecutionError::unsupported(message)
-        }
+        AggregateExecutionSource::WordRun(fre::UnicodeWordRunError::WorkLimitExceeded {
+            ..
+        }) => ExecutionError::unsupported(message),
         AggregateExecutionSource::WordRun(_) => ExecutionError::fault(message),
         AggregateExecutionSource::Continuation(source) => aggregate_engine_error(source, message),
         AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
