@@ -10,5 +10,8 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["unicode-perl"] }
+
 [lints]
 workspace = true

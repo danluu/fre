@@ -52,6 +52,8 @@ pub enum EdgeKind {
     AssertWordStartHalfAscii,
     /// Zero-width right half of an ASCII word-end assertion.
     AssertWordEndHalfAscii,
+    /// Zero-width positive Unicode word boundary using the UTS#18 `\w` set.
+    AssertWordUnicode,
 }
 
 impl EdgeKind {
@@ -69,6 +71,7 @@ impl EdgeKind {
             Self::AssertWordEndAscii => "ASCII-word-end-assertion",
             Self::AssertWordStartHalfAscii => "ASCII-word-start-half-assertion",
             Self::AssertWordEndHalfAscii => "ASCII-word-end-half-assertion",
+            Self::AssertWordUnicode => "Unicode-word-boundary-assertion",
         }
     }
 

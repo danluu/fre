@@ -9,7 +9,9 @@
 //! The graph is automaton data, not executable regex bytecode: execution keeps
 //! sets of active consuming states and computes ordered zero-width closure over
 //! graph edges. There is no instruction pointer, call stack, or backtracking
-//! stack.
+//! stack. Positive Unicode word boundaries decode at most one scalar on each
+//! side and use the workspace-pinned UTS#18 word table; malformed encodings
+//! are non-word context and cannot be consumed by scalar paths.
 
 #![forbid(unsafe_code)]
 

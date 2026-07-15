@@ -737,6 +737,13 @@ fn zero_width_edge_enabled(
                 }
             })
         }
+        EdgeKind::AssertWordUnicode => {
+            let word_before = decode_last_utf8(&haystack[..position])
+                .is_some_and(is_unicode_word_character);
+            let word_after =
+                decode_utf8(&haystack[position..]).is_some_and(is_unicode_word_character);
+            Ok(word_before != word_after)
+        }
         EdgeKind::ByteRange => Err(SearchError::InternalInvariant {
             detail: "split state contained a consuming edge",
         }),
@@ -745,6 +752,35 @@ fn zero_width_edge_enabled(
 
 fn is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn is_unicode_word_character(character: char) -> bool {
+    regex_syntax::try_is_word_character(character)
+        .expect("fre-automata enables regex-syntax's Unicode Perl tables")
+}
+
+fn decode_utf8(bytes: &[u8]) -> Option<char> {
+    let first = *bytes.first()?;
+    let len = match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => return None,
+    };
+    let scalar = core::str::from_utf8(bytes.get(..len)?).ok()?;
+    scalar.chars().next()
+}
+
+fn decode_last_utf8(bytes: &[u8]) -> Option<char> {
+    let last = bytes.len().checked_sub(1)?;
+    let lower = bytes.len().saturating_sub(4);
+    let mut start = last;
+    while start > lower && matches!(bytes[start], 0x80..=0xBF) {
+        start -= 1;
+    }
+    let decoded = decode_utf8(&bytes[start..])?;
+    (start + decoded.len_utf8() == bytes.len()).then_some(decoded)
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
