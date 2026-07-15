@@ -62,6 +62,10 @@ const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const FRE_ADAPTER: &str = "fre-current-aggregate-v5";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
+
+const fn default_fre_unicode_compile_artifact_bytes() -> usize {
+    NFA_SIZE_LIMIT
+}
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
 const UNICODE_LITERAL_RETAINED_UNSUPPORTED_JOBS: usize = 74;
@@ -104,6 +108,9 @@ pub struct RunLimits {
     pub fre_aggregate_compile_work: usize,
     /// Maximum retained continuation-program capacity for one aggregate plan.
     pub fre_aggregate_program_bytes: usize,
+    /// Maximum retained canonical Unicode compile-artifact bytes.
+    #[serde(default = "default_fre_unicode_compile_artifact_bytes")]
+    pub fre_unicode_compile_artifact_bytes: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
     pub fre_literal_planner_work: usize,
     /// Maximum exact-literal needle bytes retained by one aggregate plan.
@@ -157,6 +164,7 @@ impl Default for RunLimits {
             fre_scratch_bytes: 256 * 1_048_576,
             fre_aggregate_compile_work: 16 * 1_048_576,
             fre_aggregate_program_bytes: 16 * 1_048_576,
+            fre_unicode_compile_artifact_bytes: default_fre_unicode_compile_artifact_bytes(),
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
             fre_literal_build_work: 64 * 1_048_576,
@@ -1924,7 +1932,7 @@ fn fre_unicode_compile_verify(
         .limits(UnicodeCompileBuildLimits {
             admission: aggregate_limits.admission,
             syntax_safety: aggregate_limits.syntax_safety,
-            max_artifact_bytes: limits.fre_aggregate_program_bytes,
+            max_artifact_bytes: limits.fre_unicode_compile_artifact_bytes,
             max_work: limits.fre_aggregate_compile_work,
             max_scalar_encodings: limits.fre_aggregate_compile_work,
         })

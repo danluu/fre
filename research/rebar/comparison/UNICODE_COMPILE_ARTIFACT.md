@@ -14,6 +14,9 @@ count, scalar count, and construction work are checked before artifact storage
 is requested. The returned immutable artifact has no deferred parser,
 lowerer, or allocation step and verifies its framing, scalar encodings, count,
 and identity before publication.
+The Rebar adapter exposes a separate 100 MiB artifact quota aligned with the
+pinned upstream Thompson-NFA size boundary instead of silently borrowing the
+smaller runtime continuation-program quota.
 
 The comparator constructs and drops a fresh artifact for each candidate call.
 Structural verification and a fresh pinned Rust semantic verifier run only
