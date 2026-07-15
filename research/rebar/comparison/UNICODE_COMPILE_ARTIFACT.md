@@ -1,9 +1,10 @@
-# Unicode compile-artifact source checkpoint
+# Unicode compile-artifact checkpoint
 
-This source-only checkpoint, recomposed on
-`78b0c3cd63b0b0cb505ba0d185670a688efef2f2`, extends only the one-pattern Rebar `compile`
-surface. It does not add Unicode execution to `count`, `count-spans`, grep, or
-capture reducers, and it makes no timing or observed-coverage claim.
+The exact source checkpoint is
+`16308239f29555890fcf1601ab68b70e33aa0f17` (tree
+`ea09793a170546ec64b0f938de3052ef9421bc19`). It extends only the one-pattern
+Rebar `compile` surface. It does not add Unicode execution to `count`,
+`count-spans`, grep, or capture reducers, and it makes no timing claim.
 
 For the exact pinned Rust bytes/Rebar profile, construction parses canonical
 HIR and preflights a deterministic preorder artifact. Literal scalars and both
@@ -24,12 +25,27 @@ after construction and are explicitly outside any future construction timing
 boundary. The verifier is qualification infrastructure, not an FRE Unicode
 runtime plan and not warmed state shared by samples.
 
-The older projection covered twelve Unicode-enabled `compile` refusals. One
-now passes through the authenticated Unicode v5 continuation artifact, so this
-composition has a projected ceiling of eleven new rows: `compile` 17 to 28 and
-the full frontier 187 pass / 157 unsupported to 198 / 146 in isolation. The
-authoritative table must remain unchanged until exact regenerated receipts and
-an independent source/provenance audit accept every disposition.
+The exact regenerated 344-row report is
+`/tmp/fre-control/results/G0-REBAR-UNICODE-COMPILE-1630823-FRONTIER-002.json`,
+SHA-256
+`196d9042324e67b98f04aec4897a930e95a32a40143c34c041dba2b8afdfeacd`,
+with sorted-receipts SHA-256
+`caa7cd09848ca1585f3ac58c129ca3702881087d9976a8a82ace42d0a626da78`.
+It records 28/33 compile passes and 200/344 total FRE passes: exactly eleven
+new compile rows over the 189-pass build-many frontier, zero lost passes, and
+no FRE `fail` or `fault` receipt. Those new rows are:
+
+- `curated/03-date/compile-unicode@rust/regex`
+- `dictionary/compile/english-10@rust/regex`
+- `dictionary/compile/english@rust/regex`
+- `reported/i1095-word-repetition/unicode-compile@rust/regex`
+- `unicode/compile/fifty-letters@rust/regex`
+- `unicode/compile/huge-character-class@rust/regex`
+- `unicode/compile/match-every-line@rust/regex`
+- `unicode/compile/negated-class-matches-codepoint@rust/regex`
+- `unicode/compile/one-letter@rust/regex`
+- `wild/bibleref/compile@rust/regex`
+- `wild/grapheme/compile@rust/regex`
 
 Future construction timing must report at least these separate cells:
 
