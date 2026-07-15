@@ -24,6 +24,12 @@ impl PatternBytes {
         &self.0
     }
 
+    /// Exact retained byte capacity of this owned source identity.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+
     pub(crate) fn as_str(&self) -> Option<&str> {
         core::str::from_utf8(&self.0).ok()
     }

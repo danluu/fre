@@ -134,7 +134,12 @@ fn unicode_many_requires_the_nonempty_utf8_literal_proof() {
         .build_count()
         .unwrap();
     assert_eq!(AggregateManyPlanKind::OrderedLiteral, regex.build_report().plan);
-    assert_eq!(2, regex.count_value("雪snow".as_bytes(), AggregateManyRunLimits::unlimited()).unwrap());
+    assert_eq!(
+        2,
+        regex
+            .count_value("雪snow".as_bytes(), AggregateManyRunLimits::unlimited())
+            .unwrap()
+    );
 
     let nonliteral = patterns(&["snow", r"\w+"]);
     assert!(matches!(

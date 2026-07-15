@@ -3,7 +3,9 @@
 //! [`PortableRegex`] provides bounded single-search operations for the HIR
 //! subset that `fre-lower` can prove exact. [`AggregateBuilder`] constructs
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
-//! `fre-aggregate` Rust-byte subset. Whole-match aggregate plans may erase
+//! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
+//! pattern's syntax identity and composes ordered whole-match count/span-sum
+//! plans without source concatenation. Whole-match aggregate plans may erase
 //! capture annotations, but no capture group API is exposed. None of these
 //! types is named `Regex`: unsupported syntax/profile/operation combinations
 //! are typed build errors, and there is no full Rust-regex/RE2 or JIT claim.
@@ -13,6 +15,7 @@
 use core::fmt;
 
 mod aggregate;
+mod aggregate_many;
 mod finite;
 mod forward_anchored;
 mod required_literal;
@@ -28,6 +31,16 @@ pub use aggregate::{
     AggregatePlanSelection, AggregateRunLimits, AggregateSpanIter, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
 };
+pub use aggregate_many::{
+    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting,
+    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
+    AggregateManyBuilder, AggregateManyCompositionAccounting, AggregateManyCountRegex,
+    AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
+    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
+    AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
+    AggregateManySpanSumRegex, AggregateManySpanSumResult,
+};
 pub use fre_aggregate::{
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,
     Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
@@ -39,7 +52,10 @@ pub use fre_kernels::{
     LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateUpperBounds,
+    LiteralAggregateUpperBounds, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
 };
 
 use fre_automata::{Automaton, Exists, SelectedEnd, Span};
