@@ -31,6 +31,16 @@ fn replacement_component_preserves_unmatched_bytes_and_exact_offsets() {
 }
 
 #[test]
+fn replacement_leading_literal_does_not_accept_a_late_suffix_only() {
+    let plan = replacement(r"\|[^|][^|]*\|", "-");
+    let result = plan
+        .replace(b"agggtaaatttaccct|t", RegexReduxRunLimits::default())
+        .expect("bounded replacement");
+    assert!(result.matches().is_empty());
+    assert_eq!(result.output(), b"agggtaaatttaccct|t");
+}
+
+#[test]
 fn non_empty_promise_refuses_empty_matches_after_bounded_progress() {
     let plan = replacement(r"a*", "x");
     assert!(matches!(
