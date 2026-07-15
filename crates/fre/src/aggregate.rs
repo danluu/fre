@@ -8,13 +8,12 @@ use fre_kernels::{
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumResult, OrderedLiteralAggregateBuildAccounting,
+    LiteralAggregateSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -881,9 +880,9 @@ impl AggregateBuilder {
                     .capacity()
                     .checked_mul(core::mem::size_of::<Vec<u8>>())
                     .and_then(|bytes| {
-                        words.iter().try_fold(bytes, |total, word| {
-                            total.checked_add(word.capacity())
-                        })
+                        words
+                            .iter()
+                            .try_fold(bytes, |total, word| total.checked_add(word.capacity()))
                     })
                     .ok_or(AggregateBuildError::InternalInvariant {
                         operation,
@@ -915,15 +914,13 @@ impl AggregateBuilder {
                     })?;
                 let (engine, kernel_build, operation_plan_id) = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
-                        let plan = OrderedLiteralCountPlan::build(
-                            &words,
-                            kernel_limits,
-                        )
-                        .map_err(|source| AggregateBuildError::FiniteOrderedLiteralBuild {
-                            operation,
-                            selection,
-                            source,
-                        })?;
+                        let plan = OrderedLiteralCountPlan::build(&words, kernel_limits).map_err(
+                            |source| AggregateBuildError::FiniteOrderedLiteralBuild {
+                                operation,
+                                selection,
+                                source,
+                            },
+                        )?;
                         let build = plan.build_accounting();
                         (
                             AggregateEngine::FiniteOrderedCount(plan),
@@ -932,15 +929,12 @@ impl AggregateBuilder {
                         )
                     }
                     AggregateOperation::SpanSum => {
-                        let plan = OrderedLiteralSpanSumPlan::build(
-                            &words,
-                            kernel_limits,
-                        )
-                        .map_err(|source| AggregateBuildError::FiniteOrderedLiteralBuild {
-                            operation,
-                            selection,
-                            source,
-                        })?;
+                        let plan = OrderedLiteralSpanSumPlan::build(&words, kernel_limits)
+                            .map_err(|source| AggregateBuildError::FiniteOrderedLiteralBuild {
+                                operation,
+                                selection,
+                                source,
+                            })?;
                         let build = plan.build_accounting();
                         (
                             AggregateEngine::FiniteOrderedSpanSum(plan),
@@ -1275,7 +1269,10 @@ enum AggregateCountExecution {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
-    Continuation { admitted: AdmittedCount, value: u64 },
+    Continuation {
+        admitted: AdmittedCount,
+        value: u64,
+    },
 }
 
 impl AggregateCountExecution {

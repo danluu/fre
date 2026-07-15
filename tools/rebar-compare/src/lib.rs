@@ -29,10 +29,10 @@ use fre::{
     AggregateStrategy, CompatibilityProfile, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
     LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits, PortableBuilder,
+    RustProfile, SearchLimits, UnicodeCompileArtifactBuilder, UnicodeCompileBuildError,
+    UnicodeCompileBuildLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -1894,9 +1894,7 @@ fn fre_compile_verify(
         })?;
     let plan = match regex.build_report().plan {
         AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
-        AggregatePlanKind::FiniteOrderedLiterals => {
-            "compile-aggregate-finite-ordered-literals"
-        }
+        AggregatePlanKind::FiniteOrderedLiterals => "compile-aggregate-finite-ordered-literals",
         AggregatePlanKind::ContinuationProgram => "compile-aggregate-continuation-program",
     };
     Ok(FreReduction {
@@ -1981,8 +1979,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         finite_ordered_literals: OrderedLiteralAggregateBuildLimits {
-            max_build_work: u64::try_from(limits.fre_aggregate_compile_work)
-                .unwrap_or(u64::MAX),
+            max_build_work: u64::try_from(limits.fre_aggregate_compile_work).unwrap_or(u64::MAX),
             max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
             max_persistent_bytes: limits.fre_aggregate_program_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
@@ -2162,12 +2159,12 @@ fn ordered_literal_operation_limits(
     let match_events = if build.has_empty_pattern {
         reducer_steps
     } else {
-        let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
-            ExecutionError::fault("FRE finite reducer lacks a nonempty width")
-        })?;
-        haystack_len.checked_div(minimum).ok_or_else(|| {
-            ExecutionError::fault("FRE finite reducer divided by a zero width")
-        })?
+        let minimum = build
+            .min_nonempty_pattern_bytes
+            .ok_or_else(|| ExecutionError::fault("FRE finite reducer lacks a nonempty width"))?;
+        haystack_len
+            .checked_div(minimum)
+            .ok_or_else(|| ExecutionError::fault("FRE finite reducer divided by a zero width"))?
     };
     let count = u64::try_from(match_events)
         .map_err(|_| ExecutionError::fault("FRE finite match bound does not fit u64"))?;
