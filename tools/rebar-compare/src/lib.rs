@@ -20,23 +20,24 @@ use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
-    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateManyBuildAccounting,
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
-    AggregateFiniteLiteralIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, AggregateUnicodeScalarSemantics, CaptureAggregateLimits, CaptureBuildError,
-    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureRegex, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
+    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
+    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
+    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits,
+    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
+    AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
+    CaptureExecutionSource, CaptureRegex, CaptureRunLimits, CaptureSearchError,
+    CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    SearchSessionLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    LiteralAggregateReduceLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits, PortableBuilder,
+    RustProfile, SearchLimits, SearchSessionLimits, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateReduceLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -2500,9 +2501,9 @@ fn ordered_literal_operation_limits(
             let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
                 ExecutionError::fault("FRE finite literal plan lacks a nonempty minimum")
             })?;
-            haystack_len.checked_div(minimum).ok_or_else(|| {
-                ExecutionError::fault("FRE finite literal minimum is zero")
-            })?
+            haystack_len
+                .checked_div(minimum)
+                .ok_or_else(|| ExecutionError::fault("FRE finite literal minimum is zero"))?
         };
         let ring = build
             .max_pattern_bytes
@@ -2519,9 +2520,8 @@ fn ordered_literal_operation_limits(
         max_transitions: haystack_len,
         max_match_events: match_events.min(reducer_limit),
         max_count: count.min(limits.reducer_steps),
-        max_span_sum: u64::try_from(haystack_len).map_err(|_| {
-            ExecutionError::fault("FRE finite literal span bound does not fit u64")
-        })?,
+        max_span_sum: u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE finite literal span bound does not fit u64"))?,
         max_reducer_steps: boundaries.min(reducer_limit),
         max_ring_initializations: ring_initializations,
         max_total_work: limits.fre_aggregate_operation_work,
@@ -2586,8 +2586,7 @@ fn require_unicode_plan_identity(
             operation,
         }) = report.plan_identity
         {
-            if algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-                && operation == finite_operation
+            if algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID && operation == finite_operation
             {
                 return Ok(());
             }

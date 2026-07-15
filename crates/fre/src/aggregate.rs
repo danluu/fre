@@ -8,18 +8,18 @@ use fre_kernels::{
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumResult, UnicodeScalarAggregateBuildAccounting,
+    LiteralAggregateSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
     OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
-    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
-    UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
-    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSpanSumResult,
+    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
+    UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
+    UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -1061,13 +1061,14 @@ impl AggregateBuilder {
         };
         let finite_planner_work = finite.as_ref().map_or(0, |result| result.work);
         if let Some(words) = finite.and_then(|result| result.words) {
-            let capture_erasure_work = expected_captures.checked_mul(2).ok_or(
-                AggregateBuildError::InternalInvariant {
-                    operation,
-                    selection,
-                    detail: "finite capture-erasure accounting overflow",
-                },
-            )?;
+            let capture_erasure_work =
+                expected_captures
+                    .checked_mul(2)
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "finite capture-erasure accounting overflow",
+                    })?;
             let (engine, build, operation_id) = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
                     let engine = OrderedLiteralCountPlan::build(&words, limits.finite_literal)
@@ -1400,7 +1401,10 @@ enum AggregateCountExecution {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
-    Continuation { admitted: AdmittedCount, value: u64 },
+    Continuation {
+        admitted: AdmittedCount,
+        value: u64,
+    },
 }
 
 impl AggregateCountExecution {

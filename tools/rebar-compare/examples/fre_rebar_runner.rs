@@ -362,9 +362,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::UnicodeScalarClass) => {
             "compile-aggregate-unicode-scalar-class"
         }
-        ("compile", AggregatePlanKind::FiniteLiteralDfa) => {
-            "compile-aggregate-finite-literal-dfa"
-        }
+        ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
         ("compile", AggregatePlanKind::ContinuationProgram) => {
             "compile-aggregate-continuation-program"
         }

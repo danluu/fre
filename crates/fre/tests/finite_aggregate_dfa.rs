@@ -39,12 +39,24 @@ fn finite_dfa_preserves_order_empty_progress_captures_and_arbitrary_bytes() {
     for (pattern, haystack) in cases {
         let expected = oracle(pattern, haystack);
         let count = builder(pattern).build_count().unwrap();
-        assert_eq!(count.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::FiniteLiteralDfa
+        );
         assert_eq!(count.build_report().continuation_strategy, None);
-        assert_eq!(count.count_value(haystack, AggregateRunLimits::default()).unwrap(), expected.0);
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.0
+        );
         let sum = builder(pattern).build_span_sum().unwrap();
         assert_eq!(sum.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
-        assert_eq!(sum.span_sum_value(haystack, AggregateRunLimits::default()).unwrap(), expected.1);
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.1
+        );
     }
 }
 
@@ -52,8 +64,14 @@ fn finite_dfa_preserves_order_empty_progress_captures_and_arbitrary_bytes() {
 fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
     let pattern = r"(?P<word>cat|dog|)";
     let compiled = builder(pattern).build_compile().unwrap();
-    assert_eq!(compiled.build_report().operation, AggregateOperation::Compile);
-    assert_eq!(compiled.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
+    assert_eq!(
+        compiled.build_report().operation,
+        AggregateOperation::Compile
+    );
+    assert_eq!(
+        compiled.build_report().plan,
+        AggregatePlanKind::FiniteLiteralDfa
+    );
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";
@@ -134,10 +152,16 @@ fn spans_anchors_and_unbounded_neighbors_keep_the_continuation_route() {
             .strategy(AggregateStrategy::ReverseSequentialRows)
             .build_spans()
             .unwrap();
-        assert_eq!(regex.build_report().plan, AggregatePlanKind::ContinuationProgram);
+        assert_eq!(
+            regex.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
     }
     for pattern in [r"\A(?:cat|dog)\z", r"(?:cat|dog)+"] {
         let regex = builder(pattern).build_count().unwrap();
-        assert_eq!(regex.build_report().plan, AggregatePlanKind::ContinuationProgram);
+        assert_eq!(
+            regex.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
     }
 }
