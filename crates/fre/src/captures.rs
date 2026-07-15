@@ -179,7 +179,10 @@ impl fmt::Display for CaptureBuildError {
                 "capture HIR {resource} needs {required}, exceeding {limit}"
             ),
             Self::Allocation { structure, items } => {
-                write!(formatter, "capture HIR failed to reserve {items} {structure} items")
+                write!(
+                    formatter,
+                    "capture HIR failed to reserve {items} {structure} items"
+                )
             }
             Self::Engine(error) => write!(formatter, "capture engine build failed: {error}"),
             Self::InternalInvariant(detail) => {
@@ -292,9 +295,7 @@ impl CaptureBuilder {
         let admission = parsed.admission_status;
         let syntax = parsed.summary;
         if unicode {
-            return Err(CaptureBuildError::Unsupported(
-                CaptureUnsupported::Unicode,
-            ));
+            return Err(CaptureBuildError::Unsupported(CaptureUnsupported::Unicode));
         }
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
             return Err(CaptureBuildError::InternalInvariant(
@@ -303,9 +304,8 @@ impl CaptureBuilder {
         };
         let mut accounting = CaptureHirAccounting::default();
         let ast = lower_hir(&rust.hir, 1, limits, &mut accounting)?;
-        let program = Arc::new(Program::compile(&ast, limits.engine).map_err(
-            CaptureBuildError::Engine,
-        )?);
+        let program =
+            Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
         let engine_report = program.build_report().clone();
         let syntax_captures = usize::try_from(syntax.captures).map_err(|_| {
             CaptureBuildError::InternalInvariant("syntax capture count does not fit usize")
@@ -397,14 +397,15 @@ fn lower_hir(
     }
     accounting.hir_depth = accounting.hir_depth.max(depth);
     charge_hir(accounting, 1, limits.max_hir_work)?;
-    accounting.hir_nodes = accounting
-        .hir_nodes
-        .checked_add(1)
-        .ok_or(CaptureBuildError::HirResource {
-            resource: "nodes",
-            required: usize::MAX,
-            limit: limits.max_hir_work,
-        })?;
+    accounting.hir_nodes =
+        accounting
+            .hir_nodes
+            .checked_add(1)
+            .ok_or(CaptureBuildError::HirResource {
+                resource: "nodes",
+                required: usize::MAX,
+                limit: limits.max_hir_work,
+            })?;
     match hir.kind() {
         HirKind::Empty => Ok(Ast::Empty),
         HirKind::Literal(literal) => {
@@ -435,23 +436,28 @@ fn lower_hir(
                 limits.max_hir_work,
             )?;
             let mut ranges = Vec::new();
-            ranges.try_reserve_exact(ranges_len).map_err(|_| {
-                CaptureBuildError::Allocation {
+            ranges
+                .try_reserve_exact(ranges_len)
+                .map_err(|_| CaptureBuildError::Allocation {
                     structure: "class range",
                     items: ranges_len,
-                }
-            })?;
-            ranges.extend(class.ranges().iter().map(|range| (range.start(), range.end())));
+                })?;
+            ranges.extend(
+                class
+                    .ranges()
+                    .iter()
+                    .map(|range| (range.start(), range.end())),
+            );
             Ok(Ast::Class(ranges))
         }
-        HirKind::Class(Class::Unicode(_)) => Err(CaptureBuildError::Unsupported(
-            CaptureUnsupported::Unicode,
-        )),
+        HirKind::Class(Class::Unicode(_)) => {
+            Err(CaptureBuildError::Unsupported(CaptureUnsupported::Unicode))
+        }
         HirKind::Look(Look::Start) => Ok(Ast::Start),
         HirKind::Look(Look::End) => Ok(Ast::End),
-        HirKind::Look(look) => Err(CaptureBuildError::Unsupported(
-            CaptureUnsupported::Look(*look),
-        )),
+        HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
+            *look,
+        ))),
         HirKind::Capture(capture) => Ok(Ast::Capture {
             index: capture.index,
             name: capture.name.as_ref().map(ToString::to_string),
@@ -477,20 +483,12 @@ fn lower_hir(
                 Greed::Lazy
             },
         }),
-        HirKind::Concat(children) => lower_children(
-            children,
-            depth,
-            limits,
-            accounting,
-            Ast::Concat,
-        ),
-        HirKind::Alternation(children) => lower_children(
-            children,
-            depth,
-            limits,
-            accounting,
-            Ast::Alt,
-        ),
+        HirKind::Concat(children) => {
+            lower_children(children, depth, limits, accounting, Ast::Concat)
+        }
+        HirKind::Alternation(children) => {
+            lower_children(children, depth, limits, accounting, Ast::Alt)
+        }
     }
 }
 

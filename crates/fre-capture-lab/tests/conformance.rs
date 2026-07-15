@@ -483,7 +483,8 @@ fn persistent_reducer_counts_participation_without_retaining_winners() {
         .capture(1)
         .repeat(1, None, Greed::Greedy);
     let pattern = render(&ast);
-    let expected = reference_iter(&pattern, b"abba cab", Window::all(b"abba cab"))
+    let expected_records = reference_iter(&pattern, b"abba cab", Window::all(b"abba cab"));
+    let expected = expected_records
         .iter()
         .flat_map(|record| &record.groups)
         .filter(|group| group.span.is_some())
@@ -497,7 +498,7 @@ fn persistent_reducer_counts_participation_without_retaining_winners() {
         )
         .unwrap();
     assert_eq!(outcome.count, expected);
-    assert_eq!(outcome.matches, 3);
+    assert_eq!(outcome.matches, expected_records.len());
     assert!(outcome.total_history_nodes <= outcome.total_state_visits);
     assert!(outcome.total_history_walk <= outcome.total_history_nodes);
 }
@@ -519,11 +520,7 @@ fn persistent_reducer_exposes_group_event_and_empty_match_boundaries() {
 
     let (_, empty) = pair(&Ast::Empty.capture(1));
     assert_eq!(
-        empty.count_captures_nonempty(
-            b"a",
-            Window::all(b"a"),
-            AggregateLimits::default()
-        ),
+        empty.count_captures_nonempty(b"a", Window::all(b"a"), AggregateLimits::default()),
         Err(SearchError::EmptyMatch)
     );
 }

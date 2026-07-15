@@ -1,6 +1,6 @@
 use fre::{
-    CaptureAggregateLimits, CaptureBuilder, CaptureResource, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits,
+    CaptureAggregateLimits, CaptureBuilder, CaptureResource, CaptureRunLimits, CaptureSearchError,
+    CaptureSearchLimits,
 };
 use regex::bytes::RegexBuilder;
 
@@ -26,9 +26,7 @@ fn assert_count(pattern: &str, haystack: &[u8]) {
     assert_eq!(result.accounting.count, reference_count(pattern, haystack));
     assert_eq!(
         result.identity.plan,
-        regex
-            .cache_identity(CaptureRunLimits::default())
-            .plan
+        regex.cache_identity(CaptureRunLimits::default()).plan
     );
 }
 

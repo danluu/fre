@@ -303,8 +303,7 @@ impl HistoryRegex {
             matches = checked_add(matches, 1, ResourceKind::Results)?;
             check(ResourceKind::Results, matches, limits.max_results)?;
             for group in record.groups {
-                capture_events =
-                    checked_add(capture_events, 1, ResourceKind::CaptureEvents)?;
+                capture_events = checked_add(capture_events, 1, ResourceKind::CaptureEvents)?;
                 check(
                     ResourceKind::CaptureEvents,
                     capture_events,
@@ -312,11 +311,7 @@ impl HistoryRegex {
                 )?;
                 if group.span.is_some() {
                     count = checked_add(count, 1, ResourceKind::CaptureCount)?;
-                    check(
-                        ResourceKind::CaptureCount,
-                        count,
-                        limits.max_capture_count,
-                    )?;
+                    check(ResourceKind::CaptureCount, count, limits.max_capture_count)?;
                 }
             }
             cursor = overall.end;

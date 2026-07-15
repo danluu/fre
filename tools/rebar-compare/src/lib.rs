@@ -2079,11 +2079,8 @@ fn fre_grep_captures(
             .matches
             .checked_mul(groups)
             .ok_or_else(|| ExecutionError::fault("FRE grep-capture group events overflow"))?;
-        reducer_events = checked_aggregate_add(
-            reducer_events,
-            group_events,
-            "capture group events",
-        )?;
+        reducer_events =
+            checked_aggregate_add(reducer_events, group_events, "capture group events")?;
         if reducer_events > reducer_limit {
             return Err(ExecutionError::unsupported(format!(
                 "FRE grep-captures events need {reducer_events}, exceeding {reducer_limit}"
