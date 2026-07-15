@@ -31,8 +31,7 @@ use fre::{
     LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError,
-    UnicodeCompileBuildLimits,
+    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
