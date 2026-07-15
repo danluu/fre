@@ -33,6 +33,7 @@ use fre::{
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -63,6 +64,10 @@ const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const FRE_ADAPTER: &str = "fre-current-aggregate-v6";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
+
+const fn default_fre_unicode_compile_artifact_bytes() -> usize {
+    NFA_SIZE_LIMIT
+}
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
 const UNICODE_LITERAL_RETAINED_UNSUPPORTED_JOBS: usize = 74;
@@ -105,6 +110,9 @@ pub struct RunLimits {
     pub fre_aggregate_compile_work: usize,
     /// Maximum retained continuation-program capacity for one aggregate plan.
     pub fre_aggregate_program_bytes: usize,
+    /// Maximum retained canonical Unicode compile-artifact bytes.
+    #[serde(default = "default_fre_unicode_compile_artifact_bytes")]
+    pub fre_unicode_compile_artifact_bytes: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
     pub fre_literal_planner_work: usize,
     /// Maximum exact-literal needle bytes retained by one aggregate plan.
@@ -158,6 +166,7 @@ impl Default for RunLimits {
             fre_scratch_bytes: 256 * 1_048_576,
             fre_aggregate_compile_work: 16 * 1_048_576,
             fre_aggregate_program_bytes: 16 * 1_048_576,
+            fre_unicode_compile_artifact_bytes: default_fre_unicode_compile_artifact_bytes(),
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
             fre_literal_build_work: 64 * 1_048_576,
@@ -345,10 +354,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum and ordered build-many count/span-sum; exact literal, direct Unicode scalar-class, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum, compile-only canonical Unicode artifacts, and ordered build-many count/span-sum; exact literal, direct Unicode scalar-class, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; capture/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; when no reusable Unicode execution plan is available, compile alone may construct a canonical Unicode artifact under its separate bound before untimed verification; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; capture/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1676,13 +1685,21 @@ impl ExecutionError {
 }
 
 fn rust_compile(job: &Job, patterns: &[String]) -> Result<Regex, ExecutionError> {
+    rust_compile_profile(patterns, job.regex.unicode, job.regex.case_insensitive)
+}
+
+fn rust_compile_profile(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<Regex, ExecutionError> {
     let config = Regex::config()
         .utf8_empty(false)
         .nfa_size_limit(Some(NFA_SIZE_LIMIT));
     let syntax = regex_automata::util::syntax::Config::new()
         .utf8(false)
-        .unicode(job.regex.unicode)
-        .case_insensitive(job.regex.case_insensitive);
+        .unicode(unicode)
+        .case_insensitive(case_insensitive);
     Regex::builder()
         .configure(config)
         .syntax(syntax)
@@ -1844,15 +1861,25 @@ fn fre_compile_verify(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
-    let regex = AggregateBuilder::new(pattern)
+    let built = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(request.unicode)
         .case_insensitive(request.case_insensitive)
         .limits(aggregate_build_limits(limits))
         .plan_selection(AggregatePlanSelection::Auto)
         .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_compile()
-        .map_err(|error| aggregate_build_error(&error))?;
+        .build_compile();
+    let regex = match built {
+        Ok(regex) => regex,
+        Err(AggregateBuildError::ContinuationCompile {
+            source:
+                AggregateEngineError::Unsupported(_) | AggregateEngineError::ResourceLimit { .. },
+            ..
+        }) if request.unicode => {
+            return fre_unicode_compile_verify(request, pattern, limits);
+        }
+        Err(error) => return Err(aggregate_build_error(&error)),
+    };
     require_unicode_plan_identity(
         regex.build_report(),
         request.unicode,
@@ -1874,6 +1901,58 @@ fn fre_compile_verify(
     Ok(FreReduction {
         actual: result.value(),
         plan,
+    })
+}
+
+fn unicode_compile_build_error(error: &UnicodeCompileBuildError) -> ExecutionError {
+    let message = format!("FRE Unicode compile artifact refused input: {error}");
+    match error {
+        UnicodeCompileBuildError::Syntax(_)
+        | UnicodeCompileBuildError::UnicodeDisabled
+        | UnicodeCompileBuildError::ProfileMismatch
+        | UnicodeCompileBuildError::InvalidUtf8Literal
+        | UnicodeCompileBuildError::InvalidByteClass
+        | UnicodeCompileBuildError::ResourceLimit { .. } => ExecutionError::unsupported(message),
+        UnicodeCompileBuildError::ArithmeticOverflow(_)
+        | UnicodeCompileBuildError::AllocationFailed { .. }
+        | UnicodeCompileBuildError::InternalInvariant(_) => ExecutionError::fault(message),
+    }
+}
+
+/// Build a fresh complete compile-only Unicode artifact. Structural artifact
+/// verification and the pinned Rust semantic count are deliberately outside
+/// the construction boundary; neither artifact nor verifier is retained.
+fn fre_unicode_compile_verify(
+    request: CandidateRequest<'_>,
+    pattern: &str,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let aggregate_limits = aggregate_build_limits(limits);
+    let mut profile = rebar_profile();
+    profile.options.unicode = true;
+    profile.options.case_insensitive = request.case_insensitive;
+    let artifact = UnicodeCompileArtifactBuilder::new(pattern)
+        .profile(profile)
+        .limits(UnicodeCompileBuildLimits {
+            admission: aggregate_limits.admission,
+            syntax_safety: aggregate_limits.syntax_safety,
+            max_artifact_bytes: limits.fre_unicode_compile_artifact_bytes,
+            max_work: limits.fre_aggregate_compile_work,
+            max_scalar_encodings: limits.fre_aggregate_compile_work,
+        })
+        .build()
+        .map_err(|error| unicode_compile_build_error(&error))?;
+    artifact.verify_complete().map_err(|detail| {
+        ExecutionError::fault(format!(
+            "FRE Unicode compile artifact failed untimed structural verification: {detail}"
+        ))
+    })?;
+    let verifier =
+        rust_compile_profile(request.patterns, request.unicode, request.case_insensitive)?;
+    let actual = count_matches(&verifier, request.haystack, limits.reducer_steps)?;
+    Ok(FreReduction {
+        actual,
+        plan: "compile-unicode-canonical-artifact",
     })
 }
 
@@ -4162,6 +4241,60 @@ mod tests {
         assert!(
             matches!(many, CandidateOutcome::Unsupported(ref reason) if reason.contains("exactly one pattern")),
             "unexpected compile build-many outcome: {many:?}"
+        );
+    }
+
+    #[test]
+    fn current_fre_unicode_compile_artifact_covers_scalar_and_line_shapes() {
+        let limits = RunLimits::default();
+        let cases: [(&str, &[u8], bool, u64, &str); 3] = [
+            (
+                r"\p{Greek}+",
+                "αβ x Γ".as_bytes(),
+                false,
+                2,
+                "compile-unicode-canonical-artifact",
+            ),
+            (
+                r"(?:é|水|😀)+",
+                "é水 x 😀".as_bytes(),
+                false,
+                2,
+                "compile-aggregate-continuation-program",
+            ),
+            (
+                r"(?m:^水+$)",
+                "水\nx\n水水".as_bytes(),
+                false,
+                2,
+                "compile-aggregate-continuation-program",
+            ),
+        ];
+        for (pattern, haystack, case_insensitive, expected, plan) in cases {
+            assert_current_fre_execution(
+                current_fre(
+                    "compile",
+                    &[pattern.to_string()],
+                    haystack,
+                    true,
+                    case_insensitive,
+                    &limits,
+                ),
+                expected,
+                plan,
+            );
+        }
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"(?-u:\xFF)".to_string()],
+                &[0xFF],
+                true,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-aggregate-continuation-program",
         );
     }
 
