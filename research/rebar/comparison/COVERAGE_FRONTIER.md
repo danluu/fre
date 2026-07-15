@@ -2,10 +2,10 @@
 
 This is the compact source checkpoint for the latest authenticated per-job
 frontier. Two full generations from final candidate source
-`3d1fe72553a298baa2f6b0f324399f4c70338f83` were byte-identical with SHA-256
-`4c3dfef7ced32f855fd1d4def7c0a4b55ebd49dd58b34d44964fe28ab86029a9`.
-That exact source tree (`93db2c7033e4c46095142d3515898fa376d1a706`)
-is integrated at canonical commit `467b68adb2743d61d7a6c542bec81f53c983242d`.
+`ad902c997d5a35c8cf567091fbccbc4a1ffabc66` were byte-identical with SHA-256
+`50d87ceabdb147f0900651cb6bf49f5fc894442ac41a9a87a54d28c610fd62e5`.
+That exact source tree (`534d0351dceb370df2c8847392a873485a70d753`)
+is canonical commit `ad902c997d5a35c8cf567091fbccbc4a1ffabc66`.
 Those raw generated reports remain outside Git. The checked-in `report.json`
 continues to preserve the preceding 144-pass baseline rather than being
 silently replaced by generated evidence.
@@ -18,20 +18,20 @@ silently replaced by generated evidence.
 | `count` | 133 | 54 | 79 | 109 | 109 |
 | `count-spans` | 129 | 100 | 29 | 110 | 110 |
 | `count-captures` | 15 | 0 | 15 | 12 | 12 |
-| `grep` | 11 | 7 | 4 | 10 | 10 |
+| `grep` | 11 | 9 | 2 | 10 | 10 |
 | `grep-captures` | 22 | 0 | 22 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **177** | **167** | **285** | **285** |
+| **Total** | **344** | **179** | **165** | **285** | **285** |
 
 FRE has no `fail` or `fault` receipt. Its 170 aggregate-facade passes comprise
-16 `compile`, 54 `count`, and 100 `count-spans` jobs; the other seven passes are
-the pre-existing portable `grep` path. All 285 RE2 jobs execute through the
+16 `compile`, 54 `count`, and 100 `count-spans` jobs; the other nine passes are
+the portable `grep` path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
 The optional v2 executed-plan field splits those passes into 29 exact-literal
 aggregate, 125 continuation-program aggregate, 16 fresh complete compile
-artifacts using the continuation program, and seven portable-search rows. It is
+artifacts using the continuation program, and nine portable-search rows. It is
 populated only after successful candidate execution and does not infer a plan
 for any unsupported receipt.
 
@@ -43,16 +43,16 @@ for any unsupported receipt.
 | `curated` | 25 | 27 | 41 |
 | `dictionary` | 0 | 7 | 4 |
 | `folly` | 4 | 0 | 4 |
-| `grep` | 1 | 2 | 2 |
+| `grep` | 2 | 1 | 2 |
 | `hyperscan` | 12 | 3 | 0 |
 | `imported` | 79 | 28 | 107 |
-| `opt` | 16 | 19 | 26 |
+| `opt` | 17 | 18 | 26 |
 | `reported` | 7 | 12 | 17 |
 | `slow` | 4 | 0 | 4 |
 | `test` | 24 | 26 | 46 |
 | `unicode` | 5 | 17 | 16 |
 | `wild` | 0 | 25 | 17 |
-| **Total** | **177** | **167** | **285** |
+| **Total** | **179** | **165** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
@@ -75,22 +75,21 @@ The 108 aggregate refusals are fully typed:
   `curated/13-noseyparker/single` reach these later resource gates. Resource
   refusals are not faults and require a better plan, not a silent quota raise.
 
-The other 59 refusals are operation/surface gaps: 17 `compile`, 22
-`grep-captures`, 15 `count-captures`, four portable `grep` syntax gaps, and one
+The other 57 refusals are operation/surface gaps: 17 `compile`, 22
+`grep-captures`, 15 `count-captures`, two portable `grep` syntax gaps, and one
 `regex-redux`. The remaining compile rows split into twelve Unicode-enabled
 inputs, three bounded-resource refusals, and two ordered build-many inputs. The
-four `grep` jobs remain:
+two `grep` jobs remain:
 
-- `grep/long-words-ascii@rust/regex`: ASCII word-boundary assertion.
 - `grep/long-words-unicode@rust/regex`: Unicode word-boundary assertion.
-- `opt/accelerate/whole-line@rust/regex`: LF-aware start assertion.
 - `wild/ruff/unnecessary-coding-comment@rust/regex`: variable-width Unicode
   scalar class lowering.
 
 ## Correctness adversaries now admitted
 
-Every newly executed candidate receipt passes, including five Unicode exact
-literal rows, twelve ASCII-word/LF assertion rows, and all selected
+Every executed candidate receipt passes, including five Unicode exact-literal
+rows, twelve aggregate ASCII-word/LF assertion rows, the two corresponding
+portable `grep` rows, and all selected
 `curated/14-quadratic`, `slow/quadratic-*`, `opt/reverse-inner/no-quadratic-*`,
 and `opt/reverse-suffix/no-quadratic` jobs. The directed facade suite also locks
 nullable/empty iteration, late priority fallback `(?:a+b|a)` over `a^N`,
@@ -130,9 +129,10 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
    quota and preserves the construction-time choice/no-fallback contract; the
    remaining refusals require other semantic shapes.
-3. Reuse the authenticated ASCII-word/LF semantics for the two eligible
-   portable `grep` gaps; retain typed refusals for Unicode word state and
-   variable-width Unicode scalar lowering until their own gates pass.
+3. Apply the stratified pointwise performance gate to the two newly admitted
+   portable ASCII-word/LF `grep` rows and two relevant unchanged neighbors.
+   Retain typed refusals for Unicode word state and variable-width Unicode
+   scalar lowering until their own semantic and performance gates pass.
 4. Add ordered build-many as its own semantic plan/API, beginning with the five
    aggregate and two compile-model jobs. Never emulate priority by concatenating
    patterns.
@@ -147,6 +147,6 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 
 Two consecutive full generations were byte-identical. The retained generated
 report SHA-256 is
-`4c3dfef7ced32f855fd1d4def7c0a4b55ebd49dd58b34d44964fe28ab86029a9`,
+`50d87ceabdb147f0900651cb6bf49f5fc894442ac41a9a87a54d28c610fd62e5`,
 and its sorted-receipts SHA-256 is
-`fd67f9692cfcecbf756ec2daf1288a5ece4f49288da4635dd2ab33c7582eb348`.
+`fb175f63514a79075c4ddf696d512097ed53ec74ae1496d1d86cf44cf0fe878d`.
