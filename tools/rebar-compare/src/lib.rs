@@ -4379,6 +4379,69 @@ mod tests {
     }
 
     #[test]
+    fn current_fre_composition_keeps_unicode_capture_and_build_many_reachable() {
+        let limits = RunLimits::default();
+        let identity = CurrentFreAdapter.identity();
+        assert_eq!(identity.adapter, "fre-current-aggregate-capture-v8");
+        assert!(identity.identity.contains("direct Unicode scalar-class"));
+        assert!(
+            identity
+                .identity
+                .contains("exact-span persistent tagged-history replay")
+        );
+
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &[r"\pL".to_string()],
+                "A雪1δ".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            3,
+            "aggregate-unicode-scalar-class",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[r"(a)(b)?".to_string()],
+                b"a ab",
+                false,
+                false,
+                &limits,
+            ),
+            5,
+            "capture-linear-selector-persistent-history",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &["ab".to_string(), "a".to_string()],
+                b"ab",
+                false,
+                false,
+                &limits,
+            ),
+            2,
+            "aggregate-many-ordered-literal",
+        );
+
+        let unicode_capture = current_fre(
+            "count-captures",
+            &[r"(\pL)".to_string()],
+            "雪".as_bytes(),
+            true,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(unicode_capture, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode")),
+            "Unicode capture must remain a typed refusal: {unicode_capture:?}"
+        );
+    }
+
+    #[test]
     fn current_fre_one_pattern_aggregate_models_cover_adversarial_semantics() {
         let limits = RunLimits::default();
         let late = vec![r"(?:a+b|a)".to_string()];
