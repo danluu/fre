@@ -18,7 +18,7 @@ pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middl
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
-    "anchored-class-suffix.absolute-end-fixed-range64-threshold64-suffix-first-hybrid.v4";
+    "anchored-class-suffix.absolute-end-fixed-single1-range64-threshold64-suffix-first-hybrid.v5";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -749,7 +749,12 @@ impl AbsoluteEndFixedPlan {
                     computation: "fixed-end suffix partition",
                 })?;
         accounting.suffix_confirmation_attempted = true;
-        if fixed_suffix != self.suffix() {
+        let suffix_matches = if let [expected] = self.suffix() {
+            fixed_suffix.first() == Some(expected)
+        } else {
+            fixed_suffix == self.suffix()
+        };
+        if !suffix_matches {
             return Ok((None, accounting));
         }
 

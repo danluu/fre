@@ -73,7 +73,7 @@ evidence. Arbitrary-class SIMD JIT work remains unpromoted.
 
 The separate forced-only strategy for `\A CLASS+ SUFFIX \z` has stable runtime
 identity
-`anchored-class-suffix.absolute-end-fixed-range64-threshold64-suffix-first-hybrid.v4`. Both
+`anchored-class-suffix.absolute-end-fixed-single1-range64-threshold64-suffix-first-hybrid.v5`. Both
 absolute anchors and the fixed literal width determine the only split:
 `p = H.len() - SUFFIX.len()`. For a full original-haystack window and
 `H.len() > SUFFIX.len()`, the verifier compares the final suffix first, then
