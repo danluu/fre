@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![allow(
     clippy::arithmetic_side_effects,
     reason = "all arithmetic operands are explicitly bounded by this deterministic test oracle"
