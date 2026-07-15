@@ -1202,7 +1202,7 @@ fn unicode_scalar_planner_charges_each_canonical_range_and_has_a_tight_limit() {
 }
 
 #[test]
-fn unicode_scalar_selection_rejects_composition_and_preserves_existing_paths() {
+fn unicode_scalar_selection_admits_composition_and_preserves_existing_paths() {
     assert_eq!(
         aggregate_builder("雪")
             .build_count()
@@ -1223,31 +1223,33 @@ fn unicode_scalar_selection_rejects_composition_and_preserves_existing_paths() {
         );
     }
     for pattern in [r"\pL+", r"\A\pL", r"\pL\z"] {
-        assert!(matches!(
-            aggregate_builder(pattern).build_count(),
-            Err(AggregateBuildError::ContinuationCompile {
-                source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
-                ..
-            })
-        ));
+        assert_eq!(
+            aggregate_builder(pattern)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram,
+            "pattern={pattern:?}"
+        );
     }
-    assert!(matches!(
+    assert_eq!(
         aggregate_builder(r"\pL")
             .plan_selection(AggregatePlanSelection::ForceContinuation)
-            .build_count(),
-        Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
-            ..
-        })
-    ));
-    assert!(matches!(
-        aggregate_builder(r"\pL").build_spans(),
-        Err(AggregateBuildError::ContinuationCompile {
-            operation: AggregateOperation::Spans,
-            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
-            ..
-        })
-    ));
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        aggregate_builder(r"\pL")
+            .build_spans()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
 }
 
 fn unicode_exact_build_error(limits: &AggregateBuildLimits) -> AggregateBuildError {
