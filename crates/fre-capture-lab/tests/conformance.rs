@@ -714,12 +714,12 @@ fn render(ast: &Ast) -> String {
         Ast::Start => r"\A".to_owned(),
         Ast::End => r"\z".to_owned(),
         Ast::AsciiWordLook(look) => match look {
-            AsciiWordLook::Boundary => r"\b".to_owned(),
-            AsciiWordLook::BoundaryNegate => r"\B".to_owned(),
-            AsciiWordLook::Start => r"\b{start}".to_owned(),
-            AsciiWordLook::End => r"\b{end}".to_owned(),
-            AsciiWordLook::StartHalf => r"\b{start-half}".to_owned(),
-            AsciiWordLook::EndHalf => r"\b{end-half}".to_owned(),
+            AsciiWordLook::Boundary => r"(?-u:\b)".to_owned(),
+            AsciiWordLook::BoundaryNegate => r"(?-u:\B)".to_owned(),
+            AsciiWordLook::Start => r"(?-u:\b{start})".to_owned(),
+            AsciiWordLook::End => r"(?-u:\b{end})".to_owned(),
+            AsciiWordLook::StartHalf => r"(?-u:\b{start-half})".to_owned(),
+            AsciiWordLook::EndHalf => r"(?-u:\b{end-half})".to_owned(),
         },
     }
 }
