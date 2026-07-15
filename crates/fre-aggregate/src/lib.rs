@@ -3,11 +3,13 @@
 //! This crate accepts canonical [`regex_syntax::hir::Hir`] for pinned Rust
 //! regex byte profiles. Unicode-off admits the complete byte program below;
 //! Unicode-on admits the same byte-stable subset after parsing has expanded
-//! literals, but refuses variable-width Unicode classes and Unicode word
-//! assertions. The semantic program is capture-free and consists of empty
+//! literals, including positive Unicode word boundaries, but refuses
+//! variable-width Unicode classes and the remaining Unicode word assertion
+//! forms. The semantic program is capture-free and consists of empty
 //! expressions, byte literals, byte classes, ordered alternation,
 //! concatenation, whole-operation absolute and LF-aware line assertions,
-//! ASCII word assertions, and arbitrary nested greedy or lazy repetition.
+//! ASCII word assertions, positive Unicode word boundaries, and arbitrary
+//! nested greedy or lazy repetition.
 //! Assertions always inspect their absolute
 //! boundary in the original haystack, even for an interior operation range;
 //! byte-consuming transitions remain confined to that range.

@@ -10,8 +10,9 @@ pub enum Unsupported {
     UnicodeClass,
     /// Captures are not erased by this capture-free operation boundary.
     Capture,
-    /// Unicode word assertions and CRLF-aware line assertions are not yet
-    /// admitted by the byte-oriented continuation engine.
+    /// Unicode word assertion forms other than the positive boundary and
+    /// CRLF-aware line assertions are not yet admitted by the continuation
+    /// engine.
     Look(Look),
 }
 

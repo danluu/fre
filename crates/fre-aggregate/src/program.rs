@@ -32,8 +32,9 @@ impl ByteSet {
 /// A constant-time zero-width predicate admitted by the continuation engine.
 ///
 /// This is deliberately distinct from `regex_syntax::hir::Look`: every
-/// variant here has one audited byte-oriented implementation below, while HIR
-/// variants that require Unicode decoding or CRLF state remain typed refusals.
+/// variant here has one audited implementation below, while HIR variants that
+/// require direction-specific Unicode word state or CRLF state remain typed
+/// refusals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Assertion {
     StartText,
@@ -46,6 +47,7 @@ pub(crate) enum Assertion {
     WordEndAscii,
     WordStartHalfAscii,
     WordEndHalfAscii,
+    WordUnicode,
 }
 
 impl Assertion {
@@ -61,9 +63,9 @@ impl Assertion {
             Look::WordEndAscii => Some(Self::WordEndAscii),
             Look::WordStartHalfAscii => Some(Self::WordStartHalfAscii),
             Look::WordEndHalfAscii => Some(Self::WordEndHalfAscii),
+            Look::WordUnicode => Some(Self::WordUnicode),
             Look::StartCRLF
             | Look::EndCRLF
-            | Look::WordUnicode
             | Look::WordUnicodeNegate
             | Look::WordStartUnicode
             | Look::WordEndUnicode
@@ -84,6 +86,7 @@ impl Assertion {
             Self::WordEndAscii => 7,
             Self::WordStartHalfAscii => 8,
             Self::WordEndHalfAscii => 9,
+            Self::WordUnicode => 10,
         }
     }
 }
@@ -148,6 +151,19 @@ impl<'h> AssertionContext<'h> {
             Assertion::WordEndAscii => left_word && !right_word,
             Assertion::WordStartHalfAscii => !left_word,
             Assertion::WordEndHalfAscii => !right_word,
+            Assertion::WordUnicode => {
+                let before = self
+                    .haystack
+                    .get(..absolute)
+                    .ok_or(Error::InternalInvariant("Unicode assertion prefix missing"))?;
+                let after = self
+                    .haystack
+                    .get(absolute..)
+                    .ok_or(Error::InternalInvariant("Unicode assertion suffix missing"))?;
+                let word_before = unicode_word_scalar(decode_last_scalar(before))?;
+                let word_after = unicode_word_scalar(decode_first_scalar(after))?;
+                word_before != word_after
+            }
         })
     }
 
@@ -158,6 +174,39 @@ impl<'h> AssertionContext<'h> {
 
 const fn is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn unicode_word_scalar(scalar: Option<char>) -> Result<bool, Error> {
+    let Some(scalar) = scalar else {
+        return Ok(false);
+    };
+    regex_syntax::try_is_word_character(scalar)
+        .map_err(|_| Error::InternalInvariant("pinned Unicode word table is unavailable"))
+}
+
+fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
+    let first = *bytes.first()?;
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    let encoded = bytes.get(..width)?;
+    core::str::from_utf8(encoded).ok()?.chars().next()
+}
+
+fn decode_last_scalar(bytes: &[u8]) -> Option<char> {
+    let end = bytes.len();
+    let mut start = end.checked_sub(1)?;
+    let limit = end.saturating_sub(4);
+    while start > limit && matches!(bytes[start], 0x80..=0xBF) {
+        start = start.checked_sub(1)?;
+    }
+    let encoded = bytes.get(start..end)?;
+    let scalar = decode_first_scalar(encoded)?;
+    (scalar.len_utf8() == encoded.len()).then_some(scalar)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

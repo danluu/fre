@@ -14,9 +14,9 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 /// token asserts both the pinned parser configuration and the empty-match
 /// boundary policy. Unicode-on callers receive only the byte-stable HIR
 /// subset: literals, byte classes, ASCII Unicode ranges, singleton Unicode
-/// scalar classes, byte-oriented assertions and their regular composition.
-/// Non-singleton non-ASCII Unicode classes and Unicode word assertions remain
-/// typed refusals.
+/// scalar classes, byte-oriented assertions, positive Unicode word boundaries,
+/// and their regular composition. Non-singleton non-ASCII Unicode classes and
+/// the other Unicode word assertion forms remain typed refusals.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
     unicode: bool,
