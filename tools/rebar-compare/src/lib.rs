@@ -1743,7 +1743,7 @@ fn fre_compile_verify(
         .strategy(AggregateStrategy::ReverseSequentialRows)
         .build_compile()
         .map_err(|error| aggregate_build_error(&error))?;
-    require_unicode_exact_identity(
+    require_unicode_plan_identity(
         regex.build_report(),
         request.unicode,
         LiteralAggregateOperation::Count,
@@ -3592,6 +3592,30 @@ mod tests {
             2,
             "compile-aggregate-continuation-program",
         );
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &["雪+".to_string()],
+                "雪雪".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-aggregate-continuation-program",
+        );
+        let variable_width = current_fre(
+            "compile",
+            &[r"\pL".to_string()],
+            "雪".as_bytes(),
+            true,
+            false,
+            &limits,
+        );
+        assert!(
+            matches!(variable_width, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
+            "unexpected Unicode compile outcome: {variable_width:?}"
+        );
 
         let many = current_fre(
             "compile",
@@ -3608,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_admits_byte_stable_unicode_hir_and_refuses_variable_width_work() {
+    fn current_fre_admits_byte_stable_unicode_hir_and_refuses_non_singleton_classes() {
         let limits = RunLimits::default();
         let empty = current_fre("count", &[String::new()], b"a", true, false, &limits);
         assert_current_fre_execution(empty, 2, "aggregate-continuation-program");
@@ -3630,9 +3654,18 @@ mod tests {
             true,
             &limits,
         );
+        assert_current_fre_execution(folded, 1, "aggregate-continuation-program");
+        let variable_width = current_fre(
+            "count",
+            &[r"\pL".to_string()],
+            "a русский".as_bytes(),
+            true,
+            false,
+            &limits,
+        );
         assert!(
-            matches!(folded, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
-            "unexpected variable-width Unicode outcome: {folded:?}"
+            matches!(variable_width, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
+            "unexpected non-singleton Unicode outcome: {variable_width:?}"
         );
 
         let build_many = vec!["(".to_string(), "a".to_string()];

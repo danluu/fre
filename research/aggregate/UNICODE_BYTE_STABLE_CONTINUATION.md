@@ -22,8 +22,9 @@ may execute canonical HIR when every transition is already byte-stable:
 
 Non-singleton non-ASCII Unicode classes, Unicode word assertions, and CRLF
 assertions remain typed compiler refusals. This excludes variable-width scalar
-decoding, Unicode case-folding classes, Unicode `.` classes, and Unicode
-word-boundary state.
+decoding, non-singleton Unicode case-folding classes, Unicode `.` classes, and
+Unicode word-boundary state. Finite case-fold expansions whose canonical HIR
+contains only singleton scalars remain inside the exact byte-chain proof.
 There is no fallback after a continuation plan is selected.
 
 The direct compiler requires an explicit
