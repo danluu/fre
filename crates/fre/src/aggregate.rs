@@ -15,12 +15,11 @@ use fre_kernels::{
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
     OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    UnicodeScalarAggregateBuildAccounting,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
-    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
-    UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
-    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeScalarAggregateSpanSumResult,
+    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
+    UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -765,10 +764,7 @@ impl AggregateBuilder {
             capture_slots: engine.capture_slots(),
             strategy,
         };
-        Ok(AggregateCapturesRegex {
-            engine,
-            report,
-        })
+        Ok(AggregateCapturesRegex { engine, report })
     }
 
     #[allow(
@@ -1343,9 +1339,9 @@ impl std::error::Error for AggregateCaptureBuildError {
         match self {
             Self::Syntax(error) => Some(error),
             Self::Compile(error) => Some(error),
-            Self::UnicodeEnabled
-            | Self::ExactLiteralUnavailable
-            | Self::InternalInvariant(_) => None,
+            Self::UnicodeEnabled | Self::ExactLiteralUnavailable | Self::InternalInvariant(_) => {
+                None
+            }
         }
     }
 }
@@ -1604,7 +1600,10 @@ enum AggregateCountExecution {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
-    Continuation { admitted: AdmittedCount, value: u64 },
+    Continuation {
+        admitted: AdmittedCount,
+        value: u64,
+    },
 }
 
 impl AggregateCountExecution {

@@ -127,11 +127,7 @@ fn account_physical_storage(
         Resource::CaptureReplayCells,
     )?;
     let stack_limit = add(
-        mul(
-            limits.max_replay_cells,
-            2,
-            Resource::CaptureReplayCells,
-        )?,
+        mul(limits.max_replay_cells, 2, Resource::CaptureReplayCells)?,
         1,
         Resource::CaptureReplayCells,
     )?;
@@ -228,12 +224,9 @@ impl CompiledCaptureRegex {
             capture_limits.max_capture_slots,
             Resource::CaptureSlots,
         )?;
-        let admitted = self.inner.admit_spans(
-            haystack,
-            range.clone(),
-            strategy,
-            operation_limits,
-        )?;
+        let admitted =
+            self.inner
+                .admit_spans(haystack, range.clone(), strategy, operation_limits)?;
         let boundaries = add(
             range
                 .end
@@ -342,9 +335,9 @@ impl CompiledCaptureRegex {
             admitted.certificate().output_bytes,
             capture_limits,
         )?;
-        let local_len = boundaries
-            .checked_sub(1)
-            .ok_or(Error::InternalInvariant("capture boundaries omitted range start"))?;
+        let local_len = boundaries.checked_sub(1).ok_or(Error::InternalInvariant(
+            "capture boundaries omitted range start",
+        ))?;
         let assertions = AssertionContext::new(haystack, range.start, local_len)?;
         let local = &haystack[range.clone()];
         let mut work = 0_usize;
@@ -473,15 +466,17 @@ fn replay_one(
         let relative = state
             .position
             .checked_sub(replay_start)
-            .ok_or(Error::InternalInvariant("capture replay moved before selected start"))?;
+            .ok_or(Error::InternalInvariant(
+                "capture replay moved before selected start",
+            ))?;
         let cell = add(
             mul(relative, states, Resource::CaptureReplayCells)?,
             state.pc,
             Resource::CaptureReplayCells,
         )?;
-        let marker = visited
-            .get_mut(cell)
-            .ok_or(Error::InternalInvariant("capture replay cell outside scratch"))?;
+        let marker = visited.get_mut(cell).ok_or(Error::InternalInvariant(
+            "capture replay cell outside scratch",
+        ))?;
         if *marker == generation {
             continue;
         }
@@ -494,8 +489,7 @@ fn replay_one(
             Inst::Match if state.position == target_end => return Ok(Some(state.history)),
             Inst::Match => {}
             Inst::Consume { bytes, next }
-                if state.position < target_end
-                    && bytes.contains(haystack[state.position]) =>
+                if state.position < target_end && bytes.contains(haystack[state.position]) =>
             {
                 push_state(
                     stack,
@@ -510,14 +504,7 @@ fn replay_one(
             Inst::Consume { .. } => {}
             Inst::Assert { assertion, next } => {
                 if assertions.is_match(*assertion, state.position)? {
-                    push_state(
-                        stack,
-                        ReplayState {
-                            pc: *next,
-                            ..state
-                        },
-                        limits,
-                    )?;
+                    push_state(stack, ReplayState { pc: *next, ..state }, limits)?;
                 }
             }
             Inst::CaptureStart { group, next } => {
@@ -622,11 +609,7 @@ fn push_history(
     Ok(index)
 }
 
-fn push_within_capacity<T>(
-    values: &mut Vec<T>,
-    value: T,
-    resource: Resource,
-) -> Result<(), Error> {
+fn push_within_capacity<T>(values: &mut Vec<T>, value: T, resource: Resource) -> Result<(), Error> {
     let required = add(values.len(), 1, resource)?;
     enforce(required, values.capacity(), resource)?;
     values.push(value);
@@ -654,22 +637,18 @@ fn materialize_groups(
             items: capture_slots,
         }
     })?;
-    enforce(
-        capture_slots,
-        offsets.capacity(),
-        Resource::PeakBytes,
-    )?;
+    enforce(capture_slots, offsets.capacity(), Resource::PeakBytes)?;
     let offset_slots = offsets.capacity();
     offsets.resize(capture_slots, (None, None));
     let mut cursor = accepted;
     while let Some(index) = cursor {
         charge(work, 1, limits.max_work)?;
-        let node = history
-            .get(index)
-            .ok_or(Error::InternalInvariant("capture history parent outside arena"))?;
-        let slot = offsets
-            .get_mut(node.group)
-            .ok_or(Error::InternalInvariant("capture action group outside slots"))?;
+        let node = history.get(index).ok_or(Error::InternalInvariant(
+            "capture history parent outside arena",
+        ))?;
+        let slot = offsets.get_mut(node.group).ok_or(Error::InternalInvariant(
+            "capture action group outside slots",
+        ))?;
         let absolute = add(base, node.position, Resource::Boundaries)?;
         match node.action {
             CaptureAction::Start if slot.0.is_none() => slot.0 = Some(absolute),
@@ -685,11 +664,7 @@ fn materialize_groups(
         }
     })?;
     let group_slots = groups.capacity();
-    push_within_capacity(
-        &mut groups,
-        Some(whole),
-        Resource::CaptureOutputBytes,
-    )?;
+    push_within_capacity(&mut groups, Some(whole), Resource::CaptureOutputBytes)?;
     for (start, end) in offsets.into_iter().skip(1) {
         let group = match (start, end) {
             (Some(start), Some(end)) => Some(Span { start, end }),

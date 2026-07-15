@@ -368,7 +368,9 @@ fn combined_unicode_word_boundary_and_scalar_class_match_pinned_ranges() {
                         SearchLimits::unlimited(),
                     )
                     .unwrap_or_else(|error| {
-                        panic!("combined Unicode search failed {haystack:?}/{start}..{end}: {error}")
+                        panic!(
+                            "combined Unicode search failed {haystack:?}/{start}..{end}: {error}"
+                        )
                     })
                     .0
                     .map(|matched| (matched.start(), matched.end()));

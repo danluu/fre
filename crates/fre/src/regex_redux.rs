@@ -140,10 +140,16 @@ impl core::fmt::Display for RegexReduxBuildError {
                 write!(f, "regex-redux needs {required} components, limit {limit}")
             }
             Self::IdentityWork { required, limit } => {
-                write!(f, "regex-redux identity needs {required} bytes, limit {limit}")
+                write!(
+                    f,
+                    "regex-redux identity needs {required} bytes, limit {limit}"
+                )
             }
             Self::ReplacementBytes { required, limit } => {
-                write!(f, "regex-redux replacement needs {required} bytes, limit {limit}")
+                write!(
+                    f,
+                    "regex-redux replacement needs {required} bytes, limit {limit}"
+                )
             }
             Self::Component { stage, source } => {
                 write!(f, "regex-redux {stage} component build failed: {source}")
@@ -207,16 +213,25 @@ impl core::fmt::Display for RegexReduxRunError {
                 write!(f, "regex-redux input needs {required} bytes, limit {limit}")
             }
             Self::OutputBytes { required, limit } => {
-                write!(f, "regex-redux output needs {required} bytes, limit {limit}")
+                write!(
+                    f,
+                    "regex-redux output needs {required} bytes, limit {limit}"
+                )
             }
             Self::MatchEvents { required, limit } => {
-                write!(f, "regex-redux needs {required} match events, limit {limit}")
+                write!(
+                    f,
+                    "regex-redux needs {required} match events, limit {limit}"
+                )
             }
             Self::CopyWork { required, limit } => {
                 write!(f, "regex-redux needs {required} copy work, limit {limit}")
             }
             Self::ReportBytes { required, limit } => {
-                write!(f, "regex-redux report needs {required} bytes, limit {limit}")
+                write!(
+                    f,
+                    "regex-redux report needs {required} bytes, limit {limit}"
+                )
             }
             Self::EmptyMatch { stage, offset } => {
                 write!(f, "regex-redux {stage} selected an empty match at {offset}")
@@ -264,7 +279,13 @@ impl RegexReduxReplacementPlan {
     ) -> Result<Self, RegexReduxBuildError> {
         profile.options.unicode = false;
         profile.options.case_insensitive = false;
-        Self::build_named(pattern.into(), replacement.as_ref(), profile, limits, "replacement")
+        Self::build_named(
+            pattern.into(),
+            replacement.as_ref(),
+            profile,
+            limits,
+            "replacement",
+        )
     }
 
     fn build_named(
@@ -291,9 +312,11 @@ impl RegexReduxReplacementPlan {
             .strategy(AggregateStrategy::ReverseSequentialRows)
             .build_spans()
             .map_err(|source| RegexReduxBuildError::Component { stage, source })?;
-        let replacement_bytes = fre_exact_alloc::copy_exact(replacement.as_bytes())
-            .map_err(|_| RegexReduxBuildError::ReplacementAllocationFailed {
-                bytes: replacement.len(),
+        let replacement_bytes =
+            fre_exact_alloc::copy_exact(replacement.as_bytes()).map_err(|_| {
+                RegexReduxBuildError::ReplacementAllocationFailed {
+                    bytes: replacement.len(),
+                }
             })?;
         let replacement = replacement_bytes.into_boxed_slice();
         Ok(Self {
@@ -331,20 +354,18 @@ impl RegexReduxReplacementPlan {
                     offset: matched.start,
                 });
             }
-            let width = matched
-                .end
-                .checked_sub(matched.start)
-                .ok_or(RegexReduxRunError::InternalInvariant(
-                    "replacement match ends before it starts",
-                ))?;
+            let width = matched.end.checked_sub(matched.start).ok_or(
+                RegexReduxRunError::InternalInvariant("replacement match ends before it starts"),
+            )?;
             removed = checked_add(removed, width)?;
         }
-        let retained = input
-            .len()
-            .checked_sub(removed)
-            .ok_or(RegexReduxRunError::InternalInvariant(
-                "replacement widths exceed input",
-            ))?;
+        let retained =
+            input
+                .len()
+                .checked_sub(removed)
+                .ok_or(RegexReduxRunError::InternalInvariant(
+                    "replacement widths exceed input",
+                ))?;
         let inserted = matches
             .len()
             .checked_mul(self.replacement.len())
@@ -455,14 +476,15 @@ impl CountPlan {
         input: &[u8],
         limits: RegexReduxRunLimits,
     ) -> Result<usize, RegexReduxRunError> {
-        let result = self.regex.count(input, limits.aggregate).map_err(|source| {
-            RegexReduxRunError::Aggregate {
+        let result = self
+            .regex
+            .count(input, limits.aggregate)
+            .map_err(|source| RegexReduxRunError::Aggregate {
                 stage: "variant-count",
                 source: Box::new(source),
-            }
-        })?;
-        let value = usize::try_from(result.value())
-            .map_err(|_| RegexReduxRunError::ArithmeticOverflow)?;
+            })?;
+        let value =
+            usize::try_from(result.value()).map_err(|_| RegexReduxRunError::ArithmeticOverflow)?;
         enforce_events(value, limits.max_stage_events)?;
         Ok(value)
     }
@@ -532,9 +554,11 @@ impl RegexReduxBuilder {
             self.limits.aggregate,
             "flatten",
         )?;
-        let mut variants = fre_exact_alloc::vec_with_exact_capacity(VARIANTS.len())
-            .map_err(|_| RegexReduxBuildError::AllocationFailed {
-                components: VARIANTS.len(),
+        let mut variants =
+            fre_exact_alloc::vec_with_exact_capacity(VARIANTS.len()).map_err(|_| {
+                RegexReduxBuildError::AllocationFailed {
+                    components: VARIANTS.len(),
+                }
             })?;
         for pattern in VARIANTS {
             variants.push(CountPlan::build(
@@ -561,9 +585,11 @@ impl RegexReduxBuilder {
             .chain(substitutions.iter().map(|plan| plan.regex.build_report()));
         let mut retained_capacity_bytes = 0_usize;
         let mut max_component_states = 0_usize;
-        let mut component_ids = fre_exact_alloc::vec_with_exact_capacity(COMPONENTS)
-            .map_err(|_| RegexReduxBuildError::AllocationFailed {
-                components: COMPONENTS,
+        let mut component_ids =
+            fre_exact_alloc::vec_with_exact_capacity(COMPONENTS).map_err(|_| {
+                RegexReduxBuildError::AllocationFailed {
+                    components: COMPONENTS,
+                }
             })?;
         for report in reports {
             retained_capacity_bytes = retained_capacity_bytes
@@ -670,20 +696,20 @@ impl RegexReduxPlan {
             peak_output_bytes = peak_output_bytes.max(allocated);
             sequence = next;
         }
-        let report_bytes = report_length(
-            &variant_counts,
-            input_length,
-            clean_length,
-            sequence.len(),
-        )?;
+        let report_bytes =
+            report_length(&variant_counts, input_length, clean_length, sequence.len())?;
         if report_bytes > limits.max_report_bytes {
             return Err(RegexReduxRunError::ReportBytes {
                 required: report_bytes,
                 limit: limits.max_report_bytes,
             });
         }
-        let report_storage = fre_exact_alloc::vec_with_exact_capacity(report_bytes)
-            .map_err(|_| RegexReduxRunError::AllocationFailed { bytes: report_bytes })?;
+        let report_storage =
+            fre_exact_alloc::vec_with_exact_capacity(report_bytes).map_err(|_| {
+                RegexReduxRunError::AllocationFailed {
+                    bytes: report_bytes,
+                }
+            })?;
         let mut report = String::from_utf8(report_storage).map_err(|_| {
             RegexReduxRunError::InternalInvariant("empty report allocation is not UTF-8")
         })?;

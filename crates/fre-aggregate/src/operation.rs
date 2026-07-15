@@ -1179,23 +1179,21 @@ fn read_bit(bytes: &[u8], index: usize) -> Result<bool, Error> {
 }
 
 fn zeroed_usizes(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
-    let mut values = fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| {
-        Error::AllocationFailed {
+    let mut values =
+        fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
             resource,
             items: length,
-        }
-    })?;
+        })?;
     values.resize(length, 0);
     Ok(values)
 }
 
 fn zeroed_bytes(length: usize, resource: Resource) -> Result<Vec<u8>, Error> {
-    let mut values = fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| {
-        Error::AllocationFailed {
+    let mut values =
+        fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
             resource,
             items: length,
-        }
-    })?;
+        })?;
     values.resize(length, 0);
     Ok(values)
 }

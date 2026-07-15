@@ -76,7 +76,10 @@ fn capture_history_preserves_priority_optional_last_iteration_and_absolute_bytes
             CaptureLimits::default(),
         )
         .unwrap();
-    assert_eq!(selected.as_slice()[0].group(1), Some(Span { start: 2, end: 3 }));
+    assert_eq!(
+        selected.as_slice()[0].group(1),
+        Some(Span { start: 2, end: 3 })
+    );
 }
 
 #[test]
@@ -92,9 +95,15 @@ fn capture_history_retains_empty_progress_and_refuses_slots_before_replay_alloca
         )
         .unwrap();
     assert_eq!(selected.as_slice().len(), 2);
-    assert_eq!(selected.as_slice()[0].group(0), Some(Span { start: 0, end: 0 }));
+    assert_eq!(
+        selected.as_slice()[0].group(0),
+        Some(Span { start: 0, end: 0 })
+    );
     assert_eq!(selected.as_slice()[0].group(1), None);
-    assert_eq!(selected.as_slice()[1].group(0), Some(Span { start: 1, end: 1 }));
+    assert_eq!(
+        selected.as_slice()[1].group(0),
+        Some(Span { start: 1, end: 1 })
+    );
 
     assert!(matches!(
         regex.admit_captures(
@@ -149,30 +158,48 @@ fn capture_history_exact_limits_succeed_and_one_below_refuses() {
         .unwrap();
 
     let cases = [
-        (Resource::CaptureSlots, CaptureLimits {
-            max_capture_slots: exact.max_capture_slots - 1,
-            ..exact
-        }),
-        (Resource::CaptureReplayCells, CaptureLimits {
-            max_replay_cells: exact.max_replay_cells - 1,
-            ..exact
-        }),
-        (Resource::CaptureHistoryNodes, CaptureLimits {
-            max_history_nodes: exact.max_history_nodes - 1,
-            ..exact
-        }),
-        (Resource::CaptureOutputBytes, CaptureLimits {
-            max_output_bytes: exact.max_output_bytes - 1,
-            ..exact
-        }),
-        (Resource::CaptureWork, CaptureLimits {
-            max_work: exact.max_work - 1,
-            ..exact
-        }),
-        (Resource::PeakBytes, CaptureLimits {
-            max_peak_bytes: exact.max_peak_bytes - 1,
-            ..exact
-        }),
+        (
+            Resource::CaptureSlots,
+            CaptureLimits {
+                max_capture_slots: exact.max_capture_slots - 1,
+                ..exact
+            },
+        ),
+        (
+            Resource::CaptureReplayCells,
+            CaptureLimits {
+                max_replay_cells: exact.max_replay_cells - 1,
+                ..exact
+            },
+        ),
+        (
+            Resource::CaptureHistoryNodes,
+            CaptureLimits {
+                max_history_nodes: exact.max_history_nodes - 1,
+                ..exact
+            },
+        ),
+        (
+            Resource::CaptureOutputBytes,
+            CaptureLimits {
+                max_output_bytes: exact.max_output_bytes - 1,
+                ..exact
+            },
+        ),
+        (
+            Resource::CaptureWork,
+            CaptureLimits {
+                max_work: exact.max_work - 1,
+                ..exact
+            },
+        ),
+        (
+            Resource::PeakBytes,
+            CaptureLimits {
+                max_peak_bytes: exact.max_peak_bytes - 1,
+                ..exact
+            },
+        ),
     ];
     for (resource, limits) in cases {
         expect_resource(

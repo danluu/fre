@@ -20,15 +20,15 @@ mod aggregate;
 mod aggregate_many;
 mod finite;
 mod forward_anchored;
-mod required_literal;
 mod regex_redux;
+mod required_literal;
 mod unicode_compile;
 
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
-    AggregateCaptureBuildError, AggregateCaptureBuildReport, AggregateCapturesRegex,
-    AggregateCaptureSemantics, AggregateCompileRegex, AggregateContinuationIdentity,
+    AggregateCaptureBuildError, AggregateCaptureBuildReport, AggregateCaptureSemantics,
+    AggregateCapturesRegex, AggregateCompileRegex, AggregateContinuationIdentity,
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
@@ -45,12 +45,11 @@ pub use aggregate_many::{
     AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
     AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
     AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
-    AggregateManySpanSumRegex, AggregateManySpanSumResult,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
+    AggregateManySpanSumResult,
 };
 pub use fre_aggregate::{
-    AdmittedCaptures as AggregateCaptures,
-    CaptureLimits as AggregateCaptureLimits,
+    AdmittedCaptures as AggregateCaptures, CaptureLimits as AggregateCaptureLimits,
     CaptureMatch as AggregateCaptureMatch,
     CaptureOperationCertificate as AggregateCaptureOperationCertificate,
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,

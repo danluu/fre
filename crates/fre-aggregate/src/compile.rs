@@ -303,11 +303,8 @@ impl CompileBudget {
             Resource::CompileWork,
         )?;
         if unique_annotation {
-            self.accounting.captures_recorded = add(
-                self.accounting.captures_recorded,
-                1,
-                Resource::CaptureSlots,
-            )?;
+            self.accounting.captures_recorded =
+                add(self.accounting.captures_recorded, 1, Resource::CaptureSlots)?;
         }
         Ok(())
     }
@@ -338,12 +335,11 @@ fn validate_hir(
         budget.limits.max_hir_stack_items,
         Resource::HirStackItems,
     )?;
-    let mut stack = fre_exact_alloc::vec_with_exact_capacity(1).map_err(|_| {
-        Error::AllocationFailed {
+    let mut stack =
+        fre_exact_alloc::vec_with_exact_capacity(1).map_err(|_| Error::AllocationFailed {
             resource: Resource::HirStackItems,
             items: 1,
-        }
-    })?;
+        })?;
     stack.push((hir, 1_usize));
     budget.accounting.peak_hir_stack_items = 1;
     while let Some((node, depth)) = stack.pop() {
@@ -599,11 +595,10 @@ impl<'a> Builder<'a> {
                 }
                 CapturePolicy::Record => {
                     self.budget.record_capture(false)?;
-                    let group = usize::try_from(capture.index).map_err(|_| {
-                        Error::ArithmeticOverflow {
+                    let group =
+                        usize::try_from(capture.index).map_err(|_| Error::ArithmeticOverflow {
                             resource: Resource::CaptureSlots,
-                        }
-                    })?;
+                        })?;
                     let end = self.push(Inst::CaptureEnd {
                         group,
                         next: continuation,
