@@ -4249,9 +4249,11 @@ mod tests {
 
     #[test]
     fn grep_capture_selector_ledgers_are_cumulative_across_lines() {
-        let mut limits = RunLimits::default();
-        limits.fre_aggregate_operation_work = 10;
-        limits.fre_aggregate_sequential_bytes = 20;
+        let limits = RunLimits {
+            fre_aggregate_operation_work: 10,
+            fre_aggregate_sequential_bytes: 20,
+            ..RunLimits::default()
+        };
 
         let mut work = CaptureSelectorLedger::default();
         assert_eq!(work.remaining(&limits).expect("initial ledger"), (10, 20));
