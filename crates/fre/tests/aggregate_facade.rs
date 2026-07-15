@@ -300,7 +300,7 @@ fn unicode_word_boundary_routes_through_continuation_exactly() {
         .build_count()
         .unwrap();
     assert_eq!(
-        compiled.build_report().plan_kind,
+        compiled.build_report().plan,
         AggregatePlanKind::ContinuationProgram
     );
     let count = compiled
