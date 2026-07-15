@@ -8,12 +8,7 @@ use fre_kernels::{
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    LiteralAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -49,8 +44,8 @@ pub enum AggregateOperation {
 /// Construction-time aggregate plan policy.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregatePlanSelection {
-    /// Select an exact-literal plan; for Unicode-off eligible HIR, then try a
-    /// bounded finite-language plan; otherwise construct continuation.
+    /// Select an exact-literal plan when canonical HIR proves eligibility;
+    /// otherwise construct the continuation program.
     #[default]
     Auto,
     /// Require the direct canonical exact-literal proof.
@@ -64,9 +59,6 @@ pub enum AggregatePlanSelection {
 pub enum AggregatePlanKind {
     /// SIMD-aware `memmem::Finder::find_iter` whole-operation reducer.
     ExactLiteral,
-    /// Bounded finite-language extraction plus a linear reversed dense
-    /// Aho-Corasick/DP whole-operation reducer.
-    FiniteOrderedLiterals,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -76,19 +68,8 @@ pub enum AggregatePlanKind {
 pub enum AggregatePlanIdentity {
     /// Exact-literal plan plus count/span-sum operation identity.
     ExactLiteral(AggregateExactLiteralIdentity),
-    /// Operation-typed ordered finite-language implementation identity. The
-    /// exact source/profile remains in the enclosing cache identity.
-    FiniteOrderedLiterals(AggregateFiniteLiteralIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
-}
-
-/// Stable identity of the ordered finite-language aggregate implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AggregateFiniteLiteralIdentity {
-    pub algorithm_id: &'static str,
-    pub operation_plan_id: &'static str,
-    pub operation: AggregateOperation,
 }
 
 /// Semantic proof attached to an exact-literal facade identity.
@@ -147,24 +128,8 @@ pub enum AggregateCaptureSemantics {
 pub enum AggregateBuildAccounting {
     /// Exact-literal kernel construction certificate.
     ExactLiteral(LiteralAggregateBuildAccounting),
-    /// Finite-language extraction result compiled into the ordered reducer.
-    FiniteOrderedLiterals(AggregateFiniteLiteralBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
-}
-
-/// Construction accounting at the finite-language facade seam. Materialized
-/// words remain live while the kernel is built, so their observed capacities
-/// are included in the combined construction peak.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AggregateFiniteLiteralBuildAccounting {
-    pub extraction_work: u64,
-    pub combined_work_upper_bound: u64,
-    pub words: usize,
-    pub word_bytes: usize,
-    pub materialized_capacity_bytes: usize,
-    pub combined_peak_bytes: usize,
-    pub kernel: OrderedLiteralAggregateBuildAccounting,
 }
 
 /// Construction limits whose complete values participate in cache identity.
@@ -176,16 +141,8 @@ pub struct AggregateBuildLimits {
     pub syntax_safety: SafetyEnvelope,
     /// Maximum allocation-free direct-root literal inspection work.
     pub max_literal_planner_work: usize,
-    /// Maximum words materialized by bounded finite-language extraction.
-    pub max_finite_language_words: usize,
-    /// Maximum total payload bytes materialized by finite-language extraction.
-    pub max_finite_language_bytes: usize,
-    /// Maximum traversal, allocation, and copy work used by extraction.
-    pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
     pub exact_literal: LiteralAggregateBuildLimits,
-    /// Complete ordered finite-language construction limits.
-    pub finite_ordered_literals: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
     pub continuation: AggregateCompileLimits,
 }
@@ -196,24 +153,18 @@ impl Default for AggregateBuildLimits {
             admission: AdmissionPolicy::default(),
             syntax_safety: SafetyEnvelope::default(),
             max_literal_planner_work: 4_096,
-            max_finite_language_words: 4_096,
-            max_finite_language_bytes: 4 << 20,
-            max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
-            finite_ordered_literals: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
     }
 }
 
-/// Complete per-invocation limits. All plan families remain visible so an
+/// Complete per-invocation limits. Both plan families remain visible so an
 /// `Auto` build cannot hide a policy change when its selected plan changes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AggregateRunLimits {
     /// Exact-literal whole-operation reducer limits.
     pub exact_literal: LiteralAggregateReduceLimits,
-    /// Ordered finite-language whole-operation reducer limits.
-    pub finite_ordered_literals: OrderedLiteralAggregateReduceLimits,
     /// Continuation whole-operation limits.
     pub continuation: AggregateOperationLimits,
 }
@@ -240,8 +191,8 @@ pub struct AggregateBuildReport {
     pub continuation_strategy: Option<AggregateStrategy>,
     /// The only capture treatment admitted by these whole-match APIs.
     pub capture_semantics: AggregateCaptureSemantics,
-    /// Plan-selection work through the selected proof. This is zero when
-    /// forced continuation skips inspection.
+    /// Direct-root exact-literal inspection work. This is zero when forced
+    /// continuation skips inspection.
     pub planner_work: usize,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
@@ -308,20 +259,6 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
-    /// Bounded finite-language extraction exhausted its explicit work cap.
-    FinitePlannerWorkLimit {
-        operation: AggregateOperation,
-        selection: AggregatePlanSelection,
-        needed: u64,
-        limit: u64,
-    },
-    /// A finite-language planner buffer could not be reserved.
-    FinitePlannerAllocationFailed {
-        operation: AggregateOperation,
-        selection: AggregatePlanSelection,
-        structure: &'static str,
-        additional: usize,
-    },
     /// A forced exact-literal request was not semantically eligible.
     ExactLiteralIneligible {
         operation: AggregateOperation,
@@ -333,12 +270,6 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: LiteralAggregateBuildError,
-    },
-    /// Ordered finite-language construction failed after plan selection.
-    FiniteOrderedLiteralBuild {
-        operation: AggregateOperation,
-        selection: AggregatePlanSelection,
-        source: OrderedLiteralAggregateBuildError,
     },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
@@ -375,24 +306,6 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} exact-literal inspection needs {needed} work units, limit is {limit}"
             ),
-            Self::FinitePlannerWorkLimit {
-                operation,
-                selection,
-                needed,
-                limit,
-            } => write!(
-                f,
-                "aggregate {operation:?}/{selection:?} finite-language extraction needs {needed} work units, limit is {limit}"
-            ),
-            Self::FinitePlannerAllocationFailed {
-                operation,
-                selection,
-                structure,
-                additional,
-            } => write!(
-                f,
-                "aggregate {operation:?}/{selection:?} finite-language extraction could not reserve {additional} items for {structure}"
-            ),
             Self::ExactLiteralIneligible {
                 operation,
                 selection,
@@ -408,14 +321,6 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} exact-literal construction failed: {source}"
-            ),
-            Self::FiniteOrderedLiteralBuild {
-                operation,
-                selection,
-                source,
-            } => write!(
-                f,
-                "aggregate {operation:?}/{selection:?} ordered finite-language construction failed: {source}"
             ),
             Self::ContinuationCompile {
                 operation,
@@ -443,11 +348,8 @@ impl std::error::Error for AggregateBuildError {
         match self {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
-            Self::FiniteOrderedLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
-            | Self::FinitePlannerWorkLimit { .. }
-            | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
             | Self::InternalInvariant { .. } => None,
         }
@@ -459,8 +361,6 @@ impl std::error::Error for AggregateBuildError {
 pub enum AggregateExecutionSource {
     /// Exact-literal whole-operation refusal.
     ExactLiteral(LiteralAggregateReduceError),
-    /// Ordered finite-language whole-operation refusal.
-    FiniteOrderedLiterals(OrderedLiteralAggregateReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -471,7 +371,6 @@ impl fmt::Display for AggregateExecutionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ExactLiteral(source) => source.fmt(f),
-            Self::FiniteOrderedLiterals(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -484,7 +383,6 @@ impl std::error::Error for AggregateExecutionSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ExactLiteral(source) => Some(source),
-            Self::FiniteOrderedLiterals(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
         }
@@ -522,12 +420,6 @@ impl std::error::Error for AggregateExecutionError {
 pub enum AggregateExecutionDetails {
     /// Exact-literal upper bounds, counters, and operation identity.
     ExactLiteral(LiteralAggregateReduceAccounting),
-    /// Ordered finite-language bounds and exact post-operation counters. The
-    /// plan identity is carried by the enclosing cache identity.
-    FiniteOrderedLiterals {
-        upper_bounds: OrderedLiteralAggregateUpperBounds,
-        actual: OrderedLiteralAggregateActualCounters,
-    },
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -818,202 +710,6 @@ impl AggregateBuilder {
                 });
             }
         };
-
-        if selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
-            && !unicode
-        {
-            let extraction = crate::finite::extract(
-                &rust.hir,
-                limits.max_finite_language_words,
-                limits.max_finite_language_bytes,
-                u64::try_from(planner_work).unwrap_or(u64::MAX),
-                limits.max_finite_planner_work,
-            )
-            .map_err(|error| match error {
-                crate::BuildError::PlannerWorkLimit { needed, limit } => {
-                    AggregateBuildError::FinitePlannerWorkLimit {
-                        operation,
-                        selection,
-                        needed,
-                        limit,
-                    }
-                }
-                crate::BuildError::AllocationFailed {
-                    structure,
-                    additional,
-                } => AggregateBuildError::FinitePlannerAllocationFailed {
-                    operation,
-                    selection,
-                    structure,
-                    additional,
-                },
-                crate::BuildError::InternalInvariant(detail) => {
-                    AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail,
-                    }
-                }
-                _ => AggregateBuildError::InternalInvariant {
-                    operation,
-                    selection,
-                    detail: "finite-language extraction returned an unrelated facade error",
-                },
-            })?;
-            if let Some(words) = extraction.words {
-                let planner_work = usize::try_from(extraction.work).map_err(|_| {
-                    AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "finite-language planner work does not fit usize",
-                    }
-                })?;
-                let capture_erasure_work = expected_captures.checked_mul(2).ok_or(
-                    AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "finite-language capture accounting overflow",
-                    },
-                )?;
-                let words_capacity_bytes = words
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<Vec<u8>>())
-                    .and_then(|bytes| {
-                        words
-                            .iter()
-                            .try_fold(bytes, |total, word| total.checked_add(word.capacity()))
-                    })
-                    .ok_or(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "finite-language materialized capacity overflow",
-                    })?;
-                let mut kernel_limits = limits.finite_ordered_literals;
-                kernel_limits.max_build_work = kernel_limits
-                    .max_build_work
-                    .checked_sub(extraction.work)
-                    .ok_or(AggregateBuildError::FiniteOrderedLiteralBuild {
-                        operation,
-                        selection,
-                        source: OrderedLiteralAggregateBuildError::WorkLimit {
-                            needed: extraction.work,
-                            limit: limits.finite_ordered_literals.max_build_work,
-                        },
-                    })?;
-                kernel_limits.max_peak_bytes = kernel_limits
-                    .max_peak_bytes
-                    .checked_sub(words_capacity_bytes)
-                    .ok_or(AggregateBuildError::FiniteOrderedLiteralBuild {
-                        operation,
-                        selection,
-                        source: OrderedLiteralAggregateBuildError::PeakLimit {
-                            needed: words_capacity_bytes,
-                            limit: limits.finite_ordered_literals.max_peak_bytes,
-                        },
-                    })?;
-                let (engine, kernel_build, operation_plan_id) = match operation {
-                    AggregateOperation::Compile | AggregateOperation::Count => {
-                        let plan = OrderedLiteralCountPlan::build(&words, kernel_limits).map_err(
-                            |source| AggregateBuildError::FiniteOrderedLiteralBuild {
-                                operation,
-                                selection,
-                                source,
-                            },
-                        )?;
-                        let build = plan.build_accounting();
-                        (
-                            AggregateEngine::FiniteOrderedCount(plan),
-                            build,
-                            ORDERED_LITERAL_COUNT_PLAN_ID,
-                        )
-                    }
-                    AggregateOperation::SpanSum => {
-                        let plan = OrderedLiteralSpanSumPlan::build(&words, kernel_limits)
-                            .map_err(|source| AggregateBuildError::FiniteOrderedLiteralBuild {
-                                operation,
-                                selection,
-                                source,
-                            })?;
-                        let build = plan.build_accounting();
-                        (
-                            AggregateEngine::FiniteOrderedSpanSum(plan),
-                            build,
-                            ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-                        )
-                    }
-                    AggregateOperation::Spans => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "span operation selected finite reducer",
-                        });
-                    }
-                };
-                let combined_work_upper_bound = extraction
-                    .work
-                    .checked_add(kernel_build.build_work_upper_bound)
-                    .ok_or(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "finite-language combined construction work overflow",
-                    })?;
-                let combined_peak_bytes = words_capacity_bytes
-                    .checked_add(kernel_build.peak_bytes)
-                    .ok_or(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "finite-language combined construction peak overflow",
-                    })?;
-                if combined_peak_bytes > limits.finite_ordered_literals.max_peak_bytes {
-                    return Err(AggregateBuildError::FiniteOrderedLiteralBuild {
-                        operation,
-                        selection,
-                        source: OrderedLiteralAggregateBuildError::PeakLimit {
-                            needed: combined_peak_bytes,
-                            limit: limits.finite_ordered_literals.max_peak_bytes,
-                        },
-                    });
-                }
-                let build = AggregateFiniteLiteralBuildAccounting {
-                    extraction_work: extraction.work,
-                    combined_work_upper_bound,
-                    words: kernel_build.patterns,
-                    word_bytes: kernel_build.pattern_bytes,
-                    materialized_capacity_bytes: words_capacity_bytes,
-                    combined_peak_bytes,
-                    kernel: kernel_build,
-                };
-                let report = AggregateBuildReport {
-                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                    syntax_key,
-                    admission,
-                    syntax,
-                    operation,
-                    selection,
-                    plan: AggregatePlanKind::FiniteOrderedLiterals,
-                    continuation_strategy: None,
-                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
-                    planner_work,
-                    capture_erasure_work,
-                    captures_erased: expected_captures,
-                    build: AggregateBuildAccounting::FiniteOrderedLiterals(build),
-                    plan_identity: AggregatePlanIdentity::FiniteOrderedLiterals(
-                        AggregateFiniteLiteralIdentity {
-                            algorithm_id: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-                            operation_plan_id,
-                            operation,
-                        },
-                    ),
-                    retained_capacity_bytes: build.kernel.persistent_bytes,
-                };
-                return Ok(AggregatePlan {
-                    engine,
-                    limits,
-                    report,
-                });
-            }
-        }
         let continuation_profile = if unicode {
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
         } else {
@@ -1073,8 +769,6 @@ impl AggregateBuilder {
 #[derive(Debug)]
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
-    FiniteOrderedCount(OrderedLiteralCountPlan),
-    FiniteOrderedSpanSum(OrderedLiteralSpanSumPlan),
     Continuation(CompiledRegex),
 }
 
@@ -1147,25 +841,6 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
                 }),
-            AggregateEngine::FiniteOrderedCount(engine) => engine
-                .count(haystack, limits.finite_ordered_literals)
-                .map(|result| AggregateCountExecution::FiniteOrderedLiterals {
-                    value: result.count,
-                    upper_bounds: result.accounting.upper_bounds,
-                    actual: result.accounting.actual,
-                })
-                .map_err(|source| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::FiniteOrderedLiterals(source),
-                    )
-                }),
-            AggregateEngine::FiniteOrderedSpanSum(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "count operation retained a span-sum finite plan",
-                ),
-            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1210,25 +885,6 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
                 }),
-            AggregateEngine::FiniteOrderedSpanSum(engine) => engine
-                .span_sum(haystack, limits.finite_ordered_literals)
-                .map(|result| AggregateSpanSumExecution::FiniteOrderedLiterals {
-                    value: result.span_sum,
-                    upper_bounds: result.accounting.upper_bounds,
-                    actual: result.accounting.actual,
-                })
-                .map_err(|source| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::FiniteOrderedLiterals(source),
-                    )
-                }),
-            AggregateEngine::FiniteOrderedCount(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span-sum operation retained a count finite plan",
-                ),
-            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1264,22 +920,14 @@ impl AggregatePlan {
 
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
-    FiniteOrderedLiterals {
-        value: u64,
-        upper_bounds: OrderedLiteralAggregateUpperBounds,
-        actual: OrderedLiteralAggregateActualCounters,
-    },
-    Continuation {
-        admitted: AdmittedCount,
-        value: u64,
-    },
+    Continuation { admitted: AdmittedCount, value: u64 },
 }
 
 impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.count,
-            Self::FiniteOrderedLiterals { value, .. } | Self::Continuation { value, .. } => *value,
+            Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1288,14 +936,6 @@ impl AggregateCountExecution {
             Self::ExactLiteral(result) => {
                 AggregateExecutionDetails::ExactLiteral(result.accounting)
             }
-            Self::FiniteOrderedLiterals {
-                upper_bounds,
-                actual,
-                ..
-            } => AggregateExecutionDetails::FiniteOrderedLiterals {
-                upper_bounds,
-                actual,
-            },
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),
@@ -1306,11 +946,6 @@ impl AggregateCountExecution {
 
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
-    FiniteOrderedLiterals {
-        value: u64,
-        upper_bounds: OrderedLiteralAggregateUpperBounds,
-        actual: OrderedLiteralAggregateActualCounters,
-    },
     Continuation {
         admitted: AdmittedSpanSum,
         value: u64,
@@ -1321,7 +956,7 @@ impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
-            Self::FiniteOrderedLiterals { value, .. } | Self::Continuation { value, .. } => *value,
+            Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1330,14 +965,6 @@ impl AggregateSpanSumExecution {
             Self::ExactLiteral(result) => {
                 AggregateExecutionDetails::ExactLiteral(result.accounting)
             }
-            Self::FiniteOrderedLiterals {
-                upper_bounds,
-                actual,
-                ..
-            } => AggregateExecutionDetails::FiniteOrderedLiterals {
-                upper_bounds,
-                actual,
-            },
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),

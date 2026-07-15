@@ -2,9 +2,9 @@
 
 This is the compact source checkpoint for the latest authenticated per-job
 frontier. A full generation from exact composed source
-`e86a6ce46e3313ed69558522c5785d307394060f` (tree
-`b3d3acac9eda492dc9d779ea4615622d7019572f`) has SHA-256
-`294aba2fdc0ac429dd525c351b5b3aa710ff0be30e6d0c408b8a7ee5aa0c6092`.
+`35b22acf7db5ebf63992085a4ad3782a9e46f139` (tree
+`b63266c7be97e82b565bf2b9ce78d9608536a2a9`) has SHA-256
+`132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`.
 It used the immutable expanded manifest with SHA-256
 `09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43`,
 clean Rebar revision `463d00f31887e84c38467805b9e3122c314b9521`,
@@ -17,63 +17,61 @@ evidence.
 
 | Rebar model | Rust jobs | FRE pass | FRE unsupported | RE2 jobs | RE2 pass |
 |---|---:|---:|---:|---:|---:|
-| `compile` | 33 | 28 | 5 | 26 | 26 |
-| `count` | 133 | 66 | 67 | 109 | 109 |
+| `compile` | 33 | 17 | 16 | 26 | 26 |
+| `count` | 133 | 62 | 71 | 109 | 109 |
 | `count-spans` | 129 | 101 | 28 | 110 | 110 |
 | `count-captures` | 15 | 0 | 15 | 12 | 12 |
 | `grep` | 11 | 9 | 2 | 10 | 10 |
 | `grep-captures` | 22 | 0 | 22 | 17 | 17 |
 | `regex-redux` | 1 | 0 | 1 | 1 | 1 |
-| **Total** | **344** | **204** | **140** | **285** | **285** |
+| **Total** | **344** | **189** | **155** | **285** | **285** |
 
-FRE has no `fail` or `fault` receipt. Its 195 aggregate-facade passes comprise
-28 `compile`, 66 `count`, and 101 `count-spans` jobs; the other nine passes are
+FRE has no `fail` or `fault` receipt. Its 180 aggregate-facade passes comprise
+17 `compile`, 62 `count`, and 101 `count-spans` jobs; the other nine passes are
 the portable `grep` path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
 The optional v2 executed-plan field splits those passes into 29 exact-literal
 aggregate, 132 continuation-program aggregate, two ordered build-many literal
-plans, 17 fresh complete compile artifacts using the continuation program,
-eleven canonical Unicode compile artifacts, four bounded finite-ordered-literal
-plans, and nine portable-search rows. It is populated only after successful
-candidate execution and does not infer a plan for any unsupported receipt.
+plans, 17 fresh complete compile artifacts using the continuation program, and
+nine portable-search rows. It is
+populated only after successful candidate execution and does not infer a plan
+for any unsupported receipt.
 
 ## By benchmark/pattern family
 
 | Family | FRE pass | FRE unsupported | RE2 pass |
 |---|---:|---:|---:|
 | `captures` | 0 | 1 | 1 |
-| `curated` | 28 | 24 | 41 |
-| `dictionary` | 3 | 4 | 4 |
+| `curated` | 27 | 25 | 41 |
+| `dictionary` | 1 | 6 | 4 |
 | `folly` | 4 | 0 | 4 |
 | `grep` | 2 | 1 | 2 |
 | `hyperscan` | 14 | 1 | 0 |
-| `imported` | 83 | 24 | 107 |
+| `imported` | 79 | 28 | 107 |
 | `opt` | 20 | 15 | 26 |
-| `reported` | 8 | 11 | 17 |
+| `reported` | 7 | 12 | 17 |
 | `slow` | 4 | 0 | 4 |
 | `test` | 26 | 24 | 46 |
-| `unicode` | 10 | 12 | 16 |
-| `wild` | 2 | 23 | 17 |
-| **Total** | **204** | **140** | **285** |
+| `unicode` | 5 | 17 | 16 |
+| `wild` | 0 | 25 | 17 |
+| **Total** | **189** | **155** | **285** |
 
 The target job sets differ because Rebar definitions select engines
 independently; columns are not intended to be row-wise equivalents.
 
 ## Exact FRE refusal split
 
-The 100 aggregate compile/count/span refusals are fully typed:
+The 115 aggregate compile/count/span refusals are fully typed:
 
-- 59 Unicode-feature jobs: 42 `count` and 17 `count-spans`.
+- 68 Unicode-feature jobs: 9 `compile`, 42 `count`, and 17 `count-spans`.
   Unicode-on continuation now admits empty/literal/ASCII-range and singleton
-  scalar classes, including finite singleton case folds. The remaining
-  compile-only Unicode shapes publish bounded canonical artifacts; executable
-  non-singleton scalar classes and Unicode-word assertions remain typed
-  unsupported.
+  scalar classes, including finite singleton case folds. Non-singleton scalar
+  classes and Unicode-word assertions remain typed unsupported.
 - 2 ordered build-many `compile` jobs. Pattern cardinality is checked before
   any candidate compilation.
-- 39 bounded resource refusals: 3 `compile`, 25 `count`, and 11 `count-spans`.
+- 45 bounded resource refusals: 5 `compile`, 29 `count`, and 11 `count-spans`.
   These retain exact construction or execution quota diagnostics. Resource
   refusals are not faults and require a better plan, not a silent quota raise.
 
@@ -124,8 +122,8 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 
 1. Extend the reusable Unicode-on continuation with explicit variable-width
    UTF-8 semantics and independent differential qualification for the remaining
-   59 Unicode execution refusals. Do not weaken singleton-only admission.
-2. Introduce faster bounded aggregate plans for the 39 aggregate resource
+   68 Unicode-feature refusals. Do not weaken singleton-only admission.
+2. Introduce faster bounded aggregate plans for the 45 aggregate resource
    refusals. The
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
    quota and preserves the construction-time choice/no-fallback contract; the
@@ -137,27 +135,16 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
 4. Extend the ordered build-many plan/API to the two remaining compile jobs.
    Never emulate priority by concatenating patterns; retain the named adverse
    performance follow-up for the two admitted execution rows.
-5. Qualify cold and allocator-warm construction performance for the 28
+5. Qualify cold and allocator-warm construction performance for the seventeen
    supported compile rows, keeping construction separate from untimed semantic
-   verification. Extend only the reusable resource/build-many mechanisms to the
-   other five rows.
+   verification. Extend only the reusable Unicode/resource/build-many mechanisms
+   to the other sixteen rows.
 6. Add capture histories for the 37 capture reducer jobs; whole-match capture
    erasure is not a capture API.
 7. Admit the composite `regex-redux` job only after its complete report,
    replacement, and non-empty iteration semantics are implemented.
 
 The retained generated report SHA-256 is
-`294aba2fdc0ac429dd525c351b5b3aa710ff0be30e6d0c408b8a7ee5aa0c6092`,
+`132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`,
 and its sorted-receipts SHA-256 is
-`11a24d1800194e1f6ee2c42717d2a65723ca05146e418d1697cff4d7392f03f3`.
-
-`UNICODE_COMPILE_ARTIFACT.md` records the exact compile-only mechanism and its
-eleven newly passing job identities. The final report is byte-identical to the
-pre-format semantic report, so mechanical source formatting did not change a
-single disposition.
-
-The bounded finite-language plan adds exactly four `count` passes with no lost
-pass: `imported/leipzig/awyer-inn`, `imported/leipzig/shing`,
-`imported/leipzig/tom-sawyer-huckle-finn`, and
-`imported/leipzig/twain-insensitive`. All four execute under the published
-`aggregate-finite-ordered-literals` identity without raising a quota.
+`106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
