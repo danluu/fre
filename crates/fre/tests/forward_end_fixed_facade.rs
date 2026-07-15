@@ -49,7 +49,12 @@ fn red_forced_both_end_is_fixed_while_start_only_and_auto_stay_old() {
 fn red_facade_projects_the_fixed_span_and_preserves_absolute_windows() {
     let regex = forced(r"\A[ab]+ZQ\z");
     let haystack = b"aabZQ";
-    assert!(regex.is_match(haystack, SearchLimits::unlimited()).unwrap().0);
+    assert!(
+        regex
+            .is_match(haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0
+    );
     assert_eq!(
         regex
             .selected_end(haystack, SearchLimits::unlimited())
@@ -92,7 +97,10 @@ fn red_build_report_runtime_and_cache_identity_all_come_from_fixed_plan() {
     assert_eq!(report.plan, PlanKind::ForwardAnchored);
     assert_eq!(report.plan_storage_bytes, build.persistent_bytes);
     assert_eq!(regex.runtime_implementation_id(), FIXED_ID);
-    assert_eq!(build.implementation, fre_kernels::ForwardClassImplementation::Bitset);
+    assert_eq!(
+        build.implementation,
+        fre_kernels::ForwardClassImplementation::Bitset
+    );
 
     let limits = SearchLimits {
         max_work: 917,
@@ -109,7 +117,10 @@ fn red_build_report_runtime_and_cache_identity_all_come_from_fixed_plan() {
         fre_kernels::ForwardAnchoredByteClass::from_bytes(b"aceg").words()
     );
     assert_eq!(identity.suffix, b"ZQ");
-    assert_eq!(identity.implementation, fre_kernels::ForwardClassImplementation::Bitset);
+    assert_eq!(
+        identity.implementation,
+        fre_kernels::ForwardClassImplementation::Bitset
+    );
     assert_eq!(identity.build_limits, BuildLimits::default());
     assert_eq!(identity.search_limits, limits);
     assert_eq!(
@@ -182,9 +193,7 @@ fn red_suffix_mismatch_has_fixed_upper_bounds_and_no_prefix_examinations() {
     for offset in 0..3 {
         let mut haystack = b"abZQX".to_vec();
         haystack[2 + offset] ^= 0x20;
-        let (matched, accounting) = regex
-            .find(&haystack, SearchLimits::unlimited())
-            .unwrap();
+        let (matched, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
         assert_eq!(matched, None, "offset={offset}");
         let SearchAccounting::ForwardAnchored(accounting) = accounting else {
             panic!("forced fixed route lost forward accounting")

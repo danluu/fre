@@ -43,11 +43,11 @@ pub use fre_kernels::{
 
 use fre_automata::{Automaton, Exists, SelectedEnd, Span};
 use fre_kernels::{
-    ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
-    ForwardAnchoredPlan, ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError,
-    ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan,
-    LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
-    LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
+    AbsoluteEndFixedPlan, ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError,
+    ForwardAnchoredBuildLimits, ForwardAnchoredPlan, ForwardAnchoredSearchAccounting,
+    ForwardAnchoredSearchError, ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits,
+    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
+    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
@@ -593,9 +593,38 @@ impl PortableBuilder {
             let forward = forward_anchored::extract(&rust.hir, 0, self.limits.max_planner_work)?;
             planner_work = forward.work;
             if let Some(shape) = forward.shape {
+                if self.selection == PlanSelection::ForceForwardAnchored && shape.anchors.end {
+                    let plan = AbsoluteEndFixedPlan::build(
+                        shape.class,
+                        shape.suffix,
+                        shape.anchors,
+                        self.limits.forward_anchored,
+                    )
+                    .map_err(BuildError::ForwardAnchored)?;
+                    let build = plan.build_accounting();
+                    return Ok(PortableRegex {
+                        plan: PortablePlan::ForwardEndFixed(plan),
+                        profile: profile.clone(),
+                        limits: self.limits,
+                        report: BuildReport {
+                            profile: profile.clone(),
+                            admission,
+                            syntax,
+                            plan: PlanKind::ForwardAnchored,
+                            planner_work,
+                            lowering: None,
+                            states: 0,
+                            edges: 0,
+                            plan_storage_bytes: build.persistent_bytes,
+                            minimum_match_bytes,
+                            required_literal: None,
+                            forward_anchored: Some(build),
+                        },
+                    });
+                }
                 match ForwardAnchoredPlan::build(
                     shape.class,
-                    &shape.suffix,
+                    shape.suffix,
                     shape.anchors,
                     self.limits.forward_anchored,
                 ) {
@@ -795,6 +824,7 @@ enum PortablePlan {
     LiteralSetDfa(LiteralSetPlan),
     RequiredLiteral(RequiredLiteralPlan),
     ForwardAnchored(ForwardAnchoredPlan),
+    ForwardEndFixed(AbsoluteEndFixedPlan),
     K0(Automaton),
 }
 
@@ -806,6 +836,7 @@ impl PortablePlan {
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
+            Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
         }
     }
@@ -895,6 +926,14 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::ForwardEndFixed(fixed) => {
+                let (matched, accounting) =
+                    fixed.find(haystack, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
             PortablePlan::K0(automaton) => {
                 let report = automaton.prepare::<Exists>().search(haystack, limits)?;
                 let accounting = report.accounting();
@@ -948,6 +987,14 @@ impl PortableRegex {
             PortablePlan::ForwardAnchored(forward) => {
                 let (matched, accounting) =
                     forward.find(haystack, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::ForwardEndFixed(fixed) => {
+                let (matched, accounting) =
+                    fixed.find(haystack, forward_anchored_limits(limits))?;
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::ForwardAnchored(accounting),
@@ -1045,6 +1092,15 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::ForwardEndFixed(fixed) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) =
+                    fixed.find_window(haystack, literal_window, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
             PortablePlan::K0(automaton) => {
                 let report = automaton
                     .prepare::<Span>()
@@ -1096,21 +1152,33 @@ impl PortableRegex {
         operation: CaptureFreeOperation,
         search_limits: SearchLimits,
     ) -> Option<ForwardAnchoredCacheIdentity> {
-        let PortablePlan::ForwardAnchored(forward) = &self.plan else {
-            return None;
-        };
-        Some(ForwardAnchoredCacheIdentity {
-            schema_version: EXPLAIN_SCHEMA_VERSION,
-            plan_id: forward.plan_id(),
-            profile: self.profile.clone(),
-            operation,
-            anchors: forward.anchors(),
-            class_words: forward.class().words(),
-            suffix: forward.suffix().to_vec(),
-            implementation: forward.implementation(),
-            build_limits: self.limits,
-            search_limits,
-        })
+        match &self.plan {
+            PortablePlan::ForwardAnchored(forward) => Some(ForwardAnchoredCacheIdentity {
+                schema_version: EXPLAIN_SCHEMA_VERSION,
+                plan_id: forward.plan_id(),
+                profile: self.profile.clone(),
+                operation,
+                anchors: forward.anchors(),
+                class_words: forward.class().words(),
+                suffix: forward.suffix().to_vec(),
+                implementation: forward.implementation(),
+                build_limits: self.limits,
+                search_limits,
+            }),
+            PortablePlan::ForwardEndFixed(fixed) => Some(ForwardAnchoredCacheIdentity {
+                schema_version: EXPLAIN_SCHEMA_VERSION,
+                plan_id: fixed.plan_id(),
+                profile: self.profile.clone(),
+                operation,
+                anchors: fixed.anchors(),
+                class_words: fixed.class().words(),
+                suffix: fixed.suffix().to_vec(),
+                implementation: fixed.implementation(),
+                build_limits: self.limits,
+                search_limits,
+            }),
+            _ => None,
+        }
     }
 }
 
