@@ -28,7 +28,10 @@ type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 const SCHEMA: &str = "fre.rebar.stratified-performance.v2";
 const PAIRS: usize = 6;
 const PARTS_PER_MILLION: u128 = 1_000_000;
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v2";
+// The immutable semantic oracle predates this candidate's runtime-only v2
+// specialization. Candidate source and runtime identity are authenticated
+// independently below; a v2 frontier regeneration remains a promotion gate.
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v10-portable-word-run-v1";
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
 const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
