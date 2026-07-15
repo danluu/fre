@@ -168,9 +168,10 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    portable ASCII-word/LF `grep` rows and two relevant unchanged neighbors.
    Retain typed refusals for Unicode word state and variable-width Unicode
    scalar lowering until their own semantic and performance gates pass.
-4. Extend the ordered build-many plan/API to the two remaining compile jobs.
-   Never emulate priority by concatenating patterns; retain the named adverse
-   performance follow-up for the two admitted execution rows.
+4. Authenticate the source-only ordered compile-many projection for the two
+   exact rows named below. Never emulate priority by concatenating patterns;
+   retain the named adverse performance follow-up for the two admitted
+   execution rows.
 5. Qualify cold and allocator-warm construction performance for the seventeen
    supported compile rows, keeping construction separate from untimed semantic
    verification. Extend only the reusable Unicode/resource/build-many mechanisms

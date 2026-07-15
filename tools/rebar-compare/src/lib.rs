@@ -4943,6 +4943,29 @@ mod tests {
             matches!(resource_refusal, CandidateOutcome::Unsupported(ref reason) if reason.contains("needs 2 patterns, limit is 1")),
             "unexpected compile-many resource outcome: {resource_refusal:?}"
         );
+
+        let wrong_profile_patterns = vec!["snow".to_string(), "雪".to_string()];
+        let wrong_profile = AggregateManyBuilder::new(&wrong_profile_patterns)
+            .profile(rebar_profile())
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        let profile_request = CandidateRequest {
+            job_id: "synthetic/compile-many-profile-mismatch",
+            model: "compile",
+            patterns: &wrong_profile_patterns,
+            haystack: "snow雪".as_bytes(),
+            unicode: true,
+            case_insensitive: false,
+        };
+        let mismatch = require_aggregate_many_identity(
+            profile_request,
+            wrong_profile.build_report(),
+            AggregateManyOperation::Compile,
+        )
+        .unwrap_err();
+        assert_eq!(Status::Fault, mismatch.status);
+        assert!(mismatch.message.contains("profile/operation identity mismatch"));
     }
 
     #[test]
