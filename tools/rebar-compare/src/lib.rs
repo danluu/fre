@@ -2026,10 +2026,20 @@ fn capture_history_limits(
         report.capture_slots,
         "capture output slots",
     )?;
-    let output_bytes = checked_aggregate_mul(
+    let group_output_bytes = checked_aggregate_mul(
         output_slots,
         core::mem::size_of::<Option<fre::Match>>(),
         "capture output bytes",
+    )?;
+    let match_output_bytes = checked_aggregate_mul(
+        boundaries,
+        core::mem::size_of::<fre::AggregateCaptureMatch>(),
+        "capture match output bytes",
+    )?;
+    let output_bytes = checked_aggregate_add(
+        group_output_bytes,
+        match_output_bytes,
+        "capture total output bytes",
     )?;
     Ok(AggregateCaptureLimits {
         max_capture_slots: report.capture_slots,

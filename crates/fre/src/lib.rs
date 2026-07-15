@@ -6,7 +6,8 @@
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match count/span-sum
 //! plans without source concatenation. Whole-match aggregate plans may erase
-//! capture annotations, but no capture group API is exposed. None of these
+//! capture annotations. The explicit Unicode-off capture plan instead retains
+//! bounded capture history and exposes absolute group spans. None of these
 //! types is named `Regex`: unsupported syntax/profile/operation combinations
 //! are typed build errors, and there is no full Rust-regex/RE2 or JIT claim.
 

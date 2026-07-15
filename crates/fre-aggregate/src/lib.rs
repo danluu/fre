@@ -11,9 +11,10 @@
 //! Assertions always inspect their absolute
 //! boundary in the original haystack, even for an interior operation range;
 //! byte-consuming transitions remain confined to that range.
-//! The default compiler rejects capture HIR. A separate whole-match-only entry
-//! point transparently traverses capture children inside the same bounded
-//! compiler and accounts every erased annotation; it cannot return captures.
+//! The default compiler rejects capture HIR. One whole-match-only entry point
+//! transparently erases capture annotations. A separate capture-preserving
+//! entry point records start/end actions and reconstructs groups by bounded
+//! prioritized replay of each already selected whole-match span.
 //!
 //! Nullable unbounded repetitions are compiled with a zero/progress product.
 //! Consequently, every cycle in the resulting continuation graph consumes a

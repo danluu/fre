@@ -158,9 +158,19 @@ impl CompiledCaptureRegex {
             self.capture_slots,
             Resource::CaptureOutputBytes,
         )?;
-        let output_bytes = mul(
+        let group_output_bytes = mul(
             output_slots,
             core::mem::size_of::<Option<Span>>(),
+            Resource::CaptureOutputBytes,
+        )?;
+        let match_output_bytes = mul(
+            admitted.as_slice().len(),
+            core::mem::size_of::<CaptureMatch>(),
+            Resource::CaptureOutputBytes,
+        )?;
+        let output_bytes = add(
+            group_output_bytes,
+            match_output_bytes,
             Resource::CaptureOutputBytes,
         )?;
         enforce(
@@ -198,7 +208,11 @@ impl CompiledCaptureRegex {
             add(history_bytes, slot_scratch_bytes, Resource::PeakBytes)?,
             Resource::PeakBytes,
         )?;
-        let peak_bytes = add(scratch_bytes, output_bytes, Resource::PeakBytes)?;
+        let peak_bytes = add(
+            add(scratch_bytes, output_bytes, Resource::PeakBytes)?,
+            admitted.certificate().output_bytes,
+            Resource::PeakBytes,
+        )?;
         enforce(
             peak_bytes,
             capture_limits.max_peak_bytes,
