@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
+pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline-equality5.v2";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -164,6 +164,20 @@ fn select_class_implementation(class: ByteClass) -> Result<ClassImplementation, 
                     fourth,
                 }
             }
+            5 => {
+                let [first, second, third, fourth, fifth] = class
+                    .canonical_members::<5>()
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "canonical quint extraction",
+                    })?;
+                ClassImplementation::Quint {
+                    first,
+                    second,
+                    third,
+                    fourth,
+                    fifth,
+                }
+            }
             _ => ClassImplementation::Bitset,
         },
     };
@@ -196,6 +210,14 @@ pub enum ClassImplementation {
         second: u8,
         third: u8,
         fourth: u8,
+    },
+    /// Five canonical, ascending members scanned with a fixed equality network.
+    Quint {
+        first: u8,
+        second: u8,
+        third: u8,
+        fourth: u8,
+        fifth: u8,
     },
 }
 
@@ -1016,6 +1038,7 @@ impl ForwardAnchoredPlan {
                 ClassImplementation::Pair { .. }
                     | ClassImplementation::Triple { .. }
                     | ClassImplementation::Quad { .. }
+                    | ClassImplementation::Quint { .. }
             );
             let (relative_candidate, prefilter_calls) = if uses_edge_witness {
                 asymmetric_suffix_witness(self.suffix[0], &searched[1..])?
@@ -1094,6 +1117,7 @@ impl ForwardAnchoredPlan {
                 | ClassImplementation::Pair { .. }
                 | ClassImplementation::Triple { .. }
                 | ClassImplementation::Quad { .. }
+                | ClassImplementation::Quint { .. }
         );
         let rescan_margin = if block_scanner && window_bytes >= RANGE_BLOCK {
             RANGE_BLOCK
@@ -1203,6 +1227,13 @@ fn scan_class_prefix(
             third,
             fourth,
         } => scan_quad_prefix(bytes, first, second, third, fourth),
+        ClassImplementation::Quint {
+            first,
+            second,
+            third,
+            fourth,
+            fifth,
+        } => scan_quint_prefix(bytes, first, second, third, fourth, fifth),
     }
 }
 
@@ -1523,6 +1554,87 @@ fn scan_quad_prefix(
         .checked_add(usize::from(within_remainder < remainder.len()))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "quad remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+fn scan_quint_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+    third: u8,
+    fourth: u8,
+    fifth: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(RANGE_BLOCK / 2);
+        let low_outside = low.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third)
+                | u8::from(byte == fourth)
+                | u8::from(byte == fifth);
+            outside | (inside ^ 1)
+        });
+        let high_outside = high.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third)
+                | u8::from(byte == fourth)
+                | u8::from(byte == fifth);
+            outside | (inside ^ 1)
+        });
+        if low_outside | high_outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| {
+                    byte != first
+                        && byte != second
+                        && byte != third
+                        && byte != fourth
+                        && byte != fifth
+                })
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "quint boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed quint block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed quint blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| {
+            byte != first && byte != second && byte != third && byte != fourth && byte != fifth
+        })
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "quint remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "quint remainder examinations",
         })?;
     Ok((boundary, examined))
 }
@@ -1917,7 +2029,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1"
+            "anchored-class-suffix.asymmetric-scalar8-reverse32-inline-equality5.v2"
         );
         assert_eq!(
             pair.implementation(),
@@ -1949,19 +2061,30 @@ mod tests {
                 fourth: b'g'
             }
         );
+        let quint = plan(ByteClass::from_bytes(b"igeacig"), b"Z", false);
+        assert_eq!(
+            quint.implementation(),
+            ClassImplementation::Quint {
+                first: b'a',
+                second: b'c',
+                third: b'e',
+                fourth: b'g',
+                fifth: b'i'
+            }
+        );
 
         let bitset = plan(
-            ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+            ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x06, 0x80, 0xFF]),
             b"Z",
             false,
         );
         assert_eq!(bitset.implementation(), ClassImplementation::Bitset);
         assert_eq!(
             bitset
-                .find(&[0, 2, 4, 0x80, 0xFF, b'Z'], SearchLimits::unlimited())
+                .find(&[0, 2, 4, 6, 0x80, 0xFF, b'Z'], SearchLimits::unlimited(),)
                 .unwrap()
                 .0,
-            Some((0, 6))
+            Some((0, 7))
         );
     }
 
@@ -2288,7 +2411,7 @@ mod tests {
 
     #[test]
     fn small_set_scanners_cover_block_lanes_tails_and_arbitrary_bytes() {
-        let cases: [(ByteClass, &[u8]); 3] = [
+        let cases: [(ByteClass, &[u8]); 4] = [
             (ByteClass::from_bytes(&[0x00, 0x80]), &[0x00, 0x80]),
             (
                 ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
@@ -2297,6 +2420,10 @@ mod tests {
             (
                 ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
                 &[0x00, 0x02, 0x80, 0xFF],
+            ),
+            (
+                ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+                &[0x00, 0x02, 0x04, 0x80, 0xFF],
             ),
         ];
         let lengths = [0_usize, 1, 15, 16, 31, 32, 33, 63, 64, 65];
@@ -2329,11 +2456,12 @@ mod tests {
     }
 
     #[test]
-    fn pair_triple_and_quad_confirm_suffix_at_the_first_outsider() {
+    fn pair_through_quint_confirm_suffix_at_the_first_outsider() {
         for class in [
             ByteClass::from_bytes(b"ac"),
             ByteClass::from_bytes(b"ace"),
             ByteClass::from_bytes(b"aceg"),
+            ByteClass::from_bytes(b"acegi"),
         ] {
             let plan = plan(class, b"END", false);
             let mut haystack: Vec<u8> = [b'a', b'c'].into_iter().cycle().take(40).collect();
@@ -2356,6 +2484,7 @@ mod tests {
             ByteClass::from_bytes(b"ac"),
             ByteClass::from_bytes(b"ace"),
             ByteClass::from_bytes(b"aceg"),
+            ByteClass::from_bytes(b"acegi"),
         ] {
             let plan = plan(class, b"Z", false);
             let mut haystack = vec![b'a'; 64];
@@ -2401,7 +2530,7 @@ mod tests {
 
     #[test]
     fn candidate_prefix_accounting_is_exact_across_equality_block_edges() {
-        let cases: [(ByteClass, &[u8]); 3] = [
+        let cases: [(ByteClass, &[u8]); 4] = [
             (ByteClass::from_bytes(&[0x00, 0x80]), &[0x00, 0x80]),
             (
                 ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
@@ -2410,6 +2539,10 @@ mod tests {
             (
                 ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
                 &[0x00, 0x02, 0x80, 0xFF],
+            ),
+            (
+                ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+                &[0x00, 0x02, 0x04, 0x80, 0xFF],
             ),
         ];
         let suffix = [0x7F, 0x11, 0x22];
@@ -2475,7 +2608,7 @@ mod tests {
 
     #[test]
     fn equality_candidate_search_handles_absence_and_earlier_outsiders() {
-        let cases: [(ByteClass, &[u8]); 3] = [
+        let cases: [(ByteClass, &[u8]); 4] = [
             (ByteClass::from_bytes(&[0x00, 0x80]), &[0x00, 0x80]),
             (
                 ByteClass::from_bytes(&[0x00, 0x80, 0xFF]),
@@ -2484,6 +2617,10 @@ mod tests {
             (
                 ByteClass::from_bytes(&[0x00, 0x02, 0x80, 0xFF]),
                 &[0x00, 0x02, 0x80, 0xFF],
+            ),
+            (
+                ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+                &[0x00, 0x02, 0x04, 0x80, 0xFF],
             ),
         ];
         let suffix = [0x7F, 0x11, 0x22];
@@ -2944,11 +3081,11 @@ mod tests {
             ),
             (
                 plan(
-                    ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x80, 0xFF]),
+                    ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x06, 0x80, 0xFF]),
                     &[0x7F, 0x11, 0x7F],
                     false,
                 ),
-                &[0x00, 0x02, 0x04, 0x80, 0xFF],
+                &[0x00, 0x02, 0x04, 0x06, 0x80, 0xFF],
                 0x40,
             ),
         ];

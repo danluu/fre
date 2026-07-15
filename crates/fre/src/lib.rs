@@ -2096,17 +2096,20 @@ mod tests {
     }
 
     #[test]
-    fn es8i_runtime_identity_rejects_the_stale_forward_family_label() {
-        const ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
+    fn equality5_runtime_identity_rejects_stale_forward_family_labels() {
+        const EQUALITY5_ID: &str =
+            "anchored-class-suffix.asymmetric-scalar8-reverse32-inline-equality5.v2";
+        const STALE_ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
         const STALE_FORWARD_ID: &str = "anchored-class-suffix.forward.v1";
 
-        assert_eq!(fre_kernels::FORWARD_ANCHORED_PLAN_ID, ES8I_ID);
+        assert_eq!(fre_kernels::FORWARD_ANCHORED_PLAN_ID, EQUALITY5_ID);
         let forward = PortableBuilder::new(r"\A[a-z]+Z")
             .unicode(false)
             .plan_selection(PlanSelection::ForceForwardAnchored)
             .build()
             .unwrap();
-        assert_eq!(forward.runtime_implementation_id(), ES8I_ID);
+        assert_eq!(forward.runtime_implementation_id(), EQUALITY5_ID);
+        assert_ne!(forward.runtime_implementation_id(), STALE_ES8I_ID);
         assert_ne!(forward.runtime_implementation_id(), STALE_FORWARD_ID);
     }
 
