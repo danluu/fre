@@ -1,5 +1,5 @@
 //! Direct whole-operation reduction for one canonical Unicode scalar class or
-//! its nonempty unbounded repetition.
+//! its nonempty repetition.
 //!
 //! Construction copies a sorted, disjoint sequence of inclusive scalar
 //! ranges into a compact ASCII bitmap plus non-ASCII `(u32, u32)` pairs.
@@ -8,8 +8,9 @@
 //! match, and membership is one bitmap test or a binary search over the
 //! immutable non-ASCII ranges. Exact-one and lazy-one-or-more emit every
 //! matching scalar. Greedy-one-or-more emits one match for each maximal run of
-//! matching scalars. The latter is a fixed deterministic run automaton, not a
-//! boundary-by-state scan.
+//! matching scalars. Non-nullable bounded and lower-bounded repetitions use
+//! the same fixed deterministic run reducer: it retains only the current
+//! scalar count and byte sum, never a boundary-indexed state set.
 //!
 //! For `N` input bytes and `R` retained non-ASCII ranges, execution takes
 //! `O(N log(R + 1))` work, retains `O(R)` bytes, and uses no dynamic scratch.
@@ -22,6 +23,9 @@ use crate::Window;
 pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
 /// Stable identity for the deterministic nonempty run reducer.
 pub const RUN_PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
+/// Stable identity for symbolic counted/lower-bounded repetition.
+pub const REPEATED_RUN_PLAN_ID: &str =
+    "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-counted.v1";
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.valid-scalar.v1";
 /// Stable identity for the matched-byte-sum reducer.
@@ -30,6 +34,12 @@ pub const SPAN_SUM_OPERATION_ID: &str = "unicode-scalar-aggregate.span-sum.valid
 pub const RUN_COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.run-plus.v1";
 /// Stable identity for greedy/lazy nonempty run matched-byte summation.
 pub const RUN_SPAN_SUM_OPERATION_ID: &str = "unicode-scalar-aggregate.span-sum.run-plus.v1";
+/// Stable identity for counted/lower-bounded repetition counting.
+pub const REPEATED_RUN_COUNT_OPERATION_ID: &str =
+    "unicode-scalar-aggregate.count.run-counted.v1";
+/// Stable identity for counted/lower-bounded matched-byte summation.
+pub const REPEATED_RUN_SPAN_SUM_OPERATION_ID: &str =
+    "unicode-scalar-aggregate.span-sum.run-counted.v1";
 
 /// Complete reducer selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +57,17 @@ pub enum Repetition {
     OneOrMoreGreedy,
     /// Lazy `CLASS+?`: one match per matching scalar.
     OneOrMoreLazy,
+    /// A non-nullable repetition not represented by the two common `+`
+    /// variants. `maximum == None` denotes an unbounded upper limit.
+    RepeatedGreedy {
+        minimum: u32,
+        maximum: Option<u32>,
+    },
+    /// Lazy form of [`Repetition::RepeatedGreedy`].
+    RepeatedLazy {
+        minimum: u32,
+        maximum: Option<u32>,
+    },
 }
 
 impl Repetition {
@@ -54,6 +75,23 @@ impl Repetition {
     #[must_use]
     pub const fn is_run(self) -> bool {
         !matches!(self, Self::ExactlyOne)
+    }
+
+    const fn is_repeated(self) -> bool {
+        matches!(
+            self,
+            Self::RepeatedGreedy { .. } | Self::RepeatedLazy { .. }
+        )
+    }
+
+    const fn bounds(self) -> Option<(u32, Option<u32>, bool)> {
+        match self {
+            Self::ExactlyOne => None,
+            Self::OneOrMoreGreedy => Some((1, None, true)),
+            Self::OneOrMoreLazy => Some((1, None, false)),
+            Self::RepeatedGreedy { minimum, maximum } => Some((minimum, maximum, true)),
+            Self::RepeatedLazy { minimum, maximum } => Some((minimum, maximum, false)),
+        }
     }
 }
 
@@ -86,14 +124,18 @@ impl OperationIdentity {
     /// Return the immutable identity for an exact atom or proved `+` root.
     #[must_use]
     pub const fn for_repetition(operation: Operation, repetition: Repetition) -> Self {
-        let operation_id = match (repetition.is_run(), operation) {
-            (false, Operation::Count) => COUNT_OPERATION_ID,
-            (false, Operation::SpanSum) => SPAN_SUM_OPERATION_ID,
-            (true, Operation::Count) => RUN_COUNT_OPERATION_ID,
-            (true, Operation::SpanSum) => RUN_SPAN_SUM_OPERATION_ID,
+        let operation_id = match (repetition.is_run(), repetition.is_repeated(), operation) {
+            (false, _, Operation::Count) => COUNT_OPERATION_ID,
+            (false, _, Operation::SpanSum) => SPAN_SUM_OPERATION_ID,
+            (true, false, Operation::Count) => RUN_COUNT_OPERATION_ID,
+            (true, false, Operation::SpanSum) => RUN_SPAN_SUM_OPERATION_ID,
+            (true, true, Operation::Count) => REPEATED_RUN_COUNT_OPERATION_ID,
+            (true, true, Operation::SpanSum) => REPEATED_RUN_SPAN_SUM_OPERATION_ID,
         };
         Self {
-            plan_id: if repetition.is_run() {
+            plan_id: if repetition.is_repeated() {
+                REPEATED_RUN_PLAN_ID
+            } else if repetition.is_run() {
                 RUN_PLAN_ID
             } else {
                 PLAN_ID
@@ -278,6 +320,10 @@ pub struct SpanSumResult {
 #[non_exhaustive]
 pub enum BuildError {
     EmptyClass,
+    InvalidRepetition {
+        minimum: u32,
+        maximum: Option<u32>,
+    },
     ReversedRange { start: char, end: char },
     NonCanonicalRanges,
     RangeLimit { needed: usize, limit: usize },
@@ -293,6 +339,10 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyClass => f.write_str("Unicode scalar plan needs a nonempty class"),
+            Self::InvalidRepetition { minimum, maximum } => write!(
+                f,
+                "Unicode scalar repetition must be non-nullable and ordered, got {minimum}..={maximum:?}"
+            ),
             Self::ReversedRange { start, end } => {
                 write!(f, "Unicode scalar range {start:?}..={end:?} is reversed")
             }
@@ -506,6 +556,28 @@ impl UnicodeScalarAggregatePlan {
             Repetition::OneOrMoreGreedy
         } else {
             Repetition::OneOrMoreLazy
+        };
+        Self::build_with_repetition(ranges, repetition, limits)
+    }
+
+    /// Copy a canonical scalar class for a proved non-nullable root
+    /// repetition. This keeps counted repetition symbolic instead of
+    /// expanding the class into UTF-8 paths or repeated automaton states.
+    pub fn build_repeated(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        minimum: u32,
+        maximum: Option<u32>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        if minimum == 0 || maximum.is_some_and(|maximum| maximum < minimum) {
+            return Err(BuildError::InvalidRepetition { minimum, maximum });
+        }
+        let repetition = match (minimum, maximum, greedy) {
+            (1, None, true) => Repetition::OneOrMoreGreedy,
+            (1, None, false) => Repetition::OneOrMoreLazy,
+            (_, _, true) => Repetition::RepeatedGreedy { minimum, maximum },
+            (_, _, false) => Repetition::RepeatedLazy { minimum, maximum },
         };
         Self::build_with_repetition(ranges, repetition, limits)
     }
@@ -859,19 +931,51 @@ impl UnicodeScalarAggregatePlan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         match self.repetition {
             Repetition::ExactlyOne => {
-                self.execute_mode::<false, false, false>(haystack, window, upper)
+                self.execute_mode::<false, false, false, false>(
+                    haystack,
+                    window,
+                    upper,
+                    1,
+                    Some(1),
+                )
             }
             Repetition::OneOrMoreGreedy if self.non_ascii.is_empty() => {
-                self.execute_mode::<true, true, false>(haystack, window, upper)
+                self.execute_mode::<true, true, false, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreGreedy => {
-                self.execute_mode::<true, true, true>(haystack, window, upper)
+                self.execute_mode::<true, true, true, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreLazy if self.non_ascii.is_empty() => {
-                self.execute_mode::<true, false, false>(haystack, window, upper)
+                self.execute_mode::<true, false, false, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreLazy => {
-                self.execute_mode::<true, false, true>(haystack, window, upper)
+                self.execute_mode::<true, false, true, false>(haystack, window, upper, 1, None)
+            }
+            repetition
+                @ (Repetition::RepeatedGreedy { .. } | Repetition::RepeatedLazy { .. }) =>
+            {
+                let (minimum, maximum, greedy) = repetition
+                    .bounds()
+                    .expect("repeated variants always have bounds");
+                if greedy {
+                    if self.non_ascii.is_empty() {
+                        self.execute_mode::<true, true, false, true>(
+                            haystack, window, upper, minimum, maximum,
+                        )
+                    } else {
+                        self.execute_mode::<true, true, true, true>(
+                            haystack, window, upper, minimum, maximum,
+                        )
+                    }
+                } else if self.non_ascii.is_empty() {
+                    self.execute_mode::<true, false, false, true>(
+                        haystack, window, upper, minimum, maximum,
+                    )
+                } else {
+                    self.execute_mode::<true, false, true, true>(
+                        haystack, window, upper, minimum, maximum,
+                    )
+                }
             }
         }
     }
@@ -881,15 +985,23 @@ impl UnicodeScalarAggregatePlan {
         clippy::arithmetic_side_effects,
         reason = "the monomorphized streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled while removing all repetition-mode branches from execution"
     )]
-    fn execute_mode<const RUN: bool, const GREEDY: bool, const CACHE_RANGE: bool>(
+    fn execute_mode<
+        const RUN: bool,
+        const GREEDY: bool,
+        const CACHE_RANGE: bool,
+        const GENERAL_REPETITION: bool,
+    >(
         &self,
         haystack: &[u8],
         window: Window,
         upper: ReduceUpperBounds,
+        minimum: u32,
+        maximum: Option<u32>,
     ) -> Result<ReduceActualCounters, ReduceError> {
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
         let mut pending_run_bytes = 0_u64;
+        let mut pending_run_scalars = 0_u64;
         let mut cached_non_ascii_range = None::<usize>;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
@@ -924,7 +1036,27 @@ impl UnicodeScalarAggregatePlan {
                     }
                     let word = self.ascii[usize::from(byte / 64)];
                     let matched = word & (1_u64 << (byte % 64)) != 0;
-                    if GREEDY {
+                    if GENERAL_REPETITION {
+                        if matched {
+                            reduce_repeated_scalar(
+                                &mut actual,
+                                &mut pending_run_bytes,
+                                &mut pending_run_scalars,
+                                1,
+                                minimum,
+                                maximum,
+                                GREEDY,
+                            )?;
+                        } else {
+                            finish_repeated_run(
+                                &mut actual,
+                                &mut pending_run_bytes,
+                                &mut pending_run_scalars,
+                                minimum,
+                                GREEDY,
+                            )?;
+                        }
+                    } else if GREEDY {
                         if matched {
                             pending_run_bytes = pending_run_bytes.checked_add(1).ok_or(
                                 ReduceError::ArithmeticOverflow {
@@ -973,7 +1105,7 @@ impl UnicodeScalarAggregatePlan {
                         },
                     )?;
                 }
-                if !GREEDY {
+                if !GREEDY && !GENERAL_REPETITION {
                     actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual ASCII-run match events",
@@ -1054,7 +1186,17 @@ impl UnicodeScalarAggregatePlan {
                     u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "matched scalar width",
                     })?;
-                if GREEDY {
+                if GENERAL_REPETITION {
+                    reduce_repeated_scalar(
+                        &mut actual,
+                        &mut pending_run_bytes,
+                        &mut pending_run_scalars,
+                        width,
+                        minimum,
+                        maximum,
+                        GREEDY,
+                    )?;
+                } else if GREEDY {
                     pending_run_bytes = pending_run_bytes.checked_add(width).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "pending greedy run bytes",
@@ -1063,6 +1205,14 @@ impl UnicodeScalarAggregatePlan {
                 } else {
                     record_match(&mut actual, width)?;
                 }
+            } else if GENERAL_REPETITION {
+                finish_repeated_run(
+                    &mut actual,
+                    &mut pending_run_bytes,
+                    &mut pending_run_scalars,
+                    minimum,
+                    GREEDY,
+                )?;
             } else if GREEDY {
                 flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
             }
@@ -1082,7 +1232,15 @@ impl UnicodeScalarAggregatePlan {
                         computation: "final run reducer transition",
                     })?;
         }
-        if GREEDY {
+        if GENERAL_REPETITION {
+            finish_repeated_run(
+                &mut actual,
+                &mut pending_run_bytes,
+                &mut pending_run_scalars,
+                minimum,
+                GREEDY,
+            )?;
+        } else if GREEDY {
             flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
         }
         actual.input_bytes_advanced = position;
@@ -1255,6 +1413,63 @@ fn flush_greedy_run(
                 computation: "actual greedy run flushes",
             })?;
     *pending_run_bytes = 0;
+    Ok(())
+}
+
+fn reduce_repeated_scalar(
+    actual: &mut ReduceActualCounters,
+    pending_bytes: &mut u64,
+    pending_scalars: &mut u64,
+    width: u64,
+    minimum: u32,
+    maximum: Option<u32>,
+    greedy: bool,
+) -> Result<(), ReduceError> {
+    *pending_bytes = pending_bytes
+        .checked_add(width)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "pending repeated-run bytes",
+        })?;
+    *pending_scalars = pending_scalars
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "pending repeated-run scalars",
+        })?;
+    let complete = if greedy {
+        maximum.is_some_and(|maximum| *pending_scalars == u64::from(maximum))
+    } else {
+        *pending_scalars == u64::from(minimum)
+    };
+    if complete {
+        record_match(actual, *pending_bytes)?;
+        actual.run_flushes = actual.run_flushes.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "actual repeated-run flushes",
+            },
+        )?;
+        *pending_bytes = 0;
+        *pending_scalars = 0;
+    }
+    Ok(())
+}
+
+fn finish_repeated_run(
+    actual: &mut ReduceActualCounters,
+    pending_bytes: &mut u64,
+    pending_scalars: &mut u64,
+    minimum: u32,
+    greedy: bool,
+) -> Result<(), ReduceError> {
+    if greedy && *pending_scalars >= u64::from(minimum) {
+        record_match(actual, *pending_bytes)?;
+        actual.run_flushes = actual.run_flushes.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "actual repeated-run terminal flushes",
+            },
+        )?;
+    }
+    *pending_bytes = 0;
+    *pending_scalars = 0;
     Ok(())
 }
 
@@ -1667,6 +1882,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nonnullable_counted_repetitions_match_rust_and_scale_linearly() {
+        let ranges = [('A', 'Z'), ('a', 'z'), ('α', 'ω'), ('雪', '雪')];
+        let haystacks: [&[u8]; 7] = [
+            b"",
+            b"a-abc-abcde",
+            b"\xFFab\x80cdefZ",
+            b"--abcd",
+            b"abcd--",
+            b"----",
+            "αβγ!雪雪雪雪雪".as_bytes(),
+        ];
+        for (minimum, maximum, greedy, pattern) in [
+            (2, Some(4), true, "[A-Za-zα-ω雪]{2,4}"),
+            (2, Some(4), false, "[A-Za-zα-ω雪]{2,4}?"),
+            (3, None, true, "[A-Za-zα-ω雪]{3,}"),
+            (2, Some(2), true, "[A-Za-zα-ω雪]{2}"),
+        ] {
+            let plan = UnicodeScalarAggregatePlan::build_repeated(
+                ranges,
+                minimum,
+                maximum,
+                greedy,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let regex = RegexBuilder::new(pattern).unicode(true).build().unwrap();
+            for haystack in haystacks {
+                let expected = regex.find_iter(haystack).collect::<Vec<_>>();
+                let expected_count = u64::try_from(expected.len()).unwrap();
+                let expected_sum = expected
+                    .iter()
+                    .map(|matched| u64::try_from(matched.len()).unwrap())
+                    .sum::<u64>();
+                assert_eq!(
+                    plan.count(haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .count,
+                    expected_count,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum(haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .span_sum,
+                    expected_sum,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+            }
+        }
+
+        let window_plan = UnicodeScalarAggregatePlan::build_repeated(
+            ranges,
+            2,
+            Some(4),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let window_regex = RegexBuilder::new("[A-Za-zα-ω雪]{2,4}")
+            .unicode(true)
+            .build()
+            .unwrap();
+        let windowed = b"x\xCE\xB1\xCE\xB2!\xFF\xE9\x9B\xAA\xE9\x9B\xAAz";
+        for start in 0..=windowed.len() {
+            for end in start..=windowed.len() {
+                let expected = window_regex
+                    .find_iter(&windowed[start..end])
+                    .collect::<Vec<_>>();
+                let expected_count = u64::try_from(expected.len()).unwrap();
+                let expected_sum = expected
+                    .iter()
+                    .map(|matched| u64::try_from(matched.len()).unwrap())
+                    .sum::<u64>();
+                assert_eq!(
+                    window_plan
+                        .count_in(windowed, Window::new(start, end), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count,
+                    expected_count,
+                    "window={start}..{end}"
+                );
+                assert_eq!(
+                    window_plan
+                        .span_sum_in(
+                            windowed,
+                            Window::new(start, end),
+                            ReduceLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .span_sum,
+                    expected_sum,
+                    "window={start}..{end}"
+                );
+            }
+        }
+
+        let plan = UnicodeScalarAggregatePlan::build_repeated(
+            ranges,
+            2,
+            Some(4),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let unit = b"abcd!\xCE\xB1\xCE\xB2\xFF-";
+        let rows = [8_usize, 16, 32].map(|copies| {
+            plan.count(&unit.repeat(copies), ReduceLimits::unlimited())
+                .unwrap()
+                .accounting
+                .actual
+        });
+        for pair in rows.windows(2) {
+            assert_eq!(
+                pair[1].input_bytes_advanced,
+                pair[0].input_bytes_advanced * 2
+            );
+            assert_eq!(
+                pair[1].decode_byte_checks,
+                pair[0].decode_byte_checks * 2
+            );
+            assert_eq!(
+                pair[1].range_comparisons,
+                pair[0].range_comparisons * 2
+            );
+            assert_eq!(
+                pair[1].reducer_steps - 1,
+                (pair[0].reducer_steps - 1) * 2
+            );
+            assert_eq!(pair[1].match_events, pair[0].match_events * 2);
+            assert_eq!(pair[1].scratch_bytes, 0);
+        }
+        assert!(matches!(
+            UnicodeScalarAggregatePlan::build_repeated(
+                ranges,
+                0,
+                Some(4),
+                true,
+                BuildLimits::unlimited()
+            ),
+            Err(BuildError::InvalidRepetition { .. })
+        ));
     }
 
     #[test]
