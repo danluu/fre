@@ -84,7 +84,11 @@ fn compile_unicode_byte_stable(pattern: &str) -> Result<CompiledRegex, Error> {
     )
 }
 
-fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
+fn upstream_unicode_byte_stable_range(
+    pattern: &str,
+    haystack: &[u8],
+    range: core::ops::Range<usize>,
+) -> Vec<Span> {
     let config = MetaRegex::config().utf8_empty(false);
     let syntax = regex_automata::util::syntax::Config::new()
         .unicode(true)
@@ -94,7 +98,7 @@ fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
         .syntax(syntax)
         .build(pattern)
         .unwrap_or_else(|error| panic!("pinned Unicode oracle rejected {pattern:?}: {error}"))
-        .find_iter(haystack)
+        .find_iter(Input::new(haystack).span(range))
         .map(|matched| Span {
             start: matched.start(),
             end: matched.end(),
@@ -102,8 +106,12 @@ fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
         .collect()
 }
 
+fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
+    upstream_unicode_byte_stable_range(pattern, haystack, 0..haystack.len())
+}
+
 #[test]
-fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_variable_width_features() {
+fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_unicode_classes() {
     let cases: [(&str, &[u8]); 6] = [
         ("", &[0xFF, 0x80]),
         ("雪+", "x雪雪y☃".as_bytes()),
@@ -137,10 +145,45 @@ fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_variable_width_f
         compile_unicode_byte_stable("[雪-雫]"),
         Err(Error::Unsupported(Unsupported::UnicodeClass))
     ));
-    assert!(matches!(
-        compile_unicode_byte_stable(r"\b"),
-        Err(Error::Unsupported(Unsupported::Look(Look::WordUnicode)))
-    ));
+}
+
+#[test]
+fn unicode_word_boundary_matches_pinned_rust_at_absolute_byte_ranges() {
+    let regex = compile_unicode_byte_stable(r"\b").unwrap();
+    let haystacks: [&[u8]; 6] = [
+        b"",
+        b"ascii word",
+        "雪-Ж_é".as_bytes(),
+        &[0xFF, b'a', 0x80],
+        &[b'a', 0xE9, b'b'],
+        &[0xE9, 0x9B, 0xAA, b'_', 0xFF],
+    ];
+    for haystack in haystacks {
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let range = start..end;
+                let expected =
+                    upstream_unicode_byte_stable_range(r"\b", haystack, range.clone());
+                for strategy in STRATEGIES {
+                    let actual = regex
+                        .admit_spans(
+                            haystack,
+                            range.clone(),
+                            strategy,
+                            OperationLimits::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{strategy:?} failed {haystack:?} {range:?}: {error}")
+                        });
+                    assert_eq!(
+                        expected,
+                        actual.as_slice(),
+                        "{strategy:?} {haystack:?} {range:?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -858,7 +901,6 @@ fn unsupported_hir_is_a_typed_refusal() {
     let unsupported_looks = [
         Look::StartCRLF,
         Look::EndCRLF,
-        Look::WordUnicode,
         Look::WordUnicodeNegate,
         Look::WordStartUnicode,
         Look::WordEndUnicode,

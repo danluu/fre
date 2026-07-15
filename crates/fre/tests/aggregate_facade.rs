@@ -286,20 +286,31 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
 }
 
 #[test]
-fn unicode_word_and_crlf_assertions_remain_typed_refusals() {
-    assert!(matches!(
-        aggregate_builder(r"\b")
-            .unicode(true)
-            .plan_selection(AggregatePlanSelection::ForceContinuation)
-            .build_count(),
-        Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::Look(
-                Look::WordUnicode,
-            )),
-            ..
-        })
-    ));
+fn unicode_word_boundary_routes_through_continuation_exactly() {
+    let haystack = b"ascii \xFF snow\xE9\x9B\xAA_ \x80";
+    let expected = regex::bytes::RegexBuilder::new(r"\b")
+        .unicode(true)
+        .build()
+        .unwrap()
+        .find_iter(haystack)
+        .count();
+    let compiled = aggregate_builder(r"\b")
+        .unicode(true)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        compiled.build_report().plan_kind,
+        AggregatePlanKind::ContinuationProgram
+    );
+    let count = compiled
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(count.value(), u64::try_from(expected).unwrap());
+}
 
+#[test]
+fn crlf_assertions_remain_typed_refusals() {
     let mut crlf_profile = RustProfile::regex_1_12_4();
     crlf_profile.options.crlf = true;
     assert!(matches!(
