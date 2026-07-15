@@ -52,11 +52,13 @@ Absolute `Start` and `End` retain their existing edge kinds and remain defined
 as `p == 0` and `p == len` respectively. Together these ten edge kinds are the
 complete assertion set admitted by this slice.
 
-`StartCRLF`, `EndCRLF`, and all six Unicode word looks remain typed
-`UnsupportedFeature::LookAssertion` errors. In particular, `(?mR:$)` must
-lower to `Look::EndCRLF` and be refused; it must never be approximated by the
-LF predicate. No Unicode assertion is approximated by inspecting a byte or by
-assuming the haystack is ASCII.
+At this historical checkpoint, `StartCRLF`, `EndCRLF`, and all six Unicode word
+looks remained typed `UnsupportedFeature::LookAssertion` errors. The later
+source-only `research/portable-unicode-word-boundary/PROOF.md` mechanism
+projects exact support for positive `WordUnicode` only. In particular,
+`(?mR:$)` must lower to `Look::EndCRLF` and be refused; it must never be
+approximated by the LF predicate. No Unicode assertion is approximated by
+inspecting one byte or by assuming the haystack is ASCII.
 
 Admission follows the HIR look variant rather than the profile's global flag.
 Thus a locally ASCII `(?-u:\b)` remains exact inside a Unicode-enabled profile,
@@ -133,13 +135,14 @@ either job. The first uses ASCII word boundaries and the second uses LF-aware
 line boundaries, so they exercise the same semantics as arbitrary user
 patterns.
 
-`grep/long-words-unicode@rust/regex` must remain refused because Unicode word
-classification is outside this slice.
-At this historical checkpoint,
-`wild/ruff/unnecessary-coding-comment@rust/regex` remained refused because its
-variable-width Unicode scalar lowering was outside this slice. The later
-qualified `research/portable-unicode-classes/PROOF.md` mechanism admits that
-row; it does not change this checkpoint's evidence.
+At this historical checkpoint, `grep/long-words-unicode@rust/regex` remained
+refused because Unicode word classification and variable-width Unicode scalar
+lowering were both outside this slice. The later qualified
+`research/portable-unicode-classes/PROOF.md` mechanism supplies the scalar-class
+half and projects `wild/ruff/unnecessary-coding-comment@rust/regex`. The later
+positive-boundary mechanism supplies the other half for `long-words-unicode`.
+Their source-only composition projects that row without changing this
+historical checkpoint's evidence.
 
 After source validation, representative performance work should measure the
 two newly admitted rows against pinned Rust and against RE2 where that row has a

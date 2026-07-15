@@ -184,3 +184,21 @@ The retained generated report SHA-256 is
 `132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`,
 and its sorted-receipts SHA-256 is
 `106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
+
+## Source-only combined portable projection
+
+The later mechanisms in `research/portable-unicode-classes/PROOF.md` and
+`research/portable-unicode-word-boundary/PROOF.md` are not included in the
+authenticated tables above. The exact combined source contains both canonical
+valid-UTF-8 Unicode scalar-class lowering and the positive `WordUnicode` look
+in portable K0. It retains typed refusals for negated/start/end/half Unicode
+looks and CRLF assertions.
+
+Relative to the accepted breadth source, the positive-boundary composition
+projects exactly one additional Rebar beneficiary:
+`grep/long-words-unicode@rust/regex`. The breadth source separately projects
+`wild/ruff/unnecessary-coding-comment@rust/regex` through its scalar-class
+mechanism. Neither row changes the authenticated tables above. Both require
+fresh combined semantic qualification and a complete authenticated generation
+before any coverage statement; this remains a source projection, not coverage
+or performance evidence.
