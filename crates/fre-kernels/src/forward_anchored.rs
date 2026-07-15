@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v21";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1378,7 +1378,7 @@ const PAIR_NEON_BLOCK: usize = 16;
 const SWAR_BYTES: usize = size_of::<u64>();
 const SWAR_LOW: u64 = u64::MAX / 0xFF;
 const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
-const START_RANGE_SWAR_MIN: usize = 8;
+const START_RANGE_SWAR_MIN: usize = 1;
 const WORD_BYTES: usize = size_of::<usize>();
 const BYTE_ONES: usize = usize::MAX / 0xFF;
 const BYTE_HIGH: usize = BYTE_ONES * 0x80;
@@ -2560,8 +2560,8 @@ fn scan_fixed_range_prefix(
 mod tests {
     use super::{
         ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits,
-        ByteClass, ClassImplementation, ForwardAnchoredPlan, RANGE_BLOCK, START_RANGE_SWAR_MIN,
-        SearchError, SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
+        ByteClass, ClassImplementation, ForwardAnchoredPlan, RANGE_BLOCK, SearchError,
+        SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
         copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
         packed_outside_mask, repeat_byte, scan_swar_range_prefix,
     };
@@ -2899,7 +2899,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v21"
+            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22"
         );
         assert_eq!(
             pair.implementation(),
@@ -4113,12 +4113,13 @@ mod tests {
     #[test]
     fn start_range_swar8_threshold_and_failed_word_lanes_are_exact() {
         let plan = plan(ByteClass::inclusive(b'a', b'z'), b"Z", false);
+        let word_bytes = size_of::<usize>();
         for prefix_len in [15_usize, 16, 17, 31, 32, 33, 72, 73] {
             let mut valid = vec![b'a'; prefix_len];
             valid.push(b'Z');
             let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
             assert_eq!(matched, Some((0, valid.len())), "N={prefix_len}");
-            let expected_examined = if valid.len() == START_RANGE_SWAR_MIN {
+            let expected_examined = if valid.len() < RANGE_BLOCK && valid.len() % word_bytes == 0 {
                 valid.len() + size_of::<usize>()
             } else {
                 prefix_len + 1
@@ -4131,7 +4132,6 @@ mod tests {
         let prefix_len = 32_usize;
         let mut valid = vec![b'a'; prefix_len];
         valid.push(b'Z');
-        let word_bytes = size_of::<usize>();
         for lane in 0..word_bytes {
             let outsider = word_bytes + lane;
             let mut invalid = valid.clone();
@@ -4161,11 +4161,12 @@ mod tests {
                 valid.push(suffix);
                 let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
                 assert_eq!(matched, Some((0, valid.len())));
-                let expected_examined = if valid.len() == START_RANGE_SWAR_MIN {
-                    valid.len() + word_bytes
-                } else {
-                    prefix_len + 1
-                };
+                let expected_examined =
+                    if valid.len() < RANGE_BLOCK && valid.len() % word_bytes == 0 {
+                        valid.len() + word_bytes
+                    } else {
+                        prefix_len + 1
+                    };
                 assert_eq!(accounting.prefix_bytes_examined, expected_examined);
                 assert_eq!(
                     accounting.prefix_bytes_upper_bound,
