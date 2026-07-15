@@ -100,7 +100,9 @@ eight-byte SWAR membership words per 32-byte block with scalar recovery only
 after a failing block; that exact 32-byte recovery is isolated in a cold
 non-inlined helper. Non-single inclusive ranges at 16 bytes and above use
 native-word SWAR membership with exact scalar recovery inside only a failing
-word. Other class shapes and fixed-end verification retain their prior leaves.
+word. The preflight activates its one-word rescan margin at the same inclusive
+16-byte boundary, including the exact-threshold suffix word. Other class
+shapes and fixed-end verification retain their prior leaves.
 The direct legacy kernel constructor is unchanged.
 
 Extraction borrows the suffix from the parsed HIR and preserves its checked
