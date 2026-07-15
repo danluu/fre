@@ -4186,7 +4186,7 @@ mod tests {
                     );
                     assert_eq!(
                         accounting.suffix_confirmation_attempted,
-                        valid.len() < RANGE_BLOCK
+                        valid.len() < RANGE_BLOCK && position != 0
                     );
                     assert!(accounting.prefix_bytes_examined <= valid.len() + word_bytes);
                 }
