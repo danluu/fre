@@ -334,7 +334,7 @@ fn is_ascii_word(byte: u8) -> bool {
 
 fn is_unicode_word(scalar: char) -> bool {
     if scalar.is_ascii() {
-        return is_ascii_word(scalar as u8);
+        return scalar == '_' || scalar.is_ascii_alphanumeric();
     }
     regex_syntax::try_is_word_character(scalar)
         .expect("fre enables regex-syntax's Unicode Perl tables")
