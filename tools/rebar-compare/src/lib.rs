@@ -65,7 +65,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v7";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v8";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 
 const fn default_fre_unicode_compile_artifact_bytes() -> usize {

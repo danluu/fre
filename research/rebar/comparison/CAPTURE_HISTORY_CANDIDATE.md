@@ -1,15 +1,18 @@
 # Bounded capture-history candidate
 
 Status: source-only candidate recomposed on exact canonical base
-`bf53ce82a17df0351d9e7a936271e5ebfa8c9635` (tree
-`57565e86fb8abf59a58c0ebb575a86916db829ca`). No compiler, formatter,
+`f85cdfda7bc3968f6910d122bb4cffe32db47dbd` (tree
+`260ab9e1ca6d3e4979e50dcf5deab3a572d57c8b`). No compiler, formatter,
 executable test, report generation, assembly, or timing command was run in this
 lane. The candidate adapter identity advances to
-`fre-current-aggregate-v7` for the composed scalar-plus-capture route; the direct
-Unicode scalar plan plus the ordered build-many and timing surfaces retain
-their existing plan, schema, and timing identities. The authenticated frontier
-remains 214 pass / 130 unsupported, and this document claims no additional
-coverage.
+`fre-current-aggregate-v8` for the combined breadth-plus-capture route. The
+direct Unicode scalar, compile-only Unicode fallback, finite reducer, portable
+Unicode scalar-class, ordered build-many, and timing surfaces retain their
+existing plan, schema, route, and timing identities. No combined report has
+been generated. The separately authenticated direct-scalar frontier remains
+214 pass / 130 unsupported, while the breadth source retains only its documented
+overlap-aware projected ceiling. Capture adds a bounded evaluation universe of
+at most 22 rows, not authenticated coverage or 22 projected passes.
 
 ## Semantic boundary
 
