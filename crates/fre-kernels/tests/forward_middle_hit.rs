@@ -4,7 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v9";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-512-swar8-triple-candidate-swar8x4-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v10";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -148,5 +148,81 @@ fn pair_quad_forward_middle_threshold_is_exact_at_71_72_73() {
             assert_eq!(accounting.prefix_bytes_examined, boundary + 1);
             assert!(accounting.suffix_confirmation_attempted);
         }
+    }
+}
+
+#[test]
+fn triple_swar_candidate_boundaries_have_exact_accounting() {
+    assert_eq!(FORWARD_ANCHORED_PLAN_ID, MIDDLE_HIT_PLAN_ID);
+    let candidate = plan(&[0x00, 0x80, 0xFF], &[0x7F]);
+
+    for (prefix_len, expected_calls) in [
+        (31_usize, 1_usize),
+        (32, 1),
+        (33, 1),
+        (55, 0),
+        (56, 0),
+        (63, 0),
+        (64, 1),
+        (65, 1),
+        (127, 1),
+        (128, 1),
+        (255, 1),
+        (256, 1),
+    ] {
+        let mut haystack: Vec<u8> = [0x00, 0x80, 0xFF]
+            .into_iter()
+            .cycle()
+            .take(prefix_len)
+            .collect();
+        haystack.push(0x7F);
+        let (span, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(span, Some((0, haystack.len())), "prefix={prefix_len}");
+        assert_eq!(
+            accounting.prefilter_calls, expected_calls,
+            "prefix={prefix_len}"
+        );
+        assert_eq!(
+            accounting.prefix_bytes_examined,
+            prefix_len.checked_add(1).unwrap(),
+            "prefix={prefix_len}"
+        );
+        assert_eq!(
+            accounting.prefix_bytes_upper_bound,
+            haystack.len().checked_add(32).unwrap(),
+            "prefix={prefix_len}"
+        );
+    }
+}
+
+#[test]
+fn triple_swar_candidate_recovers_every_arbitrary_byte_outsider() {
+    let candidate = plan(&[0x00, 0x80, 0xFF], &[0x7F]);
+    let prefix_len = 256_usize;
+    for outsider in 0..prefix_len {
+        let mut haystack: Vec<u8> = [0x00, 0x80, 0xFF]
+            .into_iter()
+            .cycle()
+            .take(prefix_len)
+            .collect();
+        haystack[outsider] = 0x01;
+        haystack.push(0x7F);
+        let (span, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        let expected_examined = if outsider == 0 {
+            1
+        } else {
+            let block_start = outsider / 32 * 32;
+            1 + block_start + 32 + outsider % 32 + 1
+        };
+        assert_eq!(span, None, "outsider={outsider}");
+        assert_eq!(
+            accounting.prefix_bytes_examined, expected_examined,
+            "outsider={outsider}"
+        );
+        assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
     }
 }
