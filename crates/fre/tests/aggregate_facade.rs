@@ -216,10 +216,8 @@ fn continuation_details(
             certificate,
             accounting,
         } => (certificate, accounting),
-        AggregateExecutionDetails::ExactLiteral(_) => {
-            panic!("expected continuation execution details")
-        }
-        AggregateExecutionDetails::FiniteOrderedLiterals { .. } => {
+        AggregateExecutionDetails::ExactLiteral(_)
+        | AggregateExecutionDetails::FiniteOrderedLiterals { .. } => {
             panic!("expected continuation execution details")
         }
     }
@@ -958,10 +956,10 @@ fn unicode_singleton_case_folds_use_byte_stable_continuation() {
     ));
 }
 
-fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
+fn unicode_exact_build_error(limits: &AggregateBuildLimits) -> AggregateBuildError {
     aggregate_builder("雪")
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
-        .limits(limits)
+        .limits(*limits)
         .build_count()
         .unwrap_err()
 }
@@ -1023,7 +1021,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let mut one_below_build = exact_build;
     one_below_build.max_literal_planner_work = 0;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::LiteralPlannerWorkLimit {
             needed: 1,
             limit: 0,
@@ -1033,7 +1031,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_needle_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::NeedleLimit { .. },
             ..
@@ -1042,7 +1040,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_build_work -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::WorkLimit { .. },
             ..
@@ -1051,7 +1049,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_scratch_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::ScratchLimit { .. },
             ..
@@ -1060,7 +1058,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_persistent_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::PersistentLimit { .. },
             ..
@@ -1069,7 +1067,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     one_below_build = exact_build;
     one_below_build.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        unicode_exact_build_error(one_below_build),
+        unicode_exact_build_error(&one_below_build),
         AggregateBuildError::ExactLiteralBuild {
             source: LiteralAggregateBuildError::PeakLimit { .. },
             ..
@@ -1516,11 +1514,11 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
     }
 }
 
-fn exact_build_error(limits: AggregateBuildLimits) -> LiteralAggregateBuildError {
+fn exact_build_error(limits: &AggregateBuildLimits) -> LiteralAggregateBuildError {
     match aggregate_builder("needle")
         .unicode(false)
         .plan_selection(AggregatePlanSelection::ForceExactLiteral)
-        .limits(limits)
+        .limits(*limits)
         .build_count()
     {
         Err(AggregateBuildError::ExactLiteralBuild { source, .. }) => source,
@@ -1560,31 +1558,31 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
     let mut one_below = limits;
     one_below.exact_literal.max_needle_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::NeedleLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_build_work -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::WorkLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_scratch_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::ScratchLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_persistent_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::PersistentLimit { .. }
     ));
     one_below = limits;
     one_below.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        exact_build_error(one_below),
+        exact_build_error(&one_below),
         LiteralAggregateBuildError::PeakLimit { .. }
     ));
 
