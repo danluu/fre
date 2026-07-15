@@ -3079,7 +3079,6 @@ fn aggregate_capture_build_error(error: &AggregateCaptureBuildError) -> Executio
         | AggregateCaptureBuildError::ExactLiteralUnavailable
         | AggregateCaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
         AggregateCaptureBuildError::Compile(source) => aggregate_engine_error(source, message),
-        AggregateCaptureBuildError::InternalInvariant(_) => ExecutionError::fault(message),
         _ => ExecutionError::fault(message),
     }
 }
@@ -4799,6 +4798,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one directed test audits fresh single and ordered-many publication, identity, and retained caps as one boundary"
+    )]
     fn current_fre_compile_constructs_fresh_single_and_ordered_many_artifacts() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
