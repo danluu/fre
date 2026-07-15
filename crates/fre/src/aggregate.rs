@@ -69,7 +69,7 @@ pub enum AggregatePlanIdentity {
     /// Exact-literal plan plus count/span-sum operation identity.
     ExactLiteral(AggregateExactLiteralIdentity),
     /// Semantic continuation-program identity.
-    Continuation(AggregatePlanId),
+    Continuation(AggregateContinuationIdentity),
 }
 
 /// Semantic proof attached to an exact-literal facade identity.
@@ -91,6 +91,28 @@ pub struct AggregateExactLiteralIdentity {
     pub semantics: AggregateExactLiteralSemantics,
     /// Native kernel and operation identity.
     pub kernel: LiteralAggregateOperationIdentity,
+}
+
+/// Profile proof attached to a continuation-program facade identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateContinuationSemantics {
+    /// Rust bytes with Unicode disabled and empty matches at every byte
+    /// boundary.
+    UnicodeOffByteBoundaries,
+    /// Rust bytes with Unicode enabled, `utf8(false)` and
+    /// `utf8_empty(false)`, restricted to canonical HIR whose consuming and
+    /// assertion transitions are byte-stable.
+    UnicodeOnByteStableHir,
+}
+
+/// Facade identity that prevents the same byte program from erasing the
+/// constructor profile that justified it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateContinuationIdentity {
+    /// Profile-specific semantic proof selected during construction.
+    pub semantics: AggregateContinuationSemantics,
+    /// Stable identity of the lowered continuation program.
+    pub program: AggregatePlanId,
 }
 
 /// Capture policy in every currently exposed aggregate cache identity.
@@ -224,12 +246,6 @@ pub enum AggregateLiteralIneligibility {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AggregateBuildError {
-    /// Unicode-enabled input fell outside the nonempty canonical-literal
-    /// admission, and general Unicode continuation execution is unavailable.
-    UnicodeEnabled {
-        operation: AggregateOperation,
-        selection: AggregatePlanSelection,
-    },
     /// Syntax/profile/admission failure.
     Syntax {
         operation: AggregateOperation,
@@ -273,13 +289,6 @@ pub enum AggregateBuildError {
 impl fmt::Display for AggregateBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnicodeEnabled {
-                operation,
-                selection,
-            } => write!(
-                f,
-                "aggregate {operation:?}/{selection:?} Unicode-enabled input is outside the nonempty exact-literal admission and general Unicode continuation execution is unavailable"
-            ),
             Self::Syntax {
                 operation,
                 selection,
@@ -340,8 +349,7 @@ impl std::error::Error for AggregateBuildError {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
-            Self::UnicodeEnabled { .. }
-            | Self::LiteralPlannerWorkLimit { .. }
+            Self::LiteralPlannerWorkLimit { .. }
             | Self::ExactLiteralIneligible { .. }
             | Self::InternalInvariant { .. } => None,
         }
@@ -438,8 +446,8 @@ pub struct AggregateBuilder {
 
 impl AggregateBuilder {
     /// Start from the pinned Rust byte profile. Unicode defaults to enabled;
-    /// only the separately certified nonempty canonical-literal subset is
-    /// admitted directly in that mode.
+    /// exact literals and byte-stable continuation HIR are admitted in that
+    /// mode; variable-width Unicode transitions remain typed refusals.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {
@@ -458,8 +466,8 @@ impl AggregateBuilder {
         self
     }
 
-    /// Set Unicode syntax mode. `true` admits only the nonempty exact-literal
-    /// proof; general Unicode continuation execution remains a typed refusal.
+    /// Set Unicode syntax mode. `true` admits nonempty exact literals and the
+    /// separately certified byte-stable continuation subset.
     #[must_use]
     pub fn unicode(mut self, enabled: bool) -> Self {
         self.profile.options.unicode = enabled;
@@ -541,15 +549,6 @@ impl AggregateBuilder {
                 reason: AggregateLiteralIneligibility::SpanOperation,
             });
         }
-        if unicode
-            && (selection == AggregatePlanSelection::ForceContinuation
-                || operation == AggregateOperation::Spans)
-        {
-            return Err(AggregateBuildError::UnicodeEnabled {
-                operation,
-                selection,
-            });
-        }
         let profile = CompatibilityProfile::RustBytes(self.profile);
         let request = fre_syntax::ParseRequest::rust(self.pattern, profile)
             .with_admission(limits.admission)
@@ -595,10 +594,7 @@ impl AggregateBuilder {
                             AggregateLiteralIneligibility::UnicodeCaseInsensitiveOutsideAdmission,
                     });
                 }
-                return Err(AggregateBuildError::UnicodeEnabled {
-                    operation,
-                    selection,
-                });
+                None
             }
             _ => Some(
                 inspect_exact_literal(
@@ -703,12 +699,6 @@ impl AggregateBuilder {
                         reason,
                     });
                 }
-                if unicode {
-                    return Err(AggregateBuildError::UnicodeEnabled {
-                        operation,
-                        selection,
-                    });
-                }
                 work
             }
             None => 0,
@@ -720,9 +710,14 @@ impl AggregateBuilder {
                 });
             }
         };
+        let continuation_profile = if unicode {
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
+        } else {
+            RustByteProfile::PINNED_1_12_4
+        };
         let engine = CompiledRegex::from_hir_erasing_captures_for_whole_match(
             &rust.hir,
-            RustByteProfile::PINNED_1_12_4,
+            continuation_profile,
             limits.continuation,
         )
         .map_err(|source| AggregateBuildError::ContinuationCompile {
@@ -753,7 +748,14 @@ impl AggregateBuilder {
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
             build: AggregateBuildAccounting::Continuation(compile),
-            plan_identity: AggregatePlanIdentity::Continuation(engine.plan_id()),
+            plan_identity: AggregatePlanIdentity::Continuation(AggregateContinuationIdentity {
+                semantics: if unicode {
+                    AggregateContinuationSemantics::UnicodeOnByteStableHir
+                } else {
+                    AggregateContinuationSemantics::UnicodeOffByteBoundaries
+                },
+                program: engine.plan_id(),
+            }),
             retained_capacity_bytes: compile.program_bytes,
         };
         Ok(AggregatePlan {

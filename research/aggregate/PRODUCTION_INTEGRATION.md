@@ -117,7 +117,8 @@ and anchors. Separate tests establish:
 - exact compile-limit success and one-below refusal with captures;
 - fixed strategy and operation identities, full-haystack certificate ranges,
   retained program capacity, and execution accounting;
-- Unicode-on refusal for both empty and ASCII patterns;
+- Unicode-on byte-stable empty, literal, class, assertion, and composition
+  differentials, plus typed refusal of variable-width Unicode features;
 - capture-equivalent program IDs but distinct source/cache identities;
 - no execution fallback after a one-below storage refusal; and
 - unchanged portable single-search plan selection.

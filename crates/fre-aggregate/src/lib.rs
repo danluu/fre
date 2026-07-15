@@ -1,11 +1,14 @@
 //! Bounded whole-operation regex iteration for FRE.
 //!
-//! This crate accepts canonical [`regex_syntax::hir::Hir`] for one explicit
-//! profile: Rust regex byte matching with Unicode mode disabled. Its admitted
-//! semantic program is capture-free and consists of empty expressions, byte
-//! literals, byte classes, ordered alternation, concatenation, whole-operation
-//! absolute and LF-aware line assertions, ASCII word assertions, and arbitrary
-//! nested greedy or lazy repetition. Assertions always inspect their absolute
+//! This crate accepts canonical [`regex_syntax::hir::Hir`] for pinned Rust
+//! regex byte profiles. Unicode-off admits the complete byte program below;
+//! Unicode-on admits the same byte-stable subset after parsing has expanded
+//! literals, but refuses variable-width Unicode classes and Unicode word
+//! assertions. The semantic program is capture-free and consists of empty
+//! expressions, byte literals, byte classes, ordered alternation,
+//! concatenation, whole-operation absolute and LF-aware line assertions,
+//! ASCII word assertions, and arbitrary nested greedy or lazy repetition.
+//! Assertions always inspect their absolute
 //! boundary in the original haystack, even for an interior operation range;
 //! byte-consuming transitions remain confined to that range.
 //! The default compiler rejects capture HIR. A separate whole-match-only entry

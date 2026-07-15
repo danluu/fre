@@ -67,6 +67,78 @@ fn upstream_range(pattern: &str, haystack: &[u8], range: core::ops::Range<usize>
         .collect()
 }
 
+fn parse_unicode_byte_stable(pattern: &str) -> Hir {
+    regex_syntax::ParserBuilder::new()
+        .unicode(true)
+        .utf8(false)
+        .build()
+        .parse(pattern)
+        .unwrap_or_else(|error| panic!("failed to parse Unicode pattern {pattern:?}: {error}"))
+}
+
+fn compile_unicode_byte_stable(pattern: &str) -> Result<CompiledRegex, Error> {
+    CompiledRegex::from_hir(
+        &parse_unicode_byte_stable(pattern),
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+}
+
+fn upstream_unicode_byte_stable(pattern: &str, haystack: &[u8]) -> Vec<Span> {
+    let config = MetaRegex::config().utf8_empty(false);
+    let syntax = regex_automata::util::syntax::Config::new()
+        .unicode(true)
+        .utf8(false);
+    MetaRegex::builder()
+        .configure(config)
+        .syntax(syntax)
+        .build(pattern)
+        .unwrap_or_else(|error| panic!("pinned Unicode oracle rejected {pattern:?}: {error}"))
+        .find_iter(haystack)
+        .map(|matched| Span {
+            start: matched.start(),
+            end: matched.end(),
+        })
+        .collect()
+}
+
+#[test]
+fn unicode_on_byte_stable_hir_matches_rebar_profile_and_rejects_variable_width_features() {
+    let cases: [(&str, &[u8]); 6] = [
+        ("", &[0xFF, 0x80]),
+        ("雪+", "x雪雪y☃".as_bytes()),
+        ("(?:雪a|☃b)", "☃b雪a雪b".as_bytes()),
+        (r"[a-c]+", &[0xFF, b'a', b'b', b'd', b'c']),
+        (r"(?-u:\xFF+)", &[b'a', 0xFF, 0xFF, b'b']),
+        (r"\A(?:a|雪)+\z", "a雪a".as_bytes()),
+    ];
+    for (pattern, haystack) in cases {
+        let regex = compile_unicode_byte_stable(pattern)
+            .unwrap_or_else(|error| panic!("byte-stable compile failed for {pattern:?}: {error}"));
+        let expected = upstream_unicode_byte_stable(pattern, haystack);
+        for strategy in STRATEGIES {
+            let actual = regex
+                .admit_spans(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(actual.as_slice(), expected, "{strategy:?}/{pattern:?}");
+        }
+    }
+
+    assert!(matches!(
+        compile_unicode_byte_stable(r"\pL"),
+        Err(Error::Unsupported(Unsupported::UnicodeClass))
+    ));
+    assert!(matches!(
+        compile_unicode_byte_stable(r"\b"),
+        Err(Error::Unsupported(Unsupported::Look(Look::WordUnicode)))
+    ));
+}
+
 #[test]
 fn directed_nested_nullable_priority_and_invalid_bytes_match_rust_1_12_4() {
     let patterns = [
@@ -929,6 +1001,21 @@ fn plan_and_operation_identities_are_deterministic_and_typed() {
     let second = compile(r"(?:(?:|a){1,2}?b?)*");
     assert_eq!(first.plan_id(), second.plan_id());
     assert_ne!(compile("a*").plan_id(), compile("a*?").plan_id());
+    let unicode_off_hir = parse("a+");
+    let unicode_off = CompiledRegex::from_hir(
+        &unicode_off_hir,
+        RustByteProfile::PINNED_1_12_4,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let unicode_on_hir = parse_unicode_byte_stable("a+");
+    let unicode_on = CompiledRegex::from_hir(
+        &unicode_on_hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    assert_ne!(unicode_off.plan_id(), unicode_on.plan_id());
     let mut assertion_ids = ASSERTION_CASES
         .iter()
         .map(|(look, _)| {

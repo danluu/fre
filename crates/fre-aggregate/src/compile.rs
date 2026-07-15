@@ -11,17 +11,33 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 ///
 /// HIR intentionally does not retain every parser option. In particular, an
 /// empty HIR cannot reveal whether Unicode mode was enabled. Passing this
-/// token asserts that the HIR was produced for `regex::bytes` with Unicode
-/// mode disabled, corresponding to a `regex-syntax` parser configured with
-/// `unicode(false)` and `utf8(false)`.
+/// token asserts both the pinned parser configuration and the empty-match
+/// boundary policy. Unicode-on callers receive only the byte-stable HIR
+/// subset: literals, byte classes, ASCII-only Unicode classes, byte-oriented
+/// assertions and their regular composition. Variable-width Unicode classes
+/// and Unicode word assertions remain typed refusals.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
-    private: (),
+    unicode: bool,
 }
 
 impl RustByteProfile {
-    /// Pinned production profile for regex 1.12.4 / regex-syntax 0.8.11.
-    pub const PINNED_1_12_4: Self = Self { private: () };
+    /// Pinned Unicode-off production profile for regex 1.12.4 /
+    /// regex-syntax 0.8.11 with byte-boundary empty matches.
+    pub const PINNED_1_12_4: Self = Self { unicode: false };
+
+    /// Pinned Unicode-on Rust-bytes profile with `utf8(false)` and
+    /// `utf8_empty(false)`, restricted by validation to byte-stable HIR.
+    pub const PINNED_1_12_4_UNICODE_ON_BYTE_STABLE: Self = Self { unicode: true };
+
+    const fn identity_domain(self) -> &'static [u8] {
+        if self.unicode {
+            b"fre.aggregate.rust.bytes.unicode-on-byte-stable.v1"
+        } else {
+            // Preserve the pre-existing Unicode-off identities exactly.
+            b"fre.aggregate.rust.bytes.unicode-off.v2"
+        }
+    }
 }
 
 /// Stable identity of the semantic continuation program.
@@ -85,7 +101,7 @@ impl CompiledRegex {
 
     fn compile(
         hir: &Hir,
-        _profile: RustByteProfile,
+        profile: RustByteProfile,
         limits: CompileLimits,
         capture_policy: CapturePolicy,
     ) -> Result<Self, Error> {
@@ -120,7 +136,7 @@ impl CompiledRegex {
             split_rank,
             split_count,
         };
-        let plan_id = plan_identity(&program, &mut budget)?;
+        let plan_id = plan_identity(&program, profile, &mut budget)?;
         let accounting = budget.finish();
         Ok(Self {
             program,
@@ -807,11 +823,15 @@ fn program_bytes(states: usize, order: usize, ranks: usize) -> Result<usize, Err
     )
 }
 
-fn plan_identity(program: &Program, budget: &mut CompileBudget) -> Result<PlanId, Error> {
+fn plan_identity(
+    program: &Program,
+    profile: RustByteProfile,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
     let mut first = StableHash::new(0xcbf2_9ce4_8422_2325);
     let mut second = StableHash::new(0x8422_2325_cbf2_9ce4);
-    first.bytes(b"fre.aggregate.rust.bytes.unicode-off.v2");
-    second.bytes(b"fre.aggregate.rust.bytes.unicode-off.v2");
+    first.bytes(profile.identity_domain());
+    second.bytes(profile.identity_domain());
     hash_usize(&mut first, program.entry);
     hash_usize(&mut second, program.entry);
     for inst in &program.insts {

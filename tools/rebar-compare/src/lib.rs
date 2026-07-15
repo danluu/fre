@@ -19,12 +19,12 @@ use std::{fmt::Write as _, io::Write as _};
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateCountRegex, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionSource, AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, LiteralAggregateReduceLimits, PortableBuilder, RustProfile,
-    SearchLimits,
+    AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
+    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateOperationLimits,
+    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
+    AggregateSpanSumRegex, AggregateStrategy, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -1966,7 +1966,7 @@ fn aggregate_run_limits(
     }
 }
 
-fn require_unicode_exact_identity(
+fn require_unicode_plan_identity(
     report: &AggregateBuildReport,
     unicode: bool,
     operation: LiteralAggregateOperation,
@@ -1980,11 +1980,16 @@ fn require_unicode_exact_identity(
             if identity.semantics
                 == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
                 && identity.kernel.operation == operation
+    ) || matches!(
+        report.plan_identity,
+        AggregatePlanIdentity::Continuation(identity)
+            if identity.semantics
+                == AggregateContinuationSemantics::UnicodeOnByteStableHir
     ) {
         Ok(())
     } else {
         Err(ExecutionError::fault(format!(
-            "Unicode exact-literal semantic identity mismatch for {operation:?}: {:?}",
+            "Unicode aggregate semantic identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )))
     }
@@ -2037,8 +2042,7 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
 fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
     let message = format!("FRE aggregate build refused input: {error}");
     match &error {
-        AggregateBuildError::UnicodeEnabled { .. }
-        | AggregateBuildError::Syntax { .. }
+        AggregateBuildError::Syntax { .. }
         | AggregateBuildError::LiteralPlannerWorkLimit { .. }
         | AggregateBuildError::ExactLiteralIneligible { .. } => {
             ExecutionError::unsupported(message)
@@ -2068,7 +2072,7 @@ fn fre_aggregate_count(
         .strategy(AggregateStrategy::ReverseSequentialRows)
         .build_count()
         .map_err(|error| aggregate_build_error(&error))?;
-    require_unicode_exact_identity(
+    require_unicode_plan_identity(
         regex.build_report(),
         request.unicode,
         LiteralAggregateOperation::Count,
@@ -2105,7 +2109,7 @@ fn fre_aggregate_span_sum(
         .strategy(AggregateStrategy::ReverseSequentialRows)
         .build_span_sum()
         .map_err(|error| aggregate_build_error(&error))?;
-    require_unicode_exact_identity(
+    require_unicode_plan_identity(
         regex.build_report(),
         request.unicode,
         LiteralAggregateOperation::SpanSum,
@@ -2168,7 +2172,7 @@ impl TimedFreAggregate {
                         job.id
                     )));
                 }
-                require_unicode_exact_identity(
+                require_unicode_plan_identity(
                     regex.build_report(),
                     job.regex.unicode,
                     LiteralAggregateOperation::Count,
@@ -2202,7 +2206,7 @@ impl TimedFreAggregate {
                         job.id
                     )));
                 }
-                require_unicode_exact_identity(
+                require_unicode_plan_identity(
                     regex.build_report(),
                     job.regex.unicode,
                     LiteralAggregateOperation::SpanSum,
@@ -3604,32 +3608,32 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_narrowly_admits_unicode_literals_and_refuses_other_unsupported_work() {
+    fn current_fre_admits_byte_stable_unicode_hir_and_refuses_variable_width_work() {
         let limits = RunLimits::default();
         let empty = current_fre("count", &[String::new()], b"a", true, false, &limits);
-        assert!(
-            matches!(empty, CandidateOutcome::Unsupported(ref reason) if reason.contains("outside the nonempty exact-literal admission")),
-            "unexpected Unicode empty outcome: {empty:?}"
+        assert_current_fre_execution(empty, 2, "aggregate-continuation-program");
+        assert_current_fre_execution(
+            current_fre("count", &["a|b".to_string()], b"baab", true, false, &limits),
+            4,
+            "aggregate-continuation-program",
         );
         assert_current_fre_execution(
             current_fre("count", &["a".to_string()], b"baab", true, false, &limits),
             2,
             "aggregate-exact-literal",
         );
-        for (pattern, case_insensitive) in [("a|b", false), ("рус", true)] {
-            let outcome = current_fre(
-                "count",
-                &[pattern.to_string()],
-                "a русский".as_bytes(),
-                true,
-                case_insensitive,
-                &limits,
-            );
-            assert!(
-                matches!(outcome, CandidateOutcome::Unsupported(ref reason) if reason.contains("outside the nonempty exact-literal admission")),
-                "unexpected broader Unicode outcome: {outcome:?}"
-            );
-        }
+        let folded = current_fre(
+            "count",
+            &["рус".to_string()],
+            "a русский".as_bytes(),
+            true,
+            true,
+            &limits,
+        );
+        assert!(
+            matches!(folded, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
+            "unexpected variable-width Unicode outcome: {folded:?}"
+        );
 
         let build_many = vec!["(".to_string(), "a".to_string()];
         let outcome = current_fre("count", &build_many, b"a", false, false, &limits);

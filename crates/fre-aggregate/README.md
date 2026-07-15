@@ -4,9 +4,11 @@
 iteration. It is integrated into the production facade for operation-specific
 whole-match spans, count, and matched-byte sum.
 
-The input contract is canonical `regex-syntax` 0.8.11 HIR plus
-`RustByteProfile::PINNED_1_12_4`, which asserts `regex::bytes` semantics with
-Unicode mode disabled. The exact admitted HIR subset is:
+The input contract is canonical `regex-syntax` 0.8.11 HIR plus an explicit
+`RustByteProfile` token. `PINNED_1_12_4` asserts Unicode-off `regex::bytes`
+semantics. `PINNED_1_12_4_UNICODE_ON_BYTE_STABLE` asserts the pinned
+Unicode-on, `utf8(false)`, byte-boundary-empty profile while retaining the same
+validated byte-stable HIR subset. The exact admitted subset is:
 
 - empty, byte literals, byte classes, and ASCII-only Unicode classes produced
   by HIR optimization;
@@ -20,7 +22,7 @@ whole-match entry point treats capture children transparently inside the
 bounded validation/lowering traversals and reports exact erased annotations
 and work; it does not implement a capture API. Non-ASCII Unicode classes,
 Unicode word assertions, and CRLF-aware line assertions are typed refusals.
-This crate makes no RE2, Unicode-enabled, or capture-history claim.
+This crate makes no RE2, variable-width Unicode, or capture-history claim.
 
 ## Construction
 

@@ -1,11 +1,11 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
-    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
-    AggregateExecutionSource, AggregateLiteralIneligibility, AggregateOperation,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile,
-    SearchLimits,
+    AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateLiteralIneligibility,
+    AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregateResource, AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
+    PortableBuilder, RustProfile, SearchLimits,
 };
 
 const STRATEGIES: [AggregateStrategy; 2] = [
@@ -607,7 +607,7 @@ fn unicode_nonempty_literal_raw_search_matches_pinned_input_spans() {
 }
 
 #[test]
-fn unicode_empty_bytes_oracle_is_recorded_but_facade_scope_refuses_it() {
+fn unicode_empty_bytes_oracle_and_facade_use_every_byte_boundary() {
     let oracle = regex::bytes::RegexBuilder::new("")
         .unicode(true)
         .build()
@@ -625,13 +625,26 @@ fn unicode_empty_bytes_oracle_is_recorded_but_facade_scope_refuses_it() {
     }
 
     for pattern in ["", r"(?:)"] {
+        let count = aggregate_builder(pattern).build_count().unwrap();
         assert!(matches!(
-            aggregate_builder(pattern).build_count(),
-            Err(AggregateBuildError::UnicodeEnabled {
-                operation: AggregateOperation::Count,
-                selection: AggregatePlanSelection::Auto,
-            })
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::Continuation(identity)
+                if identity.semantics
+                    == AggregateContinuationSemantics::UnicodeOnByteStableHir
         ));
+        assert_eq!(
+            count
+                .count_value(&[0xFF, 0x80], AggregateRunLimits::default())
+                .unwrap(),
+            3
+        );
+        let span_sum = aggregate_builder(pattern).build_span_sum().unwrap();
+        assert_eq!(
+            span_sum
+                .span_sum_value(&[0xFF, 0x80], AggregateRunLimits::default())
+                .unwrap(),
+            0
+        );
         assert!(matches!(
             aggregate_builder(pattern)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
@@ -642,6 +655,65 @@ fn unicode_empty_bytes_oracle_is_recorded_but_facade_scope_refuses_it() {
                 ..
             })
         ));
+    }
+}
+
+#[test]
+fn unicode_byte_stable_continuations_match_pinned_bytes_oracle_for_all_operations() {
+    let cases: [(&str, &[u8], bool); 8] = [
+        ("", &[0xFF, 0x80], false),
+        ("雪+", "x雪雪y☃".as_bytes(), false),
+        ("(?:雪a|☃b)", "☃b雪a雪b".as_bytes(), false),
+        (r"[a-c]+", &[0xFF, b'a', b'b', b'd', b'c'], false),
+        (r"(?-u:\xFF+)", &[b'a', 0xFF, 0xFF, b'b'], false),
+        (r"\A(?:a|雪)+\z", "a雪a".as_bytes(), false),
+        (r"(?-u:\b[a-z]+\b)", b" ab-xyz ", false),
+        (r"(?-i:a+)", b"AAa b", true),
+    ];
+    for (pattern, haystack, case_insensitive) in cases {
+        let expected = upstream_profile(pattern, haystack, case_insensitive, true);
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+        for strategy in STRATEGIES {
+            let builder = || {
+                aggregate_builder(pattern)
+                    .case_insensitive(case_insensitive)
+                    .plan_selection(AggregatePlanSelection::ForceContinuation)
+                    .strategy(strategy)
+            };
+            let spans = builder()
+                .build_spans()
+                .unwrap_or_else(|error| panic!("spans build {pattern:?}/{strategy:?}: {error}"))
+                .spans(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("spans run {pattern:?}/{strategy:?}: {error}"));
+            let actual = spans
+                .iter()
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "spans {pattern:?}/{strategy:?}");
+            assert!(matches!(
+                spans.report().identity.plan_identity,
+                AggregatePlanIdentity::Continuation(identity)
+                    if identity.semantics
+                        == AggregateContinuationSemantics::UnicodeOnByteStableHir
+            ));
+
+            let count = builder()
+                .build_count()
+                .unwrap_or_else(|error| panic!("count build {pattern:?}/{strategy:?}: {error}"))
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("count run {pattern:?}/{strategy:?}: {error}"));
+            assert_eq!(count, u64::try_from(expected.len()).unwrap());
+
+            let span_sum = builder()
+                .build_span_sum()
+                .unwrap_or_else(|error| panic!("sum build {pattern:?}/{strategy:?}: {error}"))
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("sum run {pattern:?}/{strategy:?}: {error}"));
+            assert_eq!(span_sum, u64::try_from(expected_sum).unwrap());
+        }
     }
 }
 
@@ -700,7 +772,7 @@ fn unicode_profile_local_raw_valid_utf8_literal_is_hir_eligible() {
 }
 
 #[test]
-fn unicode_profile_local_raw_byte_literal_is_typed_ineligible_not_invariant() {
+fn unicode_profile_local_raw_byte_literal_uses_byte_stable_continuation() {
     let pattern = r"(?-u:\xFF)";
     let haystack = [0xFF, b'a', 0xFF];
     let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -713,10 +785,18 @@ fn unicode_profile_local_raw_byte_literal_is_typed_ineligible_not_invariant() {
         .collect();
     assert_eq!(matches, vec![(0, 1), (2, 3)]);
 
+    let count = aggregate_builder(pattern).build_count().unwrap();
     assert!(matches!(
-        aggregate_builder(pattern).build_count(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
+        count.build_report().plan_identity,
+        AggregatePlanIdentity::Continuation(identity)
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
     ));
+    assert_eq!(
+        count
+            .count_value(&haystack, AggregateRunLimits::default())
+            .unwrap(),
+        2
+    );
     assert!(matches!(
         aggregate_builder(pattern)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
@@ -748,10 +828,13 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             if identity.semantics == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
     ));
 
-    for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+", r"(?i:a)"] {
+    for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+"] {
+        let continuation = aggregate_builder(pattern).build_count().unwrap();
         assert!(matches!(
-            aggregate_builder(pattern).build_count(),
-            Err(AggregateBuildError::UnicodeEnabled { .. })
+            continuation.build_report().plan_identity,
+            AggregatePlanIdentity::Continuation(identity)
+                if identity.semantics
+                    == AggregateContinuationSemantics::UnicodeOnByteStableHir
         ));
         assert!(matches!(
             aggregate_builder(pattern)
@@ -767,7 +850,10 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         aggregate_builder("рус")
             .case_insensitive(true)
             .build_count(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
+            ..
+        })
     ));
     assert!(matches!(
         aggregate_builder("рус")
@@ -780,10 +866,20 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         })
     ));
     assert!(matches!(
-        aggregate_builder(r"(?-i:a)")
-            .case_insensitive(true)
-            .build_count(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
+        aggregate_builder(r"(?i:k)").build_count(),
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
+            ..
+        })
+    ));
+    let local_case_sensitive = aggregate_builder(r"(?-i:a)")
+        .case_insensitive(true)
+        .build_count()
+        .unwrap();
+    assert!(matches!(
+        local_case_sensitive.build_report().plan_identity,
+        AggregatePlanIdentity::Continuation(identity)
+            if identity.semantics == AggregateContinuationSemantics::UnicodeOnByteStableHir
     ));
     assert!(matches!(
         aggregate_builder(r"(?-i:a)")
@@ -795,16 +891,19 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             ..
         })
     ));
-    assert!(matches!(
-        aggregate_builder("雪")
-            .plan_selection(AggregatePlanSelection::ForceContinuation)
-            .build_count(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
-    ));
-    assert!(matches!(
-        aggregate_builder("雪").build_spans(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
-    ));
+    let forced = aggregate_builder("雪")
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        forced.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    let spans = aggregate_builder("雪").build_spans().unwrap();
+    assert_eq!(
+        spans.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
 }
 
 fn unicode_exact_build_error(limits: AggregateBuildLimits) -> AggregateBuildError {
@@ -1047,13 +1146,14 @@ fn captures_are_erased_only_at_the_typed_whole_match_boundary() {
         uncaptured.cache_identity(AggregateRunLimits::default())
     );
 
-    assert!(matches!(
-        aggregate_builder("").build_count(),
-        Err(AggregateBuildError::UnicodeEnabled {
-            operation: AggregateOperation::Count,
-            ..
-        })
-    ));
+    assert_eq!(
+        aggregate_builder("")
+            .build_count()
+            .unwrap()
+            .count_value(b"baab", AggregateRunLimits::default())
+            .unwrap(),
+        5
+    );
     assert_eq!(
         aggregate_builder("a")
             .build_count()

@@ -56,9 +56,12 @@ deliberately does not reproduce the pinned optimizer's `actual=2` bug.
   captures inside its bounded traversal. Both are limited to whole-match
   outputs. Source syntax and cache identities remain distinct even when
   capture erasure produces the same semantic plan.
-- Unicode-enabled Rust jobs are refused before parsing, even when the HIR would
-  be empty or ASCII-only. ASCII case-insensitive lowering is admitted when the
-  resulting byte HIR stays within the aggregate subset.
+- Unicode-enabled Rust jobs select exact literal execution when eligible, then
+  the byte-stable continuation subset. Empty, literals, ASCII-only classes,
+  byte assertions, and their regular composition are eligible; non-ASCII
+  Unicode classes and Unicode word assertions remain typed refusals. ASCII
+  case-insensitive lowering is admitted when the resulting HIR stays within
+  that subset.
 - Every literal planner/build/reducer quota and every continuation
   operation-limit field is mapped explicitly. Literal bounds use authenticated
   haystack length and selected-plan needle/persistent accounting; continuation

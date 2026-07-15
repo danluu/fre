@@ -5,6 +5,11 @@ family. It is not a proof for general Unicode regex execution, captures,
 assertions, case folding, alternation, classes, empty matching, or text
 haystacks.
 
+The later candidate byte-stable continuation admission is specified separately
+in `UNICODE_BYTE_STABLE_CONTINUATION.md`. The frozen exact-literal checkpoint
+and its five-job closed-set evidence below remain historical evidence for the
+direct reducer; they are not the coverage claim for that broader candidate.
+
 ## Pinned contract and eligibility
 
 The comparator executes `count` and `count-spans` with pinned `regex` 1.12.4 /
@@ -186,6 +191,11 @@ remains report schema v2 with candidate adapter `fre-current-aggregate-v4`.
 The Unicode sentinel itself remains schema v3 and semantic-domain v2 while
 reading the retained canonical frontier through an explicit legacy
 `fre-current-aggregate-v2` identity.
+
+Those schema and adapter identities describe this frozen exact-literal
+checkpoint. The later byte-stable continuation candidate advances them to
+aggregate schema 4 and `fre-current-aggregate-v4`; see the separate candidate
+document.
 
 The retained sentinel above remains diagnostic evidence only. All semantic,
 identity, resource, deterministic-sentinel, comparator, and holdout gates must
