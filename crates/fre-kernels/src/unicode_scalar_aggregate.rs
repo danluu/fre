@@ -1159,8 +1159,14 @@ impl UnicodeScalarAggregatePlan {
                             )?
                         } else {
                             monotone_range_cursor = false;
-                            self.contains_non_ascii(scalar)?
+                            cached_non_ascii_range = None;
+                            self.contains_non_ascii_cached(
+                                scalar,
+                                &mut cached_non_ascii_range,
+                            )?
                         }
+                    } else if CACHE_RANGE {
+                        self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range)?
                     } else {
                         self.contains_non_ascii(scalar)?
                     };
@@ -1404,6 +1410,66 @@ impl UnicodeScalarAggregatePlan {
             .get(low)
             .is_some_and(|range| scalar >= range.start);
         Ok((contains, comparisons))
+    }
+
+    fn contains_non_ascii_cached(
+        &self,
+        scalar: u32,
+        cached_range: &mut Option<usize>,
+    ) -> Result<(bool, usize), ReduceError> {
+        let mut comparisons = 0_usize;
+        if let Some(index) = *cached_range {
+            comparisons = 1;
+            let range = self
+                .non_ascii
+                .get(index)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached non-ASCII range access",
+                })?;
+            if scalar >= range.start && scalar <= range.end {
+                return Ok((true, comparisons));
+            }
+            *cached_range = None;
+        }
+
+        let mut low = 0_usize;
+        let mut high = self.non_ascii.len();
+        while low < high {
+            comparisons = comparisons
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search comparisons",
+                })?;
+            let width = high
+                .checked_sub(low)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search width",
+                })?;
+            let middle = low
+                .checked_add(width / 2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search midpoint",
+                })?;
+            let range = self
+                .non_ascii
+                .get(middle)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "cached binary search range access",
+                })?;
+            if scalar < range.start {
+                high = middle;
+            } else if scalar > range.end {
+                low = middle
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "cached binary search lower bound",
+                    })?;
+            } else {
+                *cached_range = Some(middle);
+                return Ok((true, comparisons));
+            }
+        }
+        Ok((false, comparisons))
     }
 }
 
@@ -2078,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn counted_runs_abandon_the_monotone_cursor_after_a_descent() {
+    fn counted_runs_switch_to_the_local_cache_after_a_descent() {
         let ranges = [('α', 'α'), ('γ', 'γ'), ('ε', 'ε'), ('η', 'η'), ('ι', 'ι')];
         let run = UnicodeScalarAggregatePlan::build_repeated(
             ranges,
@@ -2089,7 +2155,7 @@ mod tests {
         )
         .unwrap();
         let point = UnicodeScalarAggregatePlan::build(ranges, BuildLimits::unlimited()).unwrap();
-        let haystack = format!("αγεηι{}", "ια".repeat(64));
+        let haystack = format!("αγεηι{}", "α".repeat(128));
         let run_result = run
             .count(haystack.as_bytes(), ReduceLimits::unlimited())
             .unwrap();
