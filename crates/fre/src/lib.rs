@@ -42,8 +42,8 @@ pub use aggregate_many::{
     AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
     AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
     AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
-    AggregateManySpanSumRegex, AggregateManySpanSumResult,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
+    AggregateManySpanSumResult,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
