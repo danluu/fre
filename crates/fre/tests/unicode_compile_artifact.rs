@@ -27,8 +27,9 @@ fn unicode_class_literal_and_line_shapes_are_complete_canonical_artifacts() {
         else {
             panic!("Unicode compile artifact retained another profile")
         };
-        assert_eq!(profile.regex, RustProfile::rebar_1_12_4().regex);
-        assert!(profile.options.unicode);
+        let mut expected_profile = RustProfile::rebar_1_12_4();
+        expected_profile.options.unicode = true;
+        assert_eq!(*profile, expected_profile);
         for scalar in artifact.scalar_encodings() {
             let encoded = scalar.as_bytes();
             let text = std::str::from_utf8(encoded).expect("canonical UTF-8 scalar");
@@ -53,6 +54,12 @@ fn invalid_byte_capability_is_excluded_from_unicode_artifacts() {
             .build(),
         Err(UnicodeCompileBuildError::InvalidUtf8Literal)
             | Err(UnicodeCompileBuildError::InvalidByteClass)
+    ));
+    assert!(matches!(
+        UnicodeCompileArtifactBuilder::new("α")
+            .profile(RustProfile::regex_1_12_4())
+            .build(),
+        Err(UnicodeCompileBuildError::ProfileMismatch)
     ));
 }
 
