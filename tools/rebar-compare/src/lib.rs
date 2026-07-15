@@ -3309,14 +3309,12 @@ impl TimedFreAggregate {
                 std::hint::black_box(&result);
                 Ok(value)
             }
-            Self::Count { regex, limits } => {
-                regex.count_value(haystack, limits).map_err(|error| {
-                    aggregate_execution_error(
-                        &error.source,
-                        format!("FRE timed value-only count refused execution: {error}"),
-                    )
-                })
-            }
+            Self::Count { regex, limits } => regex.count_value(haystack, limits).map_err(|error| {
+                aggregate_execution_error(
+                    &error.source,
+                    format!("FRE timed value-only count refused execution: {error}"),
+                )
+            }),
             Self::SpanSum { regex, limits } => {
                 regex.span_sum_value(haystack, limits).map_err(|error| {
                     aggregate_execution_error(
