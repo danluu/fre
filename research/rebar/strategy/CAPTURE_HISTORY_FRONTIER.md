@@ -3,7 +3,9 @@
 This checkpoint replaces the rejected suffix-restarted capture reducer with a
 whole-operation selector followed by exact-span tagged-history replay. It is a
 source, semantic, and counter checkpoint, not a performance result. Exact
-source `785cc1eecf05bea484d2be1a54206152c4108685` passed the full authenticated
+source `88df8ae1fc77523d241ef1da85292957273e5544` (tree
+`184075c81cc36a536f012f4dfcbb7cd935bc0e12`) composes the capture path onto the
+authenticated 214-row direct-Unicode source. It passed the full authenticated
 Rebar differential twice with byte-identical reports. No capture timing has
 been run.
 
@@ -75,9 +77,10 @@ commands pass:
 ```text
 cargo test -p fre-capture-lab --test conformance
 cargo test -p fre --test captures --test portable_assertions --test aggregate_many_facade
+cargo test -p fre-kernels unicode_scalar_aggregate::tests
+cargo test -p fre --test aggregate_facade
 cargo test -p rebar-compare --lib
-cargo clippy -p fre-capture-lab --all-targets -- -D warnings
-cargo clippy -p fre -p rebar-compare --all-targets --no-deps -- -D warnings
+cargo clippy -p fre-capture-lab -p fre -p rebar-compare --all-targets --no-deps -- -D warnings
 RUSTDOCFLAGS=-Dwarnings cargo doc -p fre-capture-lab -p fre --no-deps
 ```
 
@@ -87,17 +90,18 @@ receipts do not qualify this replacement. The replacement satisfies the
 semantic promotion gate:
 
 - Two full 344-Rust-row reports are byte-identical at SHA-256
-  `fc8a34677a6a7e8e4ae276c24f41339677247887901a98e824506b2fd5be26c8`;
+  `f42d288a93fa9042f2f0b6cfac0149f794a95dc4e8fbe93b45f2c313128a7b23`;
   their sorted-receipts SHA-256 is
-  `e108451aeef37bf0dacd3bfded66f0a5cd8a77fde3e832476acd26a1b27c791b`.
-- FRE has 197 passes and 147 typed unsupported receipts, with no failure,
+  `eb312c113c7bfca151786742e15eb8fa7c88a644edb6cc994926a04b5f70e30e`.
+- FRE has 222 passes and 122 typed unsupported receipts, with no failure,
   fault, unresolved result, or removed pass relative to the authenticated
-  189-pass baseline.
+  214-pass direct-Unicode baseline.
 - The exact delta is eight capture rows: three `count-captures` and five
   `grep-captures`.
-- The existing 29 exact-literal, 132 continuation, two ordered build-many, 17
-  compile-artifact, and nine portable-search dispatch identities are
-  preserved. Eight new receipts identify the selector/history capture path.
+- The existing 29 exact-literal, 132 continuation, 23 direct Unicode-scalar,
+  two ordered build-many, 19 compile-artifact, and nine portable-search
+  dispatch identities are preserved. Eight new receipts identify the
+  selector/history capture path.
 
 The eight newly supported IDs are:
 
@@ -124,7 +128,7 @@ line:
 - `opt/onepass/fn-predicate`: 43,529 required with 42,796 remaining.
 
 The authenticated reports are
-`/tmp/fre-control/results/P34-CAPTURE-785CC1E-85D-FULL344-R{1,2}.json`.
+`/tmp/fre-control/results/G0-CAPTURE-UNICODE-88DF8AE-BF53-FULL344-R{1,2}.json`.
 The earlier headline 200 screen reset line budgets and is not promotion
 evidence. The separately reverted Unicode-compile experiment is also excluded.
 
