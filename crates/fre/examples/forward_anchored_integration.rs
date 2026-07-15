@@ -91,6 +91,29 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
     let make_prefix = |bytes: &[u8], length: usize| -> Vec<u8> {
         bytes.iter().copied().cycle().take(length).collect()
     };
+    let make_middle_hit =
+        |members: &[u8], suffix: &[u8], pattern: &str| -> Result<Fixture, String> {
+            if !(42..=73).contains(&requested_size) {
+                return Err(format!(
+                    "CASE {case:?} requires SIZE in the inclusive range 42..=73"
+                ));
+            }
+            let tail_len = requested_size - 1;
+            let middle = 8 + (tail_len - 41) / 2;
+            let suffix_index = middle + 1;
+            let suffix_end = suffix_index
+                .checked_add(suffix.len())
+                .ok_or("middle-hit suffix end overflow")?;
+            let mut haystack = make_prefix(members, requested_size);
+            haystack
+                .get_mut(suffix_index..suffix_end)
+                .ok_or("middle-hit suffix outside haystack")?
+                .copy_from_slice(suffix);
+            Ok(Fixture {
+                pattern: pattern.into(),
+                haystack,
+            })
+        };
     let fixture = match case {
         "range-start-positive" => {
             let size = requested_size.max(2);
@@ -184,6 +207,7 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                 haystack,
             }
         }
+        "quad-suffix-middle" => return make_middle_hit(b"aceg", b"Z", r"\A[aceg]+Z"),
         "bitset-early-outsider" => {
             let size = requested_size.max(3);
             let mut haystack = make_prefix(b"aceg", size);
@@ -206,6 +230,7 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                 haystack,
             }
         }
+        "triple-suffix-middle" => return make_middle_hit(b"ace", b"Z", r"\A[ace]+Z"),
         "five-member-generalization" => {
             let size = requested_size.max(2);
             let prefix = size.checked_sub(1).ok_or("five-member prefix underflow")?;
@@ -226,6 +251,7 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                 haystack,
             }
         }
+        "whitespace-suffix-middle" => return make_middle_hit(b" \t", b"END", r"\A[ \t]+END"),
         "whitespace-suffix-absent" => Fixture {
             pattern: r"\A[ \t]+END".into(),
             haystack: make_prefix(b" \t", requested_size),
