@@ -283,7 +283,7 @@ impl RegexReduxReplacementPlan {
             pattern.into(),
             replacement.as_ref(),
             profile,
-            limits,
+            &limits,
             "replacement",
         )
     }
@@ -292,7 +292,7 @@ impl RegexReduxReplacementPlan {
         pattern: String,
         replacement: &str,
         profile: RustProfile,
-        limits: AggregateBuildLimits,
+        limits: &AggregateBuildLimits,
         stage: &'static str,
     ) -> Result<Self, RegexReduxBuildError> {
         require_profile(&profile)?;
@@ -307,7 +307,7 @@ impl RegexReduxReplacementPlan {
             .profile(profile)
             .unicode(false)
             .case_insensitive(false)
-            .limits(limits)
+            .limits(*limits)
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .strategy(AggregateStrategy::ReverseSequentialRows)
             .build_spans()
@@ -454,13 +454,13 @@ impl CountPlan {
     fn build(
         pattern: &str,
         profile: RustProfile,
-        limits: AggregateBuildLimits,
+        limits: &AggregateBuildLimits,
     ) -> Result<Self, RegexReduxBuildError> {
         let regex = AggregateBuilder::new(pattern)
             .profile(profile)
             .unicode(false)
             .case_insensitive(false)
-            .limits(limits)
+            .limits(*limits)
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .strategy(AggregateStrategy::ReverseSequentialRows)
             .build_count()
@@ -474,7 +474,7 @@ impl CountPlan {
     fn count(
         &self,
         input: &[u8],
-        limits: RegexReduxRunLimits,
+        limits: &RegexReduxRunLimits,
     ) -> Result<usize, RegexReduxRunError> {
         let result = self
             .regex
@@ -551,7 +551,7 @@ impl RegexReduxBuilder {
             FLATTEN_PATTERN.to_string(),
             "",
             self.profile.clone(),
-            self.limits.aggregate,
+            &self.limits.aggregate,
             "flatten",
         )?;
         let mut variants =
@@ -564,7 +564,7 @@ impl RegexReduxBuilder {
             variants.push(CountPlan::build(
                 pattern,
                 self.profile.clone(),
-                self.limits.aggregate,
+                &self.limits.aggregate,
             )?);
         }
         let mut substitutions = fre_exact_alloc::vec_with_exact_capacity(SUBSTITUTIONS.len())
@@ -576,7 +576,7 @@ impl RegexReduxBuilder {
                 pattern.to_string(),
                 replacement,
                 self.profile.clone(),
-                self.limits.aggregate,
+                &self.limits.aggregate,
                 "substitution",
             )?);
         }
@@ -676,7 +676,7 @@ impl RegexReduxPlan {
         let mut peak_output_bytes = flatten_allocated;
         let mut variant_counts = [0_usize; 9];
         for (index, plan) in self.variants.iter().enumerate() {
-            let count = plan.count(&sequence, stage_limits)?;
+            let count = plan.count(&sequence, &stage_limits)?;
             variant_counts[index] = count;
             total_events = checked_add(total_events, count)?;
             enforce_events(total_events, limits.max_total_events)?;
