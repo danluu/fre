@@ -678,8 +678,8 @@ fn add_thread(
                     && haystack
                         .get(pos - 1)
                         .is_some_and(|byte| is_ascii_word(*byte));
-                let after = pos < window.end
-                    && haystack.get(pos).is_some_and(|byte| is_ascii_word(*byte));
+                let after =
+                    pos < window.end && haystack.get(pos).is_some_and(|byte| is_ascii_word(*byte));
                 if look.matches(before, after) {
                     thread.pc = *next;
                     stack.push(thread);

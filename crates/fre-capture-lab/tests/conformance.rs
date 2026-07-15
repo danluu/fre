@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, AsciiWordLook, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord,
-    Greed, GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError, SearchLimits,
-    Span, Window,
+    Greed, GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError,
+    SearchLimits, Span, Window,
 };
 use regex::bytes::Regex;
 
@@ -153,12 +153,7 @@ fn ascii_word_assertions_match_rust_bytes_at_every_boundary() {
         AsciiWordLook::StartHalf,
         AsciiWordLook::EndHalf,
     ];
-    let haystacks: &[&[u8]] = &[
-        b"",
-        b"a",
-        b" a_9-z ",
-        &[0xFF, b'a', 0x80, b'_', b' '],
-    ];
+    let haystacks: &[&[u8]] = &[b"", b"a", b" a_9-z ", &[0xFF, b'a', 0x80, b'_', b' ']];
     for look in looks {
         let ast = Ast::concat([
             Ast::AsciiWordLook(look),

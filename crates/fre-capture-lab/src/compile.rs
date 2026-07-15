@@ -550,10 +550,7 @@ impl Compiler {
     }
 
     fn assert_ascii_word(&mut self, look: AsciiWordLook) -> Result<Fragment, BuildError> {
-        let id = self.add_state(State::AssertAsciiWord {
-            look,
-            next: UNSET,
-        })?;
+        let id = self.add_state(State::AssertAsciiWord { look, next: UNSET })?;
         Ok(Fragment {
             start: id,
             outs: self.one_out(Patch::Next(id))?,
