@@ -420,7 +420,7 @@ mod tests {
         for (pattern, expected) in [
             (
                 r"\A[a-z]+Z\z",
-                "anchored-class-suffix.absolute-end-fixed-single1-range64-threshold64-suffix-first-hybrid.v5",
+                "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6",
             ),
             (
                 r"\A[a-z]+Z",

@@ -6,8 +6,7 @@ use fre::{
 };
 use std::fmt::Write as _;
 
-const FIXED_ID: &str =
-    "anchored-class-suffix.absolute-end-fixed-single1-range64-threshold64-suffix-first-hybrid.v5";
+const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
 const ES8I_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7";
 
 fn forced(pattern: &str) -> fre::PortableRegex {
