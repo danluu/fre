@@ -4722,13 +4722,16 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count", &folded, b"SHERLOCK sherlock", false, true, &limits),
             2,
-            "aggregate-continuation-program",
+            "aggregate-finite-literal-dfa",
         );
 
         // These are canonical leftmost-first results. The pinned Rust meta
         // adapter's reverse-suffix optimization incorrectly returns 2; exact
         // report generation deliberately retains those reference failures.
-        for pattern in [r".abb|b", r"(?:[A-Za-z]ab)?b"] {
+        for (pattern, plan) in [
+            (r".abb|b", "aggregate-finite-literal-dfa"),
+            (r"(?:[A-Za-z]ab)?b", "aggregate-continuation-program"),
+        ] {
             assert_current_fre_execution(
                 current_fre(
                     "count",
@@ -4739,7 +4742,7 @@ mod tests {
                     &limits,
                 ),
                 1,
-                "aggregate-continuation-program",
+                plan,
             );
         }
     }
