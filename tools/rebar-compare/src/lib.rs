@@ -3459,6 +3459,23 @@ mod tests {
             1,
             "aggregate-continuation-program",
         );
+        let assertion_cases: [(&str, &[u8], u64, u64); 2] = [
+            (r"\b[a-z]+\b", b"_alpha beta!gamma42 \xFFdelta", 2, 9),
+            (r"(?m:sherlock$)", b"sherlock\nnot\nsherlock", 2, 16),
+        ];
+        for (pattern, haystack, count, span_sum) in assertion_cases {
+            let patterns = [pattern.to_string()];
+            assert_current_fre_execution(
+                current_fre("count", &patterns, haystack, false, false, &limits),
+                count,
+                "aggregate-continuation-program",
+            );
+            assert_current_fre_execution(
+                current_fre("count-spans", &patterns, haystack, false, false, &limits),
+                span_sum,
+                "aggregate-continuation-program",
+            );
+        }
         let captured = vec![r"(?P<outer>(?P<inner>a))".to_string()];
         assert_current_fre_execution(
             current_fre("count", &captured, b"baab", false, false, &limits),

@@ -95,7 +95,7 @@ fn continuation_details(
 
 #[test]
 fn operation_specific_continuation_facades_match_rust_for_directed_global_sequences() {
-    let cases: [(&str, &[u8], bool); 11] = [
+    let cases: [(&str, &[u8], bool); 15] = [
         ("", b"", false),
         ("", b"ab", false),
         ("a*?", b"aa", false),
@@ -105,6 +105,10 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
         (r"(?:|a){2,}?", b"aa", false),
         (r"[a-c\xFF]+", &[b'a', 0xFF, b'd', b'c'], false),
         (r"\A(?:a|)*\z", b"aa", false),
+        (r"\b[a-z]+\b", b"_alpha beta!gamma42 \xFFdelta", false),
+        (r"\Bfoo\B", b"xfooy foo zfoo_foo", false),
+        (r"\b{start}[a-z]+\b{end}", b"_alpha beta!gamma42", false),
+        (r"(?m:^sherlock$)", b"sherlock\nnot\nsherlock\n", false),
         (r"(?P<word>[a-z]+)", b"ab  c", false),
         ("sherlock", b"SHERLOCK sherlock", true),
     ];
@@ -155,6 +159,17 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
             assert_eq!(span_sum.value(), expected_sum);
         }
     }
+}
+
+#[test]
+fn unicode_word_assertions_remain_outside_the_byte_continuation_contract() {
+    assert!(matches!(
+        aggregate_builder(r"\b")
+            .unicode(true)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeEnabled { .. })
+    ));
 }
 
 #[test]
