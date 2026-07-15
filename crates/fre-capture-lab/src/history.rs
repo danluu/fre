@@ -6,7 +6,9 @@ use crate::ast::Ast;
 use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
-use crate::model::{AggregateOutcome, CandidateKind, RunReport, SearchOutcome, Window};
+use crate::model::{
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, RunReport, SearchOutcome, Window,
+};
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
 use crate::runtime::{admit_history, canonicalize, check, checked_add, validate_window};
 
@@ -217,6 +219,116 @@ impl HistoryRegex {
             total_state_visits,
             total_slot_copies: 0,
             total_history_nodes,
+        })
+    }
+
+    /// Sum participating groups over non-overlapping, non-empty matches.
+    ///
+    /// This is the capture-preserving reducer used by models whose public
+    /// result is participation count rather than capture records. It never
+    /// retains prior winners and never clones a slot vector for speculative
+    /// threads. Empty selection is rejected because silently applying an
+    /// iterator progress policy would change this operation's contract.
+    pub fn count_captures_nonempty(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: AggregateLimits,
+    ) -> Result<CaptureCountOutcome, SearchError> {
+        validate_window(haystack, window, window.start)?;
+        let mut count = 0_usize;
+        let mut matches = 0_usize;
+        let mut searches = 0_usize;
+        let mut capture_events = 0_usize;
+        let mut total_state_visits = 0_usize;
+        let mut total_history_nodes = 0_usize;
+        let mut total_history_walk = 0_usize;
+        let mut peak_threads = 0_usize;
+        let mut cursor = window.start;
+        loop {
+            searches = checked_add(searches, 1, ResourceKind::Searches)?;
+            check(ResourceKind::Searches, searches, limits.max_searches)?;
+
+            let mut per_search = limits.per_search;
+            per_search.max_state_visits = per_search.max_state_visits.min(
+                limits
+                    .max_total_state_visits
+                    .checked_sub(total_state_visits)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?,
+            );
+            per_search.max_history_nodes = per_search.max_history_nodes.min(
+                limits
+                    .max_total_history_nodes
+                    .checked_sub(total_history_nodes)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateHistoryNodes,
+                    ))?,
+            );
+            per_search.max_history_walk = per_search.max_history_walk.min(
+                limits
+                    .max_total_history_walk
+                    .checked_sub(total_history_walk)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateHistoryWalk,
+                    ))?,
+            );
+
+            let outcome = self.search_from(haystack, window, cursor, per_search)?;
+            total_state_visits = checked_add(
+                total_state_visits,
+                outcome.report.state_visits,
+                ResourceKind::AggregateStateVisits,
+            )?;
+            total_history_nodes = checked_add(
+                total_history_nodes,
+                outcome.report.history_nodes,
+                ResourceKind::AggregateHistoryNodes,
+            )?;
+            total_history_walk = checked_add(
+                total_history_walk,
+                outcome.report.history_walk,
+                ResourceKind::AggregateHistoryWalk,
+            )?;
+            peak_threads = peak_threads.max(outcome.report.peak_threads);
+
+            let Some(record) = outcome.captures else {
+                break;
+            };
+            let overall = record.overall().ok_or(SearchError::InvalidProgram)?;
+            if overall.start == overall.end {
+                return Err(SearchError::EmptyMatch);
+            }
+            matches = checked_add(matches, 1, ResourceKind::Results)?;
+            check(ResourceKind::Results, matches, limits.max_results)?;
+            for group in record.groups {
+                capture_events =
+                    checked_add(capture_events, 1, ResourceKind::CaptureEvents)?;
+                check(
+                    ResourceKind::CaptureEvents,
+                    capture_events,
+                    limits.max_capture_events,
+                )?;
+                if group.span.is_some() {
+                    count = checked_add(count, 1, ResourceKind::CaptureCount)?;
+                    check(
+                        ResourceKind::CaptureCount,
+                        count,
+                        limits.max_capture_count,
+                    )?;
+                }
+            }
+            cursor = overall.end;
+        }
+        Ok(CaptureCountOutcome {
+            count,
+            matches,
+            searches,
+            total_state_visits,
+            total_history_nodes,
+            total_history_walk,
+            peak_threads,
         })
     }
 

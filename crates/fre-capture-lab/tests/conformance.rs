@@ -478,6 +478,57 @@ fn aggregate_resource_dimensions_refuse_explicitly() {
 }
 
 #[test]
+fn persistent_reducer_counts_participation_without_retaining_winners() {
+    let ast = Ast::alt([Ast::Byte(b'a').capture(2), Ast::Byte(b'b').capture(3)])
+        .capture(1)
+        .repeat(1, None, Greed::Greedy);
+    let pattern = render(&ast);
+    let expected = reference_iter(&pattern, b"abba cab", Window::all(b"abba cab"))
+        .iter()
+        .flat_map(|record| &record.groups)
+        .filter(|group| group.span.is_some())
+        .count();
+    let (_, history) = pair(&ast);
+    let outcome = history
+        .count_captures_nonempty(
+            b"abba cab",
+            Window::all(b"abba cab"),
+            AggregateLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(outcome.count, expected);
+    assert_eq!(outcome.matches, 3);
+    assert!(outcome.total_history_nodes <= outcome.total_state_visits);
+    assert!(outcome.total_history_walk <= outcome.total_history_nodes);
+}
+
+#[test]
+fn persistent_reducer_exposes_group_event_and_empty_match_boundaries() {
+    let (_, history) = pair(&Ast::Byte(b'a').capture(1));
+    let no_events = AggregateLimits {
+        max_capture_events: 0,
+        ..AggregateLimits::default()
+    };
+    assert!(matches!(
+        history.count_captures_nonempty(b"a", Window::all(b"a"), no_events),
+        Err(SearchError::Resource {
+            kind: ResourceKind::CaptureEvents,
+            ..
+        })
+    ));
+
+    let (_, empty) = pair(&Ast::Empty.capture(1));
+    assert_eq!(
+        empty.count_captures_nonempty(
+            b"a",
+            Window::all(b"a"),
+            AggregateLimits::default()
+        ),
+        Err(SearchError::EmptyMatch)
+    );
+}
+
+#[test]
 fn re2_profile_is_typed_and_cannot_be_claimed_before_oracle_gate() {
     assert!(matches!(
         Program::compile_for(

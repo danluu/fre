@@ -6,9 +6,11 @@
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match count/span-sum
 //! plans without source concatenation. Whole-match aggregate plans may erase
-//! capture annotations, but no capture group API is exposed. None of these
-//! types is named `Regex`: unsupported syntax/profile/operation combinations
-//! are typed build errors, and there is no full Rust-regex/RE2 or JIT claim.
+//! capture annotations. [`CaptureBuilder`] separately preserves capture
+//! histories for the participating-group reducer on its certified Rust-byte
+//! subset; it is not a general capture-record facade. None of these types is
+//! named `Regex`: unsupported syntax/profile/operation combinations are typed
+//! build errors, and there is no full Rust-regex/RE2 or JIT claim.
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +18,7 @@ use core::fmt;
 
 mod aggregate;
 mod aggregate_many;
+mod captures;
 mod finite;
 mod forward_anchored;
 mod required_literal;
@@ -41,6 +44,18 @@ pub use aggregate_many::{
     AggregateManyPatternReport, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
     AggregateManySpanSumResult,
+};
+pub use captures::{
+    CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
+    CaptureCacheIdentity, CaptureExecutionError, CaptureExecutionReport, CaptureHirAccounting,
+    CaptureOperation, CapturePlanIdentity, CapturePlanKind, CaptureRegex, CaptureRunLimits,
+    CaptureUnsupported,
+};
+pub use fre_capture_lab::{
+    AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
+    BuildLimits as CaptureEngineBuildLimits, BuildReport as CaptureEngineBuildReport,
+    CaptureCountOutcome, ResourceKind as CaptureResource, SearchError as CaptureSearchError,
+    SearchLimits as CaptureSearchLimits,
 };
 pub use fre_aggregate::{
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,

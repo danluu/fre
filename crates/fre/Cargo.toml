@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 fre-aggregate = { path = "../fre-aggregate" }
 fre-automata = { path = "../fre-automata" }
+fre-capture-lab = { path = "../fre-capture-lab" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }

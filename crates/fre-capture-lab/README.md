@@ -1,16 +1,18 @@
 # fre-capture-lab
 
-This is an isolated capture-semantics laboratory, not a production engine and
-not a fallback. It currently proves a byte-oriented subset of the pinned Rust
-profile (`regex::bytes` 1.12.4 with Rebar's default features plus `logging` and
-`perf-dfa-full`). It is not integrated into the `fre` facade.
+This crate contains the capture-semantics engine core. The persistent-history
+executor is integrated through the operation-specific `fre::CaptureBuilder`
+facade for a byte-oriented subset of the pinned Rust profile (`regex::bytes`
+1.12.4 with Rebar's default features plus `logging` and `perf-dfa-full`). The
+inline-slot executor remains a comparative research formulation. Neither is a
+semantic fallback.
 
 The modules deliberately separate concerns:
 
 - `ast`: the admitted capture-aware byte AST;
 - `compile`: checked admission and immutable prioritized tagged Thompson IR;
 - `inline`: ordered Pike generations carrying inline slot vectors;
-- `history`: the same IR executed with persistent tag-history nodes;
+- `history`: the production IR executor with persistent tag-history nodes;
 - `runtime`: conservative preflight bounds and canonical capture records;
 - `profile`: versioned Rust and pending RE2 semantic identities.
 

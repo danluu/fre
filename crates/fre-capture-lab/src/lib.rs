@@ -1,12 +1,11 @@
-//! Bounded research prototypes for exact regular-expression capture semantics.
+//! Bounded engines for exact regular-expression capture semantics.
 //!
-//! This crate is an isolated laboratory for the pinned Rust byte-regex
-//! leftmost-first profile. It deliberately exposes a small AST instead of
-//! claiming to parse the complete Rust or RE2 syntaxes. A checked compiler
-//! lowers that AST to one immutable prioritized tagged Thompson program.
-//! [`InlineRegex`] executes it with inline capture vectors, while
-//! [`HistoryRegex`] uses persistent capture histories. Neither executor uses
-//! recursive backtracking, and neither can silently fall back to another
+//! This crate implements the small capture-aware AST and tagged execution core
+//! for the pinned Rust byte-regex leftmost-first profile. The production `fre`
+//! facade owns syntax/profile admission and exposes only its qualified HIR
+//! subset. [`InlineRegex`] remains a comparative formulation, while
+//! [`HistoryRegex`] supplies the persistent-history production plan. Neither
+//! executor uses recursive backtracking or silently falls back to another
 //! engine.
 //!
 //! Single-match search and aggregate iteration have different resource
@@ -35,7 +34,7 @@ pub use history::HistoryRegex;
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
 pub use model::{
-    AggregateOutcome, CandidateKind, CaptureRecord, GroupRecord, RunReport, SearchOutcome, Span,
-    Window,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord, RunReport,
+    SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;

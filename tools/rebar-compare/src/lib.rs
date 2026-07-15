@@ -26,9 +26,11 @@ use fre::{
     AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, AggregateUnicodeScalarSemantics, CompatibilityProfile,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
+    AggregateStrategy, AggregateUnicodeScalarSemantics, CaptureAggregateLimits,
+    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureRegex, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
     SearchSessionLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
@@ -61,7 +63,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v7";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v6";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -1849,7 +1851,9 @@ fn fre_reducer(
         "compile" => fre_compile_verify(request, limits),
         "count" => fre_aggregate_count(request, limits),
         "count-spans" => fre_aggregate_span_sum(request, limits),
+        "count-captures" => fre_count_captures(request, limits),
         "grep" => fre_grep(request, limits),
+        "grep-captures" => fre_grep_captures(request, limits),
         other => Err(ExecutionError::unsupported(format!(
             "current FRE facade has no certified {other} operation"
         ))),
@@ -1894,6 +1898,219 @@ fn fre_compile_verify(
     Ok(FreReduction {
         actual: result.value(),
         plan,
+    })
+}
+
+fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
+    let message = format!("FRE capture build refused input: {error}");
+    match error {
+        CaptureBuildError::Unsupported(_) | CaptureBuildError::HirResource { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        CaptureBuildError::Engine(fre::CaptureEngineBuildError::Resource { .. }) => {
+            ExecutionError::unsupported(message)
+        }
+        CaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
+        CaptureBuildError::Allocation { .. }
+        | CaptureBuildError::Engine(_)
+        | CaptureBuildError::InternalInvariant(_) => ExecutionError::fault(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn capture_search_error(error: &CaptureSearchError, message: String) -> ExecutionError {
+    match error {
+        CaptureSearchError::Resource { .. } => ExecutionError::unsupported(message),
+        CaptureSearchError::EmptyMatch
+        | CaptureSearchError::BoundOverflow(_)
+        | CaptureSearchError::Allocation(_)
+        | CaptureSearchError::InvalidWindow
+        | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
+    }
+}
+
+fn capture_regex(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<CaptureRegex, ExecutionError> {
+    let pattern = one_fre_pattern(request)?;
+    let engine_limits = fre::CaptureEngineBuildLimits {
+        max_compile_work: limits.fre_aggregate_compile_work,
+        max_program_bytes: limits.fre_aggregate_program_bytes,
+        ..fre::CaptureEngineBuildLimits::default()
+    };
+    CaptureBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(request.unicode)
+        .case_insensitive(request.case_insensitive)
+        .limits(CaptureBuildLimits {
+            max_hir_work: limits.fre_aggregate_compile_work,
+            engine: engine_limits,
+            ..CaptureBuildLimits::default()
+        })
+        .build()
+        .map_err(|error| capture_build_error(&error))
+}
+
+fn capture_run_limits(
+    haystack_len: usize,
+    reducer_events: usize,
+    reducer_count: usize,
+    state_visits: usize,
+    history_nodes: usize,
+    history_walk: usize,
+    limits: &RunLimits,
+) -> Result<CaptureRunLimits, ExecutionError> {
+    let searches = checked_aggregate_add(haystack_len, 1, "capture searches")?;
+    let search_work = usize::try_from(limits.fre_search_work)
+        .map_err(|_| ExecutionError::fault("FRE capture search work does not fit usize"))?;
+    Ok(CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_state_visits: state_visits.min(search_work),
+                max_slot_copies: 0,
+                max_history_nodes: history_nodes.min(search_work),
+                max_history_walk: history_walk.min(search_work),
+                max_scratch_bytes: limits.fre_scratch_bytes,
+            },
+            max_searches: searches,
+            max_results: haystack_len,
+            max_total_state_visits: state_visits,
+            max_total_slot_copies: 0,
+            max_total_history_nodes: history_nodes,
+            max_total_history_walk: history_walk,
+            max_capture_events: reducer_events,
+            max_capture_count: reducer_count,
+        },
+    })
+}
+
+fn capture_reducer_budget(limits: &RunLimits) -> Result<(usize, usize), ExecutionError> {
+    let reducer = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE capture reducer limit does not fit usize"))?;
+    Ok((reducer, limits.fre_aggregate_operation_work))
+}
+
+fn fre_count_captures(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex = capture_regex(request, limits)?;
+    let (reducer, work) = capture_reducer_budget(limits)?;
+    let run_limits = capture_run_limits(
+        request.haystack.len(),
+        reducer,
+        reducer,
+        work,
+        work,
+        work,
+        limits,
+    )?;
+    let result = regex
+        .count_captures(request.haystack, run_limits)
+        .map_err(|error| {
+            capture_search_error(
+                &error.source,
+                format!("FRE capture reducer refused execution: {error}"),
+            )
+        })?;
+    let actual = u64::try_from(result.accounting.count)
+        .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))?;
+    Ok(FreReduction {
+        actual,
+        plan: "capture-persistent-history",
+    })
+}
+
+fn fre_grep_captures(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex = capture_regex(request, limits)?;
+    let (reducer_limit, work_limit) = capture_reducer_budget(limits)?;
+    let groups = regex
+        .build_report()
+        .engine
+        .captures
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE capture group count overflow"))?;
+    let mut reducer_events = 0_usize;
+    let mut count = 0_usize;
+    let mut state_visits = 0_usize;
+    let mut history_nodes = 0_usize;
+    let mut history_walk = 0_usize;
+    for line in request.haystack.lines() {
+        reducer_events = checked_aggregate_add(reducer_events, 1, "capture line events")?;
+        if reducer_events > reducer_limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures line events need {reducer_events}, exceeding {reducer_limit}"
+            )));
+        }
+        let event_remaining = reducer_limit - reducer_events;
+        let count_remaining = reducer_limit
+            .checked_sub(count)
+            .ok_or_else(|| ExecutionError::fault("FRE grep-capture count underflow"))?;
+        let state_remaining = work_limit
+            .checked_sub(state_visits)
+            .ok_or_else(|| ExecutionError::fault("FRE capture state accounting underflow"))?;
+        let node_remaining = work_limit
+            .checked_sub(history_nodes)
+            .ok_or_else(|| ExecutionError::fault("FRE capture node accounting underflow"))?;
+        let walk_remaining = work_limit
+            .checked_sub(history_walk)
+            .ok_or_else(|| ExecutionError::fault("FRE capture walk accounting underflow"))?;
+        let run_limits = capture_run_limits(
+            line.len(),
+            event_remaining,
+            count_remaining,
+            state_remaining,
+            node_remaining,
+            walk_remaining,
+            limits,
+        )?;
+        let result = regex.count_captures(line, run_limits).map_err(|error| {
+            capture_search_error(
+                &error.source,
+                format!("FRE grep-capture reducer refused execution: {error}"),
+            )
+        })?;
+        let group_events = result
+            .accounting
+            .matches
+            .checked_mul(groups)
+            .ok_or_else(|| ExecutionError::fault("FRE grep-capture group events overflow"))?;
+        reducer_events = checked_aggregate_add(
+            reducer_events,
+            group_events,
+            "capture group events",
+        )?;
+        if reducer_events > reducer_limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures events need {reducer_events}, exceeding {reducer_limit}"
+            )));
+        }
+        count = checked_aggregate_add(count, result.accounting.count, "capture count")?;
+        state_visits = checked_aggregate_add(
+            state_visits,
+            result.accounting.total_state_visits,
+            "capture state visits",
+        )?;
+        history_nodes = checked_aggregate_add(
+            history_nodes,
+            result.accounting.total_history_nodes,
+            "capture history nodes",
+        )?;
+        history_walk = checked_aggregate_add(
+            history_walk,
+            result.accounting.total_history_walk,
+            "capture history walk",
+        )?;
+    }
+    let actual = u64::try_from(count)
+        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
+    Ok(FreReduction {
+        actual,
+        plan: "capture-persistent-history",
     })
 }
 
@@ -3908,6 +4125,42 @@ mod tests {
             count_captures(&captures, b"a ab", 100).expect("captures"),
             5
         );
+    }
+
+    #[test]
+    fn fre_capture_reducers_cover_optional_repeated_and_line_models() {
+        let limits = RunLimits::default();
+        let count_patterns = vec![r"(a)(b)?".to_string()];
+        let count = fre_reducer(
+            CandidateRequest {
+                job_id: "test/capture-count",
+                model: "count-captures",
+                patterns: &count_patterns,
+                haystack: b"a ab",
+                unicode: false,
+                case_insensitive: false,
+            },
+            &limits,
+        )
+        .expect("FRE capture count");
+        assert_eq!(count.actual, 5);
+        assert_eq!(count.plan, "capture-persistent-history");
+
+        let grep_patterns = vec![r"([a-z][a-z])([a-z])([\r\n])?".to_string()];
+        let grep = fre_reducer(
+            CandidateRequest {
+                job_id: "test/capture-grep",
+                model: "grep-captures",
+                patterns: &grep_patterns,
+                haystack: b"foo foo\r\nZ\r\nfoo\r\nfoo",
+                unicode: false,
+                case_insensitive: false,
+            },
+            &limits,
+        )
+        .expect("FRE grep capture count");
+        assert_eq!(grep.actual, 12);
+        assert_eq!(grep.plan, "capture-persistent-history");
     }
 
     #[test]
