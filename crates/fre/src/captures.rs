@@ -376,7 +376,7 @@ impl CaptureBuilder {
         )
         .map_err(CaptureBuildError::Selector)?;
         let selector_accounting = selector.compile_accounting();
-        let ast = lower_hir(&rust.hir, 1, limits, &mut accounting)?;
+        let ast = lower_hir(&rust.hir, 1, &limits, &mut accounting)?;
         let program =
             Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
         let engine_report = program.build_report().clone();
@@ -660,7 +660,7 @@ fn checked_capture_add(
 fn lower_hir(
     hir: &Hir,
     depth: usize,
-    limits: CaptureBuildLimits,
+    limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
 ) -> Result<Ast, CaptureBuildError> {
     if depth > limits.max_hir_depth {
@@ -770,7 +770,7 @@ fn lower_hir(
 fn lower_children(
     children: &[Hir],
     depth: usize,
-    limits: CaptureBuildLimits,
+    limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
     construct: fn(Vec<Ast>) -> Ast,
 ) -> Result<Ast, CaptureBuildError> {
