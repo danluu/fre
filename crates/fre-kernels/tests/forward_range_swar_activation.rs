@@ -36,10 +36,15 @@ fn range_swar16_activation_lanes_high_bits_remainders_and_accounting_are_exact()
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
             .unwrap();
         assert_eq!(span, Some((0, haystack.len())), "prefix={prefix_len}");
-        assert_eq!(accounting.prefix_bytes_examined, prefix_len + 1);
+        let expected_examined = if haystack.len() == 16 {
+            haystack.len() + word_bytes
+        } else {
+            prefix_len + 1
+        };
+        assert_eq!(accounting.prefix_bytes_examined, expected_examined);
         assert_eq!(
             accounting.prefix_bytes_upper_bound,
-            haystack.len() + usize::from(prefix_len >= 16) * word_bytes,
+            haystack.len() + word_bytes,
             "prefix={prefix_len}"
         );
     }

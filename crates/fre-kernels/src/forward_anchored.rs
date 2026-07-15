@@ -1203,7 +1203,7 @@ impl ForwardAnchoredPlan {
         let range_swar_bound = matches!(
             self.implementation,
             ClassImplementation::InclusiveRange { start, end } if start != end
-        ) && window_bytes > START_RANGE_SWAR_MIN;
+        ) && window_bytes >= START_RANGE_SWAR_MIN;
         let rescan_margin = if range_swar_bound {
             WORD_BYTES
         } else if block_scanner && window_bytes >= RANGE_BLOCK {
@@ -4118,12 +4118,13 @@ mod tests {
             valid.push(b'Z');
             let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
             assert_eq!(matched, Some((0, valid.len())), "N={prefix_len}");
-            assert_eq!(accounting.prefix_bytes_examined, prefix_len + 1);
-            let expected_bound = if prefix_len < START_RANGE_SWAR_MIN {
-                valid.len()
-            } else {
+            let expected_examined = if valid.len() == START_RANGE_SWAR_MIN {
                 valid.len() + size_of::<usize>()
+            } else {
+                prefix_len + 1
             };
+            assert_eq!(accounting.prefix_bytes_examined, expected_examined);
+            let expected_bound = valid.len() + size_of::<usize>();
             assert_eq!(accounting.prefix_bytes_upper_bound, expected_bound);
         }
 
@@ -4160,15 +4161,15 @@ mod tests {
                 valid.push(suffix);
                 let (matched, accounting) = plan.find(&valid, SearchLimits::unlimited()).unwrap();
                 assert_eq!(matched, Some((0, valid.len())));
-                assert_eq!(accounting.prefix_bytes_examined, prefix_len + 1);
+                let expected_examined = if valid.len() == START_RANGE_SWAR_MIN {
+                    valid.len() + word_bytes
+                } else {
+                    prefix_len + 1
+                };
+                assert_eq!(accounting.prefix_bytes_examined, expected_examined);
                 assert_eq!(
                     accounting.prefix_bytes_upper_bound,
-                    valid.len()
-                        + if prefix_len < START_RANGE_SWAR_MIN {
-                            0
-                        } else {
-                            word_bytes
-                        }
+                    valid.len() + word_bytes
                 );
 
                 for position in [0_usize, word_bytes - 1, word_bytes, prefix_len - 1] {
