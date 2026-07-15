@@ -64,7 +64,7 @@ pub use fre_kernels::{
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
 };
 
-use fre_automata::{Automaton, Exists, SelectedEnd, Span};
+use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{
     AbsoluteEndFixedPlan, ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError,
     ForwardAnchoredBuildLimits, ForwardAnchoredPlan, ForwardAnchoredSearchAccounting,
@@ -84,7 +84,10 @@ use regex_syntax::hir::Look;
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
 
-pub use fre_automata::{SearchError as K0SearchError, SearchLimits, SearchWindow};
+pub use fre_automata::{
+    SearchError as K0SearchError, SearchLimits, SearchWindow,
+    SetupAccounting as SearchSessionSetupAccounting, WorkspaceLimits as SearchSessionLimits,
+};
 
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 1;
@@ -914,6 +917,42 @@ impl PortableRegex {
         self.plan.runtime_implementation_id()
     }
 
+    /// Prepare allocation-free repeated searches over this immutable matcher.
+    ///
+    /// K0 allocates and fully initializes one fixed-capacity workspace here;
+    /// every subsequent session call reuses it without growing. Native plans
+    /// retain their existing operation-specific dispatch and need no session
+    /// storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if K0 workspace construction exceeds the
+    /// supplied setup-work or scratch limit, or if allocation fails. Native
+    /// specialized plans ignore these limits because they construct no K0
+    /// workspace.
+    pub fn search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableSearchSession<'_>, SearchError> {
+        let plan = match &self.plan {
+            PortablePlan::K0(automaton) => {
+                let workspace = K0Workspace::new(
+                    automaton,
+                    SearchSessionLimits {
+                        max_setup_work: limits.max_setup_work,
+                        max_scratch_bytes: limits.max_scratch_bytes,
+                    },
+                )?;
+                PortableSearchSessionPlan::K0 {
+                    automaton,
+                    workspace,
+                }
+            }
+            _ => PortableSearchSessionPlan::Native(self),
+        };
+        Ok(PortableSearchSession { plan })
+    }
+
     /// Whether a selected match exists.
     ///
     /// # Errors
@@ -1216,6 +1255,151 @@ impl PortableRegex {
                 search_limits,
             }),
             _ => None,
+        }
+    }
+}
+
+/// Operation-local reusable search state for one immutable portable matcher.
+///
+/// This keeps construction-selected specialized plans unchanged. Only K0 owns
+/// mutable state, consisting of one fixed-capacity workspace whose size is
+/// determined entirely by the validated automaton.
+#[derive(Debug)]
+pub struct PortableSearchSession<'a> {
+    plan: PortableSearchSessionPlan<'a>,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing K0 would add a second allocation and falsify workspace setup accounting"
+)]
+enum PortableSearchSessionPlan<'a> {
+    Native(&'a PortableRegex),
+    K0 {
+        automaton: &'a Automaton,
+        workspace: K0Workspace,
+    },
+}
+
+impl PortableSearchSession<'_> {
+    /// Stable runtime identity of the borrowed matcher.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        match &self.plan {
+            PortableSearchSessionPlan::Native(regex) => regex.runtime_implementation_id(),
+            PortableSearchSessionPlan::K0 { .. } => "k0",
+        }
+    }
+
+    /// One-time K0 workspace allocation and initialization facts.
+    ///
+    /// Native specialized plans return `None` because the session allocates no
+    /// storage for them.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        match &self.plan {
+            PortableSearchSessionPlan::Native(_) => None,
+            PortableSearchSessionPlan::K0 { workspace, .. } => {
+                Some(workspace.construction_accounting())
+            }
+        }
+    }
+
+    /// Whether a selected match exists, reusing K0 state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::is_match`].
+    pub fn is_match(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => regex.is_match(haystack, limits),
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => {
+                let report = automaton
+                    .prepare::<Exists>()
+                    .search_with_workspace(haystack, workspace, limits)?;
+                let accounting = report.accounting();
+                Ok((report.into_output(), SearchAccounting::K0(accounting)))
+            }
+        }
+    }
+
+    /// Return the selected match end, reusing K0 state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::selected_end`].
+    pub fn selected_end(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => regex.selected_end(haystack, limits),
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => {
+                let report = automaton
+                    .prepare::<SelectedEnd>()
+                    .search_with_workspace(haystack, workspace, limits)?;
+                let accounting = report.accounting();
+                Ok((report.into_output(), SearchAccounting::K0(accounting)))
+            }
+        }
+    }
+
+    /// Return the profile-selected leftmost-first match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::find`].
+    pub fn find(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        self.find_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Search a range while assertions retain original-haystack context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::find_window`].
+    pub fn find_window(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => regex.find_window(haystack, window, limits),
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => {
+                let report = automaton
+                    .prepare::<Span>()
+                    .search_window_with_workspace(haystack, window, workspace, limits)?;
+                let accounting = report.accounting();
+                let matched = report.into_output().map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                });
+                Ok((matched, SearchAccounting::K0(accounting)))
+            }
         }
     }
 }

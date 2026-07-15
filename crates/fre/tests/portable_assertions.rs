@@ -4,7 +4,8 @@
 )]
 
 use fre::{
-    BuildError, PlanKind, PlanSelection, PortableBuilder, RustProfile, SearchLimits, SearchWindow,
+    BuildError, BuildLimits, K0SearchError, PlanKind, PlanSelection, PortableBuilder, RustProfile,
+    SearchAccounting, SearchLimits, SearchSessionLimits, SearchWindow,
 };
 use fre_lower::{LowerError, UnsupportedFeature};
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
@@ -185,6 +186,257 @@ fn assertions_composed_with_consumption_match_pinned_ranged_search() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
+    const PATTERNS: &[&str] = &[
+        r"(?m:^)[A-Za-z_]+",
+        r"[A-Za-z_]+(?m:$)",
+        r"\b[0-9A-Za-z_]{2,}\b",
+        r"\B-\B",
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"-a-",
+        b"\na\n",
+        &[b'a', 0xFF, b'-', b'_', b'\n'],
+    ];
+
+    for pattern in PATTERNS {
+        let regex = portable(pattern, PlanSelection::ForceK0);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap_or_else(|error| panic!("session build failed for {pattern:?}: {error}"));
+        assert_eq!(session.runtime_implementation_id(), "k0");
+        let construction = session
+            .workspace_setup_accounting()
+            .expect("K0 session must retain one workspace");
+        assert!(!construction.reused());
+        assert!(construction.allocated_bytes() > 0);
+        assert!(construction.initialized_bytes() > 0);
+        assert_eq!(
+            construction.allocated_bytes(),
+            construction.retained_bytes()
+        );
+
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let cold = regex
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap();
+                    let reused = session
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(reused.0, cold.0, "{pattern:?}/{haystack:?}/{start}..{end}");
+                    let (
+                        SearchAccounting::K0(cold_accounting),
+                        SearchAccounting::K0(reused_accounting),
+                    ) = (cold.1, reused.1)
+                    else {
+                        panic!("forced K0 returned another accounting family")
+                    };
+                    assert_eq!(
+                        reused_accounting.transition_work(),
+                        cold_accounting.transition_work()
+                    );
+                    assert_eq!(reused_accounting.boundaries(), cold_accounting.boundaries());
+                    assert_eq!(
+                        reused_accounting.scratch_bytes(),
+                        cold_accounting.scratch_bytes()
+                    );
+                    assert!(reused_accounting.setup().reused());
+                    assert_eq!(reused_accounting.setup().allocated_bytes(), 0);
+                    assert_eq!(
+                        reused_accounting.setup().retained_bytes(),
+                        construction.retained_bytes()
+                    );
+                }
+            }
+
+            let cold_exists = regex.is_match(haystack, SearchLimits::unlimited()).unwrap();
+            let reused_exists = session
+                .is_match(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(reused_exists.0, cold_exists.0);
+            let cold_end = regex
+                .selected_end(haystack, SearchLimits::unlimited())
+                .unwrap();
+            let reused_end = session
+                .selected_end(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(reused_end.0, cold_end.0);
+            let cold_find = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+            let reused_find = session.find(haystack, SearchLimits::unlimited()).unwrap();
+            assert_eq!(reused_find.0, cold_find.0);
+        }
+    }
+}
+
+#[test]
+fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispatch() {
+    let k0 = portable(r"\b[0-9A-Za-z_]+\b", PlanSelection::ForceK0);
+    let probe = k0
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("unlimited K0 session");
+    let setup = probe.workspace_setup_accounting().unwrap();
+    let error = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect_err("one-below setup work must refuse");
+    assert!(matches!(
+        error,
+        fre::SearchError::K0(K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
+            if limit == setup.work() - 1 && needed == setup.work()
+    ));
+    assert!(matches!(
+        k0.search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: setup.retained_bytes() - 1,
+        }),
+        Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
+            needed,
+            limit,
+            ..
+        }))
+            if needed == setup.retained_bytes() && limit == setup.retained_bytes() - 1
+    ));
+
+    let literal = portable("Sherlock", PlanSelection::Auto);
+    assert_eq!(literal.build_report().plan, PlanKind::ExactLiteral);
+    let mut session = literal
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("native session requires no workspace");
+    assert_eq!(
+        session.runtime_implementation_id(),
+        literal.runtime_implementation_id()
+    );
+    assert_eq!(session.workspace_setup_accounting(), None);
+    assert_eq!(
+        session
+            .is_match(b"xxSherlock", SearchLimits::unlimited())
+            .unwrap(),
+        literal
+            .is_match(b"xxSherlock", SearchLimits::unlimited())
+            .unwrap()
+    );
+}
+
+#[test]
+fn portable_search_session_recovers_after_per_call_limit_failures() {
+    let regex = portable(r"\b[0-9A-Za-z_]+\b", PlanSelection::ForceK0);
+    let mut session = regex
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("unlimited K0 session");
+    let setup = session.workspace_setup_accounting().unwrap();
+    let haystack = b"--alpha_123--";
+    let expected = session
+        .find(haystack, SearchLimits::unlimited())
+        .expect("baseline reused search");
+    let SearchAccounting::K0(expected_accounting) = expected.1 else {
+        panic!("forced K0 returned another accounting family")
+    };
+    assert!(expected_accounting.transition_work() > 0);
+
+    assert!(matches!(
+        session.find(
+            haystack,
+            SearchLimits {
+                max_work: expected_accounting.transition_work() - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+        ),
+        Err(fre::SearchError::K0(
+            K0SearchError::WorkLimitExceeded { .. }
+        ))
+    ));
+    assert_eq!(
+        session
+            .find(haystack, SearchLimits::unlimited())
+            .expect("session must recover after work refusal")
+            .0,
+        expected.0
+    );
+
+    assert!(matches!(
+        session.find(
+            haystack,
+            SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: setup.retained_bytes() - 1,
+            },
+        ),
+        Err(fre::SearchError::K0(K0SearchError::ResourceLimit { .. }))
+    ));
+    assert_eq!(
+        session
+            .find(haystack, SearchLimits::unlimited())
+            .expect("session must recover after scratch refusal")
+            .0,
+        expected.0
+    );
+}
+
+#[test]
+fn portable_search_session_preserves_every_native_plan_family() {
+    let packed = portable("a|ab", PlanSelection::Auto);
+    assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
+
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let dfa = PortableBuilder::new("foobar|foobaz|fooquux")
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .limits(dfa_limits)
+        .build()
+        .expect("forced literal-set DFA");
+    assert_eq!(dfa.build_report().plan, PlanKind::LiteralSetDfa);
+
+    let cases = [
+        (
+            portable("Sherlock", PlanSelection::Auto),
+            PlanKind::ExactLiteral,
+        ),
+        (packed, PlanKind::PackedLiteralSet),
+        (dfa, PlanKind::LiteralSetDfa),
+        (
+            portable("[a-z]+Z", PlanSelection::Auto),
+            PlanKind::RequiredLiteral,
+        ),
+        (
+            portable(r"\A[a-z]+Z", PlanSelection::Auto),
+            PlanKind::ForwardAnchored,
+        ),
+    ];
+    let haystack = b"xxfoobaz-alphaZ-Sherlock";
+
+    for (regex, expected_plan) in cases {
+        assert_eq!(regex.build_report().plan, expected_plan);
+        let expected_id = regex.runtime_implementation_id();
+        let expected = regex.find(haystack, SearchLimits::unlimited()).unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: 0,
+                max_scratch_bytes: 0,
+            })
+            .expect("native sessions allocate no K0 workspace");
+        assert_eq!(session.runtime_implementation_id(), expected_id);
+        assert_eq!(session.workspace_setup_accounting(), None);
+        assert_eq!(
+            session.find(haystack, SearchLimits::unlimited()).unwrap(),
+            expected
+        );
     }
 }
 

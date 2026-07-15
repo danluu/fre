@@ -124,6 +124,32 @@ This boundary is suitable for a later JIT or AOT backend: it can consume the
 same assertion vocabulary and differential corpus without inheriting K0's
 execution representation.
 
+## Reusable operation-local workspace
+
+`PortableRegex::search_session` exposes the existing K0 caller-owned workspace
+contract at the facade boundary. Session construction allocates and fully
+initializes exactly one fixed-capacity K0 workspace under explicit setup-work
+and retained-scratch limits. Repeated `is_match`, `selected_end`, `find`, and
+ranged `find_window` calls reuse that workspace without reserve, resize, or
+allocation. Each call resets only logical lengths and retains the same
+operation-specific K0 output contract and per-invocation work limit as the
+one-shot method.
+
+Construction accounting is reported separately from invocation accounting.
+The constructor record identifies allocated, initialized, and retained bytes;
+each successful reused K0 call reports `reused = true` and zero newly allocated
+bytes. Native exact-literal, packed-literal, literal-set, required-literal, and
+forward-anchored plans retain their existing dispatch and allocate no session
+storage.
+
+The workspace remains `O(states + edges)` and its layout is fixed by the
+validated automaton. Reuse changes neither assertion context nor input work:
+each line is still a distinct complete haystack for grep, so LF and ASCII-word
+predicates see exactly the same adjacent bytes as a cold call. Tests compare
+cold and reused operation outputs and transition counters over every range of
+arbitrary-byte assertion inputs, require one tight setup allocation, require
+zero allocation on reused calls, and preserve native-plan identity.
+
 ## Rebar projection, not benchmark evidence
 
 The generic admission change is expected to remove the syntax/lowering refusal
