@@ -63,6 +63,8 @@ pub enum UnicodeCompileBuildError {
     Syntax(fre_syntax::ParseError),
     /// The supplied profile disabled Unicode mode.
     UnicodeDisabled,
+    /// The supplied constructor was not the pinned Rebar Rust-byte surface.
+    ProfileMismatch,
     /// A locally byte-oriented literal could match invalid UTF-8.
     InvalidUtf8Literal,
     /// A locally byte-oriented class could match invalid UTF-8.
@@ -92,6 +94,9 @@ impl core::fmt::Display for UnicodeCompileBuildError {
         match self {
             Self::Syntax(error) => write!(f, "Unicode compile syntax failed: {error}"),
             Self::UnicodeDisabled => f.write_str("Unicode compile artifact requires Unicode mode"),
+            Self::ProfileMismatch => {
+                f.write_str("Unicode compile artifact requires the pinned Rebar constructor")
+            }
             Self::InvalidUtf8Literal => {
                 f.write_str("Unicode compile artifact excludes an invalid UTF-8 literal")
             }
@@ -123,6 +128,7 @@ impl std::error::Error for UnicodeCompileBuildError {}
 pub struct UnicodeCompileArtifactId([u8; 16]);
 
 impl UnicodeCompileArtifactId {
+    /// Raw stable identity bytes.
     #[must_use]
     pub const fn bytes(self) -> [u8; 16] {
         self.0
@@ -162,7 +168,7 @@ impl UnicodeCompileArtifactBuilder {
     /// Start from the pinned Rust profile with Unicode mode enabled.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
-        let mut profile = RustProfile::default();
+        let mut profile = RustProfile::rebar_1_12_4();
         profile.options.unicode = true;
         Self {
             pattern: pattern.into(),
@@ -195,6 +201,12 @@ impl UnicodeCompileArtifactBuilder {
     pub fn build(self) -> Result<UnicodeCompileArtifact, UnicodeCompileBuildError> {
         if !self.profile.options.unicode {
             return Err(UnicodeCompileBuildError::UnicodeDisabled);
+        }
+        if !matches!(
+            &self.profile.constructor,
+            fre_syntax::RustConstructor::RebarMeta { .. }
+        ) {
+            return Err(UnicodeCompileBuildError::ProfileMismatch);
         }
         let request = fre_syntax::ParseRequest::rust(
             self.pattern,
@@ -264,18 +276,18 @@ pub struct UnicodeCompileArtifact {
 
 impl UnicodeCompileArtifact {
     /// Complete immutable construction receipt.
-    /// Exact retained artifact bytes.
     #[must_use]
     pub const fn report(&self) -> &UnicodeCompileBuildReport {
         &self.report
     }
 
-    /// Iterate every canonical literal scalar and class-range endpoint.
+    /// Exact retained artifact bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// Iterate every canonical literal scalar and class-range endpoint.
     #[must_use]
     pub fn scalar_encodings(&self) -> UnicodeScalarIter<'_> {
         UnicodeScalarIter::new(&self.bytes)
@@ -302,7 +314,8 @@ impl UnicodeCompileArtifact {
             if tag > TAG_ALTERNATION {
                 return Err("record tag unknown");
             }
-            let payload_len = read_u64(bytes, offset + 1).ok_or("record length missing")?;
+            let length_at = offset.checked_add(1).ok_or("record offset overflow")?;
+            let payload_len = read_u64(bytes, length_at).ok_or("record length missing")?;
             let payload_len = usize::try_from(payload_len).map_err(|_| "record length overflow")?;
             let payload = offset.checked_add(RECORD_HEADER_BYTES).ok_or("record overflow")?;
             offset = payload.checked_add(payload_len).ok_or("record overflow")?;
@@ -346,6 +359,7 @@ pub struct UnicodeScalarEncoding {
 }
 
 impl UnicodeScalarEncoding {
+    /// Exact canonical one-scalar UTF-8 bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
@@ -400,7 +414,8 @@ impl Iterator for UnicodeScalarIter<'_> {
                 return None;
             }
             let tag = *self.bytes.get(self.record)?;
-            let payload_len = usize::try_from(read_u64(self.bytes, self.record + 1)?).ok()?;
+            let length_at = self.record.checked_add(1)?;
+            let payload_len = usize::try_from(read_u64(self.bytes, length_at)?).ok()?;
             let payload = self.record.checked_add(RECORD_HEADER_BYTES)?;
             let end = payload.checked_add(payload_len)?;
             if end > self.bytes.len() {

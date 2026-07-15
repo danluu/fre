@@ -148,3 +148,13 @@ The retained generated report SHA-256 is
 `132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`,
 and its sorted-receipts SHA-256 is
 `106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
+
+## Unvalidated Unicode compile projection
+
+`UNICODE_COMPILE_ARTIFACT.md` records a source-only, compile-only mechanism for
+the eleven remaining members of the previously projected twelve-row Unicode
+`compile` family; one member now passes through the authenticated Unicode v5
+continuation artifact. The projected eleven-row ceiling would move `compile`
+from 17 to 28 and the total from 189 pass / 155 unsupported to 200 / 144 in
+isolation. This is not an observed result: no authoritative count above changes
+until exact report regeneration and independent acceptance.

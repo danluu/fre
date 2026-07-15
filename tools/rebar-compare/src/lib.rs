@@ -1895,6 +1895,7 @@ fn unicode_compile_build_error(error: &UnicodeCompileBuildError) -> ExecutionErr
     match error {
         UnicodeCompileBuildError::Syntax(_)
         | UnicodeCompileBuildError::UnicodeDisabled
+        | UnicodeCompileBuildError::ProfileMismatch
         | UnicodeCompileBuildError::InvalidUtf8Literal
         | UnicodeCompileBuildError::InvalidByteClass
         | UnicodeCompileBuildError::ResourceLimit { .. } => {
