@@ -35,7 +35,7 @@ fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families(
             b"Ab C",
             true,
             2,
-            AggregatePlanKind::UnicodeScalarClass,
+            AggregatePlanKind::ContinuationProgram,
         ),
     ];
     for (pattern, haystack, case_insensitive, expected, plan) in cases {
