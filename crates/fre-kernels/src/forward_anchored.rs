@@ -18,7 +18,7 @@ pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middl
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
-    "anchored-class-suffix.absolute-end-fixed-range64-suffix-first-hybrid.v3";
+    "anchored-class-suffix.absolute-end-fixed-range64-threshold64-suffix-first-hybrid.v4";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1258,9 +1258,10 @@ fn scan_fixed_class_prefix(
     implementation: ClassImplementation,
 ) -> Result<(usize, usize), SearchError> {
     match implementation {
-        ClassImplementation::InclusiveRange { start, end } => {
+        ClassImplementation::InclusiveRange { start, end } if bytes.len() >= FIXED_RANGE_BLOCK => {
             scan_fixed_range_prefix(bytes, start, end)
         }
+        ClassImplementation::InclusiveRange { start, end } => scan_range_prefix(bytes, start, end),
         _ => scan_class_prefix(bytes, class, implementation),
     }
 }

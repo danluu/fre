@@ -6,7 +6,8 @@ use fre_kernels::{
     ForwardAnchoredSearchLimits, ForwardClassImplementation, Window,
 };
 
-const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-range64-suffix-first-hybrid.v3";
+const FIXED_ID: &str =
+    "anchored-class-suffix.absolute-end-fixed-range64-threshold64-suffix-first-hybrid.v4";
 
 fn plan(class: &[u8], suffix: &[u8]) -> CandidatePlan {
     CandidatePlan::build(
