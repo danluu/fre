@@ -364,6 +364,14 @@ impl CandidateAdapter for CurrentFreAdapter {
 
     fn identity(&self) -> AdapterIdentity {
         let profile = rebar_profile();
+        let runtime_sha256 = std::env::var("FRE_CANDIDATE_RUNTIME_SHA256")
+            .ok()
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
@@ -372,7 +380,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             ),
             availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures use a complete reverse-row selector and replay tagged histories only over its disjoint nonempty spans, while refusing capture Unicode mode and unsupported looks; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
-            runtime_sha256: None,
+            runtime_sha256,
         }
     }
 
