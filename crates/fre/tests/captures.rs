@@ -1,6 +1,6 @@
 use fre::{
-    CaptureAggregateLimits, CaptureBuilder, CaptureResource, CaptureRunLimits, CaptureSearchError,
-    CaptureSearchLimits,
+    CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
 };
 use regex::bytes::RegexBuilder;
 
@@ -41,10 +41,49 @@ fn cross_family_capture_reducers_match_pinned_rust_bytes() {
             b"fn is_even(x: u8) -> bool {",
         ),
         (r"(()a)", b"a"),
+        (r"(?:\A(a)|(a))", b"xax"),
+        (r"(?:(a)\z|(a))", b"xax"),
         (r"(?-u:([\x80-\xFF]+))", &[0xFF, 0x80, b' ', 0xFE]),
     ];
     for &(pattern, haystack) in cases {
         assert_count(pattern, haystack);
+    }
+}
+
+fn adversarial_operation_work(size: usize) -> (usize, usize) {
+    let regex = CaptureBuilder::new(r"(?:a.*z|a)")
+        .unicode(false)
+        .build()
+        .expect("adversarial selector build");
+    let haystack = vec![b'a'; size];
+    let result = regex
+        .count_captures(&haystack, CaptureRunLimits::default())
+        .expect("operation-wide capture reduction");
+    assert_eq!(size, result.accounting.matches);
+    assert_eq!(size, result.accounting.count);
+    assert_eq!(size, result.selector_certificate.output_matches);
+    let state_visits = result
+        .selector_accounting
+        .state_evaluations
+        .saturating_add(result.selector_accounting.replay_steps)
+        .saturating_add(result.accounting.total_state_visits);
+    (state_visits, result.accounting.total_history_nodes)
+}
+
+#[test]
+fn operation_wide_selector_removes_quadratic_restart_work() {
+    let samples = [64_usize, 128, 256, 512].map(adversarial_operation_work);
+    for pair in samples.windows(2) {
+        let (smaller_visits, smaller_histories) = pair[0];
+        let (larger_visits, larger_histories) = pair[1];
+        assert!(
+            larger_visits <= smaller_visits.saturating_mul(5).div_ceil(2),
+            "doubling input grew state visits from {smaller_visits} to {larger_visits}"
+        );
+        assert!(
+            larger_histories <= smaller_histories.saturating_mul(5).div_ceil(2),
+            "doubling input grew history nodes from {smaller_histories} to {larger_histories}"
+        );
     }
 }
 
@@ -70,16 +109,17 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
             max_total_history_nodes: 0,
             ..CaptureAggregateLimits::default()
         },
+        ..CaptureRunLimits::default()
     };
     let error = regex
         .count_captures(b"a", starved)
         .expect_err("history starvation must refuse");
     assert!(matches!(
         error.source,
-        CaptureSearchError::Resource {
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
             kind: CaptureResource::HistoryNodes,
             ..
-        }
+        })
     ));
 }
 
@@ -120,6 +160,7 @@ fn source_and_execution_limits_remain_in_capture_identity() {
             max_capture_events: 1,
             ..CaptureAggregateLimits::default()
         },
+        ..CaptureRunLimits::default()
     };
     assert_ne!(default_identity, python_name.cache_identity(constrained));
 }

@@ -27,10 +27,10 @@ use fre::{
     AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateStrategy, AggregateUnicodeScalarSemantics, CaptureAggregateLimits,
-    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureRegex, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
+    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureRegex,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, CompatibilityProfile,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    LiteralAggregateReduceError, LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
     SearchSessionLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
@@ -63,7 +63,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v6";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v7";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -367,10 +367,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum and ordered build-many count/span-sum; exact literal, direct Unicode scalar-class, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum and ordered build-many count/span-sum; exact literal, direct Unicode scalar-class, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-operation capture-erased span selection plus exact-span persistent tagged-history replay for capture reducers",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; capture/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures use a complete reverse-row selector and replay tagged histories only over its disjoint nonempty spans, while refusing capture Unicode mode and unsupported looks; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1907,19 +1907,24 @@ fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
         CaptureBuildError::Unsupported(_)
         | CaptureBuildError::HirResource { .. }
         | CaptureBuildError::Engine(fre::CaptureEngineBuildError::Resource { .. })
+        | CaptureBuildError::Selector(
+            fre::AggregateEngineError::Unsupported(_)
+            | fre::AggregateEngineError::ResourceLimit { .. },
+        )
         | CaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
 }
 
-fn capture_search_error(error: &CaptureSearchError, message: String) -> ExecutionError {
-    match error {
-        CaptureSearchError::Resource { .. } => ExecutionError::unsupported(message),
-        CaptureSearchError::EmptyMatch
-        | CaptureSearchError::BoundOverflow(_)
-        | CaptureSearchError::Allocation(_)
-        | CaptureSearchError::InvalidWindow
-        | CaptureSearchError::InvalidProgram => ExecutionError::fault(message),
+fn capture_execution_error(source: &CaptureExecutionSource, message: String) -> ExecutionError {
+    match source {
+        CaptureExecutionSource::Selector(source) => aggregate_engine_error(source, message),
+        CaptureExecutionSource::History(CaptureSearchError::Resource { .. }) => {
+            ExecutionError::unsupported(message)
+        }
+        CaptureExecutionSource::History(_) | CaptureExecutionSource::InternalInvariant(_) => {
+            ExecutionError::fault(message)
+        }
     }
 }
 
@@ -1940,14 +1945,24 @@ fn capture_regex(
         .limits(CaptureBuildLimits {
             max_hir_work: limits.fre_aggregate_compile_work,
             engine: engine_limits,
+            selector: fre::AggregateCompileLimits {
+                max_work: limits.fre_aggregate_compile_work,
+                max_program_bytes: limits.fre_aggregate_program_bytes,
+                ..fre::AggregateCompileLimits::default()
+            },
             ..CaptureBuildLimits::default()
         })
         .build()
         .map_err(|error| capture_build_error(&error))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent capture reducer ledgers remain explicit at each line invocation"
+)]
 fn capture_run_limits(
     haystack_len: usize,
+    selector_states: usize,
     reducer_events: usize,
     reducer_count: usize,
     state_visits: usize,
@@ -1958,6 +1973,17 @@ fn capture_run_limits(
     let searches = checked_aggregate_add(haystack_len, 1, "capture searches")?;
     let search_work = usize::try_from(limits.fre_search_work)
         .map_err(|_| ExecutionError::fault("FRE capture search work does not fit usize"))?;
+    let mut selector = continuation_operation_limits(haystack_len, selector_states, limits)?;
+    let boundaries = checked_aggregate_add(haystack_len, 1, "capture selector boundaries")?;
+    selector.max_output_bytes = checked_aggregate_mul(
+        boundaries,
+        core::mem::size_of::<fre::AggregateSpan>(),
+        "capture selector output bytes",
+    )?
+    .min(limits.fre_aggregate_peak_bytes);
+    selector.max_sequential_bytes = limits.fre_aggregate_sequential_bytes;
+    selector.max_peak_bytes = limits.fre_aggregate_peak_bytes;
+    selector.max_work = limits.fre_aggregate_operation_work;
     Ok(CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
@@ -1976,6 +2002,7 @@ fn capture_run_limits(
             max_capture_events: reducer_events,
             max_capture_count: reducer_count,
         },
+        selector,
     })
 }
 
@@ -1993,6 +2020,7 @@ fn fre_count_captures(
     let (reducer, work) = capture_reducer_budget(limits)?;
     let run_limits = capture_run_limits(
         request.haystack.len(),
+        regex.build_report().selector.program_states,
         reducer,
         reducer,
         work,
@@ -2003,7 +2031,7 @@ fn fre_count_captures(
     let result = regex
         .count_captures(request.haystack, run_limits)
         .map_err(|error| {
-            capture_search_error(
+            capture_execution_error(
                 &error.source,
                 format!("FRE capture reducer refused execution: {error}"),
             )
@@ -2012,7 +2040,7 @@ fn fre_count_captures(
         .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))?;
     Ok(FreReduction {
         actual,
-        plan: "capture-persistent-history",
+        plan: "capture-linear-selector-persistent-history",
     })
 }
 
@@ -2057,6 +2085,7 @@ fn fre_grep_captures(
             .ok_or_else(|| ExecutionError::fault("FRE capture walk accounting underflow"))?;
         let run_limits = capture_run_limits(
             line.len(),
+            regex.build_report().selector.program_states,
             event_remaining,
             count_remaining,
             state_remaining,
@@ -2065,7 +2094,7 @@ fn fre_grep_captures(
             limits,
         )?;
         let result = regex.count_captures(line, run_limits).map_err(|error| {
-            capture_search_error(
+            capture_execution_error(
                 &error.source,
                 format!("FRE grep-capture reducer refused execution: {error}"),
             )
@@ -2103,7 +2132,7 @@ fn fre_grep_captures(
         .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
     Ok(FreReduction {
         actual,
-        plan: "capture-persistent-history",
+        plan: "capture-linear-selector-persistent-history",
     })
 }
 
@@ -4137,7 +4166,7 @@ mod tests {
         )
         .expect("FRE capture count");
         assert_eq!(count.actual, 5);
-        assert_eq!(count.plan, "capture-persistent-history");
+        assert_eq!(count.plan, "capture-linear-selector-persistent-history");
 
         let grep_patterns = vec![r"([a-z][a-z])([a-z])([\r\n])?".to_string()];
         let grep = fre_reducer(
@@ -4153,7 +4182,7 @@ mod tests {
         )
         .expect("FRE grep capture count");
         assert_eq!(grep.actual, 12);
-        assert_eq!(grep.plan, "capture-persistent-history");
+        assert_eq!(grep.plan, "capture-linear-selector-persistent-history");
     }
 
     #[test]

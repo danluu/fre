@@ -1,104 +1,111 @@
 # Capture-history reducer frontier
 
-This checkpoint promotes the existing persistent tagged-history executor into
-an operation-specific FRE facade and connects it to Rebar's
-`count-captures`/`grep-captures` reducers. It is a projected source frontier;
-the authenticated comparison report remains unchanged until phase B.
+This checkpoint replaces the rejected suffix-restarted capture reducer with a
+whole-operation selector followed by exact-span tagged-history replay. It is a
+source and counter checkpoint, not a performance result. No timing is allowed
+until the current source has passed the full authenticated Rebar differential
+twice with byte-identical reports.
 
-## Certified mechanism and invariant
+## Certified mechanism and progress invariant
 
-The Rust-byte HIR adapter admits literals, byte classes, ordered alternation,
-concatenation, greedy/lazy repetition, captures, and absolute start/end. It
-refuses Unicode mode and every other look assertion before publication. Each
-ordered Pike thread owns an immutable history-node ID. A save appends one
-`(slot, byte-offset, previous)` node; speculative forks share the prior ID and
-never clone a slot vector. Only the selected winner is walked, newest event
-first, into fixed slots. Thus absent groups remain absent, empty participating
-groups remain present, and a later repetition that does not participate cannot
-erase an earlier participating value on the selected path.
+One canonical Rust-byte HIR produces two immutable programs:
 
-The non-empty reducer materializes and drops one winner at a time. It separately
-accounts state visits, history-node allocation, winner walks, group events,
-participating-group count, matches, searches, peak threads, and conservative
-scratch. Construction identity includes exact source/profile/admission,
-operation, plan kind, compiler limits, and tagged-program report. Execution
-identity additionally includes every reducer limit.
+1. the production aggregate compiler erases captures and selects the complete
+   non-overlapping, non-empty whole-match span sequence in one
+   `ReverseSequentialRows` operation; and
+2. the capture compiler preserves ordered save events in persistent histories.
+   It injects a start only at each selector-certified span start and replays
+   only through that exact span end, while retaining the original haystack
+   window for absolute-anchor context.
 
-## Exact projected Rebar rows
+The selector owns leftmost-first/greedy span choice. Exact replay may discard a
+match state before the certified end; at the certified end the first
+prioritized match supplies the winning history. The overall capture is checked
+against the certified span before any group participation is counted. A
+selector/history disagreement is therefore a typed internal fault, never a
+fallback search.
 
-The admitted syntax projection is 18 of the current 37 capture gaps: nine
-`count-captures` and nine `grep-captures`, across six families.
+If `S` and `T` are the selector and tagged-program state counts, `N` is the
+haystack length, `M` is the number of non-empty matches, and `L_i` are their
+disjoint lengths, then:
 
-`count-captures`:
+- selector transition work is bounded by `O(SN)` and its span output by
+  `O(M)`;
+- tagged replay scans `sum(L_i) <= N` bytes;
+- tagged replay processes `sum(L_i + 1) <= N + M <= 2N` boundaries for
+  `N > 0`, so state/history work is `O(TN)`; and
+- replay history scratch is released after each winner. Peak history scratch
+  is bounded by the largest exact span, not by all suffixes or all matches.
 
-- `captures/contiguous-letters`
-- `opt/prefilter/rust-functions`
-- `test/model/count-captures`
-- `wild/caddy/caddy`
-- `wild/dot-star-capture/rust-src-tools`
-- `wild/rustsec-cargo-audit/original-unix`
-- `wild/rustsec-cargo-audit/original-windows`
-- `wild/rustsec-cargo-audit/both-slashes`
-- `wild/rustsec-cargo-audit/both-alternate`
+Every selector and tagged-history work, scratch, output, history-node, winner
+walk, group-event, match, and result dimension has a checked admission limit.
+Construction identity includes both program identities and their limits;
+execution identity includes both operation limit sets. Existing exact-literal,
+continuation, and portable-grep dispatch is unchanged.
 
-`grep-captures`:
+The retained suffix-restart adversary is `(?:a.*z|a)` over `a^N`. The rejected
+implementation grew from 6,884 to 399,108 tagged state visits between 64 and
+512 bytes. The operation-wide implementation records:
 
-- `curated/04-ruff-noqa/real`
-- `curated/04-ruff-noqa/tweaked`
-- `curated/07-unicode-character-data/parse-line`
-- `curated/09-aws-keys/full`
-- `curated/11-unstructured-to-json/extract`
-- `opt/onepass/fn-predicate`
-- `opt/onepass/first-three-words-english`
-- `test/model/grep-captures`
-- `unicode/overlapping-words/ascii`
+| `N` | selector work | combined selector/replay state visits | history nodes |
+|---:|---:|---:|---:|
+| 64 | 2,267 | 1,740 | 128 |
+| 128 | 4,507 | 3,468 | 256 |
+| 256 | 8,987 | 6,924 | 512 |
+| 512 | 17,947 | 13,836 | 1,024 |
 
-The 19 retained refusals are exact: all 14 Unicode-enabled capture rows; four
-ASCII word-boundary-dependent rows (`curated/05-lexer-veryl/single`,
-`opt/backtrack/words-english`, `opt/onepass/word-boundary-english`, and
-`wild/parol-veryl/ascii`); and ordered multi-pattern
-`wild/parol-veryl/multi-captures-ascii`. The Veryl alternation transforms
-contain `\b` internally. They are not plain byte-class rows.
+Each doubling is below the preregistered 2.5x ceiling. This establishes the
+counter slope for the directed adversary; it does not substitute for the full
+semantic differential or prove good wall-clock performance.
 
-These 18 are syntax projections, not authenticated passes. Conservative
-history/scratch admission or actual semantic differentials may retain a subset
-as unsupported in phase B; no row is counted as supported until the canonical
-report says so.
+## Semantic and coverage gates
 
-## Focused phase-B gates
-
-Run only after the separately authenticated coordinator packet is installed;
-use ordinary commands so its enforced shim acquires distinct holders:
+The focused gate covers optional, absent, empty, repeated, nested and 26-way
+capture histories; invalid bytes; CRLF line reduction; interior absolute
+anchors; and the quadratic restart adversary. It also retains typed refusals
+for Unicode capture lowering and unsupported looks. At this checkpoint these
+commands pass:
 
 ```text
 cargo test -p fre-capture-lab --test conformance
 cargo test -p fre --test captures
+cargo test -p fre --test portable_assertions
 cargo test -p rebar-compare fre_capture_reducers_cover_optional_repeated_and_line_models
-cargo clippy -p fre-capture-lab -p fre -p rebar-compare --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc -p fre-capture-lab -p fre --no-deps
-cargo run --release -p rebar-compare -- research/rebar/expanded/manifest.json /tmp/rebar-fre research/rebar/comparison/report.json /tmp/rebar-fre/engines/rust/regex/target/release/main /tmp/rebar-fre/engines/re2/target/release/main
+cargo test -p rebar-compare current_fre_compile_constructs_fresh_artifacts_and_keeps_build_many_typed
 ```
 
-The regenerated frontier gate must report exact pass/unsupported counts by
-model and refusal reason, preserve all 144 baseline passes, and show no fail or
-fault. Differential coverage includes nested/repeated/optional/absent/empty
-groups, invalid bytes, anchors, CRLF line splitting, and 26-way fan-out.
+The prior suffix-restarted semantic experiment added ten rows to its then-179
+baseline, but it was killed because its aggregate work was quadratic. Those
+receipts do not qualify this replacement. Promotion requires, on the current
+baseline:
 
-## Preregistered performance matrix
+1. two byte-identical full 344-row comparison reports;
+2. no removed pass, semantic failure, unresolved result or fault;
+3. an exact unique supported-row delta and refusal-reason inventory;
+4. focused static and documentation gates; and
+5. preservation of the specialized non-capture dispatch identities.
 
-No timing was run in phase A. After semantic authentication, compare the full
-public reducer boundary against pinned Rust regex for:
+The known capture-gap families must be reported rather than hidden by a total:
+Unicode lowering, unsupported looks, ordered build-many, selector construction
+limits, selector operation limits, and tagged replay/history limits. In
+particular, the seven large rows refused by the rejected replay must be
+reclassified using this mechanism's exact selector and exact-span bounds.
 
-| Family | Row | Regime |
-|---|---|---|
-| captures | `contiguous-letters` | dense 26-way participation/fan-out |
-| curated | `07-unicode-character-data/parse-line` | match-dense per-line fixed fields |
-| wild | `rustsec-cargo-audit/original-unix` | sparse literal-prefix candidates on binary bytes |
-| opt | `onepass/first-three-words-english` | line-dense three-capture parsing |
+## Preregistered pointwise performance matrix
 
-Record pointwise medians and allocation/work counters, not a suite geomean.
-The expected effect is reduced capture-slot copying versus inline speculative
-vectors, at the cost of history nodes and winner reconstruction. Repeated
-search can still be quadratic in adverse leftmost-first cases; state/history
-counters and the resource refusal are the screening gate, and no speed claim
-is made before measurement.
+Run no timings before the semantic and counter gates above pass. After they do,
+measure the complete public reducer boundary against pinned Rust regex on these
+four cells. RE2 is a secondary comparator only: equal expected reductions make
+these cells useful comparisons, but do not establish general RE2-profile
+capture conformance.
+
+| Regime | Row | Haystack bytes | Expected reduction |
+|---|---|---:|---:|
+| dense line captures | `curated/07-unicode-character-data/parse-line` | 1,913,704 | 558,784 |
+| long sparse line captures | `curated/04-ruff-noqa/real` | 32,514,634 | 84 |
+| medium line captures | `opt/onepass/fn-predicate` | 7,384,531 | 916 |
+| short whole-haystack captures | `test/model/count-captures` | 37 | 3 |
+
+Report pointwise medians, dispersion, allocations and work counters. Do not
+publish a suite geomean from four hand-selected cells, and do not select a
+different timing subset after seeing results.

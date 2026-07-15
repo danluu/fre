@@ -107,6 +107,27 @@ pub(crate) fn admit_history(
     limits: SearchLimits,
 ) -> Result<Admission, SearchError> {
     let boundaries = boundary_count(window, from)?;
+    admit_history_boundaries(program, boundaries, limits)
+}
+
+pub(crate) fn admit_history_exact(
+    program: &Program,
+    span: Span,
+    limits: SearchLimits,
+) -> Result<Admission, SearchError> {
+    let boundaries = span
+        .end
+        .checked_sub(span.start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+    admit_history_boundaries(program, boundaries, limits)
+}
+
+fn admit_history_boundaries(
+    program: &Program,
+    boundaries: usize,
+    limits: SearchLimits,
+) -> Result<Admission, SearchError> {
     let state_visit_bound = state_visit_bound(program, boundaries)?;
     check(
         ResourceKind::StateVisits,

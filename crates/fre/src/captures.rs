@@ -3,10 +3,19 @@
 use core::fmt;
 use std::sync::Arc;
 
+use fre_aggregate::{
+    CompileAccounting as SelectorCompileAccounting, CompileLimits as SelectorCompileLimits,
+    CompiledRegex as SelectorRegex, Error as SelectorError,
+    ExecutionAccounting as SelectorExecutionAccounting,
+    OperationCertificate as SelectorOperationCertificate,
+    OperationLimits as SelectorOperationLimits, PlanId as SelectorPlanId,
+    RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
+};
 use fre_capture_lab::{
     AggregateLimits, Ast, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
     BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, Greed, HistoryRegex,
-    Program, SearchError as EngineSearchError, Window,
+    Program, ResourceKind as EngineResource, SearchError as EngineSearchError, Span as EngineSpan,
+    Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -24,8 +33,8 @@ pub enum CaptureOperation {
 /// Production plan selected for the admitted capture operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturePlanKind {
-    /// Ordered Pike generations with persistent tagged histories.
-    PersistentHistory,
+    /// One operation-wide span selector plus exact-span persistent-history replay.
+    LinearSelectorPersistentHistory,
 }
 
 /// HIR forms deliberately outside the certified capture compiler.
@@ -65,6 +74,8 @@ pub struct CaptureBuildLimits {
     pub max_hir_depth: usize,
     /// Persistent-history compiler limits.
     pub engine: EngineBuildLimits,
+    /// Capture-erased operation-wide span-selector compiler limits.
+    pub selector: SelectorCompileLimits,
 }
 
 impl Default for CaptureBuildLimits {
@@ -75,6 +86,7 @@ impl Default for CaptureBuildLimits {
             max_hir_work: 1_000_000,
             max_hir_depth: 250,
             engine: EngineBuildLimits::default(),
+            selector: SelectorCompileLimits::default(),
         }
     }
 }
@@ -82,8 +94,10 @@ impl Default for CaptureBuildLimits {
 /// Execution limits included verbatim in the execution cache identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureRunLimits {
-    /// Limits for repeated bounded searches and capture reduction.
+    /// Limits for exact-span tagged replay and capture reduction.
     pub aggregate: AggregateLimits,
+    /// Limits for the complete operation-wide span selection.
+    pub selector: SelectorOperationLimits,
 }
 
 /// Immutable plan identity. Source syntax remains distinct even when HIRs agree.
@@ -97,6 +111,8 @@ pub struct CapturePlanIdentity {
     pub plan: CapturePlanKind,
     /// Versioned capture semantic profile.
     pub capture_profile: CaptureProfile,
+    /// Exact capture-erased selector program identity.
+    pub selector_plan_id: SelectorPlanId,
 }
 
 /// Construction report for one immutable capture plan.
@@ -110,6 +126,8 @@ pub struct CaptureBuildReport {
     pub hir: CaptureHirAccounting,
     /// Tagged-program construction and allocation accounting.
     pub engine: EngineBuildReport,
+    /// Capture-erased selector construction accounting.
+    pub selector: SelectorCompileAccounting,
     /// Complete immutable plan identity.
     pub plan_identity: CapturePlanIdentity,
 }
@@ -151,6 +169,8 @@ pub enum CaptureBuildError {
     },
     /// Tagged-program construction refused or faulted.
     Engine(EngineBuildError),
+    /// Operation-wide capture-erased span selector refused or faulted.
+    Selector(SelectorError),
     /// Facade invariant failure.
     InternalInvariant(&'static str),
 }
@@ -177,6 +197,7 @@ impl fmt::Display for CaptureBuildError {
                 )
             }
             Self::Engine(error) => write!(formatter, "capture engine build failed: {error}"),
+            Self::Selector(error) => write!(formatter, "capture selector build failed: {error}"),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "capture facade invariant failed: {detail}")
             }
@@ -189,7 +210,41 @@ impl std::error::Error for CaptureBuildError {
         match self {
             Self::Syntax(error) => Some(error),
             Self::Engine(error) => Some(error),
+            Self::Selector(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Typed source of a capture operation failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CaptureExecutionSource {
+    /// Complete capture-erased span selection failed before tagged replay.
+    Selector(SelectorError),
+    /// Exact-span persistent-history replay or reduction failed.
+    History(EngineSearchError),
+    /// Selector and tagged replay disagreed despite sharing one canonical HIR.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for CaptureExecutionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selector(error) => error.fmt(formatter),
+            Self::History(error) => error.fmt(formatter),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "capture operation invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaptureExecutionSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Selector(error) => Some(error),
+            Self::History(error) => Some(error),
+            Self::InternalInvariant(_) => None,
         }
     }
 }
@@ -199,8 +254,8 @@ impl std::error::Error for CaptureBuildError {
 pub struct CaptureExecutionError {
     /// Complete invocation identity.
     pub identity: Box<CaptureCacheIdentity>,
-    /// Typed history/reducer failure.
-    pub source: EngineSearchError,
+    /// Typed selector/history/reducer failure.
+    pub source: CaptureExecutionSource,
 }
 
 impl fmt::Display for CaptureExecutionError {
@@ -222,6 +277,10 @@ pub struct CaptureExecutionReport {
     pub identity: CaptureCacheIdentity,
     /// Persistent-history and reducer accounting.
     pub accounting: CaptureCountOutcome,
+    /// Whole-operation selector certificate.
+    pub selector_certificate: SelectorOperationCertificate,
+    /// Exact selector work and storage accounting.
+    pub selector_accounting: SelectorExecutionAccounting,
 }
 
 /// Builder for the capture-preserving persistent-history plan.
@@ -295,6 +354,13 @@ impl CaptureBuilder {
             ));
         };
         let mut accounting = CaptureHirAccounting::default();
+        let selector = SelectorRegex::from_hir_erasing_captures_for_whole_match(
+            &rust.hir,
+            SelectorProfile::PINNED_1_12_4,
+            limits.selector,
+        )
+        .map_err(CaptureBuildError::Selector)?;
+        let selector_accounting = selector.compile_accounting();
         let ast = lower_hir(&rust.hir, 1, limits, &mut accounting)?;
         let program =
             Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
@@ -310,18 +376,21 @@ impl CaptureBuilder {
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
-            plan: CapturePlanKind::PersistentHistory,
+            plan: CapturePlanKind::LinearSelectorPersistentHistory,
             capture_profile: CaptureProfile::RustRegexBytes1_12_4,
+            selector_plan_id: selector.plan_id(),
         };
         let report = CaptureBuildReport {
             admission,
             syntax,
             hir: accounting,
             engine: engine_report,
+            selector: selector_accounting,
             plan_identity,
         };
         Ok(CaptureRegex {
             engine: HistoryRegex::from_program(program),
+            selector: Arc::new(selector),
             build_limits: limits,
             report,
         })
@@ -332,6 +401,7 @@ impl CaptureBuilder {
 #[derive(Clone, Debug)]
 pub struct CaptureRegex {
     engine: HistoryRegex,
+    selector: Arc<SelectorRegex>,
     build_limits: CaptureBuildLimits,
     report: CaptureBuildReport,
 }
@@ -354,24 +424,191 @@ impl CaptureRegex {
     }
 
     /// Reduce all non-overlapping non-empty matches over the complete byte haystack.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "selector, replay, and complete checked reducer accounting stay locally auditable"
+    )]
     pub fn count_captures(
         &self,
         haystack: &[u8],
         limits: CaptureRunLimits,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let identity = self.cache_identity(limits);
-        let accounting = self
-            .engine
-            .count_captures_nonempty(haystack, Window::all(haystack), limits.aggregate)
+        let selected = self
+            .selector
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                SelectorStrategy::ReverseSequentialRows,
+                limits.selector,
+            )
             .map_err(|source| CaptureExecutionError {
                 identity: Box::new(identity.clone()),
-                source,
+                source: CaptureExecutionSource::Selector(source),
             })?;
+        let mut accounting = CaptureCountOutcome {
+            count: 0,
+            matches: 0,
+            searches: 0,
+            total_state_visits: 0,
+            total_history_nodes: 0,
+            total_history_walk: 0,
+            peak_threads: 0,
+        };
+        let mut capture_events = 0_usize;
+        let window = Window::all(haystack);
+        for selected_span in selected.as_slice() {
+            if selected_span.start == selected_span.end {
+                return Err(Self::history_error(
+                    &identity,
+                    EngineSearchError::EmptyMatch,
+                ));
+            }
+            accounting.searches = checked_capture_add(
+                &identity,
+                accounting.searches,
+                1,
+                EngineResource::Searches,
+                limits.aggregate.max_searches,
+            )?;
+            accounting.matches = checked_capture_add(
+                &identity,
+                accounting.matches,
+                1,
+                EngineResource::Results,
+                limits.aggregate.max_results,
+            )?;
+            let mut per_search = limits.aggregate.per_search;
+            per_search.max_state_visits = per_search.max_state_visits.min(capture_remaining(
+                &identity,
+                limits.aggregate.max_total_state_visits,
+                accounting.total_state_visits,
+                EngineResource::AggregateStateVisits,
+            )?);
+            per_search.max_history_nodes = per_search.max_history_nodes.min(capture_remaining(
+                &identity,
+                limits.aggregate.max_total_history_nodes,
+                accounting.total_history_nodes,
+                EngineResource::AggregateHistoryNodes,
+            )?);
+            per_search.max_history_walk = per_search.max_history_walk.min(capture_remaining(
+                &identity,
+                limits.aggregate.max_total_history_walk,
+                accounting.total_history_walk,
+                EngineResource::AggregateHistoryWalk,
+            )?);
+            let span = EngineSpan {
+                start: selected_span.start,
+                end: selected_span.end,
+            };
+            let replay = self
+                .engine
+                .captures_exact(haystack, window, span, per_search)
+                .map_err(|source| Self::history_error(&identity, source))?;
+            let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "selector-certified span produced no tagged winner",
+                ),
+            })?;
+            accounting.total_state_visits = checked_capture_add(
+                &identity,
+                accounting.total_state_visits,
+                replay.report.state_visits,
+                EngineResource::AggregateStateVisits,
+                limits.aggregate.max_total_state_visits,
+            )?;
+            accounting.total_history_nodes = checked_capture_add(
+                &identity,
+                accounting.total_history_nodes,
+                replay.report.history_nodes,
+                EngineResource::AggregateHistoryNodes,
+                limits.aggregate.max_total_history_nodes,
+            )?;
+            accounting.total_history_walk = checked_capture_add(
+                &identity,
+                accounting.total_history_walk,
+                replay.report.history_walk,
+                EngineResource::AggregateHistoryWalk,
+                limits.aggregate.max_total_history_walk,
+            )?;
+            accounting.peak_threads = accounting.peak_threads.max(replay.report.peak_threads);
+            for group in captures.groups {
+                capture_events = checked_capture_add(
+                    &identity,
+                    capture_events,
+                    1,
+                    EngineResource::CaptureEvents,
+                    limits.aggregate.max_capture_events,
+                )?;
+                if group.span.is_some() {
+                    accounting.count = checked_capture_add(
+                        &identity,
+                        accounting.count,
+                        1,
+                        EngineResource::CaptureCount,
+                        limits.aggregate.max_capture_count,
+                    )?;
+                }
+            }
+        }
         Ok(CaptureExecutionReport {
             identity,
             accounting,
+            selector_certificate: selected.certificate().clone(),
+            selector_accounting: selected.accounting(),
         })
     }
+
+    fn history_error(
+        identity: &CaptureCacheIdentity,
+        source: EngineSearchError,
+    ) -> CaptureExecutionError {
+        CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(source),
+        }
+    }
+}
+
+fn capture_remaining(
+    identity: &CaptureCacheIdentity,
+    limit: usize,
+    used: usize,
+    resource: EngineResource,
+) -> Result<usize, CaptureExecutionError> {
+    limit
+        .checked_sub(used)
+        .ok_or_else(|| CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+        })
+}
+
+fn checked_capture_add(
+    identity: &CaptureCacheIdentity,
+    current: usize,
+    amount: usize,
+    resource: EngineResource,
+    limit: usize,
+) -> Result<usize, CaptureExecutionError> {
+    let required = current
+        .checked_add(amount)
+        .ok_or_else(|| CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+        })?;
+    if required > limit {
+        return Err(CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(EngineSearchError::Resource {
+                kind: resource,
+                required,
+                limit,
+            }),
+        });
+    }
+    Ok(required)
 }
 
 #[allow(
