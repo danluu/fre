@@ -1376,6 +1376,21 @@ mod tests {
         }
     }
 
+    fn reduce_error_dimension(error: ReduceError) -> &'static str {
+        match error {
+            ReduceError::InputBytesLimit { .. } => "input",
+            ReduceError::DecodeByteChecksLimit { .. } => "decode",
+            ReduceError::MembershipTestsLimit { .. } => "membership",
+            ReduceError::RangeComparisonsLimit { .. } => "comparisons",
+            ReduceError::MatchEventsLimit { .. } => "events",
+            ReduceError::CountLimit { .. } => "count",
+            ReduceError::SpanSumLimit { .. } => "span",
+            ReduceError::WorkLimit { .. } => "work",
+            ReduceError::PeakLimit { .. } => "peak",
+            other => panic!("unexpected reduce error: {other:?}"),
+        }
+    }
+
     #[test]
     fn every_nonzero_reduce_limit_has_an_exact_and_one_below_boundary() {
         let plan = class_plan();
@@ -1466,18 +1481,7 @@ mod tests {
         ];
         for (limits, expected) in cases {
             let error = plan.span_sum(haystack, limits).unwrap_err();
-            let actual = match error {
-                ReduceError::InputBytesLimit { .. } => "input",
-                ReduceError::DecodeByteChecksLimit { .. } => "decode",
-                ReduceError::MembershipTestsLimit { .. } => "membership",
-                ReduceError::RangeComparisonsLimit { .. } => "comparisons",
-                ReduceError::MatchEventsLimit { .. } => "events",
-                ReduceError::CountLimit { .. } => "count",
-                ReduceError::SpanSumLimit { .. } => "span",
-                ReduceError::WorkLimit { .. } => "work",
-                ReduceError::PeakLimit { .. } => "peak",
-                other => panic!("unexpected reduce error: {other:?}"),
-            };
+            let actual = reduce_error_dimension(error);
             assert_eq!(actual, expected);
         }
     }
