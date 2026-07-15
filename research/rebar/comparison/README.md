@@ -29,11 +29,10 @@ family and ties the next coverage gates to concrete Rebar job IDs.
   Rust baseline failures.
 
 The later authenticated canonical frontier is indexed in
-`COVERAGE_FRONTIER.md`: 200 pass / 144 unsupported with no FRE fail or fault.
+`COVERAGE_FRONTIER.md`: 204 pass / 140 unsupported with no FRE fail or fault.
 Those receipts include Unicode-on byte-stable continuation, canonical Unicode
-compile artifacts, and the qualified ordered build-many rows. The bounded
-finite one-pattern source candidate remains absent and claims no additional
-coverage until a fresh authenticated regeneration.
+compile artifacts, the qualified ordered build-many rows, and four bounded
+finite one-pattern count rows.
 
 The two Rust adapter failures are:
 

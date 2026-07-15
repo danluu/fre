@@ -3,8 +3,8 @@
 Status as of 2026-07-15: the production `fre` facade construction-selects the
 exact-literal reducer, a bounded finite ordered-language reducer, or the
 `fre-aggregate` continuation program for one-pattern Rust-byte `compile`,
-`count`, and `count-spans`. The finite route is a source-only candidate pending
-the gates in `../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not
+`count`, and `count-spans`. All three routes are semantically qualified at the
+authenticated Rebar frontier; this is not
 a claim that any path is faster than Rust regex or RE2 on every workload.
 The separate ordered build-many facade is qualified for its authenticated
 multi-pattern `count` and `count-spans` frontier.
@@ -176,16 +176,16 @@ patterns on `zabb`. Both aggregate strategies return count 1. Pinned Rust
 1.12.4 returns 2 through its unsound optimization; exact receipts deliberately
 retain those Rust failures while FRE passes the canonical definitions.
 
-The canonical authenticated frontier remains 200 FRE pass / 144 unsupported,
-zero fail/fault: 28 `compile`, 62 `count`, 101 `count-spans`, and nine
+The canonical authenticated frontier is 204 FRE pass / 140 unsupported,
+zero fail/fault: 28 `compile`, 66 `count`, 101 `count-spans`, and nine
 portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
 reverse-suffix failures; pinned RE2 remains 285/285. Unicode-on byte-stable
 continuation, canonical Unicode compile artifacts, and the qualified ordered
-build-many rows are included in those receipts; the finite plan remains absent
-and claims no additional support before regeneration. Exact per-model counts,
+build-many rows are included in those receipts; four imported/leipzig count
+rows execute through the finite plan. Exact per-model counts,
 refusal classes, and source/tree identities are retained in
 `../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
-the older baseline and is not silently relabelled as 200-frontier evidence.
+the older baseline and is not silently relabelled as 204-frontier evidence.
 
 Five fresh local timing processes cover all 24 exact-literal rows at the full
 public facade boundary. Median-of-five-process medians classify 10 jobs as FRE

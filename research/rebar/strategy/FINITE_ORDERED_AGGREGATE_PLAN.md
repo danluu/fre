@@ -1,8 +1,11 @@
 # Finite ordered-language aggregate plan
 
-Status: source-only candidate recomposed on exact authenticated 200-row base
-`5f4da7b5536c42bbcdc467ea9c897bf990577938`. No compiler, executable test,
-report generation, or timing command was run in phase A.
+Status: semantic qualification on exact source
+`e86a6ce46e3313ed69558522c5785d307394060f` (tree
+`b3d3acac9eda492dc9d779ea4615622d7019572f`). The exact report has SHA-256
+`294aba2fdc0ac429dd525c351b5b3aa710ff0be30e6d0c408b8a7ee5aa0c6092`
+and sorted-receipts SHA-256
+`11a24d1800194e1f6ee2c42717d2a65723ca05146e418d1697cff4d7392f03f3`.
 
 ## Mechanism and semantic boundary
 
@@ -46,9 +49,11 @@ and its finite-horizon counterexample behavior are unchanged.
 
 ## Coverage accounting
 
-Authenticated coverage remains exactly 200 pass / 144 unsupported at the
-canonical base until a phase-B regeneration runs; this source-only checkpoint
-claims zero authenticated unlocks.
+Authenticated coverage is exactly 204 pass / 140 unsupported. Relative to the
+200-row base, four `count` rows pass, no prior pass is lost, and FRE has no
+`fail` or `fault`: `imported/leipzig/awyer-inn`, `imported/leipzig/shing`,
+`imported/leipzig/tom-sawyer-huckle-finn`, and
+`imported/leipzig/twain-insensitive`.
 
 The committed fast-plan index identifies an exact 36-row finite-language
 candidate universe in the canonical manifest:
@@ -64,21 +69,18 @@ in the exact 40-row one-pattern aggregate resource set and its finite
 extraction/dense construction fits the new bounds. That set comprises three
 `compile`, 28 `count`, and nine `count-spans` refusals. The other three resource
 refusals are qualified build-many execution rows and are cardinality-disjoint
-from this mechanism. The generated family join is not committed at this base,
-so the exact intersection must be measured rather than guessed. The phase-B
-report must publish job IDs, families, model counts, prior refusal resource,
-selected plan, and remaining typed refusal. No support count should be promoted
-from the 36-row count/count-spans upper bound.
+from this mechanism. The exact regenerated join shows four admitted rows from
+the candidate universe; the remainder were already supported or retain their
+prior typed plan/resource boundary. No support count is inferred from the
+36-row upper bound.
 
-Finite-language `compile` candidates among the 33 compile rows are a separate
-unmeasured projection in the composed schema-v5 source. The three current
-compile-resource refusals are an absolute ceiling, not a projected unlock
-count, until the same authenticated regeneration classifies them.
+The same regeneration classifies all 33 compile rows. No compile row is added;
+the three compile-resource refusals remain typed unsupported.
 
-## Focused phase-B gates
+## Focused semantic gates
 
-After an independently audited coordinator receipt and authenticated phase-B
-packet, run normal commands through the enforced shim:
+The focused facade and comparator gates, strict relevant Clippy, formatting,
+and exact report generation run through the enforced resource coordinator:
 
 ```text
 cargo test -p fre --test aggregate_facade finite_ordered_plan_preserves_priority_nullable_captures_and_invalid_bytes
@@ -90,9 +92,9 @@ cargo test -p rebar-compare
 cargo run --release -p rebar-compare -- research/rebar/expanded/manifest.json /tmp/rebar-fre research/rebar/comparison/report.json /tmp/rebar-fre/engines/rust/regex/target/release/main /tmp/rebar-fre/engines/re2/target/release/main
 ```
 
-Regenerate twice and require byte-identical reports. Compare all formerly
-passing aggregate receipts, then report the exact resource-refusal delta by
-model, family, job ID, and reason. The structural adversary gate requires
+The final report must remain byte-identical across mechanical source-only
+changes. Compare all formerly passing aggregate receipts and publish the exact
+resource-refusal delta. The structural adversary gate requires
 `transitions == N`, `reducer_steps == N + 1`, exact total-work equality, and a
 one-below `TotalWorkLimit` refusal.
 

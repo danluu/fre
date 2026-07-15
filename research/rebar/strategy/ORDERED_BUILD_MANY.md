@@ -41,7 +41,7 @@ outputs are typed preflight refusals.
 
 ## Exact qualified cluster
 
-The exact composed frontier is 200 pass / 144 unsupported. Two of the five
+The exact current frontier is 204 pass / 140 unsupported. Two of the five
 execution candidates pass; the other three now reach later typed resource
 gates instead of being rejected for pattern cardinality:
 
@@ -53,16 +53,16 @@ gates instead of being rejected for pattern cardinality:
 | `curated/05-lexer-veryl/multi@rust/regex` | `count-spans` | execution-work refusal |
 | `wild/parol-veryl/multi-patternid-ascii@rust/regex` | `count-spans` | execution-work refusal |
 
-The exact operation counts are 62 `count` and 101 `count-spans`; the two new
-passes are additive to the independently authenticated Unicode and portable
-rows. The 28 `compile` passes include the separately qualified Unicode compile
+The exact operation counts are 66 `count` and 101 `count-spans`; the two
+build-many passes are additive to the independently authenticated Unicode and
+portable rows. The 28 `compile` passes include the separately qualified Unicode compile
 artifacts and remain unchanged. The two multi-pattern compile
 jobs remain typed unsupported until the compile facade publishes a complete
 ordered artifact.
 
-The finite candidate is cardinality-disjoint from build-many and cannot alter
-these five dispositions. Its one-pattern resource-refusal intersection remains
-unmeasured, so this document claims no larger authenticated total.
+The finite plan is cardinality-disjoint from build-many and does not alter
+these five dispositions. Its separately authenticated one-pattern intersection
+adds four imported/leipzig `count` rows.
 
 ## Required follow-up
 
