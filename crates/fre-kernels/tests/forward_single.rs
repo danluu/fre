@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const SINGLE_ID: &str = "anchored-class-suffix.single-candidate73-1024-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v12";
+const SINGLE_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v13";
 
 fn plan() -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -34,7 +34,7 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
         }
     );
 
-    for boundary in [72_usize, 73, 74, 1_023, 1_024, 1_025] {
+    for boundary in [72_usize, 73, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097] {
         let mut haystack = vec![0x80; boundary];
         haystack.extend_from_slice(candidate.suffix());
         let (span, accounting) = candidate
@@ -58,8 +58,10 @@ fn singleton_candidate_window_boundaries_and_accounting_are_exact() {
 #[test]
 fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes() {
     let candidate = plan();
-    for boundary in [73_usize, 74, 127, 128, 255, 256, 1_023, 1_024] {
-        for earlier in [0_usize, 1, 31, 32, 33, boundary / 2] {
+    for boundary in [
+        73_usize, 74, 127, 128, 255, 256, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097,
+    ] {
+        for earlier in [0_usize, 1, 31, 32, 33, boundary / 2, boundary - 1] {
             if earlier >= boundary {
                 continue;
             }
@@ -71,16 +73,28 @@ fn singleton_candidate_differential_preserves_first_outsider_and_arbitrary_bytes
                     .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
                     .unwrap();
                 assert_eq!(span, None, "boundary={boundary} earlier={earlier}");
-                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
                 if earlier == 0 {
                     assert_eq!(accounting.prefix_bytes_examined, 1);
                     assert!(!accounting.suffix_confirmation_attempted);
+                } else {
+                    let complete_bytes = boundary / 32 * 32;
+                    let expected_examined = if earlier < complete_bytes {
+                        let block_start = earlier / 32 * 32;
+                        1 + block_start + 32 + earlier % 32 + 1
+                    } else {
+                        1 + earlier + 1
+                    };
+                    assert_eq!(
+                        accounting.prefix_bytes_examined, expected_examined,
+                        "boundary={boundary} earlier={earlier}"
+                    );
                 }
+                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
             }
         }
     }
 
-    for length in [73_usize, 74, 1_023, 1_024] {
+    for length in [73_usize, 74, 1_023, 1_024, 1_025, 4_095, 4_096, 4_097] {
         let haystack = vec![0x80; length];
         let (span, accounting) = candidate
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
