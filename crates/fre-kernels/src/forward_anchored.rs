@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1340,6 +1340,7 @@ const SINGLE_CANDIDATE_MIN: usize = 73;
 const SINGLE_CANDIDATE_MAX: usize = 4_096;
 const PAIR_SWAR_MIN: usize = 73;
 const PAIR_SWAR_MAX: usize = 4_096;
+const PAIR_NEON_BLOCK: usize = 16;
 const SWAR_BYTES: usize = size_of::<u64>();
 const SWAR_LOW: u64 = u64::MAX / 0xFF;
 const SWAR_HIGH: u64 = SWAR_LOW * 0x80;
@@ -1613,7 +1614,46 @@ fn swar_zero_high_bits(value: u64) -> u64 {
     !(low_seven.wrapping_add(SWAR_LOW_SEVEN) | value | SWAR_LOW_SEVEN) & SWAR_HIGH
 }
 
-fn scan_pair_swar_candidate_prefix(
+#[inline]
+fn pair_neon_block_outside(block: &[u8], first: u8, second: u8) -> u8 {
+    block.iter().fold(0_u8, |outside, &byte| {
+        let inside = u8::from(byte == first) | u8::from(byte == second);
+        outside | (inside ^ 1)
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn recover_pair_neon_block(
+    block: &[u8],
+    consumed: usize,
+    first: u8,
+    second: u8,
+) -> Result<(usize, usize), SearchError> {
+    // This runs only after the vector-width mask reports a failed block. Keep
+    // the slice opaque so recovery stays one bounded scalar loop instead of
+    // cloning all 16 lanes into the hot function.
+    let block = core::hint::black_box(block);
+    let within_block = block
+        .iter()
+        .position(|&byte| byte != first && byte != second)
+        .unwrap_or(PAIR_NEON_BLOCK);
+    let boundary = consumed
+        .checked_add(within_block)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "Pair NEON candidate boundary",
+        })?;
+    let examined = boundary
+        .checked_add(SWAR_BYTES)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "failed Pair NEON candidate block examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
+#[inline]
+fn scan_pair_swar_candidate_tail(
     bytes: &[u8],
     first: u8,
     second: u8,
@@ -1672,6 +1712,41 @@ fn scan_pair_swar_candidate_prefix(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "pair SWAR candidate remainder examinations",
         })?;
+    Ok((boundary, examined))
+}
+
+fn scan_pair_swar_candidate_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(PAIR_NEON_BLOCK);
+    for block in &mut blocks {
+        if pair_neon_block_outside(block, first, second) != 0 {
+            return recover_pair_neon_block(block, consumed, first, second);
+        }
+        consumed =
+            consumed
+                .checked_add(PAIR_NEON_BLOCK)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "completed Pair NEON candidate blocks",
+                })?;
+    }
+    let (relative_boundary, relative_examined) =
+        scan_pair_swar_candidate_tail(blocks.remainder(), first, second)?;
+    let boundary =
+        consumed
+            .checked_add(relative_boundary)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "Pair NEON candidate remainder boundary",
+            })?;
+    let examined =
+        consumed
+            .checked_add(relative_examined)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "Pair NEON candidate remainder examinations",
+            })?;
     Ok((boundary, examined))
 }
 
@@ -2790,7 +2865,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-swar8-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v14"
+            "anchored-class-suffix.single-candidate73-4096-equality32-pair-candidate73-4096-neon16-swar8-tail-triple-candidate-swar8x4-cold-recovery32-range-swar32-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v15"
         );
         assert_eq!(
             pair.implementation(),
