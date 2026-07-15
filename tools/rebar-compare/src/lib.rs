@@ -26,11 +26,13 @@ use fre::{
     AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, CompatibilityProfile, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
+    AggregateStrategy, AggregateUnicodeScalarSemantics, CompatibilityProfile,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    LiteralAggregateReduceError, LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -59,7 +61,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v5";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v6";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -343,10 +345,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum and ordered build-many count/span-sum; exact literal, ordered literal, or reverse-sequential-rows continuation; whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected one-pattern compile/count/span-sum and ordered build-many count/span-sum; exact literal, direct Unicode scalar-class, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals or a bounded continuation program; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and refuses non-singleton scalar classes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; capture/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, and supports count/span-sum without materializing matches; Unicode-on continuation admits empty/literal/ASCII-range/singleton-scalar HIR and still refuses other non-byte-stable shapes plus Unicode-word/CRLF assertions; ordered build-many count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions when bounded construction and operation admission succeed; capture/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }
@@ -1866,6 +1868,7 @@ fn fre_compile_verify(
         })?;
     let plan = match regex.build_report().plan {
         AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
+        AggregatePlanKind::UnicodeScalarClass => "compile-aggregate-unicode-scalar-class",
         AggregatePlanKind::ContinuationProgram => "compile-aggregate-continuation-program",
     };
     Ok(FreReduction {
@@ -2049,6 +2052,60 @@ fn inactive_literal_operation_limits(limits: &RunLimits) -> LiteralAggregateRedu
     }
 }
 
+fn scalar_binary_search_comparison_bound(mut ranges: usize) -> usize {
+    let mut comparisons = 0_usize;
+    while ranges != 0 {
+        comparisons = comparisons.saturating_add(1);
+        ranges /= 2;
+    }
+    comparisons
+}
+
+fn unicode_scalar_operation_limits(
+    haystack_len: usize,
+    build: fre::UnicodeScalarAggregateBuildAccounting,
+    limits: &RunLimits,
+) -> Result<UnicodeScalarAggregateReduceLimits, ExecutionError> {
+    let decode_byte_checks = checked_aggregate_mul(haystack_len, 4, "scalar decode checks")?;
+    let comparisons_per_scalar =
+        scalar_binary_search_comparison_bound(build.retained_non_ascii_ranges);
+    let range_comparisons = checked_aggregate_mul(
+        haystack_len,
+        comparisons_per_scalar,
+        "scalar range comparisons",
+    )?;
+    let work = checked_aggregate_add(
+        checked_aggregate_add(
+            decode_byte_checks,
+            haystack_len,
+            "scalar decode plus membership work",
+        )?,
+        range_comparisons,
+        "scalar total work",
+    )?;
+    let count = u64::try_from(haystack_len)
+        .map_err(|_| ExecutionError::fault("FRE scalar count bound does not fit u64"))?;
+    let reducer_events = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+
+    Ok(UnicodeScalarAggregateReduceLimits {
+        max_input_bytes: haystack_len,
+        max_decode_byte_checks: decode_byte_checks,
+        max_membership_tests: haystack_len,
+        max_range_comparisons: range_comparisons,
+        max_match_events: haystack_len.min(reducer_events),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: count,
+        max_work: work,
+        max_scratch_bytes: 0,
+        max_peak_bytes: build.persistent_bytes,
+    })
+}
+
+fn inactive_unicode_scalar_operation_limits() -> UnicodeScalarAggregateReduceLimits {
+    UnicodeScalarAggregateReduceLimits::default()
+}
+
 fn aggregate_run_limits(
     haystack_len: usize,
     report: &AggregateBuildReport,
@@ -2057,14 +2114,21 @@ fn aggregate_run_limits(
     match report.build {
         AggregateBuildAccounting::ExactLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: literal_operation_limits(haystack_len, build, limits)?,
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
             // The continuation policy remains present in cache identity even
             // though no continuation engine exists and no fallback is legal.
+            continuation: continuation_operation_limits(haystack_len, 1, limits)?,
+        }),
+        AggregateBuildAccounting::UnicodeScalar(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: unicode_scalar_operation_limits(haystack_len, build, limits)?,
             continuation: continuation_operation_limits(haystack_len, 1, limits)?,
         }),
         AggregateBuildAccounting::Continuation(compile) => Ok(AggregateRunLimits {
             // Literal policy remains present in cache identity even when HIR
             // eligibility selected the continuation program.
             exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
             continuation: continuation_operation_limits(
                 haystack_len,
                 compile.program_states,
@@ -2088,6 +2152,18 @@ fn require_unicode_plan_identity(
             if identity.semantics
                 == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
                 && identity.kernel.operation == operation
+    ) || matches!(
+        report.plan_identity,
+        AggregatePlanIdentity::UnicodeScalar(identity)
+            if identity.semantics
+                == AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
+                && identity.kernel.operation
+                    == match operation {
+                        LiteralAggregateOperation::Count => UnicodeScalarAggregateOperation::Count,
+                        LiteralAggregateOperation::SpanSum => {
+                            UnicodeScalarAggregateOperation::SpanSum
+                        }
+                    }
     ) || matches!(
         report.plan_identity,
         AggregatePlanIdentity::Continuation(identity)
@@ -2139,9 +2215,49 @@ fn literal_reduce_error(source: &LiteralAggregateReduceError, message: String) -
     }
 }
 
+fn unicode_scalar_build_error(
+    source: &UnicodeScalarAggregateBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        UnicodeScalarAggregateBuildError::RangeLimit { .. }
+        | UnicodeScalarAggregateBuildError::WorkLimit { .. }
+        | UnicodeScalarAggregateBuildError::ScratchLimit { .. }
+        | UnicodeScalarAggregateBuildError::PersistentLimit { .. }
+        | UnicodeScalarAggregateBuildError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn unicode_scalar_reduce_error(
+    source: &UnicodeScalarAggregateReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        UnicodeScalarAggregateReduceError::InputBytesLimit { .. }
+        | UnicodeScalarAggregateReduceError::DecodeByteChecksLimit { .. }
+        | UnicodeScalarAggregateReduceError::MembershipTestsLimit { .. }
+        | UnicodeScalarAggregateReduceError::RangeComparisonsLimit { .. }
+        | UnicodeScalarAggregateReduceError::MatchEventsLimit { .. }
+        | UnicodeScalarAggregateReduceError::CountLimit { .. }
+        | UnicodeScalarAggregateReduceError::SpanSumLimit { .. }
+        | UnicodeScalarAggregateReduceError::WorkLimit { .. }
+        | UnicodeScalarAggregateReduceError::ScratchLimit { .. }
+        | UnicodeScalarAggregateReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn aggregate_execution_error(source: &AggregateExecutionSource, message: String) -> ExecutionError {
     match source {
         AggregateExecutionSource::ExactLiteral(source) => literal_reduce_error(source, message),
+        AggregateExecutionSource::UnicodeScalar(source) => {
+            unicode_scalar_reduce_error(source, message)
+        }
         AggregateExecutionSource::Continuation(source) => aggregate_engine_error(source, message),
         AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
@@ -2152,11 +2268,15 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
     match &error {
         AggregateBuildError::Syntax { .. }
         | AggregateBuildError::LiteralPlannerWorkLimit { .. }
+        | AggregateBuildError::UnicodeScalarPlannerWorkLimit { .. }
         | AggregateBuildError::ExactLiteralIneligible { .. } => {
             ExecutionError::unsupported(message)
         }
         AggregateBuildError::ExactLiteralBuild { source, .. } => {
             literal_build_error(source, message)
+        }
+        AggregateBuildError::UnicodeScalarBuild { source, .. } => {
+            unicode_scalar_build_error(source, message)
         }
         AggregateBuildError::ContinuationCompile { source, .. } => {
             aggregate_engine_error(source, message)
@@ -2198,6 +2318,7 @@ fn fre_aggregate_count(
         })?;
     let plan = match regex.build_report().plan {
         AggregatePlanKind::ExactLiteral => "aggregate-exact-literal",
+        AggregatePlanKind::UnicodeScalarClass => "aggregate-unicode-scalar-class",
         AggregatePlanKind::ContinuationProgram => "aggregate-continuation-program",
     };
     Ok(FreReduction {
@@ -2238,6 +2359,7 @@ fn fre_aggregate_span_sum(
         })?;
     let plan = match regex.build_report().plan {
         AggregatePlanKind::ExactLiteral => "aggregate-exact-literal",
+        AggregatePlanKind::UnicodeScalarClass => "aggregate-unicode-scalar-class",
         AggregatePlanKind::ContinuationProgram => "aggregate-continuation-program",
     };
     Ok(FreReduction {
@@ -4016,17 +4138,17 @@ mod tests {
             1,
             "compile-aggregate-continuation-program",
         );
-        let variable_width = current_fre(
-            "compile",
-            &[r"\pL".to_string()],
-            "雪".as_bytes(),
-            true,
-            false,
-            &limits,
-        );
-        assert!(
-            matches!(variable_width, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
-            "unexpected Unicode compile outcome: {variable_width:?}"
+        assert_current_fre_execution(
+            current_fre(
+                "compile",
+                &[r"\pL".to_string()],
+                "雪".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            1,
+            "compile-aggregate-unicode-scalar-class",
         );
 
         let many = current_fre(
@@ -4101,7 +4223,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_admits_byte_stable_unicode_hir_and_refuses_non_singleton_classes() {
+    fn current_fre_admits_byte_stable_hir_and_direct_root_unicode_classes() {
         let limits = RunLimits::default();
         let empty = current_fre("count", &[String::new()], b"a", true, false, &limits);
         assert_current_fre_execution(empty, 2, "aggregate-continuation-program");
@@ -4124,17 +4246,42 @@ mod tests {
             &limits,
         );
         assert_current_fre_execution(folded, 1, "aggregate-continuation-program");
-        let variable_width = current_fre(
-            "count",
-            &[r"\pL".to_string()],
-            "a русский".as_bytes(),
-            true,
-            false,
-            &limits,
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &[r"\pL".to_string()],
+                "a русский".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            8,
+            "aggregate-unicode-scalar-class",
         );
-        assert!(
-            matches!(variable_width, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode scalar class")),
-            "unexpected non-singleton Unicode outcome: {variable_width:?}"
+
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &["(?s:.)".to_string()],
+                b"a\xFF\xE9\x9B\xAA\n\x80",
+                true,
+                false,
+                &limits,
+            ),
+            3,
+            "aggregate-unicode-scalar-class",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &[r"\pL".to_string()],
+                "A雪1δ".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            6,
+            "aggregate-unicode-scalar-class",
         );
 
         let build_many = vec!["(".to_string(), "a".to_string()];
@@ -4228,6 +4375,49 @@ mod tests {
         // zero, so a larger policy quota is represented by the tight bound.
         assert_eq!(capped.max_scratch_bytes, 0);
         assert_eq!(capped.max_peak_bytes, 7);
+    }
+
+    #[test]
+    fn unicode_scalar_run_limits_are_derived_from_input_and_retained_ranges() {
+        let build = fre::UnicodeScalarAggregateBuildAccounting {
+            source_ranges: 9,
+            retained_non_ascii_ranges: 5,
+            ascii_scalars: 17,
+            range_payload_bytes: 40,
+            work: 26,
+            temporary_capacity_bytes: 72,
+            scratch_bytes: 72,
+            persistent_bytes: 123,
+            peak_bytes: 195,
+        };
+        let derived = unicode_scalar_operation_limits(10, build, &RunLimits::default()).unwrap();
+        assert_eq!(derived.max_input_bytes, 10);
+        assert_eq!(derived.max_decode_byte_checks, 40);
+        assert_eq!(derived.max_membership_tests, 10);
+        // Five retained ranges need at most three binary-search comparisons
+        // per decoded scalar. The byte length is a safe upper bound on the
+        // number of decoded scalars, including invalid one-byte advances.
+        assert_eq!(derived.max_range_comparisons, 30);
+        assert_eq!(derived.max_match_events, 10);
+        assert_eq!(derived.max_count, 10);
+        assert_eq!(derived.max_span_sum, 10);
+        assert_eq!(derived.max_work, 80);
+        assert_eq!(derived.max_scratch_bytes, 0);
+        assert_eq!(derived.max_peak_bytes, 123);
+
+        let capped = unicode_scalar_operation_limits(
+            10,
+            build,
+            &RunLimits {
+                reducer_steps: 4,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.max_match_events, 4);
+        assert_eq!(capped.max_count, 4);
+        assert_eq!(capped.max_range_comparisons, 30);
+        assert_eq!(capped.max_work, 80);
     }
 
     #[test]
