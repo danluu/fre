@@ -19,6 +19,7 @@ mod aggregate_many;
 mod finite;
 mod forward_anchored;
 mod required_literal;
+mod unicode_compile;
 
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
@@ -83,6 +84,11 @@ use fre_syntax::{
 use regex_syntax::hir::Look;
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
+pub use unicode_compile::{
+    UnicodeCompileArtifact, UnicodeCompileArtifactBuilder, UnicodeCompileArtifactId,
+    UnicodeCompileBuildError, UnicodeCompileBuildLimits, UnicodeCompileBuildReport,
+    UnicodeCompileResource, UnicodeScalarEncoding, UnicodeScalarIter,
+};
 
 pub use fre_automata::{SearchError as K0SearchError, SearchLimits, SearchWindow};
 
