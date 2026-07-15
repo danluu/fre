@@ -851,6 +851,24 @@ impl UnicodeScalarAggregatePlan {
         window: Window,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        match self.repetition {
+            Repetition::ExactlyOne => self.execute_mode::<false, false>(haystack, window, upper),
+            Repetition::OneOrMoreGreedy => self.execute_mode::<true, true>(haystack, window, upper),
+            Repetition::OneOrMoreLazy => self.execute_mode::<true, false>(haystack, window, upper),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::arithmetic_side_effects,
+        reason = "the monomorphized streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled while removing all repetition-mode branches from execution"
+    )]
+    fn execute_mode<const RUN: bool, const GREEDY: bool>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
         let mut pending_run_bytes = 0_u64;
@@ -887,7 +905,7 @@ impl UnicodeScalarAggregatePlan {
                     }
                     let word = self.ascii[usize::from(byte / 64)];
                     let matched = word & (1_u64 << (byte % 64)) != 0;
-                    if self.repetition == Repetition::OneOrMoreGreedy {
+                    if GREEDY {
                         if matched {
                             pending_run_bytes = pending_run_bytes.checked_add(1).ok_or(
                                 ReduceError::ArithmeticOverflow {
@@ -929,14 +947,14 @@ impl UnicodeScalarAggregatePlan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "actual ASCII-run bitmap tests",
                     })?;
-                if self.repetition.is_run() {
+                if RUN {
                     actual.reducer_steps = actual.reducer_steps.checked_add(run_bytes).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual ASCII-run reducer transitions",
                         },
                     )?;
                 }
-                if self.repetition != Repetition::OneOrMoreGreedy {
+                if !GREEDY {
                     actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual ASCII-run match events",
@@ -960,7 +978,7 @@ impl UnicodeScalarAggregatePlan {
                 }
                 continue;
             }
-            if self.repetition.is_run() {
+            if RUN {
                 actual.reducer_steps =
                     actual
                         .reducer_steps
@@ -1013,7 +1031,7 @@ impl UnicodeScalarAggregatePlan {
                     u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "matched scalar width",
                     })?;
-                if self.repetition == Repetition::OneOrMoreGreedy {
+                if GREEDY {
                     pending_run_bytes = pending_run_bytes.checked_add(width).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "pending greedy run bytes",
@@ -1022,7 +1040,7 @@ impl UnicodeScalarAggregatePlan {
                 } else {
                     record_match(&mut actual, width)?;
                 }
-            } else if self.repetition == Repetition::OneOrMoreGreedy {
+            } else if GREEDY {
                 flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
             }
             position =
@@ -1032,7 +1050,7 @@ impl UnicodeScalarAggregatePlan {
                         computation: "scalar stream position",
                     })?;
         }
-        if self.repetition.is_run() {
+        if RUN {
             actual.reducer_steps =
                 actual
                     .reducer_steps
@@ -1041,7 +1059,7 @@ impl UnicodeScalarAggregatePlan {
                         computation: "final run reducer transition",
                     })?;
         }
-        if self.repetition == Repetition::OneOrMoreGreedy {
+        if GREEDY {
             flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
         }
         actual.input_bytes_advanced = position;
