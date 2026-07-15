@@ -28,10 +28,11 @@ family and ties the next coverage gates to concrete Rebar job IDs.
   runner. These cover every one of the seven Rebar models plus both retained
   Rust baseline failures.
 
-The accepted compile/finite history reached 204 pass / 140 unsupported with no
-FRE fail or fault. The later direct-scalar base independently reached 214 / 130.
-The composed source has not generated a report; `COVERAGE_FRONTIER.md` records
-only an overlap-aware arithmetic ceiling, never observed coverage.
+The accepted compile/finite/portable-class history reached 205 pass / 139
+unsupported with no FRE fail or fault. The later direct-scalar base
+independently reached 214 / 130. The composed source has not generated a
+report; `COVERAGE_FRONTIER.md` records only an overlap-aware arithmetic
+ceiling, never observed coverage.
 
 The two Rust adapter failures are:
 

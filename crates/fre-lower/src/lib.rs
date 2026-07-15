@@ -1,12 +1,12 @@
 //! Checked lowering from Rust-regex HIR to FRE's prioritized byte automata.
 //!
 //! This crate is intentionally a narrow integration layer. It supports only
-//! expressions whose HIR already has an exact one-byte transition model:
-//! empty expressions, byte literals and byte classes, concatenation, ordered
-//! alternation, greedy or lazy repetition, whole-haystack start/end assertions,
-//! LF line assertions, and ASCII word assertions. Unicode scalar classes,
-//! CRLF/Unicode-word assertions, and capture-sensitive operations are rejected
-//! explicitly.
+//! expressions whose HIR has an exact byte-automaton representation: empty
+//! expressions, byte literals and byte classes, Unicode scalar classes lowered
+//! to canonical valid-UTF-8 byte paths, concatenation, ordered alternation,
+//! greedy or lazy repetition, whole-haystack start/end assertions, LF line
+//! assertions, and ASCII word assertions. CRLF/Unicode-word assertions and
+//! capture-sensitive operations are rejected explicitly.
 //!
 //! `RustParsed` does not retain a high-level regex builder's separately
 //! configured runtime line byte. This layer therefore implements the literal
