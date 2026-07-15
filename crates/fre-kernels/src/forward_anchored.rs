@@ -2745,11 +2745,11 @@ mod tests {
                 } else {
                     let uses_short_forward_witness = length <= 73
                         && matches!(
-                        plan.implementation(),
-                        ClassImplementation::Pair { .. }
-                            | ClassImplementation::Triple { .. }
-                            | ClassImplementation::Quad { .. }
-                    );
+                            plan.implementation(),
+                            ClassImplementation::Pair { .. }
+                                | ClassImplementation::Triple { .. }
+                                | ClassImplementation::Quad { .. }
+                        );
                     let expected_prefilter_calls = if uses_short_forward_witness || length <= 64 {
                         1
                     } else {
@@ -2798,7 +2798,7 @@ mod tests {
 
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, None);
-            assert_eq!(accounting.prefilter_calls, 0);
+            assert_eq!(accounting.prefilter_calls, 1);
             assert!(accounting.suffix_confirmation_attempted);
             // The bounded short path selects the first suffix-first byte, so
             // the known outsider itself is excluded from the prefix scan.
@@ -2874,7 +2874,7 @@ mod tests {
     fn triple_plan_target_lengths_and_long_boundary_have_exact_calls() {
         let plan = plan(ByteClass::from_bytes(b"ace"), b"Z", false);
         for (length, positive_calls, absent_calls) in
-            [(56_usize, 0_usize, 1_usize), (64, 0, 1), (65, 1, 2)]
+            [(56_usize, 1_usize, 1_usize), (64, 1, 1), (65, 1, 1)]
         {
             let mut positive: Vec<u8> = b"ace".iter().copied().cycle().take(length).collect();
             positive[length - 1] = b'Z';
