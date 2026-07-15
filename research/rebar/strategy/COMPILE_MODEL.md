@@ -65,8 +65,11 @@ cargo run --release -p rebar-compare -- research/rebar/expanded/manifest.json /t
 The regenerated report must list every newly passing compile job ID grouped by
 benchmark family and plan, retain typed unsupported receipts for build-many and
 the broader Unicode/syntax/resource frontier, contain no new fail/fault, and
-leave the prior 144 passes unchanged. Run the workspace formatting, lint, and
-test gates only under that same phase-B coordination.
+leave every pass in the authenticated pre-compile frontier unchanged. The root
+handoff currently records that frontier as 161/344; the checked-in v2 report is
+the older 144/344 baseline and must not be mistaken for the current comparison.
+Run the workspace formatting, lint, and test gates only under that same phase-B
+coordination.
 
 ## Preregistered performance matrix
 

@@ -180,11 +180,12 @@ explicitly; the 100 MiB upstream setting is identity only and does not widen an
 FRE safety envelope or quota.
 
 `fre-syntax` schema 2 prevents the corrected component/configuration stamp from
-aliasing the former shape. Aggregate schema 3 is unchanged because its nested
-syntax key carries that version. The comparator remains report schema v2 with
-candidate adapter `fre-current-aggregate-v3`. The next sentinel uses schema v3
-and semantic-domain v2 while reading the retained canonical frontier through an
-explicit legacy `fre-current-aggregate-v2` identity.
+aliasing the former shape. Aggregate schema 4 additionally distinguishes the
+complete compile-artifact operation from count/span operations. The comparator
+remains report schema v2 with candidate adapter `fre-current-aggregate-v4`.
+The Unicode sentinel itself remains schema v3 and semantic-domain v2 while
+reading the retained canonical frontier through an explicit legacy
+`fre-current-aggregate-v2` identity.
 
 The retained sentinel above remains diagnostic evidence only. All semantic,
 identity, resource, deterministic-sentinel, comparator, and holdout gates must
