@@ -40,7 +40,9 @@ fn pair_swar_thresholds_valid_paths_and_resource_limits_are_exact() {
         }
     );
 
-    for boundary in [72_usize, 73, 74, 79, 80, 81, 511, 512, 513] {
+    for boundary in [
+        72_usize, 73, 74, 79, 80, 81, 511, 512, 513, 1_024, 1_025, 4_096, 4_097,
+    ] {
         let mut haystack = members(boundary);
         haystack.extend_from_slice(candidate.suffix());
         let (span, accounting) = candidate
@@ -120,6 +122,8 @@ fn pair_swar_long_extension_routes_512_through_4097_exactly() {
     for (boundary, earlier, expected_examined) in [
         (512_usize, 511_usize, 521_usize),
         (513, 511, 521),
+        (1_024, 1_023, 1_033),
+        (1_025, 1_023, 1_033),
         (4_096, 4_095, 4_105),
         (4_097, 4_095, 4_129),
     ] {
