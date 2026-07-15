@@ -7,9 +7,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError, SearchLimits, Span,
-    Window,
+    AggregateLimits, AsciiWordLook, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord,
+    Greed, GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError, SearchLimits,
+    Span, Window,
 };
 use regex::bytes::Regex;
 
@@ -140,6 +140,33 @@ fn directed_rust_capture_semantics() {
     ];
     for (ast, haystack) in cases {
         assert_case(&ast, haystack, Window::all(haystack));
+    }
+}
+
+#[test]
+fn ascii_word_assertions_match_rust_bytes_at_every_boundary() {
+    let looks = [
+        AsciiWordLook::Boundary,
+        AsciiWordLook::BoundaryNegate,
+        AsciiWordLook::Start,
+        AsciiWordLook::End,
+        AsciiWordLook::StartHalf,
+        AsciiWordLook::EndHalf,
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"a",
+        b" a_9-z ",
+        &[0xFF, b'a', 0x80, b'_', b' '],
+    ];
+    for look in looks {
+        let ast = Ast::concat([
+            Ast::AsciiWordLook(look),
+            Ast::Byte(b'a').repeat(0, Some(1), Greed::Greedy).capture(1),
+        ]);
+        for &haystack in haystacks {
+            assert_case(&ast, haystack, Window::all(haystack));
+        }
     }
 }
 
@@ -686,5 +713,13 @@ fn render(ast: &Ast) -> String {
         } => format!("({})", render(child)),
         Ast::Start => r"\A".to_owned(),
         Ast::End => r"\z".to_owned(),
+        Ast::AsciiWordLook(look) => match look {
+            AsciiWordLook::Boundary => r"\b".to_owned(),
+            AsciiWordLook::BoundaryNegate => r"\B".to_owned(),
+            AsciiWordLook::Start => r"\b{start}".to_owned(),
+            AsciiWordLook::End => r"\b{end}".to_owned(),
+            AsciiWordLook::StartHalf => r"\b{start-half}".to_owned(),
+            AsciiWordLook::EndHalf => r"\b{end-half}".to_owned(),
+        },
     }
 }

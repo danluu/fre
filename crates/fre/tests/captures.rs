@@ -155,16 +155,25 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
 }
 
 #[test]
-fn uncertified_unicode_and_word_look_remain_typed_refusals() {
+fn ascii_word_look_capture_reducers_match_pinned_rust_bytes() {
+    let haystack = &b" alpha_9-z beta 9_ \xFFword edge_"[..];
+    for pattern in [
+        r"\b([A-Za-z0-9_]+)\b",
+        r"\B([A-Za-z0-9_]+)\B",
+        r"\b{start}([A-Za-z0-9_]+)",
+        r"([A-Za-z0-9_]+)\b{end}",
+        r"\b{start-half}([A-Za-z0-9_]*)",
+        r"([A-Za-z0-9_]*)\b{end-half}",
+    ] {
+        assert_count(pattern, haystack);
+    }
+}
+
+#[test]
+fn uncertified_unicode_capture_remains_a_typed_refusal() {
     assert!(
         CaptureBuilder::new(r"(\p{L}+)")
             .unicode(true)
-            .build()
-            .is_err()
-    );
-    assert!(
-        CaptureBuilder::new(r"\b(a)\b")
-            .unicode(false)
             .build()
             .is_err()
     );
