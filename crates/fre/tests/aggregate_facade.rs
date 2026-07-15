@@ -1142,6 +1142,84 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
 }
 
 #[test]
+fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions() {
+    let cases: [(&str, &[u8]); 9] = [
+        (r"\pL{2,4}", b"ab--cdef--g"),
+        (r"\pL{2,4}?", b"ab--cdef--g"),
+        (r"\pL{3,}", "αβγ--雪雪雪雪".as_bytes()),
+        (r"\pL{2}", b"--ab--"),
+        (r"\pL{2,4}", b"ab----------------"),
+        (r"\pL{2,4}", b"----------------ab"),
+        (r"\pL{2,4}", b"\xFFa\x80bcde\xE2\x82"),
+        (r".{2,3}", b"ab\ncd\xFFef"),
+        (r"(?s:.){2,3}", b"ab\ncd\xFFef"),
+    ];
+    for (pattern, haystack) in cases {
+        let expected = upstream_profile(pattern, haystack, false, true);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+
+        let count = aggregate_builder(pattern).build_count().unwrap();
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass
+        );
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.semantics
+                    == AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
+                    && matches!(
+                        identity.kernel.repetition,
+                        fre::UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
+                            | fre::UnicodeScalarAggregateRepetition::RepeatedLazy { .. }
+                    )
+        ));
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_count,
+            "count {pattern:?}/{haystack:?}"
+        );
+        let sum = aggregate_builder(pattern).build_span_sum().unwrap();
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_sum,
+            "span sum {pattern:?}/{haystack:?}"
+        );
+        let compiled = aggregate_builder(pattern).build_compile().unwrap();
+        assert_eq!(
+            compiled.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass
+        );
+        assert_eq!(
+            compiled
+                .verify_count(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            expected_count,
+            "compile verify {pattern:?}/{haystack:?}"
+        );
+    }
+
+    for nullable in [r"\pL*", r"\pL{0,4}"] {
+        assert_eq!(
+            aggregate_builder(nullable)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+    }
+}
+
+#[test]
 fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     let pattern = r"(?P<scalar>\pL)";
     let haystack = "A雪1δ".as_bytes();
