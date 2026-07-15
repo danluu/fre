@@ -424,6 +424,10 @@ fn copy_suffix_exact(suffix: &[u8]) -> Result<Vec<u8>, BuildError> {
     }
     #[cfg(test)]
     exact_suffix_copy_probe::record();
+    #[cfg(test)]
+    if let Some(error) = exact_suffix_copy_probe::take_failure() {
+        return Err(map_copy_error(error, suffix.len()));
+    }
     fre_exact_alloc::copy_exact(suffix).map_err(|error| map_copy_error(error, suffix.len()))
 }
 
@@ -441,10 +445,12 @@ fn map_copy_error(error: CopyError, suffix_len: usize) -> BuildError {
 
 #[cfg(test)]
 mod exact_suffix_copy_probe {
+    use fre_exact_alloc::CopyError;
     use std::cell::Cell;
 
     std::thread_local! {
         static CALLS: Cell<usize> = const { Cell::new(0) };
+        static FAILURE: Cell<Option<CopyError>> = const { Cell::new(None) };
     }
 
     pub(super) fn record() {
@@ -453,10 +459,21 @@ mod exact_suffix_copy_probe {
 
     pub(super) fn reset() {
         CALLS.set(0);
+        FAILURE.set(None);
     }
 
     pub(super) fn calls() -> usize {
         CALLS.get()
+    }
+
+    pub(super) fn fail_next(error: CopyError) {
+        FAILURE.set(Some(error));
+    }
+
+    pub(super) fn take_failure() -> Option<CopyError> {
+        let failure = FAILURE.get();
+        FAILURE.set(None);
+        failure
     }
 }
 
@@ -1742,6 +1759,39 @@ mod tests {
             &BuildError::FirstSuffixByteInClass { byte: b'a' }
         );
         assert_eq!(exact_suffix_copy_probe::calls(), 0);
+    }
+
+    #[test]
+    fn fixed_exact_copy_failures_are_typed_without_retry_or_fallback() {
+        let class = ByteClass::from_bytes(b"ab");
+        let anchors = Anchors {
+            start: true,
+            end: true,
+        };
+        for (injected, expected) in [
+            (
+                CopyError::LayoutOverflow,
+                BuildError::ArithmeticOverflow {
+                    computation: "exact suffix allocation layout",
+                },
+            ),
+            (
+                CopyError::AllocationFailed,
+                BuildError::AllocationFailed {
+                    structure: "forward anchored suffix",
+                    additional: 2,
+                },
+            ),
+        ] {
+            exact_suffix_copy_probe::reset();
+            exact_suffix_copy_probe::fail_next(injected);
+            assert_eq!(
+                AbsoluteEndFixedPlan::build(class, b"ZQ", anchors, BuildLimits::default())
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(exact_suffix_copy_probe::calls(), 1);
+        }
     }
 
     #[test]
