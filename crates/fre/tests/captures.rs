@@ -162,8 +162,8 @@ fn ascii_word_look_capture_reducers_match_pinned_rust_bytes() {
         r"\B([A-Za-z0-9_]+)\B",
         r"\b{start}([A-Za-z0-9_]+)",
         r"([A-Za-z0-9_]+)\b{end}",
-        r"\b{start-half}([A-Za-z0-9_]*)",
-        r"([A-Za-z0-9_]*)\b{end-half}",
+        r"\b{start-half}([A-Za-z0-9_]+)",
+        r"([A-Za-z0-9_]+)\b{end-half}",
     ] {
         assert_count(pattern, haystack);
     }
