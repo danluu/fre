@@ -20,6 +20,7 @@ mod aggregate_many;
 mod finite;
 mod forward_anchored;
 mod required_literal;
+mod regex_redux;
 mod unicode_compile;
 
 pub use aggregate::{
@@ -91,6 +92,11 @@ use fre_syntax::{
 use regex_syntax::hir::Look;
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
+pub use regex_redux::{
+    RegexReduxAccounting, RegexReduxBuildError, RegexReduxBuildLimits, RegexReduxBuildReport,
+    RegexReduxBuilder, RegexReduxPipelineId, RegexReduxPlan, RegexReduxReplacementPlan,
+    RegexReduxReplacementResult, RegexReduxResult, RegexReduxRunError, RegexReduxRunLimits,
+};
 pub use unicode_compile::{
     UnicodeCompileArtifact, UnicodeCompileArtifactBuilder, UnicodeCompileArtifactId,
     UnicodeCompileBuildError, UnicodeCompileBuildLimits, UnicodeCompileBuildReport,
