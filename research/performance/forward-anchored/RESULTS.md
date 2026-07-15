@@ -3,17 +3,19 @@
 The portable start-only strategy remains
 `anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1`. The new
 absolute-end strategy is forced-only and is identified everywhere by
-`anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1`.
+`anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2`.
 
 ## Fixed-boundary source contract
 
 For a valid full original-haystack window, `N = H.len()`, `M = S.len()`, and
-`N > M`, the fixed verifier uses `p = N - M`, preflights `N`, compares
-`H[p..N]` with `S`, and only after exact suffix equality visits each byte in
-`H[..p]` at most once with the scalar bitset. Its certified upper bounds are
-suffix `M`, prefix `p`, examined/work `N`, and zero prefilter, scratch, search
-allocation, and fallback. A suffix mismatch retains those conservative upper
-bounds but records zero prefix examinations.
+`N > M`, the fixed verifier uses `p = N - M`, compares `H[p..N]` with `S`, and
+only after exact suffix equality dispatches `H[..p]` to the inherited canonical
+range, Pair/Triple/Quad, or arbitrary bitset leaf. Let `r = 32` when a
+specialized block leaf has `p >= 32`, and `r = 0` otherwise. Its certified
+upper bounds are suffix `M`, prefix `p + r`, examined/work `N + r`, and zero
+prefilter, scratch, search allocation, and fallback. The rescan charge retains
+the first-outsider result of a failed block. A suffix mismatch retains those
+conservative upper bounds but records zero prefix examinations.
 
 Construction borrows the HIR literal until the kernel performs its one exact
 copy. Exact caps admit; one-below suffix/work/persistent/peak caps refuse before

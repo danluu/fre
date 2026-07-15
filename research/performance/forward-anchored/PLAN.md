@@ -73,14 +73,16 @@ evidence. Arbitrary-class SIMD JIT work remains unpromoted.
 
 The separate forced-only strategy for `\A CLASS+ SUFFIX \z` has stable runtime
 identity
-`anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1`. Both
+`anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2`. Both
 absolute anchors and the fixed literal width determine the only split:
 `p = H.len() - SUFFIX.len()`. For a full original-haystack window and
-`H.len() > SUFFIX.len()`, the verifier preflights exactly `H.len()` logical
-positions, compares the final suffix first, then visits `H[..p]` once through
-the normalized scalar 256-bit membership table. It has no candidate search,
-prefilter, inherited range/Pair/Triple/Quad leaf, rescan, scratch, search
-allocation, or fallback.
+`H.len() > SUFFIX.len()`, the verifier compares the final suffix first, then
+visits `H[..p]` once through the inherited canonical inclusive-range,
+Pair/Triple/Quad, or arbitrary-class bitset leaf. A block leaf conservatively
+preflights its possible 32-byte failed-block rescan, so for `r = 32` when
+`p >= 32` on a specialized leaf and `r = 0` otherwise, its certified suffix,
+prefix, and total bounds are `M`, `p + r`, and `N + r`. It has no candidate
+search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
 absolute end. Forced start-only construction retains

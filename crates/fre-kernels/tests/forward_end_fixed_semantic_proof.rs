@@ -68,10 +68,7 @@ fn red_fixed_identity_specialized_leaf_and_n_m_p_accounting() {
                 fourth: b'g',
             },
         ),
-        (
-            b"acegi".as_slice(),
-            ForwardClassImplementation::Bitset,
-        ),
+        (b"acegi".as_slice(), ForwardClassImplementation::Bitset),
     ] {
         let candidate = plan(class, b"ZQ");
         assert_eq!(candidate.plan_id(), FIXED_ID);
@@ -373,7 +370,7 @@ fn suffix_partition_lengths_kill_shift_shorten_and_wrapping_mutants() {
 }
 
 #[test]
-fn every_prefix_outsider_position_and_partition_edge_are_checked_once() {
+fn every_prefix_outsider_position_and_partition_edge_returns_the_first_outsider() {
     let candidate = plan(b"ab", b"ZQ");
     let prefix_len = 65_usize;
     let mut valid = vec![b'a'; prefix_len];
@@ -391,8 +388,13 @@ fn every_prefix_outsider_position_and_partition_edge_are_checked_once() {
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
             .unwrap();
         assert_eq!(matched, None, "outsider={outsider}");
-        assert_eq!(accounting.prefix_bytes_examined, outsider + 1);
-        assert_eq!(accounting.prefix_bytes_upper_bound, prefix_len);
+        let expected_examined = if outsider < 64 {
+            outsider + 33
+        } else {
+            outsider + 1
+        };
+        assert_eq!(accounting.prefix_bytes_examined, expected_examined);
+        assert_eq!(accounting.prefix_bytes_upper_bound, prefix_len + 32);
         assert_eq!(accounting.suffix_bytes_upper_bound, 2);
         assert!(accounting.suffix_confirmation_attempted);
     }

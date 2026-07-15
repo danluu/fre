@@ -18,7 +18,7 @@ pub const PLAN_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-in
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
-    "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1";
+    "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -122,6 +122,52 @@ impl ByteClass {
         }
         (member_count == N).then_some(members)
     }
+}
+
+fn select_class_implementation(class: ByteClass) -> Result<ClassImplementation, BuildError> {
+    let implementation = match class.single_inclusive_range() {
+        Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
+        None => match class.cardinality() {
+            2 => {
+                let [first, second] =
+                    class
+                        .canonical_members::<2>()
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "canonical pair extraction",
+                        })?;
+                ClassImplementation::Pair { first, second }
+            }
+            3 => {
+                let [first, second, third] =
+                    class
+                        .canonical_members::<3>()
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "canonical triple extraction",
+                        })?;
+                ClassImplementation::Triple {
+                    first,
+                    second,
+                    third,
+                }
+            }
+            4 => {
+                let [first, second, third, fourth] =
+                    class
+                        .canonical_members::<4>()
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "canonical quad extraction",
+                        })?;
+                ClassImplementation::Quad {
+                    first,
+                    second,
+                    third,
+                    fourth,
+                }
+            }
+            _ => ClassImplementation::Bitset,
+        },
+    };
+    Ok(implementation)
 }
 
 /// Absolute anchors interpreted against the original haystack.
@@ -414,6 +460,7 @@ pub struct ForwardAnchoredPlan {
 pub struct AbsoluteEndFixedPlan {
     class: ByteClass,
     suffix: Vec<u8>,
+    implementation: ClassImplementation,
     build: BuildAccounting,
 }
 
@@ -506,6 +553,8 @@ impl AbsoluteEndFixedPlan {
             return Err(BuildError::FirstSuffixByteInClass { byte: first });
         }
 
+        let class_cardinality = class.cardinality();
+        let implementation = select_class_implementation(class)?;
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "suffix length as u64",
@@ -567,11 +616,12 @@ impl AbsoluteEndFixedPlan {
         Ok(Self {
             class,
             suffix: owned_suffix,
+            implementation,
             build: BuildAccounting {
                 suffix_bytes: suffix.len(),
                 suffix_capacity_bytes,
-                class_cardinality: class.cardinality(),
-                implementation: ClassImplementation::Bitset,
+                class_cardinality,
+                implementation,
                 work_upper_bound,
                 scratch_bytes,
                 persistent_bytes,
@@ -606,7 +656,7 @@ impl AbsoluteEndFixedPlan {
 
     #[must_use]
     pub const fn implementation(&self) -> ClassImplementation {
-        ClassImplementation::Bitset
+        self.implementation
     }
 
     #[must_use]
@@ -654,19 +704,13 @@ impl AbsoluteEndFixedPlan {
                     computation: "impossible fixed-end window bytes",
                 },
             )?;
-            return Ok((
-                None,
-                zero_accounting(window_bytes, ClassImplementation::Bitset),
-            ));
+            return Ok((None, zero_accounting(window_bytes, self.implementation)));
         }
 
         let haystack_len = haystack.len();
         let suffix_len = self.suffix.len();
         if haystack_len <= suffix_len {
-            return Ok((
-                None,
-                zero_accounting(haystack_len, ClassImplementation::Bitset),
-            ));
+            return Ok((None, zero_accounting(haystack_len, self.implementation)));
         }
         let prefix_len =
             haystack_len
@@ -674,7 +718,7 @@ impl AbsoluteEndFixedPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "fixed-end prefix length",
                 })?;
-        let mut accounting = Self::preflight(haystack_len, prefix_len, suffix_len, limits)?;
+        let mut accounting = self.preflight(haystack_len, prefix_len, suffix_len, limits)?;
 
         let fixed_suffix =
             haystack
@@ -692,34 +736,47 @@ impl AbsoluteEndFixedPlan {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "fixed-end prefix partition",
             })?;
-        for &byte in prefix {
-            accounting.prefix_bytes_examined = accounting
-                .prefix_bytes_examined
-                .checked_add(1)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "fixed-end actual prefix examinations",
-                })?;
-            if !self.class.contains(byte) {
-                return Ok((None, accounting));
-            }
+        let (boundary, examined) = scan_class_prefix(prefix, self.class, self.implementation)?;
+        accounting.prefix_bytes_examined = examined;
+        if boundary != prefix_len {
+            return Ok((None, accounting));
         }
         Ok((Some((0, haystack_len)), accounting))
     }
 
     fn preflight(
+        &self,
         haystack_len: usize,
         prefix_len: usize,
         suffix_len: usize,
         limits: SearchLimits,
     ) -> Result<SearchAccounting, SearchError> {
-        let work_upper_bound =
-            u64::try_from(haystack_len).map_err(|_| SearchError::ArithmeticOverflow {
-                computation: "fixed-end haystack length as u64",
-            })?;
+        let block_scanner = !matches!(self.implementation, ClassImplementation::Bitset);
+        let rescan_margin = if block_scanner && prefix_len >= RANGE_BLOCK {
+            RANGE_BLOCK
+        } else {
+            0
+        };
+        let prefix_bytes_upper_bound =
+            prefix_len
+                .checked_add(rescan_margin)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fixed-end prefix examinations upper bound",
+                })?;
+        let examined_bytes_upper_bound = prefix_bytes_upper_bound.checked_add(suffix_len).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "fixed-end examined bytes upper bound",
+            },
+        )?;
+        let work_upper_bound = u64::try_from(examined_bytes_upper_bound).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "fixed-end examined bytes as u64",
+            }
+        })?;
         let scratch_bytes = 0_usize;
-        if haystack_len > limits.max_examined_bytes_upper_bound {
+        if examined_bytes_upper_bound > limits.max_examined_bytes_upper_bound {
             return Err(SearchError::ExaminedBytesLimit {
-                needed: haystack_len,
+                needed: examined_bytes_upper_bound,
                 limit: limits.max_examined_bytes_upper_bound,
             });
         }
@@ -737,11 +794,11 @@ impl AbsoluteEndFixedPlan {
         }
         Ok(SearchAccounting {
             window_bytes: haystack_len,
-            implementation: ClassImplementation::Bitset,
+            implementation: self.implementation,
             prefilter_bytes_upper_bound: 0,
-            prefix_bytes_upper_bound: prefix_len,
+            prefix_bytes_upper_bound,
             suffix_bytes_upper_bound: suffix_len,
-            examined_bytes_upper_bound: haystack_len,
+            examined_bytes_upper_bound,
             work_upper_bound,
             scratch_bytes,
             prefilter_calls: 0,
@@ -782,46 +839,7 @@ impl ForwardAnchoredPlan {
         }
 
         let class_cardinality = class.cardinality();
-        let implementation =
-            match class.single_inclusive_range() {
-                Some((start, end)) => ClassImplementation::InclusiveRange { start, end },
-                None => match class_cardinality {
-                    2 => {
-                        let [first, second] = class.canonical_members::<2>().ok_or(
-                            BuildError::ArithmeticOverflow {
-                                computation: "canonical pair extraction",
-                            },
-                        )?;
-                        ClassImplementation::Pair { first, second }
-                    }
-                    3 => {
-                        let [first, second, third] = class.canonical_members::<3>().ok_or(
-                            BuildError::ArithmeticOverflow {
-                                computation: "canonical triple extraction",
-                            },
-                        )?;
-                        ClassImplementation::Triple {
-                            first,
-                            second,
-                            third,
-                        }
-                    }
-                    4 => {
-                        let [first, second, third, fourth] = class.canonical_members::<4>().ok_or(
-                            BuildError::ArithmeticOverflow {
-                                computation: "canonical quad extraction",
-                            },
-                        )?;
-                        ClassImplementation::Quad {
-                            first,
-                            second,
-                            third,
-                            fourth,
-                        }
-                    }
-                    _ => ClassImplementation::Bitset,
-                },
-            };
+        let implementation = select_class_implementation(class)?;
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "suffix length as u64",
@@ -1054,24 +1072,7 @@ impl ForwardAnchoredPlan {
     }
 
     fn scan_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
-        match self.implementation {
-            ClassImplementation::Bitset => Ok(scan_bitset_prefix(bytes, self.class)),
-            ClassImplementation::InclusiveRange { start, end } => {
-                scan_range_prefix(bytes, start, end)
-            }
-            ClassImplementation::Pair { first, second } => scan_pair_prefix(bytes, first, second),
-            ClassImplementation::Triple {
-                first,
-                second,
-                third,
-            } => scan_triple_prefix(bytes, first, second, third),
-            ClassImplementation::Quad {
-                first,
-                second,
-                third,
-                fourth,
-            } => scan_quad_prefix(bytes, first, second, third, fourth),
-        }
+        scan_class_prefix(bytes, self.class, self.implementation)
     }
 
     fn preflight(
@@ -1180,6 +1181,29 @@ fn scan_bitset_prefix(bytes: &[u8], class: ByteClass) -> (usize, usize) {
         .unwrap_or(bytes.len());
     let examined = boundary.saturating_add(usize::from(boundary < bytes.len()));
     (boundary, examined)
+}
+
+fn scan_class_prefix(
+    bytes: &[u8],
+    class: ByteClass,
+    implementation: ClassImplementation,
+) -> Result<(usize, usize), SearchError> {
+    match implementation {
+        ClassImplementation::Bitset => Ok(scan_bitset_prefix(bytes, class)),
+        ClassImplementation::InclusiveRange { start, end } => scan_range_prefix(bytes, start, end),
+        ClassImplementation::Pair { first, second } => scan_pair_prefix(bytes, first, second),
+        ClassImplementation::Triple {
+            first,
+            second,
+            third,
+        } => scan_triple_prefix(bytes, first, second, third),
+        ClassImplementation::Quad {
+            first,
+            second,
+            third,
+            fourth,
+        } => scan_quad_prefix(bytes, first, second, third, fourth),
+    }
 }
 
 /// Fixed blocks expose branch-free membership reductions to LLVM. These are
@@ -1596,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_construction_has_one_exact_copy_and_bitset_for_every_geometry() {
+    fn fixed_construction_has_one_exact_copy_and_specialized_geometry() {
         for length in [1_usize, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 255, 256, 4096] {
             let suffix = vec![b'Z'; length];
             exact_suffix_copy_probe::reset();
@@ -1604,7 +1628,15 @@ mod tests {
             assert_eq!(exact_suffix_copy_probe::calls(), 1);
             assert_eq!(fixed.plan_id(), ABSOLUTE_END_FIXED_PLAN_ID);
             assert_eq!(fixed.suffix(), suffix);
-            assert_eq!(fixed.implementation(), ClassImplementation::Bitset);
+            assert_eq!(
+                fixed.implementation(),
+                ClassImplementation::Quad {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                }
+            );
             assert_eq!(
                 fixed.anchors(),
                 Anchors {
@@ -1621,13 +1653,46 @@ mod tests {
             );
             assert_eq!(accounting.scratch_bytes, 0);
             assert_eq!(accounting.peak_bytes, accounting.persistent_bytes);
-            assert_eq!(accounting.implementation, ClassImplementation::Bitset);
+            assert_eq!(accounting.implementation, fixed.implementation());
         }
 
-        for class in [b"a".as_slice(), b"ab", b"ace", b"aceg", b"abcdefgh"] {
+        for (class, expected) in [
+            (
+                b"a".as_slice(),
+                ClassImplementation::InclusiveRange {
+                    start: b'a',
+                    end: b'a',
+                },
+            ),
+            (
+                b"ac".as_slice(),
+                ClassImplementation::Pair {
+                    first: b'a',
+                    second: b'c',
+                },
+            ),
+            (
+                b"ace".as_slice(),
+                ClassImplementation::Triple {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                },
+            ),
+            (
+                b"aceg".as_slice(),
+                ClassImplementation::Quad {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                },
+            ),
+            (b"acegi".as_slice(), ClassImplementation::Bitset),
+        ] {
             assert_eq!(
                 fixed(ByteClass::from_bytes(class), b"Z").implementation(),
-                ClassImplementation::Bitset
+                expected
             );
         }
     }
