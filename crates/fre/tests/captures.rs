@@ -167,6 +167,10 @@ fn ascii_word_look_capture_reducers_match_pinned_rust_bytes() {
     ] {
         assert_count(pattern, haystack);
     }
+
+    // Exact shapes used by the two previously refused Rebar capture rows.
+    assert_count(r"\b(?:(\w{6})|(\w{5}))\b", b"alpha omega6 betas short");
+    assert_count(r"^(\S{8})(\S)\b", b"123456789 rest");
 }
 
 #[test]
