@@ -62,8 +62,8 @@ fn pair_swar_thresholds_valid_paths_and_resource_limits_are_exact() {
 
 #[test]
 fn pair_swar_failed_words_recover_the_exact_first_outsider() {
-    let candidate = plan();
     const BOUNDARY: usize = 512;
+    let candidate = plan();
     for earlier in [1_usize, 7, 8, 9, 31, 32, 33, 255, 256, 511] {
         for outsider in [0x01_u8, 0x40, 0x80, 0xFE] {
             let mut haystack = members(BOUNDARY);

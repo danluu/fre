@@ -3588,7 +3588,16 @@ mod tests {
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, Some((0, 97)));
             assert_eq!(accounting.prefilter_calls, 1);
-            assert_eq!(accounting.prefix_bytes_examined, 128);
+            let expected_examined =
+                if matches!(plan.implementation(), ClassImplementation::Pair { .. }) {
+                    // The SWAR verifier reads the failed eight-byte word once,
+                    // then recovers the exact outsider inside that word. Triple
+                    // and Quad retain their existing 32-byte reduction charge.
+                    104
+                } else {
+                    128
+                };
+            assert_eq!(accounting.prefix_bytes_examined, expected_examined);
             assert!(accounting.suffix_confirmation_attempted);
             assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
         }
