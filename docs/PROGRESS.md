@@ -157,6 +157,25 @@ broad FRE coverage; `research/rebar/comparison/COVERAGE_FRONTIER.md` lists the
 remaining operation and syntax gaps. No Rebar job selects the required-literal
 plan, so its outside-Rebar evidence is not a corpus-tuned shortcut.
 
+A source-only capture-history candidate now preserves capture start/end actions
+in the same bounded continuation program, selects whole matches with the
+existing certified recurrence, and reconstructs submatches by prioritized
+exact-span replay. Replay storage is bounded by program states times the
+longest already-selected match, with capture slots, history nodes, output,
+peak bytes, and cumulative grep work checked independently. The projected
+Rebar evaluation universe is 37 rows (15 `count-captures`, 22
+`grep-captures`), not 37 passes: Unicode-on capture execution remains outside
+this candidate, and no qualification command was run in the source-only lane.
+The red mutation witness `(a|(ab))(b)?` on `ab` kills fallback-first replay by
+requiring group 1=`0..1`, group 2 unmatched, and group 3=`1..2`; separate
+witnesses cover repeated-group last capture, optional groups, absolute range
+offsets, and empty-match byte progress. Required adverse/performance follow-up
+is named in advance: `test/model/{count,grep}-captures`,
+`wild/dot-star-capture/rust-src-tools`,
+`wild/rustsec-cargo-audit/both-alternate`,
+`curated/04-ruff-noqa/real`, and `opt/onepass/fn-predicate`. This candidate is
+not a promoted general capture API or a performance claim.
+
 The frozen visible non-Rebar v1 suite authenticates 19 specifications, 169
 expanded inputs, and 1,014 comparisons with a canonical tagged-`u64` digest.
 Two independent local executions were byte-identical at 990 pass, 24 declared
