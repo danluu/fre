@@ -104,19 +104,23 @@ impl Plan {
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
             if !is_word(scalar) || word_before(haystack, position) {
-                position = position.checked_add(width).ok_or(Error::WorkLimitExceeded {
-                    needed: u64::MAX,
-                    limit: limits.max_work,
-                })?;
+                position = position
+                    .checked_add(width)
+                    .ok_or(Error::WorkLimitExceeded {
+                        needed: u64::MAX,
+                        limit: limits.max_work,
+                    })?;
                 continue;
             }
 
             let start = position;
             let mut count = 1_usize;
-            position = position.checked_add(width).ok_or(Error::WorkLimitExceeded {
-                needed: u64::MAX,
-                limit: limits.max_work,
-            })?;
+            position = position
+                .checked_add(width)
+                .ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
             while position < window.end() {
                 charge(&mut accounting, limits)?;
                 let Some((next, next_width)) = decode_first(&haystack[position..window.end()])
@@ -129,13 +133,21 @@ impl Plan {
                     break;
                 }
                 count = count.saturating_add(1);
-                position = position.checked_add(next_width).ok_or(Error::WorkLimitExceeded {
-                    needed: u64::MAX,
-                    limit: limits.max_work,
-                })?;
+                position = position
+                    .checked_add(next_width)
+                    .ok_or(Error::WorkLimitExceeded {
+                        needed: u64::MAX,
+                        limit: limits.max_work,
+                    })?;
             }
             if count >= self.minimum_scalars && !word_after(haystack, position) {
-                return Ok((Some(Match { start, end: position }), accounting));
+                return Ok((
+                    Some(Match {
+                        start,
+                        end: position,
+                    }),
+                    accounting,
+                ));
             }
         }
         Ok((None, accounting))
@@ -223,7 +235,10 @@ fn decode_first(bytes: &[u8]) -> Option<(char, usize)> {
         0xF0..=0xF4 => 4,
         _ => return None,
     };
-    let scalar = core::str::from_utf8(bytes.get(..width)?).ok()?.chars().next()?;
+    let scalar = core::str::from_utf8(bytes.get(..width)?)
+        .ok()?
+        .chars()
+        .next()?;
     Some((scalar, width))
 }
 

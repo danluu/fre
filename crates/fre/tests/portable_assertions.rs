@@ -616,7 +616,10 @@ fn unicode_word_runs_select_a_linear_plan_and_match_pinned_ranges() {
             .unwrap_or_else(|error| panic!("Unicode word-run build failed: {error}"));
         let upstream = pinned_with_unicode(pattern, true);
         assert_eq!(fre.build_report().plan, PlanKind::UnicodeWordRun);
-        assert_eq!(fre.runtime_implementation_id(), "unicode-word-run-linear-v1");
+        assert_eq!(
+            fre.runtime_implementation_id(),
+            "unicode-word-run-linear-v1"
+        );
         let mut session = fre
             .search_session(SearchSessionLimits::unlimited())
             .expect("word-run session uses no workspace");

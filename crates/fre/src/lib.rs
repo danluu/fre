@@ -1076,7 +1076,10 @@ impl PortableRegex {
             PortablePlan::UnicodeWordRun(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
-                Ok((matched.is_some(), SearchAccounting::UnicodeWordRun(accounting)))
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
             }
         }
     }
