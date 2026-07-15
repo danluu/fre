@@ -228,3 +228,219 @@ fn red_full_byte_normalization_and_bordered_suffix_are_exact() {
         None
     );
 }
+
+#[test]
+fn suffix_partition_lengths_kill_shift_shorten_and_wrapping_mutants() {
+    for suffix_len in [1_usize, 2, 15, 16, 17, 31, 32, 33] {
+        let mut suffix: Vec<u8> = (0_u8..=u8::MAX).cycle().take(suffix_len).collect();
+        suffix[0] = b'Z';
+        suffix[suffix_len - 1] = b'Q';
+        let candidate = plan(b"a", &suffix);
+        let mut haystack = vec![b'a'; 3];
+        haystack.extend_from_slice(&suffix);
+        assert_eq!(
+            candidate
+                .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((0, haystack.len())),
+            "suffix_len={suffix_len}"
+        );
+
+        let mut shifted = haystack.clone();
+        shifted[3] ^= 0x20;
+        assert_eq!(
+            candidate
+                .find(&shifted, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None,
+            "first sentinel suffix_len={suffix_len}"
+        );
+        let last = shifted.len() - 1;
+        shifted.copy_from_slice(&haystack);
+        shifted[last] ^= 0x20;
+        assert_eq!(
+            candidate
+                .find(&shifted, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None,
+            "last sentinel suffix_len={suffix_len}"
+        );
+    }
+
+    let suffix_n_minus_one = vec![b'Z'; 39];
+    let candidate = plan(b"a", &suffix_n_minus_one);
+    let mut haystack = vec![b'a'];
+    haystack.extend_from_slice(&suffix_n_minus_one);
+    assert_eq!(
+        candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap()
+            .0,
+        Some((0, 40))
+    );
+
+    for suffix_len in [40_usize, 41] {
+        let candidate = plan(b"a", &vec![b'Z'; suffix_len]);
+        assert_eq!(
+            candidate
+                .find(&[b'a'; 40], ForwardAnchoredSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None,
+            "M={suffix_len}, N=40"
+        );
+    }
+}
+
+#[test]
+fn every_prefix_outsider_position_and_partition_edge_are_checked_once() {
+    let candidate = plan(b"ab", b"ZQ");
+    let prefix_len = 65_usize;
+    let mut valid = vec![b'a'; prefix_len];
+    valid.extend_from_slice(b"ZQ");
+    let (matched, accounting) = candidate
+        .find(&valid, ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(matched, Some((0, valid.len())));
+    assert_eq!(accounting.prefix_bytes_examined, prefix_len);
+
+    for outsider in 0..prefix_len {
+        let mut haystack = valid.clone();
+        haystack[outsider] = b'!';
+        let (matched, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, None, "outsider={outsider}");
+        assert_eq!(accounting.prefix_bytes_examined, outsider + 1);
+        assert_eq!(accounting.prefix_bytes_upper_bound, prefix_len);
+        assert_eq!(accounting.suffix_bytes_upper_bound, 2);
+        assert!(accounting.suffix_confirmation_attempted);
+    }
+}
+
+#[test]
+fn earlier_suffix_lookalike_never_restarts_and_borders_never_move_the_split() {
+    let candidate = plan(b"ab", b"ZQ");
+    let (matched, accounting) = candidate
+        .find(b"aaZaaZQ", ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(matched, None);
+    assert_eq!(accounting.prefix_bytes_examined, 3);
+    assert_eq!(accounting.prefilter_calls, 0);
+
+    let bordered = plan(b"b", b"aba");
+    assert_eq!(
+        bordered
+            .find(b"bbbaba", ForwardAnchoredSearchLimits::unlimited())
+            .unwrap()
+            .0,
+        Some((0, 6))
+    );
+    for offset in 0..3 {
+        let mut haystack = b"bbbaba".to_vec();
+        haystack[3 + offset] ^= 1;
+        assert_eq!(
+            bordered
+                .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            None,
+            "border mismatch offset={offset}"
+        );
+    }
+}
+
+#[test]
+fn exact_n_limits_admit_and_each_one_below_limit_refuses_before_inspection() {
+    let candidate = plan(b"a", b"ZQ");
+    let haystack = b"aaaZQ";
+    let exact = ForwardAnchoredSearchLimits {
+        max_work_upper_bound: haystack.len() as u64,
+        max_examined_bytes_upper_bound: haystack.len(),
+        max_scratch_bytes: 0,
+    };
+    let (matched, accounting) = candidate.find(haystack, exact).unwrap();
+    assert_eq!(matched, Some((0, haystack.len())));
+    assert_eq!(accounting.examined_bytes_upper_bound, haystack.len());
+    assert_eq!(accounting.work_upper_bound, haystack.len() as u64);
+
+    for limited in [
+        ForwardAnchoredSearchLimits {
+            max_work_upper_bound: haystack.len() as u64 - 1,
+            ..exact
+        },
+        ForwardAnchoredSearchLimits {
+            max_examined_bytes_upper_bound: haystack.len() - 1,
+            ..exact
+        },
+    ] {
+        assert!(matches!(
+            candidate.find(haystack, limited),
+            Err(ForwardAnchoredSearchError::WorkLimit { .. }
+                | ForwardAnchoredSearchError::ExaminedBytesLimit { .. })
+        ));
+    }
+}
+
+#[test]
+fn fixed_kernel_matches_the_direct_theorem_on_small_exhaustive_inputs() {
+    fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        let mut all = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for &byte in alphabet {
+                    let mut word = prefix.clone();
+                    word.push(byte);
+                    next.push(word);
+                }
+            }
+            all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        all
+    }
+
+    let alphabet = [0_u8, 1, 2, 3];
+    let haystacks = words(&alphabet, 6);
+    let suffixes: Vec<Vec<u8>> = words(&alphabet, 3)
+        .into_iter()
+        .filter(|suffix| !suffix.is_empty())
+        .collect();
+    let mut comparisons = 0_usize;
+    for mask in 1_u8..16 {
+        let members: Vec<u8> = alphabet
+            .into_iter()
+            .enumerate()
+            .filter_map(|(bit, byte)| (mask & (1 << bit) != 0).then_some(byte))
+            .collect();
+        for suffix in &suffixes {
+            if members.contains(&suffix[0]) {
+                continue;
+            }
+            let candidate = plan(&members, suffix);
+            for haystack in &haystacks {
+                let expected = haystack.len() > suffix.len()
+                    && haystack.ends_with(suffix)
+                    && haystack[..haystack.len() - suffix.len()]
+                        .iter()
+                        .all(|byte| members.contains(byte));
+                let actual = candidate
+                    .find(haystack, ForwardAnchoredSearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    actual,
+                    expected.then_some((0, haystack.len())),
+                    "members={members:?} suffix={suffix:?} haystack={haystack:?}"
+                );
+                comparisons += 1;
+            }
+        }
+    }
+    assert_eq!(comparisons, 3_211_068);
+}
