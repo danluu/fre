@@ -10,6 +10,11 @@ pub struct CompileAccounting {
     /// Transparent capture-node visits across validation and lowering. This
     /// is a subset of `work`, not an additional uncharged counter.
     pub capture_erasure_work: usize,
+    /// Capture annotations retained as start/end actions by the explicit
+    /// capture-history compiler entry point.
+    pub captures_recorded: usize,
+    /// Capture-node visits across validation and capture-aware lowering.
+    pub capture_recording_work: usize,
     pub literal_bytes: usize,
     pub class_ranges: usize,
     /// Supported zero-width look nodes observed exactly once during bounded

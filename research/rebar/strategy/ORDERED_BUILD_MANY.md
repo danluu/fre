@@ -8,7 +8,16 @@ comparator, strict Clippy, and format gates. The full Rebar report has SHA-256
 `132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`
 and sorted-receipts SHA-256
 `106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
-No timing or assembly command was run.
+The qualified mechanism is retained in exact 200-row Unicode compile frontier
+`5f4da7b5536c42bbcdc467ea9c897bf990577938`; the bounded one-pattern finite
+candidate is recomposed on that frontier source-only. No new compiler, test
+executable, generated report, assembly inspection, or timing command was run
+for this composition.
+
+A later source-only extension from exact base
+`a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66` publishes the same selected plan as
+a fresh complete compile artifact. No compiler, formatter, test, report,
+assembly, or benchmark command was run for that extension.
 
 ## Semantic construction
 
@@ -37,7 +46,7 @@ outputs are typed preflight refusals.
 
 ## Exact qualified cluster
 
-The exact composed frontier is 189 pass / 155 unsupported. Two of the five
+The accepted finite-history frontier is 204 pass / 140 unsupported. Two of the five
 execution candidates pass; the other three now reach later typed resource
 gates instead of being rejected for pattern cardinality:
 
@@ -49,18 +58,36 @@ gates instead of being rejected for pattern cardinality:
 | `curated/05-lexer-veryl/multi@rust/regex` | `count-spans` | execution-work refusal |
 | `wild/parol-veryl/multi-patternid-ascii@rust/regex` | `count-spans` | execution-work refusal |
 
-The exact operation counts are 62 `count` and 101 `count-spans`; the two new
-passes are additive to the independently authenticated Unicode and portable
-rows. The 17 `compile` passes remain unchanged. The two multi-pattern compile
-jobs remain typed unsupported until the compile facade publishes a complete
-ordered artifact.
+The exact authenticated operation counts are 66 `count` and 101
+`count-spans`; the two build-many passes are additive to the independently
+authenticated Unicode and portable rows. The 28 authenticated `compile` passes
+include the separately qualified Unicode compile artifacts and remain
+unchanged by source-only work.
+
+The new compile facade projects exactly one additional pass:
+
+- `curated/12-dictionary/compile-multi@rust/regex`.
+
+It retains the complete ordered artifact, per-pattern identities, and selected
+engine accounting before untimed verification. This is a projected increment,
+not an authenticated change to the counts above.
+
+`curated/13-noseyparker/compile-multi@rust/regex` reaches the same generic
+compile facade but retains its typed `RepeatBound` refusal: `{20,1024}` exceeds
+the frozen per-node cap of 1,000. No cap is raised or reinterpreted in this
+lane. A compact plan or a separately accepted resource model is required
+before that row can become a projected pass.
+
+The finite plan is cardinality-disjoint from build-many and does not alter
+these five dispositions. Its separately authenticated one-pattern intersection
+adds four imported/leipzig `count` rows.
 
 ## Required follow-up
 
 The representative construction row is
-`curated/12-dictionary/compile-multi@rust/regex`; it remains unsupported until
-compile-model timing and work publication are defined. Its paired execution
-row, `curated/12-dictionary/multi@rust/regex`, is the representative count
+`curated/12-dictionary/compile-multi@rust/regex`; its source projection requires
+fresh semantic and report authentication before admission. Its paired execution
+row, `curated/12-dictionary/multi@rust/regex`, remains the representative count
 measurement. The named performance follow-up must also measure adverse cases:
 reversed-priority
 prefixes such as `[a{M}b, a]` over `a^N`, duplicate and empty alternatives,

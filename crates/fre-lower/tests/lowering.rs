@@ -38,6 +38,21 @@ fn find(pattern: &str, haystack: &[u8]) -> Option<MatchSpan> {
     .into_output()
 }
 
+fn find_unicode(pattern: &str, haystack: &[u8]) -> Option<MatchSpan> {
+    let parsed = parsed(pattern, true);
+    lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("supported Unicode pattern lowers")
+    .automaton()
+    .prepare::<Span>()
+    .search(haystack, SearchLimits::unlimited())
+    .expect("K0 Unicode search succeeds")
+    .into_output()
+}
+
 fn tuple(span: Option<MatchSpan>) -> Option<(usize, usize)> {
     span.map(|span| (span.start(), span.end()))
 }
@@ -66,6 +81,45 @@ fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
     assert_eq!(tuple(find(r"(?-u:\xFF)", &[0xFF])), Some((0, 1)));
     assert_eq!(tuple(find("(?:ab|cd)+", b"xcdabz")), Some((1, 5)));
     assert_eq!(tuple(find("a{2,4}", b"zaaaaax")), Some((1, 5)));
+}
+
+#[test]
+fn unicode_scalar_classes_lower_to_exact_utf8_byte_paths() {
+    assert_eq!(
+        tuple(find_unicode("[α-ω]+", "xαβz".as_bytes())),
+        Some((1, 5))
+    );
+    assert_eq!(tuple(find_unicode(".", "😀".as_bytes())), Some((0, 4)));
+    assert_eq!(tuple(find_unicode(".", &[0xFF, b'x'])), Some((1, 2)));
+    assert_eq!(tuple(find_unicode(".", &[0xCE])), None);
+    assert_eq!(tuple(find_unicode(".", &[0xC0, 0x80])), None);
+    assert_eq!(tuple(find_unicode(".", &[0xED, 0xA0, 0x80])), None);
+
+    let ruff = r"^[ \t\f]*#.*?coding[:=][ \t]*utf-?8";
+    assert_eq!(
+        tuple(find_unicode(ruff, b"# -*- coding: utf-8 -*-")),
+        Some((0, b"# -*- coding: utf-8".len()))
+    );
+    assert_eq!(tuple(find_unicode(ruff, b"x # coding: utf-8")), None);
+}
+
+#[test]
+fn unicode_class_expansion_retains_typed_construction_limits() {
+    let unicode = parsed(".", true);
+    let limits = LowerLimits {
+        automata: fre_automata::CompileLimits {
+            max_states: 1,
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&unicode, OperationSemantics::CaptureFree, limits),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -99,6 +153,33 @@ fn lowering_maps_each_portable_assertion_to_a_distinct_edge_kind() {
         assert_eq!(lowered.stats().states(), 2, "{pattern:?}");
         assert_eq!(lowered.stats().edges(), 1, "{pattern:?}");
     }
+
+    let unicode = parsed(r"\b", true);
+    let lowered = lower_raw(
+        &unicode,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("Unicode word boundary lowers");
+    assert_eq!(
+        lowered.plan().edge_kinds.as_slice(),
+        &[EdgeKind::AssertWordUnicode]
+    );
+    assert_eq!(lowered.stats().states(), 2);
+    assert_eq!(lowered.stats().edges(), 1);
+}
+
+#[test]
+fn unicode_word_boundary_is_scalar_aware_on_arbitrary_bytes() {
+    let word = r"\b(?-u:[A-Za-z]{2,})\b";
+    assert_eq!(tuple(find_unicode(word, b"-ab-")), Some((1, 3)));
+    assert_eq!(tuple(find_unicode(word, "☃ab☃".as_bytes())), Some((3, 5)));
+    assert_eq!(tuple(find_unicode(word, "βab-".as_bytes())), None);
+    assert_eq!(tuple(find_unicode(word, "-abβ".as_bytes())), None);
+    assert_eq!(
+        tuple(find_unicode(word, &[0xFF, b'a', b'b', 0xFF])),
+        Some((1, 3))
+    );
 }
 
 #[test]
@@ -245,16 +326,6 @@ fn lf_and_ascii_word_assertions_retain_original_haystack_context() {
 
 #[test]
 fn unsupported_semantics_are_never_silently_approximated() {
-    let unicode = parsed("[α-ω]", true);
-    assert!(matches!(
-        lower_raw(
-            &unicode,
-            OperationSemantics::CaptureFree,
-            LowerLimits::default()
-        ),
-        Err(LowerError::Unsupported(UnsupportedFeature::UnicodeClass))
-    ));
-
     let crlf = parsed("(?mR:$)", false);
     assert!(matches!(
         lower_raw(
@@ -267,17 +338,26 @@ fn unsupported_semantics_are_never_silently_approximated() {
         )))
     ));
 
-    let unicode_word = parsed(r"\b", true);
-    assert!(matches!(
-        lower_raw(
-            &unicode_word,
-            OperationSemantics::CaptureFree,
-            LowerLimits::default()
-        ),
-        Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::WordUnicode
-        )))
-    ));
+    const UNCERTIFIED_UNICODE_LOOKS: &[(&str, Look)] = &[
+        (r"\B", Look::WordUnicodeNegate),
+        (r"\b{start}", Look::WordStartUnicode),
+        (r"\b{end}", Look::WordEndUnicode),
+        (r"\b{start-half}", Look::WordStartHalfUnicode),
+        (r"\b{end-half}", Look::WordEndHalfUnicode),
+    ];
+    for &(pattern, expected) in UNCERTIFIED_UNICODE_LOOKS {
+        let parsed = parsed(pattern, true);
+        assert!(matches!(
+            lower_raw(
+                &parsed,
+                OperationSemantics::CaptureFree,
+                LowerLimits::default()
+            ),
+            Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
+                actual
+            ))) if actual == expected
+        ));
+    }
 
     let no_capture_nodes = parsed("abc", false);
     assert!(matches!(

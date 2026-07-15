@@ -362,9 +362,13 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::ContinuationProgram) => {
             "compile-aggregate-continuation-program"
         }
+        ("compile", AggregatePlanKind::FiniteOrderedLiterals) => {
+            "compile-aggregate-finite-ordered-literals"
+        }
         (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
         (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
+        (_, AggregatePlanKind::FiniteOrderedLiterals) => "aggregate-finite-ordered-literals",
     }
 }
 
@@ -619,5 +623,22 @@ mod tests {
         );
         current_fre_rebar_validate_aggregate_identity(compile.build_report(), true, "compile")
             .expect("Unicode scalar compile identity");
+    }
+
+    #[test]
+    fn finite_ordered_plan_identity_matches_authenticated_adapter() {
+        let regex = current_fre_rebar_aggregate_builder(r"a|bc", false, false)
+            .build_compile()
+            .expect("finite compile plan");
+        let report = regex.build_report();
+        assert_eq!(report.plan, AggregatePlanKind::FiniteOrderedLiterals);
+        assert_eq!(
+            aggregate_plan("compile", report),
+            "compile-aggregate-finite-ordered-literals"
+        );
+        assert_eq!(
+            aggregate_plan("count", report),
+            "aggregate-finite-ordered-literals"
+        );
     }
 }

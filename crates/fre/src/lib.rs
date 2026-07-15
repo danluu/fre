@@ -4,11 +4,13 @@
 //! subset that `fre-lower` can prove exact. [`AggregateBuilder`] constructs
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
-//! pattern's syntax identity and composes ordered whole-match count/span-sum
-//! plans without source concatenation. Whole-match aggregate plans may erase
-//! capture annotations, but no capture group API is exposed. None of these
-//! types is named `Regex`: unsupported syntax/profile/operation combinations
-//! are typed build errors, and there is no full Rust-regex/RE2 or JIT claim.
+//! pattern's syntax identity and composes ordered whole-match compile/count/
+//! span-sum plans without source concatenation. Whole-match aggregate plans
+//! may erase capture annotations. The explicit Unicode-off capture plan
+//! instead retains bounded capture history and exposes absolute group spans.
+//! None of these types is named `Regex`: unsupported syntax/profile/operation
+//! combinations are typed build errors, and there is no full Rust-regex/RE2 or
+//! JIT claim.
 
 #![forbid(unsafe_code)]
 
@@ -18,15 +20,19 @@ mod aggregate;
 mod aggregate_many;
 mod finite;
 mod forward_anchored;
+mod regex_redux;
 mod required_literal;
+mod unicode_compile;
 
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
-    AggregateCaptureSemantics, AggregateCompileRegex, AggregateContinuationIdentity,
+    AggregateCaptureBuildError, AggregateCaptureBuildReport, AggregateCaptureSemantics,
+    AggregateCapturesRegex, AggregateCompileRegex, AggregateContinuationIdentity,
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
+    AggregateFiniteLiteralBuildAccounting, AggregateFiniteLiteralIdentity,
     AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateSpanIter, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
@@ -35,14 +41,17 @@ pub use aggregate::{
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
     AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
-    AggregateManyCompositionAccounting, AggregateManyCountRegex, AggregateManyCountResult,
-    AggregateManyExecutionDetails, AggregateManyExecutionError, AggregateManyExecutionSource,
-    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyOutput,
-    AggregateManyPatternReport, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
+    AggregateManyCompileRegex, AggregateManyCompositionAccounting, AggregateManyCountRegex,
+    AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
+    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
+    AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
     AggregateManySpanSumResult,
 };
 pub use fre_aggregate::{
+    AdmittedCaptures as AggregateCaptures, CaptureLimits as AggregateCaptureLimits,
+    CaptureMatch as AggregateCaptureMatch,
+    CaptureOperationCertificate as AggregateCaptureOperationCertificate,
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,
     Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
@@ -83,6 +92,16 @@ use fre_syntax::{
 use regex_syntax::hir::Look;
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
+pub use regex_redux::{
+    RegexReduxAccounting, RegexReduxBuildError, RegexReduxBuildLimits, RegexReduxBuildReport,
+    RegexReduxBuilder, RegexReduxPipelineId, RegexReduxPlan, RegexReduxReplacementPlan,
+    RegexReduxReplacementResult, RegexReduxResult, RegexReduxRunError, RegexReduxRunLimits,
+};
+pub use unicode_compile::{
+    UnicodeCompileArtifact, UnicodeCompileArtifactBuilder, UnicodeCompileArtifactId,
+    UnicodeCompileBuildError, UnicodeCompileBuildLimits, UnicodeCompileBuildReport,
+    UnicodeCompileResource, UnicodeScalarEncoding, UnicodeScalarIter,
+};
 
 pub use fre_automata::{
     SearchError as K0SearchError, SearchLimits, SearchWindow,

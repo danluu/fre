@@ -21,8 +21,15 @@ fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
 
 #[test]
 fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families() {
-    let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 3] = [
+    let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 4] = [
         ("aba", b"abaaba", false, 2, AggregatePlanKind::ExactLiteral),
+        (
+            r"a|bc",
+            b"abc",
+            false,
+            2,
+            AggregatePlanKind::FiniteOrderedLiterals,
+        ),
         (
             r"(?:a+b|a)",
             b"aaaab",
@@ -211,6 +218,7 @@ fn continuation_details(
             accounting,
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_)
+        | AggregateExecutionDetails::FiniteOrderedLiterals { .. }
         | AggregateExecutionDetails::UnicodeScalar(_) => {
             panic!("expected continuation execution details")
         }
@@ -1250,10 +1258,10 @@ fn unicode_exact_build_error(limits: &AggregateBuildLimits) -> AggregateBuildErr
 fn unicode_exact_count_error(
     regex: &fre::AggregateCountRegex,
     haystack: &[u8],
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
-    let audited = regex.count(haystack, limits).unwrap_err();
-    let value = regex.count_value(haystack, limits).unwrap_err();
+    let audited = regex.count(haystack, *limits).unwrap_err();
+    let value = regex.count_value(haystack, *limits).unwrap_err();
     assert_eq!(value.identity, audited.identity);
     assert_eq!(value.source, audited.source);
     assert!(matches!(
@@ -1393,31 +1401,31 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let mut one_below_run = exact_run;
     one_below_run.exact_literal.max_linear_terms -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_match_events -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_count -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_reducer_steps -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     one_below_run = exact_run;
     one_below_run.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        unicode_exact_count_error(&baseline, &haystack, one_below_run),
+        unicode_exact_count_error(&baseline, &haystack, &one_below_run),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 
@@ -1886,9 +1894,9 @@ fn every_nonzero_exact_literal_build_quota_is_checked_at_and_one_below() {
 
 fn exact_reduce_error(
     regex: &fre::AggregateCountRegex,
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
-    let error = regex.count(b"needleneedleXneedle", limits).unwrap_err();
+    let error = regex.count(b"needleneedleXneedle", *limits).unwrap_err();
     assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
     match error.source {
         AggregateExecutionSource::ExactLiteral(source) => source,
@@ -1898,10 +1906,10 @@ fn exact_reduce_error(
 
 fn exact_reduce_value_error(
     regex: &fre::AggregateCountRegex,
-    limits: AggregateRunLimits,
+    limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
     let error = regex
-        .count_value(b"needleneedleXneedle", limits)
+        .count_value(b"needleneedleXneedle", *limits)
         .unwrap_err();
     assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
     match error.source {
@@ -1948,51 +1956,51 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let mut one_below = exact;
     one_below.exact_literal.max_linear_terms -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::LinearTermsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_match_events -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::MatchEventsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_count -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::CountLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_reducer_steps -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::ReducerStepsLimit { .. }
     ));
     one_below = exact;
     one_below.exact_literal.max_peak_bytes -= 1;
     assert!(matches!(
-        exact_reduce_error(&count, one_below),
+        exact_reduce_error(&count, &one_below),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
     assert!(matches!(
-        exact_reduce_value_error(&count, one_below),
+        exact_reduce_value_error(&count, &one_below),
         LiteralAggregateReduceError::PeakLimit { .. }
     ));
 
@@ -2058,4 +2066,202 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
     let (matched, _) = portable.find(b"xxfoo", SearchLimits::default()).unwrap();
     let matched = matched.unwrap();
     assert_eq!((matched.start(), matched.end()), (2, 5));
+}
+
+#[test]
+fn finite_ordered_plan_preserves_priority_nullable_captures_and_invalid_bytes() {
+    let cases: [(&str, &[u8]); 6] = [
+        (r"a|ab", b"ab"),
+        (r"ab|a", b"ab"),
+        (r"(?:|a)", b"aa"),
+        (r"[a-c]x|d", b"axdcz"),
+        (r"(?P<outer>a|bc)", b"bcaa"),
+        (r"\xFFa|a", &[0xFF, b'a', b'a']),
+    ];
+    for (pattern, haystack) in cases {
+        let expected = upstream(pattern, haystack, false);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+        let auto_count = aggregate_builder(pattern)
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        let auto_sum = aggregate_builder(pattern)
+            .unicode(false)
+            .build_span_sum()
+            .unwrap();
+        let continuation_count = aggregate_builder(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            auto_count.build_report().plan,
+            AggregatePlanKind::FiniteOrderedLiterals,
+            "{pattern:?}"
+        );
+        assert_eq!(
+            auto_sum.build_report().plan,
+            AggregatePlanKind::FiniteOrderedLiterals,
+            "{pattern:?}"
+        );
+        assert!(matches!(
+            auto_count.build_report().build,
+            AggregateBuildAccounting::FiniteOrderedLiterals(_)
+        ));
+        assert_eq!(
+            auto_count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_count,
+            "{pattern:?}"
+        );
+        assert_eq!(
+            auto_sum
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_sum,
+            "{pattern:?}"
+        );
+        assert_eq!(
+            continuation_count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_count,
+            "{pattern:?} continuation"
+        );
+        assert_ne!(
+            auto_count.cache_identity(AggregateRunLimits::default()),
+            continuation_count.cache_identity(AggregateRunLimits::default())
+        );
+    }
+}
+
+#[test]
+fn finite_ordered_plan_charges_one_reverse_transition_per_byte_and_all_dp_state() {
+    let horizon = 64_usize;
+    let haystack_len = 4_096_usize;
+    let pattern = format!("{}b|a", "a".repeat(horizon));
+    let haystack = vec![b'a'; haystack_len];
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::FiniteOrderedLiterals(build) = regex.build_report().build else {
+        panic!("finite adversary selected another plan")
+    };
+    assert!(build.kernel.dfa_cells_actual <= build.kernel.dfa_cells_upper_bound);
+    assert!(build.kernel.persistent_bytes > 0);
+    assert!(build.materialized_capacity_bytes > 0);
+    assert_eq!(
+        build.extraction_work,
+        u64::try_from(regex.build_report().planner_work).unwrap()
+    );
+    assert_eq!(
+        build.combined_work_upper_bound,
+        build.extraction_work + build.kernel.build_work_upper_bound
+    );
+
+    let result = regex
+        .count(&haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(result.value(), u64::try_from(haystack_len).unwrap());
+    let AggregateExecutionDetails::FiniteOrderedLiterals {
+        upper_bounds,
+        actual,
+    } = result.report().details
+    else {
+        panic!("finite adversary reported another executor")
+    };
+    assert_eq!(actual.transitions, haystack_len);
+    assert_eq!(actual.reducer_steps, haystack_len + 1);
+    assert_eq!(actual.ring_initializations, horizon + 2);
+    assert_eq!(
+        actual.total_work,
+        actual.transitions + actual.reducer_steps + actual.ring_initializations
+    );
+    assert_eq!(actual.total_work, upper_bounds.total_work);
+    assert_eq!(actual.scratch_bytes, upper_bounds.scratch_bytes);
+    assert!(actual.peak_bytes >= build.kernel.persistent_bytes);
+
+    let mut one_below = AggregateRunLimits::default();
+    one_below.finite_ordered_literals.max_total_work = upper_bounds.total_work - 1;
+    assert!(matches!(
+        regex.count_value(&haystack, one_below),
+        Err(error) if matches!(
+            error.source,
+            AggregateExecutionSource::FiniteOrderedLiterals(
+                fre::OrderedLiteralAggregateReduceError::TotalWorkLimit {
+                    needed,
+                    limit,
+                }
+            ) if needed == upper_bounds.total_work && limit == upper_bounds.total_work - 1
+        )
+    ));
+}
+
+#[test]
+fn finite_ordered_planner_and_dense_state_limits_are_exact_rejections() {
+    let baseline = aggregate_builder(r"a|bc|[d-f]")
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    let planner_work = u64::try_from(baseline.build_report().planner_work).unwrap();
+    let AggregateBuildAccounting::FiniteOrderedLiterals(build) = baseline.build_report().build
+    else {
+        panic!("finite limit baseline selected another plan")
+    };
+    let mut exact = AggregateBuildLimits {
+        max_finite_planner_work: planner_work,
+        finite_ordered_literals: fre::OrderedLiteralAggregateBuildLimits {
+            max_patterns: build.kernel.patterns,
+            max_pattern_bytes: build.kernel.pattern_bytes,
+            max_identity_bytes: build.kernel.identity_bytes,
+            max_trie_states: build.kernel.trie_states_upper_bound,
+            max_dfa_cells: build.kernel.dfa_cells_upper_bound,
+            max_build_work: build.combined_work_upper_bound,
+            max_scratch_bytes: build.kernel.scratch_bytes,
+            max_persistent_bytes: build.kernel.persistent_bytes,
+            max_peak_bytes: build.combined_peak_bytes,
+        },
+        ..AggregateBuildLimits::default()
+    };
+    aggregate_builder(r"a|bc|[d-f]")
+        .unicode(false)
+        .limits(exact)
+        .build_span_sum()
+        .unwrap();
+
+    exact.max_finite_planner_work = planner_work - 1;
+    assert!(matches!(
+        aggregate_builder(r"a|bc|[d-f]")
+            .unicode(false)
+            .limits(exact)
+            .build_span_sum(),
+        Err(AggregateBuildError::FinitePlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit == planner_work - 1
+    ));
+
+    exact.max_finite_planner_work = planner_work;
+    exact.finite_ordered_literals.max_dfa_cells = build.kernel.dfa_cells_upper_bound - 1;
+    assert!(matches!(
+        aggregate_builder(r"a|bc|[d-f]")
+            .unicode(false)
+            .limits(exact)
+            .build_span_sum(),
+        Err(AggregateBuildError::FiniteOrderedLiteralBuild {
+            source: fre::OrderedLiteralAggregateBuildError::DfaCellsLimit {
+                needed,
+                limit,
+            },
+            ..
+        }) if needed == build.kernel.dfa_cells_upper_bound
+            && limit == build.kernel.dfa_cells_upper_bound - 1
+    ));
 }

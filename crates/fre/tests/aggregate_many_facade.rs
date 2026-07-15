@@ -1,10 +1,106 @@
 use fre::{
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyOutput,
-    AggregateManyPlanKind, AggregateManyRunLimits,
+    AggregateEngineError, AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder,
+    AggregateManyOperation, AggregateManyOutput, AggregateManyPlanKind, AggregateManyRunLimits,
+    AggregateResource, CompatibilityProfile, RustProfile,
 };
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+#[test]
+fn compile_artifact_preserves_order_profile_and_priority_before_verification() {
+    let longer_first = patterns(&[r"a+", "a"]);
+    let shorter_first = patterns(&["a", r"a+"]);
+    let limits = AggregateManyRunLimits::unlimited();
+
+    let longer = AggregateManyBuilder::new(&longer_first)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build_compile()
+        .unwrap();
+    let shorter = AggregateManyBuilder::new(&shorter_first)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build_compile()
+        .unwrap();
+    let fresh_again = AggregateManyBuilder::new(&longer_first)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build_compile()
+        .unwrap();
+
+    assert_eq!(
+        AggregateManyOperation::Compile,
+        longer.build_report().operation
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        longer.build_report().plan
+    );
+    assert_eq!(longer.build_report(), fresh_again.build_report());
+    assert!(!core::ptr::eq(
+        longer.build_report().patterns.as_ptr(),
+        fresh_again.build_report().patterns.as_ptr()
+    ));
+    assert_eq!(1, longer.verify_count(b"aa", limits).unwrap().value());
+    assert_eq!(2, shorter.verify_count(b"aa", limits).unwrap().value());
+    for (ordinal, report) in longer.build_report().patterns.iter().enumerate() {
+        assert_eq!(ordinal, report.ordinal);
+        assert_eq!(
+            longer_first[ordinal].as_bytes(),
+            report.syntax_key.pattern.as_bytes()
+        );
+        assert_eq!(
+            CompatibilityProfile::RustBytes(longer.build_report().profile.clone()),
+            report.syntax_key.profile
+        );
+    }
+}
+
+#[test]
+fn compile_artifact_keeps_unicode_and_resource_refusals_before_publication() {
+    let unicode_nonliteral = patterns(&["snow", r"\w+"]);
+    assert!(matches!(
+        AggregateManyBuilder::new(&unicode_nonliteral)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(true)
+            .build_compile(),
+        Err(AggregateManyBuildError::UnicodeNonLiteral { pattern: 1 })
+    ));
+
+    let malformed_second = patterns(&["a", "("]);
+    let limits = AggregateManyBuildLimits {
+        max_patterns: 1,
+        ..AggregateManyBuildLimits::default()
+    };
+    assert!(matches!(
+        AggregateManyBuilder::new(&malformed_second)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .limits(limits)
+            .build_compile(),
+        Err(AggregateManyBuildError::PatternLimit {
+            needed: 2,
+            limit: 1
+        })
+    ));
+
+    let nosey_repeat = patterns(&[r"[A-Za-z0-9_-]{20,1024}", "never"]);
+    assert!(matches!(
+        AggregateManyBuilder::new(&nosey_repeat)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .build_compile(),
+        Err(AggregateManyBuildError::ContinuationCompile {
+            operation: AggregateManyOperation::Compile,
+            source: AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::RepeatBound,
+                ..
+            },
+            ..
+        })
+    ));
 }
 
 #[test]

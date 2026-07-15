@@ -69,6 +69,56 @@ pub struct CompiledRegex {
     accounting: CompileAccounting,
 }
 
+/// Capture-preserving continuation program.
+///
+/// Whole-match selection uses the same certified continuation recurrence as
+/// [`CompiledRegex`]. Capture start/end actions are zero-width for that
+/// recurrence and are retained for a bounded prioritized replay of each
+/// already selected span.
+#[derive(Debug)]
+pub struct CompiledCaptureRegex {
+    pub(crate) inner: CompiledRegex,
+    pub(crate) capture_slots: usize,
+}
+
+impl CompiledCaptureRegex {
+    /// Compile canonical HIR while retaining every numbered capture action.
+    pub fn from_hir(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+    ) -> Result<Self, Error> {
+        let inner = CompiledRegex::compile(hir, profile, limits, CapturePolicy::Record)?;
+        let capture_slots = add(
+            inner.accounting.captures_recorded,
+            1,
+            Resource::CaptureSlots,
+        )?;
+        Ok(Self {
+            inner,
+            capture_slots,
+        })
+    }
+
+    /// Stable identity of the capture-preserving program.
+    #[must_use]
+    pub const fn plan_id(&self) -> PlanId {
+        self.inner.plan_id
+    }
+
+    /// Exact compile accounting, including retained capture annotations.
+    #[must_use]
+    pub const fn compile_accounting(&self) -> CompileAccounting {
+        self.inner.accounting
+    }
+
+    /// Number of public group slots, including whole-match group zero.
+    #[must_use]
+    pub const fn capture_slots(&self) -> usize {
+        self.capture_slots
+    }
+}
+
 impl CompiledRegex {
     /// Compile canonical HIR for the explicit pinned byte profile.
     ///
@@ -171,6 +221,7 @@ impl CompiledRegex {
 enum CapturePolicy {
     Reject,
     EraseForWholeMatch,
+    Record,
 }
 
 struct CompileBudget {
@@ -189,6 +240,8 @@ impl CompileBudget {
                 peak_hir_stack_items: 0,
                 captures_erased: 0,
                 capture_erasure_work: 0,
+                captures_recorded: 0,
+                capture_recording_work: 0,
                 literal_bytes: 0,
                 class_ranges: 0,
                 look_assertions: 0,
@@ -243,6 +296,19 @@ impl CompileBudget {
         Ok(())
     }
 
+    fn record_capture(&mut self, unique_annotation: bool) -> Result<(), Error> {
+        self.accounting.capture_recording_work = add(
+            self.accounting.capture_recording_work,
+            1,
+            Resource::CompileWork,
+        )?;
+        if unique_annotation {
+            self.accounting.captures_recorded =
+                add(self.accounting.captures_recorded, 1, Resource::CaptureSlots)?;
+        }
+        Ok(())
+    }
+
     fn record_look_assertion(&mut self) -> Result<(), Error> {
         self.accounting.look_assertions =
             add(self.accounting.look_assertions, 1, Resource::LookAssertions)?;
@@ -264,18 +330,16 @@ fn validate_hir(
     capture_policy: CapturePolicy,
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
-    let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(1)
-        .map_err(|_| Error::AllocationFailed {
-            resource: Resource::HirStackItems,
-            items: 1,
-        })?;
     enforce(
         1,
         budget.limits.max_hir_stack_items,
         Resource::HirStackItems,
     )?;
+    let mut stack =
+        fre_exact_alloc::vec_with_exact_capacity(1).map_err(|_| Error::AllocationFailed {
+            resource: Resource::HirStackItems,
+            items: 1,
+        })?;
     stack.push((hir, 1_usize));
     budget.accounting.peak_hir_stack_items = 1;
     while let Some((node, depth)) = stack.pop() {
@@ -330,6 +394,10 @@ fn validate_hir(
                 CapturePolicy::Reject => return Err(Error::Unsupported(Unsupported::Capture)),
                 CapturePolicy::EraseForWholeMatch => {
                     budget.record_capture_erasure(true)?;
+                    push_children(&mut stack, [capture.sub.as_ref()], depth, budget)?;
+                }
+                CapturePolicy::Record => {
+                    budget.record_capture(true)?;
                     push_children(&mut stack, [capture.sub.as_ref()], depth, budget)?;
                 }
             },
@@ -524,6 +592,19 @@ impl<'a> Builder<'a> {
                 CapturePolicy::EraseForWholeMatch => {
                     self.budget.record_capture_erasure(false)?;
                     self.compile_node(capture.sub.as_ref(), continuation, child_depth)
+                }
+                CapturePolicy::Record => {
+                    self.budget.record_capture(false)?;
+                    let group =
+                        usize::try_from(capture.index).map_err(|_| Error::ArithmeticOverflow {
+                            resource: Resource::CaptureSlots,
+                        })?;
+                    let end = self.push(Inst::CaptureEnd {
+                        group,
+                        next: continuation,
+                    })?;
+                    let body = self.compile_node(capture.sub.as_ref(), end, child_depth)?;
+                    self.push(Inst::CaptureStart { group, next: body })
                 }
             },
             HirKind::Concat(children) => {
@@ -771,6 +852,14 @@ fn translate_progress(
             assertion: *assertion,
             next: mapped(same, *next)?,
         }),
+        Inst::CaptureStart { group, next } => Ok(Inst::CaptureStart {
+            group: *group,
+            next: mapped(same, *next)?,
+        }),
+        Inst::CaptureEnd { group, next } => Ok(Inst::CaptureEnd {
+            group: *group,
+            next: mapped(same, *next)?,
+        }),
         Inst::Split {
             preferred,
             fallback,
@@ -870,7 +959,9 @@ fn certify_program(
 
 fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
     let targets = match inst {
-        Inst::Assert { next, .. } => [Some(*next), None],
+        Inst::Assert { next, .. }
+        | Inst::CaptureStart { next, .. }
+        | Inst::CaptureEnd { next, .. } => [Some(*next), None],
         Inst::Split {
             preferred,
             fallback,
@@ -934,6 +1025,16 @@ fn hash_inst(hash: &mut StableHash, inst: &Inst) {
             hash.byte(assertion.identity_tag());
             hash_usize(hash, *next);
         }
+        Inst::CaptureStart { group, next } => {
+            hash.byte(6);
+            hash_usize(hash, *group);
+            hash_usize(hash, *next);
+        }
+        Inst::CaptureEnd { group, next } => {
+            hash.byte(7);
+            hash_usize(hash, *group);
+            hash_usize(hash, *next);
+        }
         Inst::Split {
             preferred,
             fallback,
@@ -981,14 +1082,10 @@ impl StableHash {
 }
 
 fn reserved_vec<T>(length: usize, resource: Resource) -> Result<Vec<T>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
-            resource,
-            items: length,
-        })?;
-    Ok(values)
+    fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
+        resource,
+        items: length,
+    })
 }
 
 fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {

@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fre-exact-alloc = { path = "../fre-exact-alloc" }
 regex-syntax = "=0.8.11"
 
 [dev-dependencies]

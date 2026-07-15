@@ -32,9 +32,10 @@ impl fmt::Display for LowerResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum UnsupportedFeature {
-    /// A Unicode scalar class requires a variable-width UTF-8 lowering.
+    /// Legacy source-compatible identity; current scalar-class lowering emits
+    /// exact UTF-8 byte paths or a typed resource/allocation error instead.
     UnicodeClass,
-    /// CRLF-aware and Unicode look assertions are not represented.
+    /// CRLF-aware and uncertified Unicode look assertions are not represented.
     LookAssertion(Look),
     /// K0 has no capture-preserving output path yet.
     CaptureSensitiveOperation,
@@ -45,13 +46,11 @@ pub enum UnsupportedFeature {
 impl fmt::Display for UnsupportedFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnicodeClass => f.write_str(
-                "Unicode scalar class (variable-width UTF-8 lowering is not implemented)",
-            ),
+            Self::UnicodeClass => f.write_str("Unicode scalar class (legacy unsupported identity)"),
             Self::LookAssertion(look) => {
                 write!(
                     f,
-                    "look assertion {look:?} (CRLF and Unicode look assertions are not implemented)"
+                    "look assertion {look:?} (CRLF and remaining Unicode look assertions are not implemented)"
                 )
             }
             Self::CaptureSensitiveOperation => {

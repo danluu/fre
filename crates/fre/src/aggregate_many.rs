@@ -36,6 +36,7 @@ pub enum AggregateManyOutput {
 /// Operation fixed before an admitted plan is built.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregateManyOperation {
+    Compile,
     Count,
     SpanSum,
 }
@@ -452,6 +453,15 @@ impl<'a> AggregateManyBuilder<'a> {
             .map(AggregateManyCountRegex)
     }
 
+    /// Construct and publish a fresh complete ordered multi-pattern artifact.
+    ///
+    /// [`AggregateManyCompileRegex::verify_count`] executes only the retained
+    /// plan; it does not parse, compile, reselect, or fall back.
+    pub fn build_compile(self) -> Result<AggregateManyCompileRegex, AggregateManyBuildError> {
+        self.build_plan(AggregateManyOperation::Compile)
+            .map(AggregateManyCompileRegex)
+    }
+
     pub fn build_span_sum(self) -> Result<AggregateManySpanSumRegex, AggregateManyBuildError> {
         self.build_plan(AggregateManyOperation::SpanSum)
             .map(AggregateManySpanSumRegex)
@@ -685,7 +695,7 @@ impl<'a> AggregateManyBuilder<'a> {
                 literals.push(literal);
             }
             match operation {
-                AggregateManyOperation::Count => {
+                AggregateManyOperation::Compile | AggregateManyOperation::Count => {
                     let mut literal_limits = self.limits.ordered_literal;
                     literal_limits.max_persistent_bytes = literal_limits
                         .max_persistent_bytes
@@ -844,6 +854,78 @@ impl AggregateManyPlan {
             source,
         }
     }
+
+    fn count(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyRunLimits,
+    ) -> Result<AggregateManyCountResult, AggregateManyExecutionError> {
+        match &self.engine {
+            AggregateManyEngine::OrderedLiteralCount(plan) => {
+                let result = plan
+                    .count(haystack, limits.ordered_literal)
+                    .map_err(|source| {
+                        self.execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
+                    })?;
+                Ok(AggregateManyCountResult {
+                    value: result.count,
+                    details: AggregateManyExecutionDetails::OrderedLiteral {
+                        upper_bounds: result.accounting.upper_bounds,
+                        actual: result.accounting.actual,
+                    },
+                })
+            }
+            AggregateManyEngine::Continuation(engine) => {
+                let admitted: AdmittedCount = engine
+                    .admit_count(
+                        haystack,
+                        0..haystack.len(),
+                        self.strategy,
+                        limits.continuation,
+                    )
+                    .map_err(|source| {
+                        self.execution_error(AggregateManyExecutionSource::Continuation(source))
+                    })?;
+                let value = u64::try_from(admitted.value()).map_err(|_| {
+                    self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                        "continuation count does not fit u64",
+                    ))
+                })?;
+                Ok(AggregateManyCountResult {
+                    value,
+                    details: AggregateManyExecutionDetails::Continuation {
+                        certificate: admitted.certificate().clone(),
+                        accounting: admitted.accounting(),
+                    },
+                })
+            }
+            AggregateManyEngine::OrderedLiteralSpanSum(_) => Err(self.execution_error(
+                AggregateManyExecutionSource::InternalInvariant(
+                    "count operation retained a span-sum engine",
+                ),
+            )),
+        }
+    }
+}
+
+/// Fresh complete ordered multi-pattern compile artifact.
+#[derive(Debug)]
+pub struct AggregateManyCompileRegex(AggregateManyPlan);
+
+impl AggregateManyCompileRegex {
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateManyBuildReport {
+        &self.0.report
+    }
+
+    /// Verify whole-match count with the already-published immutable plan.
+    pub fn verify_count(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyRunLimits,
+    ) -> Result<AggregateManyCountResult, AggregateManyExecutionError> {
+        self.0.count(haystack, limits)
+    }
 }
 
 /// Compiled ordered multi-pattern count operation.
@@ -861,56 +943,7 @@ impl AggregateManyCountRegex {
         haystack: &[u8],
         limits: AggregateManyRunLimits,
     ) -> Result<AggregateManyCountResult, AggregateManyExecutionError> {
-        match &self.0.engine {
-            AggregateManyEngine::OrderedLiteralCount(plan) => {
-                let result = plan
-                    .count(haystack, limits.ordered_literal)
-                    .map_err(|source| {
-                        self.0
-                            .execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
-                    })?;
-                Ok(AggregateManyCountResult {
-                    value: result.count,
-                    details: AggregateManyExecutionDetails::OrderedLiteral {
-                        upper_bounds: result.accounting.upper_bounds,
-                        actual: result.accounting.actual,
-                    },
-                })
-            }
-            AggregateManyEngine::Continuation(engine) => {
-                let admitted: AdmittedCount = engine
-                    .admit_count(
-                        haystack,
-                        0..haystack.len(),
-                        self.0.strategy,
-                        limits.continuation,
-                    )
-                    .map_err(|source| {
-                        self.0
-                            .execution_error(AggregateManyExecutionSource::Continuation(source))
-                    })?;
-                let value = u64::try_from(admitted.value()).map_err(|_| {
-                    self.0
-                        .execution_error(AggregateManyExecutionSource::InternalInvariant(
-                            "continuation count does not fit u64",
-                        ))
-                })?;
-                Ok(AggregateManyCountResult {
-                    value,
-                    details: AggregateManyExecutionDetails::Continuation {
-                        certificate: admitted.certificate().clone(),
-                        accounting: admitted.accounting(),
-                    },
-                })
-            }
-            AggregateManyEngine::OrderedLiteralSpanSum(_) => {
-                Err(self
-                    .0
-                    .execution_error(AggregateManyExecutionSource::InternalInvariant(
-                        "count wrapper retained a span-sum engine",
-                    )))
-            }
-        }
+        self.0.count(haystack, limits)
     }
 
     pub fn count_value(

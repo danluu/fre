@@ -737,6 +737,11 @@ fn zero_width_edge_enabled(
                 }
             })
         }
+        EdgeKind::AssertWordUnicode => {
+            let word_before = unicode_word_scalar(decode_last_scalar(&haystack[..position]))?;
+            let word_after = unicode_word_scalar(decode_first_scalar(&haystack[position..]))?;
+            Ok(word_before != word_after)
+        }
         EdgeKind::ByteRange => Err(SearchError::InternalInvariant {
             detail: "split state contained a consuming edge",
         }),
@@ -745,6 +750,40 @@ fn zero_width_edge_enabled(
 
 fn is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn unicode_word_scalar(scalar: Option<char>) -> Result<bool, SearchError> {
+    let Some(scalar) = scalar else {
+        return Ok(false);
+    };
+    regex_syntax::try_is_word_character(scalar).map_err(|_| SearchError::InternalInvariant {
+        detail: "pinned Unicode word table is unavailable",
+    })
+}
+
+fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
+    let first = *bytes.first()?;
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    let encoded = bytes.get(..width)?;
+    core::str::from_utf8(encoded).ok()?.chars().next()
+}
+
+fn decode_last_scalar(bytes: &[u8]) -> Option<char> {
+    let end = bytes.len();
+    let mut start = end.checked_sub(1)?;
+    let limit = end.saturating_sub(4);
+    while start > limit && matches!(bytes[start], 0x80..=0xBF) {
+        start = start.checked_sub(1)?;
+    }
+    let encoded = bytes.get(start..end)?;
+    let scalar = decode_first_scalar(encoded)?;
+    (scalar.len_utf8() == encoded.len()).then_some(scalar)
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
