@@ -651,9 +651,7 @@ impl AggregateBuilder {
                 })?;
             let build = engine.build_accounting();
             let kernel_identity = match operation {
-                AggregateOperation::Compile | AggregateOperation::Count => {
-                    engine.count_identity()
-                }
+                AggregateOperation::Compile | AggregateOperation::Count => engine.count_identity(),
                 AggregateOperation::SpanSum => engine.span_sum_identity(),
                 AggregateOperation::Spans => {
                     return Err(AggregateBuildError::InternalInvariant {
