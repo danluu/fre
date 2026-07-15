@@ -352,44 +352,6 @@ fn assertion_edges_match_an_independent_absolute_byte_oracle() {
 }
 
 #[test]
-fn unicode_word_boundary_requires_complete_adjacent_word_scalars() {
-    let plan = assertion(EdgeKind::AssertWordUnicode);
-    let cases: &[(&[u8], &[usize])] = &[
-        (b"", &[]),
-        ("β".as_bytes(), &[0, 2]),
-        ("☃".as_bytes(), &[]),
-        ("aβ".as_bytes(), &[0, 3]),
-        ("βa".as_bytes(), &[0, 3]),
-        ("-β-".as_bytes(), &[1, 3]),
-        ("\u{0301}".as_bytes(), &[0, 2]),
-        ("\u{200C}".as_bytes(), &[0, 3]),
-        ("\u{11011}".as_bytes(), &[0, 4]),
-        ("😀".as_bytes(), &[]),
-        (&[0xFF, b'a', 0xFF], &[1, 2]),
-        (&[0xC0, 0x80, b'a'], &[2, 3]),
-        (&[b'a', 0xED, 0xA0, 0x80], &[0, 1]),
-    ];
-
-    for &(haystack, expected_positions) in cases {
-        for at in 0..=haystack.len() {
-            let actual = plan
-                .prepare::<Span>()
-                .search_window(
-                    haystack,
-                    SearchWindow::new(at, at),
-                    SearchLimits::unlimited(),
-                )
-                .unwrap()
-                .into_output();
-            let expected = expected_positions
-                .contains(&at)
-                .then_some(MatchSpan::new(at, at));
-            assert_eq!(actual, expected, "{haystack:?}/{at}");
-        }
-    }
-}
-
-#[test]
 fn assertions_may_observe_outside_a_range_but_consumption_may_not() {
     let line_start_a = compile(vec![
         split(vec![Edge::assertion(1, EdgeKind::AssertLineStartLf)]),
@@ -452,7 +414,6 @@ fn every_short_run_respects_the_conservative_work_bound() {
             accept(),
         ]),
         assertion(EdgeKind::AssertWordAscii),
-        assertion(EdgeKind::AssertWordUnicode),
     ];
 
     for plan in &plans {

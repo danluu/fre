@@ -334,12 +334,12 @@ impl CompiledRegex {
         enforce(requested_peak, limits.max_peak_bytes, Resource::PeakBytes)?;
         let mut spans = Vec::new();
         if kind == OperationKind::Spans {
-            spans = fre_exact_alloc::vec_with_exact_capacity(summary.matches).map_err(|_| {
-                Error::AllocationFailed {
+            spans
+                .try_reserve_exact(summary.matches)
+                .map_err(|_| Error::AllocationFailed {
                     resource: Resource::OutputBytes,
                     items: summary.matches,
-                }
-            })?;
+                })?;
             let allocated_output_bytes = mul(
                 spans.capacity(),
                 core::mem::size_of::<Span>(),
@@ -452,10 +452,7 @@ impl Requirements {
                     return Err(Error::InternalInvariant("unfilled execution state"));
                 }
                 Inst::Fail | Inst::Match => 0,
-                Inst::Consume { .. }
-                | Inst::Assert { .. }
-                | Inst::CaptureStart { .. }
-                | Inst::CaptureEnd { .. } => 1,
+                Inst::Consume { .. } | Inst::Assert { .. } => 1,
                 Inst::Split { .. } => 2,
             };
             add(
@@ -706,9 +703,6 @@ impl FullTable {
                             0
                         }
                     }
-                    Inst::CaptureStart { next, .. } | Inst::CaptureEnd { next, .. } => {
-                        values[add(row, *next, Resource::TableCells)?]
-                    }
                     Inst::Split {
                         preferred,
                         fallback,
@@ -823,7 +817,6 @@ impl RowStore {
                             0
                         }
                     }
-                    Inst::CaptureStart { next, .. } | Inst::CaptureEnd { next, .. } => row[*next],
                     Inst::Split {
                         preferred,
                         fallback,
@@ -943,9 +936,6 @@ impl RowStore {
                             "row log selected failing assertion",
                         ));
                     }
-                    pc = *next;
-                }
-                Inst::CaptureStart { next, .. } | Inst::CaptureEnd { next, .. } => {
                     pc = *next;
                 }
                 Inst::Split {
@@ -1179,8 +1169,10 @@ fn read_bit(bytes: &[u8], index: usize) -> Result<bool, Error> {
 }
 
 fn zeroed_usizes(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
-    let mut values =
-        fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| Error::AllocationFailed {
             resource,
             items: length,
         })?;
@@ -1189,8 +1181,10 @@ fn zeroed_usizes(length: usize, resource: Resource) -> Result<Vec<usize>, Error>
 }
 
 fn zeroed_bytes(length: usize, resource: Resource) -> Result<Vec<u8>, Error> {
-    let mut values =
-        fre_exact_alloc::vec_with_exact_capacity(length).map_err(|_| Error::AllocationFailed {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| Error::AllocationFailed {
             resource,
             items: length,
         })?;

@@ -35,9 +35,6 @@ byte-stable semantic proof, so equal instruction graphs constructed under the
 two profiles cannot alias in reports or caches. The changed facade identity
 shape advances the composed aggregate explain/cache schema to 5, and the
 comparator candidate adapter identity advances to `fre-current-aggregate-v5`.
-The later qualified finite ordered and build-many compositions retain both
-version numbers. Finite one-pattern routing is Unicode-off only; build-many has
-its own schema and preserves each pattern's profile identity.
 
 ## Equivalence argument
 

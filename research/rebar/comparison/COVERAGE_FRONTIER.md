@@ -43,26 +43,6 @@ persistent capture-history path. All 285 RE2 jobs execute through the
 exact pinned Rebar adapter and pass. The Rust reference executes all 344 Rust
 jobs, with 342 pass and two retained failures.
 
-### Unvalidated regex-redux source projection
-
-The source composition now layers the complete reusable `regex-redux`
-candidate over the direct-scalar, breadth, and bounded capture-history source
-union, but has not generated a comparison report. Its exact projected delta is
-one row from unsupported to pass: `regex-redux +1`, total pass `+1`, total
-unsupported `-1`. The scalar-plus-breadth ceiling is 228 rows, and capture has
-at most 22 statically eligible rows before syntax/resource classification, so
-the positive Unicode-word boundary contributes exactly one additional projected
-`grep` row, and ordered compile-many contributes one bounded dictionary row.
-The combined arithmetic ceiling is therefore at most 253 pass / 91
-unsupported. This is an evaluation bound, not observed coverage and not a
-claim that all 22 capture rows pass.
-
-The candidate freshly constructs all fifteen ordered Unicode-off continuation
-components, retains the nine report patterns and five substitutions in exact
-protocol order, rejects empty replacement matches, and preflights bounded work
-and exact-capacity allocation. It does not inspect a job ID, fixture hash, or
-expected reducer.
-
 The optional v2 executed-plan field splits those passes into 29 exact-literal
 aggregates, 132 continuation-program aggregates, 23 direct Unicode-scalar
 aggregates, two ordered build-many literal aggregates, 17 continuation compile
@@ -71,22 +51,6 @@ rows, and eight selector/history capture rows. It is
 populated only after successful candidate execution and does not infer a plan
 for any unsupported receipt.
 
-### Unvalidated scalar-plus-breadth projection
-
-Canonical base `bf53ce82a17df0351d9e7a936271e5ebfa8c9635` has an independently
-authenticated direct-scalar frontier of 214 pass / 130 unsupported, recorded
-in `../../aggregate/UNICODE_SCALAR_STREAM.md`. The accepted breadth source at
-`0b1c15b0792983f42a194ad33a936185d7e5acb7` contributes three separately
-qualified mechanisms, but this composition has not generated a report.
-
-The overlap-aware arithmetic ceiling is 228 pass / 116 unsupported. It adds
-nine compile-artifact rows after excluding the two compile rows already owned
-by the direct scalar plan (`unicode/compile/negated-class-matches-codepoint`
-and `unicode/compile/one-letter`), four cardinality-disjoint Unicode-off finite
-`count` rows, and one portable Unicode-class `grep` row: `214 + 9 + 4 + 1`.
-This is a projected ceiling only. It assumes no lost disposition and is not
-observed coverage, semantic qualification of the composition, or benchmark
-evidence.
 ## Authenticated capture delta
 
 The source adds exactly eight supported jobs to the authenticated 214-pass
@@ -222,75 +186,25 @@ current coverage. `report.json` supersedes it for production semantic outcomes.
    exact-literal reducer advanced `imported/leipzig/twain` without changing a
    quota and preserves the construction-time choice/no-fallback contract; the
    remaining refusals require other semantic shapes.
-3. Apply the stratified pointwise performance gate to the two newly admitted
-   portable ASCII-word/LF `grep` rows and two relevant unchanged neighbors.
-   Retain typed refusals for Unicode word state and variable-width Unicode
-   scalar lowering until their own semantic and performance gates pass.
-4. Authenticate the source-only ordered compile-many projection for the exact
-   dictionary row named below, while retaining Nosey Parker's frozen
-   `RepeatBound` refusal. Never emulate priority by concatenating patterns.
-5. Qualify cold and allocator-warm construction performance for the seventeen
-   supported compile rows, keeping construction separate from untimed semantic
-   verification. Extend only the reusable Unicode/resource/build-many mechanisms
-   to the other sixteen rows.
-6. Add capture histories for the 37 capture reducer jobs; whole-match capture
-   erasure is not a capture API.
-7. Authenticate the source-complete composite `regex-redux` projection with a
-   fresh full comparison, then qualify its whole fresh-build operation rather
-   than diagnostic component timings.
-8. Run the preregistered pointwise capture performance gate on all four
+3. Run the preregistered pointwise capture performance gate on all four
    currently supported regimes before optimizing a favorite subset. Use
    allocations and selector/history counters to choose shared improvements;
    do not publish a four-cell suite geomean.
-9. Extend the ordered build-many plan/API to the two remaining compile jobs.
+4. Extend the ordered build-many plan/API to the two remaining compile jobs.
    Never emulate priority by concatenating patterns; retain the named adverse
    performance follow-up for the two admitted execution rows.
-10. Qualify cold and allocator-warm construction performance for the nineteen
+5. Qualify cold and allocator-warm construction performance for the nineteen
    supported compile rows, keeping construction separate from untimed semantic
    verification. Extend only the reusable Unicode/resource/build-many mechanisms
    to the other fourteen rows.
-11. Reduce selector work for the three near-bound cumulative-ledger refusals
+6. Reduce selector work for the three near-bound cumulative-ledger refusals
    (`ruff-noqa/real`, `ruff-noqa/tweaked`, and `fn-predicate`) and then address
    the six much larger selector shapes with a reusable plan. Each row must earn
    admission within the existing public-job limits; do not raise quotas.
-12. Admit the composite `regex-redux` job only after its complete report,
+7. Admit the composite `regex-redux` job only after its complete report,
    replacement, and non-empty iteration semantics are implemented.
 
 Each retained generated report has SHA-256
 `f42d288a93fa9042f2f0b6cfac0149f794a95dc4e8fbe93b45f2c313128a7b23`,
 and its sorted-receipts SHA-256 is
-`106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
-
-## Source-only combined portable projection
-
-The later mechanisms in `research/portable-unicode-classes/PROOF.md` and
-`research/portable-unicode-word-boundary/PROOF.md` are not included in the
-authenticated tables above. The exact combined source contains both canonical
-valid-UTF-8 Unicode scalar-class lowering and the positive `WordUnicode` look
-in portable K0. It retains typed refusals for negated/start/end/half Unicode
-looks and CRLF assertions.
-
-Relative to the accepted breadth source, the positive-boundary composition
-projects exactly one additional Rebar beneficiary:
-`grep/long-words-unicode@rust/regex`. The breadth source separately projects
-`wild/ruff/unnecessary-coding-comment@rust/regex` through its scalar-class
-mechanism. Neither row changes the authenticated tables above. Both require
-fresh combined semantic qualification and a complete authenticated generation
-before any coverage statement; this remains a source projection, not coverage
-or performance evidence.
-
-## Source-only ordered compile-many projection
-
-The authenticated tables, refusal split, and hashes above remain unchanged.
-Relative to exact clean source base
-`a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66`, the generic ordered compile-many
-artifact projects exactly one row from unsupported to pass:
-
-- `curated/12-dictionary/compile-multi@rust/regex`.
-
-`curated/13-noseyparker/compile-multi@rust/regex` remains a named typed
-`RepeatBound` refusal because its `{20,1024}` repetition exceeds the unchanged
-1,000 cap. No other row is included in this increment. Fresh semantic
-qualification and a complete authenticated generation are required before the
-dictionary row changes the coverage frontier; no performance result is
-claimed.
+`eb312c113c7bfca151786742e15eb8fa7c88a644edb6cc994926a04b5f70e30e`.

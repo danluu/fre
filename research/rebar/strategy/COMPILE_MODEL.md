@@ -1,10 +1,7 @@
 # Rebar compile-model production boundary
 
-Status: the qualified one-pattern mechanism is retained. A source-only
-multi-pattern extension was authored from exact clean base
-`a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66` without running a compiler,
-formatter, executable test, report generation, assembly inspection, or timing
-command.
+Status: source-only candidate. No compiler, executable test, report generation,
+or timing command was run while authoring this checkpoint.
 
 ## Lifecycle and identity
 
@@ -27,13 +24,6 @@ artifacts retain their existing kernel/program identities and complete build
 accounting. Every comparator request constructs and drops a fresh artifact, so
 neither samples nor jobs share warmed plans or parser state.
 
-`AggregateManyBuilder::build_compile` exposes the same boundary for ordered
-multi-pattern input. It independently parses every pattern with its ordinal
-and complete profile identity, selects the already-bounded ordered-literal or
-Unicode-off continuation plan, and publishes an `AggregateManyCompileRegex`.
-Its `verify_count` method executes only that retained plan. It cannot parse,
-reselect, concatenate source patterns, or fall back.
-
 ## Supported and refused domain
 
 The source frontier contains exactly 33 Rust-regex `compile` rows, all 33
@@ -47,35 +37,19 @@ surface:
 - whole-match capture erasure only, because verification observes no capture
   history.
 
-Ordered build-many compile uses the same cardinality, source-byte, composition,
-scratch, report-capacity, persistent, and selected-engine limits as the
-qualified ordered execution facade. Unicode-on remains limited to ordered
-nonempty case-sensitive canonical UTF-8 literals; general Unicode,
-unsupported assertions/syntax, and every compile resource limit retain typed
-refusals. Syntax/profile identity is never inferred from the lowered HIR.
+Ordered build-many remains explicitly unsupported before parsing or
+construction. General Unicode, unsupported assertions/syntax, and every
+compile resource limit retain typed refusals. Syntax/profile identity is never
+inferred from the lowered HIR.
 
 The canonical manifest and baseline receipt files are deliberately untracked
 and are absent from this source-only worktree. Consequently the exact number
 and family list of the 33 real rows inside the one-pattern domain is not
 authenticated in phase A: the honest authenticated gain remains 0/33 until the
 phase-B full report enumerates it. The implementation claims only the domain
-above, not 33/33 support. The source tests exercise three distinct one-pattern
-families plus ordered multi-pattern literals, priority-sensitive continuation,
-Unicode/profile refusal, and cardinality refusal.
-
-Relative to exact base `a92a4e5edfa4ee88650a7546fd6e3e7dcbdd4f66`,
-the source-only multi-pattern extension projects exactly one additional
-`compile` pass:
-
-- `curated/12-dictionary/compile-multi@rust/regex`.
-
-The other compile-multi row,
-`curated/13-noseyparker/compile-multi@rust/regex`, now reaches the generic
-builder but retains the existing typed `RepeatBound` refusal because one input
-contains `{20,1024}` and the frozen per-node cap is 1,000. This lane does not
-raise or reinterpret that cap.
-
-This is a projected increment, not authenticated coverage or performance.
+above, not 33/33 support. The source tests exercise three distinct families
+(literal, prioritized alternation/repetition, and captured case-folded class),
+plus build-many refusal.
 
 ## Focused semantic and structural gates
 
@@ -83,19 +57,19 @@ After a separately authenticated phase-B packet and coordinator receipt, run:
 
 ```text
 cargo test -p fre --test aggregate_facade compile_artifact -- --nocapture
-cargo test -p fre --test aggregate_many_facade compile_artifact -- --nocapture
 cargo test -p rebar-compare current_fre_compile -- --nocapture
 cargo test -p rebar-compare exact_rebar_model_reducers_cover_empty_and_crlf_semantics -- --nocapture
 cargo run --release -p rebar-compare -- research/rebar/expanded/manifest.json /tmp/rebar-fre research/rebar/comparison/report.json /tmp/rebar-fre/engines/rust/regex/target/release/main /tmp/rebar-fre/engines/re2/target/release/main
 ```
 
-The regenerated report must either confirm the one projected dictionary row or
-reject the projection, retain the named Nosey Parker `RepeatBound` refusal and
+The regenerated report must list every newly passing compile job ID grouped by
+benchmark family and plan, retain typed unsupported receipts for build-many and
 the broader Unicode/syntax/resource frontier, contain no new fail/fault, and
-leave every pass in the authenticated pre-extension frontier unchanged. The
-checked-in historical report must not be mistaken for current comparison
-evidence. Run formatting, lint, test, and full-report gates only under separate
-validation coordination.
+leave every pass in the authenticated pre-compile frontier unchanged. The root
+handoff currently records that frontier as 161/344; the checked-in v2 report is
+the older 144/344 baseline and must not be mistaken for the current comparison.
+Run the workspace formatting, lint, and test gates only under that same phase-B
+coordination.
 
 ## Preregistered performance matrix
 
@@ -110,8 +84,9 @@ suite geomean.
 | exact literal | Unicode off and admitted Unicode on | empty, short, long | first cold sample; later allocator-warm samples |
 | alternation/repetition | Unicode off | small, medium, near quota | first cold sample; later allocator-warm samples |
 | captures/case folding | Unicode off | nested captures; ASCII folded class | first cold sample; later allocator-warm samples |
-| rejection boundary | all relevant profiles | one-below work/storage; invalid syntax; Unicode/profile mismatch | deterministic outcome only, not speed |
+| rejection boundary | all relevant profiles | one-below work/storage; invalid syntax; build-many | deterministic outcome only, not speed |
 
-Expected effect is the exact one-row source projection above, not authenticated
-coverage or a measured speed claim. FRE may be faster or slower than Rust in
-any matrix cell; this source-only extension established no timing evidence.
+Expected effect is coverage, not a measured speed claim: compile rows in the
+certified one-pattern domain can execute an honest complete production build.
+FRE may be faster or slower than Rust in any matrix cell; phase A established
+no timing evidence.

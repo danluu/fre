@@ -167,8 +167,6 @@ pub(crate) enum Inst {
     Match,
     Consume { bytes: ByteSet, next: usize },
     Assert { assertion: Assertion, next: usize },
-    CaptureStart { group: usize, next: usize },
-    CaptureEnd { group: usize, next: usize },
     Split { preferred: usize, fallback: usize },
 }
 

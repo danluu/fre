@@ -11,18 +11,18 @@ The first certificate covers:
 
 - empty expressions and fixed byte literals;
 - byte classes with inclusive byte ranges;
-- Unicode scalar classes expanded to canonical valid-UTF-8 byte-range paths;
 - concatenation and ordered leftmost-first alternation;
 - finite greedy or lazy repetition, plus unbounded repetition whose body must
   consume at least one byte;
-- whole-original-haystack `Start` and `End`, LF line, ASCII word assertions,
-  and positive Unicode word boundaries; and
+- whole-original-haystack `Start` and `End`, LF line, and ASCII word
+  assertions; and
 - capture-node erasure only when the operation planner declares a
   capture-free output contract.
 
-It explicitly rejects CRLF assertions, negated/start/end/half Unicode word
-assertions, all capture-sensitive operations, and unbounded repetition unless
-its body has `minimum_len() == Some(n)` for `n > 0`.
+It explicitly rejects Unicode scalar classes, mixed-width Unicode class
+lowering, CRLF and Unicode word assertions, all capture-sensitive operations,
+and unbounded repetition unless its body has `minimum_len() == Some(n)` for
+`n > 0`.
 Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
 rejected: `None` is not treated as a non-nullability certificate. The
 restriction is required because K0's generation deduplication does not yet
@@ -32,22 +32,12 @@ changes those semantics.
 
 ## Bounded construction
 
-HIR traversal is postorder over an explicit task stack. Repetition and Unicode
-scalar-range expansion, fragment storage, Thompson edge patching, state/edge
-emission, raw-table storage, and validator work all have checked arithmetic and
-declared limits. Large finite repeats or expanded classes can therefore fail on
-stack, work, state, edge, or storage limits before constructing an unbounded
-graph. No lowering pass uses recursion or unsafe code.
-
-Unicode scalar ranges are partitioned with `regex-syntax`'s pinned
-`Utf8Sequences` iterator. Each resulting one-to-four-byte sequence becomes a
-concatenation of byte-range states, and the sequences form an alternation.
-Those paths accept exactly canonical encodings of scalar values in the HIR
-class: invalid, overlong, truncated, and surrogate encodings have no path.
-The iterator's private range stack is bounded by the fixed UTF-8 width and is
-precharged conservatively for every input scalar range; every yielded sequence,
-emitted branch, state, edge, patch, and requested graph allocation remains
-covered by the lowering work and automaton quotas.
+HIR traversal is postorder over an explicit task stack. Repetition expansion,
+fragment storage, Thompson edge patching, state/edge emission, raw-table
+storage, and validator work all have checked arithmetic and declared limits.
+Large finite repeats can therefore fail on stack, work, state, or edge limits
+before constructing an unbounded graph. No lowering pass uses recursion or
+unsafe code.
 
 The lowering work meter includes task dispatch and insertion, fragment and
 patch-list movement, possible vector relocation, state/edge emission, edge
@@ -59,12 +49,10 @@ while requested storage is separately preflighted and fallibly reserved.
 capture annotations. It is intentionally not multiplied when a finite repeat
 emits several copies of the same annotated subexpression.
 
-Edge order is semantic data: earlier alternation branches have higher priority,
-and loop-versus-exit ordering represents greediness. Assertions are emitted as
-original-haystack assertions, so a ranged search does not reinterpret its range
-as a new haystack. A positive Unicode boundary classifies at most one complete
-adjacent scalar on each side with the pinned Unicode word table; invalid or
-partial UTF-8 is non-word and a position inside a valid scalar cannot match.
+Edge order is semantic data: earlier alternation branches have higher
+priority, and loop-versus-exit ordering represents greediness. Assertions are
+emitted as original-haystack assertions, so a ranged search does not reinterpret
+its range as a new haystack.
 
 ## Test layers
 
@@ -80,10 +68,11 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 
 - This crate lowers `RustParsed` HIR only. It does not implement the RE2 parser
   surface or decide strict upstream constructor admission.
-- Unicode scalar classes compile to canonical valid-UTF-8 byte paths.
-- Absolute, LF line, ASCII word, and positive Unicode word-boundary assertions
-  are emitted. CRLF plus negated/start/end/half Unicode word assertions remain
-  typed refusals.
+- Unicode scalar classes and other variable-width UTF-8 transitions remain a
+  separate compiler track; accepting fixed literal bytes is not a claim that
+  mixed-width classes work.
+- Absolute, LF line, and ASCII word assertions are emitted. CRLF and Unicode
+  word assertions remain typed refusals.
 - `RustParsed` HIR does not retain a high-level builder's separately configured
   runtime line byte. This crate gives `StartLF`/`EndLF` their literal LF HIR
   semantics; the `fre` facade refuses non-LF profiles before selecting K0.

@@ -67,34 +67,3 @@ impl Default for OperationLimits {
         }
     }
 }
-
-/// Hard limits for capture reconstruction after whole-match admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CaptureLimits {
-    /// Group slots per match, including whole-match group zero.
-    pub max_capture_slots: usize,
-    /// Physical visited-vector capacity in replay cells. The stack's physical
-    /// capacity is separately restricted to `2 * max_replay_cells + 1`.
-    pub max_replay_cells: usize,
-    /// Physical capture-action history-arena capacity in nodes.
-    pub max_history_nodes: usize,
-    /// Physical capacity bytes retained by match records and group arrays.
-    pub max_output_bytes: usize,
-    /// Capture replay and history-reconstruction steps.
-    pub max_work: usize,
-    /// Physical replay scratch/output capacities plus retained whole matches.
-    pub max_peak_bytes: usize,
-}
-
-impl Default for CaptureLimits {
-    fn default() -> Self {
-        Self {
-            max_capture_slots: 4_096,
-            max_replay_cells: 16_777_216,
-            max_history_nodes: 16_777_216,
-            max_output_bytes: 256 << 20,
-            max_work: 1 << 29,
-            max_peak_bytes: 512 << 20,
-        }
-    }
-}

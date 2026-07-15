@@ -52,11 +52,6 @@ pub enum Resource {
     SpanSum,
     PeakBytes,
     ExecutionWork,
-    CaptureSlots,
-    CaptureReplayCells,
-    CaptureHistoryNodes,
-    CaptureOutputBytes,
-    CaptureWork,
 }
 
 /// Typed refusal from compilation or whole-operation admission.

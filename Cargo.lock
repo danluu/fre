@@ -100,7 +100,6 @@ dependencies = [
  "fre-aggregate",
  "fre-automata",
  "fre-capture-lab",
- "fre-exact-alloc",
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
@@ -113,7 +112,6 @@ dependencies = [
 name = "fre-aggregate"
 version = "0.1.0"
 dependencies = [
- "fre-exact-alloc",
  "fre-iterator-lab",
  "fre-reference",
  "regex",
@@ -124,9 +122,6 @@ dependencies = [
 [[package]]
 name = "fre-automata"
 version = "0.1.0"
-dependencies = [
- "regex-syntax",
-]
 
 [[package]]
 name = "fre-capi"

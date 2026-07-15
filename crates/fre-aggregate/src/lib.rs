@@ -11,10 +11,9 @@
 //! Assertions always inspect their absolute
 //! boundary in the original haystack, even for an interior operation range;
 //! byte-consuming transitions remain confined to that range.
-//! The default compiler rejects capture HIR. One whole-match-only entry point
-//! transparently erases capture annotations. A separate capture-preserving
-//! entry point records start/end actions and reconstructs groups by bounded
-//! prioritized replay of each already selected whole-match span.
+//! The default compiler rejects capture HIR. A separate whole-match-only entry
+//! point transparently traverses capture children inside the same bounded
+//! compiler and accounts every erased annotation; it cannot return captures.
 //!
 //! Nullable unbounded repetitions are compiled with a zero/progress product.
 //! Consequently, every cycle in the resulting continuation graph consumes a
@@ -31,7 +30,6 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
-mod capture;
 mod compile;
 mod error;
 mod limits;
@@ -39,10 +37,9 @@ mod operation;
 mod program;
 
 pub use accounting::{CompileAccounting, ExecutionAccounting};
-pub use capture::{AdmittedCaptures, CaptureMatch, CaptureOperationCertificate};
-pub use compile::{CompiledCaptureRegex, CompiledRegex, PlanId, RustByteProfile};
+pub use compile::{CompiledRegex, PlanId, RustByteProfile};
 pub use error::{Error, Resource, Unsupported};
-pub use limits::{CaptureLimits, CompileLimits, OperationLimits};
+pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, MatchCount, OperationCertificate, OperationId,
     Span, SpanIter, SpanIteration, SpanSum, Strategy,

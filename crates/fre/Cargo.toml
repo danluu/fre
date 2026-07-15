@@ -11,7 +11,6 @@ publish = false
 fre-aggregate = { path = "../fre-aggregate" }
 fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
-fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }
