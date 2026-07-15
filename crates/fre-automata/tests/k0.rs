@@ -99,6 +99,10 @@ fn compile(states: Vec<State>) -> Automaton {
     Automaton::from_raw(raw(0, states), CompileLimits::default()).expect("valid test automaton")
 }
 
+fn assertion(kind: EdgeKind) -> Automaton {
+    compile(vec![split(vec![Edge::assertion(1, kind)]), accept()])
+}
+
 fn literal(bytes: &[u8]) -> Automaton {
     let mut states = Vec::with_capacity(bytes.len().saturating_add(1));
     for (index, &byte) in bytes.iter().enumerate() {
@@ -276,6 +280,125 @@ fn anchors_use_original_haystack_context() {
     assert_eq!(ranged_end.into_output(), None);
 }
 
+const ASSERTION_KINDS: [EdgeKind; 10] = [
+    EdgeKind::AssertHaystackStart,
+    EdgeKind::AssertHaystackEnd,
+    EdgeKind::AssertLineStartLf,
+    EdgeKind::AssertLineEndLf,
+    EdgeKind::AssertWordAscii,
+    EdgeKind::AssertWordAsciiNegate,
+    EdgeKind::AssertWordStartAscii,
+    EdgeKind::AssertWordEndAscii,
+    EdgeKind::AssertWordStartHalfAscii,
+    EdgeKind::AssertWordEndHalfAscii,
+];
+
+fn reference_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_digit() || byte.is_ascii_alphabetic()
+}
+
+fn reference_assertion(kind: EdgeKind, haystack: &[u8], at: usize) -> bool {
+    let before = at.checked_sub(1).and_then(|index| haystack.get(index));
+    let after = haystack.get(at);
+    let word_before = before.is_some_and(|&byte| reference_ascii_word(byte));
+    let word_after = after.is_some_and(|&byte| reference_ascii_word(byte));
+    match kind {
+        EdgeKind::AssertHaystackStart => at == 0,
+        EdgeKind::AssertHaystackEnd => at == haystack.len(),
+        EdgeKind::AssertLineStartLf => at == 0 || before.is_some_and(|&byte| byte == b'\n'),
+        EdgeKind::AssertLineEndLf => {
+            at == haystack.len() || after.is_some_and(|&byte| byte == b'\n')
+        }
+        EdgeKind::AssertWordAscii => word_before != word_after,
+        EdgeKind::AssertWordAsciiNegate => word_before == word_after,
+        EdgeKind::AssertWordStartAscii => !word_before && word_after,
+        EdgeKind::AssertWordEndAscii => word_before && !word_after,
+        EdgeKind::AssertWordStartHalfAscii => !word_before,
+        EdgeKind::AssertWordEndHalfAscii => !word_after,
+        _ => panic!("reference received a non-assertion edge"),
+    }
+}
+
+#[test]
+fn assertion_edges_match_an_independent_absolute_byte_oracle() {
+    let mut haystacks = vec![Vec::new()];
+    haystacks.extend((u8::MIN..=u8::MAX).map(|byte| vec![byte]));
+    let alphabet = [b'a', b'Z', b'9', b'_', b'-', b'\n', 0xFF];
+    for &first in &alphabet {
+        for &second in &alphabet {
+            haystacks.push(vec![first, second]);
+        }
+    }
+
+    for kind in ASSERTION_KINDS {
+        let plan = assertion(kind);
+        for haystack in &haystacks {
+            for at in 0..=haystack.len() {
+                let actual = plan
+                    .prepare::<Span>()
+                    .search_window(
+                        haystack,
+                        SearchWindow::new(at, at),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                let expected =
+                    reference_assertion(kind, haystack, at).then_some(MatchSpan::new(at, at));
+                assert_eq!(actual, expected, "{kind:?}/{haystack:?}/{at}");
+            }
+        }
+    }
+}
+
+#[test]
+fn assertions_may_observe_outside_a_range_but_consumption_may_not() {
+    let line_start_a = compile(vec![
+        split(vec![Edge::assertion(1, EdgeKind::AssertLineStartLf)]),
+        consume(vec![Edge::byte(2, b'a')]),
+        accept(),
+    ]);
+    let word_start_a = compile(vec![
+        split(vec![Edge::assertion(1, EdgeKind::AssertWordStartAscii)]),
+        consume(vec![Edge::byte(2, b'a')]),
+        accept(),
+    ]);
+
+    for plan in [&line_start_a, &word_start_a] {
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_window(b"\na", SearchWindow::new(1, 1), SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            None
+        );
+    }
+    assert_eq!(
+        line_start_a
+            .prepare::<Span>()
+            .search_window(b"\na", SearchWindow::new(1, 2), SearchLimits::unlimited())
+            .unwrap()
+            .into_output(),
+        Some(MatchSpan::new(1, 2))
+    );
+    assert_eq!(
+        word_start_a
+            .prepare::<Span>()
+            .search_window(b"-a", SearchWindow::new(1, 2), SearchLimits::unlimited())
+            .unwrap()
+            .into_output(),
+        Some(MatchSpan::new(1, 2))
+    );
+    assert_eq!(
+        word_start_a
+            .prepare::<Span>()
+            .search_window(b"aa", SearchWindow::new(1, 2), SearchLimits::unlimited())
+            .unwrap()
+            .into_output(),
+        None
+    );
+}
+
 #[test]
 fn every_short_run_respects_the_conservative_work_bound() {
     let plans = [
@@ -290,6 +413,7 @@ fn every_short_run_respects_the_conservative_work_bound() {
             split(vec![Edge::epsilon(0)]),
             accept(),
         ]),
+        assertion(EdgeKind::AssertWordAscii),
     ];
 
     for plan in &plans {

@@ -36,6 +36,22 @@ pub enum EdgeKind {
     AssertHaystackStart,
     /// Zero-width assertion at the end of the original haystack.
     AssertHaystackEnd,
+    /// Zero-width assertion at original-haystack start or after an LF byte.
+    AssertLineStartLf,
+    /// Zero-width assertion at original-haystack end or before an LF byte.
+    AssertLineEndLf,
+    /// Zero-width ASCII word boundary; only `[A-Za-z0-9_]` are word bytes.
+    AssertWordAscii,
+    /// Zero-width negated ASCII word boundary assertion.
+    AssertWordAsciiNegate,
+    /// Zero-width start-of-ASCII-word assertion.
+    AssertWordStartAscii,
+    /// Zero-width end-of-ASCII-word assertion.
+    AssertWordEndAscii,
+    /// Zero-width left half of an ASCII word-start assertion.
+    AssertWordStartHalfAscii,
+    /// Zero-width right half of an ASCII word-end assertion.
+    AssertWordEndHalfAscii,
 }
 
 impl EdgeKind {
@@ -45,6 +61,14 @@ impl EdgeKind {
             Self::ByteRange => "byte-range",
             Self::AssertHaystackStart => "start-assertion",
             Self::AssertHaystackEnd => "end-assertion",
+            Self::AssertLineStartLf => "LF-line-start-assertion",
+            Self::AssertLineEndLf => "LF-line-end-assertion",
+            Self::AssertWordAscii => "ASCII-word-boundary-assertion",
+            Self::AssertWordAsciiNegate => "ASCII-not-word-boundary-assertion",
+            Self::AssertWordStartAscii => "ASCII-word-start-assertion",
+            Self::AssertWordEndAscii => "ASCII-word-end-assertion",
+            Self::AssertWordStartHalfAscii => "ASCII-word-start-half-assertion",
+            Self::AssertWordEndHalfAscii => "ASCII-word-end-half-assertion",
         }
     }
 

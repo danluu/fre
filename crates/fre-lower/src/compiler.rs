@@ -146,18 +146,34 @@ impl<'h> Compiler<'h> {
             HirKind::Class(Class::Unicode(_)) => {
                 Err(LowerError::Unsupported(UnsupportedFeature::UnicodeClass))
             }
-            HirKind::Look(look @ (Look::Start | Look::End)) => {
+            HirKind::Look(look) => {
                 let kind = match look {
                     Look::Start => EdgeKind::AssertHaystackStart,
                     Look::End => EdgeKind::AssertHaystackEnd,
-                    _ => unreachable!("pattern above exhausts supported assertions"),
+                    Look::StartLF => EdgeKind::AssertLineStartLf,
+                    Look::EndLF => EdgeKind::AssertLineEndLf,
+                    Look::WordAscii => EdgeKind::AssertWordAscii,
+                    Look::WordAsciiNegate => EdgeKind::AssertWordAsciiNegate,
+                    Look::WordStartAscii => EdgeKind::AssertWordStartAscii,
+                    Look::WordEndAscii => EdgeKind::AssertWordEndAscii,
+                    Look::WordStartHalfAscii => EdgeKind::AssertWordStartHalfAscii,
+                    Look::WordEndHalfAscii => EdgeKind::AssertWordEndHalfAscii,
+                    Look::StartCRLF
+                    | Look::EndCRLF
+                    | Look::WordUnicode
+                    | Look::WordUnicodeNegate
+                    | Look::WordStartUnicode
+                    | Look::WordEndUnicode
+                    | Look::WordStartHalfUnicode
+                    | Look::WordEndHalfUnicode => {
+                        return Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
+                            *look,
+                        )));
+                    }
                 };
                 let fragment = self.assertion_fragment(kind)?;
                 self.push_fragment(fragment)
             }
-            HirKind::Look(look) => Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-                *look,
-            ))),
             HirKind::Capture(capture) => self.push_task(Task::Visit(&capture.sub)),
             HirKind::Concat(parts) => {
                 self.push_task(Task::FinishConcat(parts.len()))?;

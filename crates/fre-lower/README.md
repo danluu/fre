@@ -14,13 +14,15 @@ The first certificate covers:
 - concatenation and ordered leftmost-first alternation;
 - finite greedy or lazy repetition, plus unbounded repetition whose body must
   consume at least one byte;
-- whole-original-haystack `Start` and `End` assertions; and
+- whole-original-haystack `Start` and `End`, LF line, and ASCII word
+  assertions; and
 - capture-node erasure only when the operation planner declares a
   capture-free output contract.
 
 It explicitly rejects Unicode scalar classes, mixed-width Unicode class
-lowering, line and word assertions, all capture-sensitive operations, and
-unbounded repetition unless its body has `minimum_len() == Some(n)` for `n > 0`.
+lowering, CRLF and Unicode word assertions, all capture-sensitive operations,
+and unbounded repetition unless its body has `minimum_len() == Some(n)` for
+`n > 0`.
 Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
 rejected: `None` is not treated as a non-nullability certificate. The
 restriction is required because K0's generation deduplication does not yet
@@ -55,8 +57,9 @@ its range as a new haystack.
 ## Test layers
 
 Integration tests exercise the full `fre-syntax -> fre-lower -> fre-automata`
-path, priority and greediness, explicit nullable-cycle rejection, ranged assertion context,
-resource failures, and a 20,000-term concatenation on a 128 KiB native stack.
+path, priority and greediness, explicit nullable-cycle rejection, ranged
+assertion context, resource failures, and a 20,000-term concatenation on a 128
+KiB native stack.
 An exhaustive small-alphabet differential suite compares supported expressions
 with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 `regex-syntax` 0.8.11 with their independently packaged source receipts.
@@ -68,8 +71,11 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 - Unicode scalar classes and other variable-width UTF-8 transitions remain a
   separate compiler track; accepting fixed literal bytes is not a claim that
   mixed-width classes work.
-- Only whole-haystack `Start`/`End` assertions are emitted. Line, CRLF, and
-  ASCII/Unicode word assertions are rejected.
+- Absolute, LF line, and ASCII word assertions are emitted. CRLF and Unicode
+  word assertions remain typed refusals.
+- `RustParsed` HIR does not retain a high-level builder's separately configured
+  runtime line byte. This crate gives `StartLF`/`EndLF` their literal LF HIR
+  semantics; the `fre` facade refuses non-LF profiles before selecting K0.
 - Capture-sensitive search is unavailable. Capture syntax may be erased only
   after the caller selects the capture-free operation contract.
 - Unbounded nullable or unknown-minimum bodies are rejected pending an ordered

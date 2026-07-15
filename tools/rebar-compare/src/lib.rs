@@ -53,7 +53,7 @@ pub const RE2_VERSION: &str = "2025-11-05";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-v5";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -337,10 +337,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep plus construction-selected exact-literal or continuation compile/count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word K0 assertions plus construction-selected exact-literal or continuation compile/count/span-sum; reverse-sequential-rows continuation; whole-match capture erasure",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; compile constructs a fresh complete artifact before untimed verification; existing portable grep executes when bounded construction and operation admission succeed; all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals (Unicode-on only for nonempty case-sensitive UTF-8 literals) or the Unicode-off bounded continuation program; compile constructs a fresh complete artifact before untimed verification; portable grep executes the certified byte-stable K0 subset including absolute/LF-line/ASCII-word assertions; CRLF, Unicode-word, variable-width Unicode scalar features, and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256: None,
         }

@@ -469,7 +469,7 @@ fn execute(
         workspace.begin_boundary(&mut meter, position)?;
         expand_boundary_roots(
             automaton,
-            haystack.len(),
+            haystack,
             position,
             workspace,
             &mut meter,
@@ -571,7 +571,7 @@ fn prepare_invocation(
 
 fn expand_boundary_roots(
     automaton: &Automaton,
-    haystack_len: usize,
+    haystack: &[u8],
     position: usize,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
@@ -581,8 +581,7 @@ fn expand_boundary_roots(
     let mut root_index = 0usize;
     while root_index < root_count {
         let root = workspace.roots[root_index];
-        if let Some(found) = expand_root(automaton, haystack_len, position, root, workspace, meter)?
-        {
+        if let Some(found) = expand_root(automaton, haystack, position, root, workspace, meter)? {
             *pending = Some(found);
             break;
         }
@@ -599,7 +598,7 @@ fn expand_boundary_roots(
     if pending.is_none() {
         *pending = expand_root(
             automaton,
-            haystack_len,
+            haystack,
             position,
             Thread {
                 state: automaton.start,
@@ -650,12 +649,17 @@ fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchEr
 
 fn expand_root(
     automaton: &Automaton,
-    haystack_len: usize,
+    haystack: &[u8],
     position: usize,
     root: Thread,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
 ) -> Result<Option<MatchSpan>, SearchError> {
+    if position > haystack.len() {
+        return Err(SearchError::InternalInvariant {
+            detail: "assertion position exceeded original haystack",
+        });
+    }
     workspace.stack_len = 0;
     workspace.push_stack(root)?;
 
@@ -674,16 +678,8 @@ fn expand_root(
                 // Reverse push produces forward edge order under a LIFO stack.
                 for edge in automaton.state_edges(thread.state).rev() {
                     meter.charge(1, position)?;
-                    let enabled = match automaton.edge_kinds[edge] {
-                        EdgeKind::Epsilon => true,
-                        EdgeKind::AssertHaystackStart => position == 0,
-                        EdgeKind::AssertHaystackEnd => position == haystack_len,
-                        EdgeKind::ByteRange => {
-                            return Err(SearchError::InternalInvariant {
-                                detail: "split state contained a consuming edge",
-                            });
-                        }
-                    };
+                    let enabled =
+                        zero_width_edge_enabled(automaton.edge_kinds[edge], haystack, position)?;
                     if enabled {
                         workspace.push_stack(Thread {
                             state: automaton.edge_targets[edge],
@@ -695,6 +691,60 @@ fn expand_root(
         }
     }
     Ok(None)
+}
+
+fn zero_width_edge_enabled(
+    kind: EdgeKind,
+    haystack: &[u8],
+    position: usize,
+) -> Result<bool, SearchError> {
+    match kind {
+        EdgeKind::Epsilon => Ok(true),
+        EdgeKind::AssertHaystackStart => Ok(position == 0),
+        EdgeKind::AssertHaystackEnd => Ok(position == haystack.len()),
+        EdgeKind::AssertLineStartLf => Ok(position == 0
+            || position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index))
+                .is_some_and(|&byte| byte == b'\n')),
+        EdgeKind::AssertLineEndLf => {
+            Ok(position == haystack.len() || haystack.get(position) == Some(&b'\n'))
+        }
+        EdgeKind::AssertWordAscii
+        | EdgeKind::AssertWordAsciiNegate
+        | EdgeKind::AssertWordStartAscii
+        | EdgeKind::AssertWordEndAscii
+        | EdgeKind::AssertWordStartHalfAscii
+        | EdgeKind::AssertWordEndHalfAscii => {
+            let word_before = position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index))
+                .is_some_and(|&byte| is_ascii_word(byte));
+            let word_after = haystack
+                .get(position)
+                .is_some_and(|&byte| is_ascii_word(byte));
+            Ok(match kind {
+                EdgeKind::AssertWordAscii => word_before != word_after,
+                EdgeKind::AssertWordAsciiNegate => word_before == word_after,
+                EdgeKind::AssertWordStartAscii => !word_before && word_after,
+                EdgeKind::AssertWordEndAscii => word_before && !word_after,
+                EdgeKind::AssertWordStartHalfAscii => !word_before,
+                EdgeKind::AssertWordEndHalfAscii => !word_after,
+                _ => {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "word assertion dispatch changed variants",
+                    });
+                }
+            })
+        }
+        EdgeKind::ByteRange => Err(SearchError::InternalInvariant {
+            detail: "split state contained a consuming edge",
+        }),
+    }
+}
+
+fn is_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {

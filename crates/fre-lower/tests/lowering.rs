@@ -1,4 +1,4 @@
-use fre_automata::{MatchSpan, SearchLimits, SearchWindow, Span};
+use fre_automata::{EdgeKind, MatchSpan, SearchLimits, SearchWindow, Span};
 use fre_lower::{
     LowerError, LowerLimits, LowerResource, OperationSemantics, UnsupportedFeature, lower,
     lower_hir_raw, lower_raw,
@@ -6,6 +6,7 @@ use fre_lower::{
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
 };
+use regex_syntax::hir::Look;
 
 fn profile(unicode: bool) -> CompatibilityProfile {
     let mut profile = RustProfile::rebar_1_12_4();
@@ -41,6 +42,22 @@ fn tuple(span: Option<MatchSpan>) -> Option<(usize, usize)> {
     span.map(|span| (span.start(), span.end()))
 }
 
+fn find_window(pattern: &str, haystack: &[u8], window: SearchWindow) -> Option<(usize, usize)> {
+    let parsed = parsed(pattern, false);
+    let found = lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("supported assertion pattern lowers")
+    .automaton()
+    .prepare::<Span>()
+    .search_window(haystack, window, SearchLimits::unlimited())
+    .expect("K0 ranged search succeeds")
+    .into_output();
+    tuple(found)
+}
+
 #[test]
 fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
     assert_eq!(tuple(find("", b"abc")), Some((0, 0)));
@@ -49,6 +66,39 @@ fn syntax_to_lowering_to_k0_handles_the_safe_byte_subset() {
     assert_eq!(tuple(find(r"(?-u:\xFF)", &[0xFF])), Some((0, 1)));
     assert_eq!(tuple(find("(?:ab|cd)+", b"xcdabz")), Some((1, 5)));
     assert_eq!(tuple(find("a{2,4}", b"zaaaaax")), Some((1, 5)));
+}
+
+#[test]
+fn lowering_maps_each_portable_assertion_to_a_distinct_edge_kind() {
+    const CASES: &[(&str, EdgeKind)] = &[
+        (r"\A", EdgeKind::AssertHaystackStart),
+        (r"\z", EdgeKind::AssertHaystackEnd),
+        (r"(?m:^)", EdgeKind::AssertLineStartLf),
+        (r"(?m:$)", EdgeKind::AssertLineEndLf),
+        (r"\b", EdgeKind::AssertWordAscii),
+        (r"\B", EdgeKind::AssertWordAsciiNegate),
+        (r"\b{start}", EdgeKind::AssertWordStartAscii),
+        (r"\b{end}", EdgeKind::AssertWordEndAscii),
+        (r"\b{start-half}", EdgeKind::AssertWordStartHalfAscii),
+        (r"\b{end-half}", EdgeKind::AssertWordEndHalfAscii),
+    ];
+
+    for &(pattern, expected) in CASES {
+        let parsed = parsed(pattern, false);
+        let lowered = lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("failed to lower {pattern:?}: {error}"));
+        assert_eq!(
+            lowered.plan().edge_kinds.as_slice(),
+            &[expected],
+            "{pattern:?}"
+        );
+        assert_eq!(lowered.stats().states(), 2, "{pattern:?}");
+        assert_eq!(lowered.stats().edges(), 1, "{pattern:?}");
+    }
 }
 
 #[test]
@@ -137,6 +187,63 @@ fn anchors_retain_original_haystack_context_for_ranged_search() {
 }
 
 #[test]
+fn lf_and_ascii_word_assertions_retain_original_haystack_context() {
+    assert_eq!(
+        find_window("(?m:^a)", b"\na", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(find_window("(?m:^a)", b"xa", SearchWindow::new(1, 2)), None);
+    assert_eq!(
+        find_window("(?m:a$)", b"a\n", SearchWindow::new(0, 1)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        find_window(r"\ba", b"-a", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"\Ba", b"aa", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"\b{start}a", b"-a", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"a\b{end}", b"a-", SearchWindow::new(0, 1)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        find_window(r"\b{start-half}-", b"--", SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"-\b{end-half}", b"--", SearchWindow::new(0, 1)),
+        Some((0, 1))
+    );
+
+    // Invalid bytes are ordinary non-word bytes, never surrogate Unicode
+    // scalars. Across leading and trailing assertions, context on either side
+    // of the requested range is visible while consumption remains inside it.
+    assert_eq!(
+        find_window(r"\b\xFF", &[b'a', 0xFF], SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"\B\xFF", &[b'-', 0xFF], SearchWindow::new(1, 2)),
+        Some((1, 2))
+    );
+    assert_eq!(
+        find_window(r"\xFF\b", &[0xFF, b'a'], SearchWindow::new(0, 1)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        find_window(r"\xFF\B", &[0xFF, b'-'], SearchWindow::new(0, 1)),
+        Some((0, 1))
+    );
+}
+
+#[test]
 fn unsupported_semantics_are_never_silently_approximated() {
     let unicode = parsed("[α-ω]", true);
     assert!(matches!(
@@ -148,15 +255,27 @@ fn unsupported_semantics_are_never_silently_approximated() {
         Err(LowerError::Unsupported(UnsupportedFeature::UnicodeClass))
     ));
 
-    let multiline = parsed("(?m:^a)", false);
+    let crlf = parsed("(?mR:$)", false);
     assert!(matches!(
         lower_raw(
-            &multiline,
+            &crlf,
             OperationSemantics::CaptureFree,
             LowerLimits::default()
         ),
         Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            _
+            Look::EndCRLF
+        )))
+    ));
+
+    let unicode_word = parsed(r"\b", true);
+    assert!(matches!(
+        lower_raw(
+            &unicode_word,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default()
+        ),
+        Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
+            Look::WordUnicode
         )))
     ));
 
@@ -374,6 +493,14 @@ fn supported_subset_matches_pinned_rebar_regex_baseline() {
         "^a*$",
         "(?:ab)?c",
         "(ab|a)+",
+        r"(?m:^)",
+        r"(?m:$)",
+        r"\b",
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        r"\b{start-half}",
+        r"\b{end-half}",
     ];
 
     let haystacks = words(6);

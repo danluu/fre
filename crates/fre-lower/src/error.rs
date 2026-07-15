@@ -34,7 +34,7 @@ impl fmt::Display for LowerResource {
 pub enum UnsupportedFeature {
     /// A Unicode scalar class requires a variable-width UTF-8 lowering.
     UnicodeClass,
-    /// Only whole-haystack start and end assertions are currently represented.
+    /// CRLF-aware and Unicode look assertions are not represented.
     LookAssertion(Look),
     /// K0 has no capture-preserving output path yet.
     CaptureSensitiveOperation,
@@ -51,7 +51,7 @@ impl fmt::Display for UnsupportedFeature {
             Self::LookAssertion(look) => {
                 write!(
                     f,
-                    "look assertion {look:?} (only Start and End are implemented)"
+                    "look assertion {look:?} (CRLF and Unicode look assertions are not implemented)"
                 )
             }
             Self::CaptureSensitiveOperation => {

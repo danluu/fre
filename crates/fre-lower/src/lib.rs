@@ -3,9 +3,15 @@
 //! This crate is intentionally a narrow integration layer. It supports only
 //! expressions whose HIR already has an exact one-byte transition model:
 //! empty expressions, byte literals and byte classes, concatenation, ordered
-//! alternation, greedy or lazy repetition, and whole-haystack start/end
-//! assertions. Unicode scalar classes, line/word assertions, and
-//! capture-sensitive operations are rejected explicitly.
+//! alternation, greedy or lazy repetition, whole-haystack start/end assertions,
+//! LF line assertions, and ASCII word assertions. Unicode scalar classes,
+//! CRLF/Unicode-word assertions, and capture-sensitive operations are rejected
+//! explicitly.
+//!
+//! `RustParsed` does not retain a high-level regex builder's separately
+//! configured runtime line byte. This layer therefore implements the literal
+//! LF semantics named by `StartLF`/`EndLF`; profile-aware callers must refuse
+//! or carry any non-LF runtime configuration before lowering.
 //!
 //! Construction is iterative. HIR traversal, repetition expansion, graph
 //! patching, and final table construction use explicit, quota-checked work
