@@ -2815,6 +2815,35 @@ mod tests {
     }
 
     #[test]
+    fn triple_plan_target_lengths_and_long_boundary_have_exact_calls() {
+        let plan = plan(ByteClass::from_bytes(b"ace"), b"Z", false);
+        for (length, positive_calls, absent_calls) in
+            [(56_usize, 0_usize, 1_usize), (64, 0, 1), (65, 1, 2)]
+        {
+            let mut positive: Vec<u8> = b"ace".iter().copied().cycle().take(length).collect();
+            positive[length - 1] = b'Z';
+            let (span, accounting) = plan.find(&positive, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, Some((0, length)), "positive length={length}");
+            assert_eq!(
+                accounting.prefilter_calls, positive_calls,
+                "positive length={length}"
+            );
+            assert_eq!(accounting.prefix_bytes_examined, length);
+            assert!(accounting.suffix_confirmation_attempted);
+
+            let absent: Vec<u8> = b"ace".iter().copied().cycle().take(length).collect();
+            let (span, accounting) = plan.find(&absent, SearchLimits::unlimited()).unwrap();
+            assert_eq!(span, None, "absence length={length}");
+            assert_eq!(
+                accounting.prefilter_calls, absent_calls,
+                "absence length={length}"
+            );
+            assert_eq!(accounting.prefix_bytes_examined, 1);
+            assert!(!accounting.suffix_confirmation_attempted);
+        }
+    }
+
+    #[test]
     fn asymmetric_witness_partitions_and_call_counts_are_exact() {
         for (candidate, expected_calls) in [
             (0_usize, 0_usize),
