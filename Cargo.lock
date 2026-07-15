@@ -146,6 +146,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-exact-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "fre-holdout"
 version = "0.1.0"
 dependencies = [
@@ -159,10 +163,6 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
-
-[[package]]
-name = "fre-exact-alloc"
-version = "0.1.0"
 
 [[package]]
 name = "fre-iterator-lab"
