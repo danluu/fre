@@ -185,7 +185,6 @@ impl HistoryRegex {
                 pc: self.program.start,
                 history: None,
             },
-            haystack,
             pos,
             window,
             &mut counters,
@@ -230,7 +229,6 @@ impl HistoryRegex {
                             pc: *target,
                             history: thread.history,
                         },
-                        haystack,
                         next_pos,
                         window,
                         &mut counters,
@@ -515,7 +513,6 @@ impl HistoryRegex {
                         pc: self.program.start,
                         history: None,
                     },
-                    haystack,
                     pos,
                     window,
                     &mut counters,
@@ -573,7 +570,6 @@ impl HistoryRegex {
                             pc: *target,
                             history: thread.history,
                         },
-                        haystack,
                         next_pos,
                         window,
                         &mut counters,
@@ -630,7 +626,6 @@ fn add_thread(
     histories: &mut HistoryArena,
     generation: usize,
     initial: Thread,
-    haystack: &[u8],
     pos: usize,
     window: Window,
     counters: &mut Counters,
@@ -673,19 +668,6 @@ fn add_thread(
                     stack.push(thread);
                 }
             }
-            State::AssertAsciiWord { look, next } => {
-                let before = pos
-                    .checked_sub(1)
-                    .filter(|&index| index >= window.start)
-                    .and_then(|index| haystack.get(index))
-                    .is_some_and(|byte| is_ascii_word(*byte));
-                let after =
-                    pos < window.end && haystack.get(pos).is_some_and(|byte| is_ascii_word(*byte));
-                if look.matches(before, after) {
-                    thread.pc = *next;
-                    stack.push(thread);
-                }
-            }
             State::Save { slot, next } => {
                 let id = histories.push(HistoryNode {
                     slot: *slot,
@@ -708,10 +690,6 @@ fn add_thread(
     }
     counters.peak_threads = counters.peak_threads.max(output.len());
     Ok(())
-}
-
-const fn is_ascii_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn materialize(

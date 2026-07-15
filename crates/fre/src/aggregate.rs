@@ -133,11 +133,6 @@ pub enum AggregateUnicodeScalarSemantics {
     UnicodeOnRootClassOneOrMoreGreedyUtf8False,
     /// The same proof for lazy `CLASS+?`, which emits one scalar per match.
     UnicodeOnRootClassOneOrMoreLazyUtf8False,
-    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to a
-    /// canonical scalar class under one non-nullable counted or
-    /// lower-bounded repetition. Bounds remain symbolic in the direct
-    /// deterministic reducer.
-    UnicodeOnRootClassRepeatedUtf8False,
 }
 
 /// Facade identity for the construction-selected direct scalar reducer.
@@ -986,24 +981,6 @@ impl AggregateBuilder {
                             limits.unicode_scalar,
                         )
                     }
-                    UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated(
-                            ranges(),
-                            minimum,
-                            maximum,
-                            true,
-                            limits.unicode_scalar,
-                        )
-                    }
-                    UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated(
-                            ranges(),
-                            minimum,
-                            maximum,
-                            false,
-                            limits.unicode_scalar,
-                        )
-                    }
                 }
                 .map_err(|source| AggregateBuildError::UnicodeScalarBuild {
                     operation,
@@ -1051,10 +1028,6 @@ impl AggregateBuilder {
                                 }
                                 UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
                                     AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
-                                }
-                                UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
-                                | UnicodeScalarAggregateRepetition::RepeatedLazy { .. } => {
-                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
                                 }
                             },
                             kernel,
@@ -1605,16 +1578,13 @@ fn inspect_unicode_scalar_class(
                     .ok_or(UnicodeScalarInspectionError::Overflow)?;
                 hir = capture.sub.as_ref();
             }
-            HirKind::Repetition(repeated) if !saw_repetition && repeated.min > 0 => {
-                repetition = match (repeated.min, repeated.max, repeated.greedy) {
-                    (1, None, true) => UnicodeScalarAggregateRepetition::OneOrMoreGreedy,
-                    (1, None, false) => UnicodeScalarAggregateRepetition::OneOrMoreLazy,
-                    (minimum, maximum, true) => {
-                        UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum }
-                    }
-                    (minimum, maximum, false) => {
-                        UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum }
-                    }
+            HirKind::Repetition(repeated)
+                if !saw_repetition && repeated.min == 1 && repeated.max.is_none() =>
+            {
+                repetition = if repeated.greedy {
+                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy
+                } else {
+                    UnicodeScalarAggregateRepetition::OneOrMoreLazy
                 };
                 saw_repetition = true;
                 hir = repeated.sub.as_ref();

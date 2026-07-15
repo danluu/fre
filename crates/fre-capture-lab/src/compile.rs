@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::mem::size_of;
 
-use crate::ast::{AsciiWordLook, Ast, Greed};
+use crate::ast::{Ast, Greed};
 use crate::error::{BuildError, ResourceKind};
 use crate::limits::BuildLimits;
 use crate::profile::CaptureProfile;
@@ -42,7 +42,6 @@ pub(crate) enum State {
     Save { slot: usize, next: usize },
     AssertStart { next: usize },
     AssertEnd { next: usize },
-    AssertAsciiWord { look: AsciiWordLook, next: usize },
     Epsilon { next: usize },
     Match,
     Fail,
@@ -197,7 +196,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
             .checked_add(1)
             .ok_or(BuildError::BoundOverflow(ResourceKind::AstDepth))?;
         match node {
-            Ast::Empty | Ast::Byte(_) | Ast::Start | Ast::End | Ast::AsciiWordLook(_) => {}
+            Ast::Empty | Ast::Byte(_) | Ast::Start | Ast::End => {}
             Ast::Class(ranges) => validate_ranges(ranges)?,
             Ast::Concat(children) | Ast::Alt(children) => {
                 stack
@@ -493,7 +492,6 @@ impl Compiler {
             }
             Ast::Start => self.assert_start(),
             Ast::End => self.assert_end(),
-            Ast::AsciiWordLook(look) => self.assert_ascii_word(*look),
             Ast::Concat(children) => self.concat(children),
             Ast::Alt(children) => self.alt(children),
             Ast::Repeat {
@@ -543,14 +541,6 @@ impl Compiler {
 
     fn assert_end(&mut self) -> Result<Fragment, BuildError> {
         let id = self.add_state(State::AssertEnd { next: UNSET })?;
-        Ok(Fragment {
-            start: id,
-            outs: self.one_out(Patch::Next(id))?,
-        })
-    }
-
-    fn assert_ascii_word(&mut self, look: AsciiWordLook) -> Result<Fragment, BuildError> {
-        let id = self.add_state(State::AssertAsciiWord { look, next: UNSET })?;
         Ok(Fragment {
             start: id,
             outs: self.one_out(Patch::Next(id))?,
@@ -769,7 +759,7 @@ impl Compiler {
     fn nullable(&mut self, ast: &Ast) -> Result<bool, BuildError> {
         self.tick()?;
         match ast {
-            Ast::Empty | Ast::Start | Ast::End | Ast::AsciiWordLook(_) => Ok(true),
+            Ast::Empty | Ast::Start | Ast::End => Ok(true),
             Ast::Byte(_) | Ast::Class(_) => Ok(false),
             Ast::Capture { child, .. } => self.nullable(child),
             Ast::Repeat { child, min, .. } => {
@@ -820,7 +810,6 @@ impl Compiler {
                 | State::Save { next, .. }
                 | State::AssertStart { next }
                 | State::AssertEnd { next }
-                | State::AssertAsciiWord { next, .. }
                 | State::Epsilon { next },
             ) => *next = target,
             (Patch::SplitFirst(_), State::Split { first, .. }) => *first = target,
