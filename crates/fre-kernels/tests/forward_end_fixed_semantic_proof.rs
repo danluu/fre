@@ -6,7 +6,7 @@ use fre_kernels::{
     ForwardAnchoredSearchLimits, ForwardClassImplementation, Window,
 };
 
-const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1";
+const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
 
 fn plan(class: &[u8], suffix: &[u8]) -> CandidatePlan {
     CandidatePlan::build(
@@ -34,21 +34,49 @@ fn assert_zero(accounting: fre_kernels::ForwardAnchoredSearchAccounting) {
 }
 
 #[test]
-fn red_fixed_identity_leaf_and_exact_n_accounting() {
+fn red_fixed_identity_specialized_leaf_and_n_m_p_accounting() {
     assert_ne!(FORWARD_ANCHORED_PLAN_ID, FIXED_ID);
-    for class in [
-        b"a".as_slice(),
-        b"ab".as_slice(),
-        b"ace".as_slice(),
-        b"aceg".as_slice(),
-        b"abcdefgh".as_slice(),
+    for (class, expected) in [
+        (
+            b"a".as_slice(),
+            ForwardClassImplementation::InclusiveRange {
+                start: b'a',
+                end: b'a',
+            },
+        ),
+        (
+            b"ac".as_slice(),
+            ForwardClassImplementation::Pair {
+                first: b'a',
+                second: b'c',
+            },
+        ),
+        (
+            b"ace".as_slice(),
+            ForwardClassImplementation::Triple {
+                first: b'a',
+                second: b'c',
+                third: b'e',
+            },
+        ),
+        (
+            b"aceg".as_slice(),
+            ForwardClassImplementation::Quad {
+                first: b'a',
+                second: b'c',
+                third: b'e',
+                fourth: b'g',
+            },
+        ),
+        (
+            b"acegi".as_slice(),
+            ForwardClassImplementation::Bitset,
+        ),
     ] {
         let candidate = plan(class, b"ZQ");
         assert_eq!(candidate.plan_id(), FIXED_ID);
-        assert_eq!(
-            candidate.implementation(),
-            ForwardClassImplementation::Bitset
-        );
+        assert_eq!(candidate.implementation(), expected);
+        assert_eq!(candidate.build_accounting().implementation, expected);
 
         let haystack = [class[0], class[0], b'Z', b'Q'];
         let (matched, accounting) = candidate
@@ -68,6 +96,52 @@ fn red_fixed_identity_leaf_and_exact_n_accounting() {
         assert_eq!(accounting.prefix_bytes_examined, 2);
         assert!(accounting.suffix_confirmation_attempted);
     }
+}
+
+#[test]
+fn red_specialized_fixed_prefix_retains_first_outsider_and_conservative_block_bound() {
+    let candidate = plan(b"az", b"ZQ");
+    assert_eq!(
+        candidate.implementation(),
+        ForwardClassImplementation::Pair {
+            first: b'a',
+            second: b'z',
+        }
+    );
+    let prefix_len = 65_usize;
+    let suffix_len = candidate.suffix().len();
+    let mut haystack: Vec<u8> = (0..prefix_len)
+        .map(|index| if index % 2 == 0 { b'a' } else { b'z' })
+        .collect();
+    haystack.extend_from_slice(candidate.suffix());
+
+    let (_, valid) = candidate
+        .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(valid.prefix_bytes_upper_bound, prefix_len + 32);
+    assert_eq!(valid.suffix_bytes_upper_bound, suffix_len);
+    assert_eq!(
+        valid.examined_bytes_upper_bound,
+        prefix_len + 32 + suffix_len
+    );
+    assert_eq!(valid.prefix_bytes_examined, prefix_len);
+    assert_eq!(valid.prefilter_calls, 0);
+
+    haystack[33] = b'!';
+    let (matched, outsider) = candidate
+        .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(matched, None);
+    assert_eq!(outsider.prefix_bytes_examined, 66);
+    assert!(outsider.suffix_confirmation_attempted);
+
+    haystack[prefix_len] ^= 1;
+    let (matched, mismatch) = candidate
+        .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(matched, None);
+    assert_eq!(mismatch.prefix_bytes_examined, 0);
+    assert!(mismatch.suffix_confirmation_attempted);
 }
 
 #[test]

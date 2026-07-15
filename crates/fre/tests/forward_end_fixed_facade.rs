@@ -6,7 +6,7 @@ use fre::{
 };
 use std::fmt::Write as _;
 
-const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1";
+const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2";
 const ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
 
 fn forced(pattern: &str) -> fre::PortableRegex {
@@ -100,7 +100,12 @@ fn red_build_report_runtime_and_cache_identity_all_come_from_fixed_plan() {
     assert_eq!(regex.runtime_implementation_id(), FIXED_ID);
     assert_eq!(
         build.implementation,
-        fre_kernels::ForwardClassImplementation::Bitset
+        fre_kernels::ForwardClassImplementation::Quad {
+            first: b'a',
+            second: b'c',
+            third: b'e',
+            fourth: b'g',
+        }
     );
 
     let limits = SearchLimits {
@@ -120,7 +125,12 @@ fn red_build_report_runtime_and_cache_identity_all_come_from_fixed_plan() {
     assert_eq!(identity.suffix, b"ZQ");
     assert_eq!(
         identity.implementation,
-        fre_kernels::ForwardClassImplementation::Bitset
+        fre_kernels::ForwardClassImplementation::Quad {
+            first: b'a',
+            second: b'c',
+            third: b'e',
+            fourth: b'g',
+        }
     );
     assert_eq!(identity.build_limits, BuildLimits::default());
     assert_eq!(identity.search_limits, limits);

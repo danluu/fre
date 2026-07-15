@@ -386,7 +386,7 @@ mod tests {
         for (pattern, expected) in [
             (
                 r"\A[a-z]+Z\z",
-                "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1",
+                "anchored-class-suffix.absolute-end-fixed-suffix-first-hybrid.v2",
             ),
             (
                 r"\A[a-z]+Z",
