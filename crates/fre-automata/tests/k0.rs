@@ -116,6 +116,8 @@ fn assertion_at(kind: EdgeKind, haystack: &[u8], at: usize) -> bool {
         .is_some()
 }
 
+type UnicodeBoundaryCase<'a> = (&'a [u8], &'a [(usize, bool)]);
+
 fn literal(bytes: &[u8]) -> Automaton {
     let mut states = Vec::with_capacity(bytes.len().saturating_add(1));
     for (index, &byte) in bytes.iter().enumerate() {
@@ -296,7 +298,7 @@ fn anchors_use_original_haystack_context() {
 #[test]
 fn positive_unicode_word_boundary_is_scalar_exact_on_arbitrary_bytes() {
     let kind = EdgeKind::AssertWordUnicode;
-    let cases: &[(&[u8], &[(usize, bool)])] = &[
+    let cases: &[UnicodeBoundaryCase<'_>] = &[
         (b"", &[(0, false)]),
         ("α".as_bytes(), &[(0, true), (1, false), (2, true)]),
         (
