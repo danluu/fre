@@ -74,6 +74,8 @@ pub use fre_kernels::{
     OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
     UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceAccounting,
