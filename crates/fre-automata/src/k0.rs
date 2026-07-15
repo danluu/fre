@@ -777,10 +777,10 @@ fn decode_last_utf8(bytes: &[u8]) -> Option<char> {
     let lower = bytes.len().saturating_sub(4);
     let mut start = last;
     while start > lower && matches!(bytes[start], 0x80..=0xBF) {
-        start -= 1;
+        start = start.checked_sub(1)?;
     }
     let decoded = decode_utf8(&bytes[start..])?;
-    (start + decoded.len_utf8() == bytes.len()).then_some(decoded)
+    (start.checked_add(decoded.len_utf8()) == Some(bytes.len())).then_some(decoded)
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
