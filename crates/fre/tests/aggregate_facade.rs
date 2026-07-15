@@ -7,6 +7,7 @@ use fre::{
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
     PortableBuilder, RustProfile, SearchLimits,
 };
+use regex_syntax::hir::Look;
 
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -283,13 +284,33 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
 }
 
 #[test]
-fn unicode_word_assertions_remain_outside_the_byte_continuation_contract() {
+fn unicode_word_and_crlf_assertions_remain_typed_refusals() {
     assert!(matches!(
         aggregate_builder(r"\b")
             .unicode(true)
             .plan_selection(AggregatePlanSelection::ForceContinuation)
             .build_count(),
-        Err(AggregateBuildError::UnicodeEnabled { .. })
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::Look(
+                Look::WordUnicode,
+            )),
+            ..
+        })
+    ));
+
+    let mut crlf_profile = RustProfile::regex_1_12_4();
+    crlf_profile.options.crlf = true;
+    assert!(matches!(
+        AggregateBuilder::new(r"(?m:^)")
+            .profile(crlf_profile)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count(),
+        Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::Look(
+                Look::StartCRLF,
+            )),
+            ..
+        })
     ));
 }
 
