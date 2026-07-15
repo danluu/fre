@@ -30,6 +30,7 @@ pub use aggregate::{
     AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateSpanIter, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
+    AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
@@ -56,6 +57,11 @@ pub use fre_kernels::{
     OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceAccounting,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
 };
 
 use fre_automata::{Automaton, Exists, SelectedEnd, Span};

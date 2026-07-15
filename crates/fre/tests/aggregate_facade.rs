@@ -3,9 +3,10 @@ use fre::{
     AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateLiteralIneligibility,
     AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
-    AggregateResource, AggregateRunLimits, AggregateStrategy, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
-    PortableBuilder, RustProfile, SearchLimits,
+    AggregateResource, AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
 use regex_syntax::hir::Look;
 
@@ -210,6 +211,9 @@ fn continuation_details(
             accounting,
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_) => {
+            panic!("expected continuation execution details")
+        }
+        AggregateExecutionDetails::UnicodeScalar(_) => {
             panic!("expected continuation execution details")
         }
     }
@@ -939,9 +943,211 @@ fn unicode_singleton_case_folds_use_byte_stable_continuation() {
             .value(),
         3
     );
+    let broad_folded_property = aggregate_builder(r"(?i:\pL)").build_count().unwrap();
+    assert_eq!(
+        broad_folded_property.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert_eq!(
+        broad_folded_property
+            .count_value("A雪1".as_bytes(), AggregateRunLimits::default())
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify() {
+    let cases: [(&str, &[u8], bool); 8] = [
+        (".", b"a\n\xFF\xE9\x9B\xAA\x80", false),
+        ("(?s:.)", b"a\n\xFF\xE9\x9B\xAA\x80", false),
+        (r"\pL", "A雪1δ Ж".as_bytes(), false),
+        (r"\p{Greek}", "Aαδ雪Ω".as_bytes(), false),
+        (r"\p{Sm}", "a+×÷雪".as_bytes(), false),
+        (r"\d", "1१雪".as_bytes(), false),
+        (r"\s", "a\u{2003}\t雪".as_bytes(), false),
+        (r"\w", "a\u{203F}\u{0301}雪!".as_bytes(), false),
+    ];
+    for (pattern, haystack, case_insensitive) in cases {
+        let expected = upstream_profile(pattern, haystack, case_insensitive, true);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+
+        let count = aggregate_builder(pattern)
+            .case_insensitive(case_insensitive)
+            .build_count()
+            .unwrap_or_else(|error| panic!("count build {pattern:?}: {error}"));
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass
+        );
+        assert_eq!(count.build_report().continuation_strategy, None);
+        assert_eq!(count.build_report().unicode_scalar_planner_work, 1);
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.semantics
+                    == AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
+                    && identity.kernel.operation == UnicodeScalarAggregateOperation::Count
+        ));
+        let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
+            panic!("root scalar class selected another build family")
+        };
+        assert!(build.source_ranges > 0);
+        assert!(build.retained_non_ascii_ranges > 0);
+        assert_eq!(
+            build.persistent_bytes,
+            count.build_report().retained_capacity_bytes
+        );
+
+        let counted = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
+        assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
+        let AggregateExecutionDetails::UnicodeScalar(accounting) = &counted.report().details else {
+            panic!("root scalar count executed another family")
+        };
+        assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
+        assert_eq!(accounting.actual.scratch_bytes, 0);
+        assert!(accounting.actual.work <= accounting.upper_bounds.work);
+        assert_eq!(
+            accounting.actual.valid_scalars + accounting.actual.invalid_bytes,
+            accounting.actual.ascii_bitmap_tests
+                + accounting.actual.non_ascii_membership_tests
+                + accounting.actual.invalid_bytes
+        );
+
+        let sum = aggregate_builder(pattern)
+            .case_insensitive(case_insensitive)
+            .build_span_sum()
+            .unwrap_or_else(|error| panic!("sum build {pattern:?}: {error}"));
+        assert!(matches!(
+            sum.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.kernel.operation == UnicodeScalarAggregateOperation::SpanSum
+        ));
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("sum run {pattern:?}: {error}")),
+            expected_sum,
+            "pattern={pattern:?}"
+        );
+
+        let compiled = aggregate_builder(pattern)
+            .case_insensitive(case_insensitive)
+            .build_compile()
+            .unwrap_or_else(|error| panic!("compile build {pattern:?}: {error}"));
+        assert_eq!(
+            compiled.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass
+        );
+        assert_eq!(
+            compiled
+                .verify_count(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("compile verify {pattern:?}: {error}"))
+                .value(),
+            expected_count
+        );
+    }
+}
+
+#[test]
+fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
+    let pattern = r"(?P<scalar>\pL)";
+    let haystack = "A雪1δ".as_bytes();
+    let regex = aggregate_builder(pattern).build_count().unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert_eq!(regex.build_report().captures_erased, 1);
+    assert_eq!(regex.build_report().capture_erasure_work, 1);
+    assert_eq!(regex.build_report().unicode_scalar_planner_work, 2);
+    assert_eq!(
+        regex
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        3
+    );
+
+    let mut build_limits = AggregateBuildLimits::default();
+    build_limits.max_unicode_scalar_planner_work = 1;
     assert!(matches!(
-        aggregate_builder(r"(?i:\pL)").build_count(),
+        aggregate_builder(pattern)
+            .limits(build_limits)
+            .build_count(),
+        Err(AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+            needed: 2,
+            limit: 1,
+            ..
+        })
+    ));
+
+    let audited = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::UnicodeScalar(accounting) = &audited.report().details else {
+        panic!("root scalar class executed another plan")
+    };
+    assert!(accounting.upper_bounds.range_comparisons > 0);
+    let mut run_limits = AggregateRunLimits::default();
+    run_limits.unicode_scalar.max_range_comparisons = accounting.upper_bounds.range_comparisons - 1;
+    let error = regex.count(haystack, run_limits).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::UnicodeScalar(
+            UnicodeScalarAggregateReduceError::RangeComparisonsLimit { .. }
+        )
+    ));
+    assert_eq!(error.identity.plan, AggregatePlanKind::UnicodeScalarClass);
+}
+
+#[test]
+fn unicode_scalar_selection_rejects_composition_and_preserves_existing_paths() {
+    assert_eq!(
+        aggregate_builder("雪")
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ExactLiteral
+    );
+    for pattern in [r"[a-z]", r"(?i:k)"] {
+        assert_eq!(
+            aggregate_builder(pattern)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram,
+            "pattern={pattern:?}"
+        );
+    }
+    for pattern in [r"\pL+", r"\A\pL", r"\pL\z"] {
+        assert!(matches!(
+            aggregate_builder(pattern).build_count(),
+            Err(AggregateBuildError::ContinuationCompile {
+                source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
+                ..
+            })
+        ));
+    }
+    assert!(matches!(
+        aggregate_builder(r"\pL")
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count(),
         Err(AggregateBuildError::ContinuationCompile {
+            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
+            ..
+        })
+    ));
+    assert!(matches!(
+        aggregate_builder(r"\pL").build_spans(),
+        Err(AggregateBuildError::ContinuationCompile {
+            operation: AggregateOperation::Spans,
             source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::UnicodeClass),
             ..
         })

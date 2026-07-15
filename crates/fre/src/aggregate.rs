@@ -8,13 +8,18 @@ use fre_kernels::{
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumResult,
+    LiteralAggregateSpanSumResult, UnicodeScalarAggregateBuildAccounting,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
+    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
+    UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
 
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
@@ -25,7 +30,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 5;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 6;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -59,6 +64,9 @@ pub enum AggregatePlanSelection {
 pub enum AggregatePlanKind {
     /// SIMD-aware `memmem::Finder::find_iter` whole-operation reducer.
     ExactLiteral,
+    /// Direct single-scalar Unicode class stream over compact canonical
+    /// ranges. This is not the continuation state engine.
+    UnicodeScalarClass,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -68,6 +76,8 @@ pub enum AggregatePlanKind {
 pub enum AggregatePlanIdentity {
     /// Exact-literal plan plus count/span-sum operation identity.
     ExactLiteral(AggregateExactLiteralIdentity),
+    /// Root Unicode scalar-class proof plus native reducer identity.
+    UnicodeScalar(AggregateUnicodeScalarIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
 }
@@ -91,6 +101,21 @@ pub struct AggregateExactLiteralIdentity {
     pub semantics: AggregateExactLiteralSemantics,
     /// Native kernel and operation identity.
     pub kernel: LiteralAggregateOperationIdentity,
+}
+
+/// Profile and HIR-shape proof attached to the direct scalar reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateUnicodeScalarSemantics {
+    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to one
+    /// canonical nonempty root scalar class after transparent captures.
+    UnicodeOnRootClassUtf8False,
+}
+
+/// Facade identity for the construction-selected direct scalar reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateUnicodeScalarIdentity {
+    pub semantics: AggregateUnicodeScalarSemantics,
+    pub kernel: UnicodeScalarAggregateOperationIdentity,
 }
 
 /// Profile proof attached to a continuation-program facade identity.
@@ -128,6 +153,8 @@ pub enum AggregateCaptureSemantics {
 pub enum AggregateBuildAccounting {
     /// Exact-literal kernel construction certificate.
     ExactLiteral(LiteralAggregateBuildAccounting),
+    /// Compact scalar-range plan construction certificate.
+    UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
 }
@@ -141,8 +168,12 @@ pub struct AggregateBuildLimits {
     pub syntax_safety: SafetyEnvelope,
     /// Maximum allocation-free direct-root literal inspection work.
     pub max_literal_planner_work: usize,
+    /// Maximum allocation-free root scalar-class inspection work.
+    pub max_unicode_scalar_planner_work: usize,
     /// Complete exact-literal kernel construction limits.
     pub exact_literal: LiteralAggregateBuildLimits,
+    /// Complete compact scalar-range construction limits.
+    pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
     pub continuation: AggregateCompileLimits,
 }
@@ -153,7 +184,9 @@ impl Default for AggregateBuildLimits {
             admission: AdmissionPolicy::default(),
             syntax_safety: SafetyEnvelope::default(),
             max_literal_planner_work: 4_096,
+            max_unicode_scalar_planner_work: 4_096,
             exact_literal: LiteralAggregateBuildLimits::default(),
+            unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
     }
@@ -165,6 +198,8 @@ impl Default for AggregateBuildLimits {
 pub struct AggregateRunLimits {
     /// Exact-literal whole-operation reducer limits.
     pub exact_literal: LiteralAggregateReduceLimits,
+    /// Direct Unicode scalar-stream limits.
+    pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Continuation whole-operation limits.
     pub continuation: AggregateOperationLimits,
 }
@@ -194,6 +229,8 @@ pub struct AggregateBuildReport {
     /// Direct-root exact-literal inspection work. This is zero when forced
     /// continuation skips inspection.
     pub planner_work: usize,
+    /// Root Unicode scalar-class inspection work, zero outside that plan.
+    pub unicode_scalar_planner_work: usize,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
     /// Capture annotations removed without changing whole-match semantics.
@@ -259,6 +296,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Allocation-free root scalar-class inspection crossed its work cap.
+    UnicodeScalarPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// A forced exact-literal request was not semantically eligible.
     ExactLiteralIneligible {
         operation: AggregateOperation,
@@ -270,6 +314,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: LiteralAggregateBuildError,
+    },
+    /// Compact Unicode scalar-class construction failed after selection.
+    UnicodeScalarBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: UnicodeScalarAggregateBuildError,
     },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
@@ -306,6 +356,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} exact-literal inspection needs {needed} work units, limit is {limit}"
             ),
+            Self::UnicodeScalarPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} work units, limit is {limit}"
+            ),
             Self::ExactLiteralIneligible {
                 operation,
                 selection,
@@ -321,6 +380,14 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} exact-literal construction failed: {source}"
+            ),
+            Self::UnicodeScalarBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} Unicode scalar construction failed: {source}"
             ),
             Self::ContinuationCompile {
                 operation,
@@ -348,8 +415,10 @@ impl std::error::Error for AggregateBuildError {
         match self {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
+            Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
+            | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::ExactLiteralIneligible { .. }
             | Self::InternalInvariant { .. } => None,
         }
@@ -361,6 +430,8 @@ impl std::error::Error for AggregateBuildError {
 pub enum AggregateExecutionSource {
     /// Exact-literal whole-operation refusal.
     ExactLiteral(LiteralAggregateReduceError),
+    /// Direct Unicode scalar-stream refusal.
+    UnicodeScalar(UnicodeScalarAggregateReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -371,6 +442,7 @@ impl fmt::Display for AggregateExecutionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ExactLiteral(source) => source.fmt(f),
+            Self::UnicodeScalar(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -383,6 +455,7 @@ impl std::error::Error for AggregateExecutionSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ExactLiteral(source) => Some(source),
+            Self::UnicodeScalar(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
         }
@@ -420,6 +493,8 @@ impl std::error::Error for AggregateExecutionError {
 pub enum AggregateExecutionDetails {
     /// Exact-literal upper bounds, counters, and operation identity.
     ExactLiteral(LiteralAggregateReduceAccounting),
+    /// Direct scalar stream's complete bounds and structural counters.
+    UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -677,6 +752,7 @@ impl AggregateBuilder {
                 continuation_strategy: None,
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                 planner_work: work,
+                unicode_scalar_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
                 build: AggregateBuildAccounting::ExactLiteral(build),
@@ -709,6 +785,105 @@ impl AggregateBuilder {
                     detail: "eligible exact literal was not constructed",
                 });
             }
+        };
+
+        let scalar_inspection = if unicode
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                inspect_unicode_scalar_class(&rust.hir, limits.max_unicode_scalar_planner_work)
+                    .map_err(|error| match error {
+                        UnicodeScalarInspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        UnicodeScalarInspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "Unicode scalar inspection accounting overflow",
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let unicode_scalar_planner_work = match scalar_inspection {
+            Some(UnicodeScalarInspection::Eligible {
+                class,
+                work,
+                captures,
+            }) => {
+                if work != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from Unicode scalar inspection",
+                    });
+                }
+                let engine = UnicodeScalarAggregatePlan::build(
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    limits.unicode_scalar,
+                )
+                .map_err(|source| AggregateBuildError::UnicodeScalarBuild {
+                    operation,
+                    selection,
+                    source,
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected Unicode scalar reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::UnicodeScalarClass,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work: work,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::UnicodeScalar(build),
+                    plan_identity: AggregatePlanIdentity::UnicodeScalar(
+                        AggregateUnicodeScalarIdentity {
+                            semantics: AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False,
+                            kernel,
+                        },
+                    ),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::UnicodeScalar(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(UnicodeScalarInspection::Ineligible { work }) => work,
+            None => 0,
         };
         let continuation_profile = if unicode {
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
@@ -745,6 +920,7 @@ impl AggregateBuilder {
             continuation_strategy: Some(strategy),
             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
             planner_work,
+            unicode_scalar_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
             build: AggregateBuildAccounting::Continuation(compile),
@@ -769,6 +945,7 @@ impl AggregateBuilder {
 #[derive(Debug)]
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
+    UnicodeScalar(UnicodeScalarAggregatePlan),
     Continuation(CompiledRegex),
 }
 
@@ -841,6 +1018,12 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
                 }),
+            AggregateEngine::UnicodeScalar(engine) => engine
+                .count(haystack, limits.unicode_scalar)
+                .map(AggregateCountExecution::UnicodeScalar)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
+                }),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -885,6 +1068,12 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
                 }),
+            AggregateEngine::UnicodeScalar(engine) => engine
+                .span_sum(haystack, limits.unicode_scalar)
+                .map(AggregateSpanSumExecution::UnicodeScalar)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
+                }),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -920,6 +1109,7 @@ impl AggregatePlan {
 
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
+    UnicodeScalar(UnicodeScalarAggregateCountResult),
     Continuation { admitted: AdmittedCount, value: u64 },
 }
 
@@ -927,6 +1117,7 @@ impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.count,
+            Self::UnicodeScalar(result) => result.count,
             Self::Continuation { value, .. } => *value,
         }
     }
@@ -935,6 +1126,9 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => {
                 AggregateExecutionDetails::ExactLiteral(result.accounting)
+            }
+            Self::UnicodeScalar(result) => {
+                AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
@@ -946,6 +1140,7 @@ impl AggregateCountExecution {
 
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
+    UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
     Continuation {
         admitted: AdmittedSpanSum,
         value: u64,
@@ -956,6 +1151,7 @@ impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
+            Self::UnicodeScalar(result) => result.span_sum,
             Self::Continuation { value, .. } => *value,
         }
     }
@@ -964,6 +1160,9 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => {
                 AggregateExecutionDetails::ExactLiteral(result.accounting)
+            }
+            Self::UnicodeScalar(result) => {
+                AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
@@ -994,6 +1193,60 @@ enum LiteralInspectionMode {
 enum LiteralInspectionError {
     WorkLimit { needed: usize, limit: usize },
     Overflow,
+}
+
+enum UnicodeScalarInspection<'a> {
+    Eligible {
+        class: &'a ClassUnicode,
+        work: usize,
+        captures: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum UnicodeScalarInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+fn inspect_unicode_scalar_class(
+    mut hir: &Hir,
+    limit: usize,
+) -> Result<UnicodeScalarInspection<'_>, UnicodeScalarInspectionError> {
+    let mut work = 0_usize;
+    let mut captures = 0_usize;
+    loop {
+        let needed = work
+            .checked_add(1)
+            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+        if needed > limit {
+            return Err(UnicodeScalarInspectionError::WorkLimit { needed, limit });
+        }
+        work = needed;
+        match hir.kind() {
+            HirKind::Capture(capture) => {
+                captures = captures
+                    .checked_add(1)
+                    .ok_or(UnicodeScalarInspectionError::Overflow)?;
+                hir = capture.sub.as_ref();
+            }
+            HirKind::Class(Class::Unicode(class))
+                if class
+                    .ranges()
+                    .iter()
+                    .any(|range| !range.end().is_ascii() && range.start() != range.end()) =>
+            {
+                return Ok(UnicodeScalarInspection::Eligible {
+                    class,
+                    work,
+                    captures,
+                });
+            }
+            _ => return Ok(UnicodeScalarInspection::Ineligible { work }),
+        }
+    }
 }
 
 fn inspect_exact_literal(
