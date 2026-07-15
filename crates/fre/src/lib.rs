@@ -31,6 +31,7 @@ pub use aggregate::{
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
+    AggregateFiniteLiteralIdentity,
     AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateSpanIter, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,

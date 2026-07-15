@@ -211,7 +211,8 @@ fn continuation_details(
             accounting,
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_)
-        | AggregateExecutionDetails::UnicodeScalar(_) => {
+        | AggregateExecutionDetails::UnicodeScalar(_)
+        | AggregateExecutionDetails::FiniteLiteral { .. } => {
             panic!("expected continuation execution details")
         }
     }

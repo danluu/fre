@@ -9,6 +9,12 @@ use fre_kernels::{
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
     LiteralAggregateSpanSumResult, UnicodeScalarAggregateBuildAccounting,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
     UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
@@ -24,7 +30,7 @@ use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
     AggregateExecutionAccounting, AggregateOperationCertificate, AggregateOperationLimits,
-    AggregatePlanId, Match,
+    AggregatePlanId, BuildError, Match, finite,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
@@ -49,8 +55,8 @@ pub enum AggregateOperation {
 /// Construction-time aggregate plan policy.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregatePlanSelection {
-    /// Select an exact-literal plan when canonical HIR proves eligibility;
-    /// otherwise construct the continuation program.
+    /// Select an exact-literal, direct-Unicode, or finite-language plan when
+    /// canonical HIR proves eligibility; otherwise construct continuation.
     #[default]
     Auto,
     /// Require the direct canonical exact-literal proof.
@@ -67,6 +73,9 @@ pub enum AggregatePlanKind {
     /// Direct Unicode scalar class/run stream over compact canonical ranges.
     /// This is not the continuation state engine.
     UnicodeScalarClass,
+    /// Ordered finite HIR lowered to one reversed shared-transition DFA and a
+    /// bounded initial/progressed reducer ring.
+    FiniteLiteralDfa,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -78,8 +87,18 @@ pub enum AggregatePlanIdentity {
     ExactLiteral(AggregateExactLiteralIdentity),
     /// Root Unicode scalar-class proof plus native reducer identity.
     UnicodeScalar(AggregateUnicodeScalarIdentity),
+    /// Finite-language DFA identity; the syntax key retains exact source and
+    /// profile identity, including order, duplicates and arbitrary bytes.
+    FiniteLiteral(AggregateFiniteLiteralIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
+}
+
+/// Operation-specific identity for the shared finite-language reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFiniteLiteralIdentity {
+    pub algorithm: &'static str,
+    pub operation: &'static str,
 }
 
 /// Semantic proof attached to an exact-literal facade identity.
@@ -161,6 +180,8 @@ pub enum AggregateBuildAccounting {
     ExactLiteral(LiteralAggregateBuildAccounting),
     /// Compact scalar-range plan construction certificate.
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
+    /// Shared reversed DFA construction certificate.
+    FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
 }
@@ -178,10 +199,14 @@ pub struct AggregateBuildLimits {
     /// One unit is charged for every HIR node and canonical scalar range
     /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
+    /// Maximum checked work for finite-language shape analysis and expansion.
+    pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
     pub exact_literal: LiteralAggregateBuildLimits,
     /// Complete compact scalar-range construction limits.
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
+    /// Complete bounded reversed-DFA construction limits.
+    pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
     pub continuation: AggregateCompileLimits,
 }
@@ -193,8 +218,10 @@ impl Default for AggregateBuildLimits {
             syntax_safety: SafetyEnvelope::default(),
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
+            max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
+            finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
     }
@@ -208,6 +235,8 @@ pub struct AggregateRunLimits {
     pub exact_literal: LiteralAggregateReduceLimits,
     /// Direct Unicode scalar-stream limits.
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
+    /// Shared finite-language DFA reducer limits.
+    pub finite_literal: OrderedLiteralAggregateReduceLimits,
     /// Continuation whole-operation limits.
     pub continuation: AggregateOperationLimits,
 }
@@ -242,6 +271,8 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
+    /// Checked finite-language analysis/expansion work, or zero when skipped.
+    pub finite_planner_work: u64,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
     /// Capture annotations removed without changing whole-match semantics.
@@ -315,6 +346,20 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Finite-language extraction crossed its explicit work cap.
+    FinitePlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: u64,
+        limit: u64,
+    },
+    /// A checked finite-language planner allocation failed.
+    FinitePlannerAllocationFailed {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        structure: &'static str,
+        additional: usize,
+    },
     /// A forced exact-literal request was not semantically eligible.
     ExactLiteralIneligible {
         operation: AggregateOperation,
@@ -332,6 +377,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: UnicodeScalarAggregateBuildError,
+    },
+    /// Reversed finite-language DFA construction failed after selection.
+    FiniteLiteralBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: OrderedLiteralAggregateBuildError,
     },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
@@ -377,6 +428,24 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::FinitePlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} finite-language planning needs {needed} work units, limit is {limit}"
+            ),
+            Self::FinitePlannerAllocationFailed {
+                operation,
+                selection,
+                structure,
+                additional,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} failed to reserve {additional} entries for {structure}"
+            ),
             Self::ExactLiteralIneligible {
                 operation,
                 selection,
@@ -400,6 +469,14 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar construction failed: {source}"
+            ),
+            Self::FiniteLiteralBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} finite-language DFA construction failed: {source}"
             ),
             Self::ContinuationCompile {
                 operation,
@@ -428,9 +505,12 @@ impl std::error::Error for AggregateBuildError {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
+            Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
+            | Self::FinitePlannerWorkLimit { .. }
+            | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
             | Self::InternalInvariant { .. } => None,
         }
@@ -444,6 +524,8 @@ pub enum AggregateExecutionSource {
     ExactLiteral(LiteralAggregateReduceError),
     /// Direct Unicode scalar-stream refusal.
     UnicodeScalar(UnicodeScalarAggregateReduceError),
+    /// Shared finite-language DFA whole-operation refusal.
+    FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -455,6 +537,7 @@ impl fmt::Display for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
+            Self::FiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -468,6 +551,7 @@ impl std::error::Error for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
+            Self::FiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
         }
@@ -507,6 +591,12 @@ pub enum AggregateExecutionDetails {
     ExactLiteral(LiteralAggregateReduceAccounting),
     /// Direct scalar stream's complete bounds and structural counters.
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
+    /// Finite-language structural upper bounds and exact counters. The build
+    /// report and syntax key retain the immutable DFA and language identity.
+    FiniteLiteral {
+        upper_bounds: OrderedLiteralAggregateUpperBounds,
+        actual: OrderedLiteralAggregateActualCounters,
+    },
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -765,6 +855,7 @@ impl AggregateBuilder {
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
+                finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
                 build: AggregateBuildAccounting::ExactLiteral(build),
@@ -897,6 +988,7 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work: work,
+                    finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
                     build: AggregateBuildAccounting::UnicodeScalar(build),
@@ -927,6 +1019,122 @@ impl AggregateBuilder {
             Some(UnicodeScalarInspection::Ineligible { work }) => work,
             None => 0,
         };
+        let finite = if !unicode
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                finite::extract(
+                    &rust.hir,
+                    limits.finite_literal.max_patterns,
+                    limits.finite_literal.max_pattern_bytes,
+                    0,
+                    limits.max_finite_planner_work,
+                )
+                .map_err(|error| match error {
+                    BuildError::PlannerWorkLimit { needed, limit } => {
+                        AggregateBuildError::FinitePlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    BuildError::AllocationFailed {
+                        structure,
+                        additional,
+                    } => AggregateBuildError::FinitePlannerAllocationFailed {
+                        operation,
+                        selection,
+                        structure,
+                        additional,
+                    },
+                    _ => AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "finite-language planner returned an unrelated facade error",
+                    },
+                })?,
+            )
+        } else {
+            None
+        };
+        let finite_planner_work = finite.as_ref().map_or(0, |result| result.work);
+        if let Some(words) = finite.and_then(|result| result.words) {
+            let capture_erasure_work = expected_captures.checked_mul(2).ok_or(
+                AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "finite capture-erasure accounting overflow",
+                },
+            )?;
+            let (engine, build, operation_id) = match operation {
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    let engine = OrderedLiteralCountPlan::build(&words, limits.finite_literal)
+                        .map_err(|source| AggregateBuildError::FiniteLiteralBuild {
+                            operation,
+                            selection,
+                            source,
+                        })?;
+                    let build = engine.build_accounting();
+                    (
+                        AggregateEngine::FiniteCount(engine),
+                        build,
+                        ORDERED_LITERAL_COUNT_PLAN_ID,
+                    )
+                }
+                AggregateOperation::SpanSum => {
+                    let engine = OrderedLiteralSpanSumPlan::build(&words, limits.finite_literal)
+                        .map_err(|source| AggregateBuildError::FiniteLiteralBuild {
+                            operation,
+                            selection,
+                            source,
+                        })?;
+                    let build = engine.build_accounting();
+                    (
+                        AggregateEngine::FiniteSpanSum(engine),
+                        build,
+                        ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                    )
+                }
+                AggregateOperation::Spans => {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "span materialization selected finite reducer",
+                    });
+                }
+            };
+            let report = AggregateBuildReport {
+                schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                syntax_key,
+                admission,
+                syntax,
+                operation,
+                selection,
+                plan: AggregatePlanKind::FiniteLiteralDfa,
+                continuation_strategy: None,
+                capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                planner_work,
+                unicode_scalar_planner_work,
+                finite_planner_work,
+                capture_erasure_work,
+                captures_erased: expected_captures,
+                build: AggregateBuildAccounting::FiniteLiteral(build),
+                plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                    AggregateFiniteLiteralIdentity {
+                        algorithm: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                        operation: operation_id,
+                    },
+                ),
+                retained_capacity_bytes: build.persistent_bytes,
+            };
+            return Ok(AggregatePlan {
+                engine,
+                limits,
+                report,
+            });
+        }
         let continuation_profile = if unicode {
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
         } else {
@@ -963,6 +1171,7 @@ impl AggregateBuilder {
             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
             planner_work,
             unicode_scalar_planner_work,
+            finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
             build: AggregateBuildAccounting::Continuation(compile),
@@ -988,6 +1197,8 @@ impl AggregateBuilder {
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
+    FiniteCount(OrderedLiteralCountPlan),
+    FiniteSpanSum(OrderedLiteralSpanSumPlan),
     Continuation(CompiledRegex),
 }
 
@@ -1066,6 +1277,22 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::FiniteCount(engine) => engine
+                .count(haystack, limits.finite_literal)
+                .map(|result| AggregateCountExecution::FiniteLiteral {
+                    value: result.count,
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::FiniteLiteral(source))
+                }),
+            AggregateEngine::FiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a finite span-sum plan",
+                ),
+            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1116,6 +1343,22 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::FiniteSpanSum(engine) => engine
+                .span_sum(haystack, limits.finite_literal)
+                .map(|result| AggregateSpanSumExecution::FiniteLiteral {
+                    value: result.span_sum,
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::FiniteLiteral(source))
+                }),
+            AggregateEngine::FiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a finite count plan",
+                ),
+            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1152,6 +1395,11 @@ impl AggregatePlan {
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
+    FiniteLiteral {
+        value: u64,
+        upper_bounds: OrderedLiteralAggregateUpperBounds,
+        actual: OrderedLiteralAggregateActualCounters,
+    },
     Continuation { admitted: AdmittedCount, value: u64 },
 }
 
@@ -1160,6 +1408,7 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
+            Self::FiniteLiteral { value, .. } => *value,
             Self::Continuation { value, .. } => *value,
         }
     }
@@ -1172,6 +1421,14 @@ impl AggregateCountExecution {
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
+            Self::FiniteLiteral {
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::FiniteLiteral {
+                upper_bounds,
+                actual,
+            },
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),
@@ -1183,6 +1440,11 @@ impl AggregateCountExecution {
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
+    FiniteLiteral {
+        value: u64,
+        upper_bounds: OrderedLiteralAggregateUpperBounds,
+        actual: OrderedLiteralAggregateActualCounters,
+    },
     Continuation {
         admitted: AdmittedSpanSum,
         value: u64,
@@ -1194,6 +1456,7 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
+            Self::FiniteLiteral { value, .. } => *value,
             Self::Continuation { value, .. } => *value,
         }
     }
@@ -1206,6 +1469,14 @@ impl AggregateSpanSumExecution {
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
+            Self::FiniteLiteral {
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::FiniteLiteral {
+                upper_bounds,
+                actual,
+            },
             Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
                 certificate: admitted.certificate().clone(),
                 accounting: admitted.accounting(),
