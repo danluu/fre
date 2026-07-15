@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn nonnullable_counted_repetitions_match_rust_and_scale_linearly() {
+    fn nonnullable_counted_repetitions_match_rust() {
         let ranges = [('A', 'Z'), ('a', 'z'), ('α', 'ω'), ('雪', '雪')];
         let haystacks: [&[u8]; 7] = [
             b"",
@@ -1922,7 +1922,11 @@ mod tests {
                 );
             }
         }
+    }
 
+    #[test]
+    fn nonnullable_counted_repetitions_match_rust_in_every_window() {
+        let ranges = [('A', 'Z'), ('a', 'z'), ('α', 'ω'), ('雪', '雪')];
         let window_plan = UnicodeScalarAggregatePlan::build_repeated(
             ranges,
             2,
@@ -1964,7 +1968,11 @@ mod tests {
                 );
             }
         }
+    }
 
+    #[test]
+    fn nonnullable_counted_repetitions_have_exact_identity_and_linear_work() {
+        let ranges = [('A', 'Z'), ('a', 'z'), ('α', 'ω'), ('雪', '雪')];
         let plan = UnicodeScalarAggregatePlan::build_repeated(
             ranges,
             2,
