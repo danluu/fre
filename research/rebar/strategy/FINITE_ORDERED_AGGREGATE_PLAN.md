@@ -45,7 +45,7 @@ and its finite-horizon counterexample behavior are unchanged.
 
 ## Coverage accounting
 
-Authenticated coverage remains exactly 179 pass / 165 unsupported at the
+Authenticated coverage remains exactly 187 pass / 157 unsupported at the
 canonical base until a phase-B regeneration runs; this source-only checkpoint
 claims zero authenticated unlocks.
 
@@ -59,19 +59,18 @@ candidate universe among the 157 one-pattern construction opportunities:
 | **candidate universe** | **26** | **10** | **36** |
 
 This mechanism can remove a resource refusal only where one of those rows is
-in the exact 30-row aggregate resource set and its finite extraction/dense
-construction fits the new bounds. The generated manifest/report containing job
-IDs and the family join is intentionally not committed at this base, so the exact
-intersection—22 `count` operation-work, two `count` row-log, one `count`
-repeat-bound, three `count-spans` operation-work, and two `count-spans`
-compile-quota receipts—must be measured rather than guessed. The phase-B report
-must publish job IDs, families, model counts, prior refusal resource, selected
-plan, and remaining typed refusal. No support count should be promoted from the
-36-row upper bound.
+in the exact 42-row aggregate resource set and its finite extraction/dense
+construction fits the new bounds. That set comprises five `compile`, 28
+`count`, and nine `count-spans` refusals. The generated family join is not
+committed at this base, so the exact intersection must be measured rather than
+guessed. The phase-B report must publish job IDs, families, model counts, prior
+refusal resource, selected plan, and remaining typed refusal. No support count
+should be promoted from the 36-row count/count-spans upper bound.
 
 Finite-language `compile` candidates among the 33 compile rows are a separate
-unmeasured projection in the composed schema-v5 source; no count is
-claimed until the same authenticated regeneration classifies them.
+unmeasured projection in the composed schema-v5 source. The five current
+compile-resource refusals are an absolute ceiling, not a projected unlock
+count, until the same authenticated regeneration classifies them.
 
 ## Focused phase-B gates
 

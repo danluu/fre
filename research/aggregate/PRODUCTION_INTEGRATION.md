@@ -6,6 +6,8 @@ exact-literal reducer, a bounded finite ordered-language reducer, or the
 `count`, and `count-spans`. The finite route is a source-only candidate pending
 the gates in `../rebar/strategy/FINITE_ORDERED_AGGREGATE_PLAN.md`; this is not
 a claim that any path is faster than Rust regex or RE2 on every workload.
+The separate ordered build-many facade is likewise a source-only candidate for
+multi-pattern `count` and `count-spans`.
 
 ## Modular production boundary
 
@@ -31,20 +33,26 @@ strategy, facade policy, and Rebar reduction independently testable:
    `AggregateSpanSumRegex`. Operation and storage strategy are fixed before
    compilation and included in reports/cache identity. Count and span-sum
    additionally expose value-only hot APIs; their audited result/report APIs
-   remain unchanged.
+   remain unchanged. `AggregateManyBuilder` separately retains every input
+   pattern's ordinal and syntax/profile identity before constructing ordered
+   literal or Unicode-off continuation count/span-sum plans.
 6. The facade always runs aggregate operations on `0..haystack.len()`. Absolute
    anchors therefore retain original-haystack context; it never implements
    global iteration by repeatedly searching sliced suffixes.
 7. `CurrentFreAdapter` compiles exactly once and executes exactly once for an
-   admitted one-pattern `compile`, `count`, or `count-spans` job. Unsupported
-   models and build-many are rejected before candidate compilation. Existing
-   portable single-search/grep routing is unchanged and retains its certified
-   absolute/LF-line/ASCII-word K0 assertion subset.
+   admitted operation. One pattern selects the one-pattern facade;
+   multi-pattern `count`/`count-spans` selects ordered build-many. Multi-pattern
+   `compile`, capture/span outputs, and unsupported models remain typed
+   refusals. Existing portable single-search/grep routing is unchanged and
+   retains its certified absolute/LF-line/ASCII-word K0 assertion subset.
 
 `AggregatePlanSelection::{Auto,ForceExactLiteral,ForceContinuation}` makes the
 plan seam testable. `Auto` publishes a selected exact or finite build refusal
 instead of falling through; a selected execution refusal never invokes another
 plan. Direct and finite reducer reports contain no continuation strategy label.
+Ordered build-many performs cardinality/source-byte preflight before parsing,
+preserves lowest input ordinal at the earliest start, and never concatenates
+pattern sources or falls back after plan selection.
 
 ## Capture and profile contract
 
@@ -73,6 +81,9 @@ Unicode word assertions, and CRLF assertions remain typed compiler refusals.
 Finite ordered selection is Unicode-off only. Case-insensitive mode is admitted
 only when canonical lowering stays inside the selected proof; no profile is
 inferred from an ASCII-looking HIR.
+Unicode-on build-many is narrower: every pattern must prove one nonempty,
+case-sensitive canonical UTF-8 literal. Unicode-off nonliteral sets may use the
+bounded continuation plan after independent parsing.
 
 ## Whole-operation resource contract
 
@@ -87,6 +98,12 @@ Every selected plan retains a no-partial-output contract:
   the longest materialized word, and extraction capacity is included in the
   combined construction peak while the operation reports transition, ring,
   total-work, scratch, and peak counters.
+
+- Ordered build-many uses the same ordered-literal reducer for eligible sets,
+  or one independently parsed ordered HIR alternation for Unicode-off
+  continuation. Pattern cardinality, source bytes, parser/composition work,
+  vector capacities, retained identities, and selected-engine storage are
+  separately bounded.
 
 - `FullTable` materializes one endpoint word per `(boundary, state)`.
 - `ReverseSequentialRows` retains two state rows and a fixed split/root record
@@ -117,13 +134,12 @@ it does not include the facade's source/`Arc<CacheKey>` allocation or the
 parser/HIR peak, so it is not an end-to-end compiler-memory claim.
 
 The Rebar adapter fixes `ReverseSequentialRows` for continuation programs. It
-maps every literal planner/build/reducer quota and constructs every
-continuation `AggregateOperationLimits` field explicitly from authenticated
-input, selected-plan accounting, the reducer limit, and named `RunLimits`
-quotas. It grants zero continuation table cells. Resource and
-unsupported-feature refusals become `unsupported` receipts; arithmetic,
-allocation, and invariant failures become `fault`. The current full report
-contains no FRE fault.
+maps every one-pattern and build-many planner/build/reducer quota and constructs
+every continuation limit explicitly from authenticated input, selected-plan
+accounting, the reducer limit, and named `RunLimits` quotas. It grants zero
+continuation table cells. Resource and unsupported-feature refusals become
+`unsupported` receipts; arithmetic, allocation, and invariant failures become
+`fault`. The current authenticated report contains no FRE fault.
 
 ## Qualification evidence
 
@@ -157,16 +173,16 @@ patterns on `zabb`. Both aggregate strategies return count 1. Pinned Rust
 1.12.4 returns 2 through its unsound optimization; exact receipts deliberately
 retain those Rust failures while FRE passes the canonical definitions.
 
-The canonical authenticated frontier remains 179 FRE pass / 165 unsupported,
-zero fail/fault: 16 `compile`, 54 `count`, 100 `count-spans`, and nine
+The canonical authenticated frontier remains 187 FRE pass / 157 unsupported,
+zero fail/fault: 17 `compile`, 60 `count`, 101 `count-spans`, and nine
 portable `grep` passes. Pinned Rust retains 342 passes and two reproduced
-reverse-suffix failures; pinned RE2 remains 285/285. The finite plan and the
-broader Unicode-on continuation candidate are absent from those receipts and
-claim no additional support before regeneration. Exact per-model counts,
-refusal classes, source/tree identities, and the two
-byte-identical generation digest are retained in
+reverse-suffix failures; pinned RE2 remains 285/285. Unicode-on byte-stable
+continuation is included in those receipts; the finite plan and ordered
+build-many source remain absent and claim no additional support before
+regeneration. Exact per-model counts, refusal classes, and source/tree
+identities are retained in
 `../rebar/comparison/COVERAGE_FRONTIER.md`; the checked-in `report.json` remains
-the older baseline and is not silently relabelled as 179-frontier evidence.
+the older baseline and is not silently relabelled as 187-frontier evidence.
 
 Five fresh local timing processes cover all 24 exact-literal rows at the full
 public facade boundary. Median-of-five-process medians classify 10 jobs as FRE
@@ -194,8 +210,8 @@ reject a strict faster-everywhere or performance-promotion claim.
    superiority.
 2. Add the remaining Unicode byte-mode lowering, Unicode word-state, and
    variable-width Unicode scalar semantics with independent differentials.
-3. Add ordered build-many and capture-history operation families instead of
-   widening whole-match erasure beyond its proof boundary.
+3. Qualify ordered build-many and add capture-history operation families
+   instead of widening whole-match erasure beyond its proof boundary.
 4. Keep compile-model verification and AOT/JIT timing work visible; never hide
    compilation or fallback work outside the measured contract.
 5. Preserve the general continuation plan as the bounded semantic backstop,
