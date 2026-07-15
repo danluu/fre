@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder, RustProfile,
-    SearchAccounting, SearchLimits, SearchWindow,
+    BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
+    RustProfile, SearchAccounting, SearchLimits, SearchWindow,
 };
+use std::fmt::Write as _;
 
 const FIXED_ID: &str = "anchored-class-suffix.absolute-end-fixed-suffix-first-bitset.v1";
 const ES8I_ID: &str = "anchored-class-suffix.asymmetric-scalar8-reverse32-inline.v1";
@@ -156,8 +157,13 @@ fn red_cache_key_equality_retains_every_required_field() {
     changed.anchors.end = false;
     assert_ne!(key, changed);
     let mut changed = key.clone();
-    changed.class_words[0] ^= 1;
+    changed.anchors.start = false;
     assert_ne!(key, changed);
+    for word in 0..4 {
+        let mut changed = key.clone();
+        changed.class_words[word] ^= 1;
+        assert_ne!(key, changed, "class word={word}");
+    }
     let mut changed = key.clone();
     changed.suffix.push(b'!');
     assert_ne!(key, changed);
@@ -167,12 +173,28 @@ fn red_cache_key_equality_retains_every_required_field() {
         second: b'b',
     };
     assert_ne!(key, changed);
-    let mut changed = key.clone();
-    changed.build_limits.max_planner_work -= 1;
-    assert_ne!(key, changed);
-    let mut changed = key.clone();
-    changed.search_limits.max_work -= 1;
-    assert_ne!(key, changed);
+    for field in 0..6 {
+        let mut changed = key.clone();
+        match field {
+            0 => changed.build_limits.forward_anchored.max_suffix_bytes -= 1,
+            1 => changed.build_limits.forward_anchored.max_build_work -= 1,
+            2 => changed.build_limits.forward_anchored.max_scratch_bytes += 1,
+            3 => changed.build_limits.forward_anchored.max_persistent_bytes -= 1,
+            4 => changed.build_limits.forward_anchored.max_peak_bytes -= 1,
+            5 => changed.build_limits.max_planner_work -= 1,
+            _ => unreachable!(),
+        }
+        assert_ne!(key, changed, "build field={field}");
+    }
+    for field in 0..2 {
+        let mut changed = key.clone();
+        match field {
+            0 => changed.search_limits.max_work -= 1,
+            1 => changed.search_limits.max_scratch_bytes += 1,
+            _ => unreachable!(),
+        }
+        assert_ne!(key, changed, "search field={field}");
+    }
 
     let mut alternate_profile = RustProfile::default();
     alternate_profile.options.octal = true;
@@ -185,6 +207,31 @@ fn red_cache_key_equality_retains_every_required_field() {
         .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
         .unwrap();
     assert_ne!(key, profile_key);
+
+    for option in 0..9 {
+        let mut profile = RustProfile::default();
+        match option {
+            0 => profile.options.case_insensitive = true,
+            1 => profile.options.multi_line = true,
+            2 => profile.options.dot_matches_new_line = true,
+            3 => profile.options.crlf = true,
+            4 => profile.options.line_terminator = b'\r',
+            5 => profile.options.swap_greed = true,
+            6 => profile.options.ignore_whitespace = true,
+            7 => profile.options.octal = true,
+            8 => profile.options.nest_limit += 1,
+            _ => unreachable!(),
+        }
+        profile.options.unicode = false;
+        let alternate = PortableBuilder::new(r"(?-ix:\A[aceg]+ZQ\z)")
+            .profile(profile)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap()
+            .forward_anchored_cache_identity(CaptureFreeOperation::Span, limits)
+            .unwrap();
+        assert_ne!(key, alternate, "profile option={option}");
+    }
 }
 
 #[test]
@@ -207,4 +254,174 @@ fn red_suffix_mismatch_has_fixed_upper_bounds_and_no_prefix_examinations() {
         assert_eq!(accounting.prefix_bytes_examined, 0);
         assert!(accounting.suffix_confirmation_attempted);
     }
+}
+
+#[test]
+fn fixed_facade_caps_and_semantic_refusals_never_fallback() {
+    let pattern = r"\A[ab]+Zborderedaba\z";
+    let baseline = forced(pattern);
+    let accounting = baseline.build_report().forward_anchored.unwrap();
+    let exact_kernel = fre_kernels::ForwardAnchoredBuildLimits {
+        max_suffix_bytes: accounting.suffix_bytes,
+        max_build_work: accounting.work_upper_bound,
+        max_scratch_bytes: accounting.scratch_bytes,
+        max_persistent_bytes: accounting.persistent_bytes,
+        max_peak_bytes: accounting.peak_bytes,
+    };
+    let exact = BuildLimits {
+        forward_anchored: exact_kernel,
+        ..BuildLimits::default()
+    };
+    assert!(
+        PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(exact)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .is_ok()
+    );
+    for limited in [
+        fre_kernels::ForwardAnchoredBuildLimits {
+            max_suffix_bytes: accounting.suffix_bytes - 1,
+            ..exact_kernel
+        },
+        fre_kernels::ForwardAnchoredBuildLimits {
+            max_build_work: accounting.work_upper_bound - 1,
+            ..exact_kernel
+        },
+        fre_kernels::ForwardAnchoredBuildLimits {
+            max_persistent_bytes: accounting.persistent_bytes - 1,
+            ..exact_kernel
+        },
+        fre_kernels::ForwardAnchoredBuildLimits {
+            max_peak_bytes: accounting.peak_bytes - 1,
+            ..exact_kernel
+        },
+    ] {
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(BuildLimits {
+                    forward_anchored: limited,
+                    ..BuildLimits::default()
+                })
+                .plan_selection(PlanSelection::ForceForwardAnchored)
+                .build(),
+            Err(BuildError::ForwardAnchored(_))
+        ));
+    }
+    assert!(matches!(
+        PortableBuilder::new(r"\Aa+a\z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build(),
+        Err(BuildError::ForwardAnchored(
+            fre_kernels::ForwardAnchoredBuildError::FirstSuffixByteInClass { byte: b'a' }
+        ))
+    ));
+}
+
+#[test]
+fn fixed_facade_matches_pinned_rust_bytes_for_greedy_lazy_and_captures() {
+    fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        let mut all = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for &byte in alphabet {
+                    let mut word = prefix.clone();
+                    word.push(byte);
+                    next.push(word);
+                }
+            }
+            all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        all
+    }
+
+    fn pattern(class: &[u8], suffix: &[u8], lazy: bool, captured: bool) -> String {
+        let mut pattern = if captured {
+            String::from(r"(?-u:\A([")
+        } else {
+            String::from(r"(?-u:\A[")
+        };
+        for &byte in class {
+            write!(pattern, r"\x{byte:02X}").unwrap();
+        }
+        pattern.push_str("]+");
+        if lazy {
+            pattern.push('?');
+        }
+        for &byte in suffix {
+            write!(pattern, r"\x{byte:02X}").unwrap();
+        }
+        if captured {
+            pattern.push_str(r")\z)");
+        } else {
+            pattern.push_str(r"\z)");
+        }
+        pattern
+    }
+
+    let alphabet = [0_u8, 1, 2];
+    let haystacks = words(&alphabet, 5);
+    let suffixes: Vec<Vec<u8>> = words(&alphabet, 2)
+        .into_iter()
+        .filter(|suffix| !suffix.is_empty())
+        .collect();
+    let mut span_comparisons = 0_usize;
+    let mut projection_comparisons = 0_usize;
+    for mask in 1_u8..8 {
+        let class: Vec<u8> = alphabet
+            .into_iter()
+            .enumerate()
+            .filter_map(|(bit, byte)| (mask & (1 << bit) != 0).then_some(byte))
+            .collect();
+        for suffix in &suffixes {
+            if class.contains(&suffix[0]) {
+                continue;
+            }
+            for lazy in [false, true] {
+                for captured in [false, true] {
+                    let pattern = pattern(&class, suffix, lazy, captured);
+                    let fre = forced(&pattern);
+                    let rust = regex::bytes::RegexBuilder::new(&pattern)
+                        .unicode(false)
+                        .build()
+                        .unwrap();
+                    assert_eq!(fre.runtime_implementation_id(), FIXED_ID);
+                    for haystack in &haystacks {
+                        let expected = rust
+                            .find(haystack)
+                            .map(|matched| (matched.start(), matched.end()));
+                        let actual = fre
+                            .find(haystack, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        assert_eq!(
+                            actual, expected,
+                            "pattern={pattern:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            expected.is_some()
+                        );
+                        assert_eq!(
+                            fre.selected_end(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected.map(|(_, end)| end)
+                        );
+                        span_comparisons += 1;
+                        projection_comparisons += 3;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(span_comparisons, 52_416);
+    assert_eq!(projection_comparisons, 157_248);
 }
