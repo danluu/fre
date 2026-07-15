@@ -15,7 +15,7 @@ use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
 pub const PLAN_ID: &str =
-    "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3";
+    "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -2091,7 +2091,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.equality5-isolated-asymmetric-scalar8-reverse32-inline.v3"
+            "anchored-class-suffix.equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v4"
         );
         assert_eq!(
             pair.implementation(),
