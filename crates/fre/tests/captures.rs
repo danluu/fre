@@ -100,3 +100,28 @@ fn uncertified_unicode_and_word_look_remain_typed_refusals() {
             .is_err()
     );
 }
+
+#[test]
+fn source_and_execution_limits_remain_in_capture_identity() {
+    let python_name = CaptureBuilder::new(r"(?P<letter>a)")
+        .unicode(false)
+        .build()
+        .expect("Python-name spelling");
+    let angle_name = CaptureBuilder::new(r"(?<letter>a)")
+        .unicode(false)
+        .build()
+        .expect("angle-name spelling");
+    assert_ne!(
+        python_name.build_report().plan_identity,
+        angle_name.build_report().plan_identity
+    );
+
+    let default_identity = python_name.cache_identity(CaptureRunLimits::default());
+    let constrained = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_capture_events: 1,
+            ..CaptureAggregateLimits::default()
+        },
+    };
+    assert_ne!(default_identity, python_name.cache_identity(constrained));
+}

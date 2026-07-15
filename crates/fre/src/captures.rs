@@ -307,6 +307,14 @@ impl CaptureBuilder {
             CaptureBuildError::Engine,
         )?);
         let engine_report = program.build_report().clone();
+        let syntax_captures = usize::try_from(syntax.captures).map_err(|_| {
+            CaptureBuildError::InternalInvariant("syntax capture count does not fit usize")
+        })?;
+        if engine_report.captures != syntax_captures {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture compiler count differs from parsed HIR",
+            ));
+        }
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
