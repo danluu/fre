@@ -35,11 +35,11 @@ jobs, with 342 pass and two retained failures.
 ### Unvalidated regex-redux source projection
 
 The isolated composition on exact frontier head
-`5ccbee0bd3211818a76af324b455a561b626a9af` adds a complete reusable
+`31001465fa49998eede9cf860a9be4c09b4d0cd5` adds a complete reusable
 `regex-redux` candidate but has not generated a comparison report. Its exact
 projected delta is one row from unsupported to pass: `regex-redux +1`, total
 pass `+1`, total unsupported `-1`. Applying that arithmetic to the recorded
-base would yield 201 pass / 143 unsupported, but those are projected values,
+base would yield 205 pass / 139 unsupported, but those are projected values,
 not observed coverage.
 
 The candidate freshly constructs all fifteen ordered Unicode-off continuation
