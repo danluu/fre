@@ -31,7 +31,7 @@ use fre::{
     LiteralAggregateReduceError, LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
+    SearchSessionLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
@@ -2985,11 +2985,19 @@ fn fre_grep(
         max_work: limits.fre_search_work,
         max_scratch_bytes: limits.fre_scratch_bytes,
     };
+    let mut session = regex
+        .search_session(SearchSessionLimits {
+            max_setup_work: limits.fre_search_work,
+            max_scratch_bytes: limits.fre_scratch_bytes,
+        })
+        .map_err(|error| {
+            ExecutionError::unsupported(format!("FRE search session refused: {error}"))
+        })?;
     let mut count = 0u64;
     let mut events = 0u64;
     for line in request.haystack.lines() {
         charge(&mut events, 1, limits.reducer_steps, "FRE grep line events")?;
-        let (matched, _) = regex
+        let (matched, _) = session
             .is_match(line, search_limits)
             .map_err(|error| ExecutionError::unsupported(format!("FRE search refused: {error}")))?;
         if matched {
@@ -4085,6 +4093,23 @@ mod tests {
                 "aggregate-continuation-program",
             );
         }
+    }
+
+    #[test]
+    fn current_fre_grep_reuses_k0_workspace_across_lines() {
+        let patterns = vec![r"\b[0-9A-Za-z_]{2,}\b".to_string()];
+        assert_current_fre_execution(
+            current_fre(
+                "grep",
+                &patterns,
+                b"--\nalpha\n-\nxy\n\xFF\n",
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            2,
+            "portable-single-search",
+        );
     }
 
     #[test]
