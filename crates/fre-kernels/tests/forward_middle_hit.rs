@@ -4,7 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -95,4 +95,63 @@ fn short_triple_keeps_the_measured_edge_witness_geometry() {
         .unwrap();
     assert_eq!(span, Some((0, 64)));
     assert_eq!(accounting.prefilter_calls, 0);
+}
+
+#[test]
+fn quint_candidate_block_edges_have_exact_accounting() {
+    assert_eq!(FORWARD_ANCHORED_PLAN_ID, MIDDLE_HIT_PLAN_ID);
+    let candidate = plan(b"acegi", b"Z");
+
+    for prefix_len in [31_usize, 32, 33, 71, 72, 73] {
+        let mut haystack: Vec<u8> = b"acegi"
+            .iter()
+            .copied()
+            .cycle()
+            .take(prefix_len)
+            .collect();
+        haystack.push(b'Z');
+        let (span, accounting) = candidate
+            .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(span, Some((0, haystack.len())), "prefix={prefix_len}");
+        assert_eq!(accounting.prefilter_calls, 1, "prefix={prefix_len}");
+        assert_eq!(
+            accounting.prefix_bytes_examined,
+            prefix_len.checked_add(1).unwrap(),
+            "prefix={prefix_len}"
+        );
+        assert_eq!(
+            accounting.prefix_bytes_upper_bound,
+            haystack.len().checked_add(32).unwrap(),
+            "prefix={prefix_len}"
+        );
+        assert!(accounting.suffix_confirmation_attempted);
+    }
+}
+
+#[test]
+fn pair_quad_forward_middle_threshold_is_exact_at_71_72_73() {
+    for members in [b"ac".as_slice(), b"aceg".as_slice()] {
+        let candidate = plan(members, b"Z");
+        for (tail_len, expected_calls) in [(71_usize, 1_usize), (72, 1), (73, 2)] {
+            let boundary = 36_usize;
+            let mut haystack: Vec<u8> = members
+                .iter()
+                .copied()
+                .cycle()
+                .take(tail_len.checked_add(1).unwrap())
+                .collect();
+            haystack[boundary] = b'Z';
+            let (span, accounting) = candidate
+                .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(span, Some((0, boundary + 1)), "tail={tail_len}");
+            assert_eq!(
+                accounting.prefilter_calls, expected_calls,
+                "tail={tail_len}"
+            );
+            assert_eq!(accounting.prefix_bytes_examined, boundary + 1);
+            assert!(accounting.suffix_confirmation_attempted);
+        }
+    }
 }
