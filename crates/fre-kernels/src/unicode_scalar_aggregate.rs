@@ -736,7 +736,8 @@ impl UnicodeScalarAggregatePlan {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the single streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled"
+        clippy::arithmetic_side_effects,
+        reason = "the single streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled; its only unchecked local arithmetic advances within the current slice or subtracts an earlier cursor"
     )]
     fn execute(
         &self,
