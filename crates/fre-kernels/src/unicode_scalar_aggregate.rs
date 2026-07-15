@@ -24,7 +24,7 @@ pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-range
 /// Stable identity for the deterministic nonempty run reducer.
 pub const RUN_PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
 /// Stable identity for symbolic counted/lower-bounded repetition.
-pub const REPEATED_RUN_PLAN_ID: &str =
+pub(crate) const REPEATED_RUN_PLAN_ID: &str =
     "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-counted.v1";
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.valid-scalar.v1";
@@ -35,10 +35,10 @@ pub const RUN_COUNT_OPERATION_ID: &str = "unicode-scalar-aggregate.count.run-plu
 /// Stable identity for greedy/lazy nonempty run matched-byte summation.
 pub const RUN_SPAN_SUM_OPERATION_ID: &str = "unicode-scalar-aggregate.span-sum.run-plus.v1";
 /// Stable identity for counted/lower-bounded repetition counting.
-pub const REPEATED_RUN_COUNT_OPERATION_ID: &str =
+pub(crate) const REPEATED_RUN_COUNT_OPERATION_ID: &str =
     "unicode-scalar-aggregate.count.run-counted.v1";
 /// Stable identity for counted/lower-bounded matched-byte summation.
-pub const REPEATED_RUN_SPAN_SUM_OPERATION_ID: &str =
+pub(crate) const REPEATED_RUN_SPAN_SUM_OPERATION_ID: &str =
     "unicode-scalar-aggregate.span-sum.run-counted.v1";
 
 /// Complete reducer selected for one invocation.
@@ -2017,8 +2017,8 @@ mod tests {
                 pair[0].decode_byte_checks * 2
             );
             assert_eq!(
-                pair[1].range_comparisons,
-                pair[0].range_comparisons * 2
+                pair[1].range_comparisons - 1,
+                (pair[0].range_comparisons - 1) * 2
             );
             assert_eq!(
                 pair[1].reducer_steps - 1,
