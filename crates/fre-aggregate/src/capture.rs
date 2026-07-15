@@ -444,8 +444,10 @@ impl CompiledCaptureRegex {
 }
 
 #[allow(
+    clippy::option_option,
     clippy::too_many_arguments,
-    reason = "capture replay keeps every fixed scratch buffer and limit explicit"
+    clippy::too_many_lines,
+    reason = "capture replay keeps fixed scratch/limits explicit; the nested option distinguishes no accepting path from an accepting path with no capture history"
 )]
 fn replay_one(
     program: &Program,
@@ -485,9 +487,7 @@ fn replay_one(
             Inst::Unfilled => {
                 return Err(Error::InternalInvariant("unfilled capture replay state"));
             }
-            Inst::Fail => {}
             Inst::Match if state.position == target_end => return Ok(Some(state.history)),
-            Inst::Match => {}
             Inst::Consume { bytes, next }
                 if state.position < target_end && bytes.contains(haystack[state.position]) =>
             {
@@ -501,7 +501,7 @@ fn replay_one(
                     limits,
                 )?;
             }
-            Inst::Consume { .. } => {}
+            Inst::Fail | Inst::Match | Inst::Consume { .. } => {}
             Inst::Assert { assertion, next } => {
                 if assertions.is_match(*assertion, state.position)? {
                     push_state(stack, ReplayState { pc: *next, ..state }, limits)?;
