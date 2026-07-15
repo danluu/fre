@@ -20,17 +20,17 @@ use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
-    AggregateExecutionSource, AggregateManyBuildAccounting, AggregateManyBuildError,
-    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
-    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
-    AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRunLimits,
-    AggregateExactLiteralSemantics, AggregateOperationLimits, AggregatePlanIdentity,
-    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, CompatibilityProfile, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
+    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateManyBuildAccounting,
+    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
+    AggregateManyBuilder, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
+    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
+    AggregateManyRunLimits, AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy,
+    CompatibilityProfile, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits, PortableBuilder,
+    RustProfile, SearchLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -2152,8 +2152,7 @@ fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
     AggregateManyBuildLimits {
         max_patterns: limits.patterns_per_job,
         max_pattern_bytes: limits.pattern_bytes_per_job,
-        max_composition_work: u64::try_from(limits.fre_aggregate_compile_work)
-            .unwrap_or(u64::MAX),
+        max_composition_work: u64::try_from(limits.fre_aggregate_compile_work).unwrap_or(u64::MAX),
         max_composition_scratch_bytes: limits.fre_aggregate_scratch_bytes,
         max_report_capacity_bytes: limits.fre_aggregate_program_bytes,
         max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
@@ -2195,11 +2194,8 @@ fn require_aggregate_many_identity(
             "FRE ordered build-many pattern identity count mismatch",
         ));
     }
-    for (ordinal, (pattern_report, source)) in report
-        .patterns
-        .iter()
-        .zip(request.patterns)
-        .enumerate()
+    for (ordinal, (pattern_report, source)) in
+        report.patterns.iter().zip(request.patterns).enumerate()
     {
         if pattern_report.ordinal != ordinal
             || pattern_report.syntax_key.pattern.as_bytes() != source.as_bytes()
@@ -2223,10 +2219,9 @@ fn require_aggregate_many_identity(
         ));
     }
     if !request.unicode
-        && literal_semantics
-            .is_some_and(|semantics| {
-                semantics != AggregateManyLiteralSemantics::UnicodeOffByteBoundaries
-            })
+        && literal_semantics.is_some_and(|semantics| {
+            semantics != AggregateManyLiteralSemantics::UnicodeOffByteBoundaries
+        })
     {
         return Err(ExecutionError::fault(
             "FRE byte ordered build-many literal proof identity mismatch",
@@ -2251,9 +2246,9 @@ fn aggregate_many_run_limits(
                 let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
                     ExecutionError::fault("FRE ordered literal plan lacks a nonempty minimum")
                 })?;
-                haystack_len.checked_div(minimum).ok_or_else(|| {
-                    ExecutionError::fault("FRE ordered literal minimum is zero")
-                })?
+                haystack_len
+                    .checked_div(minimum)
+                    .ok_or_else(|| ExecutionError::fault("FRE ordered literal minimum is zero"))?
             };
             let count = u64::try_from(match_events).map_err(|_| {
                 ExecutionError::fault("FRE ordered literal count bound does not fit u64")
@@ -2277,21 +2272,19 @@ fn aggregate_many_run_limits(
                 max_peak_bytes: limits.fre_aggregate_peak_bytes,
             }
         }
-        AggregateManyBuildAccounting::Continuation(_) => {
-            OrderedLiteralAggregateReduceLimits {
-                max_transitions: haystack_len,
-                max_match_events: boundaries.min(reducer_limit),
-                max_count: limits.reducer_steps,
-                max_span_sum: u64::try_from(haystack_len).map_err(|_| {
-                    ExecutionError::fault("FRE inactive ordered span bound does not fit u64")
-                })?,
-                max_reducer_steps: boundaries.min(reducer_limit),
-                max_ring_initializations: boundaries,
-                max_total_work: limits.fre_aggregate_operation_work,
-                max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
-                max_peak_bytes: limits.fre_aggregate_peak_bytes,
-            }
-        }
+        AggregateManyBuildAccounting::Continuation(_) => OrderedLiteralAggregateReduceLimits {
+            max_transitions: haystack_len,
+            max_match_events: boundaries.min(reducer_limit),
+            max_count: limits.reducer_steps,
+            max_span_sum: u64::try_from(haystack_len).map_err(|_| {
+                ExecutionError::fault("FRE inactive ordered span bound does not fit u64")
+            })?,
+            max_reducer_steps: boundaries.min(reducer_limit),
+            max_ring_initializations: boundaries,
+            max_total_work: limits.fre_aggregate_operation_work,
+            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
     };
     let program_states = match report.build {
         AggregateManyBuildAccounting::Continuation(compile) => compile.program_states,
@@ -2357,9 +2350,7 @@ fn aggregate_many_build_error(error: &AggregateManyBuildError) -> ExecutionError
         | AggregateManyBuildError::ReportCapacityLimit { .. }
         | AggregateManyBuildError::PersistentLimit { .. }
         | AggregateManyBuildError::Syntax { .. }
-        | AggregateManyBuildError::UnicodeNonLiteral { .. } => {
-            ExecutionError::unsupported(message)
-        }
+        | AggregateManyBuildError::UnicodeNonLiteral { .. } => ExecutionError::unsupported(message),
         AggregateManyBuildError::OrderedLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
         }
@@ -2408,9 +2399,7 @@ fn fre_aggregate_many_count(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
-        AggregateManyPlanKind::ContinuationProgram => {
-            "aggregate-many-continuation-program"
-        }
+        AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction {
         actual: result.value(),
@@ -2445,9 +2434,7 @@ fn fre_aggregate_many_span_sum(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
-        AggregateManyPlanKind::ContinuationProgram => {
-            "aggregate-many-continuation-program"
-        }
+        AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction {
         actual: result.value(),

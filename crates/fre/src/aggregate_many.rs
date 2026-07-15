@@ -1,21 +1,21 @@
 use core::{fmt, mem::size_of};
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedSpanSum, CompiledRegex, CompileAccounting, CompileLimits,
+    AdmittedCount, AdmittedSpanSum, CompileAccounting, CompileLimits, CompiledRegex,
     Error as AggregateEngineError, ExecutionAccounting, OperationCertificate, OperationLimits,
     PlanId, RustByteProfile, Strategy,
 };
 use fre_kernels::{
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
 };
 use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
-    ParseError, ParseSummary, RustProfile, SafetyEnvelope,
+    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
+    ParseSummary, RustProfile, SafetyEnvelope,
 };
 use regex_syntax::hir::{Hir, HirKind};
 
@@ -154,17 +154,45 @@ pub struct AggregateManyBuildReport {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AggregateManyBuildError {
-    UnsupportedOutput { requested: AggregateManyOutput },
+    UnsupportedOutput {
+        requested: AggregateManyOutput,
+    },
     EmptyPatternSet,
-    PatternLimit { needed: usize, limit: usize },
-    PatternBytesLimit { needed: usize, limit: usize },
-    CompositionWorkLimit { needed: u64, limit: u64 },
-    CompositionScratchLimit { needed: usize, limit: usize },
-    ReportCapacityLimit { needed: usize, limit: usize },
-    PersistentLimit { needed: usize, limit: usize },
-    AllocationFailed { structure: &'static str, additional: usize },
-    Syntax { pattern: usize, source: ParseError },
-    UnicodeNonLiteral { pattern: usize },
+    PatternLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PatternBytesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    CompositionWorkLimit {
+        needed: u64,
+        limit: u64,
+    },
+    CompositionScratchLimit {
+        needed: usize,
+        limit: usize,
+    },
+    ReportCapacityLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PersistentLimit {
+        needed: usize,
+        limit: usize,
+    },
+    AllocationFailed {
+        structure: &'static str,
+        additional: usize,
+    },
+    Syntax {
+        pattern: usize,
+        source: ParseError,
+    },
+    UnicodeNonLiteral {
+        pattern: usize,
+    },
     OrderedLiteralBuild {
         operation: AggregateManyOperation,
         source: OrderedLiteralAggregateBuildError,
@@ -174,7 +202,9 @@ pub enum AggregateManyBuildError {
         strategy: Strategy,
         source: AggregateEngineError,
     },
-    ArithmeticOverflow { computation: &'static str },
+    ArithmeticOverflow {
+        computation: &'static str,
+    },
     InternalInvariant(&'static str),
 }
 
@@ -186,7 +216,10 @@ impl fmt::Display for AggregateManyBuildError {
             }
             Self::EmptyPatternSet => write!(f, "ordered build-many requires at least one pattern"),
             Self::PatternLimit { needed, limit } => {
-                write!(f, "ordered build-many needs {needed} patterns, limit is {limit}")
+                write!(
+                    f,
+                    "ordered build-many needs {needed} patterns, limit is {limit}"
+                )
             }
             Self::PatternBytesLimit { needed, limit } => write!(
                 f,
@@ -213,7 +246,10 @@ impl fmt::Display for AggregateManyBuildError {
                 additional,
             } => write!(f, "failed to reserve {additional} entries for {structure}"),
             Self::Syntax { pattern, source } => {
-                write!(f, "ordered build-many pattern {pattern} syntax failed: {source}")
+                write!(
+                    f,
+                    "ordered build-many pattern {pattern} syntax failed: {source}"
+                )
             }
             Self::UnicodeNonLiteral { pattern } => write!(
                 f,
@@ -427,9 +463,7 @@ impl<'a> AggregateManyBuilder<'a> {
     ) -> Result<AggregateManyRegex, AggregateManyBuildError> {
         match output {
             AggregateManyOutput::Count => self.build_count().map(AggregateManyRegex::Count),
-            AggregateManyOutput::SpanSum => {
-                self.build_span_sum().map(AggregateManyRegex::SpanSum)
-            }
+            AggregateManyOutput::SpanSum => self.build_span_sum().map(AggregateManyRegex::SpanSum),
             AggregateManyOutput::Spans | AggregateManyOutput::CaptureCount => {
                 Err(AggregateManyBuildError::UnsupportedOutput { requested: output })
             }
@@ -448,28 +482,25 @@ impl<'a> AggregateManyBuilder<'a> {
         if count == 0 {
             return Err(AggregateManyBuildError::EmptyPatternSet);
         }
-        enforce_usize(
-            count,
-            self.limits.max_patterns,
-            |needed, limit| AggregateManyBuildError::PatternLimit { needed, limit },
-        )?;
+        enforce_usize(count, self.limits.max_patterns, |needed, limit| {
+            AggregateManyBuildError::PatternLimit { needed, limit }
+        })?;
         let pattern_bytes = self.patterns.iter().try_fold(0_usize, |total, pattern| {
-            total.checked_add(pattern.len()).ok_or(
-                AggregateManyBuildError::ArithmeticOverflow {
+            total
+                .checked_add(pattern.len())
+                .ok_or(AggregateManyBuildError::ArithmeticOverflow {
                     computation: "pattern byte sum",
-                },
-            )
+                })
         })?;
         enforce_usize(
             pattern_bytes,
             self.limits.max_pattern_bytes,
             |needed, limit| AggregateManyBuildError::PatternBytesLimit { needed, limit },
         )?;
-        let count_u64 = u64::try_from(count).map_err(|_| {
-            AggregateManyBuildError::ArithmeticOverflow {
+        let count_u64 =
+            u64::try_from(count).map_err(|_| AggregateManyBuildError::ArithmeticOverflow {
                 computation: "pattern count as work",
-            }
-        })?;
+            })?;
         let bytes_u64 = u64::try_from(pattern_bytes).map_err(|_| {
             AggregateManyBuildError::ArithmeticOverflow {
                 computation: "pattern bytes as work",
@@ -480,10 +511,7 @@ impl<'a> AggregateManyBuilder<'a> {
                 computation: "source preflight work",
             },
         )?;
-        enforce_u64(
-            source_preflight_work,
-            self.limits.max_composition_work,
-        )?;
+        enforce_u64(source_preflight_work, self.limits.max_composition_work)?;
 
         let logical_hir_bytes = count.checked_mul(size_of::<Hir>()).ok_or(
             AggregateManyBuildError::ArithmeticOverflow {
@@ -509,12 +537,11 @@ impl<'a> AggregateManyBuilder<'a> {
         enforce_report(logical_report_bytes, self.limits.max_report_capacity_bytes)?;
 
         let mut hirs = Vec::new();
-        hirs.try_reserve_exact(count).map_err(|_| {
-            AggregateManyBuildError::AllocationFailed {
+        hirs.try_reserve_exact(count)
+            .map_err(|_| AggregateManyBuildError::AllocationFailed {
                 structure: "per-pattern HIRs",
                 additional: count,
-            }
-        })?;
+            })?;
         let hir_capacity_bytes = capacity_bytes::<Hir>(hirs.capacity(), "HIR capacity bytes")?;
         let mut reports = Vec::new();
         reports.try_reserve_exact(count).map_err(|_| {
@@ -528,7 +555,10 @@ impl<'a> AggregateManyBuilder<'a> {
             "report capacity bytes",
         )?;
         enforce_report(report_capacity_bytes, self.limits.max_report_capacity_bytes)?;
-        enforce_scratch(hir_capacity_bytes, self.limits.max_composition_scratch_bytes)?;
+        enforce_scratch(
+            hir_capacity_bytes,
+            self.limits.max_composition_scratch_bytes,
+        )?;
 
         let compatibility = CompatibilityProfile::RustBytes(self.profile.clone());
         let mut parser_work = 0_u64;
@@ -538,12 +568,11 @@ impl<'a> AggregateManyBuilder<'a> {
             let request = fre_syntax::ParseRequest::rust(pattern.as_str(), compatibility.clone())
                 .with_admission(self.limits.admission)
                 .with_safety_envelope(self.limits.syntax_safety);
-            let parsed = fre_syntax::parse(request).map_err(|source| {
-                AggregateManyBuildError::Syntax {
+            let parsed =
+                fre_syntax::parse(request).map_err(|source| AggregateManyBuildError::Syntax {
                     pattern: ordinal,
                     source,
-                }
-            })?;
+                })?;
             parser_work = parser_work.checked_add(parsed.summary.parse_work).ok_or(
                 AggregateManyBuildError::ArithmeticOverflow {
                     computation: "parser work sum",
@@ -577,11 +606,12 @@ impl<'a> AggregateManyBuilder<'a> {
             });
             hirs.push(rust.hir);
         }
-        let composition_visits = count_u64.checked_add(1).ok_or(
-            AggregateManyBuildError::ArithmeticOverflow {
-                computation: "composition visits",
-            },
-        )?;
+        let composition_visits =
+            count_u64
+                .checked_add(1)
+                .ok_or(AggregateManyBuildError::ArithmeticOverflow {
+                    computation: "composition visits",
+                })?;
         let composition_work = source_preflight_work
             .checked_add(parser_work)
             .and_then(|work| work.checked_add(composition_visits))
@@ -660,14 +690,9 @@ impl<'a> AggregateManyBuilder<'a> {
                     literal_limits.max_persistent_bytes = literal_limits
                         .max_persistent_bytes
                         .min(engine_persistent_limit);
-                    let plan = OrderedLiteralCountPlan::build(
-                        &literals,
-                        literal_limits,
-                    )
-                    .map_err(|source| AggregateManyBuildError::OrderedLiteralBuild {
-                        operation,
-                        source,
-                    })?;
+                    let plan = OrderedLiteralCountPlan::build(&literals, literal_limits).map_err(
+                        |source| AggregateManyBuildError::OrderedLiteralBuild { operation, source },
+                    )?;
                     let accounting = plan.build_accounting();
                     (
                         AggregateManyEngine::OrderedLiteralCount(plan),
@@ -686,14 +711,11 @@ impl<'a> AggregateManyBuilder<'a> {
                     literal_limits.max_persistent_bytes = literal_limits
                         .max_persistent_bytes
                         .min(engine_persistent_limit);
-                    let plan = OrderedLiteralSpanSumPlan::build(
-                        &literals,
-                        literal_limits,
-                    )
-                    .map_err(|source| AggregateManyBuildError::OrderedLiteralBuild {
-                        operation,
-                        source,
-                    })?;
+                    let plan = OrderedLiteralSpanSumPlan::build(&literals, literal_limits)
+                        .map_err(|source| AggregateManyBuildError::OrderedLiteralBuild {
+                            operation,
+                            source,
+                        })?;
                     let accounting = plan.build_accounting();
                     (
                         AggregateManyEngine::OrderedLiteralSpanSum(plan),
@@ -774,8 +796,7 @@ impl<'a> AggregateManyBuilder<'a> {
             profile: self.profile,
             operation,
             plan,
-            strategy: (plan == AggregateManyPlanKind::ContinuationProgram)
-                .then_some(self.strategy),
+            strategy: (plan == AggregateManyPlanKind::ContinuationProgram).then_some(self.strategy),
             captures_erased: captures,
             composition,
             build,
@@ -816,10 +837,7 @@ struct AggregateManyPlan {
 }
 
 impl AggregateManyPlan {
-    fn execution_error(
-        &self,
-        source: AggregateManyExecutionSource,
-    ) -> AggregateManyExecutionError {
+    fn execution_error(&self, source: AggregateManyExecutionSource) -> AggregateManyExecutionError {
         AggregateManyExecutionError {
             operation: self.report.operation,
             plan: self.report.plan,
@@ -845,9 +863,12 @@ impl AggregateManyCountRegex {
     ) -> Result<AggregateManyCountResult, AggregateManyExecutionError> {
         match &self.0.engine {
             AggregateManyEngine::OrderedLiteralCount(plan) => {
-                let result = plan.count(haystack, limits.ordered_literal).map_err(|source| {
-                    self.0.execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
-                })?;
+                let result = plan
+                    .count(haystack, limits.ordered_literal)
+                    .map_err(|source| {
+                        self.0
+                            .execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
+                    })?;
                 Ok(AggregateManyCountResult {
                     value: result.count,
                     details: AggregateManyExecutionDetails::OrderedLiteral {
@@ -865,12 +886,14 @@ impl AggregateManyCountRegex {
                         limits.continuation,
                     )
                     .map_err(|source| {
-                        self.0.execution_error(AggregateManyExecutionSource::Continuation(source))
+                        self.0
+                            .execution_error(AggregateManyExecutionSource::Continuation(source))
                     })?;
                 let value = u64::try_from(admitted.value()).map_err(|_| {
-                    self.0.execution_error(AggregateManyExecutionSource::InternalInvariant(
-                        "continuation count does not fit u64",
-                    ))
+                    self.0
+                        .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                            "continuation count does not fit u64",
+                        ))
                 })?;
                 Ok(AggregateManyCountResult {
                     value,
@@ -880,11 +903,13 @@ impl AggregateManyCountRegex {
                     },
                 })
             }
-            AggregateManyEngine::OrderedLiteralSpanSum(_) => Err(self.0.execution_error(
-                AggregateManyExecutionSource::InternalInvariant(
-                    "count wrapper retained a span-sum engine",
-                ),
-            )),
+            AggregateManyEngine::OrderedLiteralSpanSum(_) => {
+                Err(self
+                    .0
+                    .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                        "count wrapper retained a span-sum engine",
+                    )))
+            }
         }
     }
 
@@ -917,7 +942,8 @@ impl AggregateManySpanSumRegex {
                 let result = plan
                     .span_sum(haystack, limits.ordered_literal)
                     .map_err(|source| {
-                        self.0.execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
+                        self.0
+                            .execution_error(AggregateManyExecutionSource::OrderedLiteral(source))
                     })?;
                 Ok(AggregateManySpanSumResult {
                     value: result.span_sum,
@@ -936,12 +962,14 @@ impl AggregateManySpanSumRegex {
                         limits.continuation,
                     )
                     .map_err(|source| {
-                        self.0.execution_error(AggregateManyExecutionSource::Continuation(source))
+                        self.0
+                            .execution_error(AggregateManyExecutionSource::Continuation(source))
                     })?;
                 let value = u64::try_from(admitted.value()).map_err(|_| {
-                    self.0.execution_error(AggregateManyExecutionSource::InternalInvariant(
-                        "continuation span sum does not fit u64",
-                    ))
+                    self.0
+                        .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                            "continuation span sum does not fit u64",
+                        ))
                 })?;
                 Ok(AggregateManySpanSumResult {
                     value,
@@ -951,11 +979,13 @@ impl AggregateManySpanSumRegex {
                     },
                 })
             }
-            AggregateManyEngine::OrderedLiteralCount(_) => Err(self.0.execution_error(
-                AggregateManyExecutionSource::InternalInvariant(
-                    "span-sum wrapper retained a count engine",
-                ),
-            )),
+            AggregateManyEngine::OrderedLiteralCount(_) => {
+                Err(self
+                    .0
+                    .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                        "span-sum wrapper retained a count engine",
+                    )))
+            }
         }
     }
 
@@ -1002,9 +1032,9 @@ fn capacity_bytes<T>(
     capacity: usize,
     computation: &'static str,
 ) -> Result<usize, AggregateManyBuildError> {
-    capacity.checked_mul(size_of::<T>()).ok_or(
-        AggregateManyBuildError::ArithmeticOverflow { computation },
-    )
+    capacity
+        .checked_mul(size_of::<T>())
+        .ok_or(AggregateManyBuildError::ArithmeticOverflow { computation })
 }
 
 fn enforce_usize(

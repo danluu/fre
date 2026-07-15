@@ -32,14 +32,14 @@ pub use aggregate::{
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
 };
 pub use aggregate_many::{
-    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting,
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyCompositionAccounting, AggregateManyCountRegex,
-    AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
-    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
-    AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
-    AggregateManySpanSumRegex, AggregateManySpanSumResult,
+    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCompositionAccounting, AggregateManyCountRegex, AggregateManyCountResult,
+    AggregateManyExecutionDetails, AggregateManyExecutionError, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyOutput,
+    AggregateManyPatternReport, AggregateManyPlanIdentity, AggregateManyPlanKind,
+    AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
+    AggregateManySpanSumResult,
 };
 pub use fre_aggregate::{
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,

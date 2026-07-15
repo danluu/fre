@@ -1,6 +1,6 @@
 use fre::{
-    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder,
-    AggregateManyOutput, AggregateManyPlanKind, AggregateManyRunLimits,
+    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyOutput,
+    AggregateManyPlanKind, AggregateManyRunLimits,
 };
 
 fn patterns(values: &[&str]) -> Vec<String> {
@@ -22,7 +22,10 @@ fn ordered_pattern_priority_changes_the_selected_sequence() {
         .build_count()
         .unwrap();
 
-    assert_eq!(AggregateManyPlanKind::ContinuationProgram, longer.build_report().plan);
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        longer.build_report().plan
+    );
     assert_eq!(1, longer.count_value(b"aa", limits).unwrap());
     assert_eq!(2, shorter.count_value(b"aa", limits).unwrap());
 }
@@ -42,7 +45,10 @@ fn ordered_literal_priority_is_not_set_or_longest_match_semantics() {
         .build_span_sum()
         .unwrap();
 
-    assert_eq!(AggregateManyPlanKind::OrderedLiteral, longer.build_report().plan);
+    assert_eq!(
+        AggregateManyPlanKind::OrderedLiteral,
+        longer.build_report().plan
+    );
     assert_eq!(2, longer.span_sum_value(b"ab", limits).unwrap());
     assert_eq!(1, shorter.span_sum_value(b"ab", limits).unwrap());
 }
@@ -96,7 +102,10 @@ fn preflight_refuses_cardinality_before_parsing_or_plan_allocation() {
 #[test]
 fn unsupported_whole_span_and_capture_outputs_are_typed_preflight_refusals() {
     let values = patterns(&["(a)", "b"]);
-    for output in [AggregateManyOutput::Spans, AggregateManyOutput::CaptureCount] {
+    for output in [
+        AggregateManyOutput::Spans,
+        AggregateManyOutput::CaptureCount,
+    ] {
         let error = AggregateManyBuilder::new(&values)
             .unicode(false)
             .build_output(output)
@@ -133,7 +142,10 @@ fn unicode_many_requires_the_nonempty_utf8_literal_proof() {
         .unicode(true)
         .build_count()
         .unwrap();
-    assert_eq!(AggregateManyPlanKind::OrderedLiteral, regex.build_report().plan);
+    assert_eq!(
+        AggregateManyPlanKind::OrderedLiteral,
+        regex.build_report().plan
+    );
     assert_eq!(
         2,
         regex
