@@ -107,7 +107,10 @@ impl core::fmt::Display for UnicodeCompileBuildError {
                 resource,
                 required,
                 limit,
-            } => write!(f, "Unicode compile resource {resource:?} needs {required}, limit {limit}"),
+            } => write!(
+                f,
+                "Unicode compile resource {resource:?} needs {required}, limit {limit}"
+            ),
             Self::ArithmeticOverflow(resource) => {
                 write!(f, "Unicode compile resource {resource:?} overflowed")
             }
@@ -234,11 +237,11 @@ impl UnicodeCompileArtifactBuilder {
             ));
         }
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(measure.bytes)
-            .map_err(|_| UnicodeCompileBuildError::AllocationFailed {
+        bytes.try_reserve_exact(measure.bytes).map_err(|_| {
+            UnicodeCompileBuildError::AllocationFailed {
                 bytes: measure.bytes,
-            })?;
+            }
+        })?;
         bytes.extend_from_slice(MAGIC);
         put_u64(&mut bytes, measure.nodes)?;
         encode_hir(&rust.hir, &mut bytes)?;
@@ -317,7 +320,9 @@ impl UnicodeCompileArtifact {
             let length_at = offset.checked_add(1).ok_or("record offset overflow")?;
             let payload_len = read_u64(bytes, length_at).ok_or("record length missing")?;
             let payload_len = usize::try_from(payload_len).map_err(|_| "record length overflow")?;
-            let payload = offset.checked_add(RECORD_HEADER_BYTES).ok_or("record overflow")?;
+            let payload = offset
+                .checked_add(RECORD_HEADER_BYTES)
+                .ok_or("record overflow")?;
             offset = payload.checked_add(payload_len).ok_or("record overflow")?;
             if offset > bytes.len() {
                 return Err("record outside artifact");
@@ -329,7 +334,8 @@ impl UnicodeCompileArtifact {
         }
         let mut scalars = 0_usize;
         for scalar in self.scalar_encodings() {
-            let text = core::str::from_utf8(scalar.as_bytes()).map_err(|_| "invalid scalar UTF-8")?;
+            let text =
+                core::str::from_utf8(scalar.as_bytes()).map_err(|_| "invalid scalar UTF-8")?;
             let mut chars = text.chars();
             let character = chars.next().ok_or("empty scalar encoding")?;
             if chars.next().is_some() {
@@ -447,7 +453,11 @@ struct Measure {
 
 impl Measure {
     fn new(limits: UnicodeCompileBuildLimits) -> Result<Self, UnicodeCompileBuildError> {
-        enforce(HEADER_BYTES, limits.max_artifact_bytes, UnicodeCompileResource::ArtifactBytes)?;
+        enforce(
+            HEADER_BYTES,
+            limits.max_artifact_bytes,
+            UnicodeCompileResource::ArtifactBytes,
+        )?;
         Ok(Self {
             limits,
             bytes: HEADER_BYTES,
@@ -460,10 +470,18 @@ impl Measure {
     fn record(&mut self, payload: usize) -> Result<(), UnicodeCompileBuildError> {
         self.nodes = checked_add(self.nodes, 1, UnicodeCompileResource::Work)?;
         self.work = checked_add(self.work, 1, UnicodeCompileResource::Work)?;
-        enforce(self.work, self.limits.max_work, UnicodeCompileResource::Work)?;
+        enforce(
+            self.work,
+            self.limits.max_work,
+            UnicodeCompileResource::Work,
+        )?;
         self.bytes = checked_add(
             self.bytes,
-            checked_add(RECORD_HEADER_BYTES, payload, UnicodeCompileResource::ArtifactBytes)?,
+            checked_add(
+                RECORD_HEADER_BYTES,
+                payload,
+                UnicodeCompileResource::ArtifactBytes,
+            )?,
             UnicodeCompileResource::ArtifactBytes,
         )?;
         enforce(
@@ -481,7 +499,11 @@ impl Measure {
             UnicodeCompileResource::ScalarEncodings,
         )?;
         self.work = checked_add(self.work, width, UnicodeCompileResource::Work)?;
-        enforce(self.work, self.limits.max_work, UnicodeCompileResource::Work)
+        enforce(
+            self.work,
+            self.limits.max_work,
+            UnicodeCompileResource::Work,
+        )
     }
 }
 
@@ -602,9 +624,7 @@ fn encode_hir(hir: &Hir, output: &mut Vec<u8>) -> Result<(), UnicodeCompileBuild
         }
         HirKind::Class(Class::Bytes(class)) => {
             let pairs = class.ranges().len().checked_mul(4).ok_or(
-                UnicodeCompileBuildError::ArithmeticOverflow(
-                    UnicodeCompileResource::ArtifactBytes,
-                ),
+                UnicodeCompileBuildError::ArithmeticOverflow(UnicodeCompileResource::ArtifactBytes),
             )?;
             let payload_len = checked_add(8, pairs, UnicodeCompileResource::ArtifactBytes)?;
             record_header(output, TAG_SCALAR_CLASS, payload_len)?;
@@ -717,7 +737,10 @@ fn enforce(
 fn artifact_identity(bytes: &[u8]) -> UnicodeCompileArtifactId {
     let mut first = 0xcbf2_9ce4_8422_2325_u64;
     let mut second = 0x8422_2325_cbf2_9ce4_u64;
-    for &byte in b"fre.unicode.compile-artifact.rust-bytes.v1".iter().chain(bytes) {
+    for &byte in b"fre.unicode.compile-artifact.rust-bytes.v1"
+        .iter()
+        .chain(bytes)
+    {
         first ^= u64::from(byte);
         first = first.wrapping_mul(0x0000_0100_0000_01B3);
         second ^= u64::from(byte).rotate_left(3);

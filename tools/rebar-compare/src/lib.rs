@@ -31,7 +31,8 @@ use fre::{
     LiteralAggregateReduceLimits, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError, UnicodeCompileBuildLimits,
+    UnicodeCompileArtifactBuilder, UnicodeCompileBuildError,
+    UnicodeCompileBuildLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -1683,11 +1684,7 @@ impl ExecutionError {
 }
 
 fn rust_compile(job: &Job, patterns: &[String]) -> Result<Regex, ExecutionError> {
-    rust_compile_profile(
-        patterns,
-        job.regex.unicode,
-        job.regex.case_insensitive,
-    )
+    rust_compile_profile(patterns, job.regex.unicode, job.regex.case_insensitive)
 }
 
 fn rust_compile_profile(
@@ -1875,8 +1872,7 @@ fn fre_compile_verify(
         Ok(regex) => regex,
         Err(AggregateBuildError::ContinuationCompile {
             source:
-                AggregateEngineError::Unsupported(_)
-                | AggregateEngineError::ResourceLimit { .. },
+                AggregateEngineError::Unsupported(_) | AggregateEngineError::ResourceLimit { .. },
             ..
         }) if request.unicode => {
             return fre_unicode_compile_verify(request, pattern, limits);
@@ -1914,9 +1910,7 @@ fn unicode_compile_build_error(error: &UnicodeCompileBuildError) -> ExecutionErr
         | UnicodeCompileBuildError::ProfileMismatch
         | UnicodeCompileBuildError::InvalidUtf8Literal
         | UnicodeCompileBuildError::InvalidByteClass
-        | UnicodeCompileBuildError::ResourceLimit { .. } => {
-            ExecutionError::unsupported(message)
-        }
+        | UnicodeCompileBuildError::ResourceLimit { .. } => ExecutionError::unsupported(message),
         UnicodeCompileBuildError::ArithmeticOverflow(_)
         | UnicodeCompileBuildError::AllocationFailed { .. }
         | UnicodeCompileBuildError::InternalInvariant(_) => ExecutionError::fault(message),
@@ -1951,11 +1945,8 @@ fn fre_unicode_compile_verify(
             "FRE Unicode compile artifact failed untimed structural verification: {detail}"
         ))
     })?;
-    let verifier = rust_compile_profile(
-        request.patterns,
-        request.unicode,
-        request.case_insensitive,
-    )?;
+    let verifier =
+        rust_compile_profile(request.patterns, request.unicode, request.case_insensitive)?;
     let actual = count_matches(&verifier, request.haystack, limits.reducer_steps)?;
     Ok(FreReduction {
         actual,
