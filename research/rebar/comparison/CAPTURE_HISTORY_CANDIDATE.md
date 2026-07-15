@@ -5,11 +5,11 @@ Status: source-only candidate recomposed on exact canonical base
 `260ab9e1ca6d3e4979e50dcf5deab3a572d57c8b`). No compiler, formatter,
 executable test, report generation, assembly, or timing command was run in this
 lane. The candidate adapter identity advances to
-`fre-current-aggregate-v10` for the combined breadth-plus-capture-plus-redux-plus-boundary route. The
+`fre-current-aggregate-v11` for the combined breadth-plus-capture-plus-redux-plus-boundary-plus-compile-many route. The
 direct Unicode scalar, compile-only Unicode fallback, finite reducer, portable
 Unicode scalar-class, ordered build-many, and timing surfaces retain their
 existing plan, schema, route, and timing identities; the separately typed
-regex-redux and positive Unicode-word routes are additive. No combined report has
+regex-redux, positive Unicode-word, and ordered compile-many routes are additive. No combined report has
 been generated. The separately authenticated direct-scalar frontier remains
 214 pass / 130 unsupported, while the breadth source retains only its documented
 overlap-aware projected ceiling. Capture adds a bounded evaluation universe of

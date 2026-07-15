@@ -41,7 +41,8 @@ one row from unsupported to pass: `regex-redux +1`, total pass `+1`, total
 unsupported `-1`. The scalar-plus-breadth ceiling is 228 rows, and capture has
 at most 22 statically eligible rows before syntax/resource classification, so
 the positive Unicode-word boundary contributes exactly one additional projected
-`grep` row. The combined arithmetic ceiling is therefore at most 252 pass / 92
+`grep` row, and ordered compile-many contributes one bounded dictionary row.
+The combined arithmetic ceiling is therefore at most 253 pass / 91
 unsupported. This is an evaluation bound, not observed coverage and not a
 claim that all 22 capture rows pass.
 
