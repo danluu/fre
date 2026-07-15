@@ -806,7 +806,7 @@ impl UnicodeScalarAggregatePlan {
             binary_search_comparison_bound(self.non_ascii.len())
                 .checked_add(
                     usize::from(self.repetition.is_run() && !self.non_ascii.is_empty())
-                        .checked_mul(2)
+                        .checked_mul(3)
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "cached range comparison allowance",
                         })?,
