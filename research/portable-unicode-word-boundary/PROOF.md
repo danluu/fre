@@ -8,6 +8,38 @@ Unicode word-boundary core from
 build, assembly, benchmark, or generated Rebar report was run for this
 checkpoint.
 
+## Recomposition ledger
+
+The replay had five textual conflicts and three clean semantic overlaps:
+
+- `crates/fre/tests/portable_assertions.rs` already contained the breadth
+  source's scalar-class differential. The resolution retains it, adds the
+  positive-boundary differential, makes the exact combined
+  `\b\w{25,}\b` differential build and compare every window, and keeps the
+  uncertified Unicode looks as typed refusals.
+- `crates/fre-lower/README.md` and `crates/fre-lower/src/lib.rs` already
+  documented canonical UTF-8 scalar-class lowering. Both conflicts retain
+  that route and add only positive Unicode-word boundary admission.
+- `research/portable-assertions/PROOF.md` retains the historical refusal and
+  records that later class and boundary mechanisms jointly project the target.
+- `tools/rebar-compare/src/lib.rs` retains every aggregate v7 route: direct
+  scalar execution, Unicode compile fallback, finite-language reduction,
+  ordered build-many, continuation, and portable scalar classes. The composed
+  capability bumps the adapter to `fre-current-aggregate-v8` and adds only
+  positive Unicode-word boundary admission.
+- `crates/fre-lower/src/compiler.rs` merged cleanly: the existing
+  `Utf8Sequences` class expansion is unchanged and `WordUnicode` alone moves
+  from the refusal arm to `AssertWordUnicode`.
+- `research/rebar/comparison/COVERAGE_FRONTIER.md` merged textually but
+  overlapped semantically. Its authenticated hashes and tables remain intact;
+  only the source-only projection is updated for the composed mechanisms.
+- The final four-byte boundary adversaries merged cleanly with both the facade
+  scalar-class specifications and this proof. No breadth test was removed.
+
+All other replayed paths were disjoint from the breadth delta. The dependency
+manifest change only enables the workspace-pinned `regex-syntax` Unicode-word
+table in `fre-automata`; it does not alter a planner route.
+
 ## Exact predicate
 
 K0 adds one zero-width graph edge for `regex_syntax::hir::Look::WordUnicode`.
