@@ -98,9 +98,17 @@ fn fixture(case: &str, requested_size: usize) -> Result<Fixture, String> {
                     "CASE {case:?} requires SIZE in the inclusive range 42..=73"
                 ));
             }
-            let tail_len = requested_size - 1;
-            let middle = 8 + (tail_len - 41) / 2;
-            let suffix_index = middle + 1;
+            let tail_len = requested_size
+                .checked_sub(1)
+                .ok_or("middle-hit tail underflow")?;
+            let middle = tail_len
+                .checked_sub(41)
+                .and_then(|value| value.checked_div(2))
+                .and_then(|value| value.checked_add(8))
+                .ok_or("middle-hit midpoint overflow")?;
+            let suffix_index = middle
+                .checked_add(1)
+                .ok_or("middle-hit suffix index overflow")?;
             let suffix_end = suffix_index
                 .checked_add(suffix.len())
                 .ok_or("middle-hit suffix end overflow")?;
@@ -416,7 +424,7 @@ mod tests {
             ),
             (
                 r"\A[a-z]+Z",
-                "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5",
+                "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6",
             ),
         ] {
             let regex = build_fre("forward", pattern).unwrap();

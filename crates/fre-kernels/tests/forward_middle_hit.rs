@@ -4,7 +4,7 @@ use fre_kernels::{
     ForwardClassImplementation,
 };
 
-const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5";
+const MIDDLE_HIT_PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6";
 
 fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
     ForwardAnchoredPlan::build(
@@ -20,7 +20,7 @@ fn plan(members: &[u8], suffix: &[u8]) -> ForwardAnchoredPlan {
 }
 
 #[test]
-fn short_middle_hits_use_one_forward_witness_for_pair_triple_and_quad() {
+fn short_middle_hits_use_one_forward_witness_for_pair_and_quad() {
     assert_eq!(FORWARD_ANCHORED_PLAN_ID, MIDDLE_HIT_PLAN_ID);
 
     for (members, suffix, implementation) in [
@@ -30,15 +30,6 @@ fn short_middle_hits_use_one_forward_witness_for_pair_triple_and_quad() {
             ForwardClassImplementation::Pair {
                 first: b'\t',
                 second: b' ',
-            },
-        ),
-        (
-            b"ace".as_slice(),
-            b"Z".as_slice(),
-            ForwardClassImplementation::Triple {
-                first: b'a',
-                second: b'c',
-                third: b'e',
             },
         ),
         (
@@ -92,4 +83,16 @@ fn quint_and_long_small_classes_keep_the_edge_witness_geometry() {
         assert_eq!(accounting.prefilter_calls, 1);
         assert!(accounting.suffix_confirmation_attempted);
     }
+}
+
+#[test]
+fn short_triple_keeps_the_measured_edge_witness_geometry() {
+    let triple = plan(b"ace", b"Z");
+    let mut haystack: Vec<u8> = b"ace".iter().copied().cycle().take(64).collect();
+    haystack[63] = b'Z';
+    let (span, accounting) = triple
+        .find(&haystack, ForwardAnchoredSearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(span, Some((0, 64)));
+    assert_eq!(accounting.prefilter_calls, 0);
 }

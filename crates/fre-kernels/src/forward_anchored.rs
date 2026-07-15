@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5";
+pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -1040,7 +1040,7 @@ impl ForwardAnchoredPlan {
                     | ClassImplementation::Quad { .. }
                     | ClassImplementation::Quint { .. }
             );
-            // On short Pair/Triple/Quad tails, a suffix-first byte in the
+            // On short Pair/Quad tails, a suffix-first byte in the
             // middle is common enough that searching the reverse 32-byte
             // edge first is pure extra work. One forward native search also
             // returns the authoritative first outsider. Keep Quint isolated
@@ -1050,9 +1050,7 @@ impl ForwardAnchoredPlan {
                 <= SHORT_FORWARD_WITNESS_MAX
                 && matches!(
                     self.implementation,
-                    ClassImplementation::Pair { .. }
-                        | ClassImplementation::Triple { .. }
-                        | ClassImplementation::Quad { .. }
+                    ClassImplementation::Pair { .. } | ClassImplementation::Quad { .. }
                 );
             let (relative_candidate, prefilter_calls) = if uses_short_forward_witness {
                 (memchr(self.suffix[0], &searched[1..]), 1)
@@ -2134,7 +2132,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.short72-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v5"
+            "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6"
         );
         assert_eq!(
             pair.implementation(),
@@ -2746,9 +2744,7 @@ mod tests {
                     let uses_short_forward_witness = length <= 73
                         && matches!(
                             plan.implementation(),
-                            ClassImplementation::Pair { .. }
-                                | ClassImplementation::Triple { .. }
-                                | ClassImplementation::Quad { .. }
+                            ClassImplementation::Pair { .. } | ClassImplementation::Quad { .. }
                         );
                     let expected_prefilter_calls = if uses_short_forward_witness || length <= 64 {
                         1
@@ -2773,7 +2769,10 @@ mod tests {
                 assert_eq!(accounting.prefilter_calls, 1);
                 assert_eq!(
                     accounting.suffix_confirmation_attempted,
-                    matches!(plan.implementation(), ClassImplementation::Quint { .. })
+                    matches!(
+                        plan.implementation(),
+                        ClassImplementation::Triple { .. } | ClassImplementation::Quint { .. }
+                    )
                 );
                 assert!(accounting.prefix_bytes_examined > wrong_outsider);
                 assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
@@ -2798,14 +2797,22 @@ mod tests {
 
             let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
             assert_eq!(span, None);
-            assert_eq!(accounting.prefilter_calls, 1);
+            let expected_calls = usize::from(!matches!(
+                plan.implementation(),
+                ClassImplementation::Triple { .. }
+            ));
+            assert_eq!(accounting.prefilter_calls, expected_calls);
             assert!(accounting.suffix_confirmation_attempted);
             // The bounded short path selects the first suffix-first byte, so
             // the known outsider itself is excluded from the prefix scan.
-            assert_eq!(
-                accounting.prefix_bytes_examined,
-                first_candidate.checked_add(1).unwrap()
-            );
+            let expected_examined = first_candidate
+                .checked_add(usize::from(matches!(
+                    plan.implementation(),
+                    ClassImplementation::Triple { .. }
+                )))
+                .and_then(|value| value.checked_add(1))
+                .unwrap();
+            assert_eq!(accounting.prefix_bytes_examined, expected_examined);
 
             haystack[first_candidate + 1] = suffix[1];
             assert_eq!(
@@ -2874,7 +2881,7 @@ mod tests {
     fn triple_plan_target_lengths_and_long_boundary_have_exact_calls() {
         let plan = plan(ByteClass::from_bytes(b"ace"), b"Z", false);
         for (length, positive_calls, absent_calls) in
-            [(56_usize, 1_usize, 1_usize), (64, 1, 1), (65, 1, 1)]
+            [(56_usize, 0_usize, 1_usize), (64, 0, 1), (65, 1, 2)]
         {
             let mut positive: Vec<u8> = b"ace".iter().copied().cycle().take(length).collect();
             positive[length - 1] = b'Z';
