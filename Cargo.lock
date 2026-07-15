@@ -123,6 +123,9 @@ dependencies = [
 [[package]]
 name = "fre-automata"
 version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+]
 
 [[package]]
 name = "fre-capi"

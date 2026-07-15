@@ -15,14 +15,14 @@ The first certificate covers:
 - concatenation and ordered leftmost-first alternation;
 - finite greedy or lazy repetition, plus unbounded repetition whose body must
   consume at least one byte;
-- whole-original-haystack `Start` and `End`, LF line, and ASCII word
-  assertions; and
+- whole-original-haystack `Start` and `End`, LF line, ASCII word assertions,
+  and positive Unicode word boundaries; and
 - capture-node erasure only when the operation planner declares a
   capture-free output contract.
 
-It explicitly rejects CRLF and Unicode word assertions, all capture-sensitive
-operations, and unbounded repetition unless its body has
-`minimum_len() == Some(n)` for `n > 0`.
+It explicitly rejects CRLF assertions, negated/start/end/half Unicode word
+assertions, all capture-sensitive operations, and unbounded repetition unless
+its body has `minimum_len() == Some(n)` for `n > 0`.
 Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
 rejected: `None` is not treated as a non-nullability certificate. The
 restriction is required because K0's generation deduplication does not yet
@@ -59,10 +59,12 @@ while requested storage is separately preflighted and fallibly reserved.
 capture annotations. It is intentionally not multiplied when a finite repeat
 emits several copies of the same annotated subexpression.
 
-Edge order is semantic data: earlier alternation branches have higher
-priority, and loop-versus-exit ordering represents greediness. Assertions are
-emitted as original-haystack assertions, so a ranged search does not reinterpret
-its range as a new haystack.
+Edge order is semantic data: earlier alternation branches have higher priority,
+and loop-versus-exit ordering represents greediness. Assertions are emitted as
+original-haystack assertions, so a ranged search does not reinterpret its range
+as a new haystack. A positive Unicode boundary classifies at most one complete
+adjacent scalar on each side with the pinned Unicode word table; invalid or
+partial UTF-8 is non-word and a position inside a valid scalar cannot match.
 
 ## Test layers
 
@@ -78,10 +80,10 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 
 - This crate lowers `RustParsed` HIR only. It does not implement the RE2 parser
   surface or decide strict upstream constructor admission.
-- Unicode scalar classes compile to valid-UTF-8 byte paths. This is not Unicode
-  word-boundary support: Unicode word assertions remain typed refusals.
-- Absolute, LF line, and ASCII word assertions are emitted. CRLF and Unicode
-  word assertions remain typed refusals.
+- Unicode scalar classes compile to canonical valid-UTF-8 byte paths.
+- Absolute, LF line, ASCII word, and positive Unicode word-boundary assertions
+  are emitted. CRLF plus negated/start/end/half Unicode word assertions remain
+  typed refusals.
 - `RustParsed` HIR does not retain a high-level builder's separately configured
   runtime line byte. This crate gives `StartLF`/`EndLF` their literal LF HIR
   semantics; the `fre` facade refuses non-LF profiles before selecting K0.

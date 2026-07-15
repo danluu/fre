@@ -35,7 +35,7 @@ pub enum UnsupportedFeature {
     /// Legacy source-compatible identity; current scalar-class lowering emits
     /// exact UTF-8 byte paths or a typed resource/allocation error instead.
     UnicodeClass,
-    /// CRLF-aware and Unicode look assertions are not represented.
+    /// CRLF-aware and uncertified Unicode look assertions are not represented.
     LookAssertion(Look),
     /// K0 has no capture-preserving output path yet.
     CaptureSensitiveOperation,
@@ -50,7 +50,7 @@ impl fmt::Display for UnsupportedFeature {
             Self::LookAssertion(look) => {
                 write!(
                     f,
-                    "look assertion {look:?} (CRLF and Unicode look assertions are not implemented)"
+                    "look assertion {look:?} (CRLF and remaining Unicode look assertions are not implemented)"
                 )
             }
             Self::CaptureSensitiveOperation => {

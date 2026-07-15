@@ -33,13 +33,18 @@ Key invariants:
   paths continue to implement greedy ordered semantics;
 - no later unanchored start is introduced after a pending match exists;
 - assertions use the original haystack even for a ranged search; and
+- positive Unicode word boundaries decode at most one complete scalar of at
+  most four bytes on each side, classify it with the pinned UTS#18 Annex C
+  table, allocate nothing, and never match inside malformed or partial UTF-8;
+  and
 - unsafe Rust is forbidden for the entire crate.
 
 `Automaton::conservative_work_bound` certifies total charged work for a cold
 one-shot call. `conservative_reused_work_bound` includes the worst-case rare
 generation-table reset, while `conservative_transition_work_bound` isolates the
 automaton loop. These are logical, deterministic charges, not wall-clock
-deadlines.
+deadlines. One charged assertion-edge inspection covers the fixed-width UTF-8
+decodes and bounded lookup in the immutable Unicode word table.
 
 Run its isolated tests with:
 

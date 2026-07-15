@@ -5,8 +5,9 @@
 //! expressions, byte literals and byte classes, Unicode scalar classes lowered
 //! to canonical valid-UTF-8 byte paths, concatenation, ordered alternation,
 //! greedy or lazy repetition, whole-haystack start/end assertions, LF line
-//! assertions, and ASCII word assertions. CRLF/Unicode-word assertions and
-//! capture-sensitive operations are rejected explicitly.
+//! assertions, ASCII word assertions, and positive Unicode word
+//! boundaries. CRLF/remaining Unicode-word assertions and capture-sensitive
+//! operations are rejected explicitly.
 //!
 //! `RustParsed` does not retain a high-level regex builder's separately
 //! configured runtime line byte. This layer therefore implements the literal

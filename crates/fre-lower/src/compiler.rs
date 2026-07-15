@@ -167,9 +167,9 @@ impl<'h> Compiler<'h> {
                     Look::WordEndAscii => EdgeKind::AssertWordEndAscii,
                     Look::WordStartHalfAscii => EdgeKind::AssertWordStartHalfAscii,
                     Look::WordEndHalfAscii => EdgeKind::AssertWordEndHalfAscii,
+                    Look::WordUnicode => EdgeKind::AssertWordUnicode,
                     Look::StartCRLF
                     | Look::EndCRLF
-                    | Look::WordUnicode
                     | Look::WordUnicodeNegate
                     | Look::WordStartUnicode
                     | Look::WordEndUnicode
