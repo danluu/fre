@@ -8,7 +8,11 @@ comparator, strict Clippy, and format gates. The full Rebar report has SHA-256
 `132e6c75034fe6ff720af3511eca8779ebb0dd9266c243dbc9061a5157209607`
 and sorted-receipts SHA-256
 `106dce03fad55de68e32ef9bdf8be0541918119a8e189b9243fd1f4deec4df48`.
-No timing or assembly command was run.
+The qualified mechanism is retained in exact 200-row Unicode compile frontier
+`5f4da7b5536c42bbcdc467ea9c897bf990577938`; the bounded one-pattern finite
+candidate is recomposed on that frontier source-only. No new compiler, test
+executable, generated report, assembly inspection, or timing command was run
+for this composition.
 
 ## Semantic construction
 
@@ -37,7 +41,7 @@ outputs are typed preflight refusals.
 
 ## Exact qualified cluster
 
-The exact composed frontier is 189 pass / 155 unsupported. Two of the five
+The exact current frontier is 204 pass / 140 unsupported. Two of the five
 execution candidates pass; the other three now reach later typed resource
 gates instead of being rejected for pattern cardinality:
 
@@ -49,11 +53,16 @@ gates instead of being rejected for pattern cardinality:
 | `curated/05-lexer-veryl/multi@rust/regex` | `count-spans` | execution-work refusal |
 | `wild/parol-veryl/multi-patternid-ascii@rust/regex` | `count-spans` | execution-work refusal |
 
-The exact operation counts are 62 `count` and 101 `count-spans`; the two new
-passes are additive to the independently authenticated Unicode and portable
-rows. The 17 `compile` passes remain unchanged. The two multi-pattern compile
+The exact operation counts are 66 `count` and 101 `count-spans`; the two
+build-many passes are additive to the independently authenticated Unicode and
+portable rows. The 28 `compile` passes include the separately qualified Unicode compile
+artifacts and remain unchanged. The two multi-pattern compile
 jobs remain typed unsupported until the compile facade publishes a complete
 ordered artifact.
+
+The finite plan is cardinality-disjoint from build-many and does not alter
+these five dispositions. Its separately authenticated one-pattern intersection
+adds four imported/leipzig `count` rows.
 
 ## Required follow-up
 
