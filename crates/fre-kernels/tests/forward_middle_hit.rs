@@ -103,12 +103,7 @@ fn quint_candidate_block_edges_have_exact_accounting() {
     let candidate = plan(b"acegi", b"Z");
 
     for prefix_len in [31_usize, 32, 33, 71, 72, 73] {
-        let mut haystack: Vec<u8> = b"acegi"
-            .iter()
-            .copied()
-            .cycle()
-            .take(prefix_len)
-            .collect();
+        let mut haystack: Vec<u8> = b"acegi".iter().copied().cycle().take(prefix_len).collect();
         haystack.push(b'Z');
         let (span, accounting) = candidate
             .find(&haystack, ForwardAnchoredSearchLimits::unlimited())

@@ -14,7 +14,7 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6";
+pub const PLAN_ID: &str = "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str =
@@ -1079,7 +1079,7 @@ impl ForwardAnchoredPlan {
             // outside the class by construction. Validate only the prefix
             // before it so a valid candidate never enters failed-block
             // recovery merely to rediscover that known boundary.
-            let (boundary, examined) = self.scan_prefix(&searched[..candidate])?;
+            let (boundary, examined) = self.scan_candidate_prefix(&searched[..candidate])?;
             accounting.prefix_bytes_examined = accounting
                 .prefix_bytes_examined
                 .checked_add(examined)
@@ -1116,6 +1116,20 @@ impl ForwardAnchoredPlan {
 
     fn scan_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
         scan_class_prefix(bytes, self.class, self.implementation)
+    }
+
+    #[inline]
+    fn scan_candidate_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
+        match self.implementation {
+            ClassImplementation::Quint {
+                first,
+                second,
+                third,
+                fourth,
+                fifth,
+            } => scan_quint_candidate_prefix(bytes, first, second, third, fourth, fifth),
+            _ => self.scan_prefix(bytes),
+        }
     }
 
     fn preflight(
@@ -1754,6 +1768,82 @@ fn scan_quint_prefix(
     Ok((boundary, examined))
 }
 
+/// Candidate verification excludes the known suffix outsider. One reduction
+/// over each complete block keeps the Quint-only hot path compact while an
+/// earlier outsider retains the established failed-block rescan charge.
+#[inline(never)]
+fn scan_quint_candidate_prefix(
+    bytes: &[u8],
+    first: u8,
+    second: u8,
+    third: u8,
+    fourth: u8,
+    fifth: u8,
+) -> Result<(usize, usize), SearchError> {
+    let mut consumed = 0_usize;
+    let mut blocks = bytes.chunks_exact(RANGE_BLOCK);
+    for block in &mut blocks {
+        let outside = block.iter().fold(0_u8, |outside, &byte| {
+            let inside = u8::from(byte == first)
+                | u8::from(byte == second)
+                | u8::from(byte == third)
+                | u8::from(byte == fourth)
+                | u8::from(byte == fifth);
+            outside | (inside ^ 1)
+        });
+        if outside != 0 {
+            let within_block = block
+                .iter()
+                .position(|&byte| {
+                    byte != first
+                        && byte != second
+                        && byte != third
+                        && byte != fourth
+                        && byte != fifth
+                })
+                .unwrap_or(RANGE_BLOCK);
+            let boundary =
+                consumed
+                    .checked_add(within_block)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "quint candidate boundary",
+                    })?;
+            let examined = consumed
+                .checked_add(RANGE_BLOCK)
+                .and_then(|value| value.checked_add(within_block))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "failed quint candidate block examinations",
+                })?;
+            return Ok((boundary, examined));
+        }
+        consumed = consumed
+            .checked_add(RANGE_BLOCK)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "completed quint candidate blocks",
+            })?;
+    }
+    let remainder = blocks.remainder();
+    let within_remainder = remainder
+        .iter()
+        .position(|&byte| {
+            byte != first && byte != second && byte != third && byte != fourth && byte != fifth
+        })
+        .unwrap_or(remainder.len());
+    let boundary =
+        consumed
+            .checked_add(within_remainder)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "quint candidate remainder boundary",
+            })?;
+    let examined = boundary
+        .checked_add(usize::from(within_remainder < remainder.len()))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "quint candidate remainder examinations",
+        })?;
+    Ok((boundary, examined))
+}
+
 fn scan_range_prefix(bytes: &[u8], start: u8, end: u8) -> Result<(usize, usize), SearchError> {
     let width = end.wrapping_sub(start);
     let mut consumed = 0_usize;
@@ -2230,7 +2320,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6"
+            "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7"
         );
         assert_eq!(
             pair.implementation(),

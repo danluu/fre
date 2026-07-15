@@ -424,7 +424,7 @@ mod tests {
             ),
             (
                 r"\A[a-z]+Z",
-                "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v6",
+                "anchored-class-suffix.short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v7",
             ),
         ] {
             let regex = build_fre("forward", pattern).unwrap();
