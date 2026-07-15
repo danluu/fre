@@ -279,8 +279,7 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
-        if self.program.contains_unicode_word_boundary()
-            && core::str::from_utf8(haystack).is_err()
+        if self.program.contains_unicode_word_boundary() && core::str::from_utf8(haystack).is_err()
         {
             return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
         }

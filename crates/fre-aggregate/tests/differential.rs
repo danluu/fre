@@ -160,8 +160,7 @@ fn unicode_word_boundary_matches_pinned_rust_at_absolute_byte_ranges() {
         for start in 0..=haystack.len() {
             for end in start..=haystack.len() {
                 let range = start..end;
-                let expected =
-                    upstream_unicode_byte_stable_range(r"\b", haystack, range.clone());
+                let expected = upstream_unicode_byte_stable_range(r"\b", haystack, range.clone());
                 for strategy in STRATEGIES {
                     let actual = regex
                         .admit_spans(
