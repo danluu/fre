@@ -64,6 +64,7 @@ fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {
 #[test]
 fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
     let cases: &[(&str, &[u8])] = &[
+        (r"(a){0}(a)", b"a"),
         (r"(?P<left>a)|(b)", b"ab"),
         (r"()|a", b"a"),
         (r"(a*)", b"ba"),
@@ -134,6 +135,7 @@ fn reference_text_records(pattern: &str, haystack: &str) -> Vec<CaptureFixture> 
 #[test]
 fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
     let cases = [
+        (r"(a){0}(a)", "a"),
         (r"(?P<left>a)|(b)", "éab"),
         (r"()|a", "éa"),
         (r"(a*)", "éba"),

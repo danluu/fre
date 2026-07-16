@@ -144,6 +144,58 @@ fn directed_rust_capture_semantics() {
 }
 
 #[test]
+fn sparse_capture_indices_materialize_explicit_unmatched_slots() {
+    let ast = Ast::Byte(b'a').capture(2);
+    let constrained = BuildLimits {
+        max_captures: 1,
+        ..BuildLimits::default()
+    };
+    assert!(matches!(
+        Program::compile(&ast, constrained),
+        Err(BuildError::Resource {
+            kind: ResourceKind::Captures,
+            required: 2,
+            limit: 1,
+        })
+    ));
+    let (inline, history) = pair(&ast);
+    assert_eq!(inline.program().build_report().captures, 2);
+    let expected = Some(CaptureRecord {
+        groups: vec![
+            GroupRecord {
+                index: 0,
+                name: None,
+                span: Some(Span { start: 0, end: 1 }),
+            },
+            GroupRecord {
+                index: 1,
+                name: None,
+                span: None,
+            },
+            GroupRecord {
+                index: 2,
+                name: None,
+                span: Some(Span { start: 0, end: 1 }),
+            },
+        ],
+    });
+    assert_eq!(
+        inline
+            .captures(b"a", Window::all(b"a"), SearchLimits::default())
+            .unwrap()
+            .captures,
+        expected
+    );
+    assert_eq!(
+        history
+            .captures(b"a", Window::all(b"a"), SearchLimits::default())
+            .unwrap()
+            .captures,
+        expected
+    );
+}
+
+#[test]
 fn nested_repeat_capture_catalog_matches_pinned_regex() {
     let catalog = [
         Ast::Byte(b'a')

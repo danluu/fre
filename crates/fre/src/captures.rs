@@ -63,6 +63,8 @@ pub struct CaptureHirAccounting {
     pub literal_bytes: usize,
     /// Byte-class ranges copied.
     pub class_ranges: usize,
+    /// Numeric user-capture slots implied by the greatest surviving HIR index.
+    pub capture_slots: usize,
     /// Metered conversion work.
     pub work: usize,
 }
@@ -919,12 +921,9 @@ impl CaptureBuilder {
         let program =
             Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
         let engine_report = program.build_report().clone();
-        let syntax_captures = usize::try_from(syntax.captures).map_err(|_| {
-            CaptureBuildError::InternalInvariant("syntax capture count does not fit usize")
-        })?;
-        if engine_report.captures != syntax_captures {
+        if engine_report.captures != accounting.capture_slots {
             return Err(CaptureBuildError::InternalInvariant(
-                "capture compiler count differs from parsed HIR",
+                "capture compiler schema differs from parsed HIR",
             ));
         }
         let plan_identity = CapturePlanIdentity {
@@ -1362,17 +1361,25 @@ fn lower_hir(
         HirKind::Look(Look::WordEndHalfUnicode) => {
             Ok(Ast::Assert(CaptureAssertion::WordEndHalfUnicode))
         }
-        HirKind::Capture(capture) => Ok(Ast::Capture {
-            index: capture.index,
-            name: capture.name.as_ref().map(ToString::to_string),
-            child: Box::new(lower_hir(
-                capture.sub.as_ref(),
-                next_depth(depth)?,
-                line_terminator,
-                limits,
-                accounting,
-            )?),
-        }),
+        HirKind::Capture(capture) => {
+            accounting.capture_slots =
+                accounting
+                    .capture_slots
+                    .max(usize::try_from(capture.index).map_err(|_| {
+                        CaptureBuildError::InternalInvariant("capture index does not fit usize")
+                    })?);
+            Ok(Ast::Capture {
+                index: capture.index,
+                name: capture.name.as_ref().map(ToString::to_string),
+                child: Box::new(lower_hir(
+                    capture.sub.as_ref(),
+                    next_depth(depth)?,
+                    line_terminator,
+                    limits,
+                    accounting,
+                )?),
+            })
+        }
         HirKind::Repetition(repetition) => Ok(Ast::Repeat {
             child: Box::new(lower_hir(
                 repetition.sub.as_ref(),

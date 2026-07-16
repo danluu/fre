@@ -1786,6 +1786,36 @@ mod tests {
     }
 
     #[test]
+    fn pinned_captures_wrong_order_executes_on_text_capture_surface() {
+        let mut case = fixture_case(true, true, None);
+        case.id = "regression/captures-wrong-order".to_owned();
+        case.upstream_name = case.id.clone();
+        case.source_file = "regression.toml".to_owned();
+        case.source_ordinal = 77;
+        case.unicode = true;
+        case.maximum_expected_capture_slots = 3;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["(a){0}(a)".to_owned()],
+            haystack: b"a".to_vec(),
+            bounds: SearchBounds { start: 0, end: 1 },
+            line_terminator: b'\n',
+            expected: vec![ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![
+                    Some(ExpectedSpan { start: 0, end: 1 }),
+                    None,
+                    Some(ExpectedSpan { start: 0, end: 1 }),
+                ],
+            }],
+        };
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCapturesIter, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
     fn text_set_surfaces_compile_match_and_deduplicate_pattern_ids() {
         let mut case = fixture_case(true, true, None);
         case.pattern_count = 2;

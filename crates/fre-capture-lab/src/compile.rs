@@ -236,14 +236,23 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
                 stack.push((child, child_depth));
             }
             Ast::Capture { index, name, child } => {
-                if *index != next_capture {
+                if *index < next_capture {
                     return Err(BuildError::InvalidAst(
-                        "capture indices must be contiguous source order",
+                        "capture indices must increase in source order",
                     ));
                 }
                 let capture_count = usize::try_from(*index)
                     .map_err(|_| BuildError::BoundOverflow(ResourceKind::Captures))?;
                 check_limit(ResourceKind::Captures, capture_count, limits.max_captures)?;
+                let schema_entries = index
+                    .checked_sub(next_capture)
+                    .and_then(|missing| missing.checked_add(1))
+                    .ok_or(BuildError::BoundOverflow(ResourceKind::Captures))?;
+                let schema_entries = usize::try_from(schema_entries)
+                    .map_err(|_| BuildError::BoundOverflow(ResourceKind::Captures))?;
+                let schema_bytes = schema_entries
+                    .checked_mul(size_of::<GroupMeta>())
+                    .ok_or(BuildError::BoundOverflow(ResourceKind::ProgramBytes))?;
                 let copied_name = if let Some(name) = name {
                     if !valid_name(name) {
                         return Err(BuildError::InvalidAst(
@@ -257,7 +266,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
                         return Err(BuildError::InvalidAst("capture names must be unique"));
                     }
                     let estimated_metadata = metadata_bytes
-                        .checked_add(size_of::<GroupMeta>())
+                        .checked_add(schema_bytes)
                         .and_then(|bytes| bytes.checked_add(name.len()))
                         .ok_or(BuildError::BoundOverflow(ResourceKind::ProgramBytes))?;
                     check_limit(
@@ -275,7 +284,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
                     None
                 };
                 metadata_bytes = metadata_bytes
-                    .checked_add(size_of::<GroupMeta>())
+                    .checked_add(schema_bytes)
                     .and_then(|bytes| {
                         bytes.checked_add(copied_name.as_ref().map_or(0, String::capacity))
                     })
@@ -286,13 +295,19 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
                     limits.max_program_bytes,
                 )?;
                 groups
-                    .try_reserve(1)
+                    .try_reserve(schema_entries)
                     .map_err(|_| BuildError::Allocation(ResourceKind::Captures))?;
+                for missing_index in next_capture..*index {
+                    groups.push(GroupMeta {
+                        index: missing_index,
+                        name: None,
+                    });
+                }
                 groups.push(GroupMeta {
                     index: *index,
                     name: copied_name,
                 });
-                next_capture = next_capture
+                next_capture = index
                     .checked_add(1)
                     .ok_or(BuildError::BoundOverflow(ResourceKind::Captures))?;
                 stack
