@@ -127,16 +127,19 @@ Observation schema v2 keeps timing and resource state independent at every
 exact job/boundary/comparator point. Each candidate and reference arm reports
 allocator-call count, allocated bytes, bytes still live after the boundary,
 and process peak RSS through an expected collector ID and immutable collector
-digest. The raw resource record also binds canonical/semantic/input/result,
-candidate plan or reference role, lifecycle priming, and a unique process
-token. Complete deterministic fixtures convert 256 capture resource summaries
-(32 points times four metrics times two arms) into the same 344-row draft.
+digest. The canonical `fre.rebar.performance-resource-raw.v1` record also binds
+canonical/semantic/input/result, candidate plan or reference role, exact
+lifecycle preparation and priming, and a unique process token. On the accepted
+frontier, 46,176 raw metric samples (5,772 pairs times two arms times four
+metrics) convert to 7,696 measured resource summaries while the 66 semantic
+unavailable points retain 528 distinct `not-comparable` arm/metric summaries.
+The complete synthetic frontier converts all 8,224 summaries.
 Each metric can be explicitly unavailable for one engine without fabricating a
 zero or erasing other measured metrics; mixed states or inconsistent reasons
-inside a six-sample set are rejected. First-operation and steady-operation
-resource medians remain distinct lifecycle observations.
+inside a six-sample set are rejected. Cold compile, allocator-warm compile,
+first-operation, steady-operation, and composite resource medians remain
+distinct lifecycle observations.
 
 The performance gate still needs an authorized executor/collector for the
 paired timing and resource schedules, `regex-redux` after semantic support
-exists, multi-pattern support, and conversion of the remaining model
-placeholders without altering the denominator.
+exists, and an authenticated runner path for multi-pattern rows.
