@@ -1160,6 +1160,7 @@ pub struct PortableBuilder {
     profile: RustProfile,
     limits: BuildLimits,
     selection: PlanSelection,
+    set_admitted: bool,
 }
 
 impl PortableBuilder {
@@ -1173,6 +1174,7 @@ impl PortableBuilder {
             profile: RustProfile::default(),
             limits: BuildLimits::default(),
             selection: PlanSelection::Auto,
+            set_admitted: false,
         }
     }
 
@@ -1324,6 +1326,17 @@ impl PortableBuilder {
         self
     }
 
+    /// Use the already-completed aggregate Rust-set constructor admission.
+    pub(crate) const fn after_set_admission(mut self) -> Self {
+        self.set_admitted = true;
+        self
+    }
+
+    pub(crate) const fn after_set_admission_if(mut self, admitted: bool) -> Self {
+        self.set_admitted = admitted;
+        self
+    }
+
     /// Parse, plan, and independently validate an immutable portable plan.
     ///
     /// # Errors
@@ -1340,7 +1353,11 @@ impl PortableBuilder {
         let request = fre_syntax::ParseRequest::rust(self.pattern, profile.clone())
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let parsed = fre_syntax::parse(request)?;
+        let parsed = if self.set_admitted {
+            fre_syntax::parse_rust_regex_set_constituent(request)?
+        } else {
+            fre_syntax::parse(request)?
+        };
         let source = String::from_utf8(parsed.key.pattern.into_bytes())
             .map_err(|_| {
                 BuildError::InternalInvariant("Rust parse retained a non-UTF-8 source pattern")

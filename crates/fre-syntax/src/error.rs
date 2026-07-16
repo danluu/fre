@@ -77,3 +77,33 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// Failure from the pinned Rust `RegexSetBuilder` construction boundary.
+///
+/// Syntax failures retain the exact source-order pattern index. Aggregate NFA
+/// size-limit failures have no pattern index, matching `regex` 1.12.4.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustRegexSetAdmissionError {
+    pub pattern: Option<usize>,
+    pub source: ParseError,
+}
+
+impl fmt::Display for RustRegexSetAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(pattern) = self.pattern {
+            write!(
+                f,
+                "Rust regex set pattern {pattern} failed: {}",
+                self.source
+            )
+        } else {
+            write!(f, "Rust regex set admission failed: {}", self.source)
+        }
+    }
+}
+
+impl std::error::Error for RustRegexSetAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}

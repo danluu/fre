@@ -53,6 +53,11 @@ pub enum PortableTextRegexSetBuildError {
         index: usize,
         source: PortableTextBuildError,
     },
+    /// The pinned aggregate Rust text-set constructor rejected the complete
+    /// set before FRE-specific proof and planning.
+    UpstreamAdmission {
+        source: fre_syntax::ParseError,
+    },
     ArithmeticOverflow {
         computation: &'static str,
     },
@@ -86,6 +91,12 @@ impl fmt::Display for PortableTextRegexSetBuildError {
                     "portable text regex set pattern {index} failed: {source}"
                 )
             }
+            Self::UpstreamAdmission { source } => {
+                write!(
+                    formatter,
+                    "pinned Rust text regex set admission failed: {source}"
+                )
+            }
             Self::ArithmeticOverflow { computation } => write!(
                 formatter,
                 "portable text regex set overflow computing {computation}"
@@ -98,6 +109,7 @@ impl std::error::Error for PortableTextRegexSetBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pattern { source, .. } => Some(source),
+            Self::UpstreamAdmission { source } => Some(source),
             _ => None,
         }
     }
@@ -199,6 +211,18 @@ impl<'a> PortableTextRegexSetBuilder<'a> {
         self
     }
 
+    /// Set the pinned high-level text-set builder's aggregate compiled-NFA
+    /// limit.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
     /// Set the pinned high-level builder's lazy-DFA cache identity.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
@@ -240,6 +264,10 @@ impl<'a> PortableTextRegexSetBuilder<'a> {
             self.limits.max_pattern_bytes,
             |needed, limit| PortableTextRegexSetBuildError::PatternBytesLimit { needed, limit },
         )?;
+
+        let upstream_profile = fre_syntax::CompatibilityProfile::RustText(self.profile.clone());
+        fre_syntax::validate_rust_regex_set_admission(self.patterns, &upstream_profile)
+            .map_err(map_upstream_admission)?;
 
         let source_slots = checked_mul::<String>(pattern_count, "source vector slots")?;
         let regex_slots = checked_mul::<PortableTextRegex>(pattern_count, "matcher vector slots")?;
@@ -300,6 +328,7 @@ impl<'a> PortableTextRegexSetBuilder<'a> {
             let regex = PortableTextBuilder::new(pattern.as_str())
                 .profile(self.profile.clone())
                 .limits(self.limits.pattern)
+                .after_set_admission()
                 .build()
                 .map_err(|source| PortableTextRegexSetBuildError::Pattern { index, source })?;
             let portable = &regex.build_report().portable;
@@ -367,6 +396,21 @@ impl<'a> PortableTextRegexSetBuilder<'a> {
             regexes,
             report,
         })
+    }
+}
+
+fn map_upstream_admission(
+    error: fre_syntax::RustRegexSetAdmissionError,
+) -> PortableTextRegexSetBuildError {
+    if let Some(index) = error.pattern {
+        PortableTextRegexSetBuildError::Pattern {
+            index,
+            source: PortableTextBuildError::TextSyntax(error.source),
+        }
+    } else {
+        PortableTextRegexSetBuildError::UpstreamAdmission {
+            source: error.source,
+        }
     }
 }
 

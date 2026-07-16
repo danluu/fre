@@ -1,4 +1,4 @@
-use regex_automata::{MatchKind, meta};
+use regex_automata::{MatchKind, meta, nfa::thompson::WhichCaptures, util::syntax};
 use regex_syntax::{
     ParserBuilder,
     hir::{Class, Hir, HirKind},
@@ -7,10 +7,14 @@ use regex_syntax::{
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustConstructor, RustOptions, RustParsed, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
+    RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError, SCHEMA_VERSION,
+    SafetyEnvelope, UnicodeVersion,
 };
 
-pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseError> {
+pub(crate) fn parse_rust(
+    request: ParseRequest,
+    enforce_single_size_limit: bool,
+) -> Result<ParseRecord, ParseError> {
     let (pattern, profile, admission, safety) = request.into_parts();
     let Some(source) = pattern.as_str() else {
         return Err(ParseError::new(
@@ -59,7 +63,9 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
             record
         }
     })?;
-    enforce_high_level_size_limit(&hir, &profile, options)?;
+    if enforce_single_size_limit {
+        enforce_high_level_size_limit(&hir, &profile, options)?;
+    }
     let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
     let summary = summarize_hir(&hir, source_bytes, &profile, admission, safety)?;
     Ok(ParseRecord {
@@ -74,6 +80,125 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
         summary,
         pattern: CanonicalPattern::Rust(RustParsed { hir }),
     })
+}
+
+pub(crate) fn validate_regex_set_admission<P: AsRef<str>>(
+    patterns: &[P],
+    profile: &CompatibilityProfile,
+) -> Result<(), RustRegexSetAdmissionError> {
+    let (rust, utf8) = match profile {
+        CompatibilityProfile::RustText(rust) => (rust, true),
+        CompatibilityProfile::RustBytes(rust) => (rust, false),
+        CompatibilityProfile::Re2(_) => {
+            return Err(RustRegexSetAdmissionError {
+                pattern: None,
+                source: ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::InvalidConfiguration,
+                    "Rust regex set admission requires a Rust profile",
+                ),
+            });
+        }
+    };
+    validate_rust_configuration(profile, &rust.options).map_err(|source| {
+        RustRegexSetAdmissionError {
+            pattern: None,
+            source,
+        }
+    })?;
+    let RustConstructor::RegexBuilder {
+        size_limit,
+        dfa_size_limit,
+        ..
+    } = rust.constructor
+    else {
+        return Ok(());
+    };
+    let limit = usize::try_from(size_limit).map_err(|_| RustRegexSetAdmissionError {
+        pattern: None,
+        source: ParseError::new(
+            profile.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "the high-level Rust regex set size limit does not fit this target",
+        ),
+    })?;
+    let dfa_size_limit =
+        usize::try_from(dfa_size_limit).map_err(|_| RustRegexSetAdmissionError {
+            pattern: None,
+            source: ParseError::new(
+                profile.clone(),
+                ErrorCategory::InvalidConfiguration,
+                "the high-level Rust regex set DFA size limit does not fit this target",
+            ),
+        })?;
+    let options = &rust.options;
+    let metac = meta::Config::new()
+        .nfa_size_limit(Some(limit))
+        .hybrid_cache_capacity(dfa_size_limit)
+        .match_kind(MatchKind::All)
+        .utf8_empty(utf8)
+        .line_terminator(options.line_terminator)
+        .which_captures(WhichCaptures::None);
+    let syntaxc = syntax::Config::new()
+        .nest_limit(options.nest_limit)
+        .octal(options.octal)
+        .utf8(utf8)
+        .ignore_whitespace(options.ignore_whitespace)
+        .case_insensitive(options.case_insensitive)
+        .multi_line(options.multi_line)
+        .dot_matches_new_line(options.dot_matches_new_line)
+        .crlf(options.crlf)
+        .line_terminator(options.line_terminator)
+        .swap_greed(options.swap_greed)
+        .unicode(options.unicode);
+    meta::Builder::new()
+        .configure(metac)
+        .syntax(syntaxc)
+        .build_many(patterns)
+        .map(|_| ())
+        .map_err(|error| map_regex_set_build_error(&error, profile))
+}
+
+fn map_regex_set_build_error(
+    error: &meta::BuildError,
+    profile: &CompatibilityProfile,
+) -> RustRegexSetAdmissionError {
+    let pattern = error.pattern().map(|id| id.as_usize());
+    let mut source = if let Some(limit) = error.size_limit() {
+        ParseError::new(
+            profile.clone(),
+            ErrorCategory::UpstreamRustCompiledTooBig {
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            },
+            format!("Compiled regex exceeds size limit of {limit} bytes."),
+        )
+    } else if let Some(syntax_error) = error.syntax_error() {
+        ParseError::new(
+            profile.clone(),
+            ErrorCategory::UpstreamRustSyntax,
+            syntax_error.to_string(),
+        )
+    } else {
+        ParseError::new(
+            profile.clone(),
+            ErrorCategory::UpstreamRustSyntax,
+            error.to_string(),
+        )
+    };
+    if let Some(syntax_error) = error.syntax_error() {
+        let span = match syntax_error {
+            regex_syntax::Error::Parse(error) => Some(error.span()),
+            regex_syntax::Error::Translate(error) => Some(error.span()),
+            _ => None,
+        };
+        if let Some(span) = span {
+            source = source.with_span(crate::SourceSpan {
+                start: u64::try_from(span.start.offset).unwrap_or(u64::MAX),
+                end: u64::try_from(span.end.offset).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    RustRegexSetAdmissionError { pattern, source }
 }
 
 fn enforce_high_level_size_limit(
