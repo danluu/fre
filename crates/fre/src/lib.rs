@@ -3692,11 +3692,25 @@ mod tests {
     }
 
     #[test]
-    fn uncertified_nullable_loop_is_a_build_error() {
-        let error = PortableBuilder::new("(?:|a)*")
+    fn certified_empty_first_loop_builds_and_reversed_shape_refuses() {
+        let certified = PortableBuilder::new("(?:|a)*")
             .unicode(false)
             .build()
-            .unwrap_err();
+            .expect("empty-first nullable loop is normalized");
+        assert_eq!(certified.build_report().plan, PlanKind::K0);
+        assert_eq!(
+            certified
+                .build_report()
+                .lowering
+                .expect("K0 lowering report")
+                .normalized_nullable_repetitions(),
+            1
+        );
+
+        let error = PortableBuilder::new("(?:a|)*")
+            .unicode(false)
+            .build()
+            .expect_err("reversed nullable alternative remains uncertified");
         assert!(matches!(
             error,
             BuildError::Lower(fre_lower::LowerError::Unsupported(
