@@ -918,6 +918,208 @@ fn aggregate_many_builder_with_limits<'a>(
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
 
+/// Reconstructible compile request for the exact pinned Rust-regex reference
+/// adapter.
+///
+/// Construction is deliberately deferred so an executor can measure exactly
+/// one fresh complete regex construction. Semantic verification is performed
+/// on the returned artifact after the construction duration is captured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustRegexReferenceCompileLifecycle {
+    patterns: Vec<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+}
+
+/// Fresh complete pinned Rust-regex artifact returned by one deferred
+/// construction.
+#[derive(Debug)]
+pub struct RustRegexReferenceCompileArtifact {
+    regex: Regex,
+}
+
+impl RustRegexReferenceCompileLifecycle {
+    /// Construct one fresh complete pinned Rust-regex artifact. Builder
+    /// configuration and construction are both inside this call; semantic
+    /// verification is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact pinned adapter compilation failure.
+    pub fn construct(&self) -> Result<RustRegexReferenceCompileArtifact, CompareError> {
+        let regex = rust_compile_options(&self.patterns, self.unicode, self.case_insensitive)
+            .map_err(|error| CompareError::new(error.message))?;
+        Ok(RustRegexReferenceCompileArtifact { regex })
+    }
+}
+
+impl RustRegexReferenceCompileArtifact {
+    /// Verify the compiled artifact outside its construction measurement using
+    /// the compile model's exact semantic reducer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or reducer failure.
+    pub fn verify(
+        &self,
+        lifecycle: &RustRegexReferenceCompileLifecycle,
+        haystack: &[u8],
+    ) -> Result<u64, CompareError> {
+        if haystack.len() != lifecycle.haystack_len {
+            return Err(CompareError::new(format!(
+                "Rust reference compile lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                lifecycle.haystack_len
+            )));
+        }
+        count_matches(&self.regex, haystack, RunLimits::default().reducer_steps)
+            .map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Create a deferred pinned Rust-regex compile lifecycle bound to one exact
+/// input length.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set.
+pub fn rust_regex_reference_compile_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<RustRegexReferenceCompileLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "Rust reference compile lifecycle requires at least one pattern",
+        ));
+    }
+    Ok(RustRegexReferenceCompileLifecycle {
+        patterns: patterns.to_vec(),
+        unicode,
+        case_insensitive,
+        haystack_len,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RustRegexReferenceOperationModel {
+    Count,
+    CountSpans,
+    CountCaptures,
+    Grep,
+    GrepCaptures,
+}
+
+impl RustRegexReferenceOperationModel {
+    fn parse(model: &str) -> Result<Self, CompareError> {
+        match model {
+            "count" => Ok(Self::Count),
+            "count-spans" => Ok(Self::CountSpans),
+            "count-captures" => Ok(Self::CountCaptures),
+            "grep" => Ok(Self::Grep),
+            "grep-captures" => Ok(Self::GrepCaptures),
+            other => Err(CompareError::new(format!(
+                "unexpected Rust reference operation lifecycle model {other}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::CountSpans => "count-spans",
+            Self::CountCaptures => "count-captures",
+            Self::Grep => "grep",
+            Self::GrepCaptures => "grep-captures",
+        }
+    }
+}
+
+/// One already-built pinned Rust-regex artifact for first/steady public
+/// operation reference boundaries.
+#[derive(Debug)]
+pub struct RustRegexReferenceOperationLifecycle {
+    model: RustRegexReferenceOperationModel,
+    regex: Regex,
+    haystack_len: usize,
+    reducer_steps: u64,
+}
+
+impl RustRegexReferenceOperationLifecycle {
+    /// Exact Rebar operation model retained by this artifact.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Execute one complete reference operation on the same retained artifact.
+    /// Calling this once is the first-operation boundary; one verified untimed
+    /// call followed by another call is the steady-operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or checked reducer failure.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "Rust reference operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let reduced = match self.model {
+            RustRegexReferenceOperationModel::Count => {
+                count_matches(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::CountSpans => {
+                count_spans(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::CountCaptures => {
+                count_captures(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::Grep => {
+                grep(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::GrepCaptures => {
+                grep_captures(&self.regex, haystack, self.reducer_steps)
+            }
+        };
+        reduced.map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Build one exact pinned Rust-regex operation lifecycle outside the measured
+/// first/steady public operation boundary.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set, a non-operation model, or exact
+/// pinned adapter compilation failure.
+pub fn rust_regex_reference_operation_lifecycle(
+    model: &str,
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<RustRegexReferenceOperationLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "Rust reference operation lifecycle requires at least one pattern",
+        ));
+    }
+    let model = RustRegexReferenceOperationModel::parse(model)?;
+    let regex = rust_compile_options(patterns, unicode, case_insensitive)
+        .map_err(|error| CompareError::new(error.message))?;
+    Ok(RustRegexReferenceOperationLifecycle {
+        model,
+        regex,
+        haystack_len,
+        reducer_steps: RunLimits::default().reducer_steps,
+    })
+}
+
 /// Reconstructible compile request for one exact authenticated aggregate row.
 ///
 /// Construction is deliberately deferred so an executor can place precisely
@@ -2355,13 +2557,21 @@ impl ExecutionError {
 }
 
 fn rust_compile(job: &Job, patterns: &[String]) -> Result<Regex, ExecutionError> {
+    rust_compile_options(patterns, job.regex.unicode, job.regex.case_insensitive)
+}
+
+fn rust_compile_options(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<Regex, ExecutionError> {
     let config = Regex::config()
         .utf8_empty(false)
         .nfa_size_limit(Some(NFA_SIZE_LIMIT));
     let syntax = regex_automata::util::syntax::Config::new()
         .utf8(false)
-        .unicode(job.regex.unicode)
-        .case_insensitive(job.regex.case_insensitive);
+        .unicode(unicode)
+        .case_insensitive(case_insensitive);
     Regex::builder()
         .configure(config)
         .syntax(syntax)
@@ -5715,6 +5925,89 @@ mod tests {
             ),
             0,
             "compile-many-continuation-program",
+        );
+    }
+
+    #[test]
+    fn rust_reference_lifecycles_separate_fresh_compile_from_same_artifact_operations() {
+        let patterns = vec![r"(a)(b)?".to_string()];
+        let haystack = b"ab a\nzz\nab\n";
+        let compile =
+            rust_regex_reference_compile_lifecycle(&patterns, false, false, haystack.len())
+                .expect("Rust reference compile lifecycle");
+        let first_artifact = compile.construct().expect("first fresh Rust artifact");
+        assert_eq!(
+            first_artifact
+                .verify(&compile, haystack)
+                .expect("first compile verification"),
+            3
+        );
+        let second_artifact = compile.construct().expect("second fresh Rust artifact");
+        assert_eq!(
+            second_artifact
+                .verify(&compile, haystack)
+                .expect("second compile verification"),
+            3
+        );
+        assert!(second_artifact.verify(&compile, b"ab").is_err());
+
+        for (model, expected) in [
+            ("count", 3),
+            ("count-spans", 5),
+            ("count-captures", 8),
+            ("grep", 2),
+            ("grep-captures", 8),
+        ] {
+            let lifecycle = rust_regex_reference_operation_lifecycle(
+                model,
+                &patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("Rust reference operation lifecycle");
+            assert_eq!(lifecycle.model(), model);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first operation"),
+                expected
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady operation"),
+                expected
+            );
+            assert!(lifecycle.execute(b"ab").is_err());
+        }
+
+        let unicode_patterns = vec![r"\pL+".to_string()];
+        let unicode = rust_regex_reference_operation_lifecycle(
+            "count",
+            &unicode_patterns,
+            true,
+            true,
+            "雪 SNOW".len(),
+        )
+        .expect("Unicode case-insensitive reference lifecycle");
+        assert_eq!(
+            unicode
+                .execute("雪 SNOW".as_bytes())
+                .expect("Unicode reference operation"),
+            2
+        );
+
+        assert!(rust_regex_reference_compile_lifecycle(&[], false, false, 0).is_err());
+        assert!(
+            rust_regex_reference_operation_lifecycle(
+                "compile",
+                &patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            rust_regex_reference_operation_lifecycle("count", &["(".to_string()], false, false, 0,)
+                .is_err()
         );
     }
 
