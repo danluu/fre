@@ -213,7 +213,6 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
         "(?:a*)*?",
         "(?:a?)+?",
         "(?:a?){3,}?",
-        "(?:|a)*",
         "(?:a|)*",
         "(?:a*|b)*",
     ] {
@@ -508,6 +507,163 @@ fn ordered_start_look_nullable_repetition_proof_and_resources_are_exact() {
         LowerLimits::default(),
     )
     .expect("certified start-look repetition lowers");
+    let stats = exact.stats();
+    let exact_work = stats.work();
+    let exact_storage = (stats.states() + 1) * core::mem::size_of::<u32>()
+        + stats.states() * core::mem::size_of::<fre_automata::StateRole>()
+        + stats.edges()
+            * (core::mem::size_of::<u32>()
+                + core::mem::size_of::<EdgeKind>()
+                + 2 * core::mem::size_of::<u8>());
+    let exact_storage_u64 = u64::try_from(exact_storage).expect("small graph storage fits u64");
+
+    let exact_limits = LowerLimits {
+        max_work: exact_work,
+        automata: fre_automata::CompileLimits {
+            max_storage_bytes: exact_storage,
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    assert_eq!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, exact_limits)
+            .expect("exact work and storage limits succeed")
+            .stats(),
+        stats
+    );
+
+    let work_short = LowerLimits {
+        max_work: exact_work - 1,
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, work_short),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            needed,
+            limit,
+        }) if needed > limit && limit == exact_work - 1
+    ));
+
+    let storage_short = LowerLimits {
+        automata: fre_automata::CompileLimits {
+            max_storage_bytes: exact_storage - 1,
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, storage_short),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::StorageBytes,
+            needed,
+            limit,
+        }) if needed == exact_storage_u64 && limit == exact_storage_u64 - 1
+    ));
+}
+
+#[test]
+fn ordered_empty_nullable_repetitions_match_pinned_upstream_at_every_start() {
+    let patterns = [
+        r"(?:|a)*",
+        r"(?:|a)+",
+        r"(?:|a)+b",
+        r"(?:|[a\n])*b?",
+        r"(?:|ab)+",
+    ];
+    let alphabet = [b'a', b'b', b'\n'];
+    let mut haystacks = vec![Vec::new()];
+    for len in 1..=5 {
+        let count = alphabet
+            .len()
+            .pow(u32::try_from(len).expect("short byte word"));
+        for mut number in 0..count {
+            let mut haystack = vec![0; len];
+            for byte in &mut haystack {
+                *byte = alphabet[number % alphabet.len()];
+                number /= alphabet.len();
+            }
+            haystacks.push(haystack);
+        }
+    }
+
+    for pattern in patterns {
+        let parsed = parsed(pattern, false);
+        let lowered = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned upstream rejected {pattern:?}: {error}"));
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual = lowered
+                    .automaton()
+                    .prepare::<Span>()
+                    .search_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("pattern={pattern:?}, haystack={haystack:?}, start={start}: {error}")
+                    })
+                    .into_output();
+                assert_eq!(
+                    tuple(actual),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}, start={start}"
+                );
+            }
+        }
+    }
+
+    assert_eq!(tuple(find(r"(?:|a)+b", b"ab")), Some((0, 2)));
+}
+
+#[test]
+fn ordered_empty_nullable_repetition_proof_and_resources_are_exact() {
+    for pattern in [
+        r"(?:a|)*",
+        r"(?:|a)*?",
+        r"(?:|a){2,}",
+        r"(?:|a|b)*",
+        r"(?:||a)*",
+        r"(?:|a?)*",
+        r"(?:|a*)+",
+        r"(?:|(?:^|a))*",
+    ] {
+        let parsed = parsed(pattern, false);
+        assert!(
+            matches!(
+                lower_raw(
+                    &parsed,
+                    OperationSemantics::CaptureFree,
+                    LowerLimits::default()
+                ),
+                Err(LowerError::Unsupported(
+                    UnsupportedFeature::UncertifiedUnboundedRepetition
+                ))
+            ),
+            "pattern={pattern:?}"
+        );
+    }
+
+    let parsed = parsed(r"(?:|a)+", false);
+    let exact = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("certified empty-first repetition lowers");
     let stats = exact.stats();
     let exact_work = stats.work();
     let exact_storage = (stats.states() + 1) * core::mem::size_of::<u32>()

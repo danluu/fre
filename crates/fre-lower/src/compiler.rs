@@ -81,6 +81,9 @@ enum Task<'h> {
         look: Look,
         min: u32,
     },
+    FinishOrderedEmptyAlternationRepetition {
+        min: u32,
+    },
 }
 
 pub(crate) fn compile(
@@ -155,6 +158,9 @@ impl<'h> Compiler<'h> {
                 }
                 Task::FinishOrderedStartLookAlternationRepetition { look, min } => {
                     self.finish_ordered_start_look_alternation_repetition(look, min)?;
+                }
+                Task::FinishOrderedEmptyAlternationRepetition { min } => {
+                    self.finish_ordered_empty_alternation_repetition(min)?;
                 }
             }
         }
@@ -243,6 +249,15 @@ impl<'h> Compiler<'h> {
                         self.increment_nullable_normalization_count()?;
                         self.push_task(Task::FinishOrderedStartLookAlternationRepetition {
                             look,
+                            min: repetition.min,
+                        })?;
+                        return self.push_task(Task::Visit(consuming));
+                    }
+                    if let Some(consuming) =
+                        self.normalized_ordered_empty_alternation_repetition(repetition)?
+                    {
+                        self.increment_nullable_normalization_count()?;
+                        self.push_task(Task::FinishOrderedEmptyAlternationRepetition {
                             min: repetition.min,
                         })?;
                         return self.push_task(Task::Visit(consuming));
@@ -388,6 +403,44 @@ impl<'h> Compiler<'h> {
         Ok(Some((*look, consuming_branch)))
     }
 
+    /// Prove a cycle-free implementation of greedy `(?:E|C)*` and
+    /// `(?:E|C)+`, where `E` is exactly empty and every successful `C` path
+    /// consumes at least one byte.
+    ///
+    /// Leftmost-first execution first permits the empty branch. If a suffix
+    /// rejects that path, ordinary backtracking may select `C`. After `C` has
+    /// consumed, the upstream empty-loop guard suppresses `E`, leaving only
+    /// another consuming iteration or the repetition exit. Encoding those as
+    /// separate initial and loop splits preserves the priority without a
+    /// nullable cycle.
+    fn normalized_ordered_empty_alternation_repetition(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<&'h Hir>, LowerError> {
+        if !matches!(outer.min, 0 | 1) || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let body = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = body.kind() else {
+            return Ok(None);
+        };
+        let [empty_branch, consuming_branch] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let empty_branch = self.capture_free_node(empty_branch)?;
+        if !matches!(empty_branch.kind(), HirKind::Empty) {
+            return Ok(None);
+        }
+        let consuming_branch = self.capture_free_node(consuming_branch)?;
+        if !matches!(
+            consuming_branch.properties().minimum_len(),
+            Some(minimum) if minimum > 0
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(consuming_branch))
+    }
+
     /// Prove the capture-free identity `(A*){m,} == A*` or
     /// `(A?){m,} == A*` for a positive-width atom `A`.
     ///
@@ -508,6 +561,47 @@ impl<'h> Compiler<'h> {
             _ => {
                 return Err(LowerError::InternalInvariant {
                     detail: "uncertified ordered start-look repetition minimum",
+                });
+            }
+        }
+        self.push_fragment(Fragment {
+            start: initial,
+            outs,
+        })
+    }
+
+    fn finish_ordered_empty_alternation_repetition(&mut self, min: u32) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(1)?;
+        let consuming = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing ordered empty-alternation consumer",
+        })?;
+
+        let loop_split = self.add_state(StateRole::Split)?;
+        self.add_edge(loop_split, EdgeKind::Epsilon, 0, 0, Some(consuming.start))?;
+        let loop_exit = self.add_edge(loop_split, EdgeKind::Epsilon, 0, 0, None)?;
+        self.patch_all(&consuming.outs, loop_split)?;
+
+        let initial = self.add_state(StateRole::Split)?;
+        let empty_exit = self.add_edge(initial, EdgeKind::Epsilon, 0, 0, None)?;
+        self.add_edge(initial, EdgeKind::Epsilon, 0, 0, Some(consuming.start))?;
+        let mut outs = self.singleton_patch(empty_exit, "normalized empty repetition exits")?;
+        self.charge_vector_growth(
+            outs.len(),
+            outs.capacity(),
+            2,
+            "normalized empty repetition exits",
+        )?;
+        reserve(&mut outs, 2, "normalized empty repetition exits")?;
+        outs.push(loop_exit);
+        match min {
+            0 => {
+                let initial_exit = self.add_edge(initial, EdgeKind::Epsilon, 0, 0, None)?;
+                outs.push(initial_exit);
+            }
+            1 => {}
+            _ => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "uncertified ordered empty repetition minimum",
                 });
             }
         }
