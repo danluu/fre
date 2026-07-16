@@ -49,7 +49,7 @@ fn sources(patterns: &[&str]) -> Vec<String> {
 }
 
 fn set(patterns: &[&str]) -> PortableRegexSet {
-    PortableRegexSet::new(&sources(patterns))
+    PortableRegexSet::new(patterns.iter().copied())
         .unwrap_or_else(|error| panic!("FRE rejected set {patterns:?}: {error}"))
 }
 
@@ -78,6 +78,59 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_DOCTEST_IDS.len(), 18);
     assert_eq!(UPSTREAM_DOCTEST_IDS[0], "limitations_two_pass");
     assert_eq!(UPSTREAM_DOCTEST_IDS[17], "owned_into_iter");
+}
+
+#[test]
+fn generic_constructor_preserves_upstream_sources_ids_and_bounded_ingestion() {
+    let patterns = [r"[0-9]", "duplicate", "duplicate", r"[a-z]"];
+    let fre = PortableRegexSet::new(patterns)
+        .unwrap_or_else(|error| panic!("FRE rejected generic array: {error}"));
+    let upstream = regex::bytes::RegexSet::new(patterns)
+        .unwrap_or_else(|error| panic!("upstream rejected generic array: {error}"));
+    assert_eq!(
+        fre.patterns(),
+        patterns
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .collect::<Vec<_>>()
+    );
+    for haystack in [b"duplicate1".as_slice(), b"abc", b"---"] {
+        assert_eq!(
+            ids(&fre, haystack),
+            upstream.matches(haystack).into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    let owned = sources(&["alpha", "beta"]);
+    let from_borrowed_strings = PortableRegexSet::new(&owned)
+        .unwrap_or_else(|error| panic!("FRE rejected borrowed Strings: {error}"));
+    assert_eq!(from_borrowed_strings.patterns(), owned);
+
+    let Err(invalid) = PortableRegexSet::new(["valid", "("]) else {
+        panic!("the second generic pattern must be invalid");
+    };
+    assert!(matches!(
+        invalid,
+        PortableRegexSetBuildError::Pattern { index: 1, .. }
+    ));
+
+    let yielded = core::cell::Cell::new(0_usize);
+    let endless = core::iter::from_fn(|| {
+        yielded.set(yielded.get().saturating_add(1));
+        Some("")
+    });
+    let Err(refused) = PortableRegexSet::new(endless) else {
+        panic!("an endless source must stop at the default pattern limit");
+    };
+    let limit = PortableRegexSetBuildLimits::default().max_patterns;
+    assert!(matches!(
+        refused,
+        PortableRegexSetBuildError::PatternLimit {
+            needed,
+            limit: actual_limit,
+        } if needed == limit + 1 && actual_limit == limit
+    ));
+    assert_eq!(yielded.get(), limit + 1);
 }
 
 #[test]

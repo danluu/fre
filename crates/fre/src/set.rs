@@ -393,11 +393,72 @@ pub struct PortableRegexSet {
 impl PortableRegexSet {
     /// Construct a set with pinned Rust-byte defaults and default limits.
     ///
+    /// Like the pinned Rust bytes `RegexSet::new` API, this accepts any
+    /// iterator whose items can be viewed as pattern strings. FRE consumes the
+    /// iterator in source order and refuses pattern-count or aggregate-source
+    /// limits before copying the item that crosses the limit.
+    ///
     /// # Errors
     ///
     /// Returns the same failures as [`PortableRegexSetBuilder::build`].
-    pub fn new(patterns: &[String]) -> Result<Self, PortableRegexSetBuildError> {
-        PortableRegexSetBuilder::new(patterns).build()
+    pub fn new<I, S>(patterns: I) -> Result<Self, PortableRegexSetBuildError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let limits = PortableRegexSetBuildLimits::default();
+        let mut patterns = patterns.into_iter();
+        let (lower_bound, upper_bound) = patterns.size_hint();
+        let hinted_patterns = upper_bound.unwrap_or(lower_bound).min(limits.max_patterns);
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(hinted_patterns).map_err(|_| {
+            PortableRegexSetBuildError::AllocationFailed {
+                structure: "generic constructor pattern vector",
+                additional: hinted_patterns,
+            }
+        })?;
+
+        let mut pattern_bytes = 0_usize;
+        for pattern in patterns.by_ref() {
+            let needed_patterns = checked_add(owned.len(), 1, "generic constructor pattern count")?;
+            enforce(needed_patterns, limits.max_patterns, |needed, limit| {
+                PortableRegexSetBuildError::PatternLimit { needed, limit }
+            })?;
+
+            let pattern = pattern.as_ref();
+            let needed_pattern_bytes = checked_add(
+                pattern_bytes,
+                pattern.len(),
+                "generic constructor pattern byte sum",
+            )?;
+            enforce(
+                needed_pattern_bytes,
+                limits.max_pattern_bytes,
+                |needed, limit| PortableRegexSetBuildError::PatternBytesLimit { needed, limit },
+            )?;
+
+            if owned.len() == owned.capacity() {
+                let remaining = limits.max_patterns.saturating_sub(owned.len());
+                let additional = owned.len().max(1).min(remaining);
+                owned.try_reserve_exact(additional).map_err(|_| {
+                    PortableRegexSetBuildError::AllocationFailed {
+                        structure: "generic constructor pattern vector",
+                        additional,
+                    }
+                })?;
+            }
+            let mut copied = String::new();
+            copied.try_reserve_exact(pattern.len()).map_err(|_| {
+                PortableRegexSetBuildError::AllocationFailed {
+                    structure: "generic constructor pattern source",
+                    additional: pattern.len(),
+                }
+            })?;
+            copied.push_str(pattern);
+            owned.push(copied);
+            pattern_bytes = needed_pattern_bytes;
+        }
+        PortableRegexSetBuilder::new(&owned).build()
     }
 
     /// Construct the valid empty set, which never matches.
