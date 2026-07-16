@@ -194,6 +194,11 @@ ASCII/Unicode word-run runtime after checking it against the expected runtime.
 The emitted record binds every required identity and recomputes the ordered
 input hashes from KLV bytes.
 
+In all-model raw mode, the authenticated candidate runner derives that grep
+runtime from the artifact it actually constructed and emits it in the raw arm.
+An optional runtime expectation can reject a mismatch, but the executor does
+not need a benchmark-name alias table to manufacture the selected runtime.
+
 `reference_rebar_runner` emits the matching reference arm by authenticating an
 internally pinned upstream runner digest and version, copying the authenticated
 bounded bytes to a new private mode-0500 executable, and invoking that copy as

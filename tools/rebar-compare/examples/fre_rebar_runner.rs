@@ -162,7 +162,6 @@ fn main() -> Result<(), DynError> {
         .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
-    require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
     if expectations.performance_raw {
         require_performance_raw_metadata(&benchmark.model, &expectations)?;
         let observation = model_performance_raw(&benchmark, &expectations)?;
@@ -170,6 +169,7 @@ fn main() -> Result<(), DynError> {
         io::stdout().lock().write_all(&bytes)?;
         return Ok(());
     }
+    require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
     require_capture_metadata(&benchmark.model, &expectations)?;
     if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
         let observation = model_captures(&benchmark, &expectations)?;
@@ -289,7 +289,9 @@ fn require_performance_raw_metadata(
             format!("all-model raw mode does not yet implement FRE model {model:?}").into(),
         );
     }
-    require_runtime_expectation(model, expectations.runtime.as_deref())?;
+    if model != "grep" && expectations.runtime.is_some() {
+        return Err("all-model raw non-grep timing rejects --expect-runtime".into());
+    }
     let fields = [
         expectations.job_id.as_deref(),
         expectations.contract_id.as_deref(),
@@ -915,32 +917,32 @@ where
         SearchLimits,
     ) -> Result<(Duration, u64), CompareError>,
 {
-    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let mut identity = performance_candidate_identity(benchmark, expectations)?;
     let expected_plan = identity.candidate_plan.clone();
-    let expected_runtime = identity
-        .candidate_runtime
-        .clone()
-        .ok_or("grep performance identity has no runtime")?;
+    let regex = current_fre_rebar_portable_builder(
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+    )?
+    .build()
+    .map_err(|error| CompareError::new(format!("FRE grep lifecycle build: {error}")))?;
+    require_performance_plan(&expected_plan, "portable-single-search")?;
+    let selected_runtime = regex.runtime_implementation_id().to_string();
+    if let Some(expected_runtime) = expectations.runtime.as_deref() {
+        require_performance_runtime(expected_runtime, &selected_runtime)?;
+    }
+    require_grep_runtime_plan(&selected_runtime, regex.build_report().plan)?;
+    identity.candidate_runtime = Some(selected_runtime.clone());
+    let limits = current_fre_rebar_search_limits();
+    let mut session = regex
+        .search_session(SearchSessionLimits {
+            max_setup_work: limits.max_work,
+            max_scratch_bytes: limits.max_scratch_bytes,
+        })
+        .map_err(|error| CompareError::new(format!("FRE grep session build: {error}")))?;
+    require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
-        let regex = current_fre_rebar_portable_builder(
-            benchmark.pattern(),
-            benchmark.unicode,
-            benchmark.case_insensitive,
-        )?
-        .build()
-        .map_err(|error| CompareError::new(format!("FRE grep lifecycle build: {error}")))?;
-        require_performance_plan(&expected_plan, "portable-single-search")?;
-        require_performance_runtime(&expected_runtime, regex.runtime_implementation_id())?;
-        require_grep_runtime_plan(regex.runtime_implementation_id(), regex.build_report().plan)?;
-        let limits = current_fre_rebar_search_limits();
-        let mut session = regex
-            .search_session(SearchSessionLimits {
-                max_setup_work: limits.max_work,
-                max_scratch_bytes: limits.max_scratch_bytes,
-            })
-            .map_err(|error| CompareError::new(format!("FRE grep session build: {error}")))?;
-        require_performance_runtime(&expected_runtime, session.runtime_implementation_id())?;
         if steady {
             let primed = execute_grep_session(&mut session, &benchmark.haystack, limits)?;
             if primed != identity.expected {
@@ -1553,11 +1555,16 @@ mod tests {
         let complete =
             performance_expectations("first-public-operation", "aggregate-exact-literal", 1);
         require_performance_raw_metadata("count", &complete).expect("complete metadata");
-        assert!(require_performance_raw_metadata("grep", &complete).is_err());
         let mut grep = complete.clone();
-        grep.runtime = Some("unicode-word-run-linear-v1".to_string());
         grep.plan = Some("portable-single-search".to_string());
-        require_performance_raw_metadata("grep", &grep).expect("complete grep metadata");
+        require_performance_raw_metadata("grep", &grep)
+            .expect("trusted raw grep may derive its runtime");
+        grep.runtime = Some("unicode-word-run-linear-v1".to_string());
+        require_performance_raw_metadata("grep", &grep)
+            .expect("raw grep may additionally check an expected runtime");
+        let mut non_grep_runtime = complete.clone();
+        non_grep_runtime.runtime = Some("k0".to_string());
+        assert!(require_performance_raw_metadata("count", &non_grep_runtime).is_err());
         assert!(require_capture_metadata("count", &complete).is_err());
         let mut missing = complete;
         missing.comparator = None;
@@ -1695,6 +1702,24 @@ mod tests {
         );
         assert_eq!(steady.priming_operations, 1);
         assert_eq!(steady.actual, 1);
+
+        let mut derived_runtime = first_expectations.clone();
+        derived_runtime.runtime = None;
+        let derived = model_grep_performance_raw_with_measurement(
+            &benchmark,
+            &derived_runtime,
+            |session, haystack, limits| {
+                Ok((
+                    Duration::from_nanos(61),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect("trusted grep construction derives its runtime");
+        assert_eq!(
+            derived.candidate_runtime.as_deref(),
+            Some("unicode-word-run-linear-v1")
+        );
 
         let mut wrong_runtime = first_expectations;
         wrong_runtime.runtime = Some("k0".to_string());
