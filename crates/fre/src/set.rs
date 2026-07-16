@@ -389,6 +389,24 @@ pub struct PortableRegexSet {
     report: PortableRegexSetBuildReport,
 }
 
+impl Clone for PortableRegexSet {
+    /// Rebuild an equivalent immutable set under its original profile and
+    /// construction limits.
+    ///
+    /// Some certified native matchers deliberately do not expose `Clone`, so
+    /// the set replays its already-admitted deterministic construction instead
+    /// of weakening those plan-level ownership contracts.
+    fn clone(&self) -> Self {
+        PortableRegexSetBuilder::new(&self.patterns)
+            .profile(self.report.profile.clone())
+            .limits(self.report.limits)
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("previously admitted portable regex set could not be cloned: {error}")
+            })
+    }
+}
+
 impl fmt::Debug for PortableRegexSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "PortableRegexSet({:?})", self.patterns())

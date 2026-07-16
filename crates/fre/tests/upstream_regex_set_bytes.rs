@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, PortableRegexSet, PortableRegexSetBuildError, PortableRegexSetBuildLimits,
-    PortableRegexSetBuilder, PortableRegexSetExecutionError, PortableRegexSetRunLimits,
-    RustProfile, SearchLimits,
+    BuildError, BuildLimits, PlanKind, PortableRegexSet, PortableRegexSetBuildError,
+    PortableRegexSetBuildLimits, PortableRegexSetBuilder, PortableRegexSetExecutionError,
+    PortableRegexSetRunLimits, RustProfile, SearchLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -40,7 +40,11 @@ const UPSTREAM_DOCTEST_IDS: &[&str] = &[
     "owned_into_iter",
 ];
 const UPSTREAM_CALLER_BUFFER_IDS: &[&str] = &["matches_read_at", "read_matches_at"];
-const UPSTREAM_TRAIT_IDS: &[&str] = &["bytes_regex_set_debug"];
+const UPSTREAM_TRAIT_IDS: &[&str] = &[
+    "bytes_regex_set_clone",
+    "bytes_regex_set_default",
+    "bytes_regex_set_debug",
+];
 
 fn sources(patterns: &[&str]) -> Vec<String> {
     patterns
@@ -76,10 +80,122 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
         UPSTREAM_CALLER_BUFFER_IDS,
         ["matches_read_at", "read_matches_at"]
     );
-    assert_eq!(UPSTREAM_TRAIT_IDS, ["bytes_regex_set_debug"]);
+    assert_eq!(
+        UPSTREAM_TRAIT_IDS,
+        [
+            "bytes_regex_set_clone",
+            "bytes_regex_set_default",
+            "bytes_regex_set_debug"
+        ]
+    );
     assert_eq!(UPSTREAM_DOCTEST_IDS.len(), 18);
     assert_eq!(UPSTREAM_DOCTEST_IDS[0], "limitations_two_pass");
     assert_eq!(UPSTREAM_DOCTEST_IDS[17], "owned_into_iter");
+}
+
+#[test]
+fn clone_and_default_match_pinned_traits_and_preserve_plan_identity() {
+    let fre_default = PortableRegexSet::default();
+    let upstream_default = regex::bytes::RegexSet::default();
+    assert!(fre_default.is_empty());
+    assert_eq!(fre_default.len(), upstream_default.len());
+    for haystack in [b"".as_slice(), b"anything", &[0xFF]] {
+        assert_eq!(
+            ids(&fre_default, haystack),
+            upstream_default
+                .matches(haystack)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let patterns = sources(&[
+        "Sherlock",
+        "a|ab",
+        "[a-z]+Z",
+        r"\A[a-z]+Z",
+        r"\b\w{2,}\b",
+        "(?:ab)+",
+    ]);
+    let original = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .build()
+        .expect("mixed-plan set");
+    let cloned = original.clone();
+    assert_eq!(cloned.patterns(), original.patterns());
+    assert_eq!(cloned.build_report(), original.build_report());
+    let plans = (0..original.len())
+        .map(|index| {
+            let original_report = original
+                .pattern_build_report(index)
+                .expect("original pattern report");
+            let cloned_report = cloned
+                .pattern_build_report(index)
+                .expect("cloned pattern report");
+            assert_eq!(cloned_report, original_report);
+            original_report.plan
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plans,
+        [
+            PlanKind::ExactLiteral,
+            PlanKind::PackedLiteralSet,
+            PlanKind::RequiredLiteral,
+            PlanKind::ForwardAnchored,
+            PlanKind::UnicodeWordRun,
+            PlanKind::K0,
+        ]
+    );
+
+    let upstream = regex::bytes::RegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .build()
+        .expect("pinned mixed-plan set");
+    let upstream_clone = upstream.clone();
+    for haystack in [
+        b"Sherlock ab abcZ".as_slice(),
+        b"word abab",
+        b"---",
+        &[b'a', 0xFF, b'Z'],
+    ] {
+        let expected = upstream_clone
+            .matches(haystack)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(ids(&original, haystack), expected);
+        assert_eq!(ids(&cloned, haystack), expected);
+    }
+
+    let dfa_patterns = sources(&["foobar|foobaz|fooquux"]);
+    let dfa_limits = PortableRegexSetBuildLimits {
+        pattern: BuildLimits {
+            packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                max_patterns: 0,
+                ..fre_kernels::PackedLiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        },
+        ..PortableRegexSetBuildLimits::default()
+    };
+    let dfa = PortableRegexSetBuilder::new(&dfa_patterns)
+        .unicode(false)
+        .limits(dfa_limits)
+        .build()
+        .expect("DFA set");
+    assert_eq!(
+        dfa.pattern_build_report(0).expect("DFA report").plan,
+        PlanKind::LiteralSetDfa
+    );
+    let dfa_clone = dfa.clone();
+    assert_eq!(dfa_clone.build_report(), dfa.build_report());
+    assert_eq!(
+        dfa_clone.pattern_build_report(0),
+        dfa.pattern_build_report(0)
+    );
+    for haystack in [b"fooquux".as_slice(), b"none", &[0xFF]] {
+        assert_eq!(ids(&dfa_clone, haystack), ids(&dfa, haystack));
+    }
 }
 
 #[test]
