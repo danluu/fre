@@ -7,9 +7,10 @@
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match compile/count/
-//! span-sum plans without source concatenation. Whole-match aggregate plans
-//! may erase capture annotations. Their complete spans also provide bounded
-//! byte `split`/`splitn` and literal/no-expansion replacement/`replacen`.
+//! span-sum/complete-span plans without source concatenation. Whole-match
+//! aggregate plans may erase capture annotations. Their complete spans also
+//! provide bounded byte `split`/`splitn` and literal/no-expansion replacement/
+//! `replacen`.
 //! [`CaptureBuilder`] separately preserves capture histories for the
 //! participating-group reducer on its certified Rust-byte subset; it is not a
 //! general capture-record facade. None of these types is named `Regex`:
@@ -55,8 +56,9 @@ pub use aggregate_many::{
     AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
     AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
     AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanSumRegex,
-    AggregateManySpanSumResult,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanIter,
+    AggregateManySpanSumRegex, AggregateManySpanSumResult, AggregateManySpans,
+    AggregateManySpansRegex,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
