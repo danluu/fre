@@ -3720,6 +3720,20 @@ mod tests {
     }
 
     #[test]
+    fn uncertified_nullable_loop_is_a_build_error() {
+        let error = PortableBuilder::new("(?:a|)*")
+            .unicode(false)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BuildError::Lower(fre_lower::LowerError::Unsupported(
+                UnsupportedFeature::UncertifiedUnboundedRepetition
+            ))
+        ));
+    }
+
+    #[test]
     fn ranged_search_keeps_original_anchor_context() {
         let regex = PortableRegex::new("^a").unwrap();
         let (matched, _) = regex

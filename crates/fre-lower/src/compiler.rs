@@ -143,7 +143,16 @@ impl<'h> Compiler<'h> {
     }
 
     fn run(mut self, hir: &'h Hir) -> Result<(RawPlan, LowerStats), LowerError> {
-        self.push_task(Task::Visit(hir))?;
+        let root = if let HirKind::Repetition(repetition) = hir.kind()
+            && let Some(empty) =
+                self.normalized_root_ordered_empty_alternation_repetition(repetition)?
+        {
+            self.increment_nullable_normalization_count()?;
+            empty
+        } else {
+            hir
+        };
+        self.push_task(Task::Visit(root))?;
         while let Some(task) = self.tasks.pop() {
             self.charge(1, "task dispatch")?;
             match task {
@@ -317,6 +326,46 @@ impl<'h> Compiler<'h> {
                 computation: "normalized nullable repetition count",
             })?;
         Ok(())
+    }
+
+    /// Prove the capture-free, leftmost-first root-search identity
+    /// `(?:empty|C)* == empty` and `(?:empty|C)+ == empty` for a positive-width
+    /// branch `C`.
+    ///
+    /// The first alternative completes an iteration without consuming. The
+    /// upstream empty-loop guard then exits the repetition without revisiting
+    /// the later `C` path. This identity is intentionally restricted to the
+    /// complete HIR root:
+    /// upstream search priority is not compositional when a prefix or suffix
+    /// surrounds the repetition. The proof also excludes a reversed
+    /// alternative, lazy outer repetition, minima above one, additional
+    /// alternatives and nullable sibling branches.
+    fn normalized_root_ordered_empty_alternation_repetition(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<&'h Hir>, LowerError> {
+        if !matches!(outer.min, 0 | 1) || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let body = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = body.kind() else {
+            return Ok(None);
+        };
+        let [empty_branch, consuming_branch] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let empty_branch = self.capture_free_node(empty_branch)?;
+        if !matches!(empty_branch.kind(), HirKind::Empty) {
+            return Ok(None);
+        }
+        let consuming_branch = self.capture_free_node(consuming_branch)?;
+        if !matches!(
+            consuming_branch.properties().minimum_len(),
+            Some(minimum) if minimum > 0
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(empty_branch))
     }
 
     /// Prove the capture-free, leftmost-first identity

@@ -253,6 +253,79 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
 }
 
 #[test]
+fn ordered_empty_first_repetitions_match_pinned_upstream_at_every_start() {
+    let patterns = [r"(?:|a)*", r"(?:|a)+", r"(?:|ab)*", r"(?:|[ab])+"];
+    let haystacks = words(5);
+
+    for pattern in patterns {
+        let parsed = parsed(pattern, false);
+        let lowered = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned upstream rejected {pattern:?}: {error}"));
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual = lowered
+                    .automaton()
+                    .prepare::<Span>()
+                    .search_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("pattern={pattern:?}, haystack={haystack:?}, start={start}: {error}")
+                    })
+                    .into_output();
+                assert_eq!(
+                    tuple(actual),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}, start={start}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_empty_first_repetition_proof_remains_narrow() {
+    for pattern in [
+        r"(?:a|)*",
+        r"(?:|a)*?",
+        r"(?:|a){2,}",
+        r"(?:|a?)*",
+        r"(?:|a|b)*",
+        r"(?:|ab)*b",
+        r"x(?:|[ab])+b",
+    ] {
+        let parsed = parsed(pattern, false);
+        assert!(
+            matches!(
+                lower_raw(
+                    &parsed,
+                    OperationSemantics::CaptureFree,
+                    LowerLimits::default()
+                ),
+                Err(LowerError::Unsupported(
+                    UnsupportedFeature::UncertifiedUnboundedRepetition
+                ))
+            ),
+            "pattern={pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn normalized_nullable_repetitions_match_upstream_group_zero() {
     let patterns = [
         "(?:a*)*",
