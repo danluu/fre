@@ -19,6 +19,7 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_regex_builder_swap_greed",
     "bytes_regex_builder_ignore_whitespace",
     "bytes_regex_builder_octal",
+    "bytes_regex_builder_dfa_size_limit",
     "bytes_regex_builder_nest_limit",
 ];
 
@@ -29,7 +30,110 @@ fn authenticated_bytes_builder_flag_inventory_has_no_silent_omissions() {
     assert_eq!(profile.regex.checksum, UPSTREAM_PACKAGE_SHA256);
     assert_eq!(UPSTREAM_PATH, "src/builders.rs");
     assert_eq!(UPSTREAM_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 8);
+    assert_eq!(UPSTREAM_API_IDS.len(), 9);
+}
+
+#[test]
+fn dfa_size_limit_is_semantic_neutral_and_retained_in_profile_identity() {
+    let cases: &[(&str, bool)] = &[("Sherlock", true), ("a|ab", false), ("(?:ab)+", false)];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"Sherlock",
+        b"xxSherlockyy",
+        b"a",
+        b"ab",
+        b"ababx",
+        &[0xFF, b'a', b'b'],
+    ];
+
+    for dfa_size_limit in [0, 1, 2 * (1 << 20), usize::MAX] {
+        for &(pattern, unicode) in cases {
+            let fre = PortableBuilder::new(pattern)
+                .unicode(unicode)
+                .dfa_size_limit(dfa_size_limit)
+                .build()
+                .unwrap_or_else(|error| panic!("FRE rejected {pattern:?}: {error}"));
+            let mut upstream = regex::bytes::RegexBuilder::new(pattern);
+            upstream.unicode(unicode).dfa_size_limit(dfa_size_limit);
+            let upstream = upstream
+                .build()
+                .unwrap_or_else(|error| panic!("upstream rejected {pattern:?}: {error}"));
+
+            for haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    let expected = upstream
+                        .find_at(haystack, start)
+                        .map(|matched| matched.range());
+                    let actual = fre
+                        .find_at(haystack, start, SearchLimits::unlimited())
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "FRE search failed for {pattern:?}/{haystack:?}/{start}: {error}"
+                            )
+                        })
+                        .0
+                        .map(fre::Match::range);
+                    assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}");
+                }
+            }
+
+            let CompatibilityProfile::RustBytes(profile) = fre.profile() else {
+                panic!("portable bytes builder published a non-bytes profile");
+            };
+            let fre_syntax::RustConstructor::RegexBuilder {
+                dfa_size_limit: retained,
+                ..
+            } = &profile.constructor
+            else {
+                panic!("portable bytes builder lost its high-level constructor identity");
+            };
+            assert_eq!(*retained, u64::try_from(dfa_size_limit).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+#[test]
+fn dfa_size_limit_set_builder_applies_to_every_pattern_identity() {
+    let patterns = vec!["a".to_owned(), "ab".to_owned(), "(?:ab)+".to_owned()];
+    let fre = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .dfa_size_limit(0)
+        .build()
+        .expect("zero-cache FRE set");
+    let mut upstream = regex::bytes::RegexSetBuilder::new(&patterns);
+    upstream.unicode(false).dfa_size_limit(0);
+    let upstream = upstream.build().expect("zero-cache upstream set");
+
+    for haystack in [b"".as_slice(), b"a", b"ab", b"ababx", &[0xFF, b'a']] {
+        for start in 0..=haystack.len() {
+            let expected: Vec<_> = upstream.matches_at(haystack, start).into_iter().collect();
+            let actual: Vec<_> = fre
+                .matches_at(haystack, start, PortableRegexSetRunLimits::unlimited())
+                .expect("zero-cache FRE set search")
+                .into_iter()
+                .collect();
+            assert_eq!(actual, expected, "{haystack:?}/{start}");
+        }
+    }
+
+    for profile in
+        core::iter::once(&fre.build_report().profile).chain((0..patterns.len()).map(|index| {
+            let CompatibilityProfile::RustBytes(profile) = &fre
+                .pattern_build_report(index)
+                .expect("constituent build report")
+                .profile
+            else {
+                panic!("set constituent published a non-bytes profile");
+            };
+            profile
+        }))
+    {
+        let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } = &profile.constructor
+        else {
+            panic!("configured set lost its high-level constructor identity");
+        };
+        assert_eq!(*dfa_size_limit, 0);
+    }
 }
 
 #[test]

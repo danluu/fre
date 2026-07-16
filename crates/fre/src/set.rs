@@ -232,6 +232,24 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set the pinned high-level builder's lazy-DFA cache capacity identity
+    /// for every pattern.
+    ///
+    /// FRE's portable plans do not use this upstream cache. Each constituent
+    /// matcher still retains the configured value while enforcing FRE's
+    /// independent construction and execution limits. The distinct direct-
+    /// Rebar constructor profile has no corresponding high-level option and
+    /// is left unchanged.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
     /// Replace all set-wide and per-pattern construction limits.
     #[must_use]
     pub const fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {

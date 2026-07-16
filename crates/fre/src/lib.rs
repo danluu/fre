@@ -1185,6 +1185,24 @@ impl PortableBuilder {
         self
     }
 
+    /// Set the pinned high-level builder's lazy-DFA cache capacity identity.
+    ///
+    /// FRE's portable plans do not use the upstream lazy-DFA cache, so this
+    /// option cannot weaken their independently checked construction and
+    /// execution limits. It is nevertheless retained in the compatibility
+    /// profile exactly because it is part of the public Rust bytes builder
+    /// configuration. The distinct direct-Rebar constructor profile has no
+    /// corresponding high-level option and is left unchanged.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
     /// Replace every checked construction limit.
     #[must_use]
     pub const fn limits(mut self, limits: BuildLimits) -> Self {
