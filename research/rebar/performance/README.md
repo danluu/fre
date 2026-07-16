@@ -94,7 +94,7 @@ pair slots and 66 unavailable points from the semantic universe. This is an
 execution admission artifact; it does not itself provide the still-required
 multi-pattern runner implementation or run timing.
 
-Each scheduled arm has one canonical `fre.rebar.performance-raw.v1` record.
+Each scheduled arm has one canonical `fre.rebar.performance-raw.v2` record.
 It binds the exact contract/canonical/semantic identity, job, model, lifecycle
 boundary, comparator and candidate/reference role, complete input and reducer,
 candidate plan where applicable, exact cold/allocator-initialized/built/primed
@@ -178,20 +178,23 @@ selected plan, and derived limits remain bound at each step.
 The all-model candidate raw producer rejects malformed identity and invalid
 model/boundary combinations before invoking its measurement closure, derives
 the exact preparation/prime state, and emits canonical
-`fre.rebar.performance-raw.v1` with ordered input hashes, comparator, plan,
-result digest, and fresh-process token. Fixed-duration tests prove its output
-passes the complete semantic-contract validator. Explicit `--performance-raw`
-runner mode connects these seams for all 238 supported aggregate rows plus all
-eight supported capture rows, covering 5,520 of 5,772 candidate pair-slot
-arms: cold compile constructs once; allocator-warm
+`fre.rebar.performance-raw.v2` with ordered input hashes, comparator, plan,
+selected grep runtime when applicable, result digest, and fresh-process token.
+Fixed-duration tests prove its output passes the complete semantic-contract
+validator. Explicit `--performance-raw`
+runner mode connects these seams for all 257 supported rows and all 5,772
+candidate pair-slot arms: cold compile constructs once; allocator-warm
 compile constructs and drops a distinct sacrificial artifact before measuring
 a fresh one; first operation uses a built artifact with no prime; steady
 operation performs exactly one verified untimed prime on the same artifact.
 Capture first/steady boundaries use the same retained selector/history
 lifecycle and exact prime rule while emitting the generic all-model schema.
+Grep retains one constructed matcher/session across its first or primed steady
+whole-line operation and records the construction-selected K0 or linear
+ASCII/Unicode word-run runtime after checking it against the expected runtime.
 The emitted record binds every required identity and recomputes the ordered
 input hashes from KLV bytes.
 
-The performance gate still needs authenticated Rust/RE2 raw arms, generic raw
-mode for the 11 supported grep rows, an authorized resource collector and pair
-executor, and `regex-redux` after semantic support exists.
+The performance gate still needs authenticated Rust/RE2 raw arms, an
+authorized resource collector and pair executor, and `regex-redux` after
+semantic support exists.

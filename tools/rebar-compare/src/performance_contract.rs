@@ -29,7 +29,7 @@ pub const CAPTURE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.capture-pair-schedule.
 /// Stable schema for the complete all-model fresh-process pair schedule.
 pub const PERFORMANCE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.performance-pair-schedule.v1";
 /// Stable schema for one all-model candidate or reference timing arm.
-pub const PERFORMANCE_RAW_SCHEMA: &str = "fre.rebar.performance-raw.v1";
+pub const PERFORMANCE_RAW_SCHEMA: &str = "fre.rebar.performance-raw.v2";
 /// Stable schema for one all-model resource observation arm.
 pub const PERFORMANCE_RESOURCE_RAW_SCHEMA: &str = "fre.rebar.performance-resource-raw.v1";
 /// Stable schema for deterministic current-FRE runner route admission.
@@ -628,6 +628,8 @@ pub struct PerformanceCandidateObservationIdentity {
     pub comparator: String,
     /// Authenticated construction-selected current-FRE plan.
     pub candidate_plan: String,
+    /// Authenticated selected grep runtime; absent for non-grep models.
+    pub candidate_runtime: Option<String>,
     /// Complete input identity recomputed from runner input.
     pub input: InputReceipt,
     /// Exact semantic reducer expected from the measured operation.
@@ -664,6 +666,9 @@ pub struct PerformanceRawObservation {
     pub arm: CapturePairArm,
     /// Exact current-FRE plan for a candidate arm; absent for a reference.
     pub candidate_plan: Option<String>,
+    /// Exact selected current-FRE grep runtime; absent for other arms/models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_runtime: Option<String>,
     /// Complete semantic input identity.
     pub input: InputReceipt,
     /// Expected semantic reducer.
@@ -1459,6 +1464,7 @@ where
         comparator: identity.comparator.clone(),
         arm: CapturePairArm::Candidate,
         candidate_plan: Some(identity.candidate_plan.clone()),
+        candidate_runtime: identity.candidate_runtime.clone(),
         input: identity.input.clone(),
         expected: identity.expected,
         actual,
@@ -2179,6 +2185,23 @@ fn validate_performance_candidate_identity_shape(
     require_token(&identity.boundary, "performance boundary")?;
     require_token(&identity.comparator, "performance comparator")?;
     require_token(&identity.candidate_plan, "performance candidate plan")?;
+    match (
+        identity.model.as_str(),
+        identity.candidate_runtime.as_deref(),
+    ) {
+        ("grep", Some(runtime)) => require_performance_grep_runtime(runtime)?,
+        ("grep", None) => {
+            return Err(ContractError::new(
+                "grep performance identity has no selected runtime",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(ContractError::new(
+                "non-grep performance identity claims a selected runtime",
+            ));
+        }
+        (_, None) => {}
+    }
     require_digest(&identity.process_token_sha256, "performance process token")?;
     validate_performance_input_shape(&identity.input)?;
     let _ = raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
@@ -2219,16 +2242,38 @@ fn validate_performance_raw_observation_shape(
     require_digest(&observation.result_sha256, "performance raw result digest")?;
     validate_performance_input_shape(&observation.input)?;
     match expected_arm {
-        CapturePairArm::Candidate => require_token(
-            observation
-                .candidate_plan
-                .as_deref()
-                .ok_or_else(|| ContractError::new("candidate performance raw arm has no plan"))?,
-            "candidate performance raw plan",
-        )?,
-        CapturePairArm::Reference if observation.candidate_plan.is_some() => {
+        CapturePairArm::Candidate => {
+            require_token(
+                observation.candidate_plan.as_deref().ok_or_else(|| {
+                    ContractError::new("candidate performance raw arm has no plan")
+                })?,
+                "candidate performance raw plan",
+            )?;
+            match (
+                observation.model.as_str(),
+                observation.candidate_runtime.as_deref(),
+            ) {
+                ("grep", Some(runtime)) => {
+                    require_performance_grep_runtime(runtime)?;
+                }
+                ("grep", None) => {
+                    return Err(ContractError::new(
+                        "grep candidate performance raw arm has no runtime",
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(ContractError::new(
+                        "non-grep candidate performance raw arm claims a runtime",
+                    ));
+                }
+                (_, None) => {}
+            }
+        }
+        CapturePairArm::Reference
+            if observation.candidate_plan.is_some() || observation.candidate_runtime.is_some() =>
+        {
             return Err(ContractError::new(
-                "reference performance raw arm must not claim a candidate plan",
+                "reference performance raw arm must not claim a candidate plan or runtime",
             ));
         }
         CapturePairArm::Reference => {}
@@ -2259,6 +2304,16 @@ fn validate_performance_input_shape(input: &InputReceipt) -> Result<(), Contract
         require_digest(pattern, "performance input pattern digest")?;
     }
     require_digest(&input.haystack_sha256, "performance input haystack digest")
+}
+
+fn require_performance_grep_runtime(runtime: &str) -> Result<(), ContractError> {
+    require_token(runtime, "candidate performance grep runtime")?;
+    match runtime {
+        "k0" | "ascii-word-run-linear-v1" | "unicode-word-run-linear-v1" => Ok(()),
+        other => Err(ContractError::new(format!(
+            "unrecognized candidate performance grep runtime {other:?}"
+        ))),
+    }
 }
 
 fn raw_lifecycle_preparation(
@@ -4694,6 +4749,9 @@ mod tests {
                     candidate_plan: (arm == CapturePairArm::Candidate)
                         .then(|| semantic.candidate_plan.clone())
                         .flatten(),
+                    candidate_runtime: (arm == CapturePairArm::Candidate
+                        && semantic.model == "grep")
+                        .then(|| "k0".to_string()),
                     input: semantic.input.clone(),
                     expected: semantic.expected,
                     actual: semantic.expected,
@@ -5235,6 +5293,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixed-duration fixture covers every lifecycle plus premeasurement rejection"
+    )]
     fn candidate_raw_producer_binds_identity_and_every_lifecycle_without_a_clock() {
         let identity = PerformanceCandidateObservationIdentity {
             contract_id: "fixture-performance-contract-v1".to_string(),
@@ -5247,6 +5309,7 @@ mod tests {
             boundary: "first-public-operation".to_string(),
             comparator: "rust-regex-1.12.4".to_string(),
             candidate_plan: "aggregate-many-ordered-literal".to_string(),
+            candidate_runtime: None,
             input: InputReceipt {
                 pattern_sha256: vec!["d".repeat(64), "e".repeat(64)],
                 haystack_sha256: "f".repeat(64),
@@ -5365,6 +5428,7 @@ mod tests {
                 .candidate_plan
                 .clone()
                 .expect("supported candidate plan"),
+            candidate_runtime: None,
             input: semantic.input.clone(),
             expected: semantic.expected,
             process_token_sha256: digest(b"contract-valid candidate process"),
@@ -5390,6 +5454,64 @@ mod tests {
                 &wrong_plan,
                 CapturePairArm::Candidate,
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_raw_runtime_identity_is_exactly_grep_scoped() {
+        let mut identity = PerformanceCandidateObservationIdentity {
+            contract_id: "fixture-performance-contract-v1".to_string(),
+            canonical_commit: "a".repeat(40),
+            canonical_tree: "b".repeat(40),
+            semantic_receipts_sha256: "c".repeat(64),
+            job_id: "fixture/grep@rust/regex".to_string(),
+            benchmark: "fixture/grep".to_string(),
+            model: "grep".to_string(),
+            boundary: "first-public-operation".to_string(),
+            comparator: "rust-regex-1.12.4".to_string(),
+            candidate_plan: "portable-single-search".to_string(),
+            candidate_runtime: Some("unicode-word-run-linear-v1".to_string()),
+            input: InputReceipt {
+                pattern_sha256: vec!["d".repeat(64)],
+                haystack_sha256: "e".repeat(64),
+                haystack_bytes: 26,
+                unicode: true,
+                case_insensitive: false,
+            },
+            expected: 1,
+            process_token_sha256: "f".repeat(64),
+        };
+        let grep = produce_performance_candidate_observation(&identity, || {
+            Ok((Duration::from_nanos(31), 1))
+        })
+        .expect("grep runtime identity");
+        assert_eq!(
+            grep.candidate_runtime.as_deref(),
+            Some("unicode-word-run-linear-v1")
+        );
+
+        identity.candidate_runtime = Some("unrecognized-runtime".to_string());
+        assert!(
+            produce_performance_candidate_observation(&identity, || {
+                Ok((Duration::from_nanos(1), 1))
+            })
+            .is_err()
+        );
+        identity.candidate_runtime = None;
+        assert!(
+            produce_performance_candidate_observation(&identity, || {
+                Ok((Duration::from_nanos(1), 1))
+            })
+            .is_err()
+        );
+        identity.model = "count".to_string();
+        identity.candidate_plan = "aggregate-exact-literal".to_string();
+        identity.candidate_runtime = Some("k0".to_string());
+        assert!(
+            produce_performance_candidate_observation(&identity, || {
+                Ok((Duration::from_nanos(1), 1))
+            })
             .is_err()
         );
     }
