@@ -1610,3 +1610,55 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
         }
     }
 }
+
+#[test]
+fn reverse_rows_borrow_multi_byte_decision_records_without_changing_selection() {
+    let cases: [(&str, &[u8]); 3] = [
+        (
+            r"(?:a|bb|ccc|dddd|eeeee|ffffff|ggggggg|hhhhhhhh|iiiiiiiii|jjjjjjjjjj)+?",
+            b"xajjjjjjjjjjbbiiiiiiiiiyddddz",
+        ),
+        (
+            r"(?:|ab|bcd|cdef|defgh|efghij|fghijkl|ghijklmn|hijklmnop|ijklmnopqr)",
+            b"zabijklmnopqrx",
+        ),
+        (
+            r"(?m)^(?:alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliett)$",
+            b"alpha\nnope\njuliett\ncharlie",
+        ),
+    ];
+    let mut observed_multi_byte_record = false;
+    for (pattern, haystack) in cases {
+        let regex = compile(pattern);
+        let expected = upstream(pattern, haystack);
+        let full = regex
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                Strategy::FullTable,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let rows = regex
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(expected, full.as_slice(), "full table: {pattern:?}");
+        assert_eq!(expected, rows.as_slice(), "borrowed rows: {pattern:?}");
+        assert_eq!(full.as_slice(), rows.as_slice(), "strategy: {pattern:?}");
+        let certificate = rows.certificate();
+        observed_multi_byte_record |= certificate.log_bytes >= certificate.boundaries * 2;
+        assert!(
+            rows.accounting().sequential_bytes_written + rows.accounting().sequential_bytes_read
+                <= certificate.sequential_bytes_bound
+        );
+    }
+    assert!(
+        observed_multi_byte_record,
+        "fixture must exercise a decision record wider than one byte"
+    );
+}
