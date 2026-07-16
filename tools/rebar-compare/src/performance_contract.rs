@@ -989,6 +989,56 @@ impl ValidatedPerformanceExecutionContext {
     }
 }
 
+/// Opaque proof that one independently authorized task passed packet,
+/// schedule, attempt, and process-token validation.
+#[derive(Debug)]
+pub struct ValidatedPerformancePairTaskContext {
+    packet_sha256: String,
+    task_sha256: String,
+    slot: PerformancePairSlot,
+    attempt_id: String,
+    candidate_process_token_sha256: String,
+    reference_process_token_sha256: String,
+}
+
+impl ValidatedPerformancePairTaskContext {
+    /// Independently authorized execution-packet digest.
+    #[must_use]
+    pub fn packet_sha256(&self) -> &str {
+        &self.packet_sha256
+    }
+
+    /// Independently authorized task digest.
+    #[must_use]
+    pub fn task_sha256(&self) -> &str {
+        &self.task_sha256
+    }
+
+    /// Exact canonical pair-schedule slot.
+    #[must_use]
+    pub const fn slot(&self) -> &PerformancePairSlot {
+        &self.slot
+    }
+
+    /// Exact attempt identifier.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Candidate process token reserved by this task.
+    #[must_use]
+    pub fn candidate_process_token_sha256(&self) -> &str {
+        &self.candidate_process_token_sha256
+    }
+
+    /// Reference process token reserved by this task.
+    #[must_use]
+    pub fn reference_process_token_sha256(&self) -> &str {
+        &self.reference_process_token_sha256
+    }
+}
+
 /// One raw pinned-reference arm corresponding to a schedule slot.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2454,8 +2504,9 @@ fn validate_performance_execution_limits(
 }
 
 /// Validate one prepublished task using the opaque context produced by full
-/// packet admission plus an externally authorized task digest, then return its
-/// exact schedule slot. Supplying a task and its digest through one
+/// packet admission plus an externally authorized task digest, then return an
+/// opaque context bound to its exact schedule slot and tokens. Supplying a
+/// task and its digest through one
 /// unauthenticated channel does not establish authority; the caller must
 /// obtain the task digest from its immutable publication transition. This
 /// single-task check does not persist global uniqueness or consumed state;
@@ -2468,7 +2519,7 @@ pub fn validate_performance_pair_task(
     schedule: &PerformancePairSchedule,
     task: &PerformancePairTask,
     authorized_task_sha256: &str,
-) -> Result<PerformancePairSlot, ContractError> {
+) -> Result<ValidatedPerformancePairTaskContext, ContractError> {
     require_digest(authorized_task_sha256, "authorized performance pair task")?;
     if performance_execution_packet_bytes(packet)? != packet_bytes
         || digest(packet_bytes) != context.packet_sha256
@@ -2505,7 +2556,14 @@ pub fn validate_performance_pair_task(
             "performance pair task sequence is not the canonical slot index",
         ));
     }
-    Ok(slot.clone())
+    Ok(ValidatedPerformancePairTaskContext {
+        packet_sha256: context.packet_sha256.clone(),
+        task_sha256: authorized_task_sha256.to_string(),
+        slot: slot.clone(),
+        attempt_id: task.attempt_id.clone(),
+        candidate_process_token_sha256: task.candidate_process_token_sha256.clone(),
+        reference_process_token_sha256: task.reference_process_token_sha256.clone(),
+    })
 }
 
 fn validate_performance_attempt_id(value: &str, sequence: usize) -> Result<(), ContractError> {
@@ -6684,9 +6742,18 @@ mod tests {
                 &digest(&bytes),
             )
         };
+        let task_context = validate_task(&task, &schedule).expect("authorized task");
+        assert_eq!(task_context.packet_sha256(), packet_sha256);
+        assert_eq!(task_context.task_sha256(), digest(&task_bytes));
+        assert_eq!(task_context.slot(), &schedule.slots[0]);
+        assert_eq!(task_context.attempt_id(), task.attempt_id);
         assert_eq!(
-            validate_task(&task, &schedule).expect("authorized task"),
-            schedule.slots[0]
+            task_context.candidate_process_token_sha256(),
+            task.candidate_process_token_sha256
+        );
+        assert_eq!(
+            task_context.reference_process_token_sha256(),
+            task.reference_process_token_sha256
         );
         let mut forged_schedule = schedule.clone();
         forged_schedule.slots[0].boundary = "forged-boundary".to_string();
