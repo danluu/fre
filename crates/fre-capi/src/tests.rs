@@ -13,8 +13,8 @@ use crate::{
     FRE_V1_DIAGNOSTIC_NONE, FRE_V1_DIAGNOSTIC_PANIC, FRE_V1_FEATURE_EXISTS,
     FRE_V1_FEATURE_PLAN_INFO, FRE_V1_FEATURE_RUST_BYTES, FRE_V1_FEATURE_SELECTED_END,
     FRE_V1_FEATURE_SPAN, FRE_V1_FEATURE_THREAD_SAFE_REGEX, FRE_V1_FEATURES, FRE_V1_JIT_DENY,
-    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_ABI_MISMATCH,
-    FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_ARGUMENT,
+    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN, FRE_V1_PROFILE_RUST_BYTES,
+    FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_ARGUMENT,
     FRE_V1_STATUS_INVALID_PATTERN_ENCODING, FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH,
     FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC, FRE_V1_STATUS_SEARCH_ERROR,
     FRE_V1_STATUS_STRUCT_TOO_SMALL, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
@@ -249,6 +249,20 @@ fn compile_and_all_single_search_outputs_work() {
     );
     assert_eq!(plan.plan, FRE_V1_PLAN_EXACT_LITERAL);
     assert!(plan.plan_storage_bytes >= 6);
+    // SAFETY: transfers the sole live reference from compile.
+    assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+}
+
+#[test]
+fn unicode_word_run_has_a_stable_public_plan_tag() {
+    let (regex, _) = compile(br"\b\w{2,}\b", FreV1Config::checked_default());
+    let mut plan = FreV1PlanInfo::caller_init();
+    // SAFETY: compile returned one live handle and plan is valid output storage.
+    assert_eq!(
+        unsafe { fre_v1_regex_plan(regex, &raw mut plan, ptr::null_mut()) },
+        FRE_V1_STATUS_OK
+    );
+    assert_eq!(plan.plan, FRE_V1_PLAN_UNICODE_WORD_RUN);
     // SAFETY: transfers the sole live reference from compile.
     assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
 }
