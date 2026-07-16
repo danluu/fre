@@ -16,6 +16,7 @@ use fre::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::doctest_capture_metadata::{CaptureMetadataRefusal, execute_capture_metadata_doctest};
 use crate::{CandidateIdentity, InventoryError, UPSTREAM_REPOSITORY, UPSTREAM_REVISION, sha256};
 
 /// Stable schema for the complete public-doctest report.
@@ -1489,6 +1490,12 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
     if let Some(spec) = replacement_probe(id) {
         return Some(run_replacement_probe(spec));
     }
+    if let Some(execution) = execute_capture_metadata_doctest(id) {
+        return Some(execution.map_err(|refusal| match refusal {
+            CaptureMetadataRefusal::Unsupported(reason_code) => unsupported(reason_code),
+            CaptureMetadataRefusal::Fault(reason_code) => fault(reason_code),
+        }));
+    }
     let probe = match id {
         "README.md:34" => CoreProbe::TextCaptures {
             pattern: r"(?x)
@@ -2546,9 +2553,9 @@ mod tests {
         eprintln!("doctest counts={:?}", report.payload.counts);
         assert_eq!(
             DoctestCounts {
-                pass: 179,
+                pass: 193,
                 mismatch: 0,
-                unsupported: 63,
+                unsupported: 49,
                 fault: 0,
                 total: DOCTEST_API_CASES,
             },
