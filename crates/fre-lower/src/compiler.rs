@@ -77,6 +77,10 @@ enum Task<'h> {
     FinishOrderedWordLookAlternationPlus {
         look: Look,
     },
+    FinishOrderedStartLookAlternationRepetition {
+        look: Look,
+        min: u32,
+    },
 }
 
 pub(crate) fn compile(
@@ -140,6 +144,9 @@ impl<'h> Compiler<'h> {
                 } => self.finish_repetition(min, max, greedy, copies)?,
                 Task::FinishOrderedWordLookAlternationPlus { look } => {
                     self.finish_ordered_word_look_alternation_plus(look)?;
+                }
+                Task::FinishOrderedStartLookAlternationRepetition { look, min } => {
+                    self.finish_ordered_start_look_alternation_repetition(look, min)?;
                 }
             }
         }
@@ -215,6 +222,16 @@ impl<'h> Compiler<'h> {
                 if repetition.max.is_none()
                     && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
                 {
+                    if let Some((look, consuming)) =
+                        self.normalized_ordered_start_look_alternation_repetition(repetition)?
+                    {
+                        self.increment_nullable_normalization_count()?;
+                        self.push_task(Task::FinishOrderedStartLookAlternationRepetition {
+                            look,
+                            min: repetition.min,
+                        })?;
+                        return self.push_task(Task::Visit(consuming));
+                    }
                     if let Some((look, atom)) =
                         self.normalized_ordered_word_look_alternation_plus(repetition)?
                     {
@@ -313,6 +330,49 @@ impl<'h> Compiler<'h> {
         Ok(Some((*look, consuming_branch)))
     }
 
+    /// Prove a cycle-free implementation of greedy `(?:A|C)*` and
+    /// `(?:A|C)+`, where `A` is a start assertion and every successful `C`
+    /// path consumes at least one byte.
+    ///
+    /// The upstream empty-loop guard allows `A` as the first iteration, but
+    /// suppresses that empty branch after `C` has consumed. We therefore use
+    /// an initial ordered split containing `A` and `C`, and a consuming loop
+    /// containing only `C` and the repetition exit. For `*`, the initial
+    /// split has a final exit branch too. This retains leftmost-first priority
+    /// and permits ordinary backtracking from an initially successful
+    /// assertion into `C` when a following expression needs it, without
+    /// introducing a nullable cycle.
+    fn normalized_ordered_start_look_alternation_repetition(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<(Look, &'h Hir)>, LowerError> {
+        if !matches!(outer.min, 0 | 1) || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let body = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = body.kind() else {
+            return Ok(None);
+        };
+        let [look_branch, consuming_branch] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let look_branch = self.capture_free_node(look_branch)?;
+        let HirKind::Look(look) = look_branch.kind() else {
+            return Ok(None);
+        };
+        if !matches!(look, Look::Start | Look::StartLF | Look::StartCRLF) {
+            return Ok(None);
+        }
+        let consuming_branch = self.capture_free_node(consuming_branch)?;
+        if !matches!(
+            consuming_branch.properties().minimum_len(),
+            Some(minimum) if minimum > 0
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((*look, consuming_branch)))
+    }
+
     /// Prove the capture-free identity `(A*){m,} == A*` or
     /// `(A?){m,} == A*` for a positive-width atom `A`.
     ///
@@ -393,6 +453,53 @@ impl<'h> Compiler<'h> {
         alternatives.push(consuming_plus);
         let fragment = self.alternation_fragment(alternatives)?;
         self.push_fragment(fragment)
+    }
+
+    fn finish_ordered_start_look_alternation_repetition(
+        &mut self,
+        look: Look,
+        min: u32,
+    ) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(1)?;
+        let consuming = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing ordered start-look alternation consumer",
+        })?;
+
+        let asserted = self.assertion_fragment(assertion_edge_kind(look))?;
+        let loop_split = self.add_state(StateRole::Split)?;
+        self.add_edge(loop_split, EdgeKind::Epsilon, 0, 0, Some(consuming.start))?;
+        let exit = self.add_edge(loop_split, EdgeKind::Epsilon, 0, 0, None)?;
+        self.patch_all(&consuming.outs, loop_split)?;
+
+        let mut outs = asserted.outs;
+        self.charge_vector_growth(
+            outs.len(),
+            outs.capacity(),
+            2,
+            "normalized start-look repetition exits",
+        )?;
+        reserve(&mut outs, 2, "normalized start-look repetition exits")?;
+        outs.push(exit);
+
+        let initial = self.add_state(StateRole::Split)?;
+        self.add_edge(initial, EdgeKind::Epsilon, 0, 0, Some(asserted.start))?;
+        self.add_edge(initial, EdgeKind::Epsilon, 0, 0, Some(consuming.start))?;
+        match min {
+            0 => {
+                let initial_exit = self.add_edge(initial, EdgeKind::Epsilon, 0, 0, None)?;
+                outs.push(initial_exit);
+            }
+            1 => {}
+            _ => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "uncertified ordered start-look repetition minimum",
+                });
+            }
+        }
+        self.push_fragment(Fragment {
+            start: initial,
+            outs,
+        })
     }
 
     fn alternation_fragment(&mut self, branches: Vec<Fragment>) -> Result<Fragment, LowerError> {
