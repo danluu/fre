@@ -3693,7 +3693,7 @@ mod tests {
 
     #[test]
     fn uncertified_nullable_loop_is_a_build_error() {
-        let error = PortableBuilder::new("(?:|a)*")
+        let error = PortableBuilder::new("(?:a|)*")
             .unicode(false)
             .build()
             .unwrap_err();
