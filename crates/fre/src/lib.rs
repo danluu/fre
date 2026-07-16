@@ -106,7 +106,7 @@ pub use set::{
     PortableRegexSetExecutionError, PortableRegexSetExecutionReport, PortableRegexSetRunLimits,
     PortableSetMatches, PortableSetMatchesIntoIter, PortableSetMatchesIter,
 };
-pub use split::AggregateSplit;
+pub use split::{AggregateSplit, PortableSplit};
 
 use fre_automata::{Automaton, EarliestEnd, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{

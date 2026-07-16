@@ -2,7 +2,9 @@
 
 use fre::{
     AggregateBuilder, AggregateEngineError, AggregateExecutionSource, AggregateOperation,
-    AggregateOperationLimits, AggregateResource, AggregateRunLimits, RustProfile,
+    AggregateOperationLimits, AggregateResource, AggregateRunLimits, BuildLimits, PlanKind,
+    PlanSelection, PortableBuilder, PortableFindIterError, PortableFindIterLimits, PortableRegex,
+    RustProfile, SearchLimits, SearchSessionLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -286,6 +288,41 @@ fn every_pinned_bytes_split_and_splitn_doctest_passes() {
 }
 
 #[test]
+fn every_pinned_bytes_split_doctest_passes_through_portable_regex() {
+    for case in doctest_cases() {
+        let regex = PortableRegex::new(case.pattern).unwrap_or_else(|error| {
+            panic!(
+                "portable upstream split case {} failed to build from {UPSTREAM_PATH} at \
+                 {UPSTREAM_REVISION} ({UPSTREAM_SHA256}): {error}",
+                case.id
+            )
+        });
+        let mut actual = match case.limit {
+            None => regex.split(case.haystack, PortableFindIterLimits::unlimited()),
+            Some(limit) => regex.splitn(case.haystack, limit, PortableFindIterLimits::unlimited()),
+        }
+        .unwrap_or_else(|error| {
+            panic!(
+                "portable upstream split case {} failed to prepare: {error}",
+                case.id
+            )
+        });
+        let fields: Vec<_> = actual
+            .by_ref()
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "portable upstream split case {} failed to execute: {error}",
+                    case.id
+                )
+            });
+        assert_eq!(fields, case.expected, "case {}", case.id);
+        assert_eq!(actual.next(), None, "case {}", case.id);
+        assert_eq!(actual.next(), None, "case {}", case.id);
+    }
+}
+
+#[test]
 fn split_and_splitn_match_pinned_bytes_on_empty_progress_and_invalid_bytes() {
     const PATTERNS: &[&str] = &["", "a", "a*?", r"(?:ab|a)", r"[a-c\xFF]+", r"(?m:^a+$)"];
     const HAYSTACKS: &[&[u8]] = &[
@@ -365,4 +402,223 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
             limit: 2,
         })
     ));
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PortableSplitCase {
+    pattern: &'static str,
+    unicode: bool,
+    selection: PlanSelection,
+    force_literal_set_dfa: bool,
+    expected_plan: PlanKind,
+}
+
+#[test]
+fn portable_split_and_splitn_match_pinned_bytes_across_every_plan() {
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"ab",
+        b"abab",
+        b"xxfoobaz-alphaZ-Sherlock",
+        " αβ ab 雪_42 ".as_bytes(),
+        &[0xFF, b'a', b'b', b'Z', 0x80],
+    ];
+    let limits = [0, 1, 2, 3, usize::MAX];
+
+    for case in portable_split_cases() {
+        let fre = build_portable_split_case(case);
+        assert_eq!(fre.build_report().plan, case.expected_plan, "{case:?}");
+        let mut upstream = regex::bytes::RegexBuilder::new(case.pattern);
+        upstream.unicode(case.unicode);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {case:?}: {error}"));
+
+        for &haystack in haystacks {
+            let expected: Vec<_> = upstream.split(haystack).collect();
+            let mut actual = fre
+                .split(haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("portable split setup failed for {case:?}: {error}")
+                });
+            let fields: Vec<_> = actual
+                .by_ref()
+                .collect::<Result<_, _>>()
+                .unwrap_or_else(|error| panic!("portable split failed for {case:?}: {error}"));
+            assert_eq!(
+                fields, expected,
+                "split case={case:?}, haystack={haystack:?}"
+            );
+            assert!(actual.accounting().matches <= fields.len());
+            assert!(actual.next().is_none(), "completed split must fuse");
+
+            for limit in limits {
+                let expected: Vec<_> = upstream.splitn(haystack, limit).collect();
+                let mut actual = fre
+                    .splitn(haystack, limit, PortableFindIterLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!("portable splitn setup failed for {case:?}/{limit}: {error}")
+                    });
+                assert_eq!(actual.size_hint().1, Some(limit));
+                let fields: Vec<_> =
+                    actual
+                        .by_ref()
+                        .collect::<Result<_, _>>()
+                        .unwrap_or_else(|error| {
+                            panic!("portable splitn failed for {case:?}/{limit}: {error}")
+                        });
+                assert_eq!(
+                    fields, expected,
+                    "splitn case={case:?}, haystack={haystack:?}, limit={limit}"
+                );
+                assert!(actual.next().is_none(), "completed splitn must fuse");
+            }
+        }
+    }
+}
+
+#[test]
+fn portable_split_limits_fail_visibly_and_trivial_splitn_does_no_search() {
+    let regex = PortableBuilder::new("(?:ab)+")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("portable K0 split regex");
+    let mut probe = regex
+        .split(b"abab", PortableFindIterLimits::unlimited())
+        .expect("unlimited split setup");
+    let probe_fields: Vec<_> = probe
+        .by_ref()
+        .collect::<Result<_, _>>()
+        .expect("unlimited split execution");
+    assert_eq!(probe_fields, vec![b"".as_slice(), b"".as_slice()]);
+    let probe_accounting = probe.accounting();
+    assert!(probe_accounting.search_calls > probe_accounting.matches);
+    assert!(probe.workspace_setup_accounting().is_some());
+
+    let below_limits = PortableFindIterLimits {
+        max_search_calls: probe_accounting.search_calls - 1,
+        ..PortableFindIterLimits::unlimited()
+    };
+    let mut below = regex
+        .split(b"abab", below_limits)
+        .expect("below-limit split setup");
+    assert_eq!(below.next(), Some(Ok(b"".as_slice())));
+    assert_eq!(
+        below.next(),
+        Some(Err(PortableFindIterError::SearchCallLimit {
+            needed: probe_accounting.search_calls,
+            limit: probe_accounting.search_calls - 1,
+        }))
+    );
+    assert!(below.next().is_none(), "resource refusal must fuse split");
+
+    let no_search = PortableFindIterLimits {
+        session: SearchSessionLimits {
+            max_setup_work: 0,
+            max_scratch_bytes: 0,
+        },
+        search: SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        },
+        max_search_calls: 0,
+    };
+    let zero: Vec<_> = regex
+        .splitn(b"abab", 0, no_search)
+        .expect("zero fields require no search setup")
+        .collect::<Result<_, _>>()
+        .expect("zero fields require no search execution");
+    assert!(zero.is_empty());
+
+    let mut one = regex
+        .splitn(b"abab", 1, no_search)
+        .expect("one field requires no search setup");
+    assert!(one.workspace_setup_accounting().is_none());
+    assert_eq!(one.accounting().search_calls, 0);
+    assert_eq!(one.next(), Some(Ok(b"abab".as_slice())));
+    assert!(one.next().is_none());
+    assert!(regex.split(b"abab", no_search).is_err());
+}
+
+fn portable_split_cases() -> [PortableSplitCase; 8] {
+    [
+        PortableSplitCase {
+            pattern: "ab",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::ExactLiteral,
+        },
+        PortableSplitCase {
+            pattern: "a|ab",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::PackedLiteralSet,
+        },
+        PortableSplitCase {
+            pattern: "foobar|foobaz|fooquux",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: true,
+            expected_plan: PlanKind::LiteralSetDfa,
+        },
+        PortableSplitCase {
+            pattern: "[a-z]+Z",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::RequiredLiteral,
+        },
+        PortableSplitCase {
+            pattern: r"\A[a-z]+Z",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::ForwardAnchored,
+        },
+        PortableSplitCase {
+            pattern: r"\b\w{2,}\b",
+            unicode: true,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::UnicodeWordRun,
+        },
+        PortableSplitCase {
+            pattern: "(?:ab)+",
+            unicode: false,
+            selection: PlanSelection::ForceK0,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::K0,
+        },
+        PortableSplitCase {
+            pattern: "",
+            unicode: false,
+            selection: PlanSelection::ForceK0,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::K0,
+        },
+    ]
+}
+
+fn build_portable_split_case(case: PortableSplitCase) -> PortableRegex {
+    let limits = if case.force_literal_set_dfa {
+        BuildLimits {
+            packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                max_patterns: 0,
+                ..fre_kernels::PackedLiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        }
+    } else {
+        BuildLimits::default()
+    };
+    PortableBuilder::new(case.pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .unicode(case.unicode)
+        .limits(limits)
+        .plan_selection(case.selection)
+        .build()
+        .unwrap_or_else(|error| panic!("portable regex rejected {case:?}: {error}"))
 }
