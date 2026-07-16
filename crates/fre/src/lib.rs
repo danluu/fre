@@ -535,6 +535,104 @@ impl From<UnicodeWordRunError> for SearchError {
     }
 }
 
+/// Hard limits for complete non-overlapping byte match iteration.
+///
+/// `max_search_calls` bounds the whole iterator, including searches that
+/// suppress a repeated empty match while making byte-wise progress. The
+/// session and per-search limits retain their existing operation-specific
+/// meanings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableFindIterLimits {
+    /// One-time reusable K0 workspace construction limits.
+    pub session: SearchSessionLimits,
+    /// Limits applied independently to each contextual search.
+    pub search: SearchLimits,
+    /// Maximum contextual searches across the entire iterator.
+    pub max_search_calls: usize,
+}
+
+impl PortableFindIterLimits {
+    /// Limits that accept every representable iterator execution.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            session: SearchSessionLimits::unlimited(),
+            search: SearchLimits::unlimited(),
+            max_search_calls: usize::MAX,
+        }
+    }
+}
+
+impl Default for PortableFindIterLimits {
+    fn default() -> Self {
+        Self {
+            session: SearchSessionLimits::default(),
+            search: SearchLimits::default(),
+            max_search_calls: 1_000_000,
+        }
+    }
+}
+
+/// Exact no-clock accounting accumulated by [`PortableMatches`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PortableFindIterAccounting {
+    /// Contextual search invocations, including the final miss and suppressed
+    /// repeated empty matches.
+    pub search_calls: usize,
+    /// Non-overlapping matches returned to the caller.
+    pub matches: usize,
+    /// Repeated empty matches suppressed to guarantee byte-wise progress.
+    pub suppressed_empty: usize,
+    /// Sum of charged work or conservative linear terms from successful
+    /// contextual searches.
+    pub work_or_linear_terms: u64,
+}
+
+/// Checked terminal failure from complete byte match iteration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortableFindIterError {
+    /// One contextual search failed under its operation-specific limits.
+    Search(SearchError),
+    /// The next contextual search would exceed the whole-iterator call cap.
+    SearchCallLimit { needed: usize, limit: usize },
+    /// An exact whole-iterator counter could not be incremented.
+    AccountingOverflow { counter: &'static str },
+}
+
+impl fmt::Display for PortableFindIterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Search(error) => write!(formatter, "portable iteration search failed: {error}"),
+            Self::SearchCallLimit { needed, limit } => write!(
+                formatter,
+                "portable iteration needs {needed} search calls, exceeding {limit}",
+            ),
+            Self::AccountingOverflow { counter } => {
+                write!(
+                    formatter,
+                    "portable iteration {counter} accounting overflowed"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PortableFindIterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Search(error) => Some(error),
+            Self::SearchCallLimit { .. } | Self::AccountingOverflow { .. } => None,
+        }
+    }
+}
+
+impl From<SearchError> for PortableFindIterError {
+    fn from(value: SearchError) -> Self {
+        Self::Search(value)
+    }
+}
+
 /// Planner selection control used by forced-plan differential tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PlanSelection {
@@ -1523,6 +1621,36 @@ impl PortableRegex {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Iterate over every non-overlapping match with Rust bytes empty-match
+    /// progress and original-haystack assertion context.
+    ///
+    /// K0 prepares one reusable workspace before iteration. Every subsequent
+    /// search is allocation-free for K0, while native plans retain their
+    /// selected dispatch. Iterator items are errors so a resource refusal is
+    /// never silently treated as exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if reusable K0 workspace construction exceeds
+    /// `limits.session`. Per-search and whole-iterator failures are yielded as
+    /// [`PortableFindIterError`] items.
+    pub fn find_iter<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableMatches<'r, 'h>, SearchError> {
+        let session = self.search_session(limits.session)?;
+        Ok(PortableMatches {
+            session,
+            haystack,
+            limits,
+            start: 0,
+            last_match_end: None,
+            accounting: PortableFindIterAccounting::default(),
+            finished: false,
+        })
+    }
+
     /// Return the selected match at or after `start`.
     ///
     /// Assertions inspect the complete original haystack and returned offsets
@@ -1949,6 +2077,126 @@ impl PortableSearchSession<'_> {
         }
     }
 }
+
+/// Fallible iterator over every non-overlapping byte match.
+///
+/// Repeated empty matches at the previous match end are suppressed before the
+/// next byte position is searched. This preserves the pinned Rust bytes
+/// iterator's adjacent-empty behavior without reinterpreting anchors against
+/// sliced suffixes.
+#[derive(Debug)]
+pub struct PortableMatches<'r, 'h> {
+    session: PortableSearchSession<'r>,
+    haystack: &'h [u8],
+    limits: PortableFindIterLimits,
+    start: usize,
+    last_match_end: Option<usize>,
+    accounting: PortableFindIterAccounting,
+    finished: bool,
+}
+
+impl PortableMatches<'_, '_> {
+    /// Exact counters accumulated through the most recent iterator action.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.accounting
+    }
+
+    /// One-time K0 workspace setup facts, or `None` for native plans.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.session.workspace_setup_accounting()
+    }
+
+    fn fail(&mut self, error: PortableFindIterError) -> Result<Match, PortableFindIterError> {
+        self.finished = true;
+        Err(error)
+    }
+
+    fn begin_search(&mut self) -> Result<(), PortableFindIterError> {
+        let needed = self.accounting.search_calls.checked_add(1).ok_or(
+            PortableFindIterError::AccountingOverflow {
+                counter: "search-call",
+            },
+        )?;
+        if needed > self.limits.max_search_calls {
+            return Err(PortableFindIterError::SearchCallLimit {
+                needed,
+                limit: self.limits.max_search_calls,
+            });
+        }
+        self.accounting.search_calls = needed;
+        Ok(())
+    }
+
+    fn record_search(
+        &mut self,
+        accounting: &SearchAccounting,
+    ) -> Result<(), PortableFindIterError> {
+        self.accounting.work_or_linear_terms = self
+            .accounting
+            .work_or_linear_terms
+            .checked_add(accounting.work_or_linear_terms())
+            .ok_or(PortableFindIterError::AccountingOverflow { counter: "work" })?;
+        Ok(())
+    }
+}
+
+impl Iterator for PortableMatches<'_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.finished {
+            if let Err(error) = self.begin_search() {
+                return Some(self.fail(error));
+            }
+            let searched = self.session.find_window(
+                self.haystack,
+                SearchWindow::new(self.start, self.haystack.len()),
+                self.limits.search,
+            );
+            let (matched, search_accounting) = match searched {
+                Ok(result) => result,
+                Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),
+            };
+            if let Err(error) = self.record_search(&search_accounting) {
+                return Some(self.fail(error));
+            }
+            let Some(matched) = matched else {
+                self.finished = true;
+                return None;
+            };
+
+            if matched.is_empty() && self.last_match_end == Some(matched.end()) {
+                let Some(suppressed_empty) = self.accounting.suppressed_empty.checked_add(1) else {
+                    return Some(self.fail(PortableFindIterError::AccountingOverflow {
+                        counter: "suppressed-empty",
+                    }));
+                };
+                self.accounting.suppressed_empty = suppressed_empty;
+                if self.start == self.haystack.len() {
+                    self.finished = true;
+                    return None;
+                }
+                self.start = self.start.saturating_add(1);
+                continue;
+            }
+
+            self.start = matched.end();
+            self.last_match_end = Some(matched.end());
+            let Some(emitted_count) = self.accounting.matches.checked_add(1) else {
+                return Some(
+                    self.fail(PortableFindIterError::AccountingOverflow { counter: "match" }),
+                );
+            };
+            self.accounting.matches = emitted_count;
+            return Some(Ok(matched));
+        }
+        None
+    }
+}
+
+impl core::iter::FusedIterator for PortableMatches<'_, '_> {}
 
 pub(crate) fn reserve_planner<T>(
     values: &mut Vec<T>,
