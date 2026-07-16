@@ -676,8 +676,19 @@ impl FullTable {
         accounting.scratch_peak_bytes = allocated_bytes;
         let states = program.insts.len();
         let boundaries = add(haystack.len(), 1, Resource::Boundaries)?;
+        let mut row_end = values.len();
         for position in (0..boundaries).rev() {
-            let row = mul(position, states, Resource::TableCells)?;
+            let row_start = row_end
+                .checked_sub(states)
+                .ok_or(Error::InternalInvariant("full-table row underflow"))?;
+            let (through_row, later_rows) = values.split_at_mut(row_end);
+            let row = through_row
+                .get_mut(row_start..)
+                .ok_or(Error::InternalInvariant("full-table row outside table"))?;
+            // The final input boundary has no successor row, but it also has
+            // no input byte and therefore cannot follow a Consume edge.
+            let next_row = later_rows.get(..states).unwrap_or(&[]);
+            let input = haystack.get(position).copied();
             for &pc in &program.epsilon_order {
                 charge_state(accounting, requirements.work_bound);
                 let value = match program.instruction(pc)? {
@@ -688,9 +699,8 @@ impl FullTable {
                     Inst::Match => encode(position)?,
                     Inst::Consume { bytes, next } => {
                         charge_transition(accounting, requirements.work_bound);
-                        if position < haystack.len() && bytes.contains(haystack[position]) {
-                            let next_position = add(position, 1, Resource::Boundaries)?;
-                            values[index(next_position, *next, states)?]
+                        if input.is_some_and(|byte| bytes.contains(byte)) {
+                            next_row[*next]
                         } else {
                             0
                         }
@@ -698,7 +708,7 @@ impl FullTable {
                     Inst::Assert { assertion, next } => {
                         charge_assertion(accounting, requirements.work_bound);
                         if assertions.is_match(*assertion, position)? {
-                            values[add(row, *next, Resource::TableCells)?]
+                            row[*next]
                         } else {
                             0
                         }
@@ -708,17 +718,23 @@ impl FullTable {
                         fallback,
                     } => {
                         charge_transition(accounting, requirements.work_bound);
-                        let selected = values[add(row, *preferred, Resource::TableCells)?];
+                        let selected = row[*preferred];
                         if selected != 0 {
                             selected
                         } else {
                             charge_transition(accounting, requirements.work_bound);
-                            values[add(row, *fallback, Resource::TableCells)?]
+                            row[*fallback]
                         }
                     }
                 };
-                values[add(row, pc, Resource::TableCells)?] = value;
+                row[pc] = value;
             }
+            row_end = row_start;
+        }
+        if row_end != 0 {
+            return Err(Error::InternalInvariant(
+                "full-table rows did not fill table",
+            ));
         }
         Ok(Self {
             values,
