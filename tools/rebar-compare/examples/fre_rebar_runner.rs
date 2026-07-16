@@ -35,6 +35,7 @@ use rebar_compare::{
         PerformanceRawObservation, capture_lifecycle_observation_bytes,
         performance_raw_observation_bytes, produce_capture_lifecycle_observation,
         produce_performance_candidate_observation,
+        validate_performance_candidate_observation_request,
     },
 };
 use sha2::{Digest, Sha256};
@@ -918,6 +919,7 @@ where
     ) -> Result<(Duration, u64), CompareError>,
 {
     let mut identity = performance_candidate_identity(benchmark, expectations)?;
+    validate_performance_candidate_observation_request(&identity)?;
     let expected_plan = identity.candidate_plan.clone();
     let regex = current_fre_rebar_portable_builder(
         benchmark.pattern(),
@@ -1720,6 +1722,26 @@ mod tests {
             derived.candidate_runtime.as_deref(),
             Some("unicode-word-run-linear-v1")
         );
+
+        let mut malformed_metadata = derived_runtime;
+        malformed_metadata.canonical_sha = Some("malformed".to_string());
+        let mut malformed_pattern = benchmark.clone();
+        malformed_pattern.patterns = vec!["(".to_string()];
+        let ran = std::cell::Cell::new(false);
+        let error = model_grep_performance_raw_with_measurement(
+            &malformed_pattern,
+            &malformed_metadata,
+            |session, haystack, limits| {
+                ran.set(true);
+                Ok((
+                    Duration::from_nanos(1),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect_err("malformed identity fails before constructing an invalid pattern");
+        assert!(error.to_string().contains("performance canonical commit"));
+        assert!(!ran.get(), "malformed identity reached measurement");
 
         let mut wrong_runtime = first_expectations;
         wrong_runtime.runtime = Some("k0".to_string());

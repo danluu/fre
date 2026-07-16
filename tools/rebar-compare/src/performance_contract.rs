@@ -2341,6 +2341,23 @@ pub fn validate_performance_raw_observation(
 fn validate_performance_candidate_identity_shape(
     identity: &PerformanceCandidateObservationIdentity,
 ) -> Result<(), ContractError> {
+    validate_performance_candidate_observation_request(identity)?;
+    if identity.model == "grep" && identity.candidate_runtime.is_none() {
+        return Err(ContractError::new(
+            "grep performance identity has no selected runtime",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every caller-provisioned candidate identity and lifecycle field
+/// before an untimed artifact is constructed. A grep request may omit only
+/// its selected runtime because the trusted runner derives that value from the
+/// artifact it subsequently constructs; the raw-arm producer still requires
+/// the derived runtime before it can emit evidence.
+pub fn validate_performance_candidate_observation_request(
+    identity: &PerformanceCandidateObservationIdentity,
+) -> Result<(), ContractError> {
     require_token(&identity.contract_id, "performance contract ID")?;
     require_oid(&identity.canonical_commit, "performance canonical commit")?;
     require_oid(&identity.canonical_tree, "performance canonical tree")?;
@@ -2359,11 +2376,6 @@ fn validate_performance_candidate_identity_shape(
         identity.candidate_runtime.as_deref(),
     ) {
         ("grep", Some(runtime)) => require_performance_grep_runtime(runtime)?,
-        ("grep", None) => {
-            return Err(ContractError::new(
-                "grep performance identity has no selected runtime",
-            ));
-        }
         (_, Some(_)) => {
             return Err(ContractError::new(
                 "non-grep performance identity claims a selected runtime",
@@ -5848,12 +5860,17 @@ mod tests {
             .is_err()
         );
         identity.candidate_runtime = None;
+        validate_performance_candidate_observation_request(&identity)
+            .expect("pre-construction grep request may leave runtime unresolved");
         assert!(
             produce_performance_candidate_observation(&identity, || {
                 Ok((Duration::from_nanos(1), 1))
             })
             .is_err()
         );
+        identity.canonical_commit = "malformed".to_string();
+        assert!(validate_performance_candidate_observation_request(&identity).is_err());
+        identity.canonical_commit = "a".repeat(40);
         identity.model = "count".to_string();
         identity.candidate_plan = "aggregate-exact-literal".to_string();
         identity.candidate_runtime = Some("k0".to_string());
