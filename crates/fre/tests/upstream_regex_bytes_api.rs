@@ -2,8 +2,8 @@
 
 use fre::{
     BuildError, BuildLimits, EXPLAIN_SCHEMA_VERSION, PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION,
-    PlanKind, PlanSelection, PortableBuilder, PortableRegex, PortableRegexSet,
-    PortableRegexSetBuildLimits, PortableRegexSetBuilder, RustProfile,
+    PlanKind, PlanSelection, PortableBuilder, PortableCapturesReadError, PortableRegex,
+    PortableRegexSet, PortableRegexSetBuildLimits, PortableRegexSetBuilder, RustProfile,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -37,6 +37,7 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_capture_locations_get",
     "bytes_capture_locations_len",
     "bytes_capture_locations_pos_alias",
+    "bytes_regex_captures_read",
     "misc_capture_names",
 ];
 
@@ -49,7 +50,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 22);
+    assert_eq!(UPSTREAM_API_IDS.len(), 23);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 5);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 4);
 }
@@ -372,6 +373,144 @@ fn fresh_capture_location_buffers_match_pinned_bytes_metadata() {
         assert_eq!(cloned.len(), actual.len(), "clone {name}");
         assert_eq!(format!("{cloned:?}"), format!("{actual:?}"), "clone {name}");
     }
+}
+
+#[test]
+fn capture_free_locations_read_matches_pinned_bytes_across_every_portable_plan() {
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let cases = [
+        (
+            false,
+            PortableBuilder::new("Sherlock").unicode(false).build(),
+        ),
+        (false, PortableBuilder::new("a|ab").unicode(false).build()),
+        (
+            false,
+            PortableBuilder::new("foobar|foobaz|fooquux")
+                .unicode(false)
+                .limits(dfa_limits)
+                .build(),
+        ),
+        (
+            false,
+            PortableBuilder::new("[a-z]+Z").unicode(false).build(),
+        ),
+        (
+            false,
+            PortableBuilder::new(r"\A[a-z]+Z").unicode(false).build(),
+        ),
+        (true, PortableBuilder::new(r"\b\w{2,}\b").build()),
+        (
+            false,
+            PortableBuilder::new("(?:ab)+")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build(),
+        ),
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"\xFFabab Sherlock abcZ fooquux",
+        " \u{3B1}\u{3B2} ".as_bytes(),
+    ];
+
+    for (unicode, built) in cases {
+        let fre = built.expect("capture-free portable regex");
+        let mut upstream_builder = regex::bytes::RegexBuilder::new(fre.as_str());
+        upstream_builder.unicode(unicode);
+        let upstream = upstream_builder.build().expect("pinned capture-free regex");
+        let mut actual_locations = fre.capture_locations();
+        let mut expected_locations = upstream.capture_locations();
+
+        for &haystack in haystacks {
+            let (actual, accounting) = fre
+                .captures_read(
+                    &mut actual_locations,
+                    haystack,
+                    fre::SearchLimits::unlimited(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("capture-free read failed for {:?}: {error}", fre.as_str())
+                });
+            let expected = upstream.captures_read(&mut expected_locations, haystack);
+            assert_eq!(
+                actual.map(fre::ByteMatch::range),
+                expected.map(|matched| matched.range()),
+                "pattern={:?}, haystack={haystack:?}",
+                fre.as_str()
+            );
+            assert_eq!(
+                actual_locations.get(0),
+                expected_locations.get(0),
+                "pattern={:?}, haystack={haystack:?}",
+                fre.as_str()
+            );
+            let (_, find_accounting) = fre
+                .find(haystack, fre::SearchLimits::unlimited())
+                .expect("comparison whole-match search");
+            assert_eq!(accounting, find_accounting, "pattern={:?}", fre.as_str());
+        }
+    }
+}
+
+#[test]
+fn capture_location_reads_clear_reused_buffers_before_every_typed_refusal() {
+    let capture_free = PortableBuilder::new("a")
+        .unicode(false)
+        .build()
+        .expect("capture-free regex");
+    let captured = PortableBuilder::new("(a)")
+        .unicode(false)
+        .build()
+        .expect("captured regex");
+    let mut locations = capture_free.capture_locations();
+    let (matched, _) = capture_free
+        .captures_read(&mut locations, b"a", fre::SearchLimits::unlimited())
+        .expect("populate reusable locations");
+    assert_eq!(matched.map(fre::ByteMatch::range), Some(0..1));
+    assert_eq!(locations.get(0), Some((0, 1)));
+
+    let tiny = fre::SearchLimits {
+        max_work: 0,
+        max_scratch_bytes: usize::MAX,
+    };
+    assert!(matches!(
+        capture_free.captures_read(&mut locations, b"a", tiny),
+        Err(PortableCapturesReadError::Search(_))
+    ));
+    assert_eq!(locations.get(0), None);
+
+    let mut captured_locations = captured.capture_locations();
+    assert!(matches!(
+        captured.captures_read(
+            &mut captured_locations,
+            b"a",
+            fre::SearchLimits::unlimited()
+        ),
+        Err(PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 1 })
+    ));
+    assert_eq!(captured_locations.get(0), None);
+    assert_eq!(captured_locations.get(1), None);
+
+    assert!(matches!(
+        capture_free.captures_read(
+            &mut captured_locations,
+            b"a",
+            fre::SearchLimits::unlimited()
+        ),
+        Err(PortableCapturesReadError::LocationCount {
+            expected: 1,
+            actual: 2
+        })
+    ));
+    assert_eq!(captured_locations.get(0), None);
+    assert_eq!(captured_locations.get(1), None);
 }
 
 #[test]

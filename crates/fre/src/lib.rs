@@ -1722,9 +1722,9 @@ impl core::iter::FusedIterator for PortableCaptureNames<'_> {}
 ///
 /// A newly allocated buffer contains no matched locations. Its cardinality is
 /// nevertheless fixed by the regex and includes the implicit whole-match slot
-/// at index zero. This is the allocation and metadata half of the pinned Rust
-/// bytes `CaptureLocations` contract; capture-reading execution will populate
-/// the same buffer type when that API is admitted.
+/// at index zero. This is the reusable-buffer half of the pinned Rust bytes
+/// `CaptureLocations` contract; [`PortableRegex::captures_read`] populates its
+/// admitted capture-free group-zero slice.
 #[derive(Clone, Debug)]
 pub struct PortableCaptureLocations {
     slots: Box<[Option<(usize, usize)>]>,
@@ -1761,6 +1761,62 @@ impl PortableCaptureLocations {
     #[must_use]
     pub fn pos(&self, index: usize) -> Option<(usize, usize)> {
         self.get(index)
+    }
+}
+
+/// Failure while populating reusable portable capture locations.
+///
+/// The portable whole-match executors can populate group zero exactly for a
+/// capture-free pattern. Explicit subgroup preservation remains a separate
+/// capability and is refused instead of publishing incomplete locations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortableCapturesReadError {
+    /// The caller supplied a location buffer created for another regex.
+    LocationCount {
+        /// Capture slots required by this regex.
+        expected: usize,
+        /// Capture slots present in the supplied buffer.
+        actual: usize,
+    },
+    /// The regex contains explicit groups whose offsets are not preserved by
+    /// the selected portable whole-match executor.
+    ExplicitCapturesUnsupported {
+        /// Number of explicit groups, excluding the whole-match slot.
+        captures: usize,
+    },
+    /// The selected whole-match executor refused the bounded search.
+    Search(SearchError),
+}
+
+impl fmt::Display for PortableCapturesReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocationCount { expected, actual } => write!(
+                formatter,
+                "capture location count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ExplicitCapturesUnsupported { captures } => write!(
+                formatter,
+                "portable capture reading does not yet preserve {captures} explicit capture groups"
+            ),
+            Self::Search(error) => write!(formatter, "portable capture search failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PortableCapturesReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Search(error) => Some(error),
+            Self::LocationCount { .. } | Self::ExplicitCapturesUnsupported { .. } => None,
+        }
+    }
+}
+
+impl From<SearchError> for PortableCapturesReadError {
+    fn from(value: SearchError) -> Self {
+        Self::Search(value)
     }
 }
 
@@ -1922,6 +1978,45 @@ impl PortableRegex {
     #[must_use]
     pub fn locations(&self) -> PortableCaptureLocations {
         self.capture_locations()
+    }
+
+    /// Search and populate reusable locations for a capture-free regex.
+    ///
+    /// This is the admitted group-zero slice of the pinned Rust bytes
+    /// `captures_read` contract. The buffer is cleared before every attempt,
+    /// including typed refusals, and a successful match stores its offsets in
+    /// slot zero. Patterns with explicit capture groups are refused until the
+    /// portable facade has a capture-preserving executor for their offsets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableCapturesReadError`] if `locations` belongs to a regex
+    /// with different capture cardinality, explicit subgroups require an
+    /// unavailable capability, or the selected search exceeds its limits.
+    pub fn captures_read<'h>(
+        &self,
+        locations: &mut PortableCaptureLocations,
+        haystack: &'h [u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), PortableCapturesReadError> {
+        locations.slots.fill(None);
+        if locations.len() != self.captures_len() {
+            return Err(PortableCapturesReadError::LocationCount {
+                expected: self.captures_len(),
+                actual: locations.len(),
+            });
+        }
+        let explicit_captures = self.captures_len().saturating_sub(1);
+        if explicit_captures != 0 {
+            return Err(PortableCapturesReadError::ExplicitCapturesUnsupported {
+                captures: explicit_captures,
+            });
+        }
+        let (matched, accounting) = self.find_borrowed(haystack, limits)?;
+        if let Some(matched) = matched {
+            locations.slots[0] = Some((matched.start(), matched.end()));
+        }
+        Ok((matched, accounting))
     }
 
     /// The immutable compatibility profile used during parsing.
