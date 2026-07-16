@@ -800,64 +800,49 @@ impl RowStore {
             limits.max_peak_bytes,
             Resource::PeakBytes,
         )?;
-        let boundaries = add(haystack.len(), 1, Resource::Boundaries)?;
-        let mut write_offset = 0_usize;
-        for position in (0..boundaries).rev() {
+        // Build the sole boundary without an input byte separately. Every
+        // remaining row then has a byte, so every consuming state avoids an
+        // `Option` discriminant check in the Q-by-N construction loop.
+        let mut write_offset = requirements.record_bytes;
+        {
+            let terminal_record = store
+                .get_mut(..write_offset)
+                .ok_or(Error::InternalInvariant("terminal row outside row log"))?;
+            Self::build_row::<false>(
+                program,
+                assertions,
+                haystack.len(),
+                0,
+                row,
+                next_row,
+                terminal_record,
+                accounting,
+                requirements.work_bound,
+            )?;
+        }
+        accounting.sequential_bytes_written = add(
+            accounting.sequential_bytes_written,
+            requirements.record_bytes,
+            Resource::SequentialBytes,
+        )?;
+        core::mem::swap(&mut row, &mut next_row);
+
+        for (position, input) in haystack.iter().copied().enumerate().rev() {
             let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
             let record = store
                 .get_mut(write_offset..end)
                 .ok_or(Error::InternalInvariant("row-log write outside store"))?;
-            let input = haystack.get(position).copied();
-            for &pc in &program.epsilon_order {
-                charge_state(accounting, requirements.work_bound);
-                let value = match program.instruction(pc)? {
-                    Inst::Unfilled => {
-                        return Err(Error::InternalInvariant("unfilled execution state"));
-                    }
-                    Inst::Fail => 0,
-                    Inst::Match => encode(position)?,
-                    Inst::Consume { bytes, next } => {
-                        charge_transition(accounting, requirements.work_bound);
-                        if input.is_some_and(|byte| bytes.contains(byte)) {
-                            next_row[*next]
-                        } else {
-                            0
-                        }
-                    }
-                    Inst::Assert { assertion, next } => {
-                        charge_assertion(accounting, requirements.work_bound);
-                        if assertions.is_match(*assertion, position)? {
-                            row[*next]
-                        } else {
-                            0
-                        }
-                    }
-                    Inst::Split {
-                        preferred,
-                        fallback,
-                    } => {
-                        charge_transition(accounting, requirements.work_bound);
-                        let preferred_value = row[*preferred];
-                        let rank = program.split_rank[pc];
-                        if rank == NO_SPLIT_RANK {
-                            return Err(Error::InternalInvariant(
-                                "split state has no decision rank",
-                            ));
-                        }
-                        if preferred_value != 0 {
-                            set_bit(record, rank)?;
-                            preferred_value
-                        } else {
-                            charge_transition(accounting, requirements.work_bound);
-                            row[*fallback]
-                        }
-                    }
-                };
-                row[pc] = value;
-            }
-            if row[program.entry] != 0 {
-                set_bit(record, program.split_count)?;
-            }
+            Self::build_row::<true>(
+                program,
+                assertions,
+                position,
+                input,
+                row,
+                next_row,
+                record,
+                accounting,
+                requirements.work_bound,
+            )?;
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
                 requirements.record_bytes,
@@ -879,6 +864,73 @@ impl RowStore {
             build_scratch_bytes: build_scratch,
             root_rank: program.split_count,
         })
+    }
+
+    #[inline]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the specialized row loop keeps borrowed buffers and exact accounting explicit"
+    )]
+    fn build_row<const HAS_INPUT: bool>(
+        program: &Program,
+        assertions: AssertionContext<'_>,
+        position: usize,
+        input: u8,
+        row: &mut [usize],
+        next_row: &[usize],
+        record: &mut [u8],
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<(), Error> {
+        for &pc in &program.epsilon_order {
+            charge_state(accounting, admitted_work_bound);
+            let value = match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant("unfilled execution state"));
+                }
+                Inst::Fail => 0,
+                Inst::Consume { bytes, next } => {
+                    charge_transition(accounting, admitted_work_bound);
+                    if HAS_INPUT && bytes.contains(input) {
+                        next_row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::Match => encode(position)?,
+                Inst::Assert { assertion, next } => {
+                    charge_assertion(accounting, admitted_work_bound);
+                    if assertions.is_match(*assertion, position)? {
+                        row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                } => {
+                    charge_transition(accounting, admitted_work_bound);
+                    let preferred_value = row[*preferred];
+                    let rank = program.split_rank[pc];
+                    if rank == NO_SPLIT_RANK {
+                        return Err(Error::InternalInvariant("split state has no decision rank"));
+                    }
+                    if preferred_value != 0 {
+                        set_bit(record, rank)?;
+                        preferred_value
+                    } else {
+                        charge_transition(accounting, admitted_work_bound);
+                        row[*fallback]
+                    }
+                }
+            };
+            row[pc] = value;
+        }
+        if row[program.entry] != 0 {
+            set_bit(record, program.split_count)?;
+        }
+        Ok(())
     }
 
     fn reader(&self) -> RowReader<'_> {
