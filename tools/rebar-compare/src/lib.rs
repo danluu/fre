@@ -4660,17 +4660,17 @@ mod tests {
             "aggregate-finite-literal-dfa",
         );
 
-        let unicode_capture = current_fre(
-            "count-captures",
-            &[r"(\pL)".to_string()],
-            "雪".as_bytes(),
-            true,
-            false,
-            &limits,
-        );
-        assert!(
-            matches!(unicode_capture, CandidateOutcome::Unsupported(ref reason) if reason.contains("Unicode")),
-            "Unicode capture must remain a typed refusal: {unicode_capture:?}"
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[r"(\pL)".to_string()],
+                "雪".as_bytes(),
+                true,
+                false,
+                &limits,
+            ),
+            2,
+            "capture-linear-selector-persistent-history",
         );
     }
 
