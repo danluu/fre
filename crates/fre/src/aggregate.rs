@@ -1894,6 +1894,13 @@ impl AggregateSpans {
     pub fn is_empty(&self) -> bool {
         self.admitted.as_slice().is_empty()
     }
+
+    pub(crate) fn span_at(&self, index: usize) -> Option<Match> {
+        self.admitted.as_slice().get(index).map(|span| Match {
+            start: span.start,
+            end: span.end,
+        })
+    }
 }
 
 impl<'a> IntoIterator for &'a AggregateSpans {

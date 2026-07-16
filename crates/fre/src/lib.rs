@@ -7,12 +7,12 @@
 //! pattern's syntax identity and composes ordered whole-match compile/count/
 //! span-sum plans without source concatenation. Whole-match aggregate plans
 //! may erase capture annotations. Their complete spans also provide bounded
-//! literal/no-expansion replacement and `replacen`. [`CaptureBuilder`]
-//! separately preserves capture histories for the participating-group reducer
-//! on its certified Rust-byte subset; it is not a general capture-record
-//! facade. None of these types is named `Regex`: unsupported syntax/profile/
-//! operation combinations are typed build errors, and there is no full
-//! Rust-regex/RE2 or JIT claim.
+//! byte `split`/`splitn` and literal/no-expansion replacement/`replacen`.
+//! [`CaptureBuilder`] separately preserves capture histories for the
+//! participating-group reducer on its certified Rust-byte subset; it is not a
+//! general capture-record facade. None of these types is named `Regex`:
+//! unsupported syntax/profile/operation combinations are typed build errors,
+//! and there is no full Rust-regex/RE2 or JIT claim.
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +25,7 @@ mod finite;
 mod forward_anchored;
 mod replacement;
 mod required_literal;
+mod split;
 mod unicode_word_run;
 
 pub use aggregate::{
@@ -90,6 +91,7 @@ pub use replacement::{
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
     LiteralReplacementResult,
 };
+pub use split::AggregateSplit;
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{
