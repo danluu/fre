@@ -349,6 +349,7 @@ version = "0.1.0"
 dependencies = [
  "bstr",
  "fre",
+ "libc",
  "rebar-expand",
  "regex",
  "regex-automata",

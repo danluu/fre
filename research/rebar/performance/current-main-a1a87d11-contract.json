@@ -1,0 +1,200 @@
+{
+  "schema": "fre.rebar.performance-contract.v1",
+  "contract_id": "rebar-current-main-a1a87d11-v1",
+  "canonical": {
+    "reference": "refs/heads/main",
+    "commit": "a1a87d11f923973c4148743fcaddb119965c518b",
+    "tree": "2cc1247598615e0b93ef3e3dfa1288fd49ced14c"
+  },
+  "semantic": {
+    "report_schema": "fre.rebar.comparison.v2",
+    "accepted_report_sha256": [
+      "a43d6feff5e55beee4aca28d67404219b7f80d533d7e6becfd23cda7042ff3b0",
+      "dddd0da2d0d5347bad12b9f3c6bab519a00a35cca95740a563c109e093c9e7d7"
+    ],
+    "manifest_sha256": "09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43",
+    "receipts_sha256": "3232b4f43110f532b6a1fdaaf046f6e8b1a681e4bcb51d4c522866e068de236d",
+    "rebar_revision": "463d00f31887e84c38467805b9e3122c314b9521",
+    "fre_adapter": "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2",
+    "denominator_rows": 344,
+    "supported_rows": 257,
+    "unsupported_rows": 87
+  },
+  "models": [
+    {
+      "model": "compile",
+      "denominator_rows": 33,
+      "supported_rows": 28,
+      "unsupported_rows": 5,
+      "lifecycle_boundaries": [
+        "cold-public-compile",
+        "allocator-warm-public-compile"
+      ]
+    },
+    {
+      "model": "count",
+      "denominator_rows": 133,
+      "supported_rows": 100,
+      "unsupported_rows": 33,
+      "lifecycle_boundaries": [
+        "first-public-operation",
+        "steady-public-operation"
+      ]
+    },
+    {
+      "model": "count-captures",
+      "denominator_rows": 15,
+      "supported_rows": 3,
+      "unsupported_rows": 12,
+      "lifecycle_boundaries": [
+        "first-public-operation",
+        "steady-public-operation"
+      ]
+    },
+    {
+      "model": "count-spans",
+      "denominator_rows": 129,
+      "supported_rows": 110,
+      "unsupported_rows": 19,
+      "lifecycle_boundaries": [
+        "first-public-operation",
+        "steady-public-operation"
+      ]
+    },
+    {
+      "model": "grep",
+      "denominator_rows": 11,
+      "supported_rows": 11,
+      "unsupported_rows": 0,
+      "lifecycle_boundaries": [
+        "first-public-operation",
+        "steady-public-operation"
+      ]
+    },
+    {
+      "model": "grep-captures",
+      "denominator_rows": 22,
+      "supported_rows": 5,
+      "unsupported_rows": 17,
+      "lifecycle_boundaries": [
+        "first-public-operation",
+        "steady-public-operation"
+      ]
+    },
+    {
+      "model": "regex-redux",
+      "denominator_rows": 1,
+      "supported_rows": 0,
+      "unsupported_rows": 1,
+      "lifecycle_boundaries": [
+        "complete-regex-redux"
+      ]
+    }
+  ],
+  "lifecycle_boundaries": [
+    {
+      "id": "cold-public-compile",
+      "phase": "cold-construction",
+      "models": ["compile"],
+      "includes": "fresh public builder configuration and construction of the complete search-ready artifact",
+      "excludes": "input loading and untimed semantic verification",
+      "required_metrics": [
+        "elapsed_ns",
+        "result_digest",
+        "allocation_count",
+        "allocated_bytes",
+        "peak_rss_bytes",
+        "artifact_bytes"
+      ]
+    },
+    {
+      "id": "allocator-warm-public-compile",
+      "phase": "allocator-warm-construction",
+      "models": ["compile"],
+      "includes": "fresh public builder configuration and construction after process and allocator initialization",
+      "excludes": "cross-iteration regex caches, input loading, and untimed semantic verification",
+      "required_metrics": [
+        "elapsed_ns",
+        "result_digest",
+        "allocation_count",
+        "allocated_bytes",
+        "peak_rss_bytes",
+        "artifact_bytes"
+      ]
+    },
+    {
+      "id": "first-public-operation",
+      "phase": "first-operation",
+      "models": [
+        "count",
+        "count-captures",
+        "count-spans",
+        "grep",
+        "grep-captures"
+      ],
+      "includes": "the first complete public model operation on one already-built artifact, including required line iteration and reducer work",
+      "excludes": "artifact construction, input loading, and untimed full-trace semantic verification",
+      "required_metrics": [
+        "elapsed_ns",
+        "result_digest",
+        "allocation_count",
+        "allocated_bytes",
+        "peak_rss_bytes",
+        "work_units"
+      ]
+    },
+    {
+      "id": "steady-public-operation",
+      "phase": "steady-operation",
+      "models": [
+        "count",
+        "count-captures",
+        "count-spans",
+        "grep",
+        "grep-captures"
+      ],
+      "includes": "a repeated complete public model operation on the same artifact and input contract",
+      "excludes": "artifact construction, input loading, and untimed full-trace semantic verification",
+      "required_metrics": [
+        "elapsed_ns",
+        "result_digest",
+        "allocation_count",
+        "allocated_bytes",
+        "peak_rss_bytes",
+        "work_units"
+      ]
+    },
+    {
+      "id": "complete-regex-redux",
+      "phase": "composite-operation",
+      "models": ["regex-redux"],
+      "includes": "all fifteen fresh constructions, repeated search loops, literal replacements, allocation and output formatting required by the Rebar model",
+      "excludes": "input loading and independent untimed output verification",
+      "required_metrics": [
+        "elapsed_ns",
+        "result_digest",
+        "allocation_count",
+        "allocated_bytes",
+        "peak_rss_bytes"
+      ]
+    }
+  ],
+  "reporting": {
+    "require_every_denominator_row": true,
+    "require_pointwise_boundaries": true,
+    "aggregate_cannot_hide_pointwise_failure": true,
+    "pairs_per_comparator": 6,
+    "minimum_candidate_wins": 4,
+    "ratio_ppm_exclusive_upper_bound": 1000000,
+    "comparators": [
+      {
+        "id": "rust-regex-1.12.4",
+        "semantic_adapter": "rebar-rust-regex-1.12.4"
+      },
+      {
+        "id": "re2-2025-11-05",
+        "semantic_adapter": "rebar-re2-2025-11-05"
+      }
+    ]
+  }
+}

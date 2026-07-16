@@ -3,6 +3,8 @@
 //! This deliberately implements models, not benchmark names. Construction is
 //! outside the timer for `grep`; `compile` times a fresh complete artifact and
 //! performs semantic verification only after the sample duration is captured.
+//! Capture models require an explicit first/steady boundary and emit a
+//! self-identifying canonical raw-observation record instead of legacy CSV.
 
 use std::{
     env,
@@ -13,13 +15,30 @@ use std::{
 
 use bstr::ByteSlice;
 use fre::{
-    AggregateBuildReport, AggregateBuilder, AggregatePlanKind, PlanKind, SearchSessionLimits,
+    AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyPlanKind, AggregatePlanKind, PlanKind, PortableSearchSession, SearchLimits,
+    SearchSessionLimits,
 };
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_run_limits, current_fre_rebar_portable_builder,
-    current_fre_rebar_search_limits, current_fre_rebar_validate_aggregate_identity,
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
+    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle, InputReceipt,
+    REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
+    current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
+    current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_validate_aggregate_many_identity,
+    performance_contract::{
+        CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
+        CaptureLifecycleRawObservation, PerformanceCandidateObservationIdentity,
+        PerformanceRawObservation, capture_lifecycle_observation_bytes,
+        performance_raw_observation_bytes, produce_capture_lifecycle_observation,
+        produce_performance_candidate_observation,
+        validate_performance_candidate_observation_request,
+    },
 };
+use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -52,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -76,9 +95,42 @@ fn main() -> Result<(), DynError> {
                         .map_err(|error| format!("invalid --expect-count: {error}"))?,
                 );
             }
+            "--expect-job-id" => {
+                expectations.job_id = Some(next_argument(&mut arguments, "--expect-job-id")?);
+            }
+            "--expect-contract-id" => {
+                expectations.contract_id =
+                    Some(next_argument(&mut arguments, "--expect-contract-id")?);
+            }
+            "--expect-canonical-sha" => {
+                expectations.canonical_sha =
+                    Some(next_argument(&mut arguments, "--expect-canonical-sha")?);
+            }
+            "--expect-canonical-tree" => {
+                expectations.canonical_tree =
+                    Some(next_argument(&mut arguments, "--expect-canonical-tree")?);
+            }
+            "--expect-semantic-receipts" => {
+                expectations.semantic_receipts =
+                    Some(next_argument(&mut arguments, "--expect-semantic-receipts")?);
+            }
+            "--expect-boundary" => {
+                expectations.boundary = Some(next_argument(&mut arguments, "--expect-boundary")?);
+            }
+            "--expect-process-token" => {
+                expectations.process_token =
+                    Some(next_argument(&mut arguments, "--expect-process-token")?);
+            }
+            "--expect-comparator" => {
+                expectations.comparator =
+                    Some(next_argument(&mut arguments, "--expect-comparator")?);
+            }
+            "--performance-raw" => {
+                expectations.performance_raw = true;
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime k0] --expect-count N | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
                         .into(),
                 );
             }
@@ -111,7 +163,21 @@ fn main() -> Result<(), DynError> {
         .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
+    if expectations.performance_raw {
+        require_performance_raw_metadata(&benchmark.model, &expectations)?;
+        let observation = model_performance_raw(&benchmark, &expectations)?;
+        let bytes = performance_raw_observation_bytes(&observation)?;
+        io::stdout().lock().write_all(&bytes)?;
+        return Ok(());
+    }
     require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
+    require_capture_metadata(&benchmark.model, &expectations)?;
+    if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
+        let observation = model_captures(&benchmark, &expectations)?;
+        let bytes = capture_lifecycle_observation_bytes(&observation)?;
+        io::stdout().lock().write_all(&bytes)?;
+        return Ok(());
+    }
     let samples = match benchmark.model.as_str() {
         "compile" => model_compile(&benchmark, &expectations)?,
         "count" => model_count(&benchmark, &expectations)?,
@@ -148,6 +214,15 @@ struct Expectations {
     plan: Option<String>,
     runtime: Option<String>,
     count: Option<u64>,
+    job_id: Option<String>,
+    contract_id: Option<String>,
+    canonical_sha: Option<String>,
+    canonical_tree: Option<String>,
+    semantic_receipts: Option<String>,
+    boundary: Option<String>,
+    process_token: Option<String>,
+    comparator: Option<String>,
+    performance_raw: bool,
 }
 
 fn next_argument(
@@ -174,6 +249,67 @@ fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(),
         ("grep", Some(_)) | (_, None) => Ok(()),
         (_, Some(_)) => Err("formal non-grep timing rejects --expect-runtime".into()),
     }
+}
+
+fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<(), DynError> {
+    if expectations.comparator.is_some() {
+        return Err("--expect-comparator requires --performance-raw".into());
+    }
+    let fields = [
+        expectations.job_id.as_deref(),
+        expectations.contract_id.as_deref(),
+        expectations.canonical_sha.as_deref(),
+        expectations.canonical_tree.as_deref(),
+        expectations.semantic_receipts.as_deref(),
+        expectations.boundary.as_deref(),
+        expectations.process_token.as_deref(),
+    ];
+    let supplied = fields.iter().filter(|value| value.is_some()).count();
+    if matches!(model, "count-captures" | "grep-captures") {
+        if supplied != fields.len() {
+            return Err(
+                "formal capture timing requires every authenticated identity and boundary field"
+                    .into(),
+            );
+        }
+    } else if supplied != 0 {
+        return Err("formal non-capture timing rejects capture identity or boundary fields".into());
+    }
+    Ok(())
+}
+
+fn require_performance_raw_metadata(
+    model: &str,
+    expectations: &Expectations,
+) -> Result<(), DynError> {
+    if !matches!(
+        model,
+        "compile" | "count" | "count-spans" | "grep" | "count-captures" | "grep-captures"
+    ) {
+        return Err(
+            format!("all-model raw mode does not yet implement FRE model {model:?}").into(),
+        );
+    }
+    if model != "grep" && expectations.runtime.is_some() {
+        return Err("all-model raw non-grep timing rejects --expect-runtime".into());
+    }
+    let fields = [
+        expectations.job_id.as_deref(),
+        expectations.contract_id.as_deref(),
+        expectations.canonical_sha.as_deref(),
+        expectations.canonical_tree.as_deref(),
+        expectations.semantic_receipts.as_deref(),
+        expectations.boundary.as_deref(),
+        expectations.process_token.as_deref(),
+        expectations.comparator.as_deref(),
+    ];
+    if fields.iter().any(Option::is_none) {
+        return Err(
+            "all-model raw mode requires every identity, boundary, token, and comparator field"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,9 +405,18 @@ impl Benchmark {
         if benchmark.max_iters != 1 || benchmark.max_warmup_iters != 0 {
             return Err("formal FRE timing requires max-iters=1 and max-warmup-iters=0".into());
         }
-        if benchmark.patterns.len() != 1 {
+        if benchmark.patterns.is_empty() {
+            return Err("FRE KLV runner requires at least one pattern".into());
+        }
+        if benchmark.patterns.len() != 1
+            && !matches!(
+                benchmark.model.as_str(),
+                "compile" | "count" | "count-spans"
+            )
+        {
             return Err(format!(
-                "FRE KLV runner requires one pattern, got {}",
+                "FRE KLV model {:?} requires one pattern, got {}",
+                benchmark.model,
                 benchmark.patterns.len()
             )
             .into());
@@ -356,6 +501,14 @@ fn aggregate_builder(benchmark: &Benchmark) -> AggregateBuilder {
     )
 }
 
+fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
+    current_fre_rebar_aggregate_many_builder(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+    )
+}
+
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     match (model, report.plan) {
         ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
@@ -373,6 +526,17 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     }
 }
 
+fn aggregate_many_plan(model: &str, report: &AggregateManyBuildReport) -> &'static str {
+    match (model, report.plan) {
+        ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
+        ("compile", AggregateManyPlanKind::ContinuationProgram) => {
+            "compile-many-continuation-program"
+        }
+        (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
+        (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
+    }
+}
+
 fn require_aggregate_plan(
     model: &str,
     report: &AggregateBuildReport,
@@ -387,10 +551,33 @@ fn require_aggregate_plan(
     )
 }
 
+fn require_aggregate_many_plan(
+    benchmark: &Benchmark,
+    model: &str,
+    report: &AggregateManyBuildReport,
+    expectations: &Expectations,
+) -> Result<(), DynError> {
+    current_fre_rebar_validate_aggregate_many_identity(
+        &benchmark.patterns,
+        report,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        model,
+    )?;
+    require_optional(
+        "plan",
+        expectations.plan.as_deref(),
+        aggregate_many_plan(model, report),
+    )
+}
+
 fn model_compile(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_compile_many(benchmark, expectations);
+    }
     let haystack = benchmark.haystack.as_slice();
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
@@ -436,10 +623,48 @@ fn model_compile(
     Ok(samples)
 }
 
+fn model_compile_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let haystack = benchmark.haystack.as_slice();
+    let warmup_start = Instant::now();
+    for _ in 0..benchmark.max_warmup_iters {
+        let artifact = aggregate_many_builder(benchmark).build_compile()?;
+        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
+        let _ = artifact.verify_count(haystack, limits)?;
+        if warmup_start.elapsed() >= benchmark.max_warmup_time {
+            break;
+        }
+    }
+
+    let mut samples = Vec::new();
+    let run_start = Instant::now();
+    for _ in 0..benchmark.max_iters {
+        let sample_start = Instant::now();
+        let artifact = aggregate_many_builder(benchmark).build_compile()?;
+        let duration = sample_start.elapsed();
+        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
+        let count = artifact.verify_count(haystack, limits)?.value();
+        samples.push(Sample { duration, count });
+        if run_start.elapsed() >= benchmark.max_time {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
 fn model_count(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_count_many(benchmark, expectations);
+    }
     let regex = aggregate_builder(benchmark).build_count()?;
     require_aggregate_plan(
         "count",
@@ -461,10 +686,34 @@ fn model_count(
     )
 }
 
+fn model_count_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let regex = aggregate_many_builder(benchmark).build_count()?;
+    require_aggregate_many_plan(benchmark, "count", regex.build_report(), expectations)?;
+    let limits = current_fre_rebar_aggregate_many_run_limits(
+        benchmark.haystack.len(),
+        regex.build_report(),
+    )?;
+    run(
+        benchmark,
+        || {
+            regex
+                .count_value(&benchmark.haystack, limits)
+                .map_err(Into::into)
+        },
+        Ok,
+    )
+}
+
 fn model_count_spans(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_count_spans_many(benchmark, expectations);
+    }
     let regex = aggregate_builder(benchmark).build_span_sum()?;
     require_aggregate_plan(
         "count-spans",
@@ -484,6 +733,398 @@ fn model_count_spans(
         },
         Ok,
     )
+}
+
+fn model_count_spans_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let regex = aggregate_many_builder(benchmark).build_span_sum()?;
+    require_aggregate_many_plan(benchmark, "count-spans", regex.build_report(), expectations)?;
+    let limits = current_fre_rebar_aggregate_many_run_limits(
+        benchmark.haystack.len(),
+        regex.build_report(),
+    )?;
+    run(
+        benchmark,
+        || {
+            regex
+                .span_sum_value(&benchmark.haystack, limits)
+                .map_err(Into::into)
+        },
+        Ok,
+    )
+}
+
+fn model_performance_raw(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<PerformanceRawObservation, DynError> {
+    match benchmark.model.as_str() {
+        "compile" => {
+            model_compile_performance_raw_with_measurement(benchmark, expectations, |lifecycle| {
+                let start = Instant::now();
+                let artifact = lifecycle.construct()?;
+                Ok((start.elapsed(), artifact))
+            })
+        }
+        "count" | "count-spans" => model_operation_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |lifecycle, haystack| {
+                let start = Instant::now();
+                let actual = lifecycle.execute(haystack)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
+        "grep" => model_grep_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |session, haystack, limits| {
+                let start = Instant::now();
+                let actual = execute_grep_session(session, haystack, limits)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
+        "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |lifecycle, haystack| {
+                let start = Instant::now();
+                let actual = lifecycle.execute(haystack)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
+        model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
+    }
+}
+
+fn model_compile_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &CurrentFreAggregateCompileLifecycle,
+    ) -> Result<(Duration, CurrentFreAggregateCompileArtifact), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let expected_plan = identity.candidate_plan.clone();
+    let allocator_warm = identity.boundary == "allocator-warm-public-compile";
+    produce_performance_candidate_observation(&identity, || {
+        if allocator_warm {
+            let warm = lifecycle.construct()?;
+            require_performance_plan(&expected_plan, warm.plan(&lifecycle)?)?;
+            drop(warm);
+        }
+        let (elapsed, artifact) = measure(&lifecycle)?;
+        require_performance_plan(&expected_plan, artifact.plan(&lifecycle)?)?;
+        let actual = artifact.verify(&lifecycle, &benchmark.haystack)?;
+        Ok((elapsed, actual))
+    })
+    .map_err(Into::into)
+}
+
+fn model_operation_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &CurrentFreAggregateOperationLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            &benchmark.model,
+            &benchmark.patterns,
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )?;
+        require_performance_plan(&expected_plan, lifecycle.plan())?;
+        if steady {
+            let primed = lifecycle.execute(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "aggregate lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn model_capture_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &rebar_compare::CurrentFreCaptureLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let lifecycle = current_fre_rebar_capture_lifecycle(
+            &benchmark.model,
+            benchmark.pattern(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )?;
+        require_performance_plan(&expected_plan, lifecycle.plan())?;
+        if steady {
+            let primed = lifecycle.execute(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "capture lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn model_grep_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &mut PortableSearchSession<'_>,
+        &[u8],
+        SearchLimits,
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let mut identity = performance_candidate_identity(benchmark, expectations)?;
+    validate_performance_candidate_observation_request(&identity)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let regex = current_fre_rebar_portable_builder(
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+    )?
+    .build()
+    .map_err(|error| CompareError::new(format!("FRE grep lifecycle build: {error}")))?;
+    require_performance_plan(&expected_plan, "portable-single-search")?;
+    let selected_runtime = regex.runtime_implementation_id().to_string();
+    if let Some(expected_runtime) = expectations.runtime.as_deref() {
+        require_performance_runtime(expected_runtime, &selected_runtime)?;
+    }
+    require_grep_runtime_plan(&selected_runtime, regex.build_report().plan)?;
+    identity.candidate_runtime = Some(selected_runtime.clone());
+    let limits = current_fre_rebar_search_limits();
+    let mut session = regex
+        .search_session(SearchSessionLimits {
+            max_setup_work: limits.max_work,
+            max_scratch_bytes: limits.max_scratch_bytes,
+        })
+        .map_err(|error| CompareError::new(format!("FRE grep session build: {error}")))?;
+    require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        if steady {
+            let primed = execute_grep_session(&mut session, &benchmark.haystack, limits)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "grep lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&mut session, &benchmark.haystack, limits)
+    })
+    .map_err(Into::into)
+}
+
+fn execute_grep_session(
+    session: &mut PortableSearchSession<'_>,
+    haystack: &[u8],
+    limits: SearchLimits,
+) -> Result<u64, CompareError> {
+    let mut count = 0_u64;
+    for line in haystack.lines() {
+        if session
+            .is_match(line, limits)
+            .map_err(|error| CompareError::new(format!("FRE grep lifecycle search: {error}")))?
+            .0
+        {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| CompareError::new("FRE grep lifecycle count overflow"))?;
+        }
+    }
+    Ok(count)
+}
+
+fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
+    if expected != actual {
+        return Err(CompareError::new(format!(
+            "FRE performance plan {actual:?} differs from expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_performance_runtime(expected: &str, actual: &str) -> Result<(), CompareError> {
+    if expected != actual {
+        return Err(CompareError::new(format!(
+            "FRE performance runtime {actual:?} differs from expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn performance_candidate_identity(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<PerformanceCandidateObservationIdentity, DynError> {
+    Ok(PerformanceCandidateObservationIdentity {
+        contract_id: required(expectations.contract_id.clone(), "--expect-contract-id")?,
+        canonical_commit: required(expectations.canonical_sha.clone(), "--expect-canonical-sha")?,
+        canonical_tree: required(
+            expectations.canonical_tree.clone(),
+            "--expect-canonical-tree",
+        )?,
+        semantic_receipts_sha256: required(
+            expectations.semantic_receipts.clone(),
+            "--expect-semantic-receipts",
+        )?,
+        job_id: required(expectations.job_id.clone(), "--expect-job-id")?,
+        benchmark: benchmark.name.clone(),
+        model: benchmark.model.clone(),
+        boundary: required(expectations.boundary.clone(), "--expect-boundary")?,
+        comparator: required(expectations.comparator.clone(), "--expect-comparator")?,
+        candidate_plan: required(expectations.plan.clone(), "--expect-plan")?,
+        candidate_runtime: expectations.runtime.clone(),
+        input: InputReceipt {
+            pattern_sha256: benchmark
+                .patterns
+                .iter()
+                .map(|pattern| sha256(pattern.as_bytes()))
+                .collect(),
+            haystack_sha256: sha256(&benchmark.haystack),
+            haystack_bytes: benchmark.haystack.len(),
+            unicode: benchmark.unicode,
+            case_insensitive: benchmark.case_insensitive,
+        },
+        expected: required(expectations.count, "--expect-count")?,
+        process_token_sha256: required(
+            expectations.process_token.clone(),
+            "--expect-process-token",
+        )?,
+    })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn capture_lifecycle(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<rebar_compare::CurrentFreCaptureLifecycle, DynError> {
+    let lifecycle = current_fre_rebar_capture_lifecycle(
+        &benchmark.model,
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
+    Ok(lifecycle)
+}
+
+fn model_captures(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<CaptureLifecycleRawObservation, DynError> {
+    model_captures_with_measurement(benchmark, expectations, |operation, haystack| {
+        let start = Instant::now();
+        let actual = operation.execute(haystack)?;
+        Ok((start.elapsed(), actual))
+    })
+}
+
+fn model_captures_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<CaptureLifecycleRawObservation, DynError>
+where
+    F: FnOnce(
+        &rebar_compare::CurrentFreCaptureLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let boundary = CaptureLifecycleBoundary::parse(
+        expectations
+            .boundary
+            .as_deref()
+            .ok_or("capture boundary is absent")?,
+    )?;
+    let identity = CaptureLifecycleObservationIdentity {
+        contract_id: expectations
+            .contract_id
+            .clone()
+            .ok_or("capture contract ID is absent")?,
+        canonical_commit: expectations
+            .canonical_sha
+            .clone()
+            .ok_or("capture canonical SHA is absent")?,
+        canonical_tree: expectations
+            .canonical_tree
+            .clone()
+            .ok_or("capture canonical tree is absent")?,
+        semantic_receipts_sha256: expectations
+            .semantic_receipts
+            .clone()
+            .ok_or("capture semantic receipt digest is absent")?,
+        job_id: expectations
+            .job_id
+            .clone()
+            .ok_or("capture job ID is absent")?,
+        benchmark: benchmark.name.clone(),
+        expected: expectations
+            .count
+            .ok_or("capture expected count is absent")?,
+        process_token_sha256: expectations
+            .process_token
+            .clone()
+            .ok_or("capture process token is absent")?,
+    };
+    let lifecycle = capture_lifecycle(benchmark, expectations)?;
+    produce_capture_lifecycle_observation(
+        &identity,
+        &lifecycle,
+        benchmark.pattern(),
+        &benchmark.haystack,
+        boundary,
+        measure,
+    )
+    .map_err(Into::into)
 }
 
 fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<Sample>, DynError> {
@@ -525,22 +1166,22 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     )
 }
 
-fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), DynError> {
+fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), CompareError> {
     match (runtime, plan) {
         ("k0", PlanKind::K0)
         | ("ascii-word-run-linear-v1" | "unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => {
             Ok(())
         }
-        _ => Err(format!(
+        _ => Err(CompareError::new(format!(
             "grep runtime {runtime:?} and selected plan {plan:?} are not an authenticated pair"
-        )
-        .into()),
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rebar_compare::performance_contract::PerformanceLifecyclePreparation;
 
     fn field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
         write!(output, "{key}:{}:", value.len()).unwrap();
@@ -563,6 +1204,69 @@ mod tests {
         output
     }
 
+    fn multi_klv(model: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        field(&mut output, "name", b"test/model/multi");
+        field(&mut output, "model", model.as_bytes());
+        field(&mut output, "case-insensitive", b"false");
+        field(&mut output, "unicode", b"false");
+        field(&mut output, "max-iters", b"1");
+        field(&mut output, "max-warmup-iters", b"0");
+        field(&mut output, "max-time", b"1000");
+        field(&mut output, "max-warmup-time", b"100");
+        field(&mut output, "pattern", b"cat");
+        field(&mut output, "pattern", b"dog");
+        field(&mut output, "haystack", b"cat dog cat");
+        output
+    }
+
+    fn capture_benchmark(model: &str, pattern: &str, haystack: &[u8]) -> Benchmark {
+        Benchmark {
+            name: format!("test/model/{model}"),
+            model: model.to_string(),
+            patterns: vec![pattern.to_string()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: haystack.to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        }
+    }
+
+    fn capture_expectations(boundary: &str, expected: u64) -> Expectations {
+        Expectations {
+            plan: Some("capture-linear-selector-persistent-history".to_string()),
+            count: Some(expected),
+            job_id: Some("fixture/capture@rust/regex".to_string()),
+            contract_id: Some("fixture-contract-v1".to_string()),
+            canonical_sha: Some("a".repeat(40)),
+            canonical_tree: Some("b".repeat(40)),
+            semantic_receipts: Some("c".repeat(64)),
+            boundary: Some(boundary.to_string()),
+            process_token: Some("d".repeat(64)),
+            ..Expectations::default()
+        }
+    }
+
+    fn performance_expectations(boundary: &str, plan: &str, expected: u64) -> Expectations {
+        Expectations {
+            plan: Some(plan.to_string()),
+            count: Some(expected),
+            job_id: Some("fixture/aggregate@rust/regex".to_string()),
+            contract_id: Some("fixture-performance-contract-v1".to_string()),
+            canonical_sha: Some("a".repeat(40)),
+            canonical_tree: Some("b".repeat(40)),
+            semantic_receipts: Some("c".repeat(64)),
+            boundary: Some(boundary.to_string()),
+            process_token: Some("d".repeat(64)),
+            comparator: Some("rust-regex-1.12.4".to_string()),
+            performance_raw: true,
+            ..Expectations::default()
+        }
+    }
+
     #[test]
     fn parses_arbitrary_haystack_and_delimiters_in_values() {
         let benchmark = Benchmark::parse(&valid_klv()).unwrap();
@@ -570,6 +1274,493 @@ mod tests {
         assert_eq!(benchmark.pattern(), "a:b");
         assert_eq!(benchmark.haystack, b"a:b\n\xFF");
         assert_eq!(benchmark.max_iters, 1);
+    }
+
+    #[test]
+    fn parses_multiple_patterns_only_for_aggregate_models() {
+        for model in ["compile", "count", "count-spans"] {
+            let benchmark = Benchmark::parse(&multi_klv(model)).expect("aggregate multi KLV");
+            assert_eq!(benchmark.patterns, ["cat", "dog"]);
+        }
+        for model in ["grep", "count-captures", "grep-captures"] {
+            assert!(Benchmark::parse(&multi_klv(model)).is_err());
+        }
+    }
+
+    #[test]
+    fn multi_pattern_lifecycles_bind_order_and_plan_without_timing() {
+        let benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
+        let expected = Expectations {
+            plan: Some("aggregate-many-ordered-literal".to_string()),
+            ..Expectations::default()
+        };
+        let count = aggregate_many_builder(&benchmark)
+            .build_count()
+            .expect("multi count artifact");
+        require_aggregate_many_plan(&benchmark, "count", count.build_report(), &expected)
+            .expect("multi count identity");
+        let count_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            count.build_report(),
+        )
+        .expect("multi count limits");
+        assert_eq!(
+            count
+                .count_value(&benchmark.haystack, count_limits)
+                .expect("multi count execution"),
+            3
+        );
+
+        let spans = aggregate_many_builder(&benchmark)
+            .build_span_sum()
+            .expect("multi span-sum artifact");
+        require_aggregate_many_plan(&benchmark, "count-spans", spans.build_report(), &expected)
+            .expect("multi span-sum identity");
+        let span_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            spans.build_report(),
+        )
+        .expect("multi span-sum limits");
+        assert_eq!(
+            spans
+                .span_sum_value(&benchmark.haystack, span_limits)
+                .expect("multi span-sum execution"),
+            9
+        );
+
+        let compile = aggregate_many_builder(&benchmark)
+            .build_compile()
+            .expect("multi compile artifact");
+        let compile_expected = Expectations {
+            plan: Some("compile-many-ordered-literal".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &benchmark,
+            "compile",
+            compile.build_report(),
+            &compile_expected,
+        )
+        .expect("multi compile identity");
+        let compile_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            compile.build_report(),
+        )
+        .expect("multi compile limits");
+        assert_eq!(
+            compile
+                .verify_count(&benchmark.haystack, compile_limits)
+                .expect("multi compile verification")
+                .value(),
+            3
+        );
+
+        let mut wrong_order = benchmark.patterns.clone();
+        wrong_order.reverse();
+        assert!(
+            current_fre_rebar_validate_aggregate_many_identity(
+                &wrong_order,
+                count.build_report(),
+                false,
+                false,
+                "count",
+            )
+            .is_err()
+        );
+
+        let continuation = Benchmark {
+            patterns: vec!["a+".to_string(), "b+".to_string()],
+            haystack: b"aa bbb".to_vec(),
+            ..benchmark
+        };
+        let continuation_count = aggregate_many_builder(&continuation)
+            .build_count()
+            .expect("multi continuation artifact");
+        let continuation_expected = Expectations {
+            plan: Some("aggregate-many-continuation-program".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &continuation,
+            "count",
+            continuation_count.build_report(),
+            &continuation_expected,
+        )
+        .expect("multi continuation identity");
+        let continuation_limits = current_fre_rebar_aggregate_many_run_limits(
+            continuation.haystack.len(),
+            continuation_count.build_report(),
+        )
+        .expect("multi continuation limits");
+        assert_eq!(
+            continuation_count
+                .count_value(&continuation.haystack, continuation_limits)
+                .expect("multi continuation execution"),
+            2
+        );
+
+        let continuation_compile = aggregate_many_builder(&continuation)
+            .build_compile()
+            .expect("multi continuation compile artifact");
+        let continuation_compile_expected = Expectations {
+            plan: Some("compile-many-continuation-program".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &continuation,
+            "compile",
+            continuation_compile.build_report(),
+            &continuation_compile_expected,
+        )
+        .expect("multi continuation compile identity");
+        let continuation_compile_limits = current_fre_rebar_aggregate_many_run_limits(
+            continuation.haystack.len(),
+            continuation_compile.build_report(),
+        )
+        .expect("multi continuation compile limits");
+        assert_eq!(
+            continuation_compile
+                .verify_count(&continuation.haystack, continuation_compile_limits)
+                .expect("multi continuation compile verification")
+                .value(),
+            2
+        );
+
+        let unicode = Benchmark {
+            patterns: vec!["Δ".to_string(), "β".to_string()],
+            unicode: true,
+            haystack: "Δ β Δ".as_bytes().to_vec(),
+            ..continuation
+        };
+        let unicode_count = aggregate_many_builder(&unicode)
+            .build_count()
+            .expect("Unicode ordered-many count artifact");
+        require_aggregate_many_plan(&unicode, "count", unicode_count.build_report(), &expected)
+            .expect("Unicode ordered-many count identity");
+        let unicode_limits = current_fre_rebar_aggregate_many_run_limits(
+            unicode.haystack.len(),
+            unicode_count.build_report(),
+        )
+        .expect("Unicode ordered-many limits");
+        assert_eq!(
+            unicode_count
+                .count_value(&unicode.haystack, unicode_limits)
+                .expect("Unicode ordered-many execution"),
+            3
+        );
+    }
+
+    #[test]
+    fn aggregate_raw_mode_emits_exact_compile_and_operation_lifecycles() {
+        let compile_benchmark = Benchmark::parse(&multi_klv("compile")).expect("multi compile KLV");
+        for (boundary, preparation) in [
+            (
+                "cold-public-compile",
+                PerformanceLifecyclePreparation::ColdProcess,
+            ),
+            (
+                "allocator-warm-public-compile",
+                PerformanceLifecyclePreparation::AllocatorInitialized,
+            ),
+        ] {
+            let expectations =
+                performance_expectations(boundary, "compile-many-ordered-literal", 3);
+            require_performance_raw_metadata("compile", &expectations)
+                .expect("complete aggregate raw metadata");
+            let measured = std::cell::Cell::new(0_u8);
+            let observation = model_compile_performance_raw_with_measurement(
+                &compile_benchmark,
+                &expectations,
+                |lifecycle| {
+                    measured.set(measured.get() + 1);
+                    Ok((Duration::from_nanos(31), lifecycle.construct()?))
+                },
+            )
+            .expect("fixed compile raw arm");
+            assert_eq!(measured.get(), 1);
+            assert_eq!(observation.preparation, preparation);
+            assert_eq!(observation.priming_operations, 0);
+            assert_eq!(observation.elapsed_ns, 31);
+            assert_eq!(observation.actual, 3);
+            assert_eq!(
+                observation.candidate_plan.as_deref(),
+                Some("compile-many-ordered-literal")
+            );
+            assert_eq!(
+                observation.input.pattern_sha256,
+                vec![sha256(b"cat"), sha256(b"dog")]
+            );
+            assert_eq!(observation.input.haystack_sha256, sha256(b"cat dog cat"));
+        }
+
+        let count_benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
+        let steady_expectations = performance_expectations(
+            "steady-public-operation",
+            "aggregate-many-ordered-literal",
+            3,
+        );
+        let measured = std::cell::Cell::new(0_u8);
+        let steady = model_operation_performance_raw_with_measurement(
+            &count_benchmark,
+            &steady_expectations,
+            |lifecycle, haystack| {
+                measured.set(measured.get() + 1);
+                Ok((Duration::from_nanos(37), lifecycle.execute(haystack)?))
+            },
+        )
+        .expect("fixed steady-operation raw arm");
+        assert_eq!(measured.get(), 1);
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.elapsed_ns, 37);
+        assert_eq!(steady.actual, 3);
+
+        let first_expectations = performance_expectations(
+            "first-public-operation",
+            "aggregate-many-ordered-literal",
+            3,
+        );
+        let first = model_operation_performance_raw_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(41), lifecycle.execute(haystack)?)),
+        )
+        .expect("fixed first-operation raw arm");
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+
+        let mut wrong_plan = first_expectations;
+        wrong_plan.plan = Some("aggregate-many-continuation-program".to_string());
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            model_operation_performance_raw_with_measurement(
+                &count_benchmark,
+                &wrong_plan,
+                |lifecycle, haystack| {
+                    ran.set(true);
+                    Ok((Duration::from_nanos(1), lifecycle.execute(haystack)?))
+                },
+            )
+            .is_err()
+        );
+        assert!(!ran.get(), "wrong operation plan reached measurement");
+    }
+
+    #[test]
+    fn aggregate_raw_mode_requires_explicit_complete_metadata() {
+        let complete =
+            performance_expectations("first-public-operation", "aggregate-exact-literal", 1);
+        require_performance_raw_metadata("count", &complete).expect("complete metadata");
+        let mut grep = complete.clone();
+        grep.plan = Some("portable-single-search".to_string());
+        require_performance_raw_metadata("grep", &grep)
+            .expect("trusted raw grep may derive its runtime");
+        grep.runtime = Some("unicode-word-run-linear-v1".to_string());
+        require_performance_raw_metadata("grep", &grep)
+            .expect("raw grep may additionally check an expected runtime");
+        let mut non_grep_runtime = complete.clone();
+        non_grep_runtime.runtime = Some("k0".to_string());
+        assert!(require_performance_raw_metadata("count", &non_grep_runtime).is_err());
+        assert!(require_capture_metadata("count", &complete).is_err());
+        let mut missing = complete;
+        missing.comparator = None;
+        assert!(require_performance_raw_metadata("count", &missing).is_err());
+    }
+
+    #[test]
+    fn capture_raw_mode_emits_first_and_steady_all_model_arms() {
+        let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
+        let first_expectations = performance_expectations(
+            "first-public-operation",
+            "capture-linear-selector-persistent-history",
+            5,
+        );
+        require_performance_raw_metadata("count-captures", &first_expectations)
+            .expect("capture raw metadata");
+        let first = model_capture_performance_raw_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(43), lifecycle.execute(haystack)?)),
+        )
+        .expect("capture first-operation raw arm");
+        assert_eq!(first.model, "count-captures");
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 43);
+        assert_eq!(first.actual, 5);
+        assert_eq!(
+            first.input.pattern_sha256,
+            vec![sha256(r"(a)(b)?".as_bytes())]
+        );
+
+        let grep_benchmark = capture_benchmark(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            b"foo foo\r\nZ\r\nfoo\r\nfoo",
+        );
+        let steady_expectations = performance_expectations(
+            "steady-public-operation",
+            "capture-linear-selector-persistent-history",
+            12,
+        );
+        let steady = model_capture_performance_raw_with_measurement(
+            &grep_benchmark,
+            &steady_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(47), lifecycle.execute(haystack)?)),
+        )
+        .expect("capture steady-operation raw arm");
+        assert_eq!(steady.model, "grep-captures");
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.actual, 12);
+
+        let mut wrong_plan = first_expectations;
+        wrong_plan.plan = Some("aggregate-exact-literal".to_string());
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            model_capture_performance_raw_with_measurement(
+                &count_benchmark,
+                &wrong_plan,
+                |lifecycle, haystack| {
+                    ran.set(true);
+                    Ok((Duration::from_nanos(1), lifecycle.execute(haystack)?))
+                },
+            )
+            .is_err()
+        );
+        assert!(!ran.get(), "wrong capture plan reached measurement");
+    }
+
+    #[test]
+    fn grep_raw_mode_binds_runtime_and_reuses_one_session_for_steady_operation() {
+        let benchmark = Benchmark {
+            name: "grep/long-words-unicode".to_string(),
+            model: "grep".to_string(),
+            patterns: vec![r"\b\w{25,}\b".to_string()],
+            case_insensitive: false,
+            unicode: true,
+            haystack: b"abcdefghijklmnopqrstuvwxyz\nshort\n".to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        };
+        let mut first_expectations =
+            performance_expectations("first-public-operation", "portable-single-search", 1);
+        first_expectations.runtime = Some("unicode-word-run-linear-v1".to_string());
+        let first = model_grep_performance_raw_with_measurement(
+            &benchmark,
+            &first_expectations,
+            |session, haystack, limits| {
+                Ok((
+                    Duration::from_nanos(53),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect("grep first-operation raw arm");
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.actual, 1);
+        assert_eq!(
+            first.candidate_runtime.as_deref(),
+            Some("unicode-word-run-linear-v1")
+        );
+
+        let mut steady_expectations = first_expectations.clone();
+        steady_expectations.boundary = Some("steady-public-operation".to_string());
+        let measured = std::cell::Cell::new(0_u8);
+        let steady = model_grep_performance_raw_with_measurement(
+            &benchmark,
+            &steady_expectations,
+            |session, haystack, limits| {
+                measured.set(measured.get() + 1);
+                Ok((
+                    Duration::from_nanos(59),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect("grep steady-operation raw arm");
+        assert_eq!(measured.get(), 1);
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.actual, 1);
+
+        let mut derived_runtime = first_expectations.clone();
+        derived_runtime.runtime = None;
+        let derived = model_grep_performance_raw_with_measurement(
+            &benchmark,
+            &derived_runtime,
+            |session, haystack, limits| {
+                Ok((
+                    Duration::from_nanos(61),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect("trusted grep construction derives its runtime");
+        assert_eq!(
+            derived.candidate_runtime.as_deref(),
+            Some("unicode-word-run-linear-v1")
+        );
+
+        let mut malformed_metadata = derived_runtime;
+        malformed_metadata.canonical_sha = Some("malformed".to_string());
+        let mut malformed_pattern = benchmark.clone();
+        malformed_pattern.patterns = vec!["(".to_string()];
+        let ran = std::cell::Cell::new(false);
+        let error = model_grep_performance_raw_with_measurement(
+            &malformed_pattern,
+            &malformed_metadata,
+            |session, haystack, limits| {
+                ran.set(true);
+                Ok((
+                    Duration::from_nanos(1),
+                    execute_grep_session(session, haystack, limits)?,
+                ))
+            },
+        )
+        .expect_err("malformed identity fails before constructing an invalid pattern");
+        assert!(error.to_string().contains("performance canonical commit"));
+        assert!(!ran.get(), "malformed identity reached measurement");
+
+        let mut wrong_runtime = first_expectations;
+        wrong_runtime.runtime = Some("k0".to_string());
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            model_grep_performance_raw_with_measurement(
+                &benchmark,
+                &wrong_runtime,
+                |session, haystack, limits| {
+                    ran.set(true);
+                    Ok((
+                        Duration::from_nanos(1),
+                        execute_grep_session(session, haystack, limits)?,
+                    ))
+                },
+            )
+            .is_err()
+        );
+        assert!(!ran.get(), "wrong grep runtime reached measurement");
     }
 
     #[test]
@@ -596,6 +1787,68 @@ mod tests {
         assert!(require_runtime_expectation("grep", None).is_err());
         assert!(require_runtime_expectation("count", Some("k0")).is_err());
         assert!(require_runtime_expectation("count", None).is_ok());
+        assert!(require_runtime_expectation("count-captures", None).is_ok());
+        assert!(require_runtime_expectation("grep-captures", None).is_ok());
+        assert!(require_runtime_expectation("grep-captures", Some("k0")).is_err());
+    }
+
+    #[test]
+    fn capture_models_bind_plan_and_preserve_first_and_steady_semantics() {
+        let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
+        let first_expectations = capture_expectations("first-public-operation", 5);
+        require_capture_metadata("count-captures", &first_expectations)
+            .expect("complete capture metadata");
+        let first = model_captures_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(17), operation.execute(haystack)?)),
+        )
+        .expect("first raw capture observation");
+        assert_eq!(
+            first.boundary,
+            CaptureLifecycleBoundary::FirstPublicOperation
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 17);
+        assert_eq!(first.actual, 5);
+
+        let steady_expectations = capture_expectations("steady-public-operation", 5);
+        let steady = model_captures_with_measurement(
+            &count_benchmark,
+            &steady_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(19), operation.execute(haystack)?)),
+        )
+        .expect("steady raw capture observation");
+        assert_eq!(
+            steady.boundary,
+            CaptureLifecycleBoundary::SteadyPublicOperation
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.elapsed_ns, 19);
+
+        let grep_benchmark = capture_benchmark(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            b"foo foo\r\nZ\r\nfoo\r\nfoo",
+        );
+        let grep_expectations = capture_expectations("steady-public-operation", 12);
+        let grep = model_captures_with_measurement(
+            &grep_benchmark,
+            &grep_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(23), operation.execute(haystack)?)),
+        )
+        .expect("grep raw capture observation");
+        assert_eq!(grep.model, "grep-captures");
+        assert_eq!(grep.actual, 12);
+        assert_eq!(grep.priming_operations, 1);
+
+        let wrong_plan = Expectations {
+            plan: Some("aggregate-exact-literal".to_string()),
+            ..Expectations::default()
+        };
+        assert!(capture_lifecycle(&count_benchmark, &wrong_plan).is_err());
+        assert!(require_capture_metadata("count-captures", &wrong_plan).is_err());
+        assert!(require_capture_metadata("count", &first_expectations).is_err());
     }
 
     #[test]

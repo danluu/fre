@@ -19,17 +19,18 @@ use std::{fmt::Write as _, io::Write as _};
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
-    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyExecutionSource,
+    AggregateBuilder, AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
+    AggregateFiniteLiteralIdentity, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
-    AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
-    CaptureExecutionSource, CaptureRegex, CaptureRunLimits, CaptureSearchError,
-    CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
+    CaptureExecutionSource, CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
     LiteralAggregateReduceLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
@@ -43,6 +44,8 @@ use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob
 use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub mod performance_contract;
 
 /// Stable schema for deterministic semantic comparison reports.
 pub const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
@@ -63,6 +66,8 @@ pub const RUST_REGEX_VERSION: &str = "1.12.4";
 pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 /// Exact RE2 version recorded by the pinned Rebar adapter.
 pub const RE2_VERSION: &str = "2025-11-05";
+/// Stable plan label emitted by the authenticated current-FRE capture adapter.
+pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
@@ -557,7 +562,8 @@ struct UnicodeUnsupportedReasonPin<'a> {
 pub struct CompareError(String);
 
 impl CompareError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Construct one fatal authentication or execution diagnostic.
+    pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -886,6 +892,658 @@ pub fn current_fre_rebar_aggregate_builder(
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
 
+/// Construct the exact ordered multi-pattern aggregate builder used by the
+/// authenticated current-FRE Rebar adapter.
+#[must_use]
+pub fn current_fre_rebar_aggregate_many_builder(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+) -> AggregateManyBuilder<'_> {
+    let limits = RunLimits::default();
+    aggregate_many_builder_with_limits(patterns, unicode, case_insensitive, &limits)
+}
+
+fn aggregate_many_builder_with_limits<'a>(
+    patterns: &'a [String],
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> AggregateManyBuilder<'a> {
+    AggregateManyBuilder::new(patterns)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(aggregate_many_build_limits(limits))
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+}
+
+/// Reconstructible compile request for the exact pinned Rust-regex reference
+/// adapter.
+///
+/// Construction is deliberately deferred so an executor can measure exactly
+/// one fresh complete regex construction. Semantic verification is performed
+/// on the returned artifact after the construction duration is captured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustRegexReferenceCompileLifecycle {
+    patterns: Vec<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+}
+
+/// Fresh complete pinned Rust-regex artifact returned by one deferred
+/// construction.
+#[derive(Debug)]
+pub struct RustRegexReferenceCompileArtifact {
+    regex: Regex,
+}
+
+impl RustRegexReferenceCompileLifecycle {
+    /// Construct one fresh complete pinned Rust-regex artifact. Builder
+    /// configuration and construction are both inside this call; semantic
+    /// verification is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact pinned adapter compilation failure.
+    pub fn construct(&self) -> Result<RustRegexReferenceCompileArtifact, CompareError> {
+        let regex = rust_compile_options(&self.patterns, self.unicode, self.case_insensitive)
+            .map_err(|error| CompareError::new(error.message))?;
+        Ok(RustRegexReferenceCompileArtifact { regex })
+    }
+}
+
+impl RustRegexReferenceCompileArtifact {
+    /// Verify the compiled artifact outside its construction measurement using
+    /// the compile model's exact semantic reducer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or reducer failure.
+    pub fn verify(
+        &self,
+        lifecycle: &RustRegexReferenceCompileLifecycle,
+        haystack: &[u8],
+    ) -> Result<u64, CompareError> {
+        if haystack.len() != lifecycle.haystack_len {
+            return Err(CompareError::new(format!(
+                "Rust reference compile lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                lifecycle.haystack_len
+            )));
+        }
+        count_matches(&self.regex, haystack, RunLimits::default().reducer_steps)
+            .map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Create a deferred pinned Rust-regex compile lifecycle bound to one exact
+/// input length.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set.
+pub fn rust_regex_reference_compile_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<RustRegexReferenceCompileLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "Rust reference compile lifecycle requires at least one pattern",
+        ));
+    }
+    Ok(RustRegexReferenceCompileLifecycle {
+        patterns: patterns.to_vec(),
+        unicode,
+        case_insensitive,
+        haystack_len,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RustRegexReferenceOperationModel {
+    Count,
+    CountSpans,
+    CountCaptures,
+    Grep,
+    GrepCaptures,
+}
+
+impl RustRegexReferenceOperationModel {
+    fn parse(model: &str) -> Result<Self, CompareError> {
+        match model {
+            "count" => Ok(Self::Count),
+            "count-spans" => Ok(Self::CountSpans),
+            "count-captures" => Ok(Self::CountCaptures),
+            "grep" => Ok(Self::Grep),
+            "grep-captures" => Ok(Self::GrepCaptures),
+            other => Err(CompareError::new(format!(
+                "unexpected Rust reference operation lifecycle model {other}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::CountSpans => "count-spans",
+            Self::CountCaptures => "count-captures",
+            Self::Grep => "grep",
+            Self::GrepCaptures => "grep-captures",
+        }
+    }
+}
+
+/// One already-built pinned Rust-regex artifact for first/steady public
+/// operation reference boundaries.
+#[derive(Debug)]
+pub struct RustRegexReferenceOperationLifecycle {
+    model: RustRegexReferenceOperationModel,
+    regex: Regex,
+    haystack_len: usize,
+    reducer_steps: u64,
+}
+
+impl RustRegexReferenceOperationLifecycle {
+    /// Exact Rebar operation model retained by this artifact.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Execute one complete reference operation on the same retained artifact.
+    /// Calling this once is the first-operation boundary; one verified untimed
+    /// call followed by another call is the steady-operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or checked reducer failure.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "Rust reference operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let reduced = match self.model {
+            RustRegexReferenceOperationModel::Count => {
+                count_matches(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::CountSpans => {
+                count_spans(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::CountCaptures => {
+                count_captures(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::Grep => {
+                grep(&self.regex, haystack, self.reducer_steps)
+            }
+            RustRegexReferenceOperationModel::GrepCaptures => {
+                grep_captures(&self.regex, haystack, self.reducer_steps)
+            }
+        };
+        reduced.map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Build one exact pinned Rust-regex operation lifecycle outside the measured
+/// first/steady public operation boundary.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set, a non-operation model, or exact
+/// pinned adapter compilation failure.
+pub fn rust_regex_reference_operation_lifecycle(
+    model: &str,
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<RustRegexReferenceOperationLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "Rust reference operation lifecycle requires at least one pattern",
+        ));
+    }
+    let model = RustRegexReferenceOperationModel::parse(model)?;
+    let regex = rust_compile_options(patterns, unicode, case_insensitive)
+        .map_err(|error| CompareError::new(error.message))?;
+    Ok(RustRegexReferenceOperationLifecycle {
+        model,
+        regex,
+        haystack_len,
+        reducer_steps: RunLimits::default().reducer_steps,
+    })
+}
+
+/// Reconstructible compile request for one exact authenticated aggregate row.
+///
+/// Construction is deliberately deferred so an executor can place precisely
+/// one fresh public construction inside a contracted measurement boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentFreAggregateCompileLifecycle {
+    patterns: Vec<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+}
+
+/// Fresh complete compile artifact returned by one deferred construction.
+#[derive(Debug)]
+pub struct CurrentFreAggregateCompileArtifact {
+    inner: CurrentFreAggregateCompileArtifactInner,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation inside the exact fresh-construction boundary"
+)]
+enum CurrentFreAggregateCompileArtifactInner {
+    Single(AggregateCompileRegex),
+    Many(AggregateManyCompileRegex),
+}
+
+impl CurrentFreAggregateCompileLifecycle {
+    /// Construct one fresh complete public artifact. Builder configuration and
+    /// construction are both inside this call; semantic verification is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an exact builder refusal/fault without selecting another plan.
+    pub fn construct(&self) -> Result<CurrentFreAggregateCompileArtifact, CompareError> {
+        let inner = if self.patterns.len() == 1 {
+            CurrentFreAggregateCompileArtifactInner::Single(
+                current_fre_rebar_aggregate_builder(
+                    self.patterns[0].clone(),
+                    self.unicode,
+                    self.case_insensitive,
+                )
+                .build_compile()
+                .map_err(|error| {
+                    CompareError::new(format!("FRE compile lifecycle construction: {error}"))
+                })?,
+            )
+        } else {
+            CurrentFreAggregateCompileArtifactInner::Many(
+                current_fre_rebar_aggregate_many_builder(
+                    &self.patterns,
+                    self.unicode,
+                    self.case_insensitive,
+                )
+                .build_compile()
+                .map_err(|error| {
+                    CompareError::new(format!("FRE compile-many lifecycle construction: {error}"))
+                })?,
+            )
+        };
+        Ok(CurrentFreAggregateCompileArtifact { inner })
+    }
+}
+
+impl CurrentFreAggregateCompileArtifact {
+    /// Authenticate the selected plan and return its exact semantic plan label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this artifact does not bind the lifecycle's exact
+    /// pattern order, profile, operation, and selected-plan semantics.
+    pub fn plan(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+    ) -> Result<&'static str, CompareError> {
+        match (&self.inner, lifecycle.patterns.as_slice()) {
+            (CurrentFreAggregateCompileArtifactInner::Single(regex), [_]) => {
+                current_fre_rebar_validate_aggregate_identity(
+                    regex.build_report(),
+                    lifecycle.unicode,
+                    "compile",
+                )?;
+                Ok(match regex.build_report().plan {
+                    AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
+                    AggregatePlanKind::UnicodeScalarClass => {
+                        "compile-aggregate-unicode-scalar-class"
+                    }
+                    AggregatePlanKind::FiniteLiteralDfa => "compile-aggregate-finite-literal-dfa",
+                    AggregatePlanKind::ContinuationProgram => {
+                        "compile-aggregate-continuation-program"
+                    }
+                })
+            }
+            (CurrentFreAggregateCompileArtifactInner::Many(regex), patterns)
+                if patterns.len() > 1 =>
+            {
+                current_fre_rebar_validate_aggregate_many_identity(
+                    patterns,
+                    regex.build_report(),
+                    lifecycle.unicode,
+                    lifecycle.case_insensitive,
+                    "compile",
+                )?;
+                Ok(match regex.build_report().plan {
+                    AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
+                    AggregateManyPlanKind::ContinuationProgram => {
+                        "compile-many-continuation-program"
+                    }
+                })
+            }
+            _ => Err(CompareError::new(
+                "FRE compile artifact multiplicity differs from its lifecycle",
+            )),
+        }
+    }
+
+    /// Verify the compiled artifact outside its construction measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for lifecycle identity mismatch, input-length mismatch,
+    /// limit derivation failure, or retained-plan execution failure.
+    pub fn verify(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+        haystack: &[u8],
+    ) -> Result<u64, CompareError> {
+        let _ = self.plan(lifecycle)?;
+        if haystack.len() != lifecycle.haystack_len {
+            return Err(CompareError::new(format!(
+                "compile lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                lifecycle.haystack_len
+            )));
+        }
+        match &self.inner {
+            CurrentFreAggregateCompileArtifactInner::Single(regex) => {
+                let limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report())?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        CompareError::new(format!("FRE compile lifecycle verification: {error}"))
+                    })
+            }
+            CurrentFreAggregateCompileArtifactInner::Many(regex) => {
+                let limits = current_fre_rebar_aggregate_many_run_limits(
+                    haystack.len(),
+                    regex.build_report(),
+                )?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE compile-many lifecycle verification: {error}"
+                        ))
+                    })
+            }
+        }
+    }
+}
+
+/// Create a deferred aggregate compile lifecycle bound to one input length.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set.
+pub fn current_fre_rebar_aggregate_compile_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateCompileLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "FRE aggregate compile lifecycle requires at least one pattern",
+        ));
+    }
+    Ok(CurrentFreAggregateCompileLifecycle {
+        patterns: patterns.to_vec(),
+        unicode,
+        case_insensitive,
+        haystack_len,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentFreAggregateOperationModel {
+    Count,
+    SpanSum,
+}
+
+impl CurrentFreAggregateOperationModel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::SpanSum => "count-spans",
+        }
+    }
+}
+
+/// One already-built aggregate artifact for first/steady public operations.
+#[derive(Debug)]
+pub struct CurrentFreAggregateOperationLifecycle {
+    model: CurrentFreAggregateOperationModel,
+    plan: &'static str,
+    haystack_len: usize,
+    inner: CurrentFreAggregateOperationInner,
+}
+
+#[derive(Debug)]
+enum CurrentFreAggregateOperationInner {
+    CountSingle(AggregateCountRegex, AggregateRunLimits),
+    CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
+    SpanSumSingle(AggregateSpanSumRegex, AggregateRunLimits),
+    SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
+}
+
+impl CurrentFreAggregateOperationLifecycle {
+    /// Exact Rebar model retained by this artifact.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Exact authenticated construction-selected plan label.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        self.plan
+    }
+
+    /// Execute one complete public operation on the same retained artifact.
+    /// Calling this once is the first-operation boundary; an untimed call then
+    /// another call is the steady-operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or retained-plan refusal.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "aggregate operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        match &self.inner {
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+                .count_value(haystack, limits)
+                .map_err(|error| CompareError::new(format!("FRE count lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
+                .count_value(haystack, *limits)
+                .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
+                .span_sum_value(haystack, limits)
+                .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => {
+                regex.span_sum_value(haystack, *limits).map_err(|error| {
+                    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+                })
+            }
+        }
+    }
+}
+
+/// Build one exact aggregate operation lifecycle outside the measured public
+/// operation boundary.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set, non-operation model, builder
+/// refusal, semantic identity mismatch, or limit-derivation failure.
+pub fn current_fre_rebar_aggregate_operation_lifecycle(
+    model: &str,
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "FRE aggregate operation lifecycle requires at least one pattern",
+        ));
+    }
+    match model {
+        "count" => {
+            build_current_fre_count_lifecycle(patterns, unicode, case_insensitive, haystack_len)
+        }
+        "count-spans" => {
+            build_current_fre_span_sum_lifecycle(patterns, unicode, case_insensitive, haystack_len)
+        }
+        other => Err(CompareError::new(format!(
+            "unexpected aggregate operation lifecycle model {other}"
+        ))),
+    }
+}
+
+fn build_current_fre_count_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let (plan, inner) = if let [pattern] = patterns {
+        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
+            .build_count()
+            .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
+        current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
+        let plan = aggregate_single_plan_label("count", regex.build_report().plan);
+        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits),
+        )
+    } else {
+        let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
+            .build_count()
+            .map_err(|error| {
+                CompareError::new(format!("FRE count-many lifecycle build: {error}"))
+            })?;
+        current_fre_rebar_validate_aggregate_many_identity(
+            patterns,
+            regex.build_report(),
+            unicode,
+            case_insensitive,
+            "count",
+        )?;
+        let plan = aggregate_many_plan_label("count", regex.build_report().plan);
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CountMany(regex, limits),
+        )
+    };
+    Ok(CurrentFreAggregateOperationLifecycle {
+        model: CurrentFreAggregateOperationModel::Count,
+        plan,
+        haystack_len,
+        inner,
+    })
+}
+
+fn build_current_fre_span_sum_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let (plan, inner) = if let [pattern] = patterns {
+        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
+            .build_span_sum()
+            .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle build: {error}")))?;
+        current_fre_rebar_validate_aggregate_identity(
+            regex.build_report(),
+            unicode,
+            "count-spans",
+        )?;
+        let plan = aggregate_single_plan_label("count-spans", regex.build_report().plan);
+        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits),
+        )
+    } else {
+        let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
+            .build_span_sum()
+            .map_err(|error| {
+                CompareError::new(format!("FRE span-sum-many lifecycle build: {error}"))
+            })?;
+        current_fre_rebar_validate_aggregate_many_identity(
+            patterns,
+            regex.build_report(),
+            unicode,
+            case_insensitive,
+            "count-spans",
+        )?;
+        let plan = aggregate_many_plan_label("count-spans", regex.build_report().plan);
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits),
+        )
+    };
+    Ok(CurrentFreAggregateOperationLifecycle {
+        model: CurrentFreAggregateOperationModel::SpanSum,
+        plan,
+        haystack_len,
+        inner,
+    })
+}
+
+fn aggregate_single_plan_label(model: &str, plan: AggregatePlanKind) -> &'static str {
+    match (model, plan) {
+        ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
+        ("compile", AggregatePlanKind::UnicodeScalarClass) => {
+            "compile-aggregate-unicode-scalar-class"
+        }
+        ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
+        ("compile", AggregatePlanKind::ContinuationProgram) => {
+            "compile-aggregate-continuation-program"
+        }
+        (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
+        (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
+        (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
+    }
+}
+
+fn aggregate_many_plan_label(model: &str, plan: AggregateManyPlanKind) -> &'static str {
+    match (model, plan) {
+        ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
+        ("compile", AggregateManyPlanKind::ContinuationProgram) => {
+            "compile-many-continuation-program"
+        }
+        (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
+        (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
+    }
+}
+
 /// Construct the exact portable-search builder used by the authenticated
 /// current-FRE Rebar adapter.
 ///
@@ -908,6 +1566,143 @@ pub fn current_fre_rebar_portable_builder(
         .unicode(unicode))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentFreCaptureModel {
+    CountCaptures,
+    GrepCaptures,
+}
+
+#[derive(Clone, Debug)]
+enum CurrentFreCapturePreparation {
+    Count(Box<CaptureRunLimits>),
+    Grep,
+}
+
+impl CurrentFreCaptureModel {
+    fn parse(model: &str) -> Result<Self, CompareError> {
+        match model {
+            "count-captures" => Ok(Self::CountCaptures),
+            "grep-captures" => Ok(Self::GrepCaptures),
+            other => Err(CompareError::new(format!(
+                "unexpected capture lifecycle model {other}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CountCaptures => "count-captures",
+            Self::GrepCaptures => "grep-captures",
+        }
+    }
+}
+
+/// One already-built capture artifact at the public operation lifecycle
+/// boundary used by the authenticated current-FRE Rebar adapter.
+///
+/// The first call to [`Self::execute`] is the contracted first-operation
+/// boundary. Later calls on the same value are steady-operation boundaries.
+/// Construction and input loading are outside both boundaries.
+#[derive(Clone, Debug)]
+pub struct CurrentFreCaptureLifecycle {
+    model: CurrentFreCaptureModel,
+    regex: CaptureRegex,
+    limits: RunLimits,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    preparation: CurrentFreCapturePreparation,
+}
+
+impl CurrentFreCaptureLifecycle {
+    /// Exact Rebar model bound into this lifecycle producer.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Stable authenticated plan label expected by the timing runner.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        CURRENT_FRE_CAPTURE_PLAN
+    }
+
+    /// Exact Rust-regex Unicode option bound at construction.
+    #[must_use]
+    pub const fn unicode(&self) -> bool {
+        self.unicode
+    }
+
+    /// Exact Rust-regex case-insensitive option bound at construction.
+    #[must_use]
+    pub const fn case_insensitive(&self) -> bool {
+        self.case_insensitive
+    }
+
+    /// Execute one complete public model operation on the retained artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checked reducer limits or the capture engine refuse
+    /// the operation, or if the input length differs from the authenticated
+    /// preparation. No alternate implementation is selected.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "capture lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let result = match &self.preparation {
+            CurrentFreCapturePreparation::Count(run_limits) => {
+                execute_count_captures_with_limits(&self.regex, haystack, **run_limits)
+            }
+            CurrentFreCapturePreparation::Grep => {
+                execute_grep_captures(&self.regex, haystack, &self.limits)
+            }
+        };
+        result.map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Construct the exact capture lifecycle producer used by the authenticated
+/// current-FRE Rebar adapter.
+///
+/// # Errors
+///
+/// `haystack_len` binds checked operation limits before the lifecycle boundary.
+/// Returns an error for a non-capture model, unsupported syntax/profile, or an
+/// unexpected capture plan identity. It never substitutes another engine.
+pub fn current_fre_rebar_capture_lifecycle(
+    model: &str,
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreCaptureLifecycle, CompareError> {
+    let model = CurrentFreCaptureModel::parse(model)?;
+    let limits = RunLimits::default();
+    let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    let preparation = match model {
+        CurrentFreCaptureModel::CountCaptures => CurrentFreCapturePreparation::Count(Box::new(
+            capture_count_run_limits(&regex, haystack_len, &limits)
+                .map_err(|error| CompareError::new(error.message))?,
+        )),
+        CurrentFreCaptureModel::GrepCaptures => CurrentFreCapturePreparation::Grep,
+    };
+    Ok(CurrentFreCaptureLifecycle {
+        model,
+        regex,
+        limits,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        preparation,
+    })
+}
+
 /// Derive the exact whole-operation limits used by the authenticated
 /// current-FRE Rebar adapter for one already-published aggregate plan.
 ///
@@ -919,6 +1714,20 @@ pub fn current_fre_rebar_aggregate_run_limits(
     report: &AggregateBuildReport,
 ) -> Result<AggregateRunLimits, CompareError> {
     aggregate_run_limits(haystack_len, report, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
+}
+
+/// Derive the exact whole-operation limits used by the authenticated
+/// current-FRE Rebar adapter for one already-published multi-pattern plan.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if a bound cannot be represented.
+pub fn current_fre_rebar_aggregate_many_run_limits(
+    haystack_len: usize,
+    report: &AggregateManyBuildReport,
+) -> Result<AggregateManyRunLimits, CompareError> {
+    aggregate_many_run_limits(haystack_len, report, &RunLimits::default())
         .map_err(|error| CompareError::new(error.message))
 }
 
@@ -956,6 +1765,34 @@ pub fn current_fre_rebar_validate_aggregate_identity(
         )));
     }
     require_unicode_plan_identity(report, unicode, literal_operation)
+        .map_err(|error| CompareError::new(error.message))
+}
+
+/// Check the ordered multi-pattern semantic identity required by the
+/// authenticated adapter for one operation model.
+///
+/// # Errors
+///
+/// Returns an identity error for an unexpected model, profile, source order,
+/// operation, or selected-plan semantic certificate.
+pub fn current_fre_rebar_validate_aggregate_many_identity(
+    patterns: &[String],
+    report: &AggregateManyBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+    model: &str,
+) -> Result<(), CompareError> {
+    let operation = match model {
+        "compile" => AggregateManyOperation::Compile,
+        "count" => AggregateManyOperation::Count,
+        "count-spans" => AggregateManyOperation::SpanSum,
+        other => {
+            return Err(CompareError::new(format!(
+                "unexpected aggregate-many model {other}"
+            )));
+        }
+    };
+    require_aggregate_many_report_identity(patterns, unicode, case_insensitive, report, operation)
         .map_err(|error| CompareError::new(error.message))
 }
 
@@ -1720,13 +2557,21 @@ impl ExecutionError {
 }
 
 fn rust_compile(job: &Job, patterns: &[String]) -> Result<Regex, ExecutionError> {
+    rust_compile_options(patterns, job.regex.unicode, job.regex.case_insensitive)
+}
+
+fn rust_compile_options(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+) -> Result<Regex, ExecutionError> {
     let config = Regex::config()
         .utf8_empty(false)
         .nfa_size_limit(Some(NFA_SIZE_LIMIT));
     let syntax = regex_automata::util::syntax::Config::new()
         .utf8(false)
-        .unicode(job.regex.unicode)
-        .case_insensitive(job.regex.case_insensitive);
+        .unicode(unicode)
+        .case_insensitive(case_insensitive);
     Regex::builder()
         .configure(config)
         .syntax(syntax)
@@ -1960,15 +2805,24 @@ fn capture_regex(
     limits: &RunLimits,
 ) -> Result<CaptureRegex, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
+    capture_regex_one(pattern, request.unicode, request.case_insensitive, limits)
+}
+
+fn capture_regex_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<CaptureRegex, ExecutionError> {
     let engine_limits = fre::CaptureEngineBuildLimits {
         max_compile_work: limits.fre_aggregate_compile_work,
         max_program_bytes: limits.fre_aggregate_program_bytes,
         ..fre::CaptureEngineBuildLimits::default()
     };
-    CaptureBuilder::new(pattern)
+    let regex = CaptureBuilder::new(pattern)
         .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
         .limits(CaptureBuildLimits {
             max_hir_work: limits.fre_aggregate_compile_work,
             engine: engine_limits,
@@ -1980,7 +2834,16 @@ fn capture_regex(
             ..CaptureBuildLimits::default()
         })
         .build()
-        .map_err(|error| capture_build_error(&error))
+        .map_err(|error| capture_build_error(&error))?;
+    let identity = &regex.build_report().plan_identity;
+    if identity.operation != CaptureOperation::CountParticipatingNonempty
+        || identity.plan != CapturePlanKind::LinearSelectorPersistentHistory
+    {
+        return Err(ExecutionError::fault(
+            "FRE capture builder returned an unexpected plan identity",
+        ));
+    }
+    Ok(regex)
 }
 
 #[allow(
@@ -2092,9 +2955,30 @@ fn fre_count_captures(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let regex = capture_regex(request, limits)?;
+    let actual = execute_count_captures(&regex, request.haystack, limits)?;
+    Ok(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_PLAN,
+    })
+}
+
+fn execute_count_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let run_limits = capture_count_run_limits(regex, haystack.len(), limits)?;
+    execute_count_captures_with_limits(regex, haystack, run_limits)
+}
+
+fn capture_count_run_limits(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CaptureRunLimits, ExecutionError> {
     let (reducer, work) = capture_reducer_budget(limits)?;
-    let run_limits = capture_run_limits(
-        request.haystack.len(),
+    capture_run_limits(
+        haystack_len,
         regex.build_report().selector.program_states,
         work,
         limits.fre_aggregate_sequential_bytes,
@@ -2104,21 +2988,24 @@ fn fre_count_captures(
         work,
         work,
         limits,
-    )?;
+    )
+}
+
+fn execute_count_captures_with_limits(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureRunLimits,
+) -> Result<u64, ExecutionError> {
     let result = regex
-        .count_captures(request.haystack, run_limits)
+        .count_captures(haystack, run_limits)
         .map_err(|error| {
             capture_execution_error(
                 &error.source,
                 format!("FRE capture reducer refused execution: {error}"),
             )
         })?;
-    let actual = u64::try_from(result.accounting.count)
-        .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))?;
-    Ok(FreReduction {
-        actual,
-        plan: "capture-linear-selector-persistent-history",
-    })
+    u64::try_from(result.accounting.count)
+        .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))
 }
 
 fn fre_grep_captures(
@@ -2126,6 +3013,18 @@ fn fre_grep_captures(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let regex = capture_regex(request, limits)?;
+    let actual = execute_grep_captures(&regex, request.haystack, limits)?;
+    Ok(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_PLAN,
+    })
+}
+
+fn execute_grep_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
     let (reducer_limit, work_limit) = capture_reducer_budget(limits)?;
     let groups = regex
         .build_report()
@@ -2139,7 +3038,7 @@ fn fre_grep_captures(
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
-    for line in request.haystack.lines() {
+    for line in haystack.lines() {
         reducer_events = checked_aggregate_add(reducer_events, 1, "capture line events")?;
         if reducer_events > reducer_limit {
             return Err(ExecutionError::unsupported(format!(
@@ -2216,12 +3115,8 @@ fn fre_grep_captures(
             "capture history walk",
         )?;
     }
-    let actual = u64::try_from(count)
-        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
-    Ok(FreReduction {
-        actual,
-        plan: "capture-linear-selector-persistent-history",
-    })
+    u64::try_from(count)
+        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))
 }
 
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
@@ -2895,22 +3790,36 @@ fn require_aggregate_many_identity(
     report: &AggregateManyBuildReport,
     operation: AggregateManyOperation,
 ) -> Result<(), ExecutionError> {
+    require_aggregate_many_report_identity(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        report,
+        operation,
+    )
+}
+
+fn require_aggregate_many_report_identity(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    report: &AggregateManyBuildReport,
+    operation: AggregateManyOperation,
+) -> Result<(), ExecutionError> {
     let mut expected_profile = rebar_profile();
-    expected_profile.options.unicode = request.unicode;
-    expected_profile.options.case_insensitive = request.case_insensitive;
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
     if report.profile != expected_profile || report.operation != operation {
         return Err(ExecutionError::fault(
             "FRE ordered build-many profile/operation identity mismatch",
         ));
     }
-    if report.patterns.len() != request.patterns.len() {
+    if report.patterns.len() != patterns.len() {
         return Err(ExecutionError::fault(
             "FRE ordered build-many pattern identity count mismatch",
         ));
     }
-    for (ordinal, (pattern_report, source)) in
-        report.patterns.iter().zip(request.patterns).enumerate()
-    {
+    for (ordinal, (pattern_report, source)) in report.patterns.iter().zip(patterns).enumerate() {
         if pattern_report.ordinal != ordinal
             || pattern_report.syntax_key.pattern.as_bytes() != source.as_bytes()
             || pattern_report.syntax_key.profile
@@ -2925,14 +3834,14 @@ fn require_aggregate_many_identity(
         AggregateManyPlanIdentity::OrderedLiteral { semantics, .. } => Some(semantics),
         AggregateManyPlanIdentity::Continuation(_) => None,
     };
-    if request.unicode
+    if unicode
         && literal_semantics != Some(AggregateManyLiteralSemantics::UnicodeOnNonemptyUtf8Literals)
     {
         return Err(ExecutionError::fault(
             "FRE Unicode ordered build-many literal proof identity mismatch",
         ));
     }
-    if !request.unicode
+    if !unicode
         && literal_semantics.is_some_and(|semantics| {
             semantics != AggregateManyLiteralSemantics::UnicodeOffByteBoundaries
         })
@@ -3094,14 +4003,14 @@ fn fre_aggregate_many_count(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_count()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_count()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Count)?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
@@ -3125,14 +4034,14 @@ fn fre_aggregate_many_compile(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_compile()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_compile()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(
         request,
         regex.build_report(),
@@ -3160,14 +4069,14 @@ fn fre_aggregate_many_span_sum(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_span_sum()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_span_sum()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(
         request,
         regex.build_report(),
@@ -4439,6 +5348,38 @@ mod tests {
     }
 
     #[test]
+    fn capture_lifecycle_reuses_one_authenticated_artifact_across_boundaries() {
+        let count =
+            current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
+                .expect("count-captures lifecycle");
+        assert_eq!(count.model(), "count-captures");
+        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(count.execute(b"a ab").expect("first count operation"), 5);
+        assert_eq!(count.execute(b"a ab").expect("steady count operation"), 5);
+        assert!(count.execute(b"a").is_err());
+
+        let haystack = b"foo foo\r\nZ\r\nfoo\r\nfoo";
+        let grep = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("grep-captures lifecycle");
+        assert_eq!(grep.model(), "grep-captures");
+        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(grep.execute(haystack).expect("first grep operation"), 12);
+        assert_eq!(grep.execute(haystack).expect("steady grep operation"), 12);
+
+        assert!(current_fre_rebar_capture_lifecycle("count", "a", false, false, 1).is_err());
+        assert!(
+            current_fre_rebar_capture_lifecycle("count-captures", r"(\pL)", true, false, 3)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn grep_capture_selector_ledgers_are_cumulative_across_lines() {
         let limits = RunLimits {
             fre_aggregate_operation_work: 10,
@@ -4984,6 +5925,189 @@ mod tests {
             ),
             0,
             "compile-many-continuation-program",
+        );
+    }
+
+    #[test]
+    fn rust_reference_lifecycles_separate_fresh_compile_from_same_artifact_operations() {
+        let patterns = vec![r"(a)(b)?".to_string()];
+        let haystack = b"ab a\nzz\nab\n";
+        let compile =
+            rust_regex_reference_compile_lifecycle(&patterns, false, false, haystack.len())
+                .expect("Rust reference compile lifecycle");
+        let first_artifact = compile.construct().expect("first fresh Rust artifact");
+        assert_eq!(
+            first_artifact
+                .verify(&compile, haystack)
+                .expect("first compile verification"),
+            3
+        );
+        let second_artifact = compile.construct().expect("second fresh Rust artifact");
+        assert_eq!(
+            second_artifact
+                .verify(&compile, haystack)
+                .expect("second compile verification"),
+            3
+        );
+        assert!(second_artifact.verify(&compile, b"ab").is_err());
+
+        for (model, expected) in [
+            ("count", 3),
+            ("count-spans", 5),
+            ("count-captures", 8),
+            ("grep", 2),
+            ("grep-captures", 8),
+        ] {
+            let lifecycle = rust_regex_reference_operation_lifecycle(
+                model,
+                &patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("Rust reference operation lifecycle");
+            assert_eq!(lifecycle.model(), model);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first operation"),
+                expected
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady operation"),
+                expected
+            );
+            assert!(lifecycle.execute(b"ab").is_err());
+        }
+
+        let unicode_patterns = vec![r"\pL+".to_string()];
+        let unicode = rust_regex_reference_operation_lifecycle(
+            "count",
+            &unicode_patterns,
+            true,
+            true,
+            "雪 SNOW".len(),
+        )
+        .expect("Unicode case-insensitive reference lifecycle");
+        assert_eq!(
+            unicode
+                .execute("雪 SNOW".as_bytes())
+                .expect("Unicode reference operation"),
+            2
+        );
+
+        assert!(rust_regex_reference_compile_lifecycle(&[], false, false, 0).is_err());
+        assert!(
+            rust_regex_reference_operation_lifecycle(
+                "compile",
+                &patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .is_err()
+        );
+        assert!(
+            rust_regex_reference_operation_lifecycle("count", &["(".to_string()], false, false, 0,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aggregate_lifecycles_separate_construction_from_same_artifact_operations() {
+        let haystack = b"aba aba";
+        let single_patterns = vec!["aba".to_string()];
+        let compile = current_fre_rebar_aggregate_compile_lifecycle(
+            &single_patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("single compile lifecycle");
+        let first_artifact = compile.construct().expect("first fresh compile artifact");
+        assert_eq!(
+            first_artifact.plan(&compile).expect("single compile plan"),
+            "compile-aggregate-exact-literal"
+        );
+        assert_eq!(
+            first_artifact
+                .verify(&compile, haystack)
+                .expect("single compile verification"),
+            2
+        );
+        let second_artifact = compile.construct().expect("second fresh compile artifact");
+        assert_eq!(
+            second_artifact
+                .verify(&compile, haystack)
+                .expect("second compile verification"),
+            2
+        );
+        assert!(second_artifact.verify(&compile, b"aba").is_err());
+
+        let continuation_patterns = vec!["a+".to_string(), "b+".to_string()];
+        let continuation_haystack = b"aa bbb";
+        let compile_many = current_fre_rebar_aggregate_compile_lifecycle(
+            &continuation_patterns,
+            false,
+            false,
+            continuation_haystack.len(),
+        )
+        .expect("compile-many lifecycle");
+        let artifact = compile_many.construct().expect("compile-many artifact");
+        assert_eq!(
+            artifact.plan(&compile_many).expect("compile-many plan"),
+            "compile-many-continuation-program"
+        );
+        assert_eq!(
+            artifact
+                .verify(&compile_many, continuation_haystack)
+                .expect("compile-many verification"),
+            2
+        );
+
+        let count = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &continuation_patterns,
+            false,
+            false,
+            continuation_haystack.len(),
+        )
+        .expect("count-many lifecycle");
+        assert_eq!(count.model(), "count");
+        assert_eq!(count.plan(), "aggregate-many-continuation-program");
+        assert_eq!(
+            count
+                .execute(continuation_haystack)
+                .expect("first count operation"),
+            2
+        );
+        assert_eq!(
+            count
+                .execute(continuation_haystack)
+                .expect("steady count operation"),
+            2
+        );
+        assert!(count.execute(b"aa").is_err());
+
+        let span_sum = current_fre_rebar_aggregate_operation_lifecycle(
+            "count-spans",
+            &single_patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("single span-sum lifecycle");
+        assert_eq!(span_sum.model(), "count-spans");
+        assert_eq!(span_sum.plan(), "aggregate-exact-literal");
+        assert_eq!(span_sum.execute(haystack).expect("span-sum operation"), 6);
+        assert!(current_fre_rebar_aggregate_compile_lifecycle(&[], false, false, 0).is_err());
+        assert!(
+            current_fre_rebar_aggregate_operation_lifecycle(
+                "compile",
+                &single_patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .is_err()
         );
     }
 
