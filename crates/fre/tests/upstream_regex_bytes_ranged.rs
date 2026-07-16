@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildLimits, K0SearchError, Match, PlanKind, PlanSelection, PortableBuilder, PortableRegex,
-    RustProfile, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
+    BuildLimits, ByteMatch, K0SearchError, Match, PlanKind, PlanSelection, PortableBuilder,
+    PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
 };
 use regex::bytes::{Regex, RegexBuilder};
 
@@ -11,7 +11,11 @@ const UPSTREAM_PACKAGE_SHA256: &str =
     "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba";
 const UPSTREAM_PATH: &str = "src/regex/bytes.rs";
 const UPSTREAM_SHA256: &str = "fae9e125ff320e85fe5e59e2a32ae24d85f6ca9f38c737c4e929a8376b9b53b0";
-const UPSTREAM_API_IDS: &[&str] = &["bytes_regex_is_match_at", "bytes_regex_find_at"];
+const UPSTREAM_API_IDS: &[&str] = &[
+    "bytes_regex_is_match_at",
+    "bytes_regex_find_at",
+    "bytes_regex_find_at_borrowed_match",
+];
 
 #[test]
 fn authenticated_bytes_ranged_api_inventory_has_no_silent_omissions() {
@@ -20,7 +24,7 @@ fn authenticated_bytes_ranged_api_inventory_has_no_silent_omissions() {
     assert_eq!(profile.regex.checksum, UPSTREAM_PACKAGE_SHA256);
     assert_eq!(UPSTREAM_PATH, "src/regex/bytes.rs");
     assert_eq!(UPSTREAM_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 2);
+    assert_eq!(UPSTREAM_API_IDS.len(), 3);
 }
 
 #[test]
@@ -63,6 +67,12 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
             .0,
         None
     );
+    assert_eq!(
+        fre.find_at_borrowed(haystack, 2, SearchLimits::unlimited())
+            .expect("contextual borrowed search")
+            .0,
+        None
+    );
 
     let mut session = fre
         .search_session(SearchSessionLimits::unlimited())
@@ -77,6 +87,13 @@ fn pinned_ranged_search_examples_preserve_original_haystack_context() {
         session
             .find_at(haystack, 2, SearchLimits::unlimited())
             .expect("reused contextual span search")
+            .0,
+        None
+    );
+    assert_eq!(
+        session
+            .find_at_borrowed(haystack, 2, SearchLimits::unlimited())
+            .expect("reused contextual borrowed search")
             .0,
         None
     );
@@ -99,15 +116,33 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
             .search_session(SearchSessionLimits::unlimited())
             .expect("portable ranged-search session");
         for &haystack in haystacks {
+            let expected_full = upstream
+                .find(haystack)
+                .map(|matched| (matched.range(), matched.as_bytes()));
+            let (reused_full, reused_full_accounting) = session
+                .find_borrowed(haystack, SearchLimits::unlimited())
+                .expect("reused full borrowed search");
+            assert_eq!(borrowed(reused_full), expected_full);
+            assert_accounting_plan(&reused_full_accounting, expected_plan);
+
             for start in 0..=haystack.len() {
-                let expected = upstream
-                    .find_at(haystack, start)
-                    .map(|matched| (matched.start(), matched.end()));
+                let expected_match = upstream.find_at(haystack, start);
+                let expected = expected_match.map(|matched| (matched.start(), matched.end()));
+                let expected_borrowed =
+                    expected_match.map(|matched| (matched.range(), matched.as_bytes()));
                 let (actual, find_accounting) = fre
                     .find_at(haystack, start, SearchLimits::unlimited())
                     .unwrap_or_else(|error| {
                         panic!(
                             "find_at failed for {:?}/{haystack:?}/{start}: {error}",
+                            fre.as_str()
+                        )
+                    });
+                let (actual_borrowed, borrowed_accounting) = fre
+                    .find_at_borrowed(haystack, start, SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "find_at_borrowed failed for {:?}/{haystack:?}/{start}: {error}",
                             fre.as_str()
                         )
                     });
@@ -127,6 +162,8 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                 );
                 assert_eq!(exists, upstream.is_match_at(haystack, start));
                 assert_eq!(exists, expected.is_some());
+                assert_eq!(borrowed(actual_borrowed), expected_borrowed);
+                assert_eq!(borrowed_accounting, find_accounting);
                 assert_accounting_plan(&find_accounting, expected_plan);
                 assert_accounting_plan(&exists_accounting, expected_plan);
 
@@ -136,8 +173,13 @@ fn ranged_search_matches_pinned_bytes_across_every_portable_plan() {
                 let reused_exists = session
                     .is_match_at(haystack, start, SearchLimits::unlimited())
                     .expect("reused ranged existence search");
+                let reused_borrowed = session
+                    .find_at_borrowed(haystack, start, SearchLimits::unlimited())
+                    .expect("reused ranged borrowed search");
                 assert_eq!(span(reused_find.0), expected);
                 assert_eq!(reused_exists.0, exists);
+                assert_eq!(borrowed(reused_borrowed.0), expected_borrowed);
+                assert_eq!(reused_borrowed.1, reused_find.1);
                 assert_accounting_plan(&reused_find.1, expected_plan);
                 assert_accounting_plan(&reused_exists.1, expected_plan);
             }
@@ -154,6 +196,8 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
     for error in [
         fre.find_at(haystack, start, SearchLimits::unlimited())
             .expect_err("cold find_at must reject an out-of-bounds start"),
+        fre.find_at_borrowed(haystack, start, SearchLimits::unlimited())
+            .expect_err("cold find_at_borrowed must reject an out-of-bounds start"),
         fre.is_match_at(haystack, start, SearchLimits::unlimited())
             .expect_err("cold is_match_at must reject an out-of-bounds start"),
     ] {
@@ -172,6 +216,14 @@ fn out_of_bounds_start_is_a_typed_cold_and_reused_error() {
         .expect("reusable K0 session");
     assert!(matches!(
         session.find_at(haystack, start, SearchLimits::unlimited()),
+        Err(SearchError::K0(K0SearchError::InvalidWindow {
+            start: 3,
+            end: 2,
+            haystack_len: 2,
+        }))
+    ));
+    assert!(matches!(
+        session.find_at_borrowed(haystack, start, SearchLimits::unlimited()),
         Err(SearchError::K0(K0SearchError::InvalidWindow {
             start: 3,
             end: 2,
@@ -273,6 +325,10 @@ fn ranged_cases() -> Vec<(PortableRegex, Regex, PlanKind)> {
 
 fn span(matched: Option<Match>) -> Option<(usize, usize)> {
     matched.map(|matched| (matched.start(), matched.end()))
+}
+
+fn borrowed(matched: Option<ByteMatch<'_>>) -> Option<(core::ops::Range<usize>, &[u8])> {
+    matched.map(|matched| (matched.range(), matched.as_bytes()))
 }
 
 fn assert_accounting_plan(accounting: &SearchAccounting, expected: PlanKind) {

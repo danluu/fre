@@ -2185,6 +2185,27 @@ impl PortableRegex {
         self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
+    /// Return the selected match at or after `start` while retaining the
+    /// complete original haystack.
+    ///
+    /// This is the ranged companion to [`Self::find_borrowed`]. Assertions
+    /// still inspect bytes before `start`, and [`ByteMatch`] offsets and bytes
+    /// are both relative to the unsliced original haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::find_at`].
+    pub fn find_at_borrowed<'h>(
+        &self,
+        haystack: &'h [u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.find_at(haystack, start, limits)?;
+        Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
+    }
+
     /// Search a range while assertions retain original-haystack context.
     ///
     /// # Errors
@@ -2547,6 +2568,22 @@ impl PortableSearchSession<'_> {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Return the selected match while retaining the complete original
+    /// haystack and reusing K0 state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`Self::find`].
+    pub fn find_borrowed<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.find(haystack, limits)?;
+        Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
+    }
+
     /// Return the selected match at or after `start`, reusing K0 state.
     ///
     /// # Errors
@@ -2560,6 +2597,23 @@ impl PortableSearchSession<'_> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Return the selected match at or after `start` while retaining the
+    /// complete original haystack and reusing K0 state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::find_at`].
+    pub fn find_at_borrowed<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.find_at(haystack, start, limits)?;
+        Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
     }
 
     /// Search a range while assertions retain original-haystack context.
