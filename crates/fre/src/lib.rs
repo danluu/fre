@@ -6,11 +6,13 @@
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match compile/count/
 //! span-sum plans without source concatenation. Whole-match aggregate plans
-//! may erase capture annotations. [`CaptureBuilder`] separately preserves
-//! capture histories for the participating-group reducer on its certified
-//! Rust-byte subset; it is not a general capture-record facade. None of these
-//! types is named `Regex`: unsupported syntax/profile/operation combinations
-//! are typed build errors, and there is no full Rust-regex/RE2 or JIT claim.
+//! may erase capture annotations. Their complete spans also provide bounded
+//! literal/no-expansion replacement and `replacen`. [`CaptureBuilder`]
+//! separately preserves capture histories for the participating-group reducer
+//! on its certified Rust-byte subset; it is not a general capture-record
+//! facade. None of these types is named `Regex`: unsupported syntax/profile/
+//! operation combinations are typed build errors, and there is no full
+//! Rust-regex/RE2 or JIT claim.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +23,7 @@ mod aggregate_many;
 mod captures;
 mod finite;
 mod forward_anchored;
+mod replacement;
 mod required_literal;
 mod unicode_word_run;
 
@@ -81,6 +84,11 @@ pub use fre_kernels::{
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+};
+pub use replacement::{
+    LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
+    LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
+    LiteralReplacementResult,
 };
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};
