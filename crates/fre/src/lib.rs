@@ -1181,6 +1181,15 @@ impl PortableBuilder {
     /// Select the complete Rust release-stack and constructor identity.
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile.into_regex_builder();
+        self
+    }
+
+    /// Retain a set-constructor stamp while building one already-associated
+    /// constituent. Only the set builder may use this path; public single-
+    /// pattern construction always normalizes to `RegexBuilder` identity.
+    #[must_use]
+    fn set_constituent_profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
         self
     }
@@ -1815,7 +1824,7 @@ impl Clone for PortableRegex {
             }
         };
         PortableBuilder::new(self.as_str())
-            .profile(profile)
+            .set_constituent_profile(profile)
             .limits(self.limits)
             .plan_selection(self.selection)
             .build()

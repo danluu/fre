@@ -200,7 +200,7 @@ fn aggregate_size_limit_matches_pinned_bytes_set_and_retains_identity() {
         }),
     );
     for profile in profiles {
-        let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &profile.constructor
+        let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } = &profile.constructor
         else {
             panic!("set lost high-level constructor identity");
         };

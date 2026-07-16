@@ -106,13 +106,18 @@ pub(crate) fn validate_regex_set_admission<P: AsRef<str>>(
             source,
         }
     })?;
-    let RustConstructor::RegexBuilder {
-        size_limit,
-        dfa_size_limit,
-        ..
-    } = rust.constructor
-    else {
-        return Ok(());
+    let (size_limit, dfa_size_limit) = match rust.constructor {
+        RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            ..
+        }
+        | RustConstructor::RegexSetBuilder {
+            size_limit,
+            dfa_size_limit,
+            ..
+        } => (size_limit, dfa_size_limit),
+        RustConstructor::RebarMeta { .. } => return Ok(()),
     };
     let limit = usize::try_from(size_limit).map_err(|_| RustRegexSetAdmissionError {
         pattern: None,
@@ -210,13 +215,17 @@ fn enforce_high_level_size_limit(
         CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => rust,
         CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
     };
-    let RustConstructor::RegexBuilder {
-        size_limit,
-        dfa_size_limit,
-        ..
-    } = rust.constructor
-    else {
-        return Ok(());
+    let (size_limit, dfa_size_limit) = match rust.constructor {
+        RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            ..
+        } => (size_limit, dfa_size_limit),
+        // A set builder applies this limit once to its combined capture-free
+        // NFA in `validate_regex_set_admission`, never to a constituent pattern.
+        RustConstructor::RegexSetBuilder { .. } | RustConstructor::RebarMeta { .. } => {
+            return Ok(());
+        }
     };
     let limit = usize::try_from(size_limit).map_err(|_| {
         ParseError::new(
@@ -282,6 +291,15 @@ fn validate_rust_configuration(
     let supported_constructor = match (&rust.constructor, profile) {
         (
             RustConstructor::RegexBuilder {
+                size_limit,
+                dfa_size_limit,
+                text_syntax_utf8,
+                bytes_syntax_utf8,
+                text_utf8_empty,
+                bytes_utf8_empty,
+                match_kind: crate::RustMatchKind::LeftmostFirst,
+            }
+            | RustConstructor::RegexSetBuilder {
                 size_limit,
                 dfa_size_limit,
                 text_syntax_utf8,

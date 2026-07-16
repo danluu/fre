@@ -70,6 +70,19 @@ fn pinned_defaults_are_explicit() {
         }
     );
 
+    assert_eq!(
+        RustProfile::regex_set_1_12_4().constructor,
+        RustConstructor::RegexSetBuilder {
+            size_limit: 10 * (1 << 20),
+            dfa_size_limit: 2 * (1 << 20),
+            text_syntax_utf8: true,
+            bytes_syntax_utf8: false,
+            text_utf8_empty: true,
+            bytes_utf8_empty: false,
+            match_kind: RustMatchKind::LeftmostFirst,
+        }
+    );
+
     assert!(matches!(
         RustProfile::rebar_1_12_4().constructor,
         RustConstructor::RebarMeta {

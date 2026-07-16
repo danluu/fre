@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 3;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 4;
 
 /// Complete construction limits for one portable Rust-byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,7 +147,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     pub fn new(patterns: &'a [String]) -> Self {
         Self {
             patterns,
-            profile: RustProfile::default(),
+            profile: RustProfile::regex_set_1_12_4(),
             limits: PortableRegexSetBuildLimits::default(),
         }
     }
@@ -155,7 +155,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// Select the complete pinned Rust release and builder-option identity.
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
-        self.profile = profile;
+        self.profile = profile.into_regex_set_builder();
         self
     }
 
@@ -240,13 +240,16 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
-    /// Set the pinned high-level set builder's aggregate compiled-NFA limit.
+    /// Set the pinned high-level set builder's approximate compiled-regex
+    /// limit for the combined capture-free program.
     ///
-    /// The limit applies once to the complete capture-free, source-ordered
-    /// set, exactly as in `regex::bytes::RegexSetBuilder` 1.12.4.
+    /// Unlike a single-pattern builder, this limit is evaluated once across
+    /// every pattern after each constituent passes FRE's syntax and plan
+    /// admission. It is never approximated as an independent per-pattern
+    /// limit.
     #[must_use]
     pub fn size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
+        if let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } =
             &mut self.profile.constructor
         {
             *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -264,7 +267,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// is left unchanged.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+        if let fre_syntax::RustConstructor::RegexSetBuilder { dfa_size_limit, .. } =
             &mut self.profile.constructor
         {
             *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -365,7 +368,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
             )?;
 
             let regex = PortableBuilder::new(pattern.as_str())
-                .profile(self.profile.clone())
+                .set_constituent_profile(self.profile.clone())
                 .limits(self.limits.pattern)
                 .after_set_admission()
                 .build()

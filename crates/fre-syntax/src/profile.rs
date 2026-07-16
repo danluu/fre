@@ -165,6 +165,20 @@ pub enum RustConstructor {
         bytes_utf8_empty: bool,
         match_kind: RustMatchKind,
     },
+    /// High-level `regex::bytes::RegexSetBuilder` release defaults.
+    ///
+    /// The fields deliberately mirror [`Self::RegexBuilder`], but the
+    /// compiled-size limit applies once to the combined capture-free NFA for
+    /// all patterns. It must not be applied independently to each pattern.
+    RegexSetBuilder {
+        size_limit: u64,
+        dfa_size_limit: u64,
+        text_syntax_utf8: bool,
+        bytes_syntax_utf8: bool,
+        text_utf8_empty: bool,
+        bytes_utf8_empty: bool,
+        match_kind: RustMatchKind,
+    },
     /// Rebar's ordered `regex_automata::meta::Regex::builder` configuration.
     RebarMeta {
         rebar_revision: UpstreamRevision,
@@ -218,6 +232,72 @@ impl RustProfile {
             },
             options: RustOptions::default(),
         }
+    }
+
+    /// Exact high-level `regex::bytes::RegexSetBuilder` release identity.
+    #[must_use]
+    pub fn regex_set_1_12_4() -> Self {
+        Self::regex_1_12_4().into_regex_set_builder()
+    }
+
+    /// Convert a high-level single-regex constructor stamp into the
+    /// corresponding set constructor while preserving every configured
+    /// option and component identity.
+    ///
+    /// Non-high-level constructor profiles are returned unchanged.
+    #[must_use]
+    pub fn into_regex_set_builder(mut self) -> Self {
+        if let RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            text_syntax_utf8,
+            bytes_syntax_utf8,
+            text_utf8_empty,
+            bytes_utf8_empty,
+            match_kind,
+        } = self.constructor
+        {
+            self.constructor = RustConstructor::RegexSetBuilder {
+                size_limit,
+                dfa_size_limit,
+                text_syntax_utf8,
+                bytes_syntax_utf8,
+                text_utf8_empty,
+                bytes_utf8_empty,
+                match_kind,
+            };
+        }
+        self
+    }
+
+    /// Convert a high-level set constructor stamp into the corresponding
+    /// single-regex constructor while preserving every configured option and
+    /// component identity.
+    ///
+    /// Non-high-level constructor profiles are returned unchanged.
+    #[must_use]
+    pub fn into_regex_builder(mut self) -> Self {
+        if let RustConstructor::RegexSetBuilder {
+            size_limit,
+            dfa_size_limit,
+            text_syntax_utf8,
+            bytes_syntax_utf8,
+            text_utf8_empty,
+            bytes_utf8_empty,
+            match_kind,
+        } = self.constructor
+        {
+            self.constructor = RustConstructor::RegexBuilder {
+                size_limit,
+                dfa_size_limit,
+                text_syntax_utf8,
+                bytes_syntax_utf8,
+                text_utf8_empty,
+                bytes_utf8_empty,
+                match_kind,
+            };
+        }
+        self
     }
 
     /// Exact Rebar 1.12.4 Rust adapter construction identity.
