@@ -92,7 +92,7 @@ pub use fre_kernels::{
 pub use replacement::{
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
-    LiteralReplacementResult,
+    LiteralReplacementResult, LiteralReplacer,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

@@ -5,6 +5,65 @@ use crate::{
     AggregateRunLimits, AggregateSpans, AggregateSpansRegex,
 };
 
+/// A byte source accepted by the literal/no-expansion replacement facade.
+///
+/// Unlike Rust regex's general `Replacer` contract, implementations of this
+/// trait are always copied literally: `$` has no special meaning. The standard
+/// byte containers are supported alongside the UTF-8 string containers used
+/// by upstream's replacement type-surface tests.
+pub trait LiteralReplacer {
+    /// Borrow the exact bytes to insert for every selected match.
+    fn literal_bytes(&self) -> &[u8];
+}
+
+impl LiteralReplacer for [u8] {
+    fn literal_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl<const N: usize> LiteralReplacer for [u8; N] {
+    fn literal_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl LiteralReplacer for Vec<u8> {
+    fn literal_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl LiteralReplacer for str {
+    fn literal_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl LiteralReplacer for String {
+    fn literal_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl LiteralReplacer for std::borrow::Cow<'_, [u8]> {
+    fn literal_bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl LiteralReplacer for std::borrow::Cow<'_, str> {
+    fn literal_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<T: LiteralReplacer + ?Sized> LiteralReplacer for &T {
+    fn literal_bytes(&self) -> &[u8] {
+        (*self).literal_bytes()
+    }
+}
+
 /// Per-call policy for literal/no-expansion replacement.
 ///
 /// The aggregate limits bound complete match selection. `max_output_bytes`
@@ -176,10 +235,10 @@ impl AggregateSpansRegex {
     ///
     /// The replacement is equivalent to `regex::bytes::NoExpand`: dollar
     /// syntax is copied verbatim and no capture value is observed.
-    pub fn replace_literal(
+    pub fn replace_literal<R: LiteralReplacer>(
         &self,
         haystack: &[u8],
-        replacement: &[u8],
+        replacement: R,
         limits: impl core::borrow::Borrow<LiteralReplacementLimits>,
     ) -> Result<LiteralReplacementResult, LiteralReplacementError> {
         self.replacen_literal(haystack, 1, replacement, limits)
@@ -189,10 +248,10 @@ impl AggregateSpansRegex {
     ///
     /// Empty-match progress and absolute anchor context come from the same
     /// complete-span selector used by the aggregate facade.
-    pub fn replace_all_literal(
+    pub fn replace_all_literal<R: LiteralReplacer>(
         &self,
         haystack: &[u8],
-        replacement: &[u8],
+        replacement: R,
         limits: impl core::borrow::Borrow<LiteralReplacementLimits>,
     ) -> Result<LiteralReplacementResult, LiteralReplacementError> {
         self.replacen_literal(haystack, 0, replacement, limits)
@@ -205,13 +264,14 @@ impl AggregateSpansRegex {
     /// It selects all spans once, computes the exact output length without
     /// allocation, enforces the caller's byte ceiling, reserves once and then
     /// copies the unchanged gaps and literal replacement.
-    pub fn replacen_literal(
+    pub fn replacen_literal<R: LiteralReplacer>(
         &self,
         haystack: &[u8],
         limit: usize,
-        replacement: &[u8],
+        replacement: R,
         limits: impl core::borrow::Borrow<LiteralReplacementLimits>,
     ) -> Result<LiteralReplacementResult, LiteralReplacementError> {
+        let replacement = replacement.literal_bytes();
         let limits = *limits.borrow();
         let spans =
             self.spans(haystack, limits.aggregate)

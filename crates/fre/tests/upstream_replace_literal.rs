@@ -243,6 +243,15 @@ const SUPPORTED_CASES: &[SupportedCase] = &[
     },
 ];
 
+const PORTED_TYPE_SURFACE_IDS: &[&str] = &[
+    "impl_string",
+    "impl_string_ref",
+    "impl_cow_str_borrowed",
+    "impl_cow_str_borrowed_ref",
+    "impl_cow_str_owned",
+    "impl_cow_str_owned_ref",
+];
+
 #[test]
 fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     let profile = RustProfile::regex_1_12_4();
@@ -265,6 +274,12 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     let ported: Vec<_> = SUPPORTED_CASES.iter().map(|case| case.id).collect();
     assert_eq!(ported, supported);
     assert_eq!(supported.len(), 9);
+    let type_surface: Vec<_> = INVENTORY
+        .iter()
+        .filter(|case| case.capability == Capability::ReplacerTypeSurface)
+        .map(|case| case.id)
+        .collect();
+    assert_eq!(type_surface, PORTED_TYPE_SURFACE_IDS);
     assert_eq!(
         INVENTORY
             .iter()
@@ -289,6 +304,54 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     for case in INVENTORY {
         assert!(case.capability.id().starts_with("replacement."));
     }
+}
+
+#[test]
+fn ported_upstream_replacer_type_surface_cases_pass() {
+    use std::borrow::Cow;
+
+    let regex = AggregateBuilder::new(r"[0-9]")
+        .profile(RustProfile::regex_1_12_4())
+        .build_spans()
+        .expect("upstream replacer type-surface selector");
+    let expected = b"age: Z6";
+    let limits = LiteralReplacementLimits::default();
+
+    let string = "Z".to_owned();
+    let actual = regex
+        .replace_literal(b"age: 26", string, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[0]);
+    assert_eq!(actual.as_bytes(), expected);
+
+    let string = "Z".to_owned();
+    let actual = regex
+        .replace_literal(b"age: 26", &string, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[1]);
+    assert_eq!(actual.as_bytes(), expected);
+
+    let borrowed = Cow::<'_, str>::Borrowed("Z");
+    let actual = regex
+        .replace_literal(b"age: 26", borrowed, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[2]);
+    assert_eq!(actual.as_bytes(), expected);
+
+    let borrowed = Cow::<'_, str>::Borrowed("Z");
+    let actual = regex
+        .replace_literal(b"age: 26", &borrowed, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[3]);
+    assert_eq!(actual.as_bytes(), expected);
+
+    let owned = Cow::<'_, str>::Owned("Z".to_owned());
+    let actual = regex
+        .replace_literal(b"age: 26", owned, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[4]);
+    assert_eq!(actual.as_bytes(), expected);
+
+    let owned = Cow::<'_, str>::Owned("Z".to_owned());
+    let actual = regex
+        .replace_literal(b"age: 26", &owned, limits)
+        .expect(PORTED_TYPE_SURFACE_IDS[5]);
+    assert_eq!(actual.as_bytes(), expected);
 }
 
 #[test]
