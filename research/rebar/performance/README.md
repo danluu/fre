@@ -181,14 +181,17 @@ the exact preparation/prime state, and emits canonical
 `fre.rebar.performance-raw.v1` with ordered input hashes, comparator, plan,
 result digest, and fresh-process token. Fixed-duration tests prove its output
 passes the complete semantic-contract validator. Explicit `--performance-raw`
-runner mode connects these seams for all 238 supported aggregate rows and
-5,328 candidate pair-slot arms: cold compile constructs once; allocator-warm
+runner mode connects these seams for all 238 supported aggregate rows plus all
+eight supported capture rows, covering 5,520 of 5,772 candidate pair-slot
+arms: cold compile constructs once; allocator-warm
 compile constructs and drops a distinct sacrificial artifact before measuring
 a fresh one; first operation uses a built artifact with no prime; steady
 operation performs exactly one verified untimed prime on the same artifact.
+Capture first/steady boundaries use the same retained selector/history
+lifecycle and exact prime rule while emitting the generic all-model schema.
 The emitted record binds every required identity and recomputes the ordered
 input hashes from KLV bytes.
 
 The performance gate still needs authenticated Rust/RE2 raw arms, generic raw
-mode for the 19 supported grep/capture rows, an authorized resource collector
-and pair executor, and `regex-redux` after semantic support exists.
+mode for the 11 supported grep rows, an authorized resource collector and pair
+executor, and `regex-redux` after semantic support exists.

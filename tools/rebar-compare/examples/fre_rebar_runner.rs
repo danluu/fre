@@ -69,7 +69,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans performance-raw=aggregate facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans performance-raw=aggregate+capture facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -164,7 +164,7 @@ fn main() -> Result<(), DynError> {
     require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
     if expectations.performance_raw {
         require_performance_raw_metadata(&benchmark.model, &expectations)?;
-        let observation = model_aggregate_performance_raw(&benchmark, &expectations)?;
+        let observation = model_performance_raw(&benchmark, &expectations)?;
         let bytes = performance_raw_observation_bytes(&observation)?;
         io::stdout().lock().write_all(&bytes)?;
         return Ok(());
@@ -280,7 +280,10 @@ fn require_performance_raw_metadata(
     model: &str,
     expectations: &Expectations,
 ) -> Result<(), DynError> {
-    if !matches!(model, "compile" | "count" | "count-spans") {
+    if !matches!(
+        model,
+        "compile" | "count" | "count-spans" | "count-captures" | "grep-captures"
+    ) {
         return Err(
             format!("all-model raw mode does not yet implement FRE model {model:?}").into(),
         );
@@ -748,7 +751,7 @@ fn model_count_spans_many(
     )
 }
 
-fn model_aggregate_performance_raw(
+fn model_performance_raw(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<PerformanceRawObservation, DynError> {
@@ -769,7 +772,16 @@ fn model_aggregate_performance_raw(
                 Ok((start.elapsed(), actual))
             },
         ),
-        model => Err(format!("all-model raw aggregate route rejects model {model:?}").into()),
+        "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |lifecycle, haystack| {
+                let start = Instant::now();
+                let actual = lifecycle.execute(haystack)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
+        model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
     }
 }
 
@@ -834,6 +846,43 @@ where
             if primed != identity.expected {
                 return Err(CompareError::new(format!(
                     "aggregate lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn model_capture_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &rebar_compare::CurrentFreCaptureLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let lifecycle = current_fre_rebar_capture_lifecycle(
+            &benchmark.model,
+            benchmark.pattern(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )?;
+        require_performance_plan(&expected_plan, lifecycle.plan())?;
+        if steady {
+            let primed = lifecycle.execute(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "capture lifecycle prime returned {primed}, expected {}",
                     identity.expected
                 )));
             }
@@ -1417,6 +1466,76 @@ mod tests {
         let mut missing = complete;
         missing.comparator = None;
         assert!(require_performance_raw_metadata("count", &missing).is_err());
+    }
+
+    #[test]
+    fn capture_raw_mode_emits_first_and_steady_all_model_arms() {
+        let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
+        let first_expectations = performance_expectations(
+            "first-public-operation",
+            "capture-linear-selector-persistent-history",
+            5,
+        );
+        require_performance_raw_metadata("count-captures", &first_expectations)
+            .expect("capture raw metadata");
+        let first = model_capture_performance_raw_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(43), lifecycle.execute(haystack)?)),
+        )
+        .expect("capture first-operation raw arm");
+        assert_eq!(first.model, "count-captures");
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 43);
+        assert_eq!(first.actual, 5);
+        assert_eq!(
+            first.input.pattern_sha256,
+            vec![sha256(r"(a)(b)?".as_bytes())]
+        );
+
+        let grep_benchmark = capture_benchmark(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            b"foo foo\r\nZ\r\nfoo\r\nfoo",
+        );
+        let steady_expectations = performance_expectations(
+            "steady-public-operation",
+            "capture-linear-selector-persistent-history",
+            12,
+        );
+        let steady = model_capture_performance_raw_with_measurement(
+            &grep_benchmark,
+            &steady_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(47), lifecycle.execute(haystack)?)),
+        )
+        .expect("capture steady-operation raw arm");
+        assert_eq!(steady.model, "grep-captures");
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.actual, 12);
+
+        let mut wrong_plan = first_expectations;
+        wrong_plan.plan = Some("aggregate-exact-literal".to_string());
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            model_capture_performance_raw_with_measurement(
+                &count_benchmark,
+                &wrong_plan,
+                |lifecycle, haystack| {
+                    ran.set(true);
+                    Ok((Duration::from_nanos(1), lifecycle.execute(haystack)?))
+                },
+            )
+            .is_err()
+        );
+        assert!(!ran.get(), "wrong capture plan reached measurement");
     }
 
     #[test]
