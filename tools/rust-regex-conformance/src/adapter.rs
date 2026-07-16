@@ -1765,14 +1765,19 @@ mod tests {
             AdapterDisposition::Pass { .. }
         ));
 
-        let mut unproved = input.clone();
-        unproved.patterns = vec![r"\B".to_owned()];
+        let mut guarded = input.clone();
+        guarded.patterns = vec![r"\B".to_owned()];
+        guarded.expected = vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 1 })],
+        }];
         assert!(matches!(
-            execute_case(AdapterSurface::RustTextCompile, &text_case, &unproved),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::RustTextFacade,
-                ref reason_code,
-            } if reason_code == "build.text-equivalence-proof-gap"
+            execute_case(AdapterSurface::RustTextCompile, &text_case, &guarded),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextFindIter, &text_case, &guarded),
+            AdapterDisposition::Pass { .. }
         ));
     }
 
@@ -1878,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn text_set_proof_gaps_remain_typed_unsupported() {
+    fn text_set_scalar_guarded_ascii_assertion_compiles() {
         let mut case = fixture_case(true, true, None);
         case.match_kind = MatchKind::All;
         case.search_kind = SearchKind::Overlapping;
@@ -1887,10 +1892,7 @@ mod tests {
         input.patterns = vec![r"(?-u:\B)".to_owned()];
         assert!(matches!(
             execute_case(AdapterSurface::RustTextSetCompile, &case, &input),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::RustTextSetFacade,
-                ref reason_code,
-            } if reason_code == "build.text-set-equivalence-proof-gap"
+            AdapterDisposition::Pass { .. }
         ));
     }
 

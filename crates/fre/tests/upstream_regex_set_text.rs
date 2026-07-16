@@ -196,18 +196,34 @@ fn construction_is_bounded_and_reports_the_exact_pattern_failure() {
             source: PortableTextBuildError::TextSyntax(_),
         }
     ));
+}
 
-    let unproved = sources(&["a", r"(?-u:\B)"]);
-    let error = PortableTextRegexSetBuilder::new(&unproved)
+#[test]
+fn scalar_guarded_ascii_assertions_match_pinned_text_sets() {
+    let patterns = sources(&[
+        "a",
+        r"(?-u:\B)",
+        r"(?-u:\b{start-half})",
+        r"(?-u:\b{end-half})",
+    ]);
+    let fre = PortableTextRegexSetBuilder::new(&patterns)
         .build()
-        .expect_err("UTF-8-unsafe assertion");
-    assert!(matches!(
-        error,
-        PortableTextRegexSetBuildError::Pattern {
-            index: 1,
-            source: PortableTextBuildError::NonFiniteLanguage,
-        }
-    ));
+        .expect("scalar-guarded text set");
+    let upstream = regex::RegexSet::new(&patterns).expect("pinned scalar-guarded text set");
+
+    for index in 1..patterns.len() {
+        assert!(matches!(
+            fre.pattern_build_report(index).unwrap().proof,
+            PortableTextProof::Utf8StartBoundaryGuardedHir { .. }
+        ));
+    }
+    for haystack in ["", "a", " ", "𝛃", " 𝛃 ", "𝛃b", "b𝛃", "𝛃𐆀"] {
+        assert_eq!(
+            ids(&fre, haystack),
+            upstream.matches(haystack).into_iter().collect::<Vec<_>>(),
+            "haystack={haystack:?}"
+        );
+    }
 }
 
 #[test]

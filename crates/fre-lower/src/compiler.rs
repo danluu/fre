@@ -83,13 +83,19 @@ pub(crate) fn compile(
     hir: &Hir,
     operation: OperationSemantics,
     limits: LowerLimits,
+    utf8_start_guarded: bool,
 ) -> Result<(RawPlan, LowerStats), LowerError> {
     if operation == OperationSemantics::CaptureSensitive {
         return Err(LowerError::Unsupported(
             UnsupportedFeature::CaptureSensitiveOperation,
         ));
     }
-    Compiler::new(limits, hir.properties().explicit_captures_len()).run(hir)
+    Compiler::new(
+        limits,
+        hir.properties().explicit_captures_len(),
+        utf8_start_guarded,
+    )
+    .run(hir)
 }
 
 struct Compiler<'h> {
@@ -102,6 +108,7 @@ struct Compiler<'h> {
     peak_stack_items: usize,
     erased_captures: usize,
     normalized_nullable_repetitions: usize,
+    utf8_start_guarded: bool,
 }
 
 impl<'h> Compiler<'h> {
@@ -110,7 +117,7 @@ impl<'h> Compiler<'h> {
     // yielded sequence and all emitted graph work are charged separately.
     const UTF8_SCALAR_RANGE_PARTITION_WORK: u64 = 64;
 
-    const fn new(limits: LowerLimits, erased_captures: usize) -> Self {
+    const fn new(limits: LowerLimits, erased_captures: usize, utf8_start_guarded: bool) -> Self {
         Self {
             limits,
             tasks: Vec::new(),
@@ -121,6 +128,7 @@ impl<'h> Compiler<'h> {
             peak_stack_items: 0,
             erased_captures,
             normalized_nullable_repetitions: 0,
+            utf8_start_guarded,
         }
     }
 
@@ -152,9 +160,15 @@ impl<'h> Compiler<'h> {
         let fragment = self.fragments.pop().ok_or(LowerError::InternalInvariant {
             detail: "missing final fragment",
         })?;
+        let start = if self.utf8_start_guarded {
+            let guard = self.utf8_start_guard_fragment()?;
+            self.patch_all(&guard.outs, fragment.start)?;
+            guard.start
+        } else {
+            fragment.start
+        };
         let accept = self.add_state(StateRole::Accept)?;
         self.patch_all(&fragment.outs, accept)?;
-        let start = fragment.start;
         preflight_final_tables(self.states.len(), self.edges, self.limits)?;
         self.charge_final_table_writes()?;
         let stats = LowerStats {
@@ -164,6 +178,7 @@ impl<'h> Compiler<'h> {
             edges: self.edges,
             erased_captures: self.erased_captures,
             normalized_nullable_repetitions: self.normalized_nullable_repetitions,
+            utf8_start_guarded: self.utf8_start_guarded,
         };
         let raw = self.into_raw(start)?;
         Ok((raw, stats))
@@ -403,6 +418,27 @@ impl<'h> Compiler<'h> {
             self.append_patches(&mut outs, branch.outs, "alternation patch list")?;
         }
         Ok(Fragment { start: split, outs })
+    }
+
+    /// Match exactly the byte offsets that are scalar boundaries in a valid
+    /// UTF-8 haystack. At such an offset, Unicode `\b` and `\B` are exhaustive
+    /// and mutually exclusive. At an interior continuation-byte offset both
+    /// assertions are false. The text facade separately proves its haystack is
+    /// valid UTF-8 before selecting this synthesized start guard.
+    fn utf8_start_guard_fragment(&mut self) -> Result<Fragment, LowerError> {
+        let boundary = self.assertion_fragment(EdgeKind::AssertWordUnicode)?;
+        let non_boundary = self.assertion_fragment(EdgeKind::AssertWordUnicodeNegate)?;
+        let mut alternatives = Vec::new();
+        self.charge_vector_growth(
+            alternatives.len(),
+            alternatives.capacity(),
+            2,
+            "UTF-8 start-guard alternatives",
+        )?;
+        reserve(&mut alternatives, 2, "UTF-8 start-guard alternatives")?;
+        alternatives.push(boundary);
+        alternatives.push(non_boundary);
+        self.alternation_fragment(alternatives)
     }
 
     fn finish_repetition(
