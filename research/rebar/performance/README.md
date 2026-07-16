@@ -71,6 +71,18 @@ semantic reasons. The schedule covers every supported model and boundary;
 unsupported. Schedule publication is canonical, deterministic, and
 non-overwriting.
 
+Each scheduled arm has one canonical `fre.rebar.performance-raw.v1` record.
+It binds the exact contract/canonical/semantic identity, job, model, lifecycle
+boundary, comparator and candidate/reference role, complete input and reducer,
+candidate plan where applicable, exact cold/allocator-initialized/built/primed
+process-artifact preparation, lifecycle prime count, one measured operation,
+and a unique fresh-process token. The all-model converter requires
+the exact 5,772 schedule slots in order, rejects missing/reordered arms or any
+token reuse, and deterministically replaces all 962 available timing
+placeholders while preserving all 66 unavailable points and every independent
+resource field. Fixed-duration fixtures exercise this complete conversion
+without reading a clock.
+
 Validate a coverage-complete draft or final pointwise observation file:
 
 ```text

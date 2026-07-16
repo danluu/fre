@@ -28,6 +28,8 @@ pub const CAPTURE_LIFECYCLE_RAW_SCHEMA: &str = "fre.rebar.capture-lifecycle-raw.
 pub const CAPTURE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.capture-pair-schedule.v1";
 /// Stable schema for the complete all-model fresh-process pair schedule.
 pub const PERFORMANCE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.performance-pair-schedule.v1";
+/// Stable schema for one all-model candidate or reference timing arm.
+pub const PERFORMANCE_RAW_SCHEMA: &str = "fre.rebar.performance-raw.v1";
 /// Stable schema for one raw Rust/RE2 capture reference arm.
 pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
 /// Stable schema for one raw capture resource-observation arm.
@@ -583,6 +585,82 @@ pub struct PerformancePairSchedule {
     pub unavailable: Vec<PerformanceUnavailableComparator>,
 }
 
+/// Exact untimed process/artifact state before one lifecycle measurement.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerformanceLifecyclePreparation {
+    /// No process or allocator warm-up beyond input loading.
+    ColdProcess,
+    /// Process and allocator initialized without reusing a regex artifact.
+    AllocatorInitialized,
+    /// One already-built artifact before its first public operation.
+    BuiltArtifact,
+    /// One already-built artifact after one verified untimed operation.
+    PrimedArtifact,
+    /// Fresh complete composite workload state.
+    CompositeFresh,
+}
+
+/// One self-identifying all-model timing arm.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRawObservation {
+    /// Raw observation schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact benchmark name.
+    pub benchmark: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Exact lifecycle boundary ID.
+    pub boundary: String,
+    /// Comparator point to which this arm belongs.
+    pub comparator: String,
+    /// Candidate or reference engine.
+    pub arm: CapturePairArm,
+    /// Exact current-FRE plan for a candidate arm; absent for a reference.
+    pub candidate_plan: Option<String>,
+    /// Complete semantic input identity.
+    pub input: InputReceipt,
+    /// Expected semantic reducer.
+    pub expected: u64,
+    /// Reducer returned by the observed operation.
+    pub actual: u64,
+    /// Exact untimed state required by the lifecycle phase.
+    pub preparation: PerformanceLifecyclePreparation,
+    /// Untimed lifecycle operations completed before measurement.
+    pub priming_operations: u8,
+    /// Lifecycle operations included in `elapsed_ns`.
+    pub measured_operations: u8,
+    /// Raw elapsed nanoseconds for one complete lifecycle operation.
+    pub elapsed_ns: u64,
+    /// SHA-256 of `actual.to_le_bytes()`.
+    pub result_sha256: String,
+    /// Unique token provisioned for this fresh process.
+    pub process_token_sha256: String,
+}
+
+/// Candidate and reference timing arms for one all-model schedule slot.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformancePairEvidence {
+    /// Exact schedule slot.
+    pub slot: PerformancePairSlot,
+    /// Current-FRE timing arm.
+    pub candidate: PerformanceRawObservation,
+    /// Rust-regex or RE2 timing arm.
+    pub reference: PerformanceRawObservation,
+}
+
 /// One raw pinned-reference arm corresponding to a schedule slot.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -756,6 +834,8 @@ pub struct SemanticUniverse {
 type CapturePointKey = (String, CaptureLifecycleBoundary, String);
 type CapturePairMeasurement = (u32, u64, bool);
 type CapturePairGroups = BTreeMap<CapturePointKey, Vec<CapturePairMeasurement>>;
+type PerformancePointKey = (String, String, String);
+type PerformancePairGroups = BTreeMap<PerformancePointKey, Vec<CapturePairMeasurement>>;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ResourceMetricKind {
     AllocationCount,
@@ -1066,6 +1146,33 @@ pub fn write_new_performance_pair_schedule(
         .map_err(|error| ContractError::new(format!("sync schedule {}: {error}", path.display())))
 }
 
+/// Serialize one all-model raw timing arm as canonical compact JSON plus LF.
+pub fn performance_raw_observation_bytes(
+    observation: &PerformanceRawObservation,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(observation)
+        .map_err(|error| ContractError::new(format!("serialize performance raw arm: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read one canonically serialized all-model raw timing arm.
+pub fn read_performance_raw_observation(
+    path: &Path,
+) -> Result<PerformanceRawObservation, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let observation: PerformanceRawObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_raw_observation_bytes(&observation)? != bytes {
+        return Err(ContractError::new(format!(
+            "performance raw observation {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(observation)
+}
+
 /// Execute the explicit first/steady schedule and construct one raw capture
 /// observation. The caller supplies the measurement closure, which permits
 /// deterministic no-clock validation fixtures.
@@ -1365,6 +1472,268 @@ const fn pair_order(pair_index: u32) -> [CapturePairArm; 2] {
         [CapturePairArm::Candidate, CapturePairArm::Reference]
     } else {
         [CapturePairArm::Reference, CapturePairArm::Candidate]
+    }
+}
+
+/// Convert a complete all-model fresh-process timing evidence set into the
+/// fixed 344-row draft. Resource states are preserved exactly.
+pub fn apply_performance_pair_evidence(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    draft: &PerformanceObservations,
+    schedule: &PerformancePairSchedule,
+    evidence: &[PerformancePairEvidence],
+) -> Result<PerformanceObservations, ContractError> {
+    validate_performance_pair_schedule(contract, universe, schedule)?;
+    validate_observations(contract, universe, draft)?;
+    if draft.phase != ObservationPhase::Draft {
+        return Err(ContractError::new(
+            "all-model pair conversion requires a draft observation artifact",
+        ));
+    }
+    let groups = collect_performance_pair_groups(contract, universe, schedule, evidence)?;
+    let mut observations = draft.clone();
+    for ((job_id, boundary, comparator), mut pairs) in groups {
+        pairs.sort_unstable_by_key(|pair| pair.0);
+        let expected_pairs = contract.reporting.pairs_per_comparator;
+        let expected_len = usize::try_from(expected_pairs)
+            .map_err(|_| ContractError::new("performance pair count does not fit usize"))?;
+        if pairs.len() != expected_len
+            || pairs
+                .iter()
+                .enumerate()
+                .any(|(index, pair)| u32::try_from(index) != Ok(pair.0))
+        {
+            return Err(ContractError::new(format!(
+                "performance point {job_id:?}/{boundary:?}/{comparator:?} has incomplete pair indices"
+            )));
+        }
+        let ratios: Vec<u64> = pairs.iter().map(|pair| pair.1).collect();
+        let ratio_ppm = capture_median(&ratios)?;
+        let wins = u32::try_from(pairs.iter().filter(|pair| pair.2).count())
+            .map_err(|_| ContractError::new("performance win count does not fit u32"))?;
+        let pointwise_pass = ratio_ppm < contract.reporting.ratio_ppm_exclusive_upper_bound
+            && wins >= contract.reporting.minimum_candidate_wins;
+        let comparison =
+            performance_comparison_mut(&mut observations, &job_id, &boundary, &comparator)?;
+        if comparison.status != ComparisonStatus::Pending {
+            return Err(ContractError::new(format!(
+                "performance point {job_id:?}/{boundary:?}/{comparator:?} is not pending"
+            )));
+        }
+        comparison.status = ComparisonStatus::Measured;
+        comparison.ratio_ppm = Some(ratio_ppm);
+        comparison.pair_count = Some(expected_pairs);
+        comparison.candidate_wins = Some(wins);
+        comparison.pointwise_pass = Some(pointwise_pass);
+        comparison.reason = None;
+    }
+    for unavailable in &schedule.unavailable {
+        let comparison = performance_comparison_mut(
+            &mut observations,
+            &unavailable.job_id,
+            &unavailable.boundary,
+            &unavailable.comparator,
+        )?;
+        if comparison.status != ComparisonStatus::NotComparable
+            || comparison.reason.as_deref() != Some(unavailable.reason.as_str())
+        {
+            return Err(ContractError::new(format!(
+                "unavailable performance comparator {:?} was not retained exactly",
+                unavailable.comparator
+            )));
+        }
+        validate_not_comparable_resource_observation(&comparison.resources, &unavailable.reason)?;
+    }
+    validate_observations(contract, universe, &observations)?;
+    Ok(observations)
+}
+
+fn collect_performance_pair_groups(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    schedule: &PerformancePairSchedule,
+    evidence: &[PerformancePairEvidence],
+) -> Result<PerformancePairGroups, ContractError> {
+    if evidence.len() != schedule.slots.len() {
+        return Err(ContractError::new(format!(
+            "performance evidence has {} pairs, schedule requires {}",
+            evidence.len(),
+            schedule.slots.len()
+        )));
+    }
+    let mut process_tokens = BTreeSet::new();
+    let mut groups = PerformancePairGroups::new();
+    for (slot, pair) in schedule.slots.iter().zip(evidence) {
+        if &pair.slot != slot {
+            return Err(ContractError::new(format!(
+                "performance evidence slot differs at sequence {}",
+                slot.sequence
+            )));
+        }
+        validate_performance_raw_observation(
+            contract,
+            universe,
+            &pair.candidate,
+            CapturePairArm::Candidate,
+        )?;
+        validate_performance_raw_observation(
+            contract,
+            universe,
+            &pair.reference,
+            CapturePairArm::Reference,
+        )?;
+        if pair.candidate.job_id != slot.job_id
+            || pair.candidate.model != slot.model
+            || pair.candidate.boundary != slot.boundary
+            || pair.candidate.comparator != slot.comparator
+            || pair.reference.job_id != slot.job_id
+            || pair.reference.model != slot.model
+            || pair.reference.boundary != slot.boundary
+            || pair.reference.comparator != slot.comparator
+            || pair.candidate.input != pair.reference.input
+            || pair.candidate.expected != pair.reference.expected
+        {
+            return Err(ContractError::new(format!(
+                "performance evidence identity differs from sequence {}",
+                slot.sequence
+            )));
+        }
+        for token in [
+            pair.candidate.process_token_sha256.as_str(),
+            pair.reference.process_token_sha256.as_str(),
+        ] {
+            if !process_tokens.insert(token) {
+                return Err(ContractError::new(format!(
+                    "performance process token is reused at sequence {}",
+                    slot.sequence
+                )));
+            }
+        }
+        let ratio = capture_ratio_ppm(pair.candidate.elapsed_ns, pair.reference.elapsed_ns)?;
+        groups
+            .entry((
+                slot.job_id.clone(),
+                slot.boundary.clone(),
+                slot.comparator.clone(),
+            ))
+            .or_default()
+            .push((
+                slot.pair_index,
+                ratio,
+                pair.candidate.elapsed_ns < pair.reference.elapsed_ns,
+            ));
+    }
+    Ok(groups)
+}
+
+/// Validate one all-model raw arm against the exact contract, semantic row,
+/// lifecycle boundary, comparator, and candidate/reference role.
+pub fn validate_performance_raw_observation(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    observation: &PerformanceRawObservation,
+    expected_arm: CapturePairArm,
+) -> Result<(), ContractError> {
+    if observation.schema != PERFORMANCE_RAW_SCHEMA
+        || observation.contract_id != contract.contract_id
+        || observation.canonical_commit != contract.canonical.commit
+        || observation.canonical_tree != contract.canonical.tree
+        || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+        || observation.arm != expected_arm
+    {
+        return Err(ContractError::new(
+            "performance raw schema, contract, semantic, or arm identity mismatch",
+        ));
+    }
+    require_token(&observation.job_id, "performance raw job ID")?;
+    require_text(&observation.benchmark, "performance raw benchmark")?;
+    require_token(&observation.model, "performance raw model")?;
+    require_token(&observation.boundary, "performance raw boundary")?;
+    require_token(&observation.comparator, "performance raw comparator")?;
+    require_digest(
+        &observation.process_token_sha256,
+        "performance raw process token",
+    )?;
+    require_digest(&observation.result_sha256, "performance raw result digest")?;
+    if observation.actual != observation.expected
+        || observation.measured_operations != 1
+        || observation.elapsed_ns == 0
+        || observation.result_sha256 != digest(&observation.actual.to_le_bytes())
+    {
+        return Err(ContractError::new(
+            "performance raw reducer, operation count, duration, or digest is inconsistent",
+        ));
+    }
+    let semantic = universe.rows.get(&observation.job_id).ok_or_else(|| {
+        ContractError::new("performance raw job is absent from semantic denominator")
+    })?;
+    let comparator_status = semantic
+        .comparator_statuses
+        .get(&observation.comparator)
+        .copied()
+        .flatten();
+    if semantic.status != RowSemanticStatus::Supported
+        || semantic.model != observation.model
+        || semantic.benchmark != observation.benchmark
+        || semantic.input != observation.input
+        || semantic.expected != observation.expected
+        || comparator_status != Some(Status::Pass)
+    {
+        return Err(ContractError::new(
+            "performance raw arm differs from its passing semantic point",
+        ));
+    }
+    match expected_arm {
+        CapturePairArm::Candidate => {
+            let plan = observation
+                .candidate_plan
+                .as_deref()
+                .ok_or_else(|| ContractError::new("candidate performance raw arm has no plan"))?;
+            require_token(plan, "candidate performance raw plan")?;
+            if semantic.candidate_plan.as_deref() != Some(plan) {
+                return Err(ContractError::new(
+                    "candidate performance raw arm has the wrong plan",
+                ));
+            }
+        }
+        CapturePairArm::Reference => {
+            if observation.candidate_plan.is_some() {
+                return Err(ContractError::new(
+                    "reference performance raw arm must not claim a candidate plan",
+                ));
+            }
+        }
+    }
+    let boundary = contract
+        .lifecycle_boundaries
+        .iter()
+        .find(|boundary| boundary.id == observation.boundary)
+        .ok_or_else(|| ContractError::new("performance raw boundary is absent"))?;
+    let (preparation, priming_operations) = lifecycle_preparation(boundary.phase);
+    if !boundary
+        .models
+        .iter()
+        .any(|model| model == &observation.model)
+        || observation.preparation != preparation
+        || observation.priming_operations != priming_operations
+    {
+        return Err(ContractError::new(
+            "performance raw boundary, model, or priming count is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+const fn lifecycle_preparation(phase: LifecyclePhase) -> (PerformanceLifecyclePreparation, u8) {
+    match phase {
+        LifecyclePhase::ColdConstruction => (PerformanceLifecyclePreparation::ColdProcess, 0),
+        LifecyclePhase::AllocatorWarmConstruction => {
+            (PerformanceLifecyclePreparation::AllocatorInitialized, 0)
+        }
+        LifecyclePhase::FirstOperation => (PerformanceLifecyclePreparation::BuiltArtifact, 0),
+        LifecyclePhase::SteadyOperation => (PerformanceLifecyclePreparation::PrimedArtifact, 1),
+        LifecyclePhase::CompositeOperation => (PerformanceLifecyclePreparation::CompositeFresh, 0),
     }
 }
 
@@ -2089,6 +2458,15 @@ fn capture_comparison_mut<'a>(
     boundary: CaptureLifecycleBoundary,
     comparator: &str,
 ) -> Result<&'a mut ComparisonObservation, ContractError> {
+    performance_comparison_mut(observations, job_id, boundary.as_str(), comparator)
+}
+
+fn performance_comparison_mut<'a>(
+    observations: &'a mut PerformanceObservations,
+    job_id: &str,
+    boundary: &str,
+    comparator: &str,
+) -> Result<&'a mut ComparisonObservation, ContractError> {
     observations
         .rows
         .iter_mut()
@@ -2096,7 +2474,7 @@ fn capture_comparison_mut<'a>(
         .and_then(|row| {
             row.boundaries
                 .iter_mut()
-                .find(|item| item.boundary == boundary.as_str())
+                .find(|item| item.boundary == boundary)
         })
         .and_then(|item| {
             item.comparisons
@@ -2105,7 +2483,7 @@ fn capture_comparison_mut<'a>(
         })
         .ok_or_else(|| {
             ContractError::new(format!(
-                "capture comparison {job_id:?}/{boundary:?}/{comparator:?} is absent"
+                "performance comparison {job_id:?}/{boundary:?}/{comparator:?} is absent"
             ))
         })
 }
@@ -3240,10 +3618,14 @@ mod tests {
     }
 
     fn bind_fixture_candidate_plan(mut receipt: Receipt) -> Receipt {
-        if receipt.status == Status::Pass
-            && matches!(receipt.model.as_str(), "count-captures" | "grep-captures")
-        {
-            receipt.candidate_plan = Some(crate::CURRENT_FRE_CAPTURE_PLAN.to_string());
+        if receipt.status == Status::Pass {
+            receipt.candidate_plan = Some(
+                if matches!(receipt.model.as_str(), "count-captures" | "grep-captures") {
+                    crate::CURRENT_FRE_CAPTURE_PLAN.to_string()
+                } else {
+                    format!("fixture-{}-plan", receipt.model)
+                },
+            );
         }
         receipt
     }
@@ -3408,6 +3790,58 @@ mod tests {
                         result_sha256: digest(&semantic.expected.to_le_bytes()),
                         process_token_sha256: reference_token,
                     },
+                }
+            })
+            .collect()
+    }
+
+    fn fixture_performance_evidence(
+        contract: &PerformanceContract,
+        universe: &SemanticUniverse,
+        schedule: &PerformancePairSchedule,
+    ) -> Vec<PerformancePairEvidence> {
+        schedule
+            .slots
+            .iter()
+            .map(|slot| {
+                let semantic = &universe.rows[&slot.job_id];
+                let boundary = contract
+                    .lifecycle_boundaries
+                    .iter()
+                    .find(|boundary| boundary.id == slot.boundary)
+                    .expect("fixture boundary");
+                let (preparation, priming_operations) = lifecycle_preparation(boundary.phase);
+                let raw = |arm: CapturePairArm, elapsed_ns: u64| PerformanceRawObservation {
+                    schema: PERFORMANCE_RAW_SCHEMA.to_string(),
+                    contract_id: contract.contract_id.clone(),
+                    canonical_commit: contract.canonical.commit.clone(),
+                    canonical_tree: contract.canonical.tree.clone(),
+                    semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+                    job_id: slot.job_id.clone(),
+                    benchmark: semantic.benchmark.clone(),
+                    model: semantic.model.clone(),
+                    boundary: slot.boundary.clone(),
+                    comparator: slot.comparator.clone(),
+                    arm,
+                    candidate_plan: (arm == CapturePairArm::Candidate)
+                        .then(|| semantic.candidate_plan.clone())
+                        .flatten(),
+                    input: semantic.input.clone(),
+                    expected: semantic.expected,
+                    actual: semantic.expected,
+                    preparation,
+                    priming_operations,
+                    measured_operations: 1,
+                    elapsed_ns,
+                    result_sha256: digest(&semantic.expected.to_le_bytes()),
+                    process_token_sha256: digest(
+                        format!("performance:{arm:?}:{}", slot.sequence).as_bytes(),
+                    ),
+                };
+                PerformancePairEvidence {
+                    slot: slot.clone(),
+                    candidate: raw(CapturePairArm::Candidate, 80),
+                    reference: raw(CapturePairArm::Reference, 100),
                 }
             })
             .collect()
@@ -3864,6 +4298,132 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one no-clock all-model fixture covers complete conversion and primary identity/lifecycle rejection cases"
+    )]
+    fn all_model_raw_evidence_converts_every_available_point() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let schedule =
+            generate_performance_pair_schedule(&contract, &universe).expect("all-model schedule");
+        let evidence = fixture_performance_evidence(&contract, &universe, &schedule);
+        assert_eq!(evidence.len(), 6_168);
+        let bytes = performance_raw_observation_bytes(&evidence[0].candidate)
+            .expect("raw performance serialization");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<PerformanceRawObservation>(&bytes)
+                .expect("raw performance round trip"),
+            evidence[0].candidate
+        );
+        let converted =
+            apply_performance_pair_evidence(&contract, &universe, &draft, &schedule, &evidence)
+                .expect("complete fixed-duration evidence converts");
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Measured),
+            1_028
+        );
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Pending),
+            0
+        );
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::Pending),
+            8_224
+        );
+        assert!(
+            converted
+                .rows
+                .iter()
+                .flat_map(|row| &row.boundaries)
+                .flat_map(|boundary| &boundary.comparisons)
+                .all(|comparison| {
+                    comparison.ratio_ppm == Some(800_000)
+                        && comparison.pair_count == Some(6)
+                        && comparison.candidate_wins == Some(6)
+                        && comparison.pointwise_pass == Some(true)
+                })
+        );
+        assert!(evidence.iter().all(|pair| {
+            let phase = contract
+                .lifecycle_boundaries
+                .iter()
+                .find(|boundary| boundary.id == pair.slot.boundary)
+                .expect("evidence boundary")
+                .phase;
+            let (preparation, priming_operations) = lifecycle_preparation(phase);
+            pair.candidate.preparation == preparation
+                && pair.reference.preparation == preparation
+                && pair.candidate.priming_operations == priming_operations
+                && pair.reference.priming_operations == priming_operations
+        }));
+
+        let mut missing = evidence.clone();
+        missing.pop();
+        assert!(
+            apply_performance_pair_evidence(&contract, &universe, &draft, &schedule, &missing,)
+                .is_err()
+        );
+        let mut reused_process = evidence.clone();
+        reused_process[1].reference.process_token_sha256 =
+            reused_process[0].candidate.process_token_sha256.clone();
+        assert!(
+            apply_performance_pair_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &reused_process,
+            )
+            .is_err()
+        );
+        let mut wrong_plan = evidence.clone();
+        wrong_plan[0].candidate.candidate_plan = Some("different-plan".to_string());
+        assert!(
+            apply_performance_pair_evidence(&contract, &universe, &draft, &schedule, &wrong_plan,)
+                .is_err()
+        );
+        let mut wrong_lifecycle = evidence.clone();
+        wrong_lifecycle[0].candidate.priming_operations ^= 1;
+        assert!(
+            apply_performance_pair_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &wrong_lifecycle,
+            )
+            .is_err()
+        );
+        let mut wrong_preparation = evidence.clone();
+        wrong_preparation[0].candidate.preparation = PerformanceLifecyclePreparation::BuiltArtifact;
+        assert!(
+            apply_performance_pair_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &wrong_preparation,
+            )
+            .is_err()
+        );
+        let mut wrong_boundary = evidence;
+        wrong_boundary[0].candidate.boundary = "steady-public-operation".to_string();
+        assert!(
+            apply_performance_pair_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &wrong_boundary,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn all_model_schedule_retains_exact_unavailable_points() {
         let mut contract = contract();
         let (_, mut universe) = synthetic_semantic_report(&mut contract);
@@ -3890,6 +4450,19 @@ mod tests {
                 .slots
                 .iter()
                 .any(|slot| slot.job_id == unavailable_job && slot.comparator == comparator)
+        );
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let evidence = fixture_performance_evidence(&contract, &universe, &schedule);
+        let converted =
+            apply_performance_pair_evidence(&contract, &universe, &draft, &schedule, &evidence)
+                .expect("available all-model points convert");
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Measured),
+            1_026
+        );
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::NotComparable),
+            2
         );
     }
 
