@@ -1134,6 +1134,18 @@ impl PortableBuilder {
         self
     }
 
+    /// Set CRLF mode for the complete pattern before parsing.
+    ///
+    /// This makes both carriage return and line feed line terminators for
+    /// dot and multiline assertions. Inline `R` flag groups may still
+    /// override this setting locally, just as they do in the pinned Rust
+    /// bytes builder.
+    #[must_use]
+    pub fn crlf(mut self, enabled: bool) -> Self {
+        self.profile.options.crlf = enabled;
+        self
+    }
+
     /// Swap greedy and lazy repetition semantics before parsing.
     ///
     /// Inline `U` flag groups may still override this setting locally, just as

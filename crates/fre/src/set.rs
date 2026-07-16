@@ -183,6 +183,16 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set CRLF mode for every pattern before parsing.
+    ///
+    /// Inline `R` flag groups may still override this setting locally, just
+    /// as they do in the pinned Rust bytes set builder.
+    #[must_use]
+    pub fn crlf(mut self, enabled: bool) -> Self {
+        self.profile.options.crlf = enabled;
+        self
+    }
+
     /// Swap greedy and lazy repetition semantics before parsing every pattern.
     ///
     /// Inline `U` flag groups may still override this setting locally, just as
