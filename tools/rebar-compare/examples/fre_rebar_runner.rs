@@ -17,8 +17,9 @@ use fre::{
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_run_limits, current_fre_rebar_portable_builder,
-    current_fre_rebar_search_limits, current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
+    current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
+    current_fre_rebar_validate_aggregate_identity,
 };
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -115,6 +116,7 @@ fn main() -> Result<(), DynError> {
     let samples = match benchmark.model.as_str() {
         "compile" => model_compile(&benchmark, &expectations)?,
         "count" => model_count(&benchmark, &expectations)?,
+        "count-captures" | "grep-captures" => model_captures(&benchmark, &expectations)?,
         "count-spans" => model_count_spans(&benchmark, &expectations)?,
         "grep" => model_grep(&benchmark, &expectations)?,
         model => return Err(format!("unsupported FRE Rebar model {model:?}").into()),
@@ -486,6 +488,33 @@ fn model_count_spans(
     )
 }
 
+fn capture_lifecycle(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<rebar_compare::CurrentFreCaptureLifecycle, DynError> {
+    let lifecycle = current_fre_rebar_capture_lifecycle(
+        &benchmark.model,
+        benchmark.pattern(),
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
+    Ok(lifecycle)
+}
+
+fn model_captures(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let lifecycle = capture_lifecycle(benchmark, expectations)?;
+    run(
+        benchmark,
+        || Ok(lifecycle.execute(&benchmark.haystack)?),
+        Ok,
+    )
+}
+
 fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<Sample>, DynError> {
     let regex = current_fre_rebar_portable_builder(
         benchmark.pattern(),
@@ -563,6 +592,21 @@ mod tests {
         output
     }
 
+    fn capture_benchmark(model: &str, pattern: &str, haystack: &[u8]) -> Benchmark {
+        Benchmark {
+            name: format!("test/model/{model}"),
+            model: model.to_string(),
+            patterns: vec![pattern.to_string()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: haystack.to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn parses_arbitrary_haystack_and_delimiters_in_values() {
         let benchmark = Benchmark::parse(&valid_klv()).unwrap();
@@ -596,6 +640,38 @@ mod tests {
         assert!(require_runtime_expectation("grep", None).is_err());
         assert!(require_runtime_expectation("count", Some("k0")).is_err());
         assert!(require_runtime_expectation("count", None).is_ok());
+        assert!(require_runtime_expectation("count-captures", None).is_ok());
+        assert!(require_runtime_expectation("grep-captures", None).is_ok());
+        assert!(require_runtime_expectation("grep-captures", Some("k0")).is_err());
+    }
+
+    #[test]
+    fn capture_models_bind_plan_and_preserve_first_and_steady_semantics() {
+        let expectations = Expectations {
+            plan: Some("capture-linear-selector-persistent-history".to_string()),
+            ..Expectations::default()
+        };
+        let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
+        let count = capture_lifecycle(&count_benchmark, &expectations).expect("count lifecycle");
+        assert_eq!(count.model(), "count-captures");
+        assert_eq!(count.execute(&count_benchmark.haystack).unwrap(), 5);
+        assert_eq!(count.execute(&count_benchmark.haystack).unwrap(), 5);
+
+        let grep_benchmark = capture_benchmark(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            b"foo foo\r\nZ\r\nfoo\r\nfoo",
+        );
+        let grep = capture_lifecycle(&grep_benchmark, &expectations).expect("grep lifecycle");
+        assert_eq!(grep.model(), "grep-captures");
+        assert_eq!(grep.execute(&grep_benchmark.haystack).unwrap(), 12);
+        assert_eq!(grep.execute(&grep_benchmark.haystack).unwrap(), 12);
+
+        let wrong_plan = Expectations {
+            plan: Some("aggregate-exact-literal".to_string()),
+            ..Expectations::default()
+        };
+        assert!(capture_lifecycle(&count_benchmark, &wrong_plan).is_err());
     }
 
     #[test]

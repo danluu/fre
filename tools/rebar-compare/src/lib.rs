@@ -28,8 +28,8 @@ use fre::{
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
     AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
-    CaptureExecutionSource, CaptureRegex, CaptureRunLimits, CaptureSearchError,
-    CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
+    CaptureExecutionSource, CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
     LiteralAggregateReduceLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
@@ -65,6 +65,8 @@ pub const RUST_REGEX_VERSION: &str = "1.12.4";
 pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 /// Exact RE2 version recorded by the pinned Rebar adapter.
 pub const RE2_VERSION: &str = "2025-11-05";
+/// Stable plan label emitted by the authenticated current-FRE capture adapter.
+pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
@@ -908,6 +910,127 @@ pub fn current_fre_rebar_portable_builder(
     Ok(PortableBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(unicode))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentFreCaptureModel {
+    CountCaptures,
+    GrepCaptures,
+}
+
+#[derive(Clone, Debug)]
+enum CurrentFreCapturePreparation {
+    Count(Box<CaptureRunLimits>),
+    Grep,
+}
+
+impl CurrentFreCaptureModel {
+    fn parse(model: &str) -> Result<Self, CompareError> {
+        match model {
+            "count-captures" => Ok(Self::CountCaptures),
+            "grep-captures" => Ok(Self::GrepCaptures),
+            other => Err(CompareError::new(format!(
+                "unexpected capture lifecycle model {other}"
+            ))),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CountCaptures => "count-captures",
+            Self::GrepCaptures => "grep-captures",
+        }
+    }
+}
+
+/// One already-built capture artifact at the public operation lifecycle
+/// boundary used by the authenticated current-FRE Rebar adapter.
+///
+/// The first call to [`Self::execute`] is the contracted first-operation
+/// boundary. Later calls on the same value are steady-operation boundaries.
+/// Construction and input loading are outside both boundaries.
+#[derive(Clone, Debug)]
+pub struct CurrentFreCaptureLifecycle {
+    model: CurrentFreCaptureModel,
+    regex: CaptureRegex,
+    limits: RunLimits,
+    haystack_len: usize,
+    preparation: CurrentFreCapturePreparation,
+}
+
+impl CurrentFreCaptureLifecycle {
+    /// Exact Rebar model bound into this lifecycle producer.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Stable authenticated plan label expected by the timing runner.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        CURRENT_FRE_CAPTURE_PLAN
+    }
+
+    /// Execute one complete public model operation on the retained artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checked reducer limits or the capture engine refuse
+    /// the operation, or if the input length differs from the authenticated
+    /// preparation. No alternate implementation is selected.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "capture lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let result = match &self.preparation {
+            CurrentFreCapturePreparation::Count(run_limits) => {
+                execute_count_captures_with_limits(&self.regex, haystack, **run_limits)
+            }
+            CurrentFreCapturePreparation::Grep => {
+                execute_grep_captures(&self.regex, haystack, &self.limits)
+            }
+        };
+        result.map_err(|error| CompareError::new(error.message))
+    }
+}
+
+/// Construct the exact capture lifecycle producer used by the authenticated
+/// current-FRE Rebar adapter.
+///
+/// # Errors
+///
+/// `haystack_len` binds checked operation limits before the lifecycle boundary.
+/// Returns an error for a non-capture model, unsupported syntax/profile, or an
+/// unexpected capture plan identity. It never substitutes another engine.
+pub fn current_fre_rebar_capture_lifecycle(
+    model: &str,
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreCaptureLifecycle, CompareError> {
+    let model = CurrentFreCaptureModel::parse(model)?;
+    let limits = RunLimits::default();
+    let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    let preparation = match model {
+        CurrentFreCaptureModel::CountCaptures => CurrentFreCapturePreparation::Count(Box::new(
+            capture_count_run_limits(&regex, haystack_len, &limits)
+                .map_err(|error| CompareError::new(error.message))?,
+        )),
+        CurrentFreCaptureModel::GrepCaptures => CurrentFreCapturePreparation::Grep,
+    };
+    Ok(CurrentFreCaptureLifecycle {
+        model,
+        regex,
+        limits,
+        haystack_len,
+        preparation,
+    })
 }
 
 /// Derive the exact whole-operation limits used by the authenticated
@@ -1962,15 +2085,24 @@ fn capture_regex(
     limits: &RunLimits,
 ) -> Result<CaptureRegex, ExecutionError> {
     let pattern = one_fre_pattern(request)?;
+    capture_regex_one(pattern, request.unicode, request.case_insensitive, limits)
+}
+
+fn capture_regex_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<CaptureRegex, ExecutionError> {
     let engine_limits = fre::CaptureEngineBuildLimits {
         max_compile_work: limits.fre_aggregate_compile_work,
         max_program_bytes: limits.fre_aggregate_program_bytes,
         ..fre::CaptureEngineBuildLimits::default()
     };
-    CaptureBuilder::new(pattern)
+    let regex = CaptureBuilder::new(pattern)
         .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
         .limits(CaptureBuildLimits {
             max_hir_work: limits.fre_aggregate_compile_work,
             engine: engine_limits,
@@ -1982,7 +2114,16 @@ fn capture_regex(
             ..CaptureBuildLimits::default()
         })
         .build()
-        .map_err(|error| capture_build_error(&error))
+        .map_err(|error| capture_build_error(&error))?;
+    let identity = &regex.build_report().plan_identity;
+    if identity.operation != CaptureOperation::CountParticipatingNonempty
+        || identity.plan != CapturePlanKind::LinearSelectorPersistentHistory
+    {
+        return Err(ExecutionError::fault(
+            "FRE capture builder returned an unexpected plan identity",
+        ));
+    }
+    Ok(regex)
 }
 
 #[allow(
@@ -2094,9 +2235,30 @@ fn fre_count_captures(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let regex = capture_regex(request, limits)?;
+    let actual = execute_count_captures(&regex, request.haystack, limits)?;
+    Ok(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_PLAN,
+    })
+}
+
+fn execute_count_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let run_limits = capture_count_run_limits(regex, haystack.len(), limits)?;
+    execute_count_captures_with_limits(regex, haystack, run_limits)
+}
+
+fn capture_count_run_limits(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CaptureRunLimits, ExecutionError> {
     let (reducer, work) = capture_reducer_budget(limits)?;
-    let run_limits = capture_run_limits(
-        request.haystack.len(),
+    capture_run_limits(
+        haystack_len,
         regex.build_report().selector.program_states,
         work,
         limits.fre_aggregate_sequential_bytes,
@@ -2106,21 +2268,24 @@ fn fre_count_captures(
         work,
         work,
         limits,
-    )?;
+    )
+}
+
+fn execute_count_captures_with_limits(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    run_limits: CaptureRunLimits,
+) -> Result<u64, ExecutionError> {
     let result = regex
-        .count_captures(request.haystack, run_limits)
+        .count_captures(haystack, run_limits)
         .map_err(|error| {
             capture_execution_error(
                 &error.source,
                 format!("FRE capture reducer refused execution: {error}"),
             )
         })?;
-    let actual = u64::try_from(result.accounting.count)
-        .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))?;
-    Ok(FreReduction {
-        actual,
-        plan: "capture-linear-selector-persistent-history",
-    })
+    u64::try_from(result.accounting.count)
+        .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))
 }
 
 fn fre_grep_captures(
@@ -2128,6 +2293,18 @@ fn fre_grep_captures(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     let regex = capture_regex(request, limits)?;
+    let actual = execute_grep_captures(&regex, request.haystack, limits)?;
+    Ok(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_PLAN,
+    })
+}
+
+fn execute_grep_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
     let (reducer_limit, work_limit) = capture_reducer_budget(limits)?;
     let groups = regex
         .build_report()
@@ -2141,7 +2318,7 @@ fn fre_grep_captures(
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
-    for line in request.haystack.lines() {
+    for line in haystack.lines() {
         reducer_events = checked_aggregate_add(reducer_events, 1, "capture line events")?;
         if reducer_events > reducer_limit {
             return Err(ExecutionError::unsupported(format!(
@@ -2218,12 +2395,8 @@ fn fre_grep_captures(
             "capture history walk",
         )?;
     }
-    let actual = u64::try_from(count)
-        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
-    Ok(FreReduction {
-        actual,
-        plan: "capture-linear-selector-persistent-history",
-    })
+    u64::try_from(count)
+        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))
 }
 
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
@@ -4438,6 +4611,38 @@ mod tests {
         .expect("FRE grep capture count");
         assert_eq!(grep.actual, 12);
         assert_eq!(grep.plan, "capture-linear-selector-persistent-history");
+    }
+
+    #[test]
+    fn capture_lifecycle_reuses_one_authenticated_artifact_across_boundaries() {
+        let count =
+            current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
+                .expect("count-captures lifecycle");
+        assert_eq!(count.model(), "count-captures");
+        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(count.execute(b"a ab").expect("first count operation"), 5);
+        assert_eq!(count.execute(b"a ab").expect("steady count operation"), 5);
+        assert!(count.execute(b"a").is_err());
+
+        let haystack = b"foo foo\r\nZ\r\nfoo\r\nfoo";
+        let grep = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"([a-z][a-z])([a-z])([\r\n])?",
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("grep-captures lifecycle");
+        assert_eq!(grep.model(), "grep-captures");
+        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(grep.execute(haystack).expect("first grep operation"), 12);
+        assert_eq!(grep.execute(haystack).expect("steady grep operation"), 12);
+
+        assert!(current_fre_rebar_capture_lifecycle("count", "a", false, false, 1).is_err());
+        assert!(
+            current_fre_rebar_capture_lifecycle("count-captures", r"(\pL)", true, false, 3)
+                .is_err()
+        );
     }
 
     #[test]

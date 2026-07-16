@@ -62,8 +62,11 @@ cargo run -p rebar-compare --bin performance-contract -- \
   /absolute/path/to/observations.json
 ```
 
-These units do not execute a benchmark. The existing KLV timing runner still
-needs real `count-captures`, `grep-captures`, and `regex-redux` timing
-boundaries, multi-pattern input, allocation/memory collection, and an
-authenticated process that replaces draft placeholders with measured points
-without altering the fixed row/boundary/comparator universe.
+These units do not execute a benchmark. The FRE KLV runner now has
+authenticated, already-built lifecycle producers for the three supported
+`count-captures` rows and five supported `grep-captures` rows: the first call
+is the first-operation boundary and repeated calls on the same artifact are
+steady-operation boundaries. The performance gate still needs to schedule
+those boundaries, add `regex-redux` when FRE supports it semantically, handle
+multi-pattern input, collect allocation/memory metrics, and replace draft
+placeholders without altering the fixed row/boundary/comparator universe.
