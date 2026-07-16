@@ -42,7 +42,10 @@ pub enum CapturePlanKind {
     LinearSelectorPersistentHistory,
 }
 
-/// HIR forms deliberately outside the certified capture compiler.
+/// Typed compatibility receipt for HIR forms outside the certified capture compiler.
+///
+/// The pinned `regex-syntax` look set is currently implemented. This type is
+/// retained so future upstream look variants can remain explicit refusals.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureUnsupported {
     /// A look assertion has not been implemented by the tagged program.
@@ -1329,6 +1332,10 @@ fn lower_hir(
         HirKind::Look(Look::EndLF) if line_terminator == b'\n' => {
             Ok(Ast::Assert(CaptureAssertion::EndLf))
         }
+        HirKind::Look(Look::StartLF) => {
+            Ok(Ast::Assert(CaptureAssertion::StartLine(line_terminator)))
+        }
+        HirKind::Look(Look::EndLF) => Ok(Ast::Assert(CaptureAssertion::EndLine(line_terminator))),
         HirKind::Look(Look::WordAscii) => Ok(Ast::Assert(CaptureAssertion::WordAscii)),
         HirKind::Look(Look::WordAsciiNegate) => Ok(Ast::Assert(CaptureAssertion::WordAsciiNegate)),
         HirKind::Look(Look::WordStartAscii) => Ok(Ast::Assert(CaptureAssertion::WordStartAscii)),
@@ -1355,9 +1362,6 @@ fn lower_hir(
         HirKind::Look(Look::WordEndHalfUnicode) => {
             Ok(Ast::Assert(CaptureAssertion::WordEndHalfUnicode))
         }
-        HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
-            *look,
-        ))),
         HirKind::Capture(capture) => Ok(Ast::Capture {
             index: capture.index,
             name: capture.name.as_ref().map(ToString::to_string),

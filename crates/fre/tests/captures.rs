@@ -432,17 +432,96 @@ fn unicode_capture_classes_and_admitted_contextual_looks_execute() {
         .accounting
         .count;
     assert_eq!(word_actual, word_reference);
+}
 
-    let mut custom_line = fre::RustProfile::default();
-    custom_line.options.line_terminator = b'\r';
-    assert!(matches!(
-        CaptureBuilder::new(r"(?m:^)(a)")
-            .profile(custom_line)
-            .build(),
-        Err(fre::CaptureBuildError::Unsupported(
-            fre::CaptureUnsupported::Look(_)
-        ))
-    ));
+#[test]
+fn custom_line_terminator_captures_match_pinned_regex() {
+    let cases: &[(&str, &[u8], u8)] = &[
+        (r"(?m)^([a-z]+)$", b"\0abc\0", b'\0'),
+        (r"(?m)^([a-z]+)$", b"\nabc\n", b'\0'),
+        (r"(?m)^([a-z]+)$", &[0xFF, b'a', b'b', b'c', 0xFF], 0xFF),
+        (r"(?m)^\b([a-z]+)\b$", b"ZabcZ", b'Z'),
+        (r"(?m)^\B([a-z]+)\B$", b"ZabcZ", b'Z'),
+        (r"(?m)^\b([a-z]+)\b$", b"%abc%", b'%'),
+    ];
+    for &(pattern, haystack, line_terminator) in cases {
+        let mut reference_builder = RegexBuilder::new(pattern);
+        reference_builder
+            .unicode(false)
+            .line_terminator(line_terminator);
+        let reference = reference_builder
+            .build()
+            .unwrap_or_else(|error| panic!("reference pattern={pattern:?}: {error}"));
+        let expected = reference
+            .captures_iter(haystack)
+            .map(|captures| {
+                captures
+                    .iter()
+                    .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut profile = fre::RustProfile::default();
+        profile.options.unicode = false;
+        profile.options.line_terminator = line_terminator;
+        let regex = CaptureBuilder::new(pattern)
+            .profile(profile)
+            .build()
+            .unwrap_or_else(|error| panic!("FRE pattern={pattern:?}: {error}"));
+        let actual = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .unwrap_or_else(|error| panic!("FRE pattern={pattern:?}: {error}"))
+            .captures
+            .into_iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .into_iter()
+                    .map(|group| group.span.map(|span| (span.start, span.end)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "pattern={pattern:?}, line={line_terminator:#04X}"
+        );
+    }
+
+    let pattern = r"(?m)^([\p{L}]+)$";
+    let haystack = "!é東京!";
+    let mut reference_builder = TextRegexBuilder::new(pattern);
+    reference_builder.line_terminator(b'!');
+    let expected = reference_builder
+        .build()
+        .expect("reference text pattern")
+        .captures_iter(haystack)
+        .map(|captures| {
+            captures
+                .iter()
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut profile = fre::RustProfile::default();
+    profile.options.line_terminator = b'!';
+    let actual = PortableTextCaptureBuilder::new(pattern)
+        .profile(profile)
+        .build()
+        .expect("FRE text pattern")
+        .captures_iter(haystack, CaptureAggregateLimits::default())
+        .expect("FRE text captures")
+        .captures
+        .into_iter()
+        .map(|captures| {
+            captures
+                .groups
+                .into_iter()
+                .map(|group| group.span.map(|span| (span.start, span.end)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 #[test]

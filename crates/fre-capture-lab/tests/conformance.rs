@@ -749,6 +749,9 @@ fn render(ast: &Ast) -> String {
             Assertion::End => r"\z",
             Assertion::StartLf => r"(?m:^)",
             Assertion::EndLf => r"(?m:$)",
+            Assertion::StartLine(_) | Assertion::EndLine(_) => {
+                panic!("parameterized line assertions require a configured reference builder")
+            }
             Assertion::StartCrlf => r"(?Rm:^)",
             Assertion::EndCrlf => r"(?Rm:$)",
             Assertion::WordAscii => r"(?-u:\b)",

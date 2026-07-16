@@ -20,6 +20,10 @@ pub enum Assertion {
     StartLf,
     /// End of the logical window or immediately before LF.
     EndLf,
+    /// Beginning of the logical window or immediately after the configured byte.
+    StartLine(u8),
+    /// End of the logical window or immediately before the configured byte.
+    EndLine(u8),
     /// Beginning of a CRLF-aware line without splitting a CRLF pair.
     StartCrlf,
     /// End of a CRLF-aware line without splitting a CRLF pair.
