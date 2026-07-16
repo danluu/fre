@@ -10,17 +10,20 @@ use std::{
     io::Write as _,
     path::Path,
     process::Command,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Report, Status, report_bytes};
+use crate::{CompareError, CurrentFreCaptureLifecycle, InputReceipt, Report, Status, report_bytes};
 
 /// Stable schema for a performance qualification contract.
 pub const PERFORMANCE_CONTRACT_SCHEMA: &str = "fre.rebar.performance-contract.v1";
 /// Stable schema for pointwise performance observations.
 pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observations.v1";
+/// Stable schema for one raw current-FRE capture lifecycle sample.
+pub const CAPTURE_LIFECYCLE_RAW_SCHEMA: &str = "fre.rebar.capture-lifecycle-raw.v1";
 /// Complete Rebar operation-model universe.
 pub const REBAR_MODELS: [&str; 7] = [
     "compile",
@@ -288,11 +291,113 @@ pub struct PerformanceObservations {
     pub rows: Vec<PerformanceRow>,
 }
 
+/// Exact capture operation boundary measured by one fresh runner process.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureLifecycleBoundary {
+    /// First complete operation after construction and limit preparation.
+    FirstPublicOperation,
+    /// One untimed verified prime followed by one measured operation.
+    SteadyPublicOperation,
+}
+
+impl CaptureLifecycleBoundary {
+    /// Parse an exact performance-contract boundary ID.
+    pub fn parse(value: &str) -> Result<Self, ContractError> {
+        match value {
+            "first-public-operation" => Ok(Self::FirstPublicOperation),
+            "steady-public-operation" => Ok(Self::SteadyPublicOperation),
+            other => Err(ContractError::new(format!(
+                "unexpected capture lifecycle boundary {other:?}"
+            ))),
+        }
+    }
+
+    /// Exact performance-contract boundary ID.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPublicOperation => "first-public-operation",
+            Self::SteadyPublicOperation => "steady-public-operation",
+        }
+    }
+
+    const fn priming_operations(self) -> u8 {
+        match self {
+            Self::FirstPublicOperation => 0,
+            Self::SteadyPublicOperation => 1,
+        }
+    }
+}
+
+/// Contract and semantic identity supplied to one capture runner invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureLifecycleObservationIdentity {
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt-array digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact Rust-target semantic job ID.
+    pub job_id: String,
+    /// Exact Rebar benchmark name.
+    pub benchmark: String,
+    /// Exact semantic reducer result.
+    pub expected: u64,
+}
+
+/// One unaggregated, self-identifying current-FRE capture lifecycle sample.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureLifecycleRawObservation {
+    /// Raw observation schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt-array digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact Rebar benchmark name.
+    pub benchmark: String,
+    /// Capture Rebar model.
+    pub model: String,
+    /// First or steady public operation.
+    pub boundary: CaptureLifecycleBoundary,
+    /// Authenticated current-FRE plan label.
+    pub candidate_plan: String,
+    /// Complete semantic input identity recomputed from runner input.
+    pub input: InputReceipt,
+    /// Exact semantic reducer expected by the runner.
+    pub expected: u64,
+    /// Reducer returned inside the measured operation.
+    pub actual: u64,
+    /// Untimed operations completed before measurement.
+    pub priming_operations: u8,
+    /// Operations included in `elapsed_ns`.
+    pub measured_operations: u8,
+    /// Raw elapsed nanoseconds for the single measured operation.
+    pub elapsed_ns: u64,
+    /// SHA-256 of `actual.to_le_bytes()`.
+    pub result_sha256: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SemanticRow {
+    benchmark: String,
     model: String,
     status: RowSemanticStatus,
     reason: Option<String>,
+    input: InputReceipt,
+    expected: u64,
+    candidate_plan: Option<String>,
     comparator_statuses: BTreeMap<String, Option<Status>>,
 }
 
@@ -479,6 +584,223 @@ pub fn write_new_observations(
     output.sync_all().map_err(|error| {
         ContractError::new(format!("sync observation {}: {error}", path.display()))
     })
+}
+
+/// Execute the explicit first/steady schedule and construct one raw capture
+/// observation. The caller supplies the measurement closure, which permits
+/// deterministic no-clock validation fixtures.
+///
+/// # Errors
+///
+/// Returns an error for malformed identity, a failed/mismatched prime,
+/// measurement failure, zero/overflowed duration, or inconsistent output.
+pub fn produce_capture_lifecycle_observation<F>(
+    identity: &CaptureLifecycleObservationIdentity,
+    lifecycle: &CurrentFreCaptureLifecycle,
+    pattern: &str,
+    haystack: &[u8],
+    boundary: CaptureLifecycleBoundary,
+    measure: F,
+) -> Result<CaptureLifecycleRawObservation, ContractError>
+where
+    F: FnOnce(&CurrentFreCaptureLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
+{
+    validate_capture_identity_shape(identity)?;
+    if boundary == CaptureLifecycleBoundary::SteadyPublicOperation {
+        let primed = lifecycle
+            .execute(haystack)
+            .map_err(|error| ContractError::new(format!("capture lifecycle prime: {error}")))?;
+        if primed != identity.expected {
+            return Err(ContractError::new(format!(
+                "capture lifecycle prime returned {primed}, expected {}",
+                identity.expected
+            )));
+        }
+    }
+    let (elapsed, actual) = measure(lifecycle, haystack)
+        .map_err(|error| ContractError::new(format!("capture lifecycle measurement: {error}")))?;
+    let elapsed_ns = u64::try_from(elapsed.as_nanos())
+        .map_err(|_| ContractError::new("capture lifecycle duration does not fit u64"))?;
+    let observation = CaptureLifecycleRawObservation {
+        schema: CAPTURE_LIFECYCLE_RAW_SCHEMA.to_string(),
+        contract_id: identity.contract_id.clone(),
+        canonical_commit: identity.canonical_commit.clone(),
+        canonical_tree: identity.canonical_tree.clone(),
+        semantic_receipts_sha256: identity.semantic_receipts_sha256.clone(),
+        job_id: identity.job_id.clone(),
+        benchmark: identity.benchmark.clone(),
+        model: lifecycle.model().to_string(),
+        boundary,
+        candidate_plan: lifecycle.plan().to_string(),
+        input: InputReceipt {
+            pattern_sha256: vec![digest(pattern.as_bytes())],
+            haystack_sha256: digest(haystack),
+            haystack_bytes: haystack.len(),
+            unicode: lifecycle.unicode(),
+            case_insensitive: lifecycle.case_insensitive(),
+        },
+        expected: identity.expected,
+        actual,
+        priming_operations: boundary.priming_operations(),
+        measured_operations: 1,
+        elapsed_ns,
+        result_sha256: digest(&actual.to_le_bytes()),
+    };
+    validate_capture_observation_shape(&observation)?;
+    if observation.model != lifecycle.model()
+        || observation.candidate_plan != lifecycle.plan()
+        || observation.actual != identity.expected
+    {
+        return Err(ContractError::new(
+            "capture lifecycle output differs from its prepared identity or semantic result",
+        ));
+    }
+    Ok(observation)
+}
+
+/// Validate a raw capture sample against the authenticated contract and
+/// semantic denominator.
+pub fn validate_capture_lifecycle_observation(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    observation: &CaptureLifecycleRawObservation,
+) -> Result<(), ContractError> {
+    validate_contract(contract)?;
+    validate_capture_observation_shape(observation)?;
+    if observation.contract_id != contract.contract_id
+        || observation.canonical_commit != contract.canonical.commit
+        || observation.canonical_tree != contract.canonical.tree
+        || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+    {
+        return Err(ContractError::new(
+            "raw capture observation contract, canonical, or semantic identity mismatch",
+        ));
+    }
+    let semantic = universe.rows.get(&observation.job_id).ok_or_else(|| {
+        ContractError::new(format!(
+            "raw capture job {:?} is absent from the semantic denominator",
+            observation.job_id
+        ))
+    })?;
+    if semantic.status != RowSemanticStatus::Supported
+        || semantic.model != observation.model
+        || semantic.benchmark != observation.benchmark
+        || semantic.input != observation.input
+        || semantic.expected != observation.expected
+        || semantic.candidate_plan.as_deref() != Some(observation.candidate_plan.as_str())
+    {
+        return Err(ContractError::new(format!(
+            "raw capture job {:?} differs from its passing semantic receipt",
+            observation.job_id
+        )));
+    }
+    let model = contract
+        .models
+        .iter()
+        .find(|model| model.model == observation.model)
+        .ok_or_else(|| ContractError::new("raw capture model is absent from contract"))?;
+    if !matches!(
+        observation.model.as_str(),
+        "count-captures" | "grep-captures"
+    ) || observation.candidate_plan != crate::CURRENT_FRE_CAPTURE_PLAN
+        || !model
+            .lifecycle_boundaries
+            .iter()
+            .any(|boundary| boundary == observation.boundary.as_str())
+    {
+        return Err(ContractError::new(
+            "raw capture model or lifecycle boundary is not contracted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capture_identity_shape(
+    identity: &CaptureLifecycleObservationIdentity,
+) -> Result<(), ContractError> {
+    require_token(&identity.contract_id, "raw capture contract ID")?;
+    require_oid(&identity.canonical_commit, "raw capture canonical commit")?;
+    require_oid(&identity.canonical_tree, "raw capture canonical tree")?;
+    require_digest(
+        &identity.semantic_receipts_sha256,
+        "raw capture semantic receipts",
+    )?;
+    require_token(&identity.job_id, "raw capture job ID")?;
+    require_text(&identity.benchmark, "raw capture benchmark")
+}
+
+fn validate_capture_observation_shape(
+    observation: &CaptureLifecycleRawObservation,
+) -> Result<(), ContractError> {
+    if observation.schema != CAPTURE_LIFECYCLE_RAW_SCHEMA {
+        return Err(ContractError::new(
+            "raw capture observation schema mismatch",
+        ));
+    }
+    validate_capture_identity_shape(&CaptureLifecycleObservationIdentity {
+        contract_id: observation.contract_id.clone(),
+        canonical_commit: observation.canonical_commit.clone(),
+        canonical_tree: observation.canonical_tree.clone(),
+        semantic_receipts_sha256: observation.semantic_receipts_sha256.clone(),
+        job_id: observation.job_id.clone(),
+        benchmark: observation.benchmark.clone(),
+        expected: observation.expected,
+    })?;
+    require_token(&observation.model, "raw capture model")?;
+    require_token(&observation.candidate_plan, "raw capture plan")?;
+    if observation.input.pattern_sha256.len() != 1 {
+        return Err(ContractError::new(
+            "raw capture observation requires exactly one pattern digest",
+        ));
+    }
+    require_digest(
+        &observation.input.pattern_sha256[0],
+        "raw capture pattern digest",
+    )?;
+    require_digest(
+        &observation.input.haystack_sha256,
+        "raw capture haystack digest",
+    )?;
+    require_digest(&observation.result_sha256, "raw capture result digest")?;
+    if observation.actual != observation.expected
+        || observation.priming_operations != observation.boundary.priming_operations()
+        || observation.measured_operations != 1
+        || observation.elapsed_ns == 0
+        || observation.result_sha256 != digest(&observation.actual.to_le_bytes())
+    {
+        return Err(ContractError::new(
+            "raw capture result, schedule, duration, or digest is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+/// Serialize one raw capture observation as canonical compact JSON plus LF.
+pub fn capture_lifecycle_observation_bytes(
+    observation: &CaptureLifecycleRawObservation,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(observation).map_err(|error| {
+        ContractError::new(format!("serialize raw capture observation: {error}"))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read a canonically serialized raw capture observation.
+pub fn read_capture_lifecycle_observation(
+    path: &Path,
+) -> Result<CaptureLifecycleRawObservation, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let observation: CaptureLifecycleRawObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if capture_lifecycle_observation_bytes(&observation)? != bytes {
+        return Err(ContractError::new(format!(
+            "raw capture observation {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(observation)
 }
 
 /// Resolve the exact protected main commit and tree from `repo`.
@@ -947,9 +1269,13 @@ fn semantic_universe(
             })
             .collect();
         let row = SemanticRow {
+            benchmark: receipt.benchmark.clone(),
             model: receipt.model.clone(),
             status,
             reason,
+            input: receipt.input.clone(),
+            expected: receipt.expected,
+            candidate_plan: receipt.candidate_plan.clone(),
             comparator_statuses,
         };
         if rows.insert(receipt.job_id.clone(), row).is_some() {
@@ -1349,6 +1675,15 @@ mod tests {
         }
     }
 
+    fn bind_fixture_candidate_plan(mut receipt: Receipt) -> Receipt {
+        if receipt.status == Status::Pass
+            && matches!(receipt.model.as_str(), "count-captures" | "grep-captures")
+        {
+            receipt.candidate_plan = Some(crate::CURRENT_FRE_CAPTURE_PLAN.to_string());
+        }
+        receipt
+    }
+
     fn synthetic_semantic_report(
         contract: &mut PerformanceContract,
     ) -> (Vec<u8>, SemanticUniverse) {
@@ -1364,14 +1699,14 @@ mod tests {
                 } else {
                     Status::Unsupported
                 };
-                receipts.push(receipt(
+                receipts.push(bind_fixture_candidate_plan(receipt(
                     job_id.clone(),
                     benchmark.clone(),
                     model.model.clone(),
                     contract.semantic.fre_adapter.clone(),
                     "rust/regex",
                     candidate_status,
-                ));
+                )));
                 receipts.push(receipt(
                     job_id,
                     benchmark.clone(),
@@ -1525,6 +1860,145 @@ mod tests {
             .expect("supported row exists");
         supported.boundaries[0].comparisons.pop();
         assert!(validate_observations(&contract, &universe, &hidden_comparator).is_err());
+    }
+
+    #[test]
+    fn capture_lifecycle_schedule_and_raw_validation_need_no_clock() {
+        let contract = contract();
+        let pattern = r"(a)(b)?";
+        let haystack = b"a ab";
+        let lifecycle = crate::current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("capture lifecycle");
+        let identity = CaptureLifecycleObservationIdentity {
+            contract_id: contract.contract_id.clone(),
+            canonical_commit: contract.canonical.commit.clone(),
+            canonical_tree: contract.canonical.tree.clone(),
+            semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+            job_id: "fixture/count-captures@rust/regex".to_string(),
+            benchmark: "fixture/count-captures".to_string(),
+            expected: 5,
+        };
+        let first = produce_capture_lifecycle_observation(
+            &identity,
+            &lifecycle,
+            pattern,
+            haystack,
+            CaptureLifecycleBoundary::FirstPublicOperation,
+            |operation, input| Ok((Duration::from_nanos(37), operation.execute(input)?)),
+        )
+        .expect("fixed first observation");
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 37);
+        assert_eq!(first.actual, 5);
+        assert_eq!(first.input.pattern_sha256, vec![digest(pattern.as_bytes())]);
+        assert_eq!(first.input.haystack_sha256, digest(haystack));
+
+        let steady = produce_capture_lifecycle_observation(
+            &identity,
+            &lifecycle,
+            pattern,
+            haystack,
+            CaptureLifecycleBoundary::SteadyPublicOperation,
+            |operation, input| Ok((Duration::from_nanos(41), operation.execute(input)?)),
+        )
+        .expect("fixed steady observation");
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.elapsed_ns, 41);
+        let bytes = capture_lifecycle_observation_bytes(&steady).expect("serialize raw capture");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<CaptureLifecycleRawObservation>(&bytes)
+                .expect("raw capture round trip"),
+            steady
+        );
+
+        let called = std::cell::Cell::new(false);
+        let mut wrong_expected = identity.clone();
+        wrong_expected.expected = 6;
+        assert!(
+            produce_capture_lifecycle_observation(
+                &wrong_expected,
+                &lifecycle,
+                pattern,
+                haystack,
+                CaptureLifecycleBoundary::SteadyPublicOperation,
+                |operation, input| {
+                    called.set(true);
+                    Ok((Duration::from_nanos(1), operation.execute(input)?))
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            !called.get(),
+            "mismatched steady prime must stop measurement"
+        );
+    }
+
+    #[test]
+    fn raw_capture_observation_is_bound_to_the_semantic_row() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let mut observation = CaptureLifecycleRawObservation {
+            schema: CAPTURE_LIFECYCLE_RAW_SCHEMA.to_string(),
+            contract_id: contract.contract_id.clone(),
+            canonical_commit: contract.canonical.commit.clone(),
+            canonical_tree: contract.canonical.tree.clone(),
+            semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+            job_id: "fixture/count-captures/row-000@rust/regex".to_string(),
+            benchmark: "fixture/count-captures/row-000".to_string(),
+            model: "count-captures".to_string(),
+            boundary: CaptureLifecycleBoundary::FirstPublicOperation,
+            candidate_plan: crate::CURRENT_FRE_CAPTURE_PLAN.to_string(),
+            input: InputReceipt {
+                pattern_sha256: vec!["1".repeat(64)],
+                haystack_sha256: "2".repeat(64),
+                haystack_bytes: 1,
+                unicode: false,
+                case_insensitive: false,
+            },
+            expected: 0,
+            actual: 0,
+            priming_operations: 0,
+            measured_operations: 1,
+            elapsed_ns: 23,
+            result_sha256: digest(&0_u64.to_le_bytes()),
+        };
+        validate_capture_lifecycle_observation(&contract, &universe, &observation)
+            .expect("exact raw capture observation validates");
+
+        let exact = observation.clone();
+        observation.input.haystack_sha256 = "3".repeat(64);
+        assert!(
+            validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
+        );
+        observation = exact.clone();
+        observation.model = "grep-captures".to_string();
+        assert!(
+            validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
+        );
+        observation = exact.clone();
+        observation.candidate_plan = "capture-other".to_string();
+        assert!(
+            validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
+        );
+        observation = exact.clone();
+        observation.elapsed_ns = 0;
+        assert!(
+            validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
+        );
+        observation = exact;
+        observation.job_id = "fixture/count-captures/row-003@rust/regex".to_string();
+        observation.benchmark = "fixture/count-captures/row-003".to_string();
+        assert!(
+            validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
+        );
     }
 
     #[test]

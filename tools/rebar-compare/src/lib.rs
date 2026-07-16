@@ -954,6 +954,8 @@ pub struct CurrentFreCaptureLifecycle {
     model: CurrentFreCaptureModel,
     regex: CaptureRegex,
     limits: RunLimits,
+    unicode: bool,
+    case_insensitive: bool,
     haystack_len: usize,
     preparation: CurrentFreCapturePreparation,
 }
@@ -969,6 +971,18 @@ impl CurrentFreCaptureLifecycle {
     #[must_use]
     pub const fn plan(&self) -> &'static str {
         CURRENT_FRE_CAPTURE_PLAN
+    }
+
+    /// Exact Rust-regex Unicode option bound at construction.
+    #[must_use]
+    pub const fn unicode(&self) -> bool {
+        self.unicode
+    }
+
+    /// Exact Rust-regex case-insensitive option bound at construction.
+    #[must_use]
+    pub const fn case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     /// Execute one complete public model operation on the retained artifact.
@@ -1028,6 +1042,8 @@ pub fn current_fre_rebar_capture_lifecycle(
         model,
         regex,
         limits,
+        unicode,
+        case_insensitive,
         haystack_len,
         preparation,
     })

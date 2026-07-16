@@ -3,6 +3,8 @@
 //! This deliberately implements models, not benchmark names. Construction is
 //! outside the timer for `grep`; `compile` times a fresh complete artifact and
 //! performs semantic verification only after the sample duration is captured.
+//! Capture models require an explicit first/steady boundary and emit a
+//! self-identifying canonical raw-observation record instead of legacy CSV.
 
 use std::{
     env,
@@ -16,10 +18,15 @@ use fre::{
     AggregateBuildReport, AggregateBuilder, AggregatePlanKind, PlanKind, SearchSessionLimits,
 };
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
+    AUDITED_REBAR_REVISION, CompareError, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
     current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
     current_fre_rebar_validate_aggregate_identity,
+    performance_contract::{
+        CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
+        CaptureLifecycleRawObservation, capture_lifecycle_observation_bytes,
+        produce_capture_lifecycle_observation,
+    },
 };
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -77,9 +84,31 @@ fn main() -> Result<(), DynError> {
                         .map_err(|error| format!("invalid --expect-count: {error}"))?,
                 );
             }
+            "--expect-job-id" => {
+                expectations.job_id = Some(next_argument(&mut arguments, "--expect-job-id")?);
+            }
+            "--expect-contract-id" => {
+                expectations.contract_id =
+                    Some(next_argument(&mut arguments, "--expect-contract-id")?);
+            }
+            "--expect-canonical-sha" => {
+                expectations.canonical_sha =
+                    Some(next_argument(&mut arguments, "--expect-canonical-sha")?);
+            }
+            "--expect-canonical-tree" => {
+                expectations.canonical_tree =
+                    Some(next_argument(&mut arguments, "--expect-canonical-tree")?);
+            }
+            "--expect-semantic-receipts" => {
+                expectations.semantic_receipts =
+                    Some(next_argument(&mut arguments, "--expect-semantic-receipts")?);
+            }
+            "--expect-boundary" => {
+                expectations.boundary = Some(next_argument(&mut arguments, "--expect-boundary")?);
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime k0] --expect-count N | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation] | --version"
                         .into(),
                 );
             }
@@ -113,10 +142,16 @@ fn main() -> Result<(), DynError> {
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
     require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
+    require_capture_metadata(&benchmark.model, &expectations)?;
+    if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
+        let observation = model_captures(&benchmark, &expectations)?;
+        let bytes = capture_lifecycle_observation_bytes(&observation)?;
+        io::stdout().lock().write_all(&bytes)?;
+        return Ok(());
+    }
     let samples = match benchmark.model.as_str() {
         "compile" => model_compile(&benchmark, &expectations)?,
         "count" => model_count(&benchmark, &expectations)?,
-        "count-captures" | "grep-captures" => model_captures(&benchmark, &expectations)?,
         "count-spans" => model_count_spans(&benchmark, &expectations)?,
         "grep" => model_grep(&benchmark, &expectations)?,
         model => return Err(format!("unsupported FRE Rebar model {model:?}").into()),
@@ -150,6 +185,12 @@ struct Expectations {
     plan: Option<String>,
     runtime: Option<String>,
     count: Option<u64>,
+    job_id: Option<String>,
+    contract_id: Option<String>,
+    canonical_sha: Option<String>,
+    canonical_tree: Option<String>,
+    semantic_receipts: Option<String>,
+    boundary: Option<String>,
 }
 
 fn next_argument(
@@ -176,6 +217,29 @@ fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(),
         ("grep", Some(_)) | (_, None) => Ok(()),
         (_, Some(_)) => Err("formal non-grep timing rejects --expect-runtime".into()),
     }
+}
+
+fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<(), DynError> {
+    let fields = [
+        expectations.job_id.as_deref(),
+        expectations.contract_id.as_deref(),
+        expectations.canonical_sha.as_deref(),
+        expectations.canonical_tree.as_deref(),
+        expectations.semantic_receipts.as_deref(),
+        expectations.boundary.as_deref(),
+    ];
+    let supplied = fields.iter().filter(|value| value.is_some()).count();
+    if matches!(model, "count-captures" | "grep-captures") {
+        if supplied != fields.len() {
+            return Err(
+                "formal capture timing requires every authenticated identity and boundary field"
+                    .into(),
+            );
+        }
+    } else if supplied != 0 {
+        return Err("formal non-capture timing rejects capture identity or boundary fields".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,13 +570,67 @@ fn capture_lifecycle(
 fn model_captures(
     benchmark: &Benchmark,
     expectations: &Expectations,
-) -> Result<Vec<Sample>, DynError> {
+) -> Result<CaptureLifecycleRawObservation, DynError> {
+    model_captures_with_measurement(benchmark, expectations, |operation, haystack| {
+        let start = Instant::now();
+        let actual = operation.execute(haystack)?;
+        Ok((start.elapsed(), actual))
+    })
+}
+
+fn model_captures_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<CaptureLifecycleRawObservation, DynError>
+where
+    F: FnOnce(
+        &rebar_compare::CurrentFreCaptureLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let boundary = CaptureLifecycleBoundary::parse(
+        expectations
+            .boundary
+            .as_deref()
+            .ok_or("capture boundary is absent")?,
+    )?;
+    let identity = CaptureLifecycleObservationIdentity {
+        contract_id: expectations
+            .contract_id
+            .clone()
+            .ok_or("capture contract ID is absent")?,
+        canonical_commit: expectations
+            .canonical_sha
+            .clone()
+            .ok_or("capture canonical SHA is absent")?,
+        canonical_tree: expectations
+            .canonical_tree
+            .clone()
+            .ok_or("capture canonical tree is absent")?,
+        semantic_receipts_sha256: expectations
+            .semantic_receipts
+            .clone()
+            .ok_or("capture semantic receipt digest is absent")?,
+        job_id: expectations
+            .job_id
+            .clone()
+            .ok_or("capture job ID is absent")?,
+        benchmark: benchmark.name.clone(),
+        expected: expectations
+            .count
+            .ok_or("capture expected count is absent")?,
+    };
     let lifecycle = capture_lifecycle(benchmark, expectations)?;
-    run(
-        benchmark,
-        || Ok(lifecycle.execute(&benchmark.haystack)?),
-        Ok,
+    produce_capture_lifecycle_observation(
+        &identity,
+        &lifecycle,
+        benchmark.pattern(),
+        &benchmark.haystack,
+        boundary,
+        measure,
     )
+    .map_err(Into::into)
 }
 
 fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<Sample>, DynError> {
@@ -607,6 +725,20 @@ mod tests {
         }
     }
 
+    fn capture_expectations(boundary: &str, expected: u64) -> Expectations {
+        Expectations {
+            plan: Some("capture-linear-selector-persistent-history".to_string()),
+            count: Some(expected),
+            job_id: Some("fixture/capture@rust/regex".to_string()),
+            contract_id: Some("fixture-contract-v1".to_string()),
+            canonical_sha: Some("a".repeat(40)),
+            canonical_tree: Some("b".repeat(40)),
+            semantic_receipts: Some("c".repeat(64)),
+            boundary: Some(boundary.to_string()),
+            ..Expectations::default()
+        }
+    }
+
     #[test]
     fn parses_arbitrary_haystack_and_delimiters_in_values() {
         let benchmark = Benchmark::parse(&valid_klv()).unwrap();
@@ -647,31 +779,61 @@ mod tests {
 
     #[test]
     fn capture_models_bind_plan_and_preserve_first_and_steady_semantics() {
-        let expectations = Expectations {
-            plan: Some("capture-linear-selector-persistent-history".to_string()),
-            ..Expectations::default()
-        };
         let count_benchmark = capture_benchmark("count-captures", r"(a)(b)?", b"a ab");
-        let count = capture_lifecycle(&count_benchmark, &expectations).expect("count lifecycle");
-        assert_eq!(count.model(), "count-captures");
-        assert_eq!(count.execute(&count_benchmark.haystack).unwrap(), 5);
-        assert_eq!(count.execute(&count_benchmark.haystack).unwrap(), 5);
+        let first_expectations = capture_expectations("first-public-operation", 5);
+        require_capture_metadata("count-captures", &first_expectations)
+            .expect("complete capture metadata");
+        let first = model_captures_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(17), operation.execute(haystack)?)),
+        )
+        .expect("first raw capture observation");
+        assert_eq!(
+            first.boundary,
+            CaptureLifecycleBoundary::FirstPublicOperation
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 17);
+        assert_eq!(first.actual, 5);
+
+        let steady_expectations = capture_expectations("steady-public-operation", 5);
+        let steady = model_captures_with_measurement(
+            &count_benchmark,
+            &steady_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(19), operation.execute(haystack)?)),
+        )
+        .expect("steady raw capture observation");
+        assert_eq!(
+            steady.boundary,
+            CaptureLifecycleBoundary::SteadyPublicOperation
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.elapsed_ns, 19);
 
         let grep_benchmark = capture_benchmark(
             "grep-captures",
             r"([a-z][a-z])([a-z])([\r\n])?",
             b"foo foo\r\nZ\r\nfoo\r\nfoo",
         );
-        let grep = capture_lifecycle(&grep_benchmark, &expectations).expect("grep lifecycle");
-        assert_eq!(grep.model(), "grep-captures");
-        assert_eq!(grep.execute(&grep_benchmark.haystack).unwrap(), 12);
-        assert_eq!(grep.execute(&grep_benchmark.haystack).unwrap(), 12);
+        let grep_expectations = capture_expectations("steady-public-operation", 12);
+        let grep = model_captures_with_measurement(
+            &grep_benchmark,
+            &grep_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(23), operation.execute(haystack)?)),
+        )
+        .expect("grep raw capture observation");
+        assert_eq!(grep.model, "grep-captures");
+        assert_eq!(grep.actual, 12);
+        assert_eq!(grep.priming_operations, 1);
 
         let wrong_plan = Expectations {
             plan: Some("aggregate-exact-literal".to_string()),
             ..Expectations::default()
         };
         assert!(capture_lifecycle(&count_benchmark, &wrong_plan).is_err());
+        assert!(require_capture_metadata("count-captures", &wrong_plan).is_err());
+        assert!(require_capture_metadata("count", &first_expectations).is_err());
     }
 
     #[test]

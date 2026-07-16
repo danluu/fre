@@ -1,7 +1,8 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use rebar_compare::performance_contract::{
-    generate_draft_observations, read_contract, read_observations, resolve_exact_main,
+    generate_draft_observations, read_capture_lifecycle_observation, read_contract,
+    read_observations, resolve_exact_main, validate_capture_lifecycle_observation,
     validate_contract, validate_exact_main, validate_observations, validate_semantic_report,
     write_new_observations,
 };
@@ -86,6 +87,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 contract.semantic.receipts_sha256,
                 observations.rows.len(),
                 output_path.display()
+            );
+        }
+        "validate-capture-observation" => {
+            let semantic_path = path_argument(&mut arguments, "SEMANTIC_REPORT")?;
+            let observation_path = path_argument(&mut arguments, "RAW_OBSERVATION")?;
+            require_end(arguments)?;
+            let semantic_bytes = fs::read(&semantic_path)?;
+            let universe = validate_semantic_report(&contract, &semantic_bytes)?;
+            let observation = read_capture_lifecycle_observation(&observation_path)?;
+            validate_capture_lifecycle_observation(&contract, &universe, &observation)?;
+            println!(
+                "contract={} job={} model={} boundary={} status=valid",
+                contract.contract_id,
+                observation.job_id,
+                observation.model,
+                observation.boundary.as_str()
             );
         }
         other => return Err(format!("unknown command {other:?}").into()),

@@ -66,7 +66,22 @@ These units do not execute a benchmark. The FRE KLV runner now has
 authenticated, already-built lifecycle producers for the three supported
 `count-captures` rows and five supported `grep-captures` rows: the first call
 is the first-operation boundary and repeated calls on the same artifact are
-steady-operation boundaries. The performance gate still needs to schedule
-those boundaries, add `regex-redux` when FRE supports it semantically, handle
-multi-pattern input, collect allocation/memory metrics, and replace draft
-placeholders without altering the fixed row/boundary/comparator universe.
+steady-operation boundaries. Capture runner invocations now require an exact
+boundary plus contract/canonical/semantic/job identity. They emit canonical
+`fre.rebar.capture-lifecycle-raw.v1` JSON: first-operation records have no
+prime; steady-operation records authenticate one untimed successful prime
+before their single measured call. Raw records can be checked with:
+
+```text
+cargo run -p rebar-compare --bin performance-contract -- \
+  validate-capture-observation \
+  research/rebar/performance/current-main-a1a87d11-contract.json \
+  /Users/danluu/dev/fre \
+  /absolute/path/to/full344.json \
+  /absolute/path/to/raw-capture.json
+```
+
+The performance gate still needs fresh-process paired scheduling of these raw
+arms, allocation/memory metrics, `regex-redux` after semantic support exists,
+multi-pattern support, and replacement of draft placeholders without altering
+the fixed row/boundary/comparator universe.
