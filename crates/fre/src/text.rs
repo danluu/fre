@@ -197,6 +197,104 @@ impl PortableTextBuilder {
         self
     }
 
+    /// Set case-insensitive mode for the complete pattern before parsing.
+    ///
+    /// Inline `i` flag groups may still override this setting locally, just as
+    /// they do in the pinned Rust text builder.
+    #[must_use]
+    pub fn case_insensitive(mut self, enabled: bool) -> Self {
+        self.profile.options.case_insensitive = enabled;
+        self
+    }
+
+    /// Set multiline mode for `^` and `$` before parsing.
+    #[must_use]
+    pub fn multi_line(mut self, enabled: bool) -> Self {
+        self.profile.options.multi_line = enabled;
+        self
+    }
+
+    /// Set whether `.` matches the configured line terminator.
+    #[must_use]
+    pub fn dot_matches_new_line(mut self, enabled: bool) -> Self {
+        self.profile.options.dot_matches_new_line = enabled;
+        self
+    }
+
+    /// Set CRLF mode for the complete pattern before parsing.
+    ///
+    /// Inline `R` flag groups may still override this setting locally, just as
+    /// they do in the pinned Rust text builder.
+    #[must_use]
+    pub fn crlf(mut self, enabled: bool) -> Self {
+        self.profile.options.crlf = enabled;
+        self
+    }
+
+    /// Swap greedy and lazy repetition semantics before parsing.
+    #[must_use]
+    pub fn swap_greed(mut self, enabled: bool) -> Self {
+        self.profile.options.swap_greed = enabled;
+        self
+    }
+
+    /// Set verbose mode before parsing, ignoring unescaped pattern whitespace
+    /// and treating `#` as the start of a line comment.
+    #[must_use]
+    pub fn ignore_whitespace(mut self, enabled: bool) -> Self {
+        self.profile.options.ignore_whitespace = enabled;
+        self
+    }
+
+    /// Enable or disable octal escape syntax before parsing.
+    #[must_use]
+    pub fn octal(mut self, enabled: bool) -> Self {
+        self.profile.options.octal = enabled;
+        self
+    }
+
+    /// Set the parser's abstract-syntax-tree nesting limit.
+    #[must_use]
+    pub fn nest_limit(mut self, limit: u32) -> Self {
+        self.profile.options.nest_limit = limit;
+        self
+    }
+
+    /// Set the byte recognized by multiline `^` and `$` assertions.
+    #[must_use]
+    pub fn line_terminator(mut self, line_terminator: u8) -> Self {
+        self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
+    /// Set the pinned high-level builder's approximate compiled-regex limit.
+    ///
+    /// Admission uses the pinned text constructor configuration before FRE's
+    /// independent equivalence proof and plan selection.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
+    /// Set the pinned high-level builder's lazy-DFA cache capacity identity.
+    ///
+    /// Portable execution does not use that cache, but the value remains part
+    /// of the authenticated compatibility identity and constructor admission.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
     /// Replace every checked construction limit.
     #[must_use]
     pub const fn limits(mut self, limits: BuildLimits) -> Self {
