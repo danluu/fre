@@ -24,6 +24,8 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "try_from_string",
     "bytes_match_len",
     "bytes_match_range",
+    "bytes_regex_captures_len",
+    "bytes_regex_static_captures_len",
 ];
 
 #[test]
@@ -35,9 +37,124 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 8);
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 2);
+    assert_eq!(UPSTREAM_API_IDS.len(), 10);
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 3);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 2);
+}
+
+#[test]
+fn capture_cardinality_metadata_matches_pinned_bytes_across_every_portable_plan() {
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let cases = [
+        (
+            "(Sherlock)",
+            PlanKind::ExactLiteral,
+            PortableBuilder::new("(Sherlock)").unicode(false).build(),
+        ),
+        (
+            "a|(ab)",
+            PlanKind::PackedLiteralSet,
+            PortableBuilder::new("a|(ab)").unicode(false).build(),
+        ),
+        (
+            "(foobar)|foobaz|fooquux",
+            PlanKind::LiteralSetDfa,
+            PortableBuilder::new("(foobar)|foobaz|fooquux")
+                .unicode(false)
+                .limits(dfa_limits)
+                .build(),
+        ),
+        (
+            "([a-z]+Z)",
+            PlanKind::RequiredLiteral,
+            PortableBuilder::new("([a-z]+Z)").unicode(false).build(),
+        ),
+        (
+            r"\A[a-z]+Z",
+            PlanKind::ForwardAnchored,
+            PortableBuilder::new(r"\A[a-z]+Z").unicode(false).build(),
+        ),
+        (
+            r"\b\w{2,}\b",
+            PlanKind::UnicodeWordRun,
+            PortableBuilder::new(r"\b\w{2,}\b").build(),
+        ),
+        (
+            "((?:ab)+)",
+            PlanKind::K0,
+            PortableBuilder::new("((?:ab)+)")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build(),
+        ),
+    ];
+
+    for (pattern, expected_plan, built) in cases {
+        let fre = built.unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(pattern == r"\b\w{2,}\b")
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+        assert_eq!(fre.build_report().plan, expected_plan, "{pattern:?}");
+        assert_eq!(fre.captures_len(), upstream.captures_len(), "{pattern:?}");
+        assert_eq!(
+            fre.static_captures_len(),
+            upstream.static_captures_len(),
+            "{pattern:?}"
+        );
+        assert_eq!(fre.build_report().captures_len, fre.captures_len());
+        assert_eq!(
+            fre.build_report().static_captures_len,
+            fre.static_captures_len()
+        );
+    }
+}
+
+#[test]
+fn capture_cardinality_matches_every_pinned_doctest_shape() {
+    for pattern in ["foo", "(foo)", r"(?<a>.(?<b>.))(.)(?:.)(?<c>.)", r"[a&&b]"] {
+        let fre = PortableBuilder::new(pattern)
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::Regex::new(pattern)
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+        assert_eq!(fre.captures_len(), upstream.captures_len(), "{pattern:?}");
+    }
+}
+
+#[test]
+fn static_capture_cardinality_matches_every_pinned_doctest_shape() {
+    for pattern in [
+        "a",
+        "(a)",
+        "(a)|(b)",
+        "(a)(b)|(c)(d)",
+        "(a)|b",
+        "a|(b)",
+        "(b)*",
+        "(b)+",
+    ] {
+        let fre = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+        assert_eq!(fre.captures_len(), upstream.captures_len(), "{pattern:?}");
+        assert_eq!(
+            fre.static_captures_len(),
+            upstream.static_captures_len(),
+            "{pattern:?}"
+        );
+    }
 }
 
 #[test]

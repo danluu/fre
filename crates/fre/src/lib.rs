@@ -128,7 +128,7 @@ pub use fre_automata::{
 pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 2;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 3;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -242,6 +242,11 @@ pub struct BuildReport {
     pub plan_storage_bytes: usize,
     /// Exact retained bytes for the original pattern source.
     pub source_storage_bytes: usize,
+    /// Total capture slots, including the implicit whole-match slot.
+    pub captures_len: usize,
+    /// Capture slots present in every possible match, including the implicit
+    /// whole-match slot, or `None` when participation cardinality can vary.
+    pub static_captures_len: Option<usize>,
     /// Exact minimum bytes consumed by any match, or `None` if the HIR's
     /// language is empty. This is preserved for future aggregate routing.
     pub minimum_match_bytes: Option<usize>,
@@ -829,6 +834,30 @@ impl PortableBuilder {
                 "Rust bytes request produced a non-Rust canonical pattern",
             ));
         };
+        let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
+            BuildError::InternalInvariant("syntax capture count does not fit usize")
+        })?;
+        if explicit_captures != rust.hir.properties().explicit_captures_len() {
+            return Err(BuildError::InternalInvariant(
+                "syntax capture count differs from HIR properties",
+            ));
+        }
+        let captures_len =
+            explicit_captures
+                .checked_add(1)
+                .ok_or(BuildError::InternalInvariant(
+                    "capture count including group zero overflowed usize",
+                ))?;
+        let static_captures_len = rust
+            .hir
+            .properties()
+            .static_explicit_captures_len()
+            .map(|len| {
+                len.checked_add(1).ok_or(BuildError::InternalInvariant(
+                    "static capture count including group zero overflowed usize",
+                ))
+            })
+            .transpose()?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         if self.selection == PlanSelection::ForceK0 {
             let lowered =
@@ -854,6 +883,8 @@ impl PortableBuilder {
                     edges: plan.edges(),
                     plan_storage_bytes: plan.storage_bytes(),
                     source_storage_bytes,
+                    captures_len,
+                    static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
@@ -879,6 +910,8 @@ impl PortableBuilder {
                     edges: 0,
                     plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
                     source_storage_bytes,
+                    captures_len,
+                    static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
@@ -918,6 +951,8 @@ impl PortableBuilder {
                             edges: 0,
                             plan_storage_bytes: build.persistent_bytes,
                             source_storage_bytes,
+                            captures_len,
+                            static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: Some(build),
@@ -948,6 +983,8 @@ impl PortableBuilder {
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
+                                captures_len,
+                                static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: None,
                                 forward_anchored: Some(build),
@@ -993,6 +1030,8 @@ impl PortableBuilder {
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
+                                captures_len,
+                                static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: Some(build),
                                 forward_anchored: None,
@@ -1035,6 +1074,8 @@ impl PortableBuilder {
                         edges: 0,
                         plan_storage_bytes: storage,
                         source_storage_bytes,
+                        captures_len,
+                        static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
@@ -1062,6 +1103,8 @@ impl PortableBuilder {
                             edges: 0,
                             plan_storage_bytes: storage,
                             source_storage_bytes,
+                            captures_len,
+                            static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: None,
@@ -1086,6 +1129,8 @@ impl PortableBuilder {
                         edges: 0,
                         plan_storage_bytes: storage,
                         source_storage_bytes,
+                        captures_len,
+                        static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
@@ -1116,6 +1161,8 @@ impl PortableBuilder {
                 edges: plan.edges(),
                 plan_storage_bytes: plan.storage_bytes(),
                 source_storage_bytes,
+                captures_len,
+                static_captures_len,
                 minimum_match_bytes,
                 required_literal: None,
                 forward_anchored: None,
@@ -1216,6 +1263,27 @@ impl PortableRegex {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.source
+    }
+
+    /// Return the number of capture slots, including the implicit unnamed
+    /// slot for the overall match.
+    ///
+    /// This metadata is preserved before capture-erasing execution planning,
+    /// so it is identical for every selected portable plan family.
+    #[must_use]
+    pub const fn captures_len(&self) -> usize {
+        self.report.captures_len
+    }
+
+    /// Return the number of capture slots that participate in every possible
+    /// match, including the implicit whole-match slot.
+    ///
+    /// `None` means that capture participation cardinality can vary across
+    /// alternatives or repetitions. This is construction metadata and does
+    /// not execute a search.
+    #[must_use]
+    pub const fn static_captures_len(&self) -> Option<usize> {
+        self.report.static_captures_len
     }
 
     /// The immutable compatibility profile used during parsing.
