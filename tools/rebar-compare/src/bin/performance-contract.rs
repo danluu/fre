@@ -3,9 +3,9 @@ use std::{env, fs, path::PathBuf, process::ExitCode};
 use rebar_compare::performance_contract::{
     PerformanceContract, PerformanceRunnerRoute, generate_draft_observations,
     generate_performance_pair_schedule, generate_performance_runner_manifest,
-    read_capture_lifecycle_observation, read_contract, read_observations, resolve_exact_main,
-    validate_capture_lifecycle_observation, validate_contract, validate_exact_main,
-    validate_observations, validate_semantic_report, write_new_observations,
+    read_capture_lifecycle_observation, read_contract, read_observations, resolve_tested_source,
+    validate_capture_lifecycle_observation, validate_contract, validate_observations,
+    validate_semantic_report, validate_tested_source, write_new_observations,
     write_new_performance_pair_schedule, write_new_performance_runner_manifest,
 };
 
@@ -31,16 +31,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let repo = path_argument(&mut arguments, "REPO")?;
     let contract = read_contract(&contract_path)?;
     validate_contract(&contract)?;
-    let observed = resolve_exact_main(&repo)?;
-    validate_exact_main(&contract, &observed)?;
+    let observed = resolve_tested_source(&repo, &contract.tested_source)?;
+    validate_tested_source(&contract, &observed)?;
 
     match command.as_str() {
         "validate-contract" => {
             require_end(arguments)?;
             println!(
-                "contract={} main={} rows={} supported={} unsupported={} models={}",
+                "contract={} tested_source={} rows={} supported={} unsupported={} models={}",
                 contract.contract_id,
-                contract.canonical.commit,
+                contract.tested_source.commit,
                 contract.semantic.denominator_rows,
                 contract.semantic.supported_rows,
                 contract.semantic.unsupported_rows,

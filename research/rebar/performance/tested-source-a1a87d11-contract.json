@@ -1,8 +1,7 @@
 {
-  "schema": "fre.rebar.performance-contract.v1",
-  "contract_id": "rebar-current-main-a1a87d11-v1",
-  "canonical": {
-    "reference": "refs/heads/main",
+  "schema": "fre.rebar.performance-contract.v2",
+  "contract_id": "rebar-tested-source-a1a87d11-v2",
+  "tested_source": {
     "commit": "a1a87d11f923973c4148743fcaddb119965c518b",
     "tree": "2cc1247598615e0b93ef3e3dfa1288fd49ced14c"
   },

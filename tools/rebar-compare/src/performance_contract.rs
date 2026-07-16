@@ -1,4 +1,4 @@
-//! Executable current-main performance qualification contract.
+//! Executable immutable-tested-source performance qualification contract.
 //!
 //! This module deliberately validates coverage before it accepts timing
 //! observations. A benchmark row cannot disappear because it is unsupported,
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{CompareError, CurrentFreCaptureLifecycle, InputReceipt, Report, Status, report_bytes};
 
 /// Stable schema for a performance qualification contract.
-pub const PERFORMANCE_CONTRACT_SCHEMA: &str = "fre.rebar.performance-contract.v1";
+pub const PERFORMANCE_CONTRACT_SCHEMA: &str = "fre.rebar.performance-contract.v2";
 /// Stable schema for pointwise performance observations.
 pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observations.v2";
 /// Stable schema for one raw current-FRE capture lifecycle sample.
@@ -77,15 +77,13 @@ impl fmt::Display for ContractError {
 
 impl std::error::Error for ContractError {}
 
-/// Exact canonical Git identity required by the contract.
+/// Exact immutable Git source identity measured by the contract.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct CanonicalIdentity {
-    /// Protected canonical reference.
-    pub reference: String,
-    /// Exact canonical commit.
+pub struct TestedSourceIdentity {
+    /// Exact tested source commit.
     pub commit: String,
-    /// Exact canonical tree.
+    /// Exact tested source tree.
     pub tree: String,
 }
 
@@ -201,8 +199,8 @@ pub struct PerformanceContract {
     pub schema: String,
     /// Stable human-readable contract ID.
     pub contract_id: String,
-    /// Exact canonical Git identity.
-    pub canonical: CanonicalIdentity,
+    /// Exact immutable Git source identity measured by this contract.
+    pub tested_source: TestedSourceIdentity,
     /// Exact semantic frontier.
     pub semantic: SemanticIdentity,
     /// All seven model contracts.
@@ -355,9 +353,9 @@ pub struct PerformanceObservations {
     pub schema: String,
     /// Exact contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt-array digest.
     pub semantic_receipts_sha256: String,
@@ -411,9 +409,9 @@ impl CaptureLifecycleBoundary {
 pub struct CaptureLifecycleObservationIdentity {
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt-array digest.
     pub semantic_receipts_sha256: String,
@@ -435,9 +433,9 @@ pub struct CaptureLifecycleRawObservation {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt-array digest.
     pub semantic_receipts_sha256: String,
@@ -523,9 +521,9 @@ pub struct CapturePairSchedule {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -581,9 +579,9 @@ pub struct PerformancePairSchedule {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -616,9 +614,9 @@ pub enum PerformanceLifecyclePreparation {
 pub struct PerformanceCandidateObservationIdentity {
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -650,9 +648,9 @@ pub struct PerformanceCandidateObservationIdentity {
 pub struct PerformanceReferenceObservationIdentity {
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -682,9 +680,9 @@ pub struct PerformanceRawObservation {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -745,9 +743,9 @@ pub struct PerformanceResourceRawObservation {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -849,9 +847,9 @@ pub struct PerformanceRunnerManifest {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -927,9 +925,9 @@ pub struct PerformanceExecutionPacket {
     pub pair_schedule_sha256: String,
     /// SHA-256 of the canonical current-FRE runner manifest.
     pub runner_manifest_sha256: String,
-    /// Exact canonical commit repeated from the contract.
+    /// Exact tested-source commit repeated from the contract (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree repeated from the contract.
+    /// Exact tested-source tree repeated from the contract (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic adapter implemented by the candidate wrapper.
     pub candidate_adapter: String,
@@ -1047,9 +1045,9 @@ pub struct CaptureReferenceRawObservation {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -1133,9 +1131,9 @@ pub struct CaptureResourceRawObservation {
     pub schema: String,
     /// Exact performance contract ID.
     pub contract_id: String,
-    /// Exact canonical commit.
+    /// Exact tested-source commit (legacy artifact field name).
     pub canonical_commit: String,
-    /// Exact canonical tree.
+    /// Exact tested-source tree (legacy artifact field name).
     pub canonical_tree: String,
     /// Exact semantic receipt digest.
     pub semantic_receipts_sha256: String,
@@ -1324,8 +1322,8 @@ pub fn generate_draft_observations(
     let observations = PerformanceObservations {
         schema: PERFORMANCE_OBSERVATIONS_SCHEMA.to_string(),
         contract_id: contract.contract_id.clone(),
-        canonical_commit: contract.canonical.commit.clone(),
-        canonical_tree: contract.canonical.tree.clone(),
+        canonical_commit: contract.tested_source.commit.clone(),
+        canonical_tree: contract.tested_source.tree.clone(),
         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
         phase: ObservationPhase::Draft,
         rows,
@@ -2012,8 +2010,8 @@ pub fn validate_capture_lifecycle_observation(
     validate_contract(contract)?;
     validate_capture_observation_shape(observation)?;
     if observation.contract_id != contract.contract_id
-        || observation.canonical_commit != contract.canonical.commit
-        || observation.canonical_tree != contract.canonical.tree
+        || observation.canonical_commit != contract.tested_source.commit
+        || observation.canonical_tree != contract.tested_source.tree
         || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
     {
         return Err(ContractError::new(
@@ -2071,8 +2069,8 @@ pub fn generate_capture_pair_schedule(
     let schedule = CapturePairSchedule {
         schema: CAPTURE_PAIR_SCHEDULE_SCHEMA.to_string(),
         contract_id: contract.contract_id.clone(),
-        canonical_commit: contract.canonical.commit.clone(),
-        canonical_tree: contract.canonical.tree.clone(),
+        canonical_commit: contract.tested_source.commit.clone(),
+        canonical_tree: contract.tested_source.tree.clone(),
         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
         pairs_per_comparator,
         slots,
@@ -2093,8 +2091,8 @@ pub fn validate_capture_pair_schedule(
     let pairs = contract.reporting.pairs_per_comparator;
     if schedule.schema != CAPTURE_PAIR_SCHEDULE_SCHEMA
         || schedule.contract_id != contract.contract_id
-        || schedule.canonical_commit != contract.canonical.commit
-        || schedule.canonical_tree != contract.canonical.tree
+        || schedule.canonical_commit != contract.tested_source.commit
+        || schedule.canonical_tree != contract.tested_source.tree
         || schedule.semantic_receipts_sha256 != contract.semantic.receipts_sha256
         || schedule.pairs_per_comparator != pairs
     {
@@ -2122,8 +2120,8 @@ pub fn generate_performance_pair_schedule(
     let schedule = PerformancePairSchedule {
         schema: PERFORMANCE_PAIR_SCHEDULE_SCHEMA.to_string(),
         contract_id: contract.contract_id.clone(),
-        canonical_commit: contract.canonical.commit.clone(),
-        canonical_tree: contract.canonical.tree.clone(),
+        canonical_commit: contract.tested_source.commit.clone(),
+        canonical_tree: contract.tested_source.tree.clone(),
         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
         pairs_per_comparator: contract.reporting.pairs_per_comparator,
         slots,
@@ -2143,8 +2141,8 @@ pub fn validate_performance_pair_schedule(
     validate_contract(contract)?;
     if schedule.schema != PERFORMANCE_PAIR_SCHEDULE_SCHEMA
         || schedule.contract_id != contract.contract_id
-        || schedule.canonical_commit != contract.canonical.commit
-        || schedule.canonical_tree != contract.canonical.tree
+        || schedule.canonical_commit != contract.tested_source.commit
+        || schedule.canonical_tree != contract.tested_source.tree
         || schedule.semantic_receipts_sha256 != contract.semantic.receipts_sha256
         || schedule.pairs_per_comparator != contract.reporting.pairs_per_comparator
     {
@@ -2172,8 +2170,8 @@ pub fn generate_performance_runner_manifest(
     let manifest = PerformanceRunnerManifest {
         schema: PERFORMANCE_RUNNER_MANIFEST_SCHEMA.to_string(),
         contract_id: contract.contract_id.clone(),
-        canonical_commit: contract.canonical.commit.clone(),
-        canonical_tree: contract.canonical.tree.clone(),
+        canonical_commit: contract.tested_source.commit.clone(),
+        canonical_tree: contract.tested_source.tree.clone(),
         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
         rows,
     };
@@ -2261,8 +2259,8 @@ pub fn validate_performance_runner_manifest(
     validate_contract(contract)?;
     if manifest.schema != PERFORMANCE_RUNNER_MANIFEST_SCHEMA
         || manifest.contract_id != contract.contract_id
-        || manifest.canonical_commit != contract.canonical.commit
-        || manifest.canonical_tree != contract.canonical.tree
+        || manifest.canonical_commit != contract.tested_source.commit
+        || manifest.canonical_tree != contract.tested_source.tree
         || manifest.semantic_receipts_sha256 != contract.semantic.receipts_sha256
     {
         return Err(ContractError::new(
@@ -2332,8 +2330,8 @@ pub fn validate_performance_execution_packet(
         || packet.expanded_manifest_sha256 != contract.semantic.manifest_sha256
         || packet.pair_schedule_sha256 != digest(&schedule_bytes)
         || packet.runner_manifest_sha256 != digest(&runner_manifest_bytes)
-        || packet.canonical_commit != contract.canonical.commit
-        || packet.canonical_tree != contract.canonical.tree
+        || packet.canonical_commit != contract.tested_source.commit
+        || packet.canonical_tree != contract.tested_source.tree
         || packet.candidate_adapter != contract.semantic.fre_adapter
     {
         return Err(ContractError::new(
@@ -2880,8 +2878,8 @@ pub fn validate_performance_raw_observation(
     validate_contract(contract)?;
     validate_performance_raw_observation_shape(observation, expected_arm)?;
     if observation.contract_id != contract.contract_id
-        || observation.canonical_commit != contract.canonical.commit
-        || observation.canonical_tree != contract.canonical.tree
+        || observation.canonical_commit != contract.tested_source.commit
+        || observation.canonical_tree != contract.tested_source.tree
         || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
     {
         return Err(ContractError::new(
@@ -2968,8 +2966,11 @@ pub fn validate_performance_candidate_observation_request(
     identity: &PerformanceCandidateObservationIdentity,
 ) -> Result<(), ContractError> {
     require_token(&identity.contract_id, "performance contract ID")?;
-    require_oid(&identity.canonical_commit, "performance canonical commit")?;
-    require_oid(&identity.canonical_tree, "performance canonical tree")?;
+    require_oid(
+        &identity.canonical_commit,
+        "performance tested-source commit",
+    )?;
+    require_oid(&identity.canonical_tree, "performance tested-source tree")?;
     require_digest(
         &identity.semantic_receipts_sha256,
         "performance semantic receipts",
@@ -3002,8 +3003,11 @@ fn validate_performance_reference_identity_shape(
     identity: &PerformanceReferenceObservationIdentity,
 ) -> Result<(), ContractError> {
     require_token(&identity.contract_id, "performance contract ID")?;
-    require_oid(&identity.canonical_commit, "performance canonical commit")?;
-    require_oid(&identity.canonical_tree, "performance canonical tree")?;
+    require_oid(
+        &identity.canonical_commit,
+        "performance tested-source commit",
+    )?;
+    require_oid(&identity.canonical_tree, "performance tested-source tree")?;
     require_digest(
         &identity.semantic_receipts_sha256,
         "performance semantic receipts",
@@ -3031,11 +3035,11 @@ fn validate_performance_raw_observation_shape(
     require_token(&observation.contract_id, "performance raw contract ID")?;
     require_oid(
         &observation.canonical_commit,
-        "performance raw canonical commit",
+        "performance raw tested-source commit",
     )?;
     require_oid(
         &observation.canonical_tree,
-        "performance raw canonical tree",
+        "performance raw tested-source tree",
     )?;
     require_digest(
         &observation.semantic_receipts_sha256,
@@ -3339,8 +3343,8 @@ pub fn validate_performance_resource_observation(
 ) -> Result<(), ContractError> {
     if observation.schema != PERFORMANCE_RESOURCE_RAW_SCHEMA
         || observation.contract_id != contract.contract_id
-        || observation.canonical_commit != contract.canonical.commit
-        || observation.canonical_tree != contract.canonical.tree
+        || observation.canonical_commit != contract.tested_source.commit
+        || observation.canonical_tree != contract.tested_source.tree
         || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
         || observation.collector != *collector
         || observation.arm != expected_arm
@@ -3791,8 +3795,8 @@ pub fn validate_capture_resource_observation(
 ) -> Result<(), ContractError> {
     if observation.schema != CAPTURE_RESOURCE_RAW_SCHEMA
         || observation.contract_id != contract.contract_id
-        || observation.canonical_commit != contract.canonical.commit
-        || observation.canonical_tree != contract.canonical.tree
+        || observation.canonical_commit != contract.tested_source.commit
+        || observation.canonical_tree != contract.tested_source.tree
         || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
         || observation.collector != *collector
         || observation.arm != expected_arm
@@ -4114,8 +4118,8 @@ fn validate_capture_reference_observation(
 ) -> Result<(), ContractError> {
     if observation.schema != CAPTURE_REFERENCE_RAW_SCHEMA
         || observation.contract_id != contract.contract_id
-        || observation.canonical_commit != contract.canonical.commit
-        || observation.canonical_tree != contract.canonical.tree
+        || observation.canonical_commit != contract.tested_source.commit
+        || observation.canonical_tree != contract.tested_source.tree
         || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
     {
         return Err(ContractError::new(
@@ -4265,8 +4269,11 @@ fn validate_capture_identity_shape(
     identity: &CaptureLifecycleObservationIdentity,
 ) -> Result<(), ContractError> {
     require_token(&identity.contract_id, "raw capture contract ID")?;
-    require_oid(&identity.canonical_commit, "raw capture canonical commit")?;
-    require_oid(&identity.canonical_tree, "raw capture canonical tree")?;
+    require_oid(
+        &identity.canonical_commit,
+        "raw capture tested-source commit",
+    )?;
+    require_oid(&identity.canonical_tree, "raw capture tested-source tree")?;
     require_digest(
         &identity.semantic_receipts_sha256,
         "raw capture semantic receipts",
@@ -4381,21 +4388,28 @@ pub fn read_capture_resource_observation(
     Ok(observation)
 }
 
-/// Resolve the exact protected main commit and tree from `repo`.
-pub fn resolve_exact_main(repo: &Path) -> Result<CanonicalIdentity, ContractError> {
+/// Resolve the immutable tested-source commit and tree from `repo`.
+///
+/// This deliberately resolves the contract's exact commit object. It does not
+/// read `refs/heads/main`, so later canonical integration cannot invalidate
+/// historical performance evidence.
+pub fn resolve_tested_source(
+    repo: &Path,
+    expected: &TestedSourceIdentity,
+) -> Result<TestedSourceIdentity, ContractError> {
     if !repo.is_dir() {
         return Err(ContractError::new(format!(
             "repository root {} is not a directory",
             repo.display()
         )));
     }
-    let commit = git_object(repo, "refs/heads/main^{commit}")?;
-    let tree = git_object(repo, "refs/heads/main^{tree}")?;
-    Ok(CanonicalIdentity {
-        reference: "refs/heads/main".to_string(),
-        commit,
-        tree,
-    })
+    require_oid(&expected.commit, "tested source commit")?;
+    require_oid(&expected.tree, "tested source tree")?;
+    let commit_revision = format!("{}^{{commit}}", expected.commit);
+    let tree_revision = format!("{}^{{tree}}", expected.commit);
+    let commit = git_object(repo, &commit_revision)?;
+    let tree = git_object(repo, &tree_revision)?;
+    Ok(TestedSourceIdentity { commit, tree })
 }
 
 fn git_object(repo: &Path, revision: &str) -> Result<String, ContractError> {
@@ -4427,13 +4441,8 @@ pub fn validate_contract(contract: &PerformanceContract) -> Result<(), ContractE
         )));
     }
     require_token(&contract.contract_id, "contract_id")?;
-    if contract.canonical.reference != "refs/heads/main" {
-        return Err(ContractError::new(
-            "canonical reference must be exactly refs/heads/main",
-        ));
-    }
-    require_oid(&contract.canonical.commit, "canonical commit")?;
-    require_oid(&contract.canonical.tree, "canonical tree")?;
+    require_oid(&contract.tested_source.commit, "tested source commit")?;
+    require_oid(&contract.tested_source.tree, "tested source tree")?;
     validate_semantic_identity(&contract.semantic)?;
 
     let expected_models: BTreeSet<&str> = REBAR_MODELS.into_iter().collect();
@@ -4660,15 +4669,15 @@ fn validate_reporting_policy(reporting: &ReportingPolicy) -> Result<(), Contract
     Ok(())
 }
 
-/// Require the observed protected main identity to equal the contract.
-pub fn validate_exact_main(
+/// Require the resolved immutable tested-source identity to equal the contract.
+pub fn validate_tested_source(
     contract: &PerformanceContract,
-    observed: &CanonicalIdentity,
+    observed: &TestedSourceIdentity,
 ) -> Result<(), ContractError> {
-    if observed != &contract.canonical {
+    if observed != &contract.tested_source {
         return Err(ContractError::new(format!(
-            "observed canonical identity {observed:?} differs from contract {:?}",
-            contract.canonical
+            "observed tested-source identity {observed:?} differs from contract {:?}",
+            contract.tested_source
         )));
     }
     Ok(())
@@ -4909,12 +4918,12 @@ pub fn validate_observations(
 ) -> Result<(), ContractError> {
     if observations.schema != PERFORMANCE_OBSERVATIONS_SCHEMA
         || observations.contract_id != contract.contract_id
-        || observations.canonical_commit != contract.canonical.commit
-        || observations.canonical_tree != contract.canonical.tree
+        || observations.canonical_commit != contract.tested_source.commit
+        || observations.canonical_tree != contract.tested_source.tree
         || observations.semantic_receipts_sha256 != contract.semantic.receipts_sha256
     {
         return Err(ContractError::new(
-            "observation schema, contract, canonical identity, or semantic identity mismatch",
+            "observation schema, contract, tested-source identity, or semantic identity mismatch",
         ));
     }
     if observations.rows.len() != universe.rows.len() {
@@ -5314,11 +5323,29 @@ mod tests {
     use super::*;
     use crate::{AdapterIdentity, Coverage, InputReceipt, Receipt};
 
-    const CURRENT_CONTRACT: &str =
-        include_str!("../../../research/rebar/performance/current-main-a1a87d11-contract.json");
+    const TESTED_SOURCE_CONTRACT: &str =
+        include_str!("../../../research/rebar/performance/tested-source-a1a87d11-contract.json");
 
     fn contract() -> PerformanceContract {
-        serde_json::from_str(CURRENT_CONTRACT).expect("checked-in contract decodes")
+        serde_json::from_str(TESTED_SOURCE_CONTRACT).expect("checked-in contract decodes")
+    }
+
+    fn test_git(repo: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(repo)
+            .args(arguments)
+            .output()
+            .expect("execute fixture git");
+        assert!(
+            output.status.success(),
+            "fixture git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("fixture git output is UTF-8")
+            .trim_end()
+            .to_string()
     }
 
     fn receipt(
@@ -5484,8 +5511,8 @@ mod tests {
                     candidate: CaptureLifecycleRawObservation {
                         schema: CAPTURE_LIFECYCLE_RAW_SCHEMA.to_string(),
                         contract_id: contract.contract_id.clone(),
-                        canonical_commit: contract.canonical.commit.clone(),
-                        canonical_tree: contract.canonical.tree.clone(),
+                        canonical_commit: contract.tested_source.commit.clone(),
+                        canonical_tree: contract.tested_source.tree.clone(),
                         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
                         job_id: slot.job_id.clone(),
                         benchmark: semantic.benchmark.clone(),
@@ -5507,8 +5534,8 @@ mod tests {
                     reference: CaptureReferenceRawObservation {
                         schema: CAPTURE_REFERENCE_RAW_SCHEMA.to_string(),
                         contract_id: contract.contract_id.clone(),
-                        canonical_commit: contract.canonical.commit.clone(),
-                        canonical_tree: contract.canonical.tree.clone(),
+                        canonical_commit: contract.tested_source.commit.clone(),
+                        canonical_tree: contract.tested_source.tree.clone(),
                         semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
                         job_id: slot.job_id.clone(),
                         benchmark: semantic.benchmark.clone(),
@@ -5548,8 +5575,8 @@ mod tests {
                 let raw = |arm: CapturePairArm, elapsed_ns: u64| PerformanceRawObservation {
                     schema: PERFORMANCE_RAW_SCHEMA.to_string(),
                     contract_id: contract.contract_id.clone(),
-                    canonical_commit: contract.canonical.commit.clone(),
-                    canonical_tree: contract.canonical.tree.clone(),
+                    canonical_commit: contract.tested_source.commit.clone(),
+                    canonical_tree: contract.tested_source.tree.clone(),
                     semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
                     job_id: slot.job_id.clone(),
                     benchmark: semantic.benchmark.clone(),
@@ -5616,8 +5643,8 @@ mod tests {
                 let raw = |arm: CapturePairArm, base: u64| PerformanceResourceRawObservation {
                     schema: PERFORMANCE_RESOURCE_RAW_SCHEMA.to_string(),
                     contract_id: contract.contract_id.clone(),
-                    canonical_commit: contract.canonical.commit.clone(),
-                    canonical_tree: contract.canonical.tree.clone(),
+                    canonical_commit: contract.tested_source.commit.clone(),
+                    canonical_tree: contract.tested_source.tree.clone(),
                     semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
                     job_id: slot.job_id.clone(),
                     benchmark: semantic.benchmark.clone(),
@@ -5684,8 +5711,8 @@ mod tests {
                 let raw = |arm: ResourceObservationArm, base: u64| CaptureResourceRawObservation {
                     schema: CAPTURE_RESOURCE_RAW_SCHEMA.to_string(),
                     contract_id: contract.contract_id.clone(),
-                    canonical_commit: contract.canonical.commit.clone(),
-                    canonical_tree: contract.canonical.tree.clone(),
+                    canonical_commit: contract.tested_source.commit.clone(),
+                    canonical_tree: contract.tested_source.tree.clone(),
                     semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
                     job_id: slot.job_id.clone(),
                     benchmark: semantic.benchmark.clone(),
@@ -5756,13 +5783,92 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_contract_covers_every_model_and_exact_main() {
+    fn checked_in_contract_covers_every_model_and_tested_source() {
         let contract = contract();
         validate_contract(&contract).expect("checked-in contract validates");
-        validate_exact_main(&contract, &contract.canonical).expect("exact identity validates");
-        let mut moved = contract.canonical.clone();
+        validate_tested_source(&contract, &contract.tested_source)
+            .expect("exact identity validates");
+        let mut moved = contract.tested_source.clone();
         moved.commit = "0".repeat(40);
-        assert!(validate_exact_main(&contract, &moved).is_err());
+        assert!(validate_tested_source(&contract, &moved).is_err());
+    }
+
+    #[test]
+    fn tested_source_contract_survives_main_movement_without_retargeting() {
+        let repository = std::env::temp_dir().join(format!(
+            "fre-rebar-tested-source-contract-{}",
+            std::process::id()
+        ));
+        if repository.exists() {
+            fs::remove_dir_all(&repository).expect("remove stale fixture repository");
+        }
+        fs::create_dir(&repository).expect("create fixture repository");
+        test_git(&repository, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(repository.join("source.txt"), b"first\n").expect("write first source");
+        test_git(&repository, &["add", "source.txt"]);
+        test_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=FRE fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "first source",
+            ],
+        );
+        let tested_source = TestedSourceIdentity {
+            commit: git_object(&repository, "HEAD^{commit}").expect("first commit"),
+            tree: git_object(&repository, "HEAD^{tree}").expect("first tree"),
+        };
+        fs::write(repository.join("source.txt"), b"second\n").expect("write second source");
+        test_git(&repository, &["add", "source.txt"]);
+        test_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=FRE fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "move main",
+            ],
+        );
+        assert_ne!(
+            git_object(&repository, "refs/heads/main^{commit}").expect("moved main"),
+            tested_source.commit
+        );
+
+        let mut contract = contract();
+        contract.tested_source = tested_source;
+        let observed = resolve_tested_source(&repository, &contract.tested_source)
+            .expect("historical tested source remains resolvable after main moves");
+        validate_tested_source(&contract, &observed)
+            .expect("resolved historical source matches the contract");
+
+        let mut wrong_tree = contract.tested_source.clone();
+        wrong_tree.tree = "0".repeat(40);
+        let observed = resolve_tested_source(&repository, &wrong_tree)
+            .expect("the exact commit resolves independently of the claimed tree");
+        assert!(
+            validate_tested_source(
+                &PerformanceContract {
+                    tested_source: wrong_tree,
+                    ..contract
+                },
+                &observed
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(repository).expect("remove fixture repository");
     }
 
     #[test]
@@ -5854,8 +5960,8 @@ mod tests {
         .expect("capture lifecycle");
         let identity = CaptureLifecycleObservationIdentity {
             contract_id: contract.contract_id.clone(),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
+            canonical_commit: contract.tested_source.commit.clone(),
+            canonical_tree: contract.tested_source.tree.clone(),
             semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
             job_id: "fixture/count-captures@rust/regex".to_string(),
             benchmark: "fixture/count-captures".to_string(),
@@ -5928,8 +6034,8 @@ mod tests {
         let mut observation = CaptureLifecycleRawObservation {
             schema: CAPTURE_LIFECYCLE_RAW_SCHEMA.to_string(),
             contract_id: contract.contract_id.clone(),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
+            canonical_commit: contract.tested_source.commit.clone(),
+            canonical_tree: contract.tested_source.tree.clone(),
             semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
             job_id: "fixture/count-captures/row-000@rust/regex".to_string(),
             benchmark: "fixture/count-captures/row-000".to_string(),
@@ -6227,8 +6333,8 @@ mod tests {
         let comparator = contract.reporting.comparators[0].id.clone();
         let identity = PerformanceCandidateObservationIdentity {
             contract_id: contract.contract_id.clone(),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
+            canonical_commit: contract.tested_source.commit.clone(),
+            canonical_tree: contract.tested_source.tree.clone(),
             semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
             job_id: job_id.clone(),
             benchmark: semantic.benchmark.clone(),
@@ -6391,8 +6497,8 @@ mod tests {
         let comparator = contract.reporting.comparators[0].id.clone();
         let identity = PerformanceReferenceObservationIdentity {
             contract_id: contract.contract_id.clone(),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
+            canonical_commit: contract.tested_source.commit.clone(),
+            canonical_tree: contract.tested_source.tree.clone(),
             semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
             job_id: job_id.clone(),
             benchmark: semantic.benchmark.clone(),
@@ -6660,8 +6766,8 @@ mod tests {
             runner_manifest_sha256: digest(
                 &performance_runner_manifest_bytes(&runner_manifest).expect("manifest bytes"),
             ),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
+            canonical_commit: contract.tested_source.commit.clone(),
+            canonical_tree: contract.tested_source.tree.clone(),
             candidate_adapter: contract.semantic.fre_adapter.clone(),
             executor: executable('6', "fixture-pair-executor-v1"),
             candidate_wrapper: executable('7', "fixture-candidate-wrapper-v1"),

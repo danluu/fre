@@ -1,10 +1,18 @@
-# Current-main Rebar performance contract
+# Immutable tested-source Rebar performance contract
 
-`current-main-a1a87d11-contract.json` is an executable coverage and reporting
-contract, not a timing result. It binds exact canonical main, its independently
-reproduced semantic receipt set, all 344 Rust-target rows, all seven Rebar
-models, and the lifecycle boundaries that must be reported for each supported
-row.
+`tested-source-a1a87d11-contract.json` is an executable historical coverage
+and reporting contract, not a timing result and not a gate on the current live
+`refs/heads/main`. It binds the immutable tested source commit and tree, its
+independently reproduced semantic receipt set, all 344 Rust-target rows, all
+seven Rebar models, and the lifecycle boundaries that must be reported for
+each supported row. The command resolves that exact commit object in the
+provided repository; advancing `main` neither invalidates nor silently
+retargets this evidence. A new source frontier requires a new contract.
+
+Existing observation, schedule, and packet wire schemas retain the field names
+`canonical_commit` and `canonical_tree` for compatibility. In a v2 contract
+those fields carry the immutable `tested_source` identity; they are never
+re-resolved from the live canonical ref.
 
 The contract deliberately keeps all 87 unsupported rows in the denominator.
 A pointwise observation artifact has exactly one row for every semantic FRE
@@ -14,12 +22,12 @@ explicit `not-comparable` point with a reason. Unsupported rows retain their
 exact semantic reason. A qualification artifact cannot contain `pending`
 points, and no aggregate can substitute for a missing or failed point.
 
-Validate only the contract and protected main identity:
+Validate only the contract and immutable tested-source identity:
 
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   validate-contract \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre
 ```
 
@@ -28,7 +36,7 @@ Authenticate the bound full semantic report and its exact 344-row universe:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   validate-semantic \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json
 ```
@@ -38,10 +46,10 @@ Generate a new coverage-complete pending draft without running timing:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   generate-draft \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json \
-  /new/path/current-main-draft.json
+  /new/path/tested-source-draft.json
 ```
 
 Generation refuses to overwrite an existing output. The compact JSON contains
@@ -57,13 +65,13 @@ any benchmark:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   generate-pair-schedule \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json \
-  /new/path/current-main-pair-schedule.json
+  /new/path/tested-source-pair-schedule.json
 ```
 
-For the accepted current-main report this produces 5,772 six-pair slots and
+For the accepted tested-source report this produces 5,772 six-pair slots and
 11,544 fresh-process arms across 962 available lifecycle/comparator points.
 The other 66 points remain explicit unavailable records with their exact
 semantic reasons. The schedule covers every supported model and boundary;
@@ -77,10 +85,10 @@ executing a benchmark:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   generate-runner-manifest \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json \
-  /new/path/current-main-runner-manifest.json
+  /new/path/tested-source-runner-manifest.json
 ```
 
 For the accepted report this binds all 257 supported rows to an exact runner
@@ -94,7 +102,7 @@ pair slots and 66 unavailable points from the semantic universe. This is an
 execution admission artifact; it does not itself run timing.
 
 Each scheduled arm has one canonical `fre.rebar.performance-raw.v2` record.
-It binds the exact contract/canonical/semantic identity, job, model, lifecycle
+It binds the exact contract/tested-source/semantic identity, job, model, lifecycle
 boundary, comparator and candidate/reference role, complete input and reducer,
 candidate plan where applicable, exact cold/allocator-initialized/built/primed
 process-artifact preparation, lifecycle prime count, one measured operation,
@@ -110,7 +118,7 @@ Validate a coverage-complete draft or final pointwise observation file:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   validate-observations \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json \
   /absolute/path/to/observations.json
@@ -121,7 +129,7 @@ authenticated, already-built lifecycle producers for the three supported
 `count-captures` rows and five supported `grep-captures` rows: the first call
 is the first-operation boundary and repeated calls on the same artifact are
 steady-operation boundaries. Capture runner invocations now require an exact
-boundary plus contract/canonical/semantic/job identity. They emit canonical
+boundary plus contract/tested-source/semantic/job identity. They emit canonical
 `fre.rebar.capture-lifecycle-raw.v1` JSON: first-operation records have no
 prime; steady-operation records authenticate one untimed successful prime
 before their single measured call, and every arm carries a unique fresh-process
@@ -130,7 +138,7 @@ token. Raw records can be checked with:
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
   validate-capture-observation \
-  research/rebar/performance/current-main-a1a87d11-contract.json \
+  research/rebar/performance/tested-source-a1a87d11-contract.json \
   /Users/danluu/dev/fre \
   /absolute/path/to/full344.json \
   /absolute/path/to/raw-capture.json
@@ -150,7 +158,7 @@ exact job/boundary/comparator point. Each candidate and reference arm reports
 allocator-call count, allocated bytes, bytes still live after the boundary,
 and process peak RSS through an expected collector ID and immutable collector
 digest. The canonical `fre.rebar.performance-resource-raw.v1` record also binds
-canonical/semantic/input/result, candidate plan or reference role, exact
+tested-source/semantic/input/result, candidate plan or reference role, exact
 lifecycle preparation and priming, and a unique process token. On the accepted
 frontier, 46,176 raw metric samples (5,772 pairs times two arms times four
 metrics) convert to 7,696 measured resource summaries while the 66 semantic
