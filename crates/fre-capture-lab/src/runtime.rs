@@ -35,6 +35,12 @@ pub(crate) fn assertion_matches(
             position == window.start || left_byte.is_some_and(|&byte| byte == b'\n')
         }
         Assertion::EndLf => position == window.end || right_byte.is_some_and(|&byte| byte == b'\n'),
+        Assertion::StartLine(terminator) => {
+            position == window.start || left_byte.is_some_and(|&byte| byte == terminator)
+        }
+        Assertion::EndLine(terminator) => {
+            position == window.end || right_byte.is_some_and(|&byte| byte == terminator)
+        }
         Assertion::StartCrlf => {
             position == window.start
                 || left_byte == Some(&b'\n')
