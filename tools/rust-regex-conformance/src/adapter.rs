@@ -9,9 +9,9 @@ use std::{
 
 use bstr::ByteVec;
 use fre::{
-    BuildError, PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder,
-    PortableTextRegex, PortableTextSearchError, RustProfile, SearchError, SearchLimits,
-    SearchWindow,
+    BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
+    PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder, PortableTextRegex,
+    PortableTextSearchError, RustProfile, SearchError, SearchLimits, SearchWindow,
 };
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
@@ -27,12 +27,12 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v4";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v5";
 
 const LIMITATIONS: [&str; 3] = [
     "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE facade has no Rust text or bytes RegexSet matcher",
-    "the production FRE facade has no capture iterator",
+    "the production FRE Rust text facade has no capture iterator; the Rust bytes capture iterator is restricted to its certified non-Unicode persistent-history subset",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -51,7 +51,7 @@ pub struct ExpectedSpan {
 }
 
 /// One expected match with all participating or absent capture slots.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ExpectedCaptures {
     pub pattern_id: usize,
     pub groups: Vec<Option<ExpectedSpan>>,
@@ -153,12 +153,11 @@ fn execute_case(
         AdapterSurface::RustTextCompile => execute_text_compile(case, input),
         AdapterSurface::RustTextIsMatch => execute_text_is_match(case, input),
         AdapterSurface::RustTextFindIter => execute_text_find(case, input),
-        AdapterSurface::RustTextCapturesIter | AdapterSurface::RustBytesCapturesIter => {
-            unsupported(
-                CapabilityId::CaptureIteration,
-                "operation.captures-iter-missing",
-            )
-        }
+        AdapterSurface::RustTextCapturesIter => unsupported(
+            CapabilityId::CaptureIteration,
+            "facade.rust-text-captures-missing",
+        ),
+        AdapterSurface::RustBytesCapturesIter => execute_bytes_captures(case, input),
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
         | AdapterSurface::RustTextSetWhich => unsupported(
@@ -518,6 +517,7 @@ enum SemanticValue {
     CompileAccepted(bool),
     IsMatch(bool),
     Matches(Vec<ExpectedSpan>),
+    Captures(Vec<ExpectedCaptures>),
 }
 
 enum BuildAttempt {
@@ -529,6 +529,13 @@ enum BuildAttempt {
 
 enum TextBuildAttempt {
     Built(Box<PortableTextRegex>),
+    Rejected,
+    Unsupported(AdapterDisposition),
+    Fault(AdapterDisposition),
+}
+
+enum CaptureBuildAttempt {
+    Built(Box<CaptureRegex>),
     Rejected,
     Unsupported(AdapterDisposition),
     Fault(AdapterDisposition),
@@ -803,6 +810,110 @@ fn collect_byte_matches(
         last_match_end = Some(matched.end());
     }
     Ok(spans)
+}
+
+fn execute_bytes_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::Captures(input.expected.clone());
+    let regex = match build_captures(case, input) {
+        CaptureBuildAttempt::Built(regex) => regex,
+        CaptureBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        CaptureBuildAttempt::Unsupported(disposition) | CaptureBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(report) = regex.captures_iter(&input.haystack, CaptureAggregateLimits::default()) else {
+        return unsupported(
+            CapabilityId::CaptureIteration,
+            "search.capture-execution-refused",
+        );
+    };
+    let Ok(mut observed) = capture_records(&report.captures, input.haystack.len()) else {
+        return fault("adapter.capture-record-invariant");
+    };
+    if let Some(limit) = case.match_limit {
+        observed.truncate(limit);
+    }
+    compare(&expected, &SemanticValue::Captures(observed))
+}
+
+fn build_captures(case: &CaseReceipt, input: &ExecutableCase) -> CaptureBuildAttempt {
+    let Some(pattern) = input.patterns.first() else {
+        return CaptureBuildAttempt::Fault(fault("adapter.single-pattern-missing"));
+    };
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = case.case_insensitive;
+    profile.options.unicode = case.unicode;
+    profile.options.line_terminator = input.line_terminator;
+    match CaptureBuilder::new(pattern.clone())
+        .profile(profile)
+        .build()
+    {
+        Ok(regex) => CaptureBuildAttempt::Built(Box::new(regex)),
+        Err(CaptureBuildError::Syntax(error))
+            if matches!(&error.category, ErrorCategory::UpstreamRustSyntax) =>
+        {
+            CaptureBuildAttempt::Rejected
+        }
+        Err(CaptureBuildError::InternalInvariant(_)) => {
+            CaptureBuildAttempt::Fault(fault("build.capture-internal-fault"))
+        }
+        Err(_) => CaptureBuildAttempt::Unsupported(unsupported(
+            CapabilityId::CaptureIteration,
+            "build.capture-subset-gap",
+        )),
+    }
+}
+
+fn capture_records(
+    records: &[fre::CaptureRecord],
+    haystack_len: usize,
+) -> Result<Vec<ExpectedCaptures>, InventoryError> {
+    records
+        .iter()
+        .map(|record| {
+            let groups = record
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(index, group)| {
+                    if usize::try_from(group.index).ok() != Some(index) {
+                        return Err(InventoryError::new(
+                            "capture group records are not in numeric order",
+                        ));
+                    }
+                    group
+                        .span
+                        .map(|span| {
+                            if span.start > span.end || span.end > haystack_len {
+                                return Err(InventoryError::new(
+                                    "capture group record is outside the haystack",
+                                ));
+                            }
+                            Ok(ExpectedSpan {
+                                start: span.start,
+                                end: span.end,
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if groups.first().is_none_or(Option::is_none) {
+                return Err(InventoryError::new(
+                    "capture record lacks participating group zero",
+                ));
+            }
+            Ok(ExpectedCaptures {
+                pattern_id: 0,
+                groups,
+            })
+        })
+        .collect()
 }
 
 fn expected_spans(input: &ExecutableCase) -> Result<Vec<ExpectedSpan>, InventoryError> {
@@ -1258,10 +1369,7 @@ mod tests {
         ));
         assert!(matches!(
             execute_case(AdapterSurface::RustBytesCapturesIter, &case, &input),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::CaptureIteration,
-                ..
-            }
+            AdapterDisposition::Pass { .. }
         ));
 
         let text_limited = fixture_case(true, true, Some(1));

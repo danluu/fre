@@ -42,11 +42,13 @@ produce the same ordered language and every word is valid UTF-8. Its bounded
 non-finite slice requires identical HIRs whose matches are valid UTF-8 and
 either positive minimum width or no assertions when nullable. Complete
 non-overlapping match iteration uses checked contextual windows and reproduces
-Rust's empty-match progression, including UTF-8 scalar boundaries. Missing
-set and capture-iteration operations plus unproved text execution remain
-stable `unsupported` receipts. Inapplicable upstream surface combinations
-remain separately typed, and panics become `fault` receipts without truncating
-the cross product.
+Rust's empty-match progression, including UTF-8 scalar boundaries. The first
+Rust bytes capture slice materializes persistent-history group records with
+exact empty and unmatched slots. Missing sets, text captures, capture HIRs
+outside that non-Unicode subset, and unproved text execution remain stable
+`unsupported` receipts. Inapplicable upstream surface combinations remain
+separately typed, and panics become `fault` receipts without truncating the
+cross product.
 
 ## Reproduce
 

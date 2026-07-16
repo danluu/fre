@@ -4,6 +4,9 @@ use fre::{
 };
 use regex::bytes::RegexBuilder;
 
+type GroupFixture = (u32, Option<String>, Option<(usize, usize)>);
+type CaptureFixture = Vec<GroupFixture>;
+
 fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
     let regex = RegexBuilder::new(pattern)
         .unicode(false)
@@ -28,6 +31,77 @@ fn assert_count(pattern: &str, haystack: &[u8]) {
         result.identity.plan,
         regex.cache_identity(CaptureRunLimits::default()).plan
     );
+}
+
+fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {
+    let regex = RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("reference pattern");
+    let names = regex
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    regex
+        .captures_iter(haystack)
+        .map(|captures| {
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, matched)| {
+                    (
+                        u32::try_from(index).unwrap(),
+                        names[index].clone(),
+                        matched.map(|matched| (matched.start(), matched.end())),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
+    let cases: &[(&str, &[u8])] = &[
+        (r"(?P<left>a)|(b)", b"ab"),
+        (r"()|a", b"a"),
+        (r"(a*)", b"ba"),
+        (r"((a)?)(b)?", b"ab b"),
+        (r"(?-u:([\x80-\xFF]+))", &[0xFF, 0x80, b' ', 0xFE]),
+    ];
+    for &(pattern, haystack) in cases {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let limits = CaptureAggregateLimits::default();
+        let report = regex
+            .captures_iter(haystack, limits)
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let actual = report
+            .captures
+            .iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.index,
+                            group.name.clone(),
+                            group.span.map(|span| (span.start, span.end)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, reference_records(pattern, haystack), "{pattern:?}");
+        assert_eq!(report.identity, regex.iteration_identity(limits));
+        assert_eq!(
+            report.identity.syntax,
+            regex.build_report().plan_identity.syntax
+        );
+    }
 }
 
 #[test]

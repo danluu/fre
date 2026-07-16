@@ -12,10 +12,10 @@ use fre_aggregate::{
     RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
-    AggregateLimits, Ast, BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
-    BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, Greed, HistoryRegex,
-    Program, ResourceKind as EngineResource, SearchError as EngineSearchError, Span as EngineSpan,
-    Window,
+    AggregateLimits, AggregateOutcome, Ast, BuildError as EngineBuildError,
+    BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport, CaptureCountOutcome,
+    CaptureProfile, CaptureRecord, Greed, HistoryRegex, Program, ResourceKind as EngineResource,
+    SearchError as EngineSearchError, Span as EngineSpan, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -298,6 +298,68 @@ pub struct CaptureExecutionReport {
     pub combined_peak_bytes: usize,
 }
 
+/// Plan selected for bounded materialized capture iteration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureIterationPlanKind {
+    /// Independently bounded leftmost searches with persistent tagged history
+    /// and Rust byte-regex empty-match progression.
+    RestartedPersistentHistory,
+}
+
+/// Production identity for the bounded persistent-history capture iterator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureIterationIdentity {
+    /// Complete syntax/profile/admission key.
+    pub syntax: Arc<CacheKey>,
+    /// Versioned capture semantic profile.
+    pub capture_profile: CaptureProfile,
+    /// Exact materializing iterator formulation.
+    pub plan: CaptureIterationPlanKind,
+    /// Construction limits used to publish the immutable tagged program.
+    pub build_limits: CaptureBuildLimits,
+    /// Aggregate limits used for this repeated-search invocation.
+    pub run_limits: AggregateLimits,
+}
+
+/// Successful complete capture sequence and bounded execution accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureIterationReport {
+    /// Complete operation identity.
+    pub identity: CaptureIterationIdentity,
+    /// Every match, with one stable numeric/name/span entry for every group.
+    /// Unmatched groups remain explicit `None` entries and empty participating
+    /// groups retain their zero-width spans.
+    pub captures: Vec<CaptureRecord>,
+    /// Number of independently bounded searches, including the final miss
+    /// unless iteration ended at a terminal empty match.
+    pub searches: usize,
+    /// Total Thompson state visits.
+    pub total_state_visits: usize,
+    /// Total persistent-history nodes.
+    pub total_history_nodes: usize,
+}
+
+/// Checked capture-iteration failure retaining exact source and limit identity.
+#[derive(Debug)]
+pub struct CaptureIterationError {
+    /// Complete attempted operation identity.
+    pub identity: Box<CaptureIterationIdentity>,
+    /// Persistent-history search or aggregate resource failure.
+    pub source: EngineSearchError,
+}
+
+impl fmt::Display for CaptureIterationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "capture iteration failed: {}", self.source)
+    }
+}
+
+impl std::error::Error for CaptureIterationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Builder for the capture-preserving persistent-history plan.
 #[derive(Clone, Debug)]
 pub struct CaptureBuilder {
@@ -436,6 +498,53 @@ impl CaptureRegex {
             build_limits: self.build_limits,
             run_limits,
         }
+    }
+
+    /// Complete identity for one bounded capture-iteration invocation.
+    #[must_use]
+    pub fn iteration_identity(&self, run_limits: AggregateLimits) -> CaptureIterationIdentity {
+        CaptureIterationIdentity {
+            syntax: Arc::clone(&self.report.plan_identity.syntax),
+            capture_profile: self.report.plan_identity.capture_profile,
+            plan: CaptureIterationPlanKind::RestartedPersistentHistory,
+            build_limits: self.build_limits,
+            run_limits,
+        }
+    }
+
+    /// Collect every non-overlapping leftmost-first match and every capture
+    /// slot, including empty participating spans and explicit unmatched slots.
+    ///
+    /// This bounded persistent-history formulation can restart at successive
+    /// match boundaries. It is the correctness path for materialized capture
+    /// records; the existing selector/replay reducer remains the linear path
+    /// for participation counts.
+    pub fn captures_iter(
+        &self,
+        haystack: &[u8],
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, CaptureIterationError> {
+        let identity = self.iteration_identity(limits);
+        let AggregateOutcome {
+            captures,
+            searches,
+            total_state_visits,
+            total_slot_copies: _,
+            total_history_nodes,
+        } = self
+            .engine
+            .captures_iter(haystack, Window::all(haystack), limits)
+            .map_err(|source| CaptureIterationError {
+                identity: Box::new(identity.clone()),
+                source,
+            })?;
+        Ok(CaptureIterationReport {
+            identity,
+            captures,
+            searches,
+            total_state_visits,
+            total_history_nodes,
+        })
     }
 
     /// Reduce all non-overlapping non-empty matches over the complete byte haystack.
