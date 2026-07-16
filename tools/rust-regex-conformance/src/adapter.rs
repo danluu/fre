@@ -10,8 +10,10 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder, PortableTextRegex,
-    PortableTextSearchError, RustProfile, SearchError, SearchLimits, SearchWindow,
+    PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder,
+    PortableTextCaptureBuildError, PortableTextCaptureBuilder, PortableTextCaptureRegex,
+    PortableTextRegex, PortableTextSearchError, RustProfile, SearchError, SearchLimits,
+    SearchWindow,
 };
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
@@ -27,12 +29,12 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v5";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v6";
 
 const LIMITATIONS: [&str; 3] = [
     "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE facade has no Rust text or bytes RegexSet matcher",
-    "the production FRE Rust text facade has no capture iterator; the Rust bytes capture iterator is restricted to its certified non-Unicode persistent-history subset",
+    "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/non-Unicode-RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -153,10 +155,7 @@ fn execute_case(
         AdapterSurface::RustTextCompile => execute_text_compile(case, input),
         AdapterSurface::RustTextIsMatch => execute_text_is_match(case, input),
         AdapterSurface::RustTextFindIter => execute_text_find(case, input),
-        AdapterSurface::RustTextCapturesIter => unsupported(
-            CapabilityId::CaptureIteration,
-            "facade.rust-text-captures-missing",
-        ),
+        AdapterSurface::RustTextCapturesIter => execute_text_captures(case, input),
         AdapterSurface::RustBytesCapturesIter => execute_bytes_captures(case, input),
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
@@ -541,6 +540,13 @@ enum CaptureBuildAttempt {
     Fault(AdapterDisposition),
 }
 
+enum TextCaptureBuildAttempt {
+    Built(Box<PortableTextCaptureRegex>),
+    Rejected,
+    Unsupported(AdapterDisposition),
+    Fault(AdapterDisposition),
+}
+
 fn execute_text_compile(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
     let expected = SemanticValue::CompileAccepted(case.compiles);
     match build_text(case, input) {
@@ -810,6 +816,78 @@ fn collect_byte_matches(
         last_match_end = Some(matched.end());
     }
     Ok(spans)
+}
+
+fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::Captures(input.expected.clone());
+    let regex = match build_text_captures(case, input) {
+        TextCaptureBuildAttempt::Built(regex) => regex,
+        TextCaptureBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextCaptureBuildAttempt::Unsupported(disposition)
+        | TextCaptureBuildAttempt::Fault(disposition) => return disposition,
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    let Ok(report) = regex.captures_iter(haystack, CaptureAggregateLimits::default()) else {
+        return unsupported(
+            CapabilityId::CaptureIteration,
+            "search.text-capture-execution-refused",
+        );
+    };
+    let Ok(mut observed) = capture_records(&report.captures, input.haystack.len()) else {
+        return fault("adapter.text-capture-record-invariant");
+    };
+    if let Some(limit) = case.match_limit {
+        observed.truncate(limit);
+    }
+    compare(&expected, &SemanticValue::Captures(observed))
+}
+
+fn build_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> TextCaptureBuildAttempt {
+    let Some(pattern) = input.patterns.first() else {
+        return TextCaptureBuildAttempt::Fault(fault("adapter.single-pattern-missing"));
+    };
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = case.case_insensitive;
+    profile.options.unicode = case.unicode;
+    profile.options.line_terminator = input.line_terminator;
+    match PortableTextCaptureBuilder::new(pattern.clone())
+        .profile(profile)
+        .build()
+    {
+        Ok(regex) => TextCaptureBuildAttempt::Built(Box::new(regex)),
+        Err(PortableTextCaptureBuildError::TextSyntax(error))
+            if matches!(&error.category, ErrorCategory::UpstreamRustSyntax) =>
+        {
+            TextCaptureBuildAttempt::Rejected
+        }
+        Err(
+            PortableTextCaptureBuildError::InternalInvariant(_)
+            | PortableTextCaptureBuildError::Capture(CaptureBuildError::InternalInvariant(_)),
+        ) => TextCaptureBuildAttempt::Fault(fault("build.text-capture-internal-fault")),
+        Err(
+            PortableTextCaptureBuildError::BytesProofSyntax(_)
+            | PortableTextCaptureBuildError::ProfileHirMismatch
+            | PortableTextCaptureBuildError::InvalidUtf8Hir,
+        ) => TextCaptureBuildAttempt::Unsupported(unsupported(
+            CapabilityId::CaptureIteration,
+            "build.text-capture-equivalence-gap",
+        )),
+        Err(PortableTextCaptureBuildError::Capture(_)) => TextCaptureBuildAttempt::Unsupported(
+            unsupported(CapabilityId::CaptureIteration, "build.capture-subset-gap"),
+        ),
+        Err(PortableTextCaptureBuildError::TextSyntax(_)) => {
+            TextCaptureBuildAttempt::Fault(fault("build.text-capture-unexpected-syntax"))
+        }
+        Err(_) => TextCaptureBuildAttempt::Fault(fault("build.text-capture-unclassified-error")),
+    }
 }
 
 fn execute_bytes_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
@@ -1365,6 +1443,10 @@ mod tests {
         let text_case = fixture_case(true, true, None);
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCompile, &text_case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCapturesIter, &text_case, &input),
             AdapterDisposition::Pass { .. }
         ));
         assert!(matches!(

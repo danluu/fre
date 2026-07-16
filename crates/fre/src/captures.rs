@@ -18,7 +18,7 @@ use fre_capture_lab::{
     SearchError as EngineSearchError, Span as EngineSpan, Window,
 };
 use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
+    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
@@ -346,6 +346,265 @@ pub struct CaptureIterationError {
     pub identity: Box<CaptureIterationIdentity>,
     /// Persistent-history search or aggregate resource failure.
     pub source: EngineSearchError,
+}
+
+/// Construction evidence for the exact-HIR Rust text capture slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortableTextCaptureBuildReport {
+    /// Public Rust text profile proved before capture construction.
+    pub profile: CompatibilityProfile,
+    /// Bounded public `RustText` parse.
+    pub text_syntax: ParseSummary,
+    /// Independently parsed non-Unicode `RustBytes` proof HIR.
+    pub bytes_syntax: ParseSummary,
+    /// Construction report for the byte-stable tagged executor.
+    pub capture: CaptureBuildReport,
+}
+
+/// Failure to prove or construct the Rust text capture slice.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PortableTextCaptureBuildError {
+    /// Public `RustText` parsing rejected the pattern.
+    TextSyntax(ParseError),
+    /// Independent non-Unicode `RustBytes` proof parsing rejected the pattern.
+    BytesProofSyntax(ParseError),
+    /// The two capture-preserving HIRs are not exactly equal.
+    ProfileHirMismatch,
+    /// The common HIR does not guarantee valid UTF-8 for every non-empty
+    /// whole match.
+    InvalidUtf8Hir,
+    /// The exact-HIR tagged executor refused construction.
+    Capture(CaptureBuildError),
+    /// An impossible profile state was observed.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for PortableTextCaptureBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TextSyntax(error) => {
+                write!(formatter, "Rust text capture syntax failed: {error}")
+            }
+            Self::BytesProofSyntax(error) => {
+                write!(formatter, "Rust bytes capture proof syntax failed: {error}")
+            }
+            Self::ProfileHirMismatch => {
+                formatter.write_str("Rust text and byte capture HIRs differ")
+            }
+            Self::InvalidUtf8Hir => {
+                formatter.write_str("capture HIR does not guarantee valid UTF-8 matches")
+            }
+            Self::Capture(error) => write!(formatter, "capture construction failed: {error}"),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "text capture invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PortableTextCaptureBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TextSyntax(error) | Self::BytesProofSyntax(error) => Some(error),
+            Self::Capture(error) => Some(error),
+            Self::ProfileHirMismatch | Self::InvalidUtf8Hir | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+/// Text-specific capture iteration failure.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PortableTextCaptureIterationError {
+    /// The bounded tagged executor refused execution.
+    Capture(CaptureIterationError),
+    /// The tagged executor published a record without participating group
+    /// zero.
+    MissingOverall { match_index: usize },
+    /// A retained match or group span violated the proved UTF-8 boundary
+    /// contract.
+    InvalidUtf8Capture {
+        match_index: usize,
+        group_index: usize,
+        start: usize,
+        end: usize,
+    },
+}
+
+impl fmt::Display for PortableTextCaptureIterationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capture(error) => error.fmt(formatter),
+            Self::MissingOverall { match_index } => {
+                write!(
+                    formatter,
+                    "text capture match {match_index} lacks group zero"
+                )
+            }
+            Self::InvalidUtf8Capture {
+                match_index,
+                group_index,
+                start,
+                end,
+            } => write!(
+                formatter,
+                "text capture match {match_index} group {group_index} has non-boundary span [{start}, {end})",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PortableTextCaptureIterationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(error) => Some(error),
+            Self::MissingOverall { .. } | Self::InvalidUtf8Capture { .. } => None,
+        }
+    }
+}
+
+/// Builder for the exact-HIR Rust text capture subset.
+#[derive(Clone, Debug)]
+pub struct PortableTextCaptureBuilder {
+    pattern: String,
+    profile: RustProfile,
+    limits: CaptureBuildLimits,
+}
+
+impl PortableTextCaptureBuilder {
+    /// Start from pinned Rust text defaults.
+    #[must_use]
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            profile: RustProfile::default(),
+            limits: CaptureBuildLimits::default(),
+        }
+    }
+
+    /// Replace the complete public Rust text profile.
+    #[must_use]
+    pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Replace every checked capture construction limit.
+    #[must_use]
+    pub const fn limits(mut self, limits: CaptureBuildLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Prove exact capture-preserving HIR equivalence and build the tagged
+    /// byte-stable executor.
+    pub fn build(self) -> Result<PortableTextCaptureRegex, PortableTextCaptureBuildError> {
+        let text_profile = CompatibilityProfile::RustText(self.profile.clone());
+        let text = fre_syntax::parse(
+            fre_syntax::ParseRequest::rust(self.pattern.clone(), text_profile.clone())
+                .with_admission(self.limits.admission)
+                .with_safety_envelope(self.limits.syntax_safety),
+        )
+        .map_err(PortableTextCaptureBuildError::TextSyntax)?;
+        let text_syntax = text.summary.clone();
+        let CanonicalPattern::Rust(text_pattern) = text.pattern else {
+            return Err(PortableTextCaptureBuildError::InternalInvariant(
+                "RustText parse produced non-Rust syntax",
+            ));
+        };
+
+        let mut bytes_profile = self.profile.clone();
+        bytes_profile.options.unicode = false;
+        let bytes = fre_syntax::parse(
+            fre_syntax::ParseRequest::rust(
+                self.pattern.clone(),
+                CompatibilityProfile::RustBytes(bytes_profile.clone()),
+            )
+            .with_admission(self.limits.admission)
+            .with_safety_envelope(self.limits.syntax_safety),
+        )
+        .map_err(PortableTextCaptureBuildError::BytesProofSyntax)?;
+        let bytes_syntax = bytes.summary.clone();
+        let CanonicalPattern::Rust(bytes_pattern) = bytes.pattern else {
+            return Err(PortableTextCaptureBuildError::InternalInvariant(
+                "RustBytes proof parse produced non-Rust syntax",
+            ));
+        };
+        if text_pattern.hir != bytes_pattern.hir {
+            return Err(PortableTextCaptureBuildError::ProfileHirMismatch);
+        }
+        if !text_pattern.hir.properties().is_utf8() {
+            return Err(PortableTextCaptureBuildError::InvalidUtf8Hir);
+        }
+        let inner = CaptureBuilder::new(self.pattern)
+            .profile(bytes_profile)
+            .limits(self.limits)
+            .build()
+            .map_err(PortableTextCaptureBuildError::Capture)?;
+        let report = PortableTextCaptureBuildReport {
+            profile: text_profile,
+            text_syntax,
+            bytes_syntax,
+            capture: inner.build_report().clone(),
+        };
+        Ok(PortableTextCaptureRegex { inner, report })
+    }
+}
+
+/// Immutable exact-HIR Rust text capture matcher.
+#[derive(Clone, Debug)]
+pub struct PortableTextCaptureRegex {
+    inner: CaptureRegex,
+    report: PortableTextCaptureBuildReport,
+}
+
+impl PortableTextCaptureRegex {
+    /// Text/bytes equivalence and tagged construction evidence.
+    #[must_use]
+    pub const fn build_report(&self) -> &PortableTextCaptureBuildReport {
+        &self.report
+    }
+
+    /// Materialize complete text captures while removing only empty records
+    /// that fall inside a UTF-8 scalar. Non-empty matches and every retained
+    /// group span must satisfy the independently proved boundary contract.
+    pub fn captures_iter(
+        &self,
+        haystack: &str,
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
+        let mut report = self
+            .inner
+            .captures_iter(haystack.as_bytes(), limits)
+            .map_err(PortableTextCaptureIterationError::Capture)?;
+        for (match_index, record) in report.captures.iter().enumerate() {
+            if record.overall().is_none() {
+                return Err(PortableTextCaptureIterationError::MissingOverall { match_index });
+            }
+        }
+        report.captures.retain(|record| {
+            record
+                .overall()
+                .is_some_and(|span| span.start != span.end || haystack.is_char_boundary(span.start))
+        });
+        for (match_index, record) in report.captures.iter().enumerate() {
+            for (group_index, group) in record.groups.iter().enumerate() {
+                let Some(span) = group.span else {
+                    continue;
+                };
+                if !haystack.is_char_boundary(span.start) || !haystack.is_char_boundary(span.end) {
+                    return Err(PortableTextCaptureIterationError::InvalidUtf8Capture {
+                        match_index,
+                        group_index,
+                        start: span.start,
+                        end: span.end,
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 impl fmt::Display for CaptureIterationError {

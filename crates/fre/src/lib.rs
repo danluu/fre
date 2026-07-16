@@ -54,6 +54,8 @@ pub use captures::{
     CaptureHirAccounting, CaptureIterationError, CaptureIterationIdentity,
     CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation, CapturePlanIdentity,
     CapturePlanKind, CaptureRegex, CaptureRunLimits, CaptureUnsupported,
+    PortableTextCaptureBuildError, PortableTextCaptureBuildReport, PortableTextCaptureBuilder,
+    PortableTextCaptureIterationError, PortableTextCaptureRegex,
 };
 pub use fre_aggregate::{
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,

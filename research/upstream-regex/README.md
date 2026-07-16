@@ -44,11 +44,12 @@ either positive minimum width or no assertions when nullable. Complete
 non-overlapping match iteration uses checked contextual windows and reproduces
 Rust's empty-match progression, including UTF-8 scalar boundaries. The first
 Rust bytes capture slice materializes persistent-history group records with
-exact empty and unmatched slots. Missing sets, text captures, capture HIRs
-outside that non-Unicode subset, and unproved text execution remain stable
-`unsupported` receipts. Inapplicable upstream surface combinations remain
-separately typed, and panics become `fault` receipts without truncating the
-cross product.
+exact empty and unmatched slots. The text capture slice admits only an exact
+UTF-8-safe HIR shared with an independently parsed non-Unicode byte proof and
+filters empty matches inside scalar encodings. Missing sets, capture HIRs
+outside those proofs, and unproved text execution remain stable `unsupported`
+receipts. Inapplicable upstream surface combinations remain separately typed,
+and panics become `fault` receipts without truncating the cross product.
 
 ## Reproduce
 

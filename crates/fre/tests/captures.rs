@@ -1,7 +1,9 @@
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
-    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, PortableTextCaptureBuildError,
+    PortableTextCaptureBuilder,
 };
+use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
 
 type GroupFixture = (u32, Option<String>, Option<(usize, usize)>);
@@ -102,6 +104,82 @@ fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
             regex.build_report().plan_identity.syntax
         );
     }
+}
+
+fn reference_text_records(pattern: &str, haystack: &str) -> Vec<CaptureFixture> {
+    let regex = TextRegexBuilder::new(pattern)
+        .build()
+        .expect("reference text pattern");
+    let names = regex
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    regex
+        .captures_iter(haystack)
+        .map(|captures| {
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, matched)| {
+                    (
+                        u32::try_from(index).unwrap(),
+                        names[index].clone(),
+                        matched.map(|matched| (matched.start(), matched.end())),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
+    let cases = [
+        (r"(?P<left>a)|(b)", "éab"),
+        (r"()|a", "éa"),
+        (r"(a*)", "éba"),
+        (r"((a)?)(b)?", "éab b"),
+        (r"(é+)", "aéé東京"),
+    ];
+    for (pattern, haystack) in cases {
+        let regex = PortableTextCaptureBuilder::new(pattern)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let report = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let actual = report
+            .captures
+            .iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.index,
+                            group.name.clone(),
+                            group.span.map(|span| (span.start, span.end)),
+                        )
+                    })
+                    .collect::<CaptureFixture>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            reference_text_records(pattern, haystack),
+            "{pattern:?}"
+        );
+    }
+
+    assert!(matches!(
+        PortableTextCaptureBuilder::new(r"(\w+)")
+            .build()
+            .expect_err("Unicode word HIR differs from the byte-stable proof"),
+        PortableTextCaptureBuildError::ProfileHirMismatch
+            | PortableTextCaptureBuildError::BytesProofSyntax(_)
+            | PortableTextCaptureBuildError::Capture(_)
+    ));
 }
 
 #[test]
