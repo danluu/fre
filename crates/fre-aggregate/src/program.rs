@@ -2,6 +2,8 @@ use regex_syntax::hir::Look;
 
 use crate::Error;
 
+pub(crate) const NO_SPLIT_RANK: usize = usize::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ByteSet(pub(crate) [u64; 4]);
 
@@ -336,7 +338,7 @@ pub(crate) struct Program {
     pub(crate) insts: Vec<Inst>,
     pub(crate) entry: usize,
     pub(crate) epsilon_order: Vec<usize>,
-    pub(crate) split_rank: Vec<Option<usize>>,
+    pub(crate) split_rank: Vec<usize>,
     pub(crate) split_count: usize,
 }
 

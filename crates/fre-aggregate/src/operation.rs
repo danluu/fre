@@ -4,7 +4,7 @@ use core::ops::Range;
 use crate::accounting::ExecutionAccounting;
 use crate::compile::{CompiledRegex, PlanId};
 use crate::error::{add, enforce, mul};
-use crate::program::{AssertionContext, Inst, Program};
+use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program};
 use crate::{Error, OperationLimits, Resource};
 
 /// Half-open absolute byte span in the original haystack.
@@ -822,8 +822,12 @@ impl RowStore {
                     } => {
                         charge_transition(accounting, requirements.work_bound);
                         let preferred_value = row[*preferred];
-                        let rank = program.split_rank[pc]
-                            .ok_or(Error::InternalInvariant("split state has no decision rank"))?;
+                        let rank = program.split_rank[pc];
+                        if rank == NO_SPLIT_RANK {
+                            return Err(Error::InternalInvariant(
+                                "split state has no decision rank",
+                            ));
+                        }
                         if preferred_value != 0 {
                             set_bit(&mut record, rank)?;
                             preferred_value
@@ -922,8 +926,10 @@ impl RowStore {
                     preferred,
                     fallback,
                 } => {
-                    let rank = program.split_rank[pc]
-                        .ok_or(Error::InternalInvariant("split state has no decision rank"))?;
+                    let rank = program.split_rank[pc];
+                    if rank == NO_SPLIT_RANK {
+                        return Err(Error::InternalInvariant("split state has no decision rank"));
+                    }
                     pc = if reader.decision(position, rank, accounting)? {
                         *preferred
                     } else {
