@@ -14,7 +14,7 @@ already inventoried by `regex-1.12.4-inventory.json`.
 | `tests/regression.rs` | Complete 10/10 mandatory dispositions with executable constructor, capture, and search checks |
 | `tests/regression_fuzz.rs` | Complete 5/5 mandatory dispositions; the upstream ignored expensive case remains explicit unsupported evidence |
 | `tests/suite_{string,bytes,string_set,bytes_set}.rs` | These are upstream adapters over the TOML corpus; their input obligations are covered by the existing 16,450-row report rather than counted again |
-| crate doctests | Not yet inventoried as individual obligations |
+| crate doctests | Complete 242/242 mandatory dispositions derived from eight authenticated source files: 127 pass, 115 unsupported, 0 mismatch, 0 fault |
 | Cargo feature matrix | Feature declarations are pinned by authenticated `Cargo.toml.orig`, but build/test combinations are not yet mandatory dispositions |
 
 The replacement adapter authenticates `.cargo_vcs_info.json`,
@@ -39,3 +39,14 @@ It executes every upstream empty, adjacent, rejected-range, zero-width and
 Unicode step-sequence obligation through FRE's real aggregate search-step API.
 All 11 fixed-order obligations must produce pass, mismatch, unsupported or
 fault receipts; omission and filtering are not report states.
+
+The doctest adapter authenticates `README.md`, `src/builders.rs`, `src/bytes.rs`,
+`src/lib.rs`, both `src/regex/*.rs` facade files and both
+`src/regexset/*.rs` facade files. It derives every default-feature rustdoc code
+obligation, including the upstream ignored example, and binds ordered
+path/line/code-block identities to inventory SHA-256
+`028754b101949945211bfb067736739d703d2979719f9f7186d5b282955f70cb`.
+Report validation rejects omissions, duplicate or reordered identities, source
+substitution, malformed dispositions and false pass digests. Replacement,
+pattern-searcher and misc integration-test behaviors retain their existing
+suite ownership instead of being counted again as doctest executions.
