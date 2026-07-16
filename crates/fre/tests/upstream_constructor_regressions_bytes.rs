@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildFailureClass, BuildLimits, PlanSelection, PortableBuilder,
+    BuildError, BuildFailureClass, BuildLimits, PlanKind, PlanSelection, PortableBuilder,
     PortableFindIterLimits, RustProfile,
 };
 
@@ -12,14 +12,14 @@ const UPSTREAM_PATH: &str = "tests/regression.rs";
 const UPSTREAM_SHA256: &str = "3490aac99fdbf3f0949ba1f338d5184a84b505ebd96d0b6d6145c610587aa60b";
 const PORTED_BYTE_REGRESSION_IDS: &[&str] = &[
     "invalid_regexes_no_crash",
+    "regression_many_repeat_stack_overflow",
     "regression_invalid_repetition_expr",
     "regression_invalid_flags_expression",
     "regression_nfa_stops1",
     "regression_big_regex_overflow",
     "regression_complete_literals_suffix_incorrect",
 ];
-const DEFERRED_TEXT_CAPTURE_OR_LARGE_PATTERN_IDS: &[&str] = &[
-    "regression_many_repeat_stack_overflow",
+const DEFERRED_TEXT_CAPTURE_IDS: &[&str] = &[
     "regression_captures_rep",
     "regression_bad_word_boundary",
     "regression_unicode_perl_not_enabled",
@@ -36,6 +36,7 @@ fn authenticated_constructor_regression_partition_has_no_silent_omissions() {
         PORTED_BYTE_REGRESSION_IDS,
         [
             "invalid_regexes_no_crash",
+            "regression_many_repeat_stack_overflow",
             "regression_invalid_repetition_expr",
             "regression_invalid_flags_expression",
             "regression_nfa_stops1",
@@ -44,18 +45,42 @@ fn authenticated_constructor_regression_partition_has_no_silent_omissions() {
         ]
     );
     assert_eq!(
-        DEFERRED_TEXT_CAPTURE_OR_LARGE_PATTERN_IDS,
+        DEFERRED_TEXT_CAPTURE_IDS,
         [
-            "regression_many_repeat_stack_overflow",
             "regression_captures_rep",
             "regression_bad_word_boundary",
             "regression_unicode_perl_not_enabled",
         ]
     );
     assert_eq!(
-        PORTED_BYTE_REGRESSION_IDS.len() + DEFERRED_TEXT_CAPTURE_OR_LARGE_PATTERN_IDS.len(),
+        PORTED_BYTE_REGRESSION_IDS.len() + DEFERRED_TEXT_CAPTURE_IDS.len(),
         10
     );
+}
+
+#[test]
+fn large_counted_repetition_builds_and_matches_without_stack_growth() {
+    let pattern = "^.{1,2500}";
+    let upstream = regex::bytes::Regex::new(pattern).expect("pinned large-repetition regression");
+    let fre = PortableBuilder::new(pattern)
+        .build()
+        .unwrap_or_else(|error| panic!("FRE rejected large-repetition regression: {error}"));
+    assert_eq!(fre.build_report().plan, PlanKind::K0);
+
+    let long = vec![b'a'; 2501];
+    for haystack in [b"".as_slice(), b"a", long.as_slice()] {
+        let expected = upstream
+            .find_iter(haystack)
+            .map(|matched| matched.range())
+            .collect::<Vec<_>>();
+        let actual = fre
+            .find_iter(haystack, PortableFindIterLimits::unlimited())
+            .expect("portable iterator construction")
+            .map(|result| result.map(fre::Match::range))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("portable large-repetition iteration failed: {error}"));
+        assert_eq!(actual, expected, "haystack length {}", haystack.len());
+    }
 }
 
 #[test]
