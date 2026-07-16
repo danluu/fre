@@ -16,6 +16,20 @@ pub trait LiteralReplacer {
     fn literal_bytes(&self) -> &[u8];
 }
 
+/// Forces replacement bytes to be copied literally without capture expansion.
+///
+/// This is the bounded FRE counterpart of `regex::bytes::NoExpand`. It can be
+/// passed to the literal replacement methods even when the replacement
+/// contains `$` syntax that a capture-aware API would otherwise expand.
+#[derive(Clone, Debug)]
+pub struct NoExpand<'s>(pub &'s [u8]);
+
+impl LiteralReplacer for NoExpand<'_> {
+    fn literal_bytes(&self) -> &[u8] {
+        self.0
+    }
+}
+
 impl LiteralReplacer for [u8] {
     fn literal_bytes(&self) -> &[u8] {
         self

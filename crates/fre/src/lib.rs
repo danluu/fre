@@ -98,7 +98,7 @@ pub use replacement::{
     FunctionalReplacementLimits, FunctionalReplacementReport, FunctionalReplacementResult,
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
-    LiteralReplacementResult, LiteralReplacer,
+    LiteralReplacementResult, LiteralReplacer, NoExpand,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
