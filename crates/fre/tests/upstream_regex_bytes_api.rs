@@ -17,6 +17,7 @@ const UPSTREAM_MISC_SHA256: &str =
     "1aeadbeb8860bd5f5b99a0adb459baf77dd3af4f23ac6c56ecf537f793407cca";
 const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_regex_as_str",
+    "bytes_regex_clone",
     "display_original_pattern",
     "debug_original_pattern",
     "from_str",
@@ -39,7 +40,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 12);
+    assert_eq!(UPSTREAM_API_IDS.len(), 13);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 4);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 3);
 }
@@ -476,6 +477,156 @@ fn source_identity_survives_every_portable_plan_family() {
         assert_eq!(regex.to_string(), source);
         assert_eq!(regex.build_report().plan, expected_plan, "{source:?}");
         assert_eq!(regex.build_report().source_storage_bytes, source.len());
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the clone gate deliberately covers every stored portable plan variant"
+)]
+fn clone_matches_pinned_bytes_and_preserves_exact_plan_identity() {
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let cases = [
+        (
+            "exact literal",
+            PlanKind::ExactLiteral,
+            PortableBuilder::new("Sherlock").unicode(false).build(),
+            regex::bytes::RegexBuilder::new("Sherlock")
+                .unicode(false)
+                .build(),
+            b"\xFFSherlock".as_slice(),
+        ),
+        (
+            "packed literal set",
+            PlanKind::PackedLiteralSet,
+            PortableBuilder::new("a|ab").unicode(false).build(),
+            regex::bytes::RegexBuilder::new("a|ab")
+                .unicode(false)
+                .build(),
+            b"\xFFab".as_slice(),
+        ),
+        (
+            "literal set DFA",
+            PlanKind::LiteralSetDfa,
+            PortableBuilder::new("foobar|foobaz|fooquux")
+                .unicode(false)
+                .limits(dfa_limits)
+                .build(),
+            regex::bytes::RegexBuilder::new("foobar|foobaz|fooquux")
+                .unicode(false)
+                .build(),
+            b"\xFFfooquux".as_slice(),
+        ),
+        (
+            "required literal",
+            PlanKind::RequiredLiteral,
+            PortableBuilder::new("[a-z]+Z").unicode(false).build(),
+            regex::bytes::RegexBuilder::new("[a-z]+Z")
+                .unicode(false)
+                .build(),
+            b"\xFFabcZ".as_slice(),
+        ),
+        (
+            "forward anchored",
+            PlanKind::ForwardAnchored,
+            PortableBuilder::new(r"\A[a-z]+Z").unicode(false).build(),
+            regex::bytes::RegexBuilder::new(r"\A[a-z]+Z")
+                .unicode(false)
+                .build(),
+            b"abcZ".as_slice(),
+        ),
+        (
+            "forced fixed end",
+            PlanKind::ForwardAnchored,
+            PortableBuilder::new(r"\A[a-z]+Z\z")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceForwardAnchored)
+                .build(),
+            regex::bytes::RegexBuilder::new(r"\A[a-z]+Z\z")
+                .unicode(false)
+                .build(),
+            b"abcZ".as_slice(),
+        ),
+        (
+            "Unicode word run",
+            PlanKind::UnicodeWordRun,
+            PortableBuilder::new(r"\b\w{2,}\b").build(),
+            regex::bytes::RegexBuilder::new(r"\b\w{2,}\b").build(),
+            " \u{3B1}\u{3B2} ".as_bytes(),
+        ),
+        (
+            "automatic K0",
+            PlanKind::K0,
+            PortableBuilder::new("^a+$")
+                .unicode(false)
+                .multi_line(true)
+                .line_terminator(b'\r')
+                .build(),
+            regex::bytes::RegexBuilder::new("^a+$")
+                .unicode(false)
+                .multi_line(true)
+                .line_terminator(b'\r')
+                .build(),
+            b"x\raaa\r".as_slice(),
+        ),
+        (
+            "forced K0",
+            PlanKind::K0,
+            PortableBuilder::new("Sherlock")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build(),
+            regex::bytes::RegexBuilder::new("Sherlock")
+                .unicode(false)
+                .build(),
+            b"\xFFSherlock".as_slice(),
+        ),
+    ];
+
+    for (name, expected_plan, fre, upstream, haystack) in cases {
+        let fre = fre.unwrap_or_else(|error| panic!("failed to build {name}: {error}"));
+        let upstream =
+            upstream.unwrap_or_else(|error| panic!("pinned regex rejected {name}: {error}"));
+        assert_eq!(fre.build_report().plan, expected_plan, "{name}");
+
+        let cloned = fre.clone();
+        let upstream_cloned = upstream.clone();
+        assert_eq!(cloned.as_str(), fre.as_str(), "{name}");
+        assert_eq!(cloned.profile(), fre.profile(), "{name}");
+        assert_eq!(cloned.build_report(), fre.build_report(), "{name}");
+        assert_eq!(
+            cloned.runtime_implementation_id(),
+            fre.runtime_implementation_id(),
+            "{name}"
+        );
+        assert_eq!(
+            cloned.capture_names().collect::<Vec<_>>(),
+            fre.capture_names().collect::<Vec<_>>(),
+            "{name}"
+        );
+
+        for start in 0..=haystack.len() {
+            let expected = upstream_cloned
+                .find_at(haystack, start)
+                .map(|matched| matched.range());
+            for candidate in [&fre, &cloned] {
+                let actual = candidate
+                    .find_at(haystack, start, fre::SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!("FRE clone search failed for {name} at {start}: {error}")
+                    })
+                    .0
+                    .map(fre::Match::range);
+                assert_eq!(actual, expected, "{name} at {start}");
+            }
+        }
     }
 }
 

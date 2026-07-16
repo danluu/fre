@@ -992,6 +992,7 @@ impl PortableBuilder {
                 plan: PortablePlan::K0(automaton),
                 profile: profile.clone(),
                 limits: self.limits,
+                selection: self.selection,
                 report: BuildReport {
                     profile: profile.clone(),
                     admission,
@@ -1021,6 +1022,7 @@ impl PortableBuilder {
                 plan: PortablePlan::UnicodeWordRun(plan),
                 profile: profile.clone(),
                 limits: self.limits,
+                selection: self.selection,
                 report: BuildReport {
                     profile: profile.clone(),
                     admission,
@@ -1064,6 +1066,7 @@ impl PortableBuilder {
                         plan: PortablePlan::ForwardEndFixed(plan),
                         profile: profile.clone(),
                         limits: self.limits,
+                        selection: self.selection,
                         report: BuildReport {
                             profile: profile.clone(),
                             admission,
@@ -1098,6 +1101,7 @@ impl PortableBuilder {
                             plan: PortablePlan::ForwardAnchored(plan),
                             profile: profile.clone(),
                             limits: self.limits,
+                            selection: self.selection,
                             report: BuildReport {
                                 profile: profile.clone(),
                                 admission,
@@ -1147,6 +1151,7 @@ impl PortableBuilder {
                             plan: PortablePlan::RequiredLiteral(plan),
                             profile: profile.clone(),
                             limits: self.limits,
+                            selection: self.selection,
                             report: BuildReport {
                                 profile: profile.clone(),
                                 admission,
@@ -1193,6 +1198,7 @@ impl PortableBuilder {
                     plan: PortablePlan::ExactLiteral(literal),
                     profile: profile.clone(),
                     limits: self.limits,
+                    selection: self.selection,
                     report: BuildReport {
                         profile: profile.clone(),
                         admission,
@@ -1224,6 +1230,7 @@ impl PortableBuilder {
                         plan: PortablePlan::PackedLiteralSet(packed),
                         profile: profile.clone(),
                         limits: self.limits,
+                        selection: self.selection,
                         report: BuildReport {
                             profile: profile.clone(),
                             admission,
@@ -1252,6 +1259,7 @@ impl PortableBuilder {
                     plan: PortablePlan::LiteralSetDfa(literal_set),
                     profile: profile.clone(),
                     limits: self.limits,
+                    selection: self.selection,
                     report: BuildReport {
                         profile: profile.clone(),
                         admission,
@@ -1286,6 +1294,7 @@ impl PortableBuilder {
             plan: PortablePlan::K0(automaton),
             profile: profile.clone(),
             limits: self.limits,
+            selection: self.selection,
             report: BuildReport {
                 profile: profile.clone(),
                 admission,
@@ -1315,6 +1324,7 @@ pub struct PortableRegex {
     plan: PortablePlan,
     profile: CompatibilityProfile,
     limits: BuildLimits,
+    selection: PlanSelection,
     report: BuildReport,
 }
 
@@ -1345,6 +1355,31 @@ impl<'r> Iterator for PortableCaptureNames<'r> {
 
 impl ExactSizeIterator for PortableCaptureNames<'_> {}
 impl core::iter::FusedIterator for PortableCaptureNames<'_> {}
+
+impl Clone for PortableRegex {
+    /// Rebuild an equivalent immutable matcher under its original profile,
+    /// limits, and planner-selection contract.
+    ///
+    /// Some certified native plans deliberately do not expose `Clone`, so the
+    /// facade replays its already-admitted deterministic construction instead
+    /// of weakening those plan-level ownership contracts.
+    fn clone(&self) -> Self {
+        let profile = match &self.profile {
+            CompatibilityProfile::RustBytes(profile) => profile.clone(),
+            CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
+                panic!("portable byte regex retained a non-byte profile")
+            }
+        };
+        PortableBuilder::new(self.as_str())
+            .profile(profile)
+            .limits(self.limits)
+            .plan_selection(self.selection)
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("previously admitted portable regex could not be cloned: {error}")
+            })
+    }
+}
 
 impl fmt::Display for PortableRegex {
     /// Show the original regular expression source.
