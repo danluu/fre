@@ -86,6 +86,13 @@ cargo run -p rust-regex-conformance -- run-replacement-api \
 
 cargo run -p rust-regex-conformance -- verify-replacement-api-report \
   /tmp/fre-rust-regex-replacement-api-report.json
+
+cargo run -p rust-regex-conformance -- run-misc-regression-api \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-misc-regression-api-report.json
+
+cargo run -p rust-regex-conformance -- verify-misc-regression-api-report \
+  /tmp/fre-rust-regex-misc-regression-api-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -102,8 +109,8 @@ The authenticated inventory plus the TOML and replacement adapters do not yet:
 
 - provide general Rust text beyond the proved slices, byte sets, capture
   iteration, or full match iteration;
-- produce mandatory reports for the remaining upstream Rust API regression,
-  searcher, doctest, or feature-matrix tests;
+- produce mandatory reports for the remaining upstream searcher, doctest, or
+  feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
   release qualification.

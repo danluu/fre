@@ -10,9 +10,9 @@ already inventoried by `regex-1.12.4-inventory.json`.
 | --- | --- |
 | `tests/replace.rs` | Complete executable adapter: 26/26 named obligations, each with a mandatory disposition |
 | `tests/searcher.rs` | Eleven behaviors have executable FRE coverage in `crates/fre/tests/upstream_searcher.rs`; a payload-hashed tool report remains |
-| `tests/misc.rs` | Source-level constructor, capture metadata/indexing and pathological-search audit remains |
-| `tests/regression.rs` | Ten source-level regression tests remain to be moved into mandatory receipts |
-| `tests/regression_fuzz.rs` | Five source-level fuzz regressions, including one ignored expensive case, remain |
+| `tests/misc.rs` | Complete 10/10 mandatory dispositions; constructor, metadata, capture, and search behavior execute where FRE exposes the upstream surface |
+| `tests/regression.rs` | Complete 10/10 mandatory dispositions with executable constructor, capture, and search checks |
+| `tests/regression_fuzz.rs` | Complete 5/5 mandatory dispositions; the upstream ignored expensive case remains explicit unsupported evidence |
 | `tests/suite_{string,bytes,string_set,bytes_set}.rs` | These are upstream adapters over the TOML corpus; their input obligations are covered by the existing 16,450-row report rather than counted again |
 | crate doctests | Not yet inventoried as individual obligations |
 | Cargo feature matrix | Feature declarations are pinned by authenticated `Cargo.toml.orig`, but build/test combinations are not yet mandatory dispositions |
@@ -24,3 +24,10 @@ The source file SHA-256 is
 Its fixed obligation order prevents omission or filtering: report validation
 rejects missing, reordered, duplicated, falsely passing, or source-unbound
 receipts.
+
+The misc/regression adapter independently authenticates those package and VCS
+files plus all bytes of `tests/misc.rs`, `tests/regression.rs`, and
+`tests/regression_fuzz.rs`. Its fixed 25-obligation order admits only pass,
+mismatch, unsupported, or fault receipts. Unsupported formatting/index
+operator/type-lifetime surfaces and the upstream ignored expensive constructor
+remain visible rather than being silently filtered.

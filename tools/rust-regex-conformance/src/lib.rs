@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod adapter;
+mod misc_regression_api;
 mod replacement_api;
 
 pub use adapter::{
@@ -25,6 +26,12 @@ pub use adapter::{
     AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
+};
+pub use misc_regression_api::{
+    MISC_REGRESSION_API_CASES, MISC_REGRESSION_API_REPORT_SCHEMA, MiscRegressionCapability,
+    MiscRegressionCounts, MiscRegressionDisposition, MiscRegressionReceipt, MiscRegressionReport,
+    MiscRegressionReportPayload, MiscRegressionSourceFile, MiscRegressionSourceIdentity,
+    build_misc_regression_report, read_misc_regression_report, write_misc_regression_report,
 };
 pub use replacement_api::{
     REPLACEMENT_API_CASES, REPLACEMENT_API_REPORT_SCHEMA, ReplacementApiCounts,
