@@ -1,7 +1,7 @@
 use fre::{
     AggregateBuilder, AggregateOperation, CaptureExpansionError, CaptureExpansionLimits,
     FunctionalReplacementErrorSource, LiteralReplacementErrorSource, LiteralReplacementLimits,
-    PortableBuilder, RustProfile,
+    NoExpand, PortableBuilder, RustProfile,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -9,6 +9,10 @@ const UPSTREAM_PACKAGE_SHA256: &str =
     "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba";
 const UPSTREAM_PATH: &str = "tests/replace.rs";
 const UPSTREAM_SHA256: &str = "78ff9bf7f78783ad83a78041bb7ee0705c7efc85b4d12301581d0ce5b2a59325";
+const UPSTREAM_BYTES_PATH: &str = "src/regex/bytes.rs";
+const UPSTREAM_BYTES_SHA256: &str =
+    "fae9e125ff320e85fe5e59e2a32ae24d85f6ca9f38c737c4e929a8376b9b53b0";
+const UPSTREAM_API_IDS: &[&str] = &["bytes_no_expand"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Capability {
@@ -275,6 +279,9 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     assert_eq!(profile.regex.checksum, UPSTREAM_PACKAGE_SHA256);
     assert_eq!(UPSTREAM_PATH, "tests/replace.rs");
     assert_eq!(UPSTREAM_SHA256.len(), 64);
+    assert_eq!(UPSTREAM_BYTES_PATH, "src/regex/bytes.rs");
+    assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
+    assert_eq!(UPSTREAM_API_IDS, ["bytes_no_expand"]);
     assert_eq!(INVENTORY.len(), 26);
 
     let mut ids: Vec<_> = INVENTORY.iter().map(|case| case.id).collect();
@@ -327,6 +334,41 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     for case in INVENTORY {
         assert!(case.capability.id().starts_with("replacement."));
     }
+}
+
+#[test]
+fn pinned_bytes_no_expand_doctest_passes_through_bounded_literal_replacement() {
+    let pattern = r"(?<last>[^,\s]+),\s+(\S+)";
+    let haystack = b"Springsteen, Bruce";
+    let replacement = b"$2 $last";
+    let regex = AggregateBuilder::new(pattern)
+        .build_spans()
+        .expect("NoExpand doctest selector");
+
+    let actual = regex
+        .replace_literal(
+            haystack,
+            NoExpand(replacement),
+            LiteralReplacementLimits::default(),
+        )
+        .expect("bounded NoExpand replacement");
+    let upstream = regex::bytes::Regex::new(pattern).expect("pinned NoExpand doctest pattern");
+    let expected = upstream.replace(haystack, regex::bytes::NoExpand(replacement));
+
+    assert_eq!(actual.as_bytes(), expected.as_ref());
+    assert_eq!(actual.as_bytes(), replacement);
+    assert_eq!(actual.report().accounting.replacements, 1);
+    assert_eq!(
+        actual.report().accounting.replacement_bytes_copied,
+        replacement.len()
+    );
+
+    let wrapper = NoExpand(replacement);
+    assert_eq!(wrapper.clone().0, wrapper.0);
+    assert_eq!(
+        format!("{wrapper:?}"),
+        r"NoExpand([36, 50, 32, 36, 108, 97, 115, 116])"
+    );
 }
 
 #[test]
