@@ -871,6 +871,7 @@ impl RowStore {
             record_bytes: self.record_bytes,
             current_record: &[],
             current_position: None,
+            current_start: self.bytes.len(),
             root_rank: self.root_rank,
         }
     }
@@ -938,6 +939,7 @@ struct RowReader<'a> {
     record_bytes: usize,
     current_record: &'a [u8],
     current_position: Option<usize>,
+    current_start: usize,
     root_rank: usize,
 }
 
@@ -991,12 +993,9 @@ impl RowReader<'_> {
             traversed,
             Resource::SequentialBytes,
         )?;
-        let ordinal = add(position, 1, Resource::LogBytes)?;
-        let from_end = mul(ordinal, self.record_bytes, Resource::LogBytes)?;
         let start = self
-            .store
-            .len()
-            .checked_sub(from_end)
+            .current_start
+            .checked_sub(traversed)
             .ok_or(Error::InternalInvariant("row-log seek outside store"))?;
         let end = add(start, self.record_bytes, Resource::LogBytes)?;
         self.current_record = self
@@ -1004,6 +1003,7 @@ impl RowReader<'_> {
             .get(start..end)
             .ok_or(Error::InternalInvariant("row-log read outside store"))?;
         self.current_position = Some(position);
+        self.current_start = start;
         Ok(())
     }
 }
@@ -1258,4 +1258,41 @@ fn operation_identity(plan: PlanId, strategy: Strategy, kind: OperationKind) -> 
             ^ ordinal.wrapping_mul(29);
     }
     OperationId(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::accounting::ExecutionAccounting;
+
+    use super::RowReader;
+
+    #[test]
+    fn row_reader_advances_from_its_authenticated_offset() {
+        let store = [30_u8, 31, 20, 21, 10, 11, 0, 1];
+        let mut reader = RowReader {
+            store: &store,
+            record_bytes: 2,
+            current_record: &[],
+            current_position: None,
+            current_start: store.len(),
+            root_rank: 0,
+        };
+        let mut accounting = ExecutionAccounting::default();
+
+        reader.ensure(0, &mut accounting).unwrap();
+        assert_eq!(reader.current_record, [0, 1]);
+        assert_eq!(accounting.sequential_bytes_read, 2);
+
+        reader.ensure(1, &mut accounting).unwrap();
+        assert_eq!(reader.current_record, [10, 11]);
+        assert_eq!(accounting.sequential_bytes_read, 4);
+
+        reader.ensure(3, &mut accounting).unwrap();
+        assert_eq!(reader.current_record, [30, 31]);
+        assert_eq!(accounting.sequential_bytes_read, 8);
+
+        reader.ensure(3, &mut accounting).unwrap();
+        assert_eq!(accounting.sequential_bytes_read, 8);
+        assert!(reader.ensure(2, &mut accounting).is_err());
+    }
 }
