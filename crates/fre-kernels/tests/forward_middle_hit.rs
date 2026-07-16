@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use fre_kernels::{
     FORWARD_ANCHORED_PLAN_ID, ForwardAnchoredAnchors, ForwardAnchoredBuildLimits,
     ForwardAnchoredByteClass, ForwardAnchoredPlan, ForwardAnchoredSearchLimits,
