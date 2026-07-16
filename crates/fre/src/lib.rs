@@ -444,6 +444,116 @@ pub enum BuildError {
     InternalInvariant(&'static str),
 }
 
+/// Stable top-level classification for a failed portable construction.
+///
+/// This is deliberately coarser than [`BuildError`]. It lets conformance
+/// adapters distinguish an upstream-invalid pattern from an FRE capability
+/// gap, an explicitly configured resource refusal, invalid profile state, or
+/// an internal construction failure without parsing diagnostic text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildFailureClass {
+    /// The pinned syntax front-end rejected the pattern or its encoding.
+    ExpectedInvalid,
+    /// The pattern is valid but outside the currently certified executor.
+    Unsupported,
+    /// A checked caller-configured construction bound was exceeded.
+    ResourceLimit,
+    /// The requested compatibility profile or builder configuration is invalid.
+    InvalidConfiguration,
+    /// Allocation, arithmetic, emitted-plan, or facade invariants failed.
+    InternalFailure,
+}
+
+impl BuildError {
+    /// Classify this failure without inspecting its human-readable message.
+    #[must_use]
+    pub fn failure_class(&self) -> BuildFailureClass {
+        match self {
+            Self::Syntax(error) => match &error.category {
+                fre_syntax::ErrorCategory::InvalidPatternEncoding
+                | fre_syntax::ErrorCategory::UpstreamRustSyntax
+                | fre_syntax::ErrorCategory::Re2Syntax { .. } => BuildFailureClass::ExpectedInvalid,
+                fre_syntax::ErrorCategory::FreResourceLimit { .. }
+                | fre_syntax::ErrorCategory::StrictQualificationFailure { .. } => {
+                    BuildFailureClass::ResourceLimit
+                }
+                fre_syntax::ErrorCategory::UnsupportedNotYetImplemented { .. } => {
+                    BuildFailureClass::Unsupported
+                }
+                fre_syntax::ErrorCategory::InvalidConfiguration => {
+                    BuildFailureClass::InvalidConfiguration
+                }
+            },
+            Self::Lower(error) => lower_failure_class(error),
+            Self::Literal(error) => match error {
+                LiteralError::NeedleLimit { .. } | LiteralError::LinearTermLimit { .. } => {
+                    BuildFailureClass::ResourceLimit
+                }
+                _ => BuildFailureClass::InternalFailure,
+            },
+            Self::LiteralSet(error) => match error {
+                LiteralSetError::PatternLimit { .. }
+                | LiteralSetError::PatternBytesLimit { .. }
+                | LiteralSetError::BuildWorkLimit { .. }
+                | LiteralSetError::BuildBytesLimit { .. }
+                | LiteralSetError::PersistentBytesLimit { .. }
+                | LiteralSetError::TransitionLimit { .. } => BuildFailureClass::ResourceLimit,
+                _ => BuildFailureClass::InternalFailure,
+            },
+            Self::RequiredLiteral(error) => required_literal_failure_class(error),
+            Self::RequiredLiteralShape | Self::ForwardAnchoredShape => {
+                BuildFailureClass::Unsupported
+            }
+            Self::ForwardAnchored(error) => forward_anchored_failure_class(error),
+            Self::PlannerWorkLimit { .. } | Self::PersistentBytesLimit { .. } => {
+                BuildFailureClass::ResourceLimit
+            }
+            Self::PersistentBytesOverflow
+            | Self::AllocationFailed { .. }
+            | Self::InternalInvariant(_) => BuildFailureClass::InternalFailure,
+        }
+    }
+}
+
+fn lower_failure_class(error: &fre_lower::LowerError) -> BuildFailureClass {
+    match error {
+        fre_lower::LowerError::Unsupported(_) => BuildFailureClass::Unsupported,
+        fre_lower::LowerError::ResourceLimit { .. }
+        | fre_lower::LowerError::Automata(fre_automata::CompileError::ResourceLimit { .. }) => {
+            BuildFailureClass::ResourceLimit
+        }
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn required_literal_failure_class(error: &RequiredLiteralBuildError) -> BuildFailureClass {
+    if error.is_semantic_refusal() {
+        return BuildFailureClass::Unsupported;
+    }
+    match error {
+        RequiredLiteralBuildError::SuffixLimit { .. }
+        | RequiredLiteralBuildError::WorkLimit { .. }
+        | RequiredLiteralBuildError::ScratchLimit { .. }
+        | RequiredLiteralBuildError::PersistentLimit { .. }
+        | RequiredLiteralBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn forward_anchored_failure_class(error: &ForwardAnchoredBuildError) -> BuildFailureClass {
+    if error.is_semantic_refusal() {
+        return BuildFailureClass::Unsupported;
+    }
+    match error {
+        ForwardAnchoredBuildError::SuffixLimit { .. }
+        | ForwardAnchoredBuildError::WorkLimit { .. }
+        | ForwardAnchoredBuildError::ScratchLimit { .. }
+        | ForwardAnchoredBuildError::PersistentLimit { .. }
+        | ForwardAnchoredBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
