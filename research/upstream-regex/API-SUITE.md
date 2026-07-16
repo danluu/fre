@@ -9,7 +9,7 @@ already inventoried by `regex-1.12.4-inventory.json`.
 | Upstream source | Status in the report-producing tool |
 | --- | --- |
 | `tests/replace.rs` | Complete executable adapter: 26/26 named obligations, each with a mandatory disposition |
-| `tests/searcher.rs` | Eleven behaviors have executable FRE coverage in `crates/fre/tests/upstream_searcher.rs`; a payload-hashed tool report remains |
+| `tests/searcher.rs` | Complete executable adapter: 11/11 named obligations, each with a mandatory disposition |
 | `tests/misc.rs` | Complete 10/10 mandatory dispositions; constructor, metadata, capture, and search behavior execute where FRE exposes the upstream surface |
 | `tests/regression.rs` | Complete 10/10 mandatory dispositions with executable constructor, capture, and search checks |
 | `tests/regression_fuzz.rs` | Complete 5/5 mandatory dispositions; the upstream ignored expensive case remains explicit unsupported evidence |
@@ -31,3 +31,11 @@ files plus all bytes of `tests/misc.rs`, `tests/regression.rs`, and
 mismatch, unsupported, or fault receipts. Unsupported formatting/index
 operator/type-lifetime surfaces and the upstream ignored expensive constructor
 remain visible rather than being silently filtered.
+
+The searcher adapter independently authenticates the same package identity and
+the complete `tests/searcher.rs` byte stream (SHA-256
+`04152e5c86431deec0c196d2564a11bc4ec36f14c77e8c16a2f9d1cbc9fc574e`).
+It executes every upstream empty, adjacent, rejected-range, zero-width and
+Unicode step-sequence obligation through FRE's real aggregate search-step API.
+All 11 fixed-order obligations must produce pass, mismatch, unsupported or
+fault receipts; omission and filtering are not report states.

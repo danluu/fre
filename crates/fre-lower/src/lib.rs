@@ -73,6 +73,7 @@ pub struct LowerStats {
     states: usize,
     edges: usize,
     erased_captures: usize,
+    normalized_nullable_repetitions: usize,
 }
 
 impl LowerStats {
@@ -103,6 +104,13 @@ impl LowerStats {
     /// HIR. Repeat expansion does not multiply this syntax-level count.
     pub const fn erased_captures(self) -> usize {
         self.erased_captures
+    }
+
+    #[must_use]
+    /// Number of capture-free nullable nested repetitions replaced by their
+    /// certified equivalent positive-width repetition before graph emission.
+    pub const fn normalized_nullable_repetitions(self) -> usize {
+        self.normalized_nullable_repetitions
     }
 }
 

@@ -39,7 +39,8 @@ pub enum UnsupportedFeature {
     LookAssertion(Look),
     /// K0 has no capture-preserving output path yet.
     CaptureSensitiveOperation,
-    /// K0 only certifies unbounded loops with a positive minimum body length.
+    /// K0 only certifies unbounded loops with a positive minimum body length
+    /// or the bounded capture-free nested-repetition normalization.
     UncertifiedUnboundedRepetition,
 }
 
@@ -52,7 +53,7 @@ impl fmt::Display for UnsupportedFeature {
                 f.write_str("capture-sensitive operation (capture preservation is not implemented)")
             }
             Self::UncertifiedUnboundedRepetition => f.write_str(
-                "unbounded repetition whose body lacks a certified positive minimum byte length",
+                "unbounded repetition lacks a positive-width or capture-free normalization proof",
             ),
         }
     }

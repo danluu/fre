@@ -49,10 +49,12 @@ UTF-8-safe HIR shared with an independently parsed same-option byte proof and
 filters empty matches inside scalar encodings. Capture Unicode scalar classes
 lower through checked canonical UTF-8 byte-range sequences under explicit HIR,
 AST, state, and work limits. Rust text sets compose those independently proved
-matchers under set-wide bounds. Missing byte sets, capture HIRs outside those
-proofs, and unproved text execution remain stable `unsupported` receipts. Inapplicable
-upstream surface combinations remain separately typed, and panics become
-`fault` receipts without truncating the cross product.
+matchers under set-wide bounds. Rust byte sets compose bounded byte matchers,
+preserve arbitrary-byte haystacks and publish matching pattern IDs in stable
+source order. Capture HIRs outside the proved slices and unproved text execution
+remain stable `unsupported` receipts. Inapplicable upstream surface combinations
+remain separately typed, and panics become `fault` receipts without truncating
+the cross product.
 
 The separate replacement API adapter covers the complete non-TOML
 `tests/replace.rs` source at the same pin. It authenticates the published crate
@@ -62,6 +64,13 @@ mismatch, unsupported or fault receipt; there is no skip/filter disposition.
 The executable split is nine literal/`NoExpand` cases, nine capture-template
 cases, two functional-replacer cases and six owned/borrowed/`Cow<str>` type
 surface cases.
+
+The pattern-searcher adapter covers the complete non-TOML
+`tests/searcher.rs` source at the same pin. It authenticates the published
+crate identity and complete Rust source file before executing all 11 named
+obligations through FRE's aggregate search-step API. Each obligation emits a
+mandatory pass, mismatch, unsupported or fault receipt, including empty,
+zero-width, rejected-range and Unicode step sequences.
 
 ## Reproduce
 
@@ -93,6 +102,13 @@ cargo run -p rust-regex-conformance -- run-misc-regression-api \
 
 cargo run -p rust-regex-conformance -- verify-misc-regression-api-report \
   /tmp/fre-rust-regex-misc-regression-api-report.json
+
+cargo run -p rust-regex-conformance -- run-searcher-api \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-searcher-api-report.json
+
+cargo run -p rust-regex-conformance -- verify-searcher-api-report \
+  /tmp/fre-rust-regex-searcher-api-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -105,11 +121,12 @@ cargo run -p rust-regex-conformance -- \
 
 ## Scope boundary
 
-The authenticated inventory plus the TOML and replacement adapters do not yet:
+The authenticated inventory plus the TOML, replacement and searcher adapters
+do not yet:
 
 - provide general Rust text beyond the proved slices, byte sets, capture
-  iteration, or full match iteration;
-- produce mandatory reports for the remaining upstream searcher, doctest, or
+  full match iteration;
+- produce mandatory reports for the remaining upstream doctest or
   feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
