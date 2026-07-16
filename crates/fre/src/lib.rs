@@ -194,6 +194,18 @@ impl Match {
     pub const fn is_empty(self) -> bool {
         self.start == self.end
     }
+
+    /// Number of matched bytes.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Half-open byte range in the original haystack.
+    #[must_use]
+    pub const fn range(self) -> core::ops::Range<usize> {
+        self.start..self.end
+    }
 }
 
 /// Auditable construction facts for one portable plan.
