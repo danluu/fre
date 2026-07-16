@@ -207,6 +207,9 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
         "(?:a*){1,}?",
         "(?:a?)+?",
         "(?:[ab]*){3,}",
+        "(?:a*|b)*",
+        "(a*|b)*",
+        "((a*|b))*",
     ] {
         let parsed = parsed(pattern, false);
         let lowered = lower_raw(
@@ -223,7 +226,7 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
         "(?:a?){3,}?",
         "(?:a*){2,}?",
         "(?:a|)*",
-        "(?:a*|b)*",
+        "(?:b|a*)*",
     ] {
         let parsed = parsed(pattern, false);
         assert!(
@@ -259,6 +262,91 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
             UnsupportedFeature::UncertifiedUnboundedRepetition
         ))
     ));
+}
+
+#[test]
+fn ordered_nullable_alternative_star_matches_upstream_in_continuations() {
+    let patterns = [
+        "(a*|b)*",
+        "((a*|b))*",
+        "(?:a*|b)*c",
+        "(?:a*|b)*b",
+        "(?:a*|b)*a",
+        "(?:a*|b)*$",
+        "^(?:a*|b)*$",
+        "(?:a*|b)*(?:b|bc)",
+        "(?:a*|b)*a?",
+    ];
+    let mut haystacks = vec![
+        Vec::new(),
+        b"b".to_vec(),
+        b"bbb".to_vec(),
+        b"a".to_vec(),
+        b"aaab".to_vec(),
+        b"aba".to_vec(),
+        b"c".to_vec(),
+        b"bc".to_vec(),
+        b"abc".to_vec(),
+        b"bbbc".to_vec(),
+        b"xbc".to_vec(),
+        b"abb".to_vec(),
+        b"ba".to_vec(),
+        b"abba".to_vec(),
+        "ébc".as_bytes().to_vec(),
+    ];
+    let alphabet = [b'a', b'b', b'c'];
+    for len in 1..=6 {
+        let count = alphabet
+            .len()
+            .pow(u32::try_from(len).expect("short byte word"));
+        for mut number in 0..count {
+            let mut haystack = vec![0; len];
+            for byte in &mut haystack {
+                *byte = alphabet[number % alphabet.len()];
+                number /= alphabet.len();
+            }
+            haystacks.push(haystack);
+        }
+    }
+
+    for pattern in patterns {
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("upstream rejected {pattern:?}: {error}"));
+        let parsed = parsed(pattern, false);
+        let lowered = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("FRE rejected {pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+        for haystack in &haystacks {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = lowered
+                .automaton()
+                .prepare::<Span>()
+                .search(haystack, SearchLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("pattern={pattern:?}, haystack={haystack:?}: {error}")
+                })
+                .into_output();
+            assert_eq!(tuple(actual), expected, "{pattern:?}, {haystack:?}");
+        }
+    }
+
+    for (pattern, expected_erased) in [("(a*|b)*", 1), ("((a*|b))*", 2)] {
+        let lowered = lower_raw(
+            &parsed(pattern, false),
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("FRE rejected {pattern:?}: {error}"));
+        assert_eq!(lowered.stats().erased_captures(), expected_erased);
+    }
 }
 
 #[test]

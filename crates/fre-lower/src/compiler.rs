@@ -96,6 +96,7 @@ enum Task<'h> {
     },
     FinishLazyOptionalGreedyPlus,
     FinishLazyGreedyOptionalThenStar,
+    FinishOrderedNullableAlternativeStar,
 }
 
 pub(crate) fn compile(
@@ -188,6 +189,9 @@ impl<'h> Compiler<'h> {
                 }
                 Task::FinishLazyGreedyOptionalThenStar => {
                     self.finish_lazy_greedy_optional_then_star()?;
+                }
+                Task::FinishOrderedNullableAlternativeStar => {
+                    self.finish_ordered_nullable_alternative_star()?;
                 }
             }
         }
@@ -302,6 +306,14 @@ impl<'h> Compiler<'h> {
                 self.increment_nullable_normalization_count()?;
                 self.push_task(Task::FinishOrderedWordLookAlternationPlus { look })?;
                 return self.push_task(Task::Visit(atom));
+            }
+            if let Some((star_atom, trailing_atom)) =
+                self.normalized_ordered_nullable_alternative_star(repetition)?
+            {
+                self.increment_nullable_normalization_count()?;
+                self.push_task(Task::FinishOrderedNullableAlternativeStar)?;
+                self.push_task(Task::Visit(trailing_atom))?;
+                return self.push_task(Task::Visit(star_atom));
             }
             if let Some((sub, normalization)) = self.normalized_nullable_repetition(repetition)? {
                 return self.schedule_nullable_repetition(sub, normalization);
@@ -580,6 +592,48 @@ impl<'h> Compiler<'h> {
         self.push_task(Task::Visit(sub))
     }
 
+    /// Eliminate the nullable cycle in an ordered greedy `(?:A*|B)*`
+    /// without changing its leftmost-first continuation priority.
+    ///
+    /// A language rewrite to `(?:A|B)*` is invalid: on `B`, the original
+    /// first accepts the empty match through its preferred `A*`, while the
+    /// rewrite consumes `B`. The dedicated graph emitted below retains the
+    /// original reset points and continuation edge. Both consumers are kept
+    /// deliberately narrow and positive-width so every cycle makes progress.
+    fn normalized_ordered_nullable_alternative_star(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<(&'h Hir, &'h Hir)>, LowerError> {
+        if outer.min != 0 || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let nested = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = nested.kind() else {
+            return Ok(None);
+        };
+        let [nullable, trailing] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let nullable = self.capture_free_node(nullable)?;
+        let HirKind::Repetition(inner) = nullable.kind() else {
+            return Ok(None);
+        };
+        if inner.min != 0 || inner.max.is_some() || !inner.greedy {
+            return Ok(None);
+        }
+        let star_atom = self.capture_free_node(&inner.sub)?;
+        let trailing_atom = self.capture_free_node(trailing)?;
+        if !Self::positive_width_atom(star_atom) || !Self::positive_width_atom(trailing_atom) {
+            return Ok(None);
+        }
+        Ok(Some((star_atom, trailing_atom)))
+    }
+
+    fn positive_width_atom(hir: &Hir) -> bool {
+        matches!(hir.kind(), HirKind::Literal(_) | HirKind::Class(_))
+            && matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0)
+    }
+
     fn capture_free_node(&mut self, mut hir: &'h Hir) -> Result<&'h Hir, LowerError> {
         while let HirKind::Capture(capture) = hir.kind() {
             self.charge(1, "capture-free nullable normalization")?;
@@ -651,6 +705,39 @@ impl<'h> Compiler<'h> {
         fragments.push(star);
         let normalized = self.concat_fragments(fragments)?;
         self.push_fragment(normalized)
+    }
+
+    fn finish_ordered_nullable_alternative_star(&mut self) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(2)?;
+        let trailing = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing ordered nullable-alternative trailing atom",
+        })?;
+        let star_atom = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing ordered nullable-alternative star atom",
+        })?;
+
+        let zero = self.add_state(StateRole::Split)?;
+        let progressed = self.add_state(StateRole::Split)?;
+        self.add_edge(zero, EdgeKind::Epsilon, 0, 0, Some(star_atom.start))?;
+        let zero_continuation = self.add_edge(zero, EdgeKind::Epsilon, 0, 0, None)?;
+        self.add_edge(zero, EdgeKind::Epsilon, 0, 0, Some(trailing.start))?;
+        self.add_edge(progressed, EdgeKind::Epsilon, 0, 0, Some(star_atom.start))?;
+        self.add_edge(progressed, EdgeKind::Epsilon, 0, 0, Some(trailing.start))?;
+        let progressed_continuation = self.add_edge(progressed, EdgeKind::Epsilon, 0, 0, None)?;
+        self.patch_all(&star_atom.outs, progressed)?;
+        self.patch_all(&trailing.outs, progressed)?;
+        let mut outs =
+            self.singleton_patch(zero_continuation, "zero-progress nullable-alternative exit")?;
+        let progressed_outs = self.singleton_patch(
+            progressed_continuation,
+            "progressed nullable-alternative exit",
+        )?;
+        self.append_patches(
+            &mut outs,
+            progressed_outs,
+            "ordered nullable-alternative exits",
+        )?;
+        self.push_fragment(Fragment { start: zero, outs })
     }
 
     fn finish_ordered_start_look_alternation_repetition(
