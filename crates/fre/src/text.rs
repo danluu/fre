@@ -3,6 +3,7 @@
 use core::fmt;
 
 use fre_syntax::{CanonicalPattern, ParseError, ParseRequest, ParseSummary};
+use regex_syntax::hir::{Look, LookSet};
 
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
@@ -32,12 +33,14 @@ pub enum PortableTextProof {
     /// Both profiles enumerate the same ordered finite UTF-8 language.
     FiniteLanguage { words: usize, word_bytes: usize },
     /// Both profiles produced an identical HIR whose non-empty matches are
-    /// valid UTF-8. A nullable HIR is admitted here only without look
-    /// assertions, which makes its first full-haystack match the empty span at
-    /// byte boundary zero.
+    /// valid UTF-8. A nullable HIR is admitted only when every look assertion
+    /// is false inside a valid scalar, so byte search cannot publish an empty
+    /// match at a non-text boundary.
     IdenticalUtf8Hir {
         minimum_match_bytes: usize,
         has_look_assertions: bool,
+        /// Every nullable assertion path is false inside a valid UTF-8 scalar.
+        empty_match_utf8_boundary_safe: bool,
     },
 }
 
@@ -154,11 +157,10 @@ impl From<SearchError> for PortableTextSearchError {
 /// Finite admission requires both pinned `RustText` and `RustBytes` parsers to
 /// produce the same ordered language and every word to be valid UTF-8. The
 /// non-finite slice requires identical HIRs whose matches are valid UTF-8 and
-/// either positive minimum width or no assertions when nullable. UTF-8's
-/// self-synchronizing encoding then proves that a non-empty match cannot begin
-/// or end inside a scalar; a nullable assertion-free search selects boundary
-/// zero. Every language outside these proofs is rejected instead of silently
-/// delegated.
+/// either positive minimum width or only UTF-8-boundary-safe assertions when
+/// nullable. UTF-8's self-synchronizing encoding then proves that a match
+/// cannot begin or end inside a scalar. Every language outside these proofs is
+/// rejected instead of silently delegated.
 #[derive(Clone, Debug)]
 pub struct PortableTextBuilder {
     pattern: String,
@@ -244,7 +246,12 @@ impl PortableTextBuilder {
             ));
         };
 
-        let proof = prove_equivalence(&text_pattern.hir, &bytes_pattern.hir, &self.limits)?;
+        let proof = prove_equivalence(
+            &text_pattern.hir,
+            &bytes_pattern.hir,
+            self.profile.options.line_terminator,
+            &self.limits,
+        )?;
 
         let inner = PortableBuilder::new(self.pattern)
             .profile(self.profile)
@@ -270,6 +277,7 @@ impl PortableTextBuilder {
 fn prove_equivalence(
     text: &regex_syntax::hir::Hir,
     bytes: &regex_syntax::hir::Hir,
+    line_terminator: u8,
     limits: &BuildLimits,
 ) -> Result<PortableTextProof, PortableTextBuildError> {
     let text_language = finite::extract(
@@ -294,7 +302,7 @@ fn prove_equivalence(
         (Some(text_language), Some(bytes_language)) => {
             finite_equivalence(&text_language, &bytes_language)
         }
-        (None, None) => hir_equivalence(text, bytes),
+        (None, None) => hir_equivalence(text, bytes, line_terminator),
         (Some(_), None) | (None, Some(_)) => Err(PortableTextBuildError::ProfileLanguageMismatch),
     }
 }
@@ -324,18 +332,43 @@ fn finite_equivalence(
 fn hir_equivalence(
     text: &regex_syntax::hir::Hir,
     bytes: &regex_syntax::hir::Hir,
+    line_terminator: u8,
 ) -> Result<PortableTextProof, PortableTextBuildError> {
     let properties = text.properties();
     let minimum_match_bytes = properties
         .minimum_len()
         .ok_or(PortableTextBuildError::NonFiniteLanguage)?;
-    let has_look_assertions = !properties.look_set().is_empty();
-    if text != bytes || !properties.is_utf8() || (minimum_match_bytes == 0 && has_look_assertions) {
+    let look_set = properties.look_set();
+    let has_look_assertions = !look_set.is_empty();
+    let empty_match_utf8_boundary_safe =
+        minimum_match_bytes > 0 || looks_are_utf8_boundary_safe(look_set, line_terminator);
+    if text != bytes || !properties.is_utf8() || !empty_match_utf8_boundary_safe {
         return Err(PortableTextBuildError::NonFiniteLanguage);
     }
     Ok(PortableTextProof::IdenticalUtf8Hir {
         minimum_match_bytes,
         has_look_assertions,
+        empty_match_utf8_boundary_safe,
+    })
+}
+
+fn looks_are_utf8_boundary_safe(looks: LookSet, line_terminator: u8) -> bool {
+    looks.iter().all(|look| match look {
+        Look::StartLF | Look::EndLF => line_terminator.is_ascii(),
+        Look::Start
+        | Look::End
+        | Look::StartCRLF
+        | Look::EndCRLF
+        | Look::WordAscii
+        | Look::WordStartAscii
+        | Look::WordEndAscii
+        | Look::WordUnicode
+        | Look::WordUnicodeNegate
+        | Look::WordStartUnicode
+        | Look::WordEndUnicode
+        | Look::WordStartHalfUnicode
+        | Look::WordEndHalfUnicode => true,
+        Look::WordAsciiNegate | Look::WordStartHalfAscii | Look::WordEndHalfAscii => false,
     })
 }
 
@@ -493,6 +526,12 @@ mod tests {
             "[^x]+",
             "^a+",
             r"\b\w+\b",
+            r"^",
+            r"(?m:$)",
+            r"\b",
+            r"(?-u:\b)",
+            r"(?-u:\b{start})",
+            r"(?-u:\b{end})",
             "a*",
             ".*",
             "a{2,4}",
@@ -530,11 +569,12 @@ mod tests {
             PortableTextProof::IdenticalUtf8Hir {
                 minimum_match_bytes: 1,
                 has_look_assertions: false,
+                empty_match_utf8_boundary_safe: true,
             }
         );
         assert!(matches!(
-            PortableTextRegex::new("\\B")
-                .expect_err("nullable look-only search needs a UTF-8 boundary iterator"),
+            PortableTextRegex::new("(?-u:\\B)")
+                .expect_err("ASCII negation can match inside a UTF-8 scalar"),
             PortableTextBuildError::NonFiniteLanguage
         ));
         assert!(matches!(
