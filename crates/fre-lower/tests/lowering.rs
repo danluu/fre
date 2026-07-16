@@ -1,7 +1,7 @@
 use fre_automata::{EdgeKind, MatchSpan, SearchLimits, SearchWindow, Span};
 use fre_lower::{
     LowerError, LowerLimits, LowerResource, OperationSemantics, UnsupportedFeature, lower,
-    lower_hir_raw, lower_raw,
+    lower_hir_raw, lower_raw, lower_utf8_start_guarded,
 };
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
@@ -597,6 +597,80 @@ fn anchors_retain_original_haystack_context_for_ranged_search() {
     assert_eq!(ranged_end, None);
     assert_eq!(tuple(find("^a", b"ab")), Some((0, 1)));
     assert_eq!(tuple(find("a$", b"ba")), Some((1, 2)));
+}
+
+#[test]
+fn utf8_start_guard_is_exact_and_resource_bounded() {
+    let haystack = "a\u{1d6c3}".as_bytes();
+    let window = SearchWindow::new(1, haystack.len());
+    for pattern in [r"(?-u:\b{start-half})", r"(?-u:\B)"] {
+        let parsed = parsed(pattern, true);
+        let unguarded = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .expect("ordinary bytes lowering");
+        let unguarded = unguarded
+            .automaton()
+            .prepare::<Span>()
+            .search_window(haystack, window, SearchLimits::unlimited())
+            .expect("ordinary bytes search")
+            .into_output()
+            .expect("ordinary bytes match");
+        assert!(
+            !core::str::from_utf8(haystack)
+                .expect("fixture is UTF-8")
+                .is_char_boundary(unguarded.start()),
+            "pattern={pattern:?}, unguarded={unguarded:?}"
+        );
+
+        let guarded = lower_utf8_start_guarded(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .expect("guarded lowering");
+        assert!(guarded.stats().utf8_start_guarded());
+        let expected_work = guarded.stats().work();
+        let guarded_match = guarded
+            .automaton()
+            .prepare::<Span>()
+            .search_window(haystack, window, SearchLimits::unlimited())
+            .expect("guarded search")
+            .into_output()
+            .expect("guarded match");
+        assert_eq!(
+            (guarded_match.start(), guarded_match.end()),
+            (haystack.len(), haystack.len()),
+            "pattern={pattern:?}"
+        );
+
+        let exact = lower_utf8_start_guarded(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_work: expected_work,
+                ..LowerLimits::default()
+            },
+        )
+        .expect("exact guarded work limit");
+        assert_eq!(exact.stats().work(), expected_work);
+        assert!(matches!(
+            lower_utf8_start_guarded(
+                &parsed,
+                OperationSemantics::CaptureFree,
+                LowerLimits {
+                    max_work: expected_work - 1,
+                    ..LowerLimits::default()
+                },
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: LowerResource::Work,
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

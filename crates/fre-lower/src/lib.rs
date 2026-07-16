@@ -74,6 +74,7 @@ pub struct LowerStats {
     edges: usize,
     erased_captures: usize,
     normalized_nullable_repetitions: usize,
+    utf8_start_guarded: bool,
 }
 
 impl LowerStats {
@@ -111,6 +112,14 @@ impl LowerStats {
     /// certified equivalent positive-width repetition before graph emission.
     pub const fn normalized_nullable_repetitions(self) -> usize {
         self.normalized_nullable_repetitions
+    }
+
+    #[must_use]
+    /// Whether lowering synthesized a Unicode scalar-boundary assertion before
+    /// every candidate start. This is used only after the text facade proves a
+    /// valid UTF-8 haystack and byte-equivalent HIR.
+    pub const fn utf8_start_guarded(self) -> bool {
+        self.utf8_start_guarded
     }
 }
 
@@ -189,8 +198,35 @@ pub fn lower_hir_raw(
     operation: OperationSemantics,
     limits: LowerLimits,
 ) -> Result<LoweredRaw, LowerError> {
-    let (plan, stats) = compiler::compile(hir, operation, limits)?;
+    let (plan, stats) = compiler::compile(hir, operation, limits, false)?;
     Ok(LoweredRaw { plan, stats })
+}
+
+/// Lower a parsed Rust pattern with a synthesized UTF-8 scalar-boundary guard
+/// on every candidate match start, then independently validate it.
+///
+/// This is an integration primitive for the Rust text facade. Callers must
+/// separately prove that the haystack is valid UTF-8 and that the parsed HIR
+/// is byte-equivalent to the text expression. Bytes-facing APIs must use
+/// [`lower`] so that arbitrary byte offsets remain observable.
+///
+/// # Errors
+///
+/// Returns [`LowerError`] under the same checked limits and invariants as
+/// [`lower`].
+pub fn lower_utf8_start_guarded(
+    parsed: &RustParsed,
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredAutomaton, LowerError> {
+    if operation == OperationSemantics::CaptureSensitive {
+        return Err(LowerError::Unsupported(
+            UnsupportedFeature::CaptureSensitiveOperation,
+        ));
+    }
+    let (plan, stats) = compiler::compile(&parsed.hir, operation, limits, true)?;
+    let automaton = Automaton::from_raw(plan, limits.automata)?;
+    Ok(LoweredAutomaton { automaton, stats })
 }
 
 /// Lower and independently validate a parsed Rust pattern.

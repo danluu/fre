@@ -42,6 +42,14 @@ pub enum PortableTextProof {
         /// Every nullable assertion path is false inside a valid UTF-8 scalar.
         empty_match_utf8_boundary_safe: bool,
     },
+    /// The profiles produced an identical UTF-8 HIR, but a nullable assertion
+    /// can succeed inside a scalar when executed as bytes. The internal K0
+    /// plan therefore synthesizes a scalar-boundary guard at every candidate
+    /// start while preserving the original source and HIR.
+    Utf8StartBoundaryGuardedHir {
+        minimum_match_bytes: usize,
+        has_look_assertions: bool,
+    },
 }
 
 /// Failure to establish or construct a text-equivalence certificate.
@@ -66,6 +74,9 @@ pub enum PortableTextBuildError {
     Portable(BuildError),
     /// An impossible profile or arithmetic state was observed.
     InternalInvariant(&'static str),
+    /// A caller forced a specialized byte plan that cannot carry the text
+    /// facade's required UTF-8 candidate-start guard.
+    Utf8StartGuardPlanSelection { selection: PlanSelection },
 }
 
 impl fmt::Display for PortableTextBuildError {
@@ -89,6 +100,10 @@ impl fmt::Display for PortableTextBuildError {
             Self::InternalInvariant(detail) => {
                 write!(formatter, "text facade invariant failed: {detail}")
             }
+            Self::Utf8StartGuardPlanSelection { selection } => write!(
+                formatter,
+                "UTF-8 start-boundary guard requires automatic or K0 selection, got {selection:?}",
+            ),
         }
     }
 }
@@ -101,7 +116,8 @@ impl std::error::Error for PortableTextBuildError {
             Self::NonFiniteLanguage
             | Self::ProfileLanguageMismatch
             | Self::InvalidUtf8Word
-            | Self::InternalInvariant(_) => None,
+            | Self::InternalInvariant(_)
+            | Self::Utf8StartGuardPlanSelection { .. } => None,
         }
     }
 }
@@ -156,10 +172,11 @@ impl From<SearchError> for PortableTextSearchError {
 ///
 /// Finite admission requires both pinned `RustText` and `RustBytes` parsers to
 /// produce the same ordered language and every word to be valid UTF-8. The
-/// non-finite slice requires identical HIRs whose matches are valid UTF-8 and
-/// either positive minimum width or only UTF-8-boundary-safe assertions when
-/// nullable. UTF-8's self-synchronizing encoding then proves that a match
-/// cannot begin or end inside a scalar. Every language outside these proofs is
+/// non-finite slice requires identical HIRs whose matches are valid UTF-8. A
+/// nullable HIR whose assertions can succeed inside a scalar receives a
+/// synthesized scalar-boundary start guard in K0; other identical HIRs need no
+/// guard. UTF-8's self-synchronizing encoding then proves that a match cannot
+/// begin or end inside a scalar. Every language outside these proofs is
 /// rejected instead of silently delegated.
 #[derive(Clone, Debug)]
 pub struct PortableTextBuilder {
@@ -365,11 +382,25 @@ impl PortableTextBuilder {
             &self.limits,
         )?;
 
-        let inner = PortableBuilder::new(self.pattern)
+        let utf8_start_guarded =
+            matches!(proof, PortableTextProof::Utf8StartBoundaryGuardedHir { .. });
+        if utf8_start_guarded
+            && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
+        {
+            return Err(PortableTextBuildError::Utf8StartGuardPlanSelection {
+                selection: self.selection,
+            });
+        }
+
+        let mut inner_builder = PortableBuilder::new(self.pattern)
             .profile(self.profile)
             .limits(self.limits)
             .plan_selection(self.selection)
-            .after_set_admission_if(self.set_admitted)
+            .after_set_admission_if(self.set_admitted);
+        if utf8_start_guarded {
+            inner_builder = inner_builder.with_utf8_start_guard();
+        }
+        let inner = inner_builder
             .build()
             .map_err(PortableTextBuildError::Portable)?;
         let report = PortableTextBuildReport {
@@ -455,14 +486,21 @@ fn hir_equivalence(
     let has_look_assertions = !look_set.is_empty();
     let empty_match_utf8_boundary_safe =
         minimum_match_bytes > 0 || looks_are_utf8_boundary_safe(look_set, line_terminator);
-    if text != bytes || !properties.is_utf8() || !empty_match_utf8_boundary_safe {
+    if text != bytes || !properties.is_utf8() {
         return Err(PortableTextBuildError::NonFiniteLanguage);
     }
-    Ok(PortableTextProof::IdenticalUtf8Hir {
-        minimum_match_bytes,
-        has_look_assertions,
-        empty_match_utf8_boundary_safe,
-    })
+    if empty_match_utf8_boundary_safe {
+        Ok(PortableTextProof::IdenticalUtf8Hir {
+            minimum_match_bytes,
+            has_look_assertions,
+            empty_match_utf8_boundary_safe,
+        })
+    } else {
+        Ok(PortableTextProof::Utf8StartBoundaryGuardedHir {
+            minimum_match_bytes,
+            has_look_assertions,
+        })
+    }
 }
 
 fn looks_are_utf8_boundary_safe(looks: LookSet, line_terminator: u8) -> bool {
@@ -750,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn utf8_safe_repetition_is_proved_and_unproved_shapes_are_refused() {
+    fn utf8_safe_repetition_and_guarded_shapes_are_distinguished() {
         let repeated = PortableTextRegex::new("a+").expect("positive UTF-8 repetition is proved");
         assert_eq!(
             repeated.build_report().proof,
@@ -760,16 +798,142 @@ mod tests {
                 empty_match_utf8_boundary_safe: true,
             }
         );
+        let guarded = PortableTextRegex::new("(?-u:\\B)")
+            .expect("ASCII negation is protected by a UTF-8 start guard");
         assert!(matches!(
-            PortableTextRegex::new("(?-u:\\B)")
-                .expect_err("ASCII negation can match inside a UTF-8 scalar"),
-            PortableTextBuildError::NonFiniteLanguage
+            guarded.build_report().proof,
+            PortableTextProof::Utf8StartBoundaryGuardedHir {
+                minimum_match_bytes: 0,
+                has_look_assertions: true,
+            }
+        ));
+        assert!(
+            guarded
+                .build_report()
+                .portable
+                .lowering
+                .expect("guarded text shape selects K0")
+                .utf8_start_guarded()
+        );
+        assert!(matches!(
+            PortableTextBuilder::new("(?-u:\\B)")
+                .plan_selection(PlanSelection::ForceRequiredLiteral)
+                .build(),
+            Err(PortableTextBuildError::Utf8StartGuardPlanSelection {
+                selection: PlanSelection::ForceRequiredLiteral,
+            })
         ));
         assert!(matches!(
             PortableTextRegex::new("(?-u:\\xFF)")
                 .expect_err("invalid UTF-8 text language is rejected"),
             PortableTextBuildError::TextSyntax(_)
         ));
+    }
+
+    #[test]
+    fn utf8_start_guarded_ascii_half_looks_match_pinned_text_exhaustively() {
+        fn spans(regex: &PortableTextRegex, haystack: &str) -> Vec<(usize, usize)> {
+            let mut spans = Vec::new();
+            let mut start = 0_usize;
+            let mut last_match_end = None;
+            loop {
+                let (matched, _) = regex
+                    .find_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .expect("guarded text iteration search");
+                let Some(matched) = matched else {
+                    break;
+                };
+                assert!(haystack.is_char_boundary(matched.start()));
+                assert!(haystack.is_char_boundary(matched.end()));
+                if matched.is_empty() && last_match_end == Some(matched.end()) {
+                    let Some(character) = haystack[start..].chars().next() else {
+                        break;
+                    };
+                    start = start.saturating_add(character.len_utf8());
+                    continue;
+                }
+                spans.push((matched.start(), matched.end()));
+                start = matched.end();
+                last_match_end = Some(matched.end());
+            }
+            spans
+        }
+
+        let alphabet = ["a", " ", "_", "!", "é", "𝛃", "𐆀"];
+        let mut haystacks = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..=3 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for scalar in alphabet {
+                    let mut value = prefix.clone();
+                    value.push_str(scalar);
+                    next.push(value);
+                }
+            }
+            haystacks.extend(next.iter().cloned());
+            frontier = next;
+        }
+
+        for pattern in [r"(?-u:\b{start-half})", r"(?-u:\b{end-half})", r"(?-u:\B)"] {
+            let fre = PortableTextBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+            assert!(matches!(
+                fre.build_report().proof,
+                PortableTextProof::Utf8StartBoundaryGuardedHir { .. }
+            ));
+            assert_eq!(fre.build_report().portable.plan, crate::PlanKind::K0);
+            assert!(
+                fre.build_report()
+                    .portable
+                    .lowering
+                    .expect("guarded text shape selects K0")
+                    .utf8_start_guarded()
+            );
+            let mut upstream = regex::RegexBuilder::new(pattern);
+            upstream.unicode(false);
+            let upstream = upstream
+                .build()
+                .unwrap_or_else(|error| panic!("pinned pattern={pattern:?}: {error}"));
+
+            for haystack in &haystacks {
+                let expected = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    spans(&fre, haystack),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}"
+                );
+                for (start, _) in haystack
+                    .char_indices()
+                    .chain(core::iter::once((haystack.len(), ' ')))
+                {
+                    let expected = upstream
+                        .find_at(haystack, start)
+                        .map(|matched| (matched.start(), matched.end()));
+                    let (actual, _) = fre
+                        .find_window(
+                            haystack,
+                            SearchWindow::new(start, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .expect("guarded contextual search");
+                    assert_eq!(
+                        actual.map(|matched| (matched.start(), matched.end())),
+                        expected,
+                        "pattern={pattern:?}, haystack={haystack:?}, start={start}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

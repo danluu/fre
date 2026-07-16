@@ -197,17 +197,24 @@ fn construction_is_bounded_and_reports_the_exact_pattern_failure() {
         }
     ));
 
-    let unproved = sources(&["a", r"(?-u:\B)"]);
-    let error = PortableTextRegexSetBuilder::new(&unproved)
+    let guarded_patterns = sources(&["a", r"(?-u:\B)"]);
+    let guarded = PortableTextRegexSetBuilder::new(&guarded_patterns)
         .build()
-        .expect_err("UTF-8-unsafe assertion");
+        .expect("UTF-8-unsafe byte assertion receives a text start guard");
     assert!(matches!(
-        error,
-        PortableTextRegexSetBuildError::Pattern {
-            index: 1,
-            source: PortableTextBuildError::NonFiniteLanguage,
-        }
+        guarded
+            .pattern_build_report(1)
+            .expect("guarded pattern report")
+            .proof,
+        PortableTextProof::Utf8StartBoundaryGuardedHir { .. }
     ));
+    let upstream = regex::RegexSet::new(&guarded_patterns).expect("pinned guarded text set");
+    for haystack in ["", "a", " a", "𝛃", "a𝛃"] {
+        assert_eq!(
+            ids(&guarded, haystack),
+            upstream.matches(haystack).into_iter().collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

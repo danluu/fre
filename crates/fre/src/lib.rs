@@ -1161,6 +1161,7 @@ pub struct PortableBuilder {
     limits: BuildLimits,
     selection: PlanSelection,
     set_admitted: bool,
+    utf8_start_guarded: bool,
 }
 
 impl PortableBuilder {
@@ -1175,6 +1176,7 @@ impl PortableBuilder {
             limits: BuildLimits::default(),
             selection: PlanSelection::Auto,
             set_admitted: false,
+            utf8_start_guarded: false,
         }
     }
 
@@ -1346,6 +1348,14 @@ impl PortableBuilder {
         self
     }
 
+    /// Restrict every candidate match start to a UTF-8 scalar boundary. The
+    /// text facade is the sole caller and proves valid UTF-8 input plus HIR
+    /// equivalence before enabling this synthesized K0 guard.
+    pub(crate) const fn with_utf8_start_guard(mut self) -> Self {
+        self.utf8_start_guarded = true;
+        self
+    }
+
     /// Parse, plan, and independently validate an immutable portable plan.
     ///
     /// # Errors
@@ -1404,9 +1414,23 @@ impl PortableBuilder {
             storage_bytes: capture_name_storage_bytes,
         } = capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
-        if self.selection == PlanSelection::ForceK0 {
-            let lowered =
-                fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?;
+        if self.utf8_start_guarded
+            && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
+        {
+            return Err(BuildError::InternalInvariant(
+                "UTF-8 start guard requires automatic or forced K0 selection",
+            ));
+        }
+        if self.selection == PlanSelection::ForceK0 || self.utf8_start_guarded {
+            let lowered = if self.utf8_start_guarded {
+                fre_lower::lower_utf8_start_guarded(
+                    &rust,
+                    OperationSemantics::CaptureFree,
+                    self.limits.lowering,
+                )?
+            } else {
+                fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?
+            };
             let lowering = lowered.stats();
             let automaton = lowered
                 .into_automaton()
