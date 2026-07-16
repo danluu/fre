@@ -91,8 +91,7 @@ the literal-alternation pattern-per-word count row. Candidate plan names and
 pattern multiplicity are checked together, so an unknown plan or a
 single/multi alias fails closed. The manifest also recomputes the exact 5,772
 pair slots and 66 unavailable points from the semantic universe. This is an
-execution admission artifact; it does not itself provide the still-required
-multi-pattern runner implementation or run timing.
+execution admission artifact; it does not itself run timing.
 
 Each scheduled arm has one canonical `fre.rebar.performance-raw.v2` record.
 It binds the exact contract/canonical/semantic identity, job, model, lifecycle
@@ -195,6 +194,39 @@ ASCII/Unicode word-run runtime after checking it against the expected runtime.
 The emitted record binds every required identity and recomputes the ordered
 input hashes from KLV bytes.
 
-The performance gate still needs authenticated Rust/RE2 raw arms, an
-authorized resource collector and pair executor, and `regex-redux` after
-semantic support exists.
+`reference_rebar_runner` emits the matching reference arm by authenticating an
+internally pinned upstream runner digest and version, copying the authenticated
+bounded bytes to a new private mode-0500 executable, and invoking that copy as
+a fresh process. It validates the exact LF-terminated nonzero sample set and
+every reducer, rehashes the private executable afterward, and removes its
+mode-0700 staging directory before accepting output. The upstream shared timer's
+one-iteration policy implements cold compile or first operation. For
+allocator-warm compile and steady operation, the wrapper instead requires two
+visible iterations with no hidden warmup and a maximum duration that cannot
+terminate the fixed two-iteration loop: it requires both emitted reducers to
+equal the semantic receipt, discards the first duration, and publishes the
+second. Compile consumes and drops the first artifact before constructing the
+second; operation models retain the same artifact across both calls. This
+avoids treating the upstream timer's unreported warmup reducer as a verified
+prime. The wrapper rejects any other lifecycle KLV and emits the same
+canonical all-model raw schema without a candidate plan or runtime.
+Rust-regex accepts the admitted ordered multi-pattern rows; the pinned RE2
+runner is exactly single-pattern, so the semantic contract keeps those RE2
+points explicitly unavailable. Fixed-duration tests exercise every
+model/boundary without launching a runner or reading a clock.
+
+The pair executor remains responsible for deriving the KLV from the
+authenticated semantic row, supplying its independently authenticated
+identity fields and unique process token, and running the complete raw-arm
+contract validator before accepting wrapper output; caller strings alone do
+not admit a result. It must also enforce a wall/process-group deadline around
+each fresh process. The wrapper drains child output concurrently with bounded
+retention, but an exact binary that never exits is an executor-level timeout,
+not a valid raw arm. Unix owner-only staging prevents accidental cross-worker
+path reuse and detects persistent inode/ownership/mode changes; adversarial
+same-UID mutation between the final pathname check and `exec` is outside this
+wrapper's threat boundary and requires executor isolation or descriptor-based
+execution.
+
+The performance gate still needs the authenticated pair executor and resource
+collector, and `regex-redux` after semantic support exists.
