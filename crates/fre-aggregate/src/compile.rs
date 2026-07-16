@@ -834,8 +834,10 @@ fn certify_program(
             Resource::TemporaryStates,
         )?;
     }
-    let mut cursor = reserved_vec(states, Resource::TemporaryStates)?;
-    cursor.extend_from_slice(&offsets[..states]);
+    // Parent cardinalities are dead once their prefix offsets are frozen.
+    // Reuse that exact allocation for the per-child insertion cursors.
+    let mut cursor = parent_counts;
+    cursor.copy_from_slice(&offsets[..states]);
     let mut parents = zeroed_vec(edge_count, Resource::TemporaryStates)?;
     for (parent, inst) in insts.iter().enumerate() {
         for child in epsilon_targets(inst) {
@@ -874,15 +876,17 @@ fn certify_program(
     if order.len() != states {
         return Err(Error::SameBoundaryCycle);
     }
-    let mut split_rank = reserved_vec(states, Resource::TemporaryStates)?;
+    // A successful topological drain leaves every outgoing count dead. Reuse
+    // the exact state-width allocation as the persistent split-rank table.
+    let mut split_rank = outgoing;
     let mut split_count = 0_usize;
-    for inst in insts {
+    for (rank, inst) in split_rank.iter_mut().zip(insts) {
         budget.charge(1)?;
         if matches!(inst, Inst::Split { .. }) {
-            split_rank.push(split_count);
+            *rank = split_count;
             split_count = add(split_count, 1, Resource::ProgramStates)?;
         } else {
-            split_rank.push(NO_SPLIT_RANK);
+            *rank = NO_SPLIT_RANK;
         }
     }
     Ok((order, split_rank, split_count))
