@@ -25,11 +25,11 @@ use crate::{
 
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
-/// Stable implementation identity for this first portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v2";
+/// Stable implementation identity for this portable-facade adapter.
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v3";
 
 const LIMITATIONS: [&str; 4] = [
-    "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent under RustText and RustBytes parsing",
+    "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe first-match semantics",
     "the production FRE facade has no Rust text or bytes RegexSet matcher",
     "the production FRE facade has no capture iterator",
     "the production FRE facade has no complete match iterator; find-iter executes only empty-result or match-limit-one obligations",
@@ -656,7 +656,7 @@ fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
         Err(PortableTextBuildError::NonFiniteLanguage) => {
             TextBuildAttempt::Unsupported(unsupported(
                 CapabilityId::RustTextFacade,
-                "build.text-finite-language-gap",
+                "build.text-equivalence-proof-gap",
             ))
         }
         Err(
@@ -1228,10 +1228,21 @@ mod tests {
         nonfinite.patterns = vec!["a+".to_owned()];
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCompile, &text_case, &nonfinite),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &text_case, &nonfinite),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut unproved = input.clone();
+        unproved.patterns = vec![r"\B".to_owned()];
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCompile, &text_case, &unproved),
             AdapterDisposition::Unsupported {
                 capability: CapabilityId::RustTextFacade,
                 ref reason_code,
-            } if reason_code == "build.text-finite-language-gap"
+            } if reason_code == "build.text-equivalence-proof-gap"
         ));
     }
 

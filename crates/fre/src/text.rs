@@ -1,4 +1,4 @@
-//! Theorem-gated Rust text facade for finite UTF-8 literal languages.
+//! Theorem-gated Rust text facade for byte-equivalent UTF-8 languages.
 
 use core::fmt;
 
@@ -10,7 +10,7 @@ use crate::{
     finite,
 };
 
-/// Construction evidence for the first sound Rust text execution slice.
+/// Construction evidence for the first sound Rust text execution slices.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortableTextBuildReport {
     /// Public text profile proved before portable execution is constructed.
@@ -19,16 +19,29 @@ pub struct PortableTextBuildReport {
     pub text_syntax: ParseSummary,
     /// Independently parsed `RustBytes` proof-side syntax traversal.
     pub bytes_syntax: ParseSummary,
-    /// Ordered finite-language cardinality proved equal under both profiles.
-    pub finite_words: usize,
-    /// Sum of byte lengths across the proved ordered language.
-    pub finite_word_bytes: usize,
+    /// Exact theorem that permits byte execution for this text matcher.
+    pub proof: PortableTextProof,
     /// Honest report for the internal portable byte executor.
     pub portable: BuildReport,
 }
 
-/// Failure to establish or construct the finite-language text equivalence
-/// certificate.
+/// Auditable theorem used to equate the public text operation with the
+/// internal byte executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PortableTextProof {
+    /// Both profiles enumerate the same ordered finite UTF-8 language.
+    FiniteLanguage { words: usize, word_bytes: usize },
+    /// Both profiles produced an identical HIR whose non-empty matches are
+    /// valid UTF-8. A nullable HIR is admitted here only without look
+    /// assertions, which makes its first full-haystack match the empty span at
+    /// byte boundary zero.
+    IdenticalUtf8Hir {
+        minimum_match_bytes: usize,
+        has_look_assertions: bool,
+    },
+}
+
+/// Failure to establish or construct a text-equivalence certificate.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PortableTextBuildError {
@@ -38,8 +51,7 @@ pub enum PortableTextBuildError {
     BytesProofSyntax(ParseError),
     /// Checked finite-language extraction could not complete.
     FiniteProof(BuildError),
-    /// At least one profile is not a finite language under the configured
-    /// literal-set limits.
+    /// The profiles are outside both bounded text-equivalence proof slices.
     NonFiniteLanguage,
     /// `RustText` and `RustBytes` produced different ordered finite languages.
     ProfileLanguageMismatch,
@@ -62,7 +74,7 @@ impl fmt::Display for PortableTextBuildError {
             }
             Self::FiniteProof(error) => write!(formatter, "finite-language proof failed: {error}"),
             Self::NonFiniteLanguage => formatter.write_str(
-                "pattern is outside the finite UTF-8 language proved by the text facade",
+                "pattern is outside the UTF-8 equivalence slices proved by the text facade",
             ),
             Self::ProfileLanguageMismatch => formatter.write_str(
                 "Rust text and bytes profiles produced different ordered finite languages",
@@ -91,14 +103,16 @@ impl std::error::Error for PortableTextBuildError {
     }
 }
 
-/// Builder for the first certified Rust `Regex` text slice.
+/// Builder for the first certified Rust `Regex` text slices.
 ///
-/// Admission requires both pinned `RustText` and `RustBytes` parsers to produce
-/// the same ordered finite language and every word to be valid UTF-8. UTF-8's
-/// self-synchronizing encoding then proves that searching a valid `&str` with
-/// the existing byte executor cannot begin or end inside a scalar. Assertions,
-/// unbounded repetition and every other language outside that proof are
-/// rejected instead of silently delegated.
+/// Finite admission requires both pinned `RustText` and `RustBytes` parsers to
+/// produce the same ordered language and every word to be valid UTF-8. The
+/// non-finite slice requires identical HIRs whose matches are valid UTF-8 and
+/// either positive minimum width or no assertions when nullable. UTF-8's
+/// self-synchronizing encoding then proves that a non-empty match cannot begin
+/// or end inside a scalar; a nullable assertion-free search selects boundary
+/// zero. Every language outside these proofs is rejected instead of silently
+/// delegated.
 #[derive(Clone, Debug)]
 pub struct PortableTextBuilder {
     pattern: String,
@@ -147,8 +161,8 @@ impl PortableTextBuilder {
         self
     }
 
-    /// Prove text/bytes finite-language equivalence and build the immutable
-    /// text matcher.
+    /// Prove one text/bytes equivalence theorem and build the immutable text
+    /// matcher.
     ///
     /// # Errors
     ///
@@ -184,42 +198,7 @@ impl PortableTextBuilder {
             ));
         };
 
-        let text_language = finite::extract(
-            &text_pattern.hir,
-            self.limits.literal_set.max_patterns,
-            self.limits.literal_set.max_pattern_bytes,
-            0,
-            self.limits.max_planner_work,
-        )
-        .map_err(PortableTextBuildError::FiniteProof)?
-        .words
-        .ok_or(PortableTextBuildError::NonFiniteLanguage)?;
-        let bytes_language = finite::extract(
-            &bytes_pattern.hir,
-            self.limits.literal_set.max_patterns,
-            self.limits.literal_set.max_pattern_bytes,
-            0,
-            self.limits.max_planner_work,
-        )
-        .map_err(PortableTextBuildError::FiniteProof)?
-        .words
-        .ok_or(PortableTextBuildError::NonFiniteLanguage)?;
-        if text_language != bytes_language {
-            return Err(PortableTextBuildError::ProfileLanguageMismatch);
-        }
-        if text_language
-            .iter()
-            .any(|word| core::str::from_utf8(word).is_err())
-        {
-            return Err(PortableTextBuildError::InvalidUtf8Word);
-        }
-        let finite_word_bytes = text_language
-            .iter()
-            .try_fold(0_usize, |total, word| total.checked_add(word.len()))
-            .ok_or(PortableTextBuildError::InternalInvariant(
-                "finite language byte count overflow",
-            ))?;
-        let finite_words = text_language.len();
+        let proof = prove_equivalence(&text_pattern.hir, &bytes_pattern.hir, &self.limits)?;
 
         let inner = PortableBuilder::new(self.pattern)
             .profile(self.profile)
@@ -231,8 +210,7 @@ impl PortableTextBuilder {
             profile: text_profile.clone(),
             text_syntax,
             bytes_syntax,
-            finite_words,
-            finite_word_bytes,
+            proof,
             portable: inner.build_report().clone(),
         };
         Ok(PortableTextRegex {
@@ -243,7 +221,79 @@ impl PortableTextBuilder {
     }
 }
 
-/// Immutable matcher for the certified finite Rust text slice.
+fn prove_equivalence(
+    text: &regex_syntax::hir::Hir,
+    bytes: &regex_syntax::hir::Hir,
+    limits: &BuildLimits,
+) -> Result<PortableTextProof, PortableTextBuildError> {
+    let text_language = finite::extract(
+        text,
+        limits.literal_set.max_patterns,
+        limits.literal_set.max_pattern_bytes,
+        0,
+        limits.max_planner_work,
+    )
+    .map_err(PortableTextBuildError::FiniteProof)?
+    .words;
+    let bytes_language = finite::extract(
+        bytes,
+        limits.literal_set.max_patterns,
+        limits.literal_set.max_pattern_bytes,
+        0,
+        limits.max_planner_work,
+    )
+    .map_err(PortableTextBuildError::FiniteProof)?
+    .words;
+    match (text_language, bytes_language) {
+        (Some(text_language), Some(bytes_language)) => {
+            finite_equivalence(&text_language, &bytes_language)
+        }
+        (None, None) => hir_equivalence(text, bytes),
+        (Some(_), None) | (None, Some(_)) => Err(PortableTextBuildError::ProfileLanguageMismatch),
+    }
+}
+
+fn finite_equivalence(
+    text: &[Vec<u8>],
+    bytes: &[Vec<u8>],
+) -> Result<PortableTextProof, PortableTextBuildError> {
+    if text != bytes {
+        return Err(PortableTextBuildError::ProfileLanguageMismatch);
+    }
+    if text.iter().any(|word| core::str::from_utf8(word).is_err()) {
+        return Err(PortableTextBuildError::InvalidUtf8Word);
+    }
+    let word_bytes = text
+        .iter()
+        .try_fold(0_usize, |total, word| total.checked_add(word.len()))
+        .ok_or(PortableTextBuildError::InternalInvariant(
+            "finite language byte count overflow",
+        ))?;
+    Ok(PortableTextProof::FiniteLanguage {
+        words: text.len(),
+        word_bytes,
+    })
+}
+
+fn hir_equivalence(
+    text: &regex_syntax::hir::Hir,
+    bytes: &regex_syntax::hir::Hir,
+) -> Result<PortableTextProof, PortableTextBuildError> {
+    let properties = text.properties();
+    let minimum_match_bytes = properties
+        .minimum_len()
+        .ok_or(PortableTextBuildError::NonFiniteLanguage)?;
+    let has_look_assertions = !properties.look_set().is_empty();
+    if text != bytes || !properties.is_utf8() || (minimum_match_bytes == 0 && has_look_assertions) {
+        return Err(PortableTextBuildError::NonFiniteLanguage);
+    }
+    Ok(PortableTextProof::IdenticalUtf8Hir {
+        minimum_match_bytes,
+        has_look_assertions,
+    })
+}
+
+/// Immutable matcher for the certified Rust text slices.
 #[derive(Debug)]
 pub struct PortableTextRegex {
     profile: CompatibilityProfile,
@@ -326,7 +376,10 @@ mod tests {
             let fre = PortableTextRegex::new(pattern)
                 .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
             assert!(matches!(fre.profile(), CompatibilityProfile::RustText(_)));
-            assert!(fre.build_report().finite_words > 0);
+            assert!(matches!(
+                fre.build_report().proof,
+                PortableTextProof::FiniteLanguage { words, .. } if words > 0
+            ));
             let upstream = regex::Regex::new(pattern).expect("pinned Rust text accepts fixture");
             for haystack in haystacks {
                 let expected = upstream
@@ -353,13 +406,56 @@ mod tests {
     }
 
     #[test]
-    fn nonfinite_and_profile_divergent_languages_are_refused() {
+    fn utf8_safe_repetition_and_assertions_match_pinned_rust_text() {
+        let patterns = [
+            "a+",
+            "(?:é|東京)+",
+            ".",
+            "[^x]+",
+            "^a+",
+            r"\b\w+\b",
+            "a*",
+            ".*",
+            "a{2,4}",
+        ];
+        let haystacks = ["", "é", "東京é", "xxaaaz", "🦀 rust 東京", "aaaaa"];
+        for pattern in patterns {
+            let fre = PortableTextRegex::new(pattern)
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+            assert!(matches!(
+                fre.build_report().proof,
+                PortableTextProof::IdenticalUtf8Hir { .. }
+            ));
+            let upstream = regex::Regex::new(pattern).expect("pinned Rust text accepts fixture");
+            for haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let (actual, _) = fre
+                    .find(haystack, SearchLimits::unlimited())
+                    .expect("FRE text search executes");
+                assert_eq!(
+                    actual.map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_safe_repetition_is_proved_and_unproved_shapes_are_refused() {
+        let repeated = PortableTextRegex::new("a+").expect("positive UTF-8 repetition is proved");
+        assert_eq!(
+            repeated.build_report().proof,
+            PortableTextProof::IdenticalUtf8Hir {
+                minimum_match_bytes: 1,
+                has_look_assertions: false,
+            }
+        );
         assert!(matches!(
-            PortableTextRegex::new("a+").expect_err("unbounded repetition is outside slice"),
-            PortableTextBuildError::NonFiniteLanguage
-        ));
-        assert!(matches!(
-            PortableTextRegex::new(".").expect_err("Unicode dot is outside finite slice"),
+            PortableTextRegex::new("\\B")
+                .expect_err("nullable look-only search needs a UTF-8 boundary iterator"),
             PortableTextBuildError::NonFiniteLanguage
         ));
         assert!(matches!(

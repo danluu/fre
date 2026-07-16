@@ -84,7 +84,8 @@ pub use fre_kernels::{
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
 };
 pub use text::{
-    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextRegex,
+    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextProof,
+    PortableTextRegex,
 };
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};
