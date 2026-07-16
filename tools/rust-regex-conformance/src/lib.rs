@@ -5,10 +5,26 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, fmt, fs, io::Write, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    fmt, fs,
+    io::Write,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
+    process::Command,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod adapter;
+
+pub use adapter::{
+    ADAPTER_ID, ADAPTER_REPORT_SCHEMA, AdapterDispositionCounts, AdapterReport,
+    AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
+    FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
+    load_executable_cases, read_adapter_report, write_adapter_report,
+};
 
 /// Checked-in manifest schema.
 pub const MANIFEST_SCHEMA: &str = "fre.upstream-rust-regex.inventory.v1";
@@ -181,6 +197,13 @@ pub enum SearchKind {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapabilityId {
+    RustTextFacade,
+    RustBytesFacade,
+    RustTextSetFacade,
+    RustBytesSetFacade,
+    FindIteration,
+    CaptureIteration,
+    PatternSetExecution,
     CompileAccepted,
     CompileRejected,
     PatternSetEmpty,
@@ -295,23 +318,33 @@ pub struct AdapterContract {
 }
 
 /// Explicit reason an upstream case does not apply to one high-level facade.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum NotApplicableReason {
     ProfileCannotRepresentSearchMode,
     ProfileCannotRepresentMatchMode,
     ProfileCannotRepresentBounds,
     ProfileCannotRepresentAnchoring,
     ProfileCannotRepresentUtf8Mode,
+    InvalidUtf8Haystack,
     PatternMultiplicity,
     CompileOnlyCase,
 }
 
-/// Result produced by an adapter scaffold. There is intentionally no `Skip`
-/// or `Option` variant.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Result produced by an adapter. There is intentionally no `Skip` or
+/// `Option` variant. Passes and mismatches bind both semantic values by their
+/// canonical JSON SHA-256.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "status")]
 pub enum AdapterDisposition {
-    Executed {
+    Pass {
+        expected_sha256: String,
         observed_sha256: String,
+    },
+    Mismatch {
+        expected_sha256: String,
+        observed_sha256: String,
+        reason_code: String,
     },
     Unsupported {
         capability: CapabilityId,
@@ -326,7 +359,8 @@ pub enum AdapterDisposition {
 }
 
 /// One mandatory adapter disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterReceipt {
     pub case_id: String,
     pub case_sha256: String,
@@ -356,7 +390,10 @@ pub fn run_adapter_scaffold(
             continue;
         }
         for surface in AdapterSurface::ALL {
-            let disposition = adapter.execute(surface, case);
+            let disposition = catch_unwind(AssertUnwindSafe(|| adapter.execute(surface, case)))
+                .unwrap_or_else(|_| AdapterDisposition::Fault {
+                    reason_code: "adapter.panic".to_owned(),
+                });
             validate_disposition(&disposition)?;
             receipts.push(AdapterReceipt {
                 case_id: case.id.clone(),
@@ -1059,12 +1096,33 @@ fn validate_cases(cases: &[CaseReceipt]) -> Result<(), InventoryError> {
 
 fn validate_disposition(disposition: &AdapterDisposition) -> Result<(), InventoryError> {
     match disposition {
-        AdapterDisposition::Executed { observed_sha256 } => {
-            if !is_sha256(observed_sha256) {
+        AdapterDisposition::Pass {
+            expected_sha256,
+            observed_sha256,
+        } => {
+            if !is_sha256(expected_sha256)
+                || !is_sha256(observed_sha256)
+                || expected_sha256 != observed_sha256
+            {
                 return Err(InventoryError::new(
-                    "adapter observed digest is not SHA-256",
+                    "adapter pass semantic digests are invalid or unequal",
                 ));
             }
+        }
+        AdapterDisposition::Mismatch {
+            expected_sha256,
+            observed_sha256,
+            reason_code,
+        } => {
+            if !is_sha256(expected_sha256)
+                || !is_sha256(observed_sha256)
+                || expected_sha256 == observed_sha256
+            {
+                return Err(InventoryError::new(
+                    "adapter mismatch semantic digests are invalid or equal",
+                ));
+            }
+            validate_reason_code(reason_code)?;
         }
         AdapterDisposition::Unsupported { reason_code, .. }
         | AdapterDisposition::Fault { reason_code } => validate_reason_code(reason_code)?,
@@ -1097,8 +1155,7 @@ fn validate_case_name(name: &str) -> Result<(), InventoryError> {
 
 fn unresolved_claims() -> Vec<String> {
     vec![
-        "FRE adapter execution and semantic comparison are not implemented by this inventory unit"
-            .to_owned(),
+        "FRE execution and semantic comparison require the separately authenticated adapter report; inventory completeness alone is not execution evidence".to_owned(),
         "upstream Rust API integration tests, doctests, and feature-matrix tests are not inventoried here"
             .to_owned(),
         "regex-syntax and regex-automata internal suites require separate authenticated inventories"
@@ -1252,8 +1309,23 @@ mod tests {
 
     struct UnsupportedAdapter;
 
+    struct PanicOnceAdapter(bool);
+
     impl CaseAdapter for UnsupportedAdapter {
         fn execute(&mut self, _surface: AdapterSurface, _case: &CaseReceipt) -> AdapterDisposition {
+            AdapterDisposition::Unsupported {
+                capability: CapabilityId::PatternSingle,
+                reason_code: "adapter.not-implemented".to_owned(),
+            }
+        }
+    }
+
+    impl CaseAdapter for PanicOnceAdapter {
+        fn execute(&mut self, _surface: AdapterSurface, _case: &CaseReceipt) -> AdapterDisposition {
+            if !self.0 {
+                self.0 = true;
+                panic!("injected adapter panic");
+            }
             AdapterDisposition::Unsupported {
                 capability: CapabilityId::PatternSingle,
                 reason_code: "adapter.not-implemented".to_owned(),
@@ -1286,6 +1358,27 @@ mod tests {
                 receipt.disposition,
                 AdapterDisposition::Unsupported { .. }
             ))
+        );
+    }
+
+    #[test]
+    fn one_adapter_panic_becomes_one_fault_without_losing_obligations() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../research/upstream-regex/regex-1.12.4-inventory.json");
+        let inventory = read_inventory(&path).expect("checked-in inventory validates");
+        let receipts = run_adapter_scaffold(&inventory, &mut PanicOnceAdapter(false))
+            .expect("panic is converted into an explicit fault receipt");
+        assert_eq!(receipts.len(), 16_450);
+        assert!(matches!(
+            receipts[0].disposition,
+            AdapterDisposition::Fault { .. }
+        ));
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| matches!(receipt.disposition, AdapterDisposition::Fault { .. }))
+                .count(),
+            1
         );
     }
 

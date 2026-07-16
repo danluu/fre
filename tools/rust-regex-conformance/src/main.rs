@@ -1,6 +1,9 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use rust_regex_conformance::{build_inventory, read_inventory, write_inventory};
+use rust_regex_conformance::{
+    authenticate_candidate_source, build_adapter_report, build_inventory, load_executable_cases,
+    read_adapter_report, read_inventory, write_adapter_report, write_inventory,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -65,6 +68,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 inventory.payload_sha256
             );
         }
+        "run" => {
+            let checkout = PathBuf::from(args.next().ok_or(usage())?);
+            let manifest_path = PathBuf::from(args.next().ok_or(usage())?);
+            let candidate_path = PathBuf::from(args.next().ok_or(usage())?);
+            let output = PathBuf::from(args.next().ok_or(usage())?);
+            reject_extra(&mut args)?;
+            let inventory = read_inventory(&manifest_path)?;
+            let executable_cases = load_executable_cases(&checkout, &inventory)?;
+            let candidate = authenticate_candidate_source(&candidate_path)?;
+            let report = build_adapter_report(&inventory, executable_cases, candidate)?;
+            write_adapter_report(&output, &report, &inventory)?;
+            let counts = &report.payload.counts;
+            println!(
+                "adapter candidate={} tree={} pass={} mismatch={} unsupported={} not_applicable={} fault={} total={} payload_sha256={}",
+                report.payload.candidate.revision,
+                report.payload.candidate.tree,
+                counts.pass,
+                counts.mismatch,
+                counts.unsupported,
+                counts.not_applicable,
+                counts.fault,
+                counts.total,
+                report.payload_sha256
+            );
+        }
+        "verify-report" => {
+            let manifest_path = PathBuf::from(args.next().ok_or(usage())?);
+            let report_path = PathBuf::from(args.next().ok_or(usage())?);
+            reject_extra(&mut args)?;
+            let inventory = read_inventory(&manifest_path)?;
+            let report = read_adapter_report(&report_path, &inventory)?;
+            let counts = &report.payload.counts;
+            println!(
+                "verified adapter candidate={} pass={} mismatch={} unsupported={} not_applicable={} fault={} total={} payload_sha256={}",
+                report.payload.candidate.revision,
+                counts.pass,
+                counts.mismatch,
+                counts.unsupported,
+                counts.not_applicable,
+                counts.fault,
+                counts.total,
+                report.payload_sha256
+            );
+        }
         "-h" | "--help" | "help" => println!("{}", usage()),
         _ => return Err(usage().into()),
     }
@@ -80,5 +127,5 @@ fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST"
+    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT"
 }

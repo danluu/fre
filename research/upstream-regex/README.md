@@ -21,7 +21,7 @@ to `regex-lite.toml` and remain inventoried but are not treated as `regex`
 obligations. Fourteen declared adapter surfaces therefore create 16,450
 mandatory dispositions.
 Inventory payload SHA-256:
-`2b590613fc7538181c072c29e34e903dcff7a055d03de00f55482b77c1ed4b06`.
+`6c5150a2fc66c7262c0ca308fa164cc6fca78de97ae3dfbc948b53c41ca2a263`.
 `SHA256SUMS` separately authenticates the checked-in pretty-JSON file bytes.
 
 The adapter contract deliberately has no skip outcome. Every raw case must
@@ -29,6 +29,17 @@ receive one explicit disposition for each declared Rust text, Rust bytes, text
 set, and bytes set compile/search surface. A future adapter may say that an
 upstream case is inapplicable to a particular facade, but it must publish the
 typed reason as a receipt instead of filtering the case out.
+
+The first executable adapter authenticates the same checkout and manifest
+again, joins every case to its decoded pattern, byte haystack, bounds, line
+terminator and expected capture records, and emits all 16,450 dispositions in
+one payload-hashed report. It executes the real `fre::PortableBuilder` Rust
+bytes facade for compile and `is_match`, plus `find` when an empty expected
+sequence or upstream `match-limit = 1` makes the facade's single-result API a
+complete comparator. Missing Rust text, set, capture-iteration and general
+match-iteration APIs are stable `unsupported` receipts. Inapplicable upstream
+surface combinations remain separately typed, and panics become `fault`
+receipts without truncating the cross product.
 
 ## Reproduce
 
@@ -38,6 +49,11 @@ Use a clean checkout at the exact revision:
 cargo run -p rust-regex-conformance -- \
   verify /path/to/rust-regex-checkout \
   research/upstream-regex/regex-1.12.4-inventory.json
+
+cargo run -p rust-regex-conformance -- run \
+  /path/to/rust-regex-checkout \
+  research/upstream-regex/regex-1.12.4-inventory.json \
+  "$PWD" /tmp/fre-rust-regex-adapter-report.json
 
 cargo test -p rust-regex-conformance
 cargo clippy -p rust-regex-conformance --all-targets -- -D warnings
@@ -53,9 +69,10 @@ cargo run -p rust-regex-conformance -- \
 
 ## Scope boundary
 
-This unit inventories the upstream TOML/Fowler corpus only. It does not yet:
+The authenticated inventory and first adapter cover the upstream TOML/Fowler
+corpus only. They do not yet:
 
-- execute an FRE adapter or compare observed values;
+- provide Rust text, set, capture-iteration, or full match-iteration facades;
 - inventory the upstream Rust API regression, replacement, searcher, doctest,
   or feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;

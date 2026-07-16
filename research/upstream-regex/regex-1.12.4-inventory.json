@@ -1,6 +1,6 @@
 {
   "schema": "fre.upstream-rust-regex.inventory.v1",
-  "payload_sha256": "2b590613fc7538181c072c29e34e903dcff7a055d03de00f55482b77c1ed4b06",
+  "payload_sha256": "6c5150a2fc66c7262c0ca308fa164cc6fca78de97ae3dfbc948b53c41ca2a263",
   "payload": {
     "upstream": {
       "repository": "https://github.com/rust-lang/regex",
@@ -43150,7 +43150,7 @@
       "silent_skip_permitted": false
     },
     "unresolved": [
-      "FRE adapter execution and semantic comparison are not implemented by this inventory unit",
+      "FRE execution and semantic comparison require the separately authenticated adapter report; inventory completeness alone is not execution evidence",
       "upstream Rust API integration tests, doctests, and feature-matrix tests are not inventoried here",
       "regex-syntax and regex-automata internal suites require separate authenticated inventories",
       "no compatibility, coverage, performance, or release claim follows from inventory completeness"
