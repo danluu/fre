@@ -1,9 +1,9 @@
 use core::{fmt, mem::size_of};
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedSpanSum, CompileAccounting, CompileLimits, CompiledRegex,
+    AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompileAccounting, CompileLimits, CompiledRegex,
     Error as AggregateEngineError, ExecutionAccounting, OperationCertificate, OperationLimits,
-    PlanId, RustByteProfile, Strategy,
+    PlanId, RustByteProfile, SpanIter, Strategy,
 };
 use fre_kernels::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
@@ -20,14 +20,14 @@ use fre_syntax::{
 use regex_syntax::hir::{Hir, HirKind};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
-pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 1;
+pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 2;
 
 /// Requested output boundary for ordered multi-pattern construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregateManyOutput {
     Count,
     SpanSum,
-    /// Complete span materialization has not yet received a bounded facade.
+    /// Complete non-overlapping whole-match spans.
     Spans,
     /// Capture histories cannot be represented by whole-match erasure.
     CaptureCount,
@@ -39,6 +39,7 @@ pub enum AggregateManyOperation {
     Compile,
     Count,
     SpanSum,
+    Spans,
 }
 
 /// Construction-selected implementation family.
@@ -386,6 +387,70 @@ pub struct AggregateManySpanSumResult {
     details: AggregateManyExecutionDetails,
 }
 
+/// Fully admitted immutable whole-match sequence for ordered patterns.
+#[derive(Debug)]
+pub struct AggregateManySpans {
+    admitted: AdmittedSpans,
+    details: AggregateManyExecutionDetails,
+}
+
+impl AggregateManySpans {
+    #[must_use]
+    pub fn iter(&self) -> AggregateManySpanIter<'_> {
+        AggregateManySpanIter {
+            inner: self.admitted.iter(),
+        }
+    }
+
+    #[must_use]
+    pub const fn details(&self) -> &AggregateManyExecutionDetails {
+        &self.details
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.admitted.as_slice().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.admitted.as_slice().is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a AggregateManySpans {
+    type Item = crate::Match;
+    type IntoIter = AggregateManySpanIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Infallible iterator over an operation that was admitted in full.
+#[derive(Clone, Debug)]
+pub struct AggregateManySpanIter<'a> {
+    inner: SpanIter<'a>,
+}
+
+impl Iterator for AggregateManySpanIter<'_> {
+    type Item = crate::Match;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|span| crate::Match {
+            start: span.start,
+            end: span.end,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for AggregateManySpanIter<'_> {}
+impl core::iter::FusedIterator for AggregateManySpanIter<'_> {}
+
 impl AggregateManySpanSumResult {
     #[must_use]
     pub const fn value(&self) -> u64 {
@@ -467,6 +532,15 @@ impl<'a> AggregateManyBuilder<'a> {
             .map(AggregateManySpanSumRegex)
     }
 
+    /// Construct complete ordered multi-pattern span materialization.
+    ///
+    /// This operation deliberately selects the bounded continuation program:
+    /// the ordered-literal reducer does not retain complete spans.
+    pub fn build_spans(self) -> Result<AggregateManySpansRegex, AggregateManyBuildError> {
+        self.build_plan(AggregateManyOperation::Spans)
+            .map(AggregateManySpansRegex)
+    }
+
     pub fn build_output(
         self,
         output: AggregateManyOutput,
@@ -474,7 +548,8 @@ impl<'a> AggregateManyBuilder<'a> {
         match output {
             AggregateManyOutput::Count => self.build_count().map(AggregateManyRegex::Count),
             AggregateManyOutput::SpanSum => self.build_span_sum().map(AggregateManyRegex::SpanSum),
-            AggregateManyOutput::Spans | AggregateManyOutput::CaptureCount => {
+            AggregateManyOutput::Spans => self.build_spans().map(AggregateManyRegex::Spans),
+            AggregateManyOutput::CaptureCount => {
                 Err(AggregateManyBuildError::UnsupportedOutput { requested: output })
             }
         }
@@ -670,7 +745,10 @@ impl<'a> AggregateManyBuilder<'a> {
         }
 
         let mut literal_view_capacity_bytes = 0_usize;
-        let (engine, plan, build, plan_identity, engine_persistent) = if all_literals {
+        let ordered_literal_operation = operation != AggregateManyOperation::Spans;
+        let (engine, plan, build, plan_identity, engine_persistent) = if all_literals
+            && ordered_literal_operation
+        {
             let mut literals = Vec::new();
             literals.try_reserve_exact(count).map_err(|_| {
                 AggregateManyBuildError::AllocationFailed {
@@ -739,6 +817,11 @@ impl<'a> AggregateManyBuilder<'a> {
                         accounting.persistent_bytes,
                     )
                 }
+                AggregateManyOperation::Spans => {
+                    return Err(AggregateManyBuildError::InternalInvariant(
+                        "span materialization reached ordered-literal construction",
+                    ));
+                }
             }
         } else {
             let combined = Hir::alternation(hirs);
@@ -746,9 +829,14 @@ impl<'a> AggregateManyBuilder<'a> {
             continuation_limits.max_program_bytes = continuation_limits
                 .max_program_bytes
                 .min(engine_persistent_limit);
+            let continuation_profile = if unicode {
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
+            } else {
+                RustByteProfile::PINNED_1_12_4
+            };
             let engine = CompiledRegex::from_hir_erasing_captures_for_whole_match(
                 &combined,
-                RustByteProfile::PINNED_1_12_4,
+                continuation_profile,
                 continuation_limits,
             )
             .map_err(|source| AggregateManyBuildError::ContinuationCompile {
@@ -826,6 +914,7 @@ impl<'a> AggregateManyBuilder<'a> {
 pub enum AggregateManyRegex {
     Count(AggregateManyCountRegex),
     SpanSum(AggregateManySpanSumRegex),
+    Spans(AggregateManySpansRegex),
 }
 
 #[derive(Debug)]
@@ -952,6 +1041,48 @@ impl AggregateManyCountRegex {
         limits: AggregateManyRunLimits,
     ) -> Result<u64, AggregateManyExecutionError> {
         self.count(haystack, limits).map(|result| result.value)
+    }
+}
+
+/// Compiled ordered multi-pattern complete-span operation.
+#[derive(Debug)]
+pub struct AggregateManySpansRegex(AggregateManyPlan);
+
+impl AggregateManySpansRegex {
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateManyBuildReport {
+        &self.0.report
+    }
+
+    /// Execute once over the complete original haystack.
+    pub fn spans(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyRunLimits,
+    ) -> Result<AggregateManySpans, AggregateManyExecutionError> {
+        let AggregateManyEngine::Continuation(engine) = &self.0.engine else {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "span operation retained a non-continuation engine",
+                )));
+        };
+        let admitted = engine
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                self.0.strategy,
+                limits.continuation,
+            )
+            .map_err(|source| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::Continuation(source))
+            })?;
+        let details = AggregateManyExecutionDetails::Continuation {
+            certificate: admitted.certificate().clone(),
+            accounting: admitted.accounting(),
+        };
+        Ok(AggregateManySpans { admitted, details })
     }
 }
 

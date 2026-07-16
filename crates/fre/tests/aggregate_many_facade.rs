@@ -1,8 +1,11 @@
 use fre::{
-    AggregateEngineError, AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuilder,
-    AggregateManyOperation, AggregateManyOutput, AggregateManyPlanKind, AggregateManyRunLimits,
-    AggregateResource, CompatibilityProfile, RustProfile,
+    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateEngineError, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyExecutionDetails,
+    AggregateManyExecutionSource, AggregateManyOperation, AggregateManyOutput,
+    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateResource,
+    AggregateStrategy, CompatibilityProfile, RustProfile,
 };
+use regex::bytes::RegexBuilder;
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -196,22 +199,160 @@ fn preflight_refuses_cardinality_before_parsing_or_plan_allocation() {
 }
 
 #[test]
-fn unsupported_whole_span_and_capture_outputs_are_typed_preflight_refusals() {
+fn complete_spans_dispatch_while_capture_output_remains_a_typed_preflight_refusal() {
     let values = patterns(&["(a)", "b"]);
-    for output in [
-        AggregateManyOutput::Spans,
-        AggregateManyOutput::CaptureCount,
-    ] {
-        let error = AggregateManyBuilder::new(&values)
-            .unicode(false)
-            .build_output(output)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            AggregateManyBuildError::UnsupportedOutput { requested }
-                if requested == output
-        ));
+    let AggregateManyRegex::Spans(regex) = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_output(AggregateManyOutput::Spans)
+        .unwrap()
+    else {
+        panic!("span output published a different operation wrapper");
+    };
+    assert_eq!(
+        AggregateManyOperation::Spans,
+        regex.build_report().operation
+    );
+    assert_eq!(1, regex.build_report().captures_erased);
+
+    let error = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_output(AggregateManyOutput::CaptureCount)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AggregateManyBuildError::UnsupportedOutput {
+            requested: AggregateManyOutput::CaptureCount
+        }
+    ));
+}
+
+#[test]
+fn complete_spans_match_pinned_ordered_alternation_exhaustively() {
+    let pattern_sets = [
+        patterns(&["ab", "a"]),
+        patterns(&["a", "ab"]),
+        patterns(&["", "a"]),
+        patterns(&[r"\Aab", r"."]),
+        patterns(&["(a+)", "b"]),
+        patterns(&[r"a+?", "a"]),
+    ];
+    let haystacks = byte_strings(3, &[b'a', b'b', 0xFF]);
+
+    for values in pattern_sets {
+        let combined = values
+            .iter()
+            .map(|pattern| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let upstream = RegexBuilder::new(&combined).unicode(false).build().unwrap();
+        for strategy in [
+            AggregateStrategy::FullTable,
+            AggregateStrategy::ReverseSequentialRows,
+        ] {
+            let fre = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_spans()
+                .unwrap();
+            assert_eq!(
+                AggregateManyPlanKind::ContinuationProgram,
+                fre.build_report().plan
+            );
+            assert_eq!(Some(strategy), fre.build_report().strategy);
+
+            for haystack in &haystacks {
+                let expected = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                let admitted = fre
+                    .spans(haystack, AggregateManyRunLimits::unlimited())
+                    .unwrap();
+                let actual = admitted
+                    .iter()
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                assert_eq!(expected, actual, "{combined:?}/{strategy:?}/{haystack:?}");
+                assert_eq!(expected.len(), admitted.len());
+                assert_eq!(expected.is_empty(), admitted.is_empty());
+            }
+        }
     }
+}
+
+#[test]
+fn complete_spans_preserve_unicode_literal_boundaries_and_schema_identity() {
+    let values = patterns(&["雪", "s"]);
+    let regex = AggregateManyBuilder::new(&values)
+        .unicode(true)
+        .build_spans()
+        .unwrap();
+    assert_eq!(2, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
+    assert_eq!(
+        AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+        regex.build_report().schema_version
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        regex.build_report().plan
+    );
+
+    let actual = regex
+        .spans("x雪ss".as_bytes(), AggregateManyRunLimits::unlimited())
+        .unwrap()
+        .iter()
+        .map(|matched| (matched.start(), matched.end()))
+        .collect::<Vec<_>>();
+    assert_eq!(vec![(1, 4), (4, 5), (5, 6)], actual);
+}
+
+#[test]
+fn complete_spans_enforce_output_admission_before_publication() {
+    let values = patterns(&["ab", "a"]);
+    let regex = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    let haystack = b"ababa";
+    let baseline = regex
+        .spans(haystack, AggregateManyRunLimits::unlimited())
+        .unwrap();
+    let AggregateManyExecutionDetails::Continuation { certificate, .. } = baseline.details() else {
+        panic!("complete spans must retain continuation accounting");
+    };
+    assert!(certificate.output_matches > 0);
+
+    let mut exact = AggregateManyRunLimits::unlimited();
+    exact.continuation.max_output_matches = certificate.output_matches;
+    assert_eq!(baseline.len(), regex.spans(haystack, exact).unwrap().len());
+
+    exact.continuation.max_output_matches -= 1;
+    let error = regex.spans(haystack, exact).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateManyExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::OutputMatches,
+            ..
+        })
+    ));
+}
+
+fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
+    let mut all = vec![Vec::new()];
+    let mut frontier = vec![Vec::new()];
+    for _ in 0..max_len {
+        let mut next = Vec::new();
+        for prefix in &frontier {
+            for &byte in alphabet {
+                let mut value = prefix.clone();
+                value.push(byte);
+                next.push(value);
+            }
+        }
+        all.extend(next.iter().cloned());
+        frontier = next;
+    }
+    all
 }
 
 #[test]
