@@ -570,6 +570,85 @@ impl PortableRegexSet {
         };
         Ok(PortableSetMatches { flags, report })
     }
+
+    /// Set every matching pattern's caller-owned flag at or after `start`.
+    ///
+    /// This is the bounded caller-buffer counterpart to [`Self::matches_at`]
+    /// and the pinned Rust bytes set's hidden `matches_read_at` API. Successful
+    /// searches only change matching slots from `false` to `true`: existing
+    /// flags and any tail beyond [`Self::len`] remain untouched. The returned
+    /// boolean reports whether this execution matched, independent of flags
+    /// that were already set by an earlier execution.
+    ///
+    /// Caller-owned storage is not charged against
+    /// [`PortableRegexSetRunLimits::max_output_bytes`], and the execution
+    /// report consequently records zero owned output-capacity bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid range, an undersized caller buffer, a set limit, or
+    /// an indexed matcher refusal. Capacity and range errors are checked
+    /// before mutation. On a later execution error, flags for preceding
+    /// successfully matched pattern IDs remain set, matching the incremental
+    /// nature of the upstream caller-buffer API.
+    pub fn matches_read_at(
+        &self,
+        match_flags: &mut [bool],
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<(bool, PortableRegexSetExecutionReport), PortableRegexSetExecutionError> {
+        validate_start(start, haystack.len())?;
+        if match_flags.len() < self.len() {
+            return Err(PortableRegexSetExecutionError::MatchBufferTooSmall {
+                needed: self.len(),
+                available: match_flags.len(),
+            });
+        }
+
+        let window = SearchWindow::new(start, haystack.len());
+        let mut total_work = 0_u64;
+        let mut matched_patterns = 0_usize;
+        for (index, regex) in self.regexes.iter().enumerate() {
+            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+            let (matched, work) = search_one(regex, index, haystack, window, limits, total_work)?;
+            total_work = work;
+            if matched {
+                let needed = matched_patterns.checked_add(1).ok_or(
+                    PortableRegexSetExecutionError::ArithmeticOverflow {
+                        computation: "matched pattern count",
+                    },
+                )?;
+                if needed > limits.max_output_matches {
+                    return Err(PortableRegexSetExecutionError::OutputMatchesLimit {
+                        needed,
+                        limit: limits.max_output_matches,
+                    });
+                }
+                match_flags[index] = true;
+                matched_patterns = needed;
+            }
+        }
+        let report = PortableRegexSetExecutionReport {
+            start,
+            patterns_searched: self.len(),
+            matched_patterns,
+            work: total_work,
+            output_capacity_bytes: 0,
+        };
+        Ok((matched_patterns != 0, report))
+    }
+
+    /// Backward-compatible alias for [`Self::matches_read_at`].
+    pub fn read_matches_at(
+        &self,
+        match_flags: &mut [bool],
+        haystack: &[u8],
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<(bool, PortableRegexSetExecutionReport), PortableRegexSetExecutionError> {
+        self.matches_read_at(match_flags, haystack, start, limits)
+    }
 }
 
 impl Default for PortableRegexSet {
@@ -638,6 +717,10 @@ pub enum PortableRegexSetExecutionError {
         start: usize,
         haystack_len: usize,
     },
+    MatchBufferTooSmall {
+        needed: usize,
+        available: usize,
+    },
     PatternSearchLimit {
         needed: usize,
         limit: usize,
@@ -674,6 +757,11 @@ impl fmt::Display for PortableRegexSetExecutionError {
             } => write!(
                 f,
                 "portable regex set start {start} exceeds haystack length {haystack_len}"
+            ),
+            Self::MatchBufferTooSmall { needed, available } => write!(
+                f,
+                "portable regex set needs {needed} caller match flags, only {available} are \
+                 available"
             ),
             Self::PatternSearchLimit { needed, limit } => write!(
                 f,

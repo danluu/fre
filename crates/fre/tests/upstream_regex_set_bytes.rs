@@ -39,6 +39,7 @@ const UPSTREAM_DOCTEST_IDS: &[&str] = &[
     "borrowed_into_iter",
     "owned_into_iter",
 ];
+const UPSTREAM_CALLER_BUFFER_IDS: &[&str] = &["matches_read_at", "read_matches_at"];
 
 fn sources(patterns: &[&str]) -> Vec<String> {
     patterns
@@ -70,9 +71,190 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BUILDERS_SHA256.len(), 64);
     assert_eq!(UPSTREAM_SUITE_PATH, "tests/suite_bytes_set.rs");
     assert_eq!(UPSTREAM_SUITE_SHA256.len(), 64);
+    assert_eq!(
+        UPSTREAM_CALLER_BUFFER_IDS,
+        ["matches_read_at", "read_matches_at"]
+    );
     assert_eq!(UPSTREAM_DOCTEST_IDS.len(), 18);
     assert_eq!(UPSTREAM_DOCTEST_IDS[0], "limitations_two_pass");
     assert_eq!(UPSTREAM_DOCTEST_IDS[17], "owned_into_iter");
+}
+
+#[test]
+fn caller_match_buffer_matches_pinned_bytes_additive_and_ranged_semantics() {
+    let pattern_sets: &[&[&str]] = &[
+        &[],
+        &["", "a", "a"],
+        &[r"\Aab", r"ab\z", r"(?m:^a+$)", r"[a-c\xFF]+"],
+        &[r"\bbar\b", r"(?m)^bar$", r"bar"],
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"ab",
+        b"foobar",
+        b"a\naa\nb",
+        &[b'a', 0xFF, b'b', b'c'],
+    ];
+
+    for patterns in pattern_sets {
+        let owned = sources(patterns);
+        let fre = PortableRegexSetBuilder::new(&owned)
+            .profile(RustProfile::regex_1_12_4())
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("FRE rejected {patterns:?}: {error}"));
+        let mut upstream = regex::bytes::RegexSetBuilder::new(patterns.iter().copied());
+        upstream.unicode(false);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("upstream rejected {patterns:?}: {error}"));
+
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for seeded in [false, true] {
+                    let seed = (0..patterns.len().saturating_add(2))
+                        .map(|index| seeded && index % 2 == 1)
+                        .collect::<Vec<_>>();
+                    let mut expected = seed.clone();
+                    let mut actual = seed.clone();
+                    let expected_any = upstream.matches_read_at(&mut expected, haystack, start);
+                    let (actual_any, report) = fre
+                        .matches_read_at(
+                            &mut actual,
+                            haystack,
+                            start,
+                            PortableRegexSetRunLimits {
+                                max_output_bytes: 0,
+                                ..PortableRegexSetRunLimits::unlimited()
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("FRE failed {patterns:?}/{haystack:?}/{start}: {error}")
+                        });
+                    assert_eq!(actual, expected, "{patterns:?}/{haystack:?}/{start}");
+                    assert_eq!(
+                        actual_any, expected_any,
+                        "{patterns:?}/{haystack:?}/{start}"
+                    );
+                    assert_eq!(report.start, start);
+                    assert_eq!(report.patterns_searched, patterns.len());
+                    assert_eq!(report.output_capacity_bytes, 0);
+                    assert_eq!(
+                        report.matched_patterns,
+                        upstream.matches_at(haystack, start).iter().count()
+                    );
+
+                    let mut alias = seed;
+                    let alias_result = fre
+                        .read_matches_at(
+                            &mut alias,
+                            haystack,
+                            start,
+                            PortableRegexSetRunLimits {
+                                max_output_bytes: 0,
+                                ..PortableRegexSetRunLimits::unlimited()
+                            },
+                        )
+                        .expect("caller-buffer compatibility alias");
+                    assert_eq!(alias, expected);
+                    assert_eq!(alias_result, (actual_any, report));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn caller_match_buffer_preflights_capacity_and_preserves_exact_limits() {
+    let set = set(&["a", "b"]);
+    let unlimited = PortableRegexSetRunLimits::unlimited();
+
+    let mut short = [false];
+    let error = set
+        .matches_read_at(&mut short, b"ab", 0, unlimited)
+        .expect_err("undersized caller buffer must fail before search");
+    assert!(matches!(
+        error,
+        PortableRegexSetExecutionError::MatchBufferTooSmall {
+            needed: 2,
+            available: 1
+        }
+    ));
+    assert_eq!(short, [false]);
+
+    let mut invalid_range = [false, false];
+    let error = set
+        .matches_read_at(&mut invalid_range, b"ab", 3, unlimited)
+        .expect_err("invalid range must fail before search");
+    assert!(matches!(
+        error,
+        PortableRegexSetExecutionError::InvalidStart {
+            start: 3,
+            haystack_len: 2
+        }
+    ));
+    assert_eq!(invalid_range, [false, false]);
+
+    let mut no_searches = [false, false];
+    let error = set
+        .matches_read_at(
+            &mut no_searches,
+            b"ab",
+            0,
+            PortableRegexSetRunLimits {
+                max_pattern_searches: 0,
+                ..unlimited
+            },
+        )
+        .expect_err("zero pattern searches must refuse before mutation");
+    assert!(matches!(
+        error,
+        PortableRegexSetExecutionError::PatternSearchLimit {
+            needed: 1,
+            limit: 0
+        }
+    ));
+    assert_eq!(no_searches, [false, false]);
+
+    let mut one_match = [false, false];
+    let error = set
+        .matches_read_at(
+            &mut one_match,
+            b"ab",
+            0,
+            PortableRegexSetRunLimits {
+                max_output_matches: 1,
+                max_output_bytes: 0,
+                ..unlimited
+            },
+        )
+        .expect_err("second match must exceed the exact output limit");
+    assert!(matches!(
+        error,
+        PortableRegexSetExecutionError::OutputMatchesLimit {
+            needed: 2,
+            limit: 1
+        }
+    ));
+    assert_eq!(one_match, [true, false]);
+
+    let mut exact = [false, false];
+    let (matched, report) = set
+        .matches_read_at(
+            &mut exact,
+            b"ab",
+            0,
+            PortableRegexSetRunLimits {
+                max_output_matches: 2,
+                max_output_bytes: 0,
+                ..unlimited
+            },
+        )
+        .expect("exact caller-buffer match limit");
+    assert!(matched);
+    assert_eq!(exact, [true, true]);
+    assert_eq!(report.matched_patterns, 2);
+    assert_eq!(report.output_capacity_bytes, 0);
 }
 
 #[test]
