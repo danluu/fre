@@ -37,7 +37,6 @@ research/aggregate/scaling.tsv
 research/aggregate/*sentinel.json
 research/aggregate/*sentinel.sha256
 research/captures/scaling.csv
-research/holdout/digests.json
 research/holdout/CURRENT.md
 research/iterator/*scaling.csv
 research/jit/**/*.csv

@@ -7,7 +7,7 @@ use fre_holdout::{
     enforce_strict_gate, expand_manifest, run_correctness, run_performance,
 };
 
-const RECEIPTS_SHA256: &str = "ae87090ef85bf119f72d27d128a2bf1211c18fd393bd04a848e3990f6246eb67";
+const RECEIPTS_SHA256: &str = "8f6a1c803f3ffb2e0dd64aecb71b46682f1dda095715abab5bf9a1e77e92104a";
 
 fn research_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,11 +84,8 @@ fn correctness_receipts_are_deterministic_and_strict_gate_is_clean() {
     assert_eq!(first, second);
     assert_eq!(first.receipts_sha256, RECEIPTS_SHA256);
     assert_eq!(first.coverage.receipts, 1_014);
-    assert_eq!(first.coverage.by_status.get(&Status::Pass), Some(&990));
-    assert_eq!(
-        first.coverage.by_status.get(&Status::Unsupported),
-        Some(&24)
-    );
+    assert_eq!(first.coverage.by_status.get(&Status::Pass), Some(&1_014));
+    assert_eq!(first.coverage.by_status.get(&Status::Unsupported), None);
     assert_eq!(first.coverage.by_status.get(&Status::Fail), None);
     assert_eq!(first.coverage.by_status.get(&Status::Fault), None);
     enforce_strict_gate(&first).expect("zero mismatch/fault gate");

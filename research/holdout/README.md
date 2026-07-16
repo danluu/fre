@@ -71,7 +71,7 @@ Timing is diagnostic-only: there are no thresholds, no performance pass state, a
 | `complete-byte-class` | 5 | complete byte class including NUL and `0xFF` |
 | `decision-horizon-fallback-geometric` | 7 | `(?:a+b|a)` on geometric `a^N`, forcing EOF failure before fallback |
 | `decision-horizon-primary-geometric` | 7 | the same adversary on geometric `a^N b` positives |
-| `word-boundary-frontier` | 4 | explicit current unsupported boundary frontier |
+| `word-boundary-frontier` | 4 | historically unsupported boundary frontier, now admitted without changing the frozen case identity |
 
 The two decision-horizon cases are labeled `suffix-restart-quadratic`: an implementation that restarts the higher-priority suffix decision at every position can turn a superficially positive-minimum pattern into quadratic work.
 

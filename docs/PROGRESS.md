@@ -93,8 +93,8 @@ an open P0 row.
   every unimplemented profile/operation feature bit remains off.
 - [x] `fre-holdout`: frozen visible non-Rebar v1 correctness gate with canonical
   cross-architecture digest framing, 1,014 deterministic receipts, strict
-  fail/fault gating, and byte-identical reruns (990 pass, 24 unsupported, zero
-  fail/fault). Timing remains separate and non-normative.
+  fail/fault gating, and byte-identical reruns (1,014 pass, zero unsupported,
+  zero fail/fault). Timing remains separate and non-normative.
 - [ ] Root workspace builds, tests, formats, and lints cleanly.
 
 Every completed package has passed its focused tests and strict Clippy/rustdoc
@@ -164,9 +164,9 @@ plan, so its outside-Rebar evidence is not a corpus-tuned shortcut.
 
 The frozen visible non-Rebar v1 suite authenticates 19 specifications, 169
 expanded inputs, and 1,014 comparisons with a canonical tagged-`u64` digest.
-Two independent local executions were byte-identical at 990 pass, 24 declared
-unsupported word-boundary comparisons, zero fail, and zero fault, with receipt
-SHA-256 `ae87090ef85bf119f72d27d128a2bf1211c18fd393bd04a848e3990f6246eb67`.
+Two independent local executions were byte-identical at 1,014 pass, zero
+unsupported, zero fail, and zero fault, with receipt SHA-256
+`8f6a1c803f3ffb2e0dd64aecb71b46682f1dda095715abab5bf9a1e77e92104a`.
 It covers both hot-reuse and one-shot boundaries and machine-visible future
 dimensions, but is not blind, is not a performance qualification, and still
 requires x86-64 execution and the declared broader APIs.
