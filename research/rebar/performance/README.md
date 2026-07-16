@@ -168,7 +168,7 @@ The FRE KLV candidate runner accepts ordered multi-pattern inputs for
 limits, source-order/profile checks, and selected-plan labels as semantic
 qualification, and preserves fresh construction for compile versus retained
 construction for operation models. Other models remain exactly one-pattern.
-Its legacy duration/count output is not yet an all-model raw evidence record.
+Its legacy mode remains separate.
 The shared aggregate lifecycle API additionally defers every compile
 construction so it can be measured before untimed verification, while
 `count`/`count-spans` retain one authenticated single- or multi-pattern
@@ -180,10 +180,15 @@ model/boundary combinations before invoking its measurement closure, derives
 the exact preparation/prime state, and emits canonical
 `fre.rebar.performance-raw.v1` with ordered input hashes, comparator, plan,
 result digest, and fresh-process token. Fixed-duration tests prove its output
-passes the complete semantic-contract validator. The runner still needs to
-connect these two seams and perform the required prime/warm construction.
+passes the complete semantic-contract validator. Explicit `--performance-raw`
+runner mode connects these seams for all 238 supported aggregate rows and
+5,328 candidate pair-slot arms: cold compile constructs once; allocator-warm
+compile constructs and drops a distinct sacrificial artifact before measuring
+a fresh one; first operation uses a built artifact with no prime; steady
+operation performs exactly one verified untimed prime on the same artifact.
+The emitted record binds every required identity and recomputes the ordered
+input hashes from KLV bytes.
 
-The performance gate still needs an authorized executor/collector for the
-paired timing and resource schedules, `regex-redux` after semantic support
-exists, and an authenticated all-model raw-record adapter around the admitted
-candidate runners.
+The performance gate still needs authenticated Rust/RE2 raw arms, generic raw
+mode for the 19 supported grep/capture rows, an authorized resource collector
+and pair executor, and `regex-redux` after semantic support exists.

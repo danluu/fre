@@ -562,7 +562,8 @@ struct UnicodeUnsupportedReasonPin<'a> {
 pub struct CompareError(String);
 
 impl CompareError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Construct one fatal authentication or execution diagnostic.
+    pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }

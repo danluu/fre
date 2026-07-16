@@ -19,18 +19,24 @@ use fre::{
     AggregateManyPlanKind, AggregatePlanKind, PlanKind, SearchSessionLimits,
 };
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CompareError, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
+    AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
+    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle, InputReceipt,
+    REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
     current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
     current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
-        CaptureLifecycleRawObservation, capture_lifecycle_observation_bytes,
-        produce_capture_lifecycle_observation,
+        CaptureLifecycleRawObservation, PerformanceCandidateObservationIdentity,
+        PerformanceRawObservation, capture_lifecycle_observation_bytes,
+        performance_raw_observation_bytes, produce_capture_lifecycle_observation,
+        produce_performance_candidate_observation,
     },
 };
+use sha2::{Digest, Sha256};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -63,7 +69,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans performance-raw=aggregate facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -113,9 +119,16 @@ fn main() -> Result<(), DynError> {
                 expectations.process_token =
                     Some(next_argument(&mut arguments, "--expect-process-token")?);
             }
+            "--expect-comparator" => {
+                expectations.comparator =
+                    Some(next_argument(&mut arguments, "--expect-comparator")?);
+            }
+            "--performance-raw" => {
+                expectations.performance_raw = true;
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
                         .into(),
                 );
             }
@@ -149,6 +162,13 @@ fn main() -> Result<(), DynError> {
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
     require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
+    if expectations.performance_raw {
+        require_performance_raw_metadata(&benchmark.model, &expectations)?;
+        let observation = model_aggregate_performance_raw(&benchmark, &expectations)?;
+        let bytes = performance_raw_observation_bytes(&observation)?;
+        io::stdout().lock().write_all(&bytes)?;
+        return Ok(());
+    }
     require_capture_metadata(&benchmark.model, &expectations)?;
     if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
         let observation = model_captures(&benchmark, &expectations)?;
@@ -199,6 +219,8 @@ struct Expectations {
     semantic_receipts: Option<String>,
     boundary: Option<String>,
     process_token: Option<String>,
+    comparator: Option<String>,
+    performance_raw: bool,
 }
 
 fn next_argument(
@@ -228,6 +250,9 @@ fn require_runtime_expectation(model: &str, runtime: Option<&str>) -> Result<(),
 }
 
 fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<(), DynError> {
+    if expectations.comparator.is_some() {
+        return Err("--expect-comparator requires --performance-raw".into());
+    }
     let fields = [
         expectations.job_id.as_deref(),
         expectations.contract_id.as_deref(),
@@ -247,6 +272,34 @@ fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<
         }
     } else if supplied != 0 {
         return Err("formal non-capture timing rejects capture identity or boundary fields".into());
+    }
+    Ok(())
+}
+
+fn require_performance_raw_metadata(
+    model: &str,
+    expectations: &Expectations,
+) -> Result<(), DynError> {
+    if !matches!(model, "compile" | "count" | "count-spans") {
+        return Err(
+            format!("all-model raw mode does not yet implement FRE model {model:?}").into(),
+        );
+    }
+    let fields = [
+        expectations.job_id.as_deref(),
+        expectations.contract_id.as_deref(),
+        expectations.canonical_sha.as_deref(),
+        expectations.canonical_tree.as_deref(),
+        expectations.semantic_receipts.as_deref(),
+        expectations.boundary.as_deref(),
+        expectations.process_token.as_deref(),
+        expectations.comparator.as_deref(),
+    ];
+    if fields.iter().any(Option::is_none) {
+        return Err(
+            "all-model raw mode requires every identity, boundary, token, and comparator field"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -695,6 +748,154 @@ fn model_count_spans_many(
     )
 }
 
+fn model_aggregate_performance_raw(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<PerformanceRawObservation, DynError> {
+    match benchmark.model.as_str() {
+        "compile" => {
+            model_compile_performance_raw_with_measurement(benchmark, expectations, |lifecycle| {
+                let start = Instant::now();
+                let artifact = lifecycle.construct()?;
+                Ok((start.elapsed(), artifact))
+            })
+        }
+        "count" | "count-spans" => model_operation_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |lifecycle, haystack| {
+                let start = Instant::now();
+                let actual = lifecycle.execute(haystack)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
+        model => Err(format!("all-model raw aggregate route rejects model {model:?}").into()),
+    }
+}
+
+fn model_compile_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &CurrentFreAggregateCompileLifecycle,
+    ) -> Result<(Duration, CurrentFreAggregateCompileArtifact), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let lifecycle = current_fre_rebar_aggregate_compile_lifecycle(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    let expected_plan = identity.candidate_plan.clone();
+    let allocator_warm = identity.boundary == "allocator-warm-public-compile";
+    produce_performance_candidate_observation(&identity, || {
+        if allocator_warm {
+            let warm = lifecycle.construct()?;
+            require_performance_plan(&expected_plan, warm.plan(&lifecycle)?)?;
+            drop(warm);
+        }
+        let (elapsed, artifact) = measure(&lifecycle)?;
+        require_performance_plan(&expected_plan, artifact.plan(&lifecycle)?)?;
+        let actual = artifact.verify(&lifecycle, &benchmark.haystack)?;
+        Ok((elapsed, actual))
+    })
+    .map_err(Into::into)
+}
+
+fn model_operation_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &CurrentFreAggregateOperationLifecycle,
+        &[u8],
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            &benchmark.model,
+            &benchmark.patterns,
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )?;
+        require_performance_plan(&expected_plan, lifecycle.plan())?;
+        if steady {
+            let primed = lifecycle.execute(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "aggregate lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
+    if expected != actual {
+        return Err(CompareError::new(format!(
+            "FRE performance plan {actual:?} differs from expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn performance_candidate_identity(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<PerformanceCandidateObservationIdentity, DynError> {
+    Ok(PerformanceCandidateObservationIdentity {
+        contract_id: required(expectations.contract_id.clone(), "--expect-contract-id")?,
+        canonical_commit: required(expectations.canonical_sha.clone(), "--expect-canonical-sha")?,
+        canonical_tree: required(
+            expectations.canonical_tree.clone(),
+            "--expect-canonical-tree",
+        )?,
+        semantic_receipts_sha256: required(
+            expectations.semantic_receipts.clone(),
+            "--expect-semantic-receipts",
+        )?,
+        job_id: required(expectations.job_id.clone(), "--expect-job-id")?,
+        benchmark: benchmark.name.clone(),
+        model: benchmark.model.clone(),
+        boundary: required(expectations.boundary.clone(), "--expect-boundary")?,
+        comparator: required(expectations.comparator.clone(), "--expect-comparator")?,
+        candidate_plan: required(expectations.plan.clone(), "--expect-plan")?,
+        input: InputReceipt {
+            pattern_sha256: benchmark
+                .patterns
+                .iter()
+                .map(|pattern| sha256(pattern.as_bytes()))
+                .collect(),
+            haystack_sha256: sha256(&benchmark.haystack),
+            haystack_bytes: benchmark.haystack.len(),
+            unicode: benchmark.unicode,
+            case_insensitive: benchmark.case_insensitive,
+        },
+        expected: required(expectations.count, "--expect-count")?,
+        process_token_sha256: required(
+            expectations.process_token.clone(),
+            "--expect-process-token",
+        )?,
+    })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn capture_lifecycle(
     benchmark: &Benchmark,
     expectations: &Expectations,
@@ -835,6 +1036,7 @@ fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), DynErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rebar_compare::performance_contract::PerformanceLifecyclePreparation;
 
     fn field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
         write!(output, "{key}:{}:", value.len()).unwrap();
@@ -899,6 +1101,23 @@ mod tests {
             semantic_receipts: Some("c".repeat(64)),
             boundary: Some(boundary.to_string()),
             process_token: Some("d".repeat(64)),
+            ..Expectations::default()
+        }
+    }
+
+    fn performance_expectations(boundary: &str, plan: &str, expected: u64) -> Expectations {
+        Expectations {
+            plan: Some(plan.to_string()),
+            count: Some(expected),
+            job_id: Some("fixture/aggregate@rust/regex".to_string()),
+            contract_id: Some("fixture-performance-contract-v1".to_string()),
+            canonical_sha: Some("a".repeat(40)),
+            canonical_tree: Some("b".repeat(40)),
+            semantic_receipts: Some("c".repeat(64)),
+            boundary: Some(boundary.to_string()),
+            process_token: Some("d".repeat(64)),
+            comparator: Some("rust-regex-1.12.4".to_string()),
+            performance_raw: true,
             ..Expectations::default()
         }
     }
@@ -1084,6 +1303,120 @@ mod tests {
                 .expect("Unicode ordered-many execution"),
             3
         );
+    }
+
+    #[test]
+    fn aggregate_raw_mode_emits_exact_compile_and_operation_lifecycles() {
+        let compile_benchmark = Benchmark::parse(&multi_klv("compile")).expect("multi compile KLV");
+        for (boundary, preparation) in [
+            (
+                "cold-public-compile",
+                PerformanceLifecyclePreparation::ColdProcess,
+            ),
+            (
+                "allocator-warm-public-compile",
+                PerformanceLifecyclePreparation::AllocatorInitialized,
+            ),
+        ] {
+            let expectations =
+                performance_expectations(boundary, "compile-many-ordered-literal", 3);
+            require_performance_raw_metadata("compile", &expectations)
+                .expect("complete aggregate raw metadata");
+            let measured = std::cell::Cell::new(0_u8);
+            let observation = model_compile_performance_raw_with_measurement(
+                &compile_benchmark,
+                &expectations,
+                |lifecycle| {
+                    measured.set(measured.get() + 1);
+                    Ok((Duration::from_nanos(31), lifecycle.construct()?))
+                },
+            )
+            .expect("fixed compile raw arm");
+            assert_eq!(measured.get(), 1);
+            assert_eq!(observation.preparation, preparation);
+            assert_eq!(observation.priming_operations, 0);
+            assert_eq!(observation.elapsed_ns, 31);
+            assert_eq!(observation.actual, 3);
+            assert_eq!(
+                observation.candidate_plan.as_deref(),
+                Some("compile-many-ordered-literal")
+            );
+            assert_eq!(
+                observation.input.pattern_sha256,
+                vec![sha256(b"cat"), sha256(b"dog")]
+            );
+            assert_eq!(observation.input.haystack_sha256, sha256(b"cat dog cat"));
+        }
+
+        let count_benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
+        let steady_expectations = performance_expectations(
+            "steady-public-operation",
+            "aggregate-many-ordered-literal",
+            3,
+        );
+        let measured = std::cell::Cell::new(0_u8);
+        let steady = model_operation_performance_raw_with_measurement(
+            &count_benchmark,
+            &steady_expectations,
+            |lifecycle, haystack| {
+                measured.set(measured.get() + 1);
+                Ok((Duration::from_nanos(37), lifecycle.execute(haystack)?))
+            },
+        )
+        .expect("fixed steady-operation raw arm");
+        assert_eq!(measured.get(), 1);
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.elapsed_ns, 37);
+        assert_eq!(steady.actual, 3);
+
+        let first_expectations = performance_expectations(
+            "first-public-operation",
+            "aggregate-many-ordered-literal",
+            3,
+        );
+        let first = model_operation_performance_raw_with_measurement(
+            &count_benchmark,
+            &first_expectations,
+            |lifecycle, haystack| Ok((Duration::from_nanos(41), lifecycle.execute(haystack)?)),
+        )
+        .expect("fixed first-operation raw arm");
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+
+        let mut wrong_plan = first_expectations;
+        wrong_plan.plan = Some("aggregate-many-continuation-program".to_string());
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            model_operation_performance_raw_with_measurement(
+                &count_benchmark,
+                &wrong_plan,
+                |lifecycle, haystack| {
+                    ran.set(true);
+                    Ok((Duration::from_nanos(1), lifecycle.execute(haystack)?))
+                },
+            )
+            .is_err()
+        );
+        assert!(!ran.get(), "wrong operation plan reached measurement");
+    }
+
+    #[test]
+    fn aggregate_raw_mode_requires_explicit_complete_metadata() {
+        let complete =
+            performance_expectations("first-public-operation", "aggregate-exact-literal", 1);
+        require_performance_raw_metadata("count", &complete).expect("complete metadata");
+        assert!(require_performance_raw_metadata("grep", &complete).is_err());
+        assert!(require_capture_metadata("count", &complete).is_err());
+        let mut missing = complete;
+        missing.comparator = None;
+        assert!(require_performance_raw_metadata("count", &missing).is_err());
     }
 
     #[test]
