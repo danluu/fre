@@ -527,27 +527,6 @@ impl<'h> Compiler<'h> {
         Ok(Fragment { start: split, outs })
     }
 
-    /// Match exactly the byte offsets that are scalar boundaries in a valid
-    /// UTF-8 haystack. At such an offset, Unicode `\b` and `\B` are exhaustive
-    /// and mutually exclusive. At an interior continuation-byte offset both
-    /// assertions are false. The text facade separately proves its haystack is
-    /// valid UTF-8 before selecting this synthesized start guard.
-    fn utf8_start_guard_fragment(&mut self) -> Result<Fragment, LowerError> {
-        let boundary = self.assertion_fragment(EdgeKind::AssertWordUnicode)?;
-        let non_boundary = self.assertion_fragment(EdgeKind::AssertWordUnicodeNegate)?;
-        let mut alternatives = Vec::new();
-        self.charge_vector_growth(
-            alternatives.len(),
-            alternatives.capacity(),
-            2,
-            "UTF-8 start-guard alternatives",
-        )?;
-        reserve(&mut alternatives, 2, "UTF-8 start-guard alternatives")?;
-        alternatives.push(boundary);
-        alternatives.push(non_boundary);
-        self.alternation_fragment(alternatives)
-    }
-
     fn finish_repetition(
         &mut self,
         min: u32,
