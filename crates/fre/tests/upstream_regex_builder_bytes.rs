@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, BuildFailureClass, CompatibilityProfile, PlanSelection, PortableBuilder,
-    PortableRegexSetBuildError, PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile,
-    SearchLimits,
+    BuildError, CompatibilityProfile, PlanSelection, PortableBuilder, PortableRegexSetBuildError,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile, SearchLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -186,17 +185,42 @@ fn crlf_dot_semantics_and_inline_overrides_match_pinned_bytes_builder() {
         assert_eq!(profile.options.line_terminator, line_terminator);
     }
 
-    let unsupported_assertions = PortableBuilder::new(r"^foo$")
+    let fre_assertions = PortableBuilder::new(r"^foo$")
         .unicode(false)
         .multi_line(true)
         .crlf(true)
         .plan_selection(PlanSelection::ForceK0)
         .build()
-        .expect_err("the current K0 executor must not approximate CRLF assertions");
-    assert_eq!(
-        unsupported_assertions.failure_class(),
-        BuildFailureClass::Unsupported
-    );
+        .expect("the K0 executor supports CRLF assertions");
+    let mut upstream_assertions = regex::bytes::RegexBuilder::new(r"^foo$");
+    upstream_assertions
+        .unicode(false)
+        .multi_line(true)
+        .crlf(true);
+    let upstream_assertions = upstream_assertions
+        .build()
+        .expect("pinned Rust bytes builder supports CRLF assertions");
+    for haystack in [
+        b"".as_slice(),
+        b"foo",
+        b"foo\r\n",
+        b"\r\nfoo",
+        b"\r\nfoo\r\nbar",
+        b"xfoo\r\n",
+        &[0xFF, b'\r', b'\n', b'f', b'o', b'o', b'\r'],
+    ] {
+        for start in 0..=haystack.len() {
+            let expected = upstream_assertions
+                .find_at(haystack, start)
+                .map(|matched| matched.range());
+            let actual = fre_assertions
+                .find_at(haystack, start, SearchLimits::unlimited())
+                .expect("FRE CRLF assertion search")
+                .0
+                .map(fre::Match::range);
+            assert_eq!(actual, expected, "{haystack:?}/{start}");
+        }
+    }
 }
 
 #[test]
