@@ -22,6 +22,7 @@ mod doctest_api;
 mod doctest_builder_remaining;
 mod doctest_byte_captures;
 mod doctest_capture_metadata;
+mod doctest_core_remaining;
 mod feature_matrix;
 mod misc_regression_api;
 mod replacement_api;

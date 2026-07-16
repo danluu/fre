@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::doctest_builder_remaining::{BuilderRefusal, execute_remaining_builder_doctest};
 use crate::doctest_byte_captures::{ByteCaptureRefusal, execute_byte_capture_doctest};
 use crate::doctest_capture_metadata::{CaptureMetadataRefusal, execute_capture_metadata_doctest};
+use crate::doctest_core_remaining::{RemainingCoreRefusal, execute_remaining_core_doctest};
 use crate::{CandidateIdentity, InventoryError, UPSTREAM_REPOSITORY, UPSTREAM_REVISION, sha256};
 
 /// Stable schema for the complete public-doctest report.
@@ -1492,6 +1493,12 @@ fn run_reused_literal_probe(probe: ReplacementProbe) -> Result<Vec<u8>, Executio
 )]
 fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
     let id = obligation.case_id.as_str();
+    if let Some(execution) = execute_remaining_core_doctest(id) {
+        return Some(execution.map_err(|refusal| match refusal {
+            RemainingCoreRefusal::Unsupported(reason_code) => unsupported(reason_code),
+            RemainingCoreRefusal::Fault(reason_code) => fault(reason_code),
+        }));
+    }
     if matches!(id, "README.md:151" | "src/lib.rs:381") {
         return Some(run_set_probe(SetProbe::Matches));
     }
