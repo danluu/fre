@@ -40,6 +40,7 @@ const UPSTREAM_DOCTEST_IDS: &[&str] = &[
     "owned_into_iter",
 ];
 const UPSTREAM_CALLER_BUFFER_IDS: &[&str] = &["matches_read_at", "read_matches_at"];
+const UPSTREAM_BUILDER_API_IDS: &[&str] = &["bytes_regex_set_builder_reusable_build"];
 const UPSTREAM_TRAIT_IDS: &[&str] = &[
     "bytes_regex_set_clone",
     "bytes_regex_set_default",
@@ -128,6 +129,10 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
     assert_eq!(
         UPSTREAM_CALLER_BUFFER_IDS,
         ["matches_read_at", "read_matches_at"]
+    );
+    assert_eq!(
+        UPSTREAM_BUILDER_API_IDS,
+        ["bytes_regex_set_builder_reusable_build"]
     );
     assert_eq!(
         UPSTREAM_TRAIT_IDS,
@@ -256,6 +261,48 @@ fn set_admission_does_not_reapply_capture_bearing_single_regex_limit() {
                 .matches(haystack)
                 .into_iter()
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn configured_builder_repeats_success_and_typed_failure_like_pinned_bytes() {
+    let patterns = sources(&[r"^a+$", r"x.y", r"[0-9]+"]).into_boxed_slice();
+    let fre_builder = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .multi_line(true)
+        .dot_matches_new_line(true);
+    let mut upstream_builder = regex::bytes::RegexSetBuilder::new(&patterns);
+    upstream_builder
+        .unicode(false)
+        .multi_line(true)
+        .dot_matches_new_line(true);
+
+    let first = fre_builder.build().expect("first reusable FRE build");
+    let second = fre_builder.build().expect("second reusable FRE build");
+    let upstream_first = upstream_builder
+        .build()
+        .expect("first reusable upstream build");
+    let upstream_second = upstream_builder
+        .build()
+        .expect("second reusable upstream build");
+
+    assert_eq!(first.build_report(), second.build_report());
+    assert_eq!(first.patterns(), second.patterns());
+    for haystack in [b"aaa\nx\ny 123".as_slice(), b"bbb", &[b'x', 0xFF, b'y']] {
+        let expected_first: Vec<_> = upstream_first.matches(haystack).into_iter().collect();
+        let expected_second: Vec<_> = upstream_second.matches(haystack).into_iter().collect();
+        assert_eq!(ids(&first, haystack), expected_first, "{haystack:?}");
+        assert_eq!(ids(&second, haystack), expected_second, "{haystack:?}");
+    }
+
+    let invalid = sources(&["valid", "("]);
+    let failing = PortableRegexSetBuilder::new(&invalid).unicode(false);
+    for attempt in 0..2 {
+        let error = failing.build().expect_err("repeated invalid build");
+        assert!(
+            matches!(error, PortableRegexSetBuildError::Pattern { index: 1, .. }),
+            "attempt {attempt}: {error:?}"
         );
     }
 }

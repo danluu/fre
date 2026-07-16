@@ -295,7 +295,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
         clippy::too_many_lines,
         reason = "one construction transaction keeps preflight, fallible allocation, indexed compilation and publication ordered"
     )]
-    pub fn build(self) -> Result<PortableRegexSet, PortableRegexSetBuildError> {
+    pub fn build(&self) -> Result<PortableRegexSet, PortableRegexSetBuildError> {
         let pattern_count = self.patterns.len();
         enforce(pattern_count, self.limits.max_patterns, |needed, limit| {
             PortableRegexSetBuildError::PatternLimit { needed, limit }
@@ -421,7 +421,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
         )?;
         let report = PortableRegexSetBuildReport {
             schema_version: PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION,
-            profile: self.profile,
+            profile: self.profile.clone(),
             limits: self.limits,
             patterns: pattern_count,
             pattern_bytes,
