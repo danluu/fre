@@ -348,6 +348,10 @@ fn positive_unicode_word_boundary_is_scalar_exact_on_arbitrary_bytes() {
             &[0xFF, b'a', 0xFF],
             &[(0, false), (1, true), (2, true), (3, false)],
         ),
+        (
+            &[0xFF, b'a', 0x80],
+            &[(0, false), (1, true), (2, true), (3, true)],
+        ),
         (&[0xCE], &[(0, false), (1, false)]),
         (&[0xC0, 0x80], &[(0, false), (1, false), (2, false)]),
     ];

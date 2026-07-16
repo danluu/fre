@@ -306,6 +306,8 @@ fn ordered_word_look_nullable_plus_matches_pinned_upstream_at_every_start() {
         r"(?:(?-u:\b)|(?u:h))+",
         r"(?:(?-u:\B)|(?su:.))+",
         r"(?:(?-u:\b)|(?u:[\u{0}-W]))+",
+        r"(?:(?u:\b)|(?s-u:.))+",
+        r"(?:(?u:\b)|(?-u:.))+",
     ];
     let mut haystacks = vec![
         Vec::new(),
@@ -316,6 +318,7 @@ fn ordered_word_look_nullable_plus_matches_pinned_upstream_at_every_start() {
         b"ab!cd".to_vec(),
         b"!ab cd!".to_vec(),
         vec![0xFF, b'a', b'!', b'B', 0x80],
+        vec![b'a', 0x80, 0x80, 0x80, 0x80],
     ];
     let alphabet = [b'a', b'B', b'!', b' ', 0x80, 0xFF];
     for len in 1..=4 {
@@ -381,7 +384,6 @@ fn ordered_word_look_nullable_plus_proof_remains_narrow() {
         r"(?:\b|a){2,}",
         r"(?:\b|a+)+",
         r"(?:\b|a|bc)+",
-        r"(?:(?u:\b)|(?s-u:.))+",
         r"(?:(?u:\B)|(?s-u:.))+",
     ] {
         let parsed = parsed(pattern, false);
@@ -395,6 +397,93 @@ fn ordered_word_look_nullable_plus_proof_remains_narrow() {
                 Err(LowerError::Unsupported(
                     UnsupportedFeature::UncertifiedUnboundedRepetition
                 ))
+            ),
+            "pattern={pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn ordered_unicode_word_look_nullable_plus_resources_are_exact() {
+    for pattern in [r"(?:(?u:\b)|(?s-u:.))+", r"(?:(?u:\b)|(?-u:.))+"] {
+        let parsed = parsed(pattern, true);
+        let exact = lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        let stats = exact.stats();
+
+        let exact_limits = LowerLimits {
+            max_work: stats.work(),
+            automata: fre_automata::CompileLimits {
+                max_states: stats.states(),
+                max_edges: stats.edges(),
+                ..fre_automata::CompileLimits::default()
+            },
+            ..LowerLimits::default()
+        };
+        assert_eq!(
+            lower_raw(&parsed, OperationSemantics::CaptureFree, exact_limits)
+                .expect("exact work, state and edge limits succeed")
+                .stats(),
+            stats,
+            "pattern={pattern:?}"
+        );
+
+        let work_short = LowerLimits {
+            max_work: stats.work() - 1,
+            ..LowerLimits::default()
+        };
+        assert!(
+            matches!(
+                lower_raw(&parsed, OperationSemantics::CaptureFree, work_short),
+                Err(LowerError::ResourceLimit {
+                    resource: LowerResource::Work,
+                    needed,
+                    limit,
+                }) if needed > limit && limit == stats.work() - 1
+            ),
+            "pattern={pattern:?}"
+        );
+
+        let states_short = LowerLimits {
+            automata: fre_automata::CompileLimits {
+                max_states: stats.states() - 1,
+                ..fre_automata::CompileLimits::default()
+            },
+            ..LowerLimits::default()
+        };
+        assert!(
+            matches!(
+                lower_raw(&parsed, OperationSemantics::CaptureFree, states_short),
+                Err(LowerError::ResourceLimit {
+                    resource: LowerResource::States,
+                    needed,
+                    limit,
+                }) if needed > limit
+                    && limit == u64::try_from(stats.states() - 1).expect("small state count")
+            ),
+            "pattern={pattern:?}"
+        );
+
+        let edges_short = LowerLimits {
+            automata: fre_automata::CompileLimits {
+                max_edges: stats.edges() - 1,
+                ..fre_automata::CompileLimits::default()
+            },
+            ..LowerLimits::default()
+        };
+        assert!(
+            matches!(
+                lower_raw(&parsed, OperationSemantics::CaptureFree, edges_short),
+                Err(LowerError::ResourceLimit {
+                    resource: LowerResource::Edges,
+                    needed,
+                    limit,
+                }) if needed > limit
+                    && limit == u64::try_from(stats.edges() - 1).expect("small edge count")
             ),
             "pattern={pattern:?}"
         );

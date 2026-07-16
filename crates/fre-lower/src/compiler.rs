@@ -60,7 +60,10 @@ const fn assertion_edge_kind(look: Look) -> EdgeKind {
 }
 
 const fn nullable_initial_word_look(look: Look) -> bool {
-    matches!(look, Look::WordAscii | Look::WordAsciiNegate)
+    matches!(
+        look,
+        Look::WordAscii | Look::WordAsciiNegate | Look::WordUnicode
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -324,12 +327,13 @@ impl<'h> Compiler<'h> {
     /// the first consuming iteration. Once `C` consumes, an empty iteration of
     /// the same repetition is suppressed and greediness keeps selecting `C`
     /// while it can consume. The right side preserves those two ordered paths
-    /// without a nullable cycle. Only ASCII `\b` and `\B` are admitted because
-    /// their byte-boundary semantics are total. Unicode word assertions remain
-    /// outside the proof because the bytes API has non-scalar positions where
-    /// its assertion semantics require separate qualification.
-    /// Other minima, lazy repetition, reversed alternatives, compound
-    /// consumers and other look forms remain unsupported.
+    /// without a nullable cycle. ASCII `\b` and `\B` are admitted because their
+    /// byte-boundary semantics are total. Positive Unicode `\b` is also total:
+    /// K0 applies the pinned forward and reverse directional decoders at every
+    /// byte position, including the pinned reverse treatment of trailing UTF-8
+    /// continuation bytes. Negative Unicode boundaries and all other minima,
+    /// lazy repetition, reversed alternatives, compound consumers and other
+    /// look forms remain unsupported.
     fn normalized_ordered_word_look_alternation_plus(
         &mut self,
         outer: &'h regex_syntax::hir::Repetition,

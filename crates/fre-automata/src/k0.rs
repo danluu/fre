@@ -854,8 +854,10 @@ fn decode_last_utf8(bytes: &[u8]) -> Option<char> {
     while start > lower && matches!(bytes[start], 0x80..=0xBF) {
         start = start.checked_sub(1)?;
     }
-    let decoded = decode_utf8(&bytes[start..])?;
-    (start.checked_add(decoded.len_utf8()) == Some(bytes.len())).then_some(decoded)
+    // Match the pinned directional decoder: after scanning back over at most
+    // three continuation bytes, classify the scalar starting there without
+    // requiring it to consume the entire suffix.
+    decode_utf8(&bytes[start..])
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
