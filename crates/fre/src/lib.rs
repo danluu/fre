@@ -85,7 +85,7 @@ pub use fre_kernels::{
 };
 pub use text::{
     PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextProof,
-    PortableTextRegex,
+    PortableTextRegex, PortableTextSearchError,
 };
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};

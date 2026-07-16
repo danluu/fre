@@ -7,7 +7,7 @@ use fre_syntax::{CanonicalPattern, ParseError, ParseRequest, ParseSummary};
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
     PortableBuilder, PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits,
-    finite,
+    SearchWindow, finite,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -100,6 +100,52 @@ impl std::error::Error for PortableTextBuildError {
             | Self::InvalidUtf8Word
             | Self::InternalInvariant(_) => None,
         }
+    }
+}
+
+/// Checked failure from one contextual Rust text window search.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PortableTextSearchError {
+    /// A byte window was not ordered, in bounds, and on UTF-8 scalar
+    /// boundaries in the original text haystack.
+    InvalidUtf8Window {
+        start: usize,
+        end: usize,
+        haystack_len: usize,
+    },
+    /// The certified internal byte executor refused the search.
+    Search(SearchError),
+}
+
+impl fmt::Display for PortableTextSearchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8Window {
+                start,
+                end,
+                haystack_len,
+            } => write!(
+                formatter,
+                "invalid UTF-8 text window [{start}, {end}) for haystack length {haystack_len}",
+            ),
+            Self::Search(error) => write!(formatter, "text search failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PortableTextSearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUtf8Window { .. } => None,
+            Self::Search(error) => Some(error),
+        }
+    }
+}
+
+impl From<SearchError> for PortableTextSearchError {
+    fn from(value: SearchError) -> Self {
+        Self::Search(value)
     }
 }
 
@@ -350,6 +396,39 @@ impl PortableTextRegex {
         self.inner.find(haystack.as_bytes(), limits)
     }
 
+    /// Search a byte range whose endpoints are scalar boundaries while
+    /// assertions retain their original-haystack context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableTextSearchError::InvalidUtf8Window`] unless both
+    /// endpoints are ordered, in bounds, and UTF-8 scalar boundaries. Other
+    /// checked search refusals are returned as
+    /// [`PortableTextSearchError::Search`].
+    pub fn find_window(
+        &self,
+        haystack: &str,
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), PortableTextSearchError> {
+        let start = window.start();
+        let end = window.end();
+        if start > end
+            || end > haystack.len()
+            || !haystack.is_char_boundary(start)
+            || !haystack.is_char_boundary(end)
+        {
+            return Err(PortableTextSearchError::InvalidUtf8Window {
+                start,
+                end,
+                haystack_len: haystack.len(),
+            });
+        }
+        self.inner
+            .find_window(haystack.as_bytes(), window, limits)
+            .map_err(PortableTextSearchError::Search)
+    }
+
     /// Return the selected match end in bytes without exposing its start.
     ///
     /// # Errors
@@ -463,5 +542,34 @@ mod tests {
                 .expect_err("invalid UTF-8 text language is rejected"),
             PortableTextBuildError::TextSyntax(_)
         ));
+    }
+
+    #[test]
+    fn contextual_text_windows_require_scalar_boundaries_and_keep_anchor_context() {
+        let haystack = "éa";
+        let regex = PortableTextRegex::new(r"^a|a$").unwrap();
+        let (matched, _) = regex
+            .find_window(
+                haystack,
+                SearchWindow::new("é".len(), haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            matched.map(|matched| (matched.start(), matched.end())),
+            Some((2, 3))
+        );
+
+        for window in [
+            SearchWindow::new(1, haystack.len()),
+            SearchWindow::new(0, 1),
+            SearchWindow::new(3, 2),
+            SearchWindow::new(0, 4),
+        ] {
+            assert!(matches!(
+                regex.find_window(haystack, window, SearchLimits::unlimited()),
+                Err(PortableTextSearchError::InvalidUtf8Window { .. })
+            ));
+        }
     }
 }
