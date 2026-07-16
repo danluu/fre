@@ -56,6 +56,15 @@ remain stable `unsupported` receipts. Inapplicable upstream surface combinations
 remain separately typed, and panics become `fault` receipts without truncating
 the cross product.
 
+The separate replacement API adapter covers the complete non-TOML
+`tests/replace.rs` source at the same pin. It authenticates the published crate
+package's VCS receipt, original manifest and complete Rust source file before
+executing all 26 named obligations. Each obligation emits a mandatory pass,
+mismatch, unsupported or fault receipt; there is no skip/filter disposition.
+The executable split is nine literal/`NoExpand` cases, nine capture-template
+cases, two functional-replacer cases and six owned/borrowed/`Cow<str>` type
+surface cases.
+
 ## Reproduce
 
 Use a clean checkout at the exact revision:
@@ -72,6 +81,13 @@ cargo run -p rust-regex-conformance -- run \
 
 cargo test -p rust-regex-conformance
 cargo clippy -p rust-regex-conformance --all-targets -- -D warnings
+
+cargo run -p rust-regex-conformance -- run-replacement-api \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-replacement-api-report.json
+
+cargo run -p rust-regex-conformance -- verify-replacement-api-report \
+  /tmp/fre-rust-regex-replacement-api-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -84,13 +100,12 @@ cargo run -p rust-regex-conformance -- \
 
 ## Scope boundary
 
-The authenticated inventory and first adapter cover the upstream TOML/Fowler
-corpus only. They do not yet:
+The authenticated inventory plus the TOML and replacement adapters do not yet:
 
 - provide general Rust text beyond the proved slices, capture iteration, or
   full match iteration;
-- inventory the upstream Rust API regression, replacement, searcher, doctest,
-  or feature-matrix tests;
+- produce mandatory reports for the remaining upstream Rust API regression,
+  searcher, doctest, or feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
   release qualification.
