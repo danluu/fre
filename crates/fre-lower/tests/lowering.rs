@@ -302,6 +302,108 @@ fn normalized_nullable_repetitions_match_upstream_group_zero() {
 }
 
 #[test]
+fn ordered_word_look_nullable_plus_matches_pinned_upstream_at_every_start() {
+    let patterns = [
+        r"(?:(?-u:\b)|(?u:h))+",
+        r"(?:(?-u:\B)|(?su:.))+",
+        r"(?:(?-u:\b)|(?u:[\u{0}-W]))+",
+    ];
+    let mut haystacks = vec![
+        Vec::new(),
+        b"h".to_vec(),
+        b"oB".to_vec(),
+        "\u{fef80}".as_bytes().to_vec(),
+        b"0".to_vec(),
+        b"ab!cd".to_vec(),
+        b"!ab cd!".to_vec(),
+        vec![0xFF, b'a', b'!', b'B', 0x80],
+    ];
+    let alphabet = [b'a', b'B', b'!', b' ', 0x80, 0xFF];
+    for len in 1..=4 {
+        let count = alphabet
+            .len()
+            .pow(u32::try_from(len).expect("short byte word"));
+        for mut number in 0..count {
+            let mut haystack = vec![0; len];
+            for byte in &mut haystack {
+                *byte = alphabet[number % alphabet.len()];
+                number /= alphabet.len();
+            }
+            haystacks.push(haystack);
+        }
+    }
+
+    for pattern in patterns {
+        let parsed = parsed(pattern, true);
+        let lowered = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+        let mut upstream = regex::bytes::RegexBuilder::new(pattern);
+        upstream.unicode(true);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("pinned upstream rejected {pattern:?}: {error}"));
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                let expected = upstream
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual = lowered
+                    .automaton()
+                    .prepare::<Span>()
+                    .search_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("pattern={pattern:?}, haystack={haystack:?}, start={start}: {error}")
+                    })
+                    .into_output();
+                assert_eq!(
+                    tuple(actual),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}, start={start}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_word_look_nullable_plus_proof_remains_narrow() {
+    for pattern in [
+        r"(?:a|\b)+",
+        r"(?:\A|a)+",
+        r"(?:\b|a)+?",
+        r"(?:\b|a){2,}",
+        r"(?:\b|a+)+",
+        r"(?:\b|a|bc)+",
+        r"(?:(?u:\b)|(?s-u:.))+",
+        r"(?:(?u:\B)|(?s-u:.))+",
+    ] {
+        let parsed = parsed(pattern, false);
+        assert!(
+            matches!(
+                lower_raw(
+                    &parsed,
+                    OperationSemantics::CaptureFree,
+                    LowerLimits::default()
+                ),
+                Err(LowerError::Unsupported(
+                    UnsupportedFeature::UncertifiedUnboundedRepetition
+                ))
+            ),
+            "pattern={pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn anchors_retain_original_haystack_context_for_ranged_search() {
     let start = parsed("^a", false);
     let start = lower(

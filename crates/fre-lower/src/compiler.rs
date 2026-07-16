@@ -36,6 +36,33 @@ struct MutableState {
     edges: Vec<MutableEdge>,
 }
 
+const fn assertion_edge_kind(look: Look) -> EdgeKind {
+    match look {
+        Look::Start => EdgeKind::AssertHaystackStart,
+        Look::End => EdgeKind::AssertHaystackEnd,
+        Look::StartLF => EdgeKind::AssertLineStartLf,
+        Look::EndLF => EdgeKind::AssertLineEndLf,
+        Look::WordAscii => EdgeKind::AssertWordAscii,
+        Look::WordAsciiNegate => EdgeKind::AssertWordAsciiNegate,
+        Look::WordStartAscii => EdgeKind::AssertWordStartAscii,
+        Look::WordEndAscii => EdgeKind::AssertWordEndAscii,
+        Look::WordStartHalfAscii => EdgeKind::AssertWordStartHalfAscii,
+        Look::WordEndHalfAscii => EdgeKind::AssertWordEndHalfAscii,
+        Look::WordUnicode => EdgeKind::AssertWordUnicode,
+        Look::StartCRLF => EdgeKind::AssertLineStartCrlf,
+        Look::EndCRLF => EdgeKind::AssertLineEndCrlf,
+        Look::WordUnicodeNegate => EdgeKind::AssertWordUnicodeNegate,
+        Look::WordStartUnicode => EdgeKind::AssertWordStartUnicode,
+        Look::WordEndUnicode => EdgeKind::AssertWordEndUnicode,
+        Look::WordStartHalfUnicode => EdgeKind::AssertWordStartHalfUnicode,
+        Look::WordEndHalfUnicode => EdgeKind::AssertWordEndHalfUnicode,
+    }
+}
+
+const fn nullable_initial_word_look(look: Look) -> bool {
+    matches!(look, Look::WordAscii | Look::WordAsciiNegate)
+}
+
 #[derive(Clone, Copy)]
 enum Task<'h> {
     Visit(&'h Hir),
@@ -46,6 +73,9 @@ enum Task<'h> {
         max: Option<u32>,
         greedy: bool,
         copies: usize,
+    },
+    FinishOrderedWordLookAlternationPlus {
+        look: Look,
     },
 }
 
@@ -108,6 +138,9 @@ impl<'h> Compiler<'h> {
                     greedy,
                     copies,
                 } => self.finish_repetition(min, max, greedy, copies)?,
+                Task::FinishOrderedWordLookAlternationPlus { look } => {
+                    self.finish_ordered_word_look_alternation_plus(look)?;
+                }
             }
         }
         if self.fragments.len() != 1 {
@@ -159,26 +192,7 @@ impl<'h> Compiler<'h> {
                 self.push_fragment(fragment)
             }
             HirKind::Look(look) => {
-                let kind = match look {
-                    Look::Start => EdgeKind::AssertHaystackStart,
-                    Look::End => EdgeKind::AssertHaystackEnd,
-                    Look::StartLF => EdgeKind::AssertLineStartLf,
-                    Look::EndLF => EdgeKind::AssertLineEndLf,
-                    Look::WordAscii => EdgeKind::AssertWordAscii,
-                    Look::WordAsciiNegate => EdgeKind::AssertWordAsciiNegate,
-                    Look::WordStartAscii => EdgeKind::AssertWordStartAscii,
-                    Look::WordEndAscii => EdgeKind::AssertWordEndAscii,
-                    Look::WordStartHalfAscii => EdgeKind::AssertWordStartHalfAscii,
-                    Look::WordEndHalfAscii => EdgeKind::AssertWordEndHalfAscii,
-                    Look::WordUnicode => EdgeKind::AssertWordUnicode,
-                    Look::StartCRLF => EdgeKind::AssertLineStartCrlf,
-                    Look::EndCRLF => EdgeKind::AssertLineEndCrlf,
-                    Look::WordUnicodeNegate => EdgeKind::AssertWordUnicodeNegate,
-                    Look::WordStartUnicode => EdgeKind::AssertWordStartUnicode,
-                    Look::WordEndUnicode => EdgeKind::AssertWordEndUnicode,
-                    Look::WordStartHalfUnicode => EdgeKind::AssertWordStartHalfUnicode,
-                    Look::WordEndHalfUnicode => EdgeKind::AssertWordEndHalfUnicode,
-                };
+                let kind = assertion_edge_kind(*look);
                 let fragment = self.assertion_fragment(kind)?;
                 self.push_fragment(fragment)
             }
@@ -201,13 +215,15 @@ impl<'h> Compiler<'h> {
                 if repetition.max.is_none()
                     && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
                 {
+                    if let Some((look, atom)) =
+                        self.normalized_ordered_word_look_alternation_plus(repetition)?
+                    {
+                        self.increment_nullable_normalization_count()?;
+                        self.push_task(Task::FinishOrderedWordLookAlternationPlus { look })?;
+                        return self.push_task(Task::Visit(atom));
+                    }
                     if let Some((sub, greedy)) = self.normalized_nullable_repetition(repetition)? {
-                        self.normalized_nullable_repetitions = self
-                            .normalized_nullable_repetitions
-                            .checked_add(1)
-                            .ok_or(LowerError::ArithmeticOverflow {
-                                computation: "normalized nullable repetition count",
-                            })?;
+                        self.increment_nullable_normalization_count()?;
                         self.push_task(Task::FinishRepetition {
                             min: 0,
                             max: None,
@@ -237,6 +253,64 @@ impl<'h> Compiler<'h> {
                 Ok(())
             }
         }
+    }
+
+    fn increment_nullable_normalization_count(&mut self) -> Result<(), LowerError> {
+        self.normalized_nullable_repetitions = self
+            .normalized_nullable_repetitions
+            .checked_add(1)
+            .ok_or(LowerError::ArithmeticOverflow {
+                computation: "normalized nullable repetition count",
+            })?;
+        Ok(())
+    }
+
+    /// Prove the capture-free, leftmost-first identity
+    /// `(?:A|C)+ == A|C+` for a word-boundary assertion `A` and a
+    /// positive-width literal or class `C`.
+    ///
+    /// The upstream leftmost-first empty-loop guard permits `A` to win before
+    /// the first consuming iteration. Once `C` consumes, an empty iteration of
+    /// the same repetition is suppressed and greediness keeps selecting `C`
+    /// while it can consume. The right side preserves those two ordered paths
+    /// without a nullable cycle. Only ASCII `\b` and `\B` are admitted because
+    /// their byte-boundary semantics are total. Unicode word assertions remain
+    /// outside the proof because the bytes API has non-scalar positions where
+    /// its assertion semantics require separate qualification.
+    /// Other minima, lazy repetition, reversed alternatives, compound
+    /// consumers and other look forms remain unsupported.
+    fn normalized_ordered_word_look_alternation_plus(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<(Look, &'h Hir)>, LowerError> {
+        if outer.min != 1 || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let body = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = body.kind() else {
+            return Ok(None);
+        };
+        let [look_branch, consuming_branch] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let look_branch = self.capture_free_node(look_branch)?;
+        let HirKind::Look(look) = look_branch.kind() else {
+            return Ok(None);
+        };
+        if !nullable_initial_word_look(*look) {
+            return Ok(None);
+        }
+        let consuming_branch = self.capture_free_node(consuming_branch)?;
+        if !matches!(
+            consuming_branch.properties().minimum_len(),
+            Some(minimum) if minimum > 0
+        ) || !matches!(
+            consuming_branch.kind(),
+            HirKind::Literal(_) | HirKind::Class(_)
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((*look, consuming_branch)))
     }
 
     /// Prove the capture-free identity `(A*){m,} == A*` or
@@ -296,6 +370,28 @@ impl<'h> Compiler<'h> {
             });
         }
         let fragment = self.alternation_fragment(branches)?;
+        self.push_fragment(fragment)
+    }
+
+    fn finish_ordered_word_look_alternation_plus(&mut self, look: Look) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(1)?;
+        let consuming = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing ordered word-look alternation consumer",
+        })?;
+        let consuming_plus = self.plus_fragment(&consuming, true)?;
+
+        let asserted = self.assertion_fragment(assertion_edge_kind(look))?;
+        let mut alternatives = Vec::new();
+        self.charge_vector_growth(
+            alternatives.len(),
+            alternatives.capacity(),
+            2,
+            "normalized word-look alternatives",
+        )?;
+        reserve(&mut alternatives, 2, "normalized word-look alternatives")?;
+        alternatives.push(asserted);
+        alternatives.push(consuming_plus);
+        let fragment = self.alternation_fragment(alternatives)?;
         self.push_fragment(fragment)
     }
 
