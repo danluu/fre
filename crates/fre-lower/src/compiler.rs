@@ -67,6 +67,13 @@ const fn nullable_initial_word_look(look: Look) -> bool {
 }
 
 #[derive(Clone, Copy)]
+enum NullableRepetitionNormalization {
+    Star { greedy: bool },
+    LazyOptionalGreedyPlus,
+    LazyGreedyOptionalThenStar,
+}
+
+#[derive(Clone, Copy)]
 enum Task<'h> {
     Visit(&'h Hir),
     FinishConcat(usize),
@@ -87,6 +94,8 @@ enum Task<'h> {
     FinishOrderedEmptyAlternationRepetition {
         min: u32,
     },
+    FinishLazyOptionalGreedyPlus,
+    FinishLazyGreedyOptionalThenStar,
 }
 
 pub(crate) fn compile(
@@ -173,6 +182,12 @@ impl<'h> Compiler<'h> {
                 }
                 Task::FinishOrderedEmptyAlternationRepetition { min } => {
                     self.finish_ordered_empty_alternation_repetition(min)?;
+                }
+                Task::FinishLazyOptionalGreedyPlus => {
+                    self.finish_lazy_optional_greedy_plus()?;
+                }
+                Task::FinishLazyGreedyOptionalThenStar => {
+                    self.finish_lazy_greedy_optional_then_star()?;
                 }
             }
         }
@@ -288,15 +303,8 @@ impl<'h> Compiler<'h> {
                 self.push_task(Task::FinishOrderedWordLookAlternationPlus { look })?;
                 return self.push_task(Task::Visit(atom));
             }
-            if let Some((sub, greedy)) = self.normalized_nullable_repetition(repetition)? {
-                self.increment_nullable_normalization_count()?;
-                self.push_task(Task::FinishRepetition {
-                    min: 0,
-                    max: None,
-                    greedy,
-                    copies: 1,
-                })?;
-                return self.push_task(Task::Visit(sub));
+            if let Some((sub, normalization)) = self.normalized_nullable_repetition(repetition)? {
+                return self.schedule_nullable_repetition(sub, normalization);
             }
             return Err(LowerError::Unsupported(
                 UnsupportedFeature::UncertifiedUnboundedRepetition,
@@ -505,17 +513,19 @@ impl<'h> Compiler<'h> {
     /// Prove the capture-free identity `(A*){m,} == A*` or
     /// `(A?){m,} == A*` for a positive-width atom `A`.
     ///
-    /// The inner repetition must prefer its consuming branch. Nested `A*` is
-    /// admitted only when the outer repetition is also greedy. For `A?`, the
-    /// outer repetition's greed controls how many one-atom iterations are
-    /// selected; a lazy outer repetition is admitted only at minimum zero.
+    /// The inner repetition must prefer its consuming branch. A lazy outer
+    /// `A*` at minimum zero first tries the outer exit, then one greedy `A+`;
+    /// at minimum one its mandatory greedy inner star is simply `A*`. For
+    /// `A?`, the outer repetition's greed controls how many one-atom
+    /// iterations are selected; a lazy outer repetition is admitted only at
+    /// minimum zero or one.
     /// Capture wrappers may be erased because `compile` has already rejected
     /// capture-sensitive operations. Empty alternatives, assertions, lazy
     /// inner repetitions and compound bodies remain outside this theorem.
     fn normalized_nullable_repetition(
         &mut self,
         outer: &'h regex_syntax::hir::Repetition,
-    ) -> Result<Option<(&'h Hir, bool)>, LowerError> {
+    ) -> Result<Option<(&'h Hir, NullableRepetitionNormalization)>, LowerError> {
         let nested = self.capture_free_node(&outer.sub)?;
         let HirKind::Repetition(inner) = nested.kind() else {
             return Ok(None);
@@ -523,9 +533,16 @@ impl<'h> Compiler<'h> {
         if inner.min != 0 || !inner.greedy {
             return Ok(None);
         }
-        let greedy = match inner.max {
-            Some(1) if outer.greedy || outer.min == 0 => outer.greedy,
-            None if outer.greedy => true,
+        let normalization = match inner.max {
+            Some(1) if outer.greedy || outer.min == 0 => NullableRepetitionNormalization::Star {
+                greedy: outer.greedy,
+            },
+            Some(1) if outer.min == 1 => {
+                NullableRepetitionNormalization::LazyGreedyOptionalThenStar
+            }
+            None if outer.greedy => NullableRepetitionNormalization::Star { greedy: true },
+            None if outer.min == 0 => NullableRepetitionNormalization::LazyOptionalGreedyPlus,
+            None if outer.min == 1 => NullableRepetitionNormalization::Star { greedy: true },
             None | Some(_) => return Ok(None),
         };
         let atom = self.capture_free_node(&inner.sub)?;
@@ -534,7 +551,33 @@ impl<'h> Compiler<'h> {
         {
             return Ok(None);
         }
-        Ok(Some((atom, greedy)))
+        Ok(Some((atom, normalization)))
+    }
+
+    fn schedule_nullable_repetition(
+        &mut self,
+        sub: &'h Hir,
+        normalization: NullableRepetitionNormalization,
+    ) -> Result<(), LowerError> {
+        self.increment_nullable_normalization_count()?;
+        match normalization {
+            NullableRepetitionNormalization::Star { greedy } => {
+                self.push_task(Task::FinishRepetition {
+                    min: 0,
+                    max: None,
+                    greedy,
+                    copies: 1,
+                })?;
+            }
+            NullableRepetitionNormalization::LazyOptionalGreedyPlus => {
+                self.push_task(Task::FinishLazyOptionalGreedyPlus)?;
+            }
+            NullableRepetitionNormalization::LazyGreedyOptionalThenStar => {
+                self.push_task(Task::FinishLazyGreedyOptionalThenStar)?;
+                self.push_task(Task::Visit(sub))?;
+            }
+        }
+        self.push_task(Task::Visit(sub))
     }
 
     fn capture_free_node(&mut self, mut hir: &'h Hir) -> Result<&'h Hir, LowerError> {
@@ -582,6 +625,32 @@ impl<'h> Compiler<'h> {
         alternatives.push(consuming_plus);
         let fragment = self.alternation_fragment(alternatives)?;
         self.push_fragment(fragment)
+    }
+
+    fn finish_lazy_optional_greedy_plus(&mut self) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(1)?;
+        let atom = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing lazy-outer greedy-star atom",
+        })?;
+        let greedy_plus = self.plus_fragment(&atom, true)?;
+        let normalized = self.optional_fragment(greedy_plus, false)?;
+        self.push_fragment(normalized)
+    }
+
+    fn finish_lazy_greedy_optional_then_star(&mut self) -> Result<(), LowerError> {
+        let mut fragments = self.take_fragments(2)?;
+        let star_atom = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing lazy-star atom after greedy optional",
+        })?;
+        let optional_atom = fragments.pop().ok_or(LowerError::InternalInvariant {
+            detail: "missing greedy-optional atom before lazy star",
+        })?;
+        let optional = self.optional_fragment(optional_atom, true)?;
+        let star = self.star_fragment(&star_atom, false)?;
+        fragments.push(optional);
+        fragments.push(star);
+        let normalized = self.concat_fragments(fragments)?;
+        self.push_fragment(normalized)
     }
 
     fn finish_ordered_start_look_alternation_repetition(

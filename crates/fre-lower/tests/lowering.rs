@@ -197,7 +197,17 @@ fn ordered_priority_and_repeat_greed_are_preserved() {
 
 #[test]
 fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
-    for pattern in ["(?:a*)*", "(?:a*)+", "(?:a?)*", "(?:a?)*?", "(?:[ab]*){3,}"] {
+    for pattern in [
+        "(?:a*)*",
+        "(?:a*)+",
+        "(?:a?)*",
+        "(?:a?)*?",
+        "(?:a*)*?",
+        "(?:a*)+?",
+        "(?:a*){1,}?",
+        "(?:a?)+?",
+        "(?:[ab]*){3,}",
+    ] {
         let parsed = parsed(pattern, false);
         let lowered = lower_raw(
             &parsed,
@@ -210,9 +220,8 @@ fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
 
     for pattern in [
         "(?:a*?)*?",
-        "(?:a*)*?",
-        "(?:a?)+?",
         "(?:a?){3,}?",
+        "(?:a*){2,}?",
         "(?:a|)*",
         "(?:a*|b)*",
     ] {
@@ -335,6 +344,10 @@ fn normalized_nullable_repetitions_match_upstream_group_zero() {
         "X(?:.?){0,}Y",
         "X(?:.?){3,}Y",
         "X(?:(?:.*)*)Y",
+        "(?:(?:.*)*?)=",
+        "(?:(?:.*)+?)=",
+        "(?:(?:.?)+?)=",
+        "(?:(?:.*){1,}?)=",
     ];
     let haystacks: [&[u8]; 16] = [
         b"", b"a", b"aa", b"ab", b"ba", b"bbb", b"X", b"Y", b"XY", b"XaY", b"XabY", b"XabYcY",
