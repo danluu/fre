@@ -2022,6 +2022,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the separately generated full Rebar expanded-artifact fixture"]
     fn generated_artifact_round_trips_and_covers_representative_definitions() {
         let root = artifact_root();
         let encoded = fs::read(root.join("manifest.json")).unwrap();
@@ -2078,6 +2079,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the separately generated full Rebar expanded-artifact fixture"]
     fn every_referenced_pattern_blob_has_exact_content_hash() {
         let root = artifact_root();
         let encoded = fs::read(root.join("manifest.json")).unwrap();

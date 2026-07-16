@@ -17,3 +17,15 @@ unresolved.
 transformed patterns live under `blobs/`; transformed haystacks are identified by
 byte length and SHA-256 plus a reproducible source/transform recipe, avoiding a
 duplicate copy of Rebar's large data files.
+
+The generated manifest and blobs are deliberately not tracked. A clean source
+checkout therefore skips the two full-artifact tests during the ordinary
+workspace test suite. After regenerating this directory, authenticate the full
+fixture explicitly with:
+
+```sh
+cargo test --locked --offline -p rebar-expand --lib \
+  generated_artifact_round_trips_and_covers_representative_definitions -- --ignored
+cargo test --locked --offline -p rebar-expand --lib \
+  every_referenced_pattern_blob_has_exact_content_hash -- --ignored
+```
