@@ -557,17 +557,17 @@ fn ordered_top_level_alternatives_equal_after_impossible_elision(
     let mut tasks = Vec::new();
     let mut values = Vec::new();
     for (text_branch, bytes_branch) in text.iter().zip(bytes) {
-        if text_branch == bytes_branch {
-            if let Some(branch_minimum) = text_branch.properties().minimum_len() {
-                if branch_minimum == 0 {
-                    return Ok(None);
-                }
-                minimum_match_bytes = Some(
-                    minimum_match_bytes
-                        .map_or(branch_minimum, |minimum: usize| minimum.min(branch_minimum)),
-                );
-                continue;
+        if text_branch == bytes_branch
+            && let Some(branch_minimum) = text_branch.properties().minimum_len()
+        {
+            if branch_minimum == 0 {
+                return Ok(None);
             }
+            minimum_match_bytes = Some(
+                minimum_match_bytes
+                    .map_or(branch_minimum, |minimum: usize| minimum.min(branch_minimum)),
+            );
+            continue;
         }
         let text_impossible = provably_impossible_with_buffers(
             text_branch,
@@ -620,6 +620,7 @@ enum ImpossibleTask<'h> {
 
 /// Prove emptiness using only HIR constructors whose Boolean language rule is
 /// exact. This deliberately does not infer contradictions between assertions.
+#[cfg(test)]
 fn provably_impossible(hir: &Hir, work: &mut u64, work_limit: u64) -> Result<bool, BuildError> {
     let mut tasks = Vec::new();
     let mut values = Vec::new();
@@ -647,7 +648,7 @@ fn provably_impossible_with_buffers<'h>(
         match task {
             ImpossibleTask::Visit(hir) => match hir.kind() {
                 HirKind::Class(class) => {
-                    push_impossible_value(values, class.is_empty(), work, work_limit)?
+                    push_impossible_value(values, class.is_empty(), work, work_limit)?;
                 }
                 HirKind::Capture(capture) => push_impossible_task(
                     tasks,
