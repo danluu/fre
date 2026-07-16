@@ -106,9 +106,13 @@ fn main() -> Result<(), DynError> {
             "--expect-boundary" => {
                 expectations.boundary = Some(next_argument(&mut arguments, "--expect-boundary")?);
             }
+            "--expect-process-token" => {
+                expectations.process_token =
+                    Some(next_argument(&mut arguments, "--expect-process-token")?);
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation] | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] | --version"
                         .into(),
                 );
             }
@@ -191,6 +195,7 @@ struct Expectations {
     canonical_tree: Option<String>,
     semantic_receipts: Option<String>,
     boundary: Option<String>,
+    process_token: Option<String>,
 }
 
 fn next_argument(
@@ -227,6 +232,7 @@ fn require_capture_metadata(model: &str, expectations: &Expectations) -> Result<
         expectations.canonical_tree.as_deref(),
         expectations.semantic_receipts.as_deref(),
         expectations.boundary.as_deref(),
+        expectations.process_token.as_deref(),
     ];
     let supplied = fields.iter().filter(|value| value.is_some()).count();
     if matches!(model, "count-captures" | "grep-captures") {
@@ -620,6 +626,10 @@ where
         expected: expectations
             .count
             .ok_or("capture expected count is absent")?,
+        process_token_sha256: expectations
+            .process_token
+            .clone()
+            .ok_or("capture process token is absent")?,
     };
     let lifecycle = capture_lifecycle(benchmark, expectations)?;
     produce_capture_lifecycle_observation(
@@ -735,6 +745,7 @@ mod tests {
             canonical_tree: Some("b".repeat(40)),
             semantic_receipts: Some("c".repeat(64)),
             boundary: Some(boundary.to_string()),
+            process_token: Some("d".repeat(64)),
             ..Expectations::default()
         }
     }

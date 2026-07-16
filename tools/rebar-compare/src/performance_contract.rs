@@ -24,6 +24,10 @@ pub const PERFORMANCE_CONTRACT_SCHEMA: &str = "fre.rebar.performance-contract.v1
 pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observations.v1";
 /// Stable schema for one raw current-FRE capture lifecycle sample.
 pub const CAPTURE_LIFECYCLE_RAW_SCHEMA: &str = "fre.rebar.capture-lifecycle-raw.v1";
+/// Stable schema for a deterministic fresh-process capture pair schedule.
+pub const CAPTURE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.capture-pair-schedule.v1";
+/// Stable schema for one raw Rust/RE2 capture reference arm.
+pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
 /// Complete Rebar operation-model universe.
 pub const REBAR_MODELS: [&str; 7] = [
     "compile",
@@ -292,7 +296,7 @@ pub struct PerformanceObservations {
 }
 
 /// Exact capture operation boundary measured by one fresh runner process.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
 pub enum CaptureLifecycleBoundary {
     /// First complete operation after construction and limit preparation.
@@ -347,6 +351,8 @@ pub struct CaptureLifecycleObservationIdentity {
     pub benchmark: String,
     /// Exact semantic reducer result.
     pub expected: u64,
+    /// Unique token provisioned for this fresh runner process.
+    pub process_token_sha256: String,
 }
 
 /// One unaggregated, self-identifying current-FRE capture lifecycle sample.
@@ -387,6 +393,130 @@ pub struct CaptureLifecycleRawObservation {
     pub elapsed_ns: u64,
     /// SHA-256 of `actual.to_le_bytes()`.
     pub result_sha256: String,
+    /// Unique token provisioned for this runner invocation.
+    pub process_token_sha256: String,
+}
+
+/// Candidate/reference process order within one paired sample.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapturePairArm {
+    /// Current-FRE capture lifecycle process.
+    Candidate,
+    /// Pinned Rust-regex or RE2 process.
+    Reference,
+}
+
+/// One exact pair slot in the deterministic fresh-process schedule.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePairSlot {
+    /// Global pair sequence.
+    pub sequence: usize,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Capture model.
+    pub model: String,
+    /// First or steady operation boundary.
+    pub boundary: CaptureLifecycleBoundary,
+    /// Comparator ID from the performance contract.
+    pub comparator: String,
+    /// Zero-based pair index within this point.
+    pub pair_index: u32,
+    /// Alternating process order; every arm is a fresh invocation.
+    pub order: [CapturePairArm; 2],
+}
+
+/// Explicit reason one semantic comparator receives no pair slots.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureUnavailableComparator {
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Capture model.
+    pub model: String,
+    /// Contracted lifecycle boundary.
+    pub boundary: CaptureLifecycleBoundary,
+    /// Comparator ID from the performance contract.
+    pub comparator: String,
+    /// Exact semantic absence/nonpass reason.
+    pub reason: String,
+}
+
+/// Complete deterministic schedule for supported capture rows.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePairSchedule {
+    /// Schedule schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Pairs required for every available comparator point.
+    pub pairs_per_comparator: u32,
+    /// Every available comparator pair slot in execution order.
+    pub slots: Vec<CapturePairSlot>,
+    /// Every unavailable comparator point, retained explicitly.
+    pub unavailable: Vec<CaptureUnavailableComparator>,
+}
+
+/// One raw pinned-reference arm corresponding to a schedule slot.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureReferenceRawObservation {
+    /// Reference raw schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact benchmark name.
+    pub benchmark: String,
+    /// Capture model.
+    pub model: String,
+    /// Contracted lifecycle boundary.
+    pub boundary: CaptureLifecycleBoundary,
+    /// Comparator ID from the performance contract.
+    pub comparator: String,
+    /// Exact semantic input identity.
+    pub input: InputReceipt,
+    /// Expected semantic reducer.
+    pub expected: u64,
+    /// Actual reference reducer.
+    pub actual: u64,
+    /// Untimed reference operations completed before measurement.
+    pub priming_operations: u8,
+    /// Reference operations included in `elapsed_ns`.
+    pub measured_operations: u8,
+    /// Raw elapsed nanoseconds for one operation.
+    pub elapsed_ns: u64,
+    /// SHA-256 of `actual.to_le_bytes()`.
+    pub result_sha256: String,
+    /// Unique token provisioned for this fresh reference process.
+    pub process_token_sha256: String,
+}
+
+/// Candidate and reference arms collected for one exact pair slot.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePairEvidence {
+    /// Exact schedule slot.
+    pub slot: CapturePairSlot,
+    /// Current-FRE raw arm.
+    pub candidate: CaptureLifecycleRawObservation,
+    /// Rust/RE2 raw arm.
+    pub reference: CaptureReferenceRawObservation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,6 +536,10 @@ struct SemanticRow {
 pub struct SemanticUniverse {
     rows: BTreeMap<String, SemanticRow>,
 }
+
+type CapturePointKey = (String, CaptureLifecycleBoundary, String);
+type CapturePairMeasurement = (u32, u64, bool);
+type CapturePairGroups = BTreeMap<CapturePointKey, Vec<CapturePairMeasurement>>;
 
 impl SemanticUniverse {
     /// Number of fixed-denominator rows.
@@ -645,6 +779,7 @@ where
         measured_operations: 1,
         elapsed_ns,
         result_sha256: digest(&actual.to_le_bytes()),
+        process_token_sha256: identity.process_token_sha256.clone(),
     };
     validate_capture_observation_shape(&observation)?;
     if observation.model != lifecycle.model()
@@ -715,6 +850,413 @@ pub fn validate_capture_lifecycle_observation(
     Ok(())
 }
 
+/// Generate the exact fresh-process pair schedule for every supported capture
+/// row and semantically available comparator.
+pub fn generate_capture_pair_schedule(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<CapturePairSchedule, ContractError> {
+    validate_contract(contract)?;
+    let pairs_per_comparator = contract.reporting.pairs_per_comparator;
+    let (slots, unavailable) = capture_schedule_contents(contract, universe)?;
+    let schedule = CapturePairSchedule {
+        schema: CAPTURE_PAIR_SCHEDULE_SCHEMA.to_string(),
+        contract_id: contract.contract_id.clone(),
+        canonical_commit: contract.canonical.commit.clone(),
+        canonical_tree: contract.canonical.tree.clone(),
+        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+        pairs_per_comparator,
+        slots,
+        unavailable,
+    };
+    validate_capture_pair_schedule(contract, universe, &schedule)?;
+    Ok(schedule)
+}
+
+/// Validate a capture schedule by recomputing its complete slot and
+/// unavailable-comparator sets from the semantic denominator.
+pub fn validate_capture_pair_schedule(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    schedule: &CapturePairSchedule,
+) -> Result<(), ContractError> {
+    validate_contract(contract)?;
+    let pairs = contract.reporting.pairs_per_comparator;
+    if schedule.schema != CAPTURE_PAIR_SCHEDULE_SCHEMA
+        || schedule.contract_id != contract.contract_id
+        || schedule.canonical_commit != contract.canonical.commit
+        || schedule.canonical_tree != contract.canonical.tree
+        || schedule.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+        || schedule.pairs_per_comparator != pairs
+    {
+        return Err(ContractError::new(
+            "capture pair schedule schema, contract, semantic identity, or pair count mismatch",
+        ));
+    }
+    let (expected_slots, expected_unavailable) = capture_schedule_contents(contract, universe)?;
+    if schedule.slots != expected_slots || schedule.unavailable != expected_unavailable {
+        return Err(ContractError::new(
+            "capture pair schedule differs from the semantic comparator universe",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_schedule_contents(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<(Vec<CapturePairSlot>, Vec<CaptureUnavailableComparator>), ContractError> {
+    let models: BTreeMap<&str, &ModelContract> = contract
+        .models
+        .iter()
+        .map(|model| (model.model.as_str(), model))
+        .collect();
+    let pair_count = contract.reporting.pairs_per_comparator;
+    let mut slots = Vec::new();
+    let mut unavailable = Vec::new();
+    let mut sequence = 0_usize;
+    for (job_id, semantic) in &universe.rows {
+        if semantic.status != RowSemanticStatus::Supported
+            || !matches!(semantic.model.as_str(), "count-captures" | "grep-captures")
+        {
+            continue;
+        }
+        let model = models.get(semantic.model.as_str()).ok_or_else(|| {
+            ContractError::new(format!("capture model {:?} is absent", semantic.model))
+        })?;
+        for boundary in &model.lifecycle_boundaries {
+            let boundary = CaptureLifecycleBoundary::parse(boundary)?;
+            for comparator in &contract.reporting.comparators {
+                let status = semantic
+                    .comparator_statuses
+                    .get(&comparator.id)
+                    .copied()
+                    .flatten();
+                if status == Some(Status::Pass) {
+                    for pair_index in 0..pair_count {
+                        let order = if pair_index.is_multiple_of(2) {
+                            [CapturePairArm::Candidate, CapturePairArm::Reference]
+                        } else {
+                            [CapturePairArm::Reference, CapturePairArm::Candidate]
+                        };
+                        slots.push(CapturePairSlot {
+                            sequence,
+                            job_id: job_id.clone(),
+                            model: semantic.model.clone(),
+                            boundary,
+                            comparator: comparator.id.clone(),
+                            pair_index,
+                            order,
+                        });
+                        sequence = sequence
+                            .checked_add(1)
+                            .ok_or_else(|| ContractError::new("capture schedule overflow"))?;
+                    }
+                } else {
+                    unavailable.push(CaptureUnavailableComparator {
+                        job_id: job_id.clone(),
+                        model: semantic.model.clone(),
+                        boundary,
+                        comparator: comparator.id.clone(),
+                        reason: comparator_unavailable_reason(status),
+                    });
+                }
+            }
+        }
+    }
+    Ok((slots, unavailable))
+}
+
+fn comparator_unavailable_reason(status: Option<Status>) -> String {
+    match status {
+        Some(status) => format!(
+            "semantic comparator is not a pass: {}",
+            status_label(status)
+        ),
+        None => "semantic report has no matching comparator receipt".to_string(),
+    }
+}
+
+/// Convert an exact complete set of fresh-process capture pairs into measured
+/// points in a coverage-complete 344-row draft.
+pub fn apply_capture_pair_evidence(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    draft: &PerformanceObservations,
+    schedule: &CapturePairSchedule,
+    evidence: &[CapturePairEvidence],
+) -> Result<PerformanceObservations, ContractError> {
+    validate_capture_pair_schedule(contract, universe, schedule)?;
+    validate_observations(contract, universe, draft)?;
+    if draft.phase != ObservationPhase::Draft {
+        return Err(ContractError::new(
+            "capture pair conversion requires a draft observation artifact",
+        ));
+    }
+    let groups = collect_capture_pair_groups(contract, universe, schedule, evidence)?;
+    let mut observations = draft.clone();
+    for ((job_id, boundary, comparator), mut pairs) in groups {
+        pairs.sort_unstable_by_key(|pair| pair.0);
+        let expected_pairs = contract.reporting.pairs_per_comparator;
+        let expected_pair_count = usize::try_from(expected_pairs)
+            .map_err(|_| ContractError::new("capture pair count does not fit usize"))?;
+        if pairs.len() != expected_pair_count
+            || pairs
+                .iter()
+                .enumerate()
+                .any(|(index, pair)| u32::try_from(index) != Ok(pair.0))
+        {
+            return Err(ContractError::new(format!(
+                "capture point {job_id:?}/{boundary:?}/{comparator:?} has incomplete pair indices"
+            )));
+        }
+        let ratios: Vec<u64> = pairs.iter().map(|pair| pair.1).collect();
+        let ratio_ppm = capture_median(&ratios)?;
+        let wins = u32::try_from(pairs.iter().filter(|pair| pair.2).count())
+            .map_err(|_| ContractError::new("capture win count does not fit u32"))?;
+        let pointwise_pass = ratio_ppm < contract.reporting.ratio_ppm_exclusive_upper_bound
+            && wins >= contract.reporting.minimum_candidate_wins;
+        let comparison = capture_comparison_mut(&mut observations, &job_id, boundary, &comparator)?;
+        if comparison.status != ComparisonStatus::Pending {
+            return Err(ContractError::new(format!(
+                "capture point {job_id:?}/{boundary:?}/{comparator:?} is not pending"
+            )));
+        }
+        comparison.status = ComparisonStatus::Measured;
+        comparison.ratio_ppm = Some(ratio_ppm);
+        comparison.pair_count = Some(expected_pairs);
+        comparison.candidate_wins = Some(wins);
+        comparison.pointwise_pass = Some(pointwise_pass);
+        comparison.reason = None;
+    }
+    for unavailable in &schedule.unavailable {
+        let comparison = capture_comparison_mut(
+            &mut observations,
+            &unavailable.job_id,
+            unavailable.boundary,
+            &unavailable.comparator,
+        )?;
+        if comparison.status != ComparisonStatus::NotComparable
+            || comparison.reason.as_deref() != Some(unavailable.reason.as_str())
+        {
+            return Err(ContractError::new(format!(
+                "unavailable capture comparator {:?} was not retained exactly",
+                unavailable.comparator
+            )));
+        }
+    }
+    validate_observations(contract, universe, &observations)?;
+    Ok(observations)
+}
+
+fn collect_capture_pair_groups(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    schedule: &CapturePairSchedule,
+    evidence: &[CapturePairEvidence],
+) -> Result<CapturePairGroups, ContractError> {
+    if evidence.len() != schedule.slots.len() {
+        return Err(ContractError::new(format!(
+            "capture evidence has {} pairs, schedule requires {}",
+            evidence.len(),
+            schedule.slots.len()
+        )));
+    }
+    let mut process_tokens = BTreeSet::new();
+    let mut groups = CapturePairGroups::new();
+    for (slot, pair) in schedule.slots.iter().zip(evidence) {
+        if &pair.slot != slot {
+            return Err(ContractError::new(format!(
+                "capture evidence slot differs at sequence {}",
+                slot.sequence
+            )));
+        }
+        validate_capture_lifecycle_observation(contract, universe, &pair.candidate)?;
+        validate_capture_reference_observation(contract, universe, &pair.reference)?;
+        if pair.candidate.job_id != slot.job_id
+            || pair.candidate.model != slot.model
+            || pair.candidate.boundary != slot.boundary
+            || pair.reference.job_id != slot.job_id
+            || pair.reference.model != slot.model
+            || pair.reference.boundary != slot.boundary
+            || pair.reference.comparator != slot.comparator
+            || pair.candidate.input != pair.reference.input
+            || pair.candidate.expected != pair.reference.expected
+        {
+            return Err(ContractError::new(format!(
+                "capture evidence identity differs from sequence {}",
+                slot.sequence
+            )));
+        }
+        for token in [
+            pair.candidate.process_token_sha256.as_str(),
+            pair.reference.process_token_sha256.as_str(),
+        ] {
+            if !process_tokens.insert(token) {
+                return Err(ContractError::new(format!(
+                    "capture process token is reused at sequence {}",
+                    slot.sequence
+                )));
+            }
+        }
+        let ratio = capture_ratio_ppm(pair.candidate.elapsed_ns, pair.reference.elapsed_ns)?;
+        groups
+            .entry((slot.job_id.clone(), slot.boundary, slot.comparator.clone()))
+            .or_default()
+            .push((
+                slot.pair_index,
+                ratio,
+                pair.candidate.elapsed_ns < pair.reference.elapsed_ns,
+            ));
+    }
+    Ok(groups)
+}
+
+fn validate_capture_reference_observation(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    observation: &CaptureReferenceRawObservation,
+) -> Result<(), ContractError> {
+    if observation.schema != CAPTURE_REFERENCE_RAW_SCHEMA
+        || observation.contract_id != contract.contract_id
+        || observation.canonical_commit != contract.canonical.commit
+        || observation.canonical_tree != contract.canonical.tree
+        || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+    {
+        return Err(ContractError::new(
+            "capture reference schema, contract, canonical, or semantic identity mismatch",
+        ));
+    }
+    require_token(&observation.job_id, "capture reference job ID")?;
+    require_text(&observation.benchmark, "capture reference benchmark")?;
+    require_token(&observation.model, "capture reference model")?;
+    require_token(&observation.comparator, "capture reference comparator")?;
+    require_digest(
+        &observation.process_token_sha256,
+        "capture reference process token",
+    )?;
+    require_digest(
+        &observation.result_sha256,
+        "capture reference result digest",
+    )?;
+    if observation.actual != observation.expected
+        || observation.priming_operations != observation.boundary.priming_operations()
+        || observation.measured_operations != 1
+        || observation.elapsed_ns == 0
+        || observation.result_sha256 != digest(&observation.actual.to_le_bytes())
+    {
+        return Err(ContractError::new(
+            "capture reference reducer, duration, or result digest is inconsistent",
+        ));
+    }
+    let semantic = universe.rows.get(&observation.job_id).ok_or_else(|| {
+        ContractError::new("capture reference job is absent from semantic denominator")
+    })?;
+    let comparator_status = semantic
+        .comparator_statuses
+        .get(&observation.comparator)
+        .copied()
+        .flatten();
+    if semantic.status != RowSemanticStatus::Supported
+        || semantic.model != observation.model
+        || semantic.benchmark != observation.benchmark
+        || semantic.input != observation.input
+        || semantic.expected != observation.expected
+        || comparator_status != Some(Status::Pass)
+    {
+        return Err(ContractError::new(
+            "capture reference differs from its passing semantic receipt",
+        ));
+    }
+    let model = contract
+        .models
+        .iter()
+        .find(|model| model.model == observation.model)
+        .ok_or_else(|| ContractError::new("capture reference model is absent"))?;
+    if !contract
+        .reporting
+        .comparators
+        .iter()
+        .any(|comparator| comparator.id == observation.comparator)
+        || !model
+            .lifecycle_boundaries
+            .iter()
+            .any(|boundary| boundary == observation.boundary.as_str())
+    {
+        return Err(ContractError::new(
+            "capture reference comparator or boundary is not contracted",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_comparison_mut<'a>(
+    observations: &'a mut PerformanceObservations,
+    job_id: &str,
+    boundary: CaptureLifecycleBoundary,
+    comparator: &str,
+) -> Result<&'a mut ComparisonObservation, ContractError> {
+    observations
+        .rows
+        .iter_mut()
+        .find(|row| row.job_id == job_id)
+        .and_then(|row| {
+            row.boundaries
+                .iter_mut()
+                .find(|item| item.boundary == boundary.as_str())
+        })
+        .and_then(|item| {
+            item.comparisons
+                .iter_mut()
+                .find(|item| item.comparator == comparator)
+        })
+        .ok_or_else(|| {
+            ContractError::new(format!(
+                "capture comparison {job_id:?}/{boundary:?}/{comparator:?} is absent"
+            ))
+        })
+}
+
+fn capture_ratio_ppm(candidate: u64, reference: u64) -> Result<u64, ContractError> {
+    if candidate == 0 || reference == 0 {
+        return Err(ContractError::new(
+            "capture pair durations must both be nonzero",
+        ));
+    }
+    let scaled = u128::from(candidate)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| ContractError::new("capture ratio multiplication overflow"))?
+        .checked_div(u128::from(reference))
+        .ok_or_else(|| ContractError::new("capture ratio denominator is zero"))?;
+    u64::try_from(scaled).map_err(|_| ContractError::new("capture ratio does not fit u64"))
+}
+
+fn capture_median(values: &[u64]) -> Result<u64, ContractError> {
+    if values.is_empty() {
+        return Err(ContractError::new("capture ratio set is empty"));
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let middle = values
+        .len()
+        .checked_div(2)
+        .ok_or_else(|| ContractError::new("capture median denominator is zero"))?;
+    if values.len().is_multiple_of(2) {
+        let left = middle
+            .checked_sub(1)
+            .ok_or_else(|| ContractError::new("capture ratio median index underflow"))?;
+        values[left]
+            .checked_add(values[middle])
+            .ok_or_else(|| ContractError::new("capture ratio median overflow"))
+            .and_then(|sum| {
+                sum.checked_div(2)
+                    .ok_or_else(|| ContractError::new("capture median denominator is zero"))
+            })
+    } else {
+        Ok(values[middle])
+    }
+}
+
 fn validate_capture_identity_shape(
     identity: &CaptureLifecycleObservationIdentity,
 ) -> Result<(), ContractError> {
@@ -726,7 +1268,8 @@ fn validate_capture_identity_shape(
         "raw capture semantic receipts",
     )?;
     require_token(&identity.job_id, "raw capture job ID")?;
-    require_text(&identity.benchmark, "raw capture benchmark")
+    require_text(&identity.benchmark, "raw capture benchmark")?;
+    require_digest(&identity.process_token_sha256, "raw capture process token")
 }
 
 fn validate_capture_observation_shape(
@@ -745,6 +1288,7 @@ fn validate_capture_observation_shape(
         job_id: observation.job_id.clone(),
         benchmark: observation.benchmark.clone(),
         expected: observation.expected,
+        process_token_sha256: observation.process_token_sha256.clone(),
     })?;
     require_token(&observation.model, "raw capture model")?;
     require_token(&observation.candidate_plan, "raw capture plan")?;
@@ -1787,6 +2331,81 @@ mod tests {
         (bytes, universe)
     }
 
+    fn fixture_capture_evidence(
+        contract: &PerformanceContract,
+        universe: &SemanticUniverse,
+        schedule: &CapturePairSchedule,
+    ) -> Vec<CapturePairEvidence> {
+        schedule
+            .slots
+            .iter()
+            .map(|slot| {
+                let semantic = &universe.rows[&slot.job_id];
+                let candidate_token = digest(format!("candidate:{}", slot.sequence).as_bytes());
+                let reference_token = digest(format!("reference:{}", slot.sequence).as_bytes());
+                CapturePairEvidence {
+                    slot: slot.clone(),
+                    candidate: CaptureLifecycleRawObservation {
+                        schema: CAPTURE_LIFECYCLE_RAW_SCHEMA.to_string(),
+                        contract_id: contract.contract_id.clone(),
+                        canonical_commit: contract.canonical.commit.clone(),
+                        canonical_tree: contract.canonical.tree.clone(),
+                        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+                        job_id: slot.job_id.clone(),
+                        benchmark: semantic.benchmark.clone(),
+                        model: semantic.model.clone(),
+                        boundary: slot.boundary,
+                        candidate_plan: semantic
+                            .candidate_plan
+                            .clone()
+                            .expect("capture fixture plan"),
+                        input: semantic.input.clone(),
+                        expected: semantic.expected,
+                        actual: semantic.expected,
+                        priming_operations: slot.boundary.priming_operations(),
+                        measured_operations: 1,
+                        elapsed_ns: 80,
+                        result_sha256: digest(&semantic.expected.to_le_bytes()),
+                        process_token_sha256: candidate_token,
+                    },
+                    reference: CaptureReferenceRawObservation {
+                        schema: CAPTURE_REFERENCE_RAW_SCHEMA.to_string(),
+                        contract_id: contract.contract_id.clone(),
+                        canonical_commit: contract.canonical.commit.clone(),
+                        canonical_tree: contract.canonical.tree.clone(),
+                        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+                        job_id: slot.job_id.clone(),
+                        benchmark: semantic.benchmark.clone(),
+                        model: semantic.model.clone(),
+                        boundary: slot.boundary,
+                        comparator: slot.comparator.clone(),
+                        input: semantic.input.clone(),
+                        expected: semantic.expected,
+                        actual: semantic.expected,
+                        priming_operations: slot.boundary.priming_operations(),
+                        measured_operations: 1,
+                        elapsed_ns: 100,
+                        result_sha256: digest(&semantic.expected.to_le_bytes()),
+                        process_token_sha256: reference_token,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn comparison_status_count(
+        observations: &PerformanceObservations,
+        status: ComparisonStatus,
+    ) -> usize {
+        observations
+            .rows
+            .iter()
+            .flat_map(|row| &row.boundaries)
+            .flat_map(|boundary| &boundary.comparisons)
+            .filter(|comparison| comparison.status == status)
+            .count()
+    }
+
     #[test]
     fn checked_in_contract_covers_every_model_and_exact_main() {
         let contract = contract();
@@ -1883,6 +2502,7 @@ mod tests {
             job_id: "fixture/count-captures@rust/regex".to_string(),
             benchmark: "fixture/count-captures".to_string(),
             expected: 5,
+            process_token_sha256: digest(b"first capture process"),
         };
         let first = produce_capture_lifecycle_observation(
             &identity,
@@ -1899,8 +2519,10 @@ mod tests {
         assert_eq!(first.input.pattern_sha256, vec![digest(pattern.as_bytes())]);
         assert_eq!(first.input.haystack_sha256, digest(haystack));
 
+        let mut steady_identity = identity.clone();
+        steady_identity.process_token_sha256 = digest(b"steady capture process");
         let steady = produce_capture_lifecycle_observation(
-            &identity,
+            &steady_identity,
             &lifecycle,
             pattern,
             haystack,
@@ -1969,6 +2591,7 @@ mod tests {
             measured_operations: 1,
             elapsed_ns: 23,
             result_sha256: digest(&0_u64.to_le_bytes()),
+            process_token_sha256: digest(b"semantic fixture process"),
         };
         validate_capture_lifecycle_observation(&contract, &universe, &observation)
             .expect("exact raw capture observation validates");
@@ -1999,6 +2622,138 @@ mod tests {
         assert!(
             validate_capture_lifecycle_observation(&contract, &universe, &observation).is_err()
         );
+    }
+
+    #[test]
+    fn capture_pair_schedule_converts_complete_fixed_duration_evidence() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let schedule =
+            generate_capture_pair_schedule(&contract, &universe).expect("capture schedule");
+        assert_eq!(schedule.slots.len(), 192);
+        assert!(schedule.unavailable.is_empty());
+        assert!(schedule.slots.iter().enumerate().all(|(index, slot)| {
+            slot.sequence == index
+                && slot.order
+                    == if slot.pair_index.is_multiple_of(2) {
+                        [CapturePairArm::Candidate, CapturePairArm::Reference]
+                    } else {
+                        [CapturePairArm::Reference, CapturePairArm::Candidate]
+                    }
+        }));
+        let mut incomplete_schedule = schedule.clone();
+        incomplete_schedule.slots.pop();
+        assert!(
+            validate_capture_pair_schedule(&contract, &universe, &incomplete_schedule).is_err()
+        );
+        let evidence = fixture_capture_evidence(&contract, &universe, &schedule);
+        assert_eq!(evidence.len(), 192);
+        let converted =
+            apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &evidence)
+                .expect("complete capture evidence converts");
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Measured),
+            32
+        );
+        for comparison in converted
+            .rows
+            .iter()
+            .flat_map(|row| &row.boundaries)
+            .flat_map(|boundary| &boundary.comparisons)
+            .filter(|comparison| comparison.status == ComparisonStatus::Measured)
+        {
+            assert_eq!(comparison.ratio_ppm, Some(800_000));
+            assert_eq!(comparison.pair_count, Some(6));
+            assert_eq!(comparison.candidate_wins, Some(6));
+            assert_eq!(comparison.pointwise_pass, Some(true));
+        }
+
+        assert!(
+            apply_capture_pair_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &evidence[..evidence.len() - 1],
+            )
+            .is_err()
+        );
+        let mut reused_process = evidence.clone();
+        reused_process[1].candidate.process_token_sha256 =
+            reused_process[0].candidate.process_token_sha256.clone();
+        assert!(
+            apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &reused_process,)
+                .is_err()
+        );
+        let mut wrong_slot = evidence;
+        wrong_slot.swap(0, 1);
+        assert!(
+            apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &wrong_slot,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_capture_comparator_gets_no_slots_and_stays_explicit() {
+        let mut contract = contract();
+        let (_, mut universe) = synthetic_semantic_report(&mut contract);
+        let re2 = contract.reporting.comparators[1].id.clone();
+        let row = universe
+            .rows
+            .iter_mut()
+            .find(|(_, row)| {
+                row.status == RowSemanticStatus::Supported && row.model == "count-captures"
+            })
+            .expect("supported capture row");
+        row.1.comparator_statuses.insert(re2.clone(), None);
+        let unavailable_job = row.0.clone();
+
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let schedule =
+            generate_capture_pair_schedule(&contract, &universe).expect("capture schedule");
+        assert_eq!(schedule.slots.len(), 180);
+        assert_eq!(schedule.unavailable.len(), 2);
+        assert!(schedule.unavailable.iter().all(|point| {
+            point.job_id == unavailable_job
+                && point.comparator == re2
+                && point.reason == "semantic report has no matching comparator receipt"
+        }));
+        assert!(
+            !schedule
+                .slots
+                .iter()
+                .any(|slot| slot.job_id == unavailable_job && slot.comparator == re2)
+        );
+
+        let evidence = fixture_capture_evidence(&contract, &universe, &schedule);
+        let converted =
+            apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &evidence)
+                .expect("available capture evidence converts");
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Measured),
+            30
+        );
+        for point in &schedule.unavailable {
+            let comparison = converted
+                .rows
+                .iter()
+                .find(|row| row.job_id == point.job_id)
+                .and_then(|row| {
+                    row.boundaries
+                        .iter()
+                        .find(|boundary| boundary.boundary == point.boundary.as_str())
+                })
+                .and_then(|boundary| {
+                    boundary
+                        .comparisons
+                        .iter()
+                        .find(|comparison| comparison.comparator == point.comparator)
+                })
+                .expect("unavailable comparison remains present");
+            assert_eq!(comparison.status, ComparisonStatus::NotComparable);
+            assert_eq!(comparison.reason.as_deref(), Some(point.reason.as_str()));
+        }
     }
 
     #[test]

@@ -70,7 +70,8 @@ steady-operation boundaries. Capture runner invocations now require an exact
 boundary plus contract/canonical/semantic/job identity. They emit canonical
 `fre.rebar.capture-lifecycle-raw.v1` JSON: first-operation records have no
 prime; steady-operation records authenticate one untimed successful prime
-before their single measured call. Raw records can be checked with:
+before their single measured call, and every arm carries a unique fresh-process
+token. Raw records can be checked with:
 
 ```text
 cargo run -p rebar-compare --bin performance-contract -- \
@@ -81,7 +82,16 @@ cargo run -p rebar-compare --bin performance-contract -- \
   /absolute/path/to/raw-capture.json
 ```
 
-The performance gate still needs fresh-process paired scheduling of these raw
-arms, allocation/memory metrics, `regex-redux` after semantic support exists,
-multi-pattern support, and replacement of draft placeholders without altering
-the fixed row/boundary/comparator universe.
+The deterministic capture scheduler expands the current semantic frontier to
+192 six-pair slots (384 unique process arms): eight supported rows, two
+boundaries, and both passing comparators. It alternates candidate/reference
+order and rejects missing, extra, reordered, identity-mismatched, or
+process-token-reusing evidence. Complete fixed-duration evidence converts 32
+pending capture comparison points to measured points in the original 344-row
+draft. Semantically missing/nonpassing comparators receive no slots and remain
+explicitly `not-comparable`.
+
+The performance gate still needs an authorized executor/collector for this
+schedule, allocation/memory metrics, `regex-redux` after semantic support
+exists, multi-pattern support, and conversion of the remaining model
+placeholders without altering the denominator.
