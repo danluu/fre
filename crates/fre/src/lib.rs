@@ -106,7 +106,7 @@ pub use replacement::{
     FunctionalReplacementLimits, FunctionalReplacementReport, FunctionalReplacementResult,
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
-    LiteralReplacementResult, LiteralReplacer,
+    LiteralReplacementResult, LiteralReplacer, NoExpand,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
@@ -2014,6 +2014,25 @@ impl PortableRegex {
         self.is_match_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Whether a selected match exists without constructing facade diagnostic
+    /// accounting on the success path.
+    ///
+    /// This is the value-only counterpart to [`Self::is_match`]. It preserves
+    /// the same selected plan, checked execution limits and typed failures,
+    /// while keeping callers that only consume the boolean outside the
+    /// [`SearchAccounting`] projection boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if scratch/work limits refuse the operation.
+    pub fn is_match_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.is_match_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
     /// Whether a selected match exists at or after `start`.
     ///
     /// Assertions inspect the complete original haystack. Unlike the pinned
@@ -2030,6 +2049,25 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
         self.is_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Whether a selected match exists at or after `start` without
+    /// constructing facade diagnostic accounting on the success path.
+    ///
+    /// Assertions inspect the complete original haystack. Range validation,
+    /// execution limits and typed failures are identical to
+    /// [`Self::is_match_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a resource refusal.
+    pub fn is_match_value_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.is_match_window_value(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Whether a selected match exists wholly inside a search range.
@@ -2127,6 +2165,82 @@ impl PortableRegex {
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
             }
+        }
+    }
+
+    /// Whether a selected match exists wholly inside a search range without
+    /// constructing facade diagnostic accounting on the success path.
+    ///
+    /// Assertions retain original-haystack context and every plan executes
+    /// the same existence operation as [`Self::is_match_window`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    pub fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        match &self.plan {
+            PortablePlan::ExactLiteral(literal) => literal
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::PackedLiteralSet(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    packed_literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::LiteralSetDfa(literal_set) => literal_set
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_set_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::RequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::ForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::ForwardEndFixed(fixed) => fixed
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::K0(automaton) => automaton
+                .prepare::<Exists>()
+                .search_window(haystack, window, limits)
+                .map(fre_automata::SearchReport::into_output)
+                .map_err(SearchError::from),
+            PortablePlan::UnicodeWordRun(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
         }
     }
 
@@ -2680,6 +2794,21 @@ impl PortableSearchSession<'_> {
         self.is_match_window(haystack, SearchWindow::full(haystack), limits)
     }
 
+    /// Whether a selected match exists without constructing facade diagnostic
+    /// accounting on the success path, reusing K0 state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::is_match_value`].
+    pub fn is_match_value(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.is_match_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
     /// Whether a selected match exists at or after `start`, reusing K0 state.
     ///
     /// # Errors
@@ -2693,6 +2822,23 @@ impl PortableSearchSession<'_> {
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
         self.is_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Whether a selected match exists at or after `start` without
+    /// constructing facade diagnostic accounting, reusing K0 state when
+    /// applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::is_match_value_at`].
+    pub fn is_match_value_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        self.is_match_window_value(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Whether a selected match exists wholly inside a range, reusing K0
@@ -2722,6 +2868,35 @@ impl PortableSearchSession<'_> {
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
+        }
+    }
+
+    /// Whether a selected match exists wholly inside a range without
+    /// constructing facade diagnostic accounting, reusing K0 state when
+    /// applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::is_match_window_value`].
+    pub fn is_match_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.is_match_window_value(haystack, window, limits)
+            }
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => automaton
+                .prepare::<Exists>()
+                .search_window_with_workspace(haystack, window, workspace, limits)
+                .map(fre_automata::SearchReport::into_output)
+                .map_err(SearchError::from),
         }
     }
 
