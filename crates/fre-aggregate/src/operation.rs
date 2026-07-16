@@ -602,7 +602,7 @@ impl Engine {
                     accounting,
                     admitted_work_bound,
                     |start, accounting| {
-                        if !reader.root(start, accounting, admitted_work_bound)? {
+                        if !reader.root(start, accounting)? {
                             return Ok(None);
                         }
                         RowStore::replay(
@@ -632,11 +632,7 @@ impl Engine {
                     Resource::PeakBytes,
                 )?;
                 let replay = add(
-                    add(
-                        store.allocated_store_bytes,
-                        store.reader_bytes,
-                        Resource::PeakBytes,
-                    )?,
+                    store.allocated_store_bytes,
                     output_bytes,
                     Resource::PeakBytes,
                 )?;
@@ -745,9 +741,7 @@ struct RowStore {
     record_bytes: usize,
     allocated_store_bytes: usize,
     build_scratch_bytes: usize,
-    reader_bytes: usize,
     root_rank: usize,
-    reader_buffer: Vec<u8>,
 }
 
 impl RowStore {
@@ -863,42 +857,23 @@ impl RowStore {
         drop(record);
         drop(row);
         drop(next_row);
-        let reader_buffer = zeroed_bytes(requirements.record_bytes, Resource::ScratchBytes)?;
-        let reader_bytes = reader_buffer.capacity();
-        enforce(
-            reader_bytes,
-            limits.max_random_access_bytes,
-            Resource::RandomAccessBytes,
-        )?;
-        enforce(
-            reader_bytes,
-            limits.max_scratch_bytes,
-            Resource::ScratchBytes,
-        )?;
-        enforce(
-            add(allocated_store, reader_bytes, Resource::PeakBytes)?,
-            limits.max_peak_bytes,
-            Resource::PeakBytes,
-        )?;
-        accounting.random_access_peak_bytes = build_scratch.max(reader_bytes);
-        accounting.scratch_peak_bytes = build_scratch.max(reader_bytes);
+        accounting.random_access_peak_bytes = build_scratch;
+        accounting.scratch_peak_bytes = build_scratch;
         accounting.log_bytes = allocated_store;
         Ok(Self {
             bytes: store,
             record_bytes: requirements.record_bytes,
             allocated_store_bytes: allocated_store,
             build_scratch_bytes: build_scratch,
-            reader_bytes,
             root_rank: program.split_count,
-            reader_buffer,
         })
     }
 
-    fn reader(&mut self) -> RowReader<'_> {
+    fn reader(&self) -> RowReader<'_> {
         RowReader {
             store: &self.bytes,
             record_bytes: self.record_bytes,
-            buffer: &mut self.reader_buffer,
+            current_record: &[],
             current_position: None,
             root_rank: self.root_rank,
         }
@@ -963,7 +938,7 @@ impl RowStore {
 struct RowReader<'a> {
     store: &'a [u8],
     record_bytes: usize,
-    buffer: &'a mut [u8],
+    current_record: &'a [u8],
     current_position: Option<usize>,
     root_rank: usize,
 }
@@ -973,10 +948,9 @@ impl RowReader<'_> {
         &mut self,
         position: usize,
         accounting: &mut ExecutionAccounting,
-        _max_work: usize,
     ) -> Result<bool, Error> {
         self.ensure(position, accounting)?;
-        read_bit(self.buffer, self.root_rank)
+        read_bit(self.current_record, self.root_rank)
     }
 
     fn decision(
@@ -986,7 +960,7 @@ impl RowReader<'_> {
         accounting: &mut ExecutionAccounting,
     ) -> Result<bool, Error> {
         self.ensure(position, accounting)?;
-        read_bit(self.buffer, rank)
+        read_bit(self.current_record, rank)
     }
 
     fn ensure(
@@ -1027,11 +1001,10 @@ impl RowReader<'_> {
             .checked_sub(from_end)
             .ok_or(Error::InternalInvariant("row-log seek outside store"))?;
         let end = add(start, self.record_bytes, Resource::LogBytes)?;
-        self.buffer.copy_from_slice(
-            self.store
-                .get(start..end)
-                .ok_or(Error::InternalInvariant("row-log read outside store"))?,
-        );
+        self.current_record = self
+            .store
+            .get(start..end)
+            .ok_or(Error::InternalInvariant("row-log read outside store"))?;
         self.current_position = Some(position);
         Ok(())
     }
