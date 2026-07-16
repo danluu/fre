@@ -1837,7 +1837,11 @@ impl AggregateSpansRegex {
             accounting: admitted.accounting(),
         };
         let report = self.0.execution_report(limits, details);
-        Ok(AggregateSpans { admitted, report })
+        Ok(AggregateSpans {
+            admitted,
+            report,
+            haystack_len: haystack.len(),
+        })
     }
 }
 
@@ -1846,6 +1850,7 @@ impl AggregateSpansRegex {
 pub struct AggregateSpans {
     admitted: AdmittedSpans,
     report: AggregateExecutionReport,
+    haystack_len: usize,
 }
 
 impl AggregateSpans {
@@ -1853,6 +1858,25 @@ impl AggregateSpans {
     pub fn iter(&self) -> AggregateSpanIter<'_> {
         AggregateSpanIter {
             inner: self.admitted.iter(),
+        }
+    }
+
+    /// Partition the complete original haystack into ordered rejected gaps
+    /// and selected matches.
+    ///
+    /// Empty matches remain explicit. The rejected gap following an empty
+    /// match is what advances to the next eligible UTF-8 or byte boundary, so
+    /// this is a stable equivalent of the behavioral contract exercised by
+    /// `regex`'s feature-gated `Pattern` searcher tests. Constructing and
+    /// advancing this iterator performs no allocation.
+    #[must_use]
+    pub fn search_steps(&self) -> AggregateSearchStepIter<'_> {
+        AggregateSearchStepIter {
+            inner: self.admitted.iter(),
+            haystack_len: self.haystack_len,
+            cursor: 0,
+            pending_match: None,
+            finished: false,
         }
     }
 
@@ -1904,6 +1928,100 @@ impl Iterator for AggregateSpanIter<'_> {
 
 impl ExactSizeIterator for AggregateSpanIter<'_> {}
 impl core::iter::FusedIterator for AggregateSpanIter<'_> {}
+
+/// One item in a complete search partition.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AggregateSearchStep {
+    /// A selected non-overlapping match, including an empty match.
+    Match(Match),
+    /// A maximal unmatched gap between selected matches.
+    Reject(Match),
+}
+
+impl AggregateSearchStep {
+    /// The half-open byte span in the original haystack.
+    #[must_use]
+    pub const fn span(self) -> Match {
+        match self {
+            Self::Match(span) | Self::Reject(span) => span,
+        }
+    }
+
+    /// Whether this step is a selected match rather than a rejected gap.
+    #[must_use]
+    pub const fn is_match(self) -> bool {
+        matches!(self, Self::Match(_))
+    }
+}
+
+/// Allocation-free iterator over a fully admitted search partition.
+#[derive(Clone, Debug)]
+pub struct AggregateSearchStepIter<'a> {
+    inner: SpanIter<'a>,
+    haystack_len: usize,
+    cursor: usize,
+    pending_match: Option<Match>,
+    finished: bool,
+}
+
+impl Iterator for AggregateSearchStepIter<'_> {
+    type Item = AggregateSearchStep;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if let Some(matched) = self.pending_match.take() {
+            self.cursor = matched.end;
+            return Some(AggregateSearchStep::Match(matched));
+        }
+        if let Some(span) = self.inner.next() {
+            let matched = Match {
+                start: span.start,
+                end: span.end,
+            };
+            debug_assert!(matched.start >= self.cursor);
+            if matched.start > self.cursor {
+                let rejected = Match {
+                    start: self.cursor,
+                    end: matched.start,
+                };
+                self.cursor = matched.start;
+                self.pending_match = Some(matched);
+                return Some(AggregateSearchStep::Reject(rejected));
+            }
+            self.cursor = matched.end;
+            return Some(AggregateSearchStep::Match(matched));
+        }
+        if self.cursor < self.haystack_len {
+            let rejected = Match {
+                start: self.cursor,
+                end: self.haystack_len,
+            };
+            self.cursor = self.haystack_len;
+            self.finished = true;
+            return Some(AggregateSearchStep::Reject(rejected));
+        }
+        self.finished = true;
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            return (0, Some(0));
+        }
+        let matches = self
+            .inner
+            .len()
+            .saturating_add(usize::from(self.pending_match.is_some()));
+        let upper = matches
+            .checked_mul(2)
+            .and_then(|steps| steps.checked_add(1));
+        (matches, upper)
+    }
+}
+
+impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 
 /// Compiled complete match-count operation.
 #[derive(Debug)]

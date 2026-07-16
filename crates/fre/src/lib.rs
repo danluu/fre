@@ -33,9 +33,9 @@ pub use aggregate::{
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
     AggregateFiniteLiteralIdentity, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
-    AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult, AggregateSpans,
-    AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarIdentity,
-    AggregateUnicodeScalarSemantics,
+    AggregateSearchStep, AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex,
+    AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
+    AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
