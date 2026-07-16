@@ -10,7 +10,8 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableRegex, PortableRegexSetRunLimits, PortableTextBuildError,
+    PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
     PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
     PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
     PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, PortableTextSearchError,
@@ -30,11 +31,10 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v8";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v9";
 
-const LIMITATIONS: [&str; 3] = [
+const LIMITATIONS: [&str; 2] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
-    "the production FRE facade has no Rust bytes RegexSet matcher",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
 ];
 
@@ -161,12 +161,9 @@ fn execute_case(
         AdapterSurface::RustTextSetCompile => execute_text_set_compile(case, input),
         AdapterSurface::RustTextSetIsMatch => execute_text_set_is_match(case, input),
         AdapterSurface::RustTextSetWhich => execute_text_set_which(case, input),
-        AdapterSurface::RustBytesSetCompile
-        | AdapterSurface::RustBytesSetIsMatch
-        | AdapterSurface::RustBytesSetWhich => unsupported(
-            CapabilityId::RustBytesSetFacade,
-            "facade.rust-bytes-set-missing",
-        ),
+        AdapterSurface::RustBytesSetCompile => execute_bytes_set_compile(case, input),
+        AdapterSurface::RustBytesSetIsMatch => execute_bytes_set_is_match(case, input),
+        AdapterSurface::RustBytesSetWhich => execute_bytes_set_which(case, input),
         AdapterSurface::RustBytesCompile => execute_bytes_compile(case, input),
         AdapterSurface::RustBytesIsMatch => execute_bytes_is_match(case, input),
         AdapterSurface::RustBytesFindIter => execute_bytes_find(case, input),
@@ -539,6 +536,13 @@ enum TextSetBuildAttempt {
     Fault(AdapterDisposition),
 }
 
+enum BytesSetBuildAttempt {
+    Built(Box<PortableRegexSet>),
+    Rejected,
+    Unsupported(AdapterDisposition),
+    Fault(AdapterDisposition),
+}
+
 enum CaptureBuildAttempt {
     Built(Box<CaptureRegex>),
     Rejected,
@@ -847,6 +851,123 @@ fn build_text_set(case: &CaseReceipt, input: &ExecutableCase) -> TextSetBuildAtt
             | PortableTextRegexSetBuildError::ArithmeticOverflow { .. },
         ) => TextSetBuildAttempt::Fault(fault("build.text-set-internal-fault")),
         Err(_) => TextSetBuildAttempt::Fault(fault("build.text-set-unclassified-error")),
+    }
+}
+
+fn execute_bytes_set_compile(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::CompileAccepted(case.compiles);
+    match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(_) => compare(&expected, &SemanticValue::CompileAccepted(true)),
+        BytesSetBuildAttempt::Rejected => {
+            compare(&expected, &SemanticValue::CompileAccepted(false))
+        }
+        BytesSetBuildAttempt::Unsupported(disposition)
+        | BytesSetBuildAttempt::Fault(disposition) => disposition,
+    }
+}
+
+fn execute_bytes_set_is_match(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::IsMatch(!input.expected.is_empty());
+    let set = match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(set) => set,
+        BytesSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        BytesSetBuildAttempt::Unsupported(disposition)
+        | BytesSetBuildAttempt::Fault(disposition) => return disposition,
+    };
+    match set.is_match(&input.haystack, PortableRegexSetRunLimits::unlimited()) {
+        Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed)),
+        Err(_) => unsupported(
+            CapabilityId::RustBytesSetFacade,
+            "search.bytes-set-execution-refused",
+        ),
+    }
+}
+
+fn execute_bytes_set_which(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::PatternIds(expected_pattern_ids(input));
+    let set = match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(set) => set,
+        BytesSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        BytesSetBuildAttempt::Unsupported(disposition)
+        | BytesSetBuildAttempt::Fault(disposition) => return disposition,
+    };
+    match set.matches(&input.haystack, PortableRegexSetRunLimits::unlimited()) {
+        Ok(observed) => compare(
+            &expected,
+            &SemanticValue::PatternIds(observed.iter().collect()),
+        ),
+        Err(_) => unsupported(
+            CapabilityId::RustBytesSetFacade,
+            "search.bytes-set-execution-refused",
+        ),
+    }
+}
+
+fn build_bytes_set(case: &CaseReceipt, input: &ExecutableCase) -> BytesSetBuildAttempt {
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = case.case_insensitive;
+    profile.options.unicode = case.unicode;
+    profile.options.line_terminator = input.line_terminator;
+    match PortableRegexSetBuilder::new(&input.patterns)
+        .profile(profile)
+        .build()
+    {
+        Ok(set) => BytesSetBuildAttempt::Built(Box::new(set)),
+        Err(PortableRegexSetBuildError::Pattern {
+            source: BuildError::Syntax(error),
+            ..
+        }) if matches!(&error.category, ErrorCategory::UpstreamRustSyntax) => {
+            BytesSetBuildAttempt::Rejected
+        }
+        Err(PortableRegexSetBuildError::Pattern {
+            source: BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+            ..
+        }) => BytesSetBuildAttempt::Fault(fault("build.bytes-set-pattern-internal-fault")),
+        Err(PortableRegexSetBuildError::Pattern {
+            source: BuildError::Syntax(error),
+            ..
+        }) if matches!(
+            &error.category,
+            ErrorCategory::FreResourceLimit { .. }
+                | ErrorCategory::StrictQualificationFailure { .. }
+        ) =>
+        {
+            BytesSetBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustBytesSetFacade,
+                "build.bytes-set-syntax-resource-envelope",
+            ))
+        }
+        Err(PortableRegexSetBuildError::Pattern { .. }) => {
+            BytesSetBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustBytesSetFacade,
+                "build.bytes-set-portable-subset-gap",
+            ))
+        }
+        Err(
+            PortableRegexSetBuildError::PatternLimit { .. }
+            | PortableRegexSetBuildError::PatternBytesLimit { .. }
+            | PortableRegexSetBuildError::PersistentLimit { .. },
+        ) => BytesSetBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustBytesSetFacade,
+            "build.bytes-set-resource-envelope",
+        )),
+        Err(
+            PortableRegexSetBuildError::AllocationFailed { .. }
+            | PortableRegexSetBuildError::ArithmeticOverflow { .. },
+        ) => BytesSetBuildAttempt::Fault(fault("build.bytes-set-internal-fault")),
+        Err(_) => BytesSetBuildAttempt::Fault(fault("build.bytes-set-unclassified-error")),
     }
 }
 
@@ -1696,6 +1817,64 @@ mod tests {
             AdapterDisposition::Pass { .. }
         ));
         assert_eq!(expected_pattern_ids(&input), vec![0, 1]);
+    }
+
+    #[test]
+    fn bytes_set_surfaces_preserve_arbitrary_bytes_and_ascending_pattern_ids() {
+        let mut case = fixture_case(true, false, None);
+        case.pattern_count = 3;
+        case.match_kind = MatchKind::All;
+        case.search_kind = SearchKind::Overlapping;
+        case.unicode = false;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec![String::new(), r"(?-u:\xFF)".to_owned(), String::new()],
+            haystack: vec![0xFF],
+            bounds: SearchBounds { start: 0, end: 1 },
+            line_terminator: b'\n',
+            expected: vec![
+                ExpectedCaptures {
+                    pattern_id: 2,
+                    groups: vec![Some(ExpectedSpan { start: 1, end: 1 })],
+                },
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![Some(ExpectedSpan { start: 0, end: 0 })],
+                },
+                ExpectedCaptures {
+                    pattern_id: 1,
+                    groups: vec![Some(ExpectedSpan { start: 0, end: 1 })],
+                },
+            ],
+        };
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetIsMatch, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetWhich, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert_eq!(expected_pattern_ids(&input), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bytes_set_compile_rejection_is_compared_not_hidden() {
+        let mut case = fixture_case(false, false, None);
+        case.pattern_count = 2;
+        case.match_kind = MatchKind::All;
+        case.search_kind = SearchKind::Overlapping;
+        let mut input = fixture_input(Vec::new());
+        input.patterns = vec!["valid".to_owned(), "(".to_owned()];
+        input.bounds.end = input.haystack.len();
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
     }
 
     #[test]

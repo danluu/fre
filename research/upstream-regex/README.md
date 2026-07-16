@@ -49,10 +49,12 @@ UTF-8-safe HIR shared with an independently parsed same-option byte proof and
 filters empty matches inside scalar encodings. Capture Unicode scalar classes
 lower through checked canonical UTF-8 byte-range sequences under explicit HIR,
 AST, state, and work limits. Rust text sets compose those independently proved
-matchers under set-wide bounds. Missing byte sets, capture HIRs outside those
-proofs, and unproved text execution remain stable `unsupported` receipts. Inapplicable
-upstream surface combinations remain separately typed, and panics become
-`fault` receipts without truncating the cross product.
+matchers under set-wide bounds. Rust byte sets compose bounded byte matchers,
+preserve arbitrary-byte haystacks and publish matching pattern IDs in stable
+source order. Capture HIRs outside the proved slices and unproved text execution
+remain stable `unsupported` receipts. Inapplicable upstream surface combinations
+remain separately typed, and panics become `fault` receipts without truncating
+the cross product.
 
 The separate replacement API adapter covers the complete non-TOML
 `tests/replace.rs` source at the same pin. It authenticates the published crate
@@ -115,8 +117,8 @@ cargo run -p rust-regex-conformance -- \
 The authenticated inventory plus the TOML, replacement and searcher adapters
 do not yet:
 
-- provide general Rust text beyond the proved slices, byte sets, capture
-  iteration, or full match iteration;
+- provide general Rust text beyond the proved slices, capture iteration, or
+  full match iteration;
 - produce mandatory reports for the remaining upstream Rust API regression,
   doctest, or feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;

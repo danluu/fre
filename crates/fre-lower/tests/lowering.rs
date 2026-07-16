@@ -196,8 +196,27 @@ fn ordered_priority_and_repeat_greed_are_preserved() {
 }
 
 #[test]
-fn nullable_unbounded_cycles_are_rejected_until_priority_is_certified() {
-    for pattern in ["(?:a*)*", "(?:a*?)*?", "(?:|a)*", "(?:a|)*"] {
+fn nullable_unbounded_cycles_require_a_capture_free_normalization_proof() {
+    for pattern in ["(?:a*)*", "(?:a*)+", "(?:a?)*", "(?:a?)*?", "(?:[ab]*){3,}"] {
+        let parsed = parsed(pattern, false);
+        let lowered = lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+    }
+
+    for pattern in [
+        "(?:a*?)*?",
+        "(?:a*)*?",
+        "(?:a?)+?",
+        "(?:a?){3,}?",
+        "(?:|a)*",
+        "(?:a|)*",
+        "(?:a*|b)*",
+    ] {
         let parsed = parsed(pattern, false);
         assert!(
             matches!(
@@ -232,6 +251,54 @@ fn nullable_unbounded_cycles_are_rejected_until_priority_is_certified() {
             UnsupportedFeature::UncertifiedUnboundedRepetition
         ))
     ));
+}
+
+#[test]
+fn normalized_nullable_repetitions_match_upstream_group_zero() {
+    let patterns = [
+        "(?:a*)*",
+        "(?:a*)+",
+        "(?:a?)*",
+        "(?:a?)*?",
+        "(?:[ab]*){3,}",
+        "X(?:.?){0,}Y",
+        "X(?:.?){3,}Y",
+        "X(?:(?:.*)*)Y",
+    ];
+    let haystacks: [&[u8]; 16] = [
+        b"", b"a", b"aa", b"ab", b"ba", b"bbb", b"X", b"Y", b"XY", b"XaY", b"XabY", b"XabYcY",
+        b"aXabYcY", b"a=b=c", b"\n", b"X\nY",
+    ];
+    for pattern in patterns {
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let parsed = parsed(pattern, false);
+        let lowered = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"));
+        assert_eq!(lowered.stats().normalized_nullable_repetitions(), 1);
+        for haystack in haystacks {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let actual = lowered
+                .automaton()
+                .prepare::<Span>()
+                .search(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(
+                tuple(actual),
+                expected,
+                "pattern={pattern:?}, haystack={haystack:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -13,21 +13,26 @@ The first certificate covers:
 - byte classes with inclusive byte ranges;
 - Unicode scalar classes expanded to canonical valid-UTF-8 byte-range paths;
 - concatenation and ordered leftmost-first alternation;
-- finite greedy or lazy repetition, plus unbounded repetition whose body must
-  consume at least one byte;
+- finite greedy or lazy repetition, unbounded repetition whose body consumes
+  at least one byte, and a capture-free normalization for greedy `(A*){m,}`
+  plus greedy-inner `(A?){m,}` when the outer repeat is greedy (or is lazy
+  with `m = 0`) and `A` is one positive-width literal or class;
 - every pinned absolute, LF and CRLF line assertion plus every ASCII and
   Unicode word assertion; and
 - capture-node erasure only when the operation planner declares a
   capture-free output contract.
 
-It explicitly rejects capture-sensitive operations and unbounded repetition unless its body has
-`minimum_len() == Some(n)` for `n > 0`.
-Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
-rejected: `None` is not treated as a non-nullability certificate. The
-restriction is required because K0's generation deduplication does not yet
-provide a proof for ordered nullable-loop priority (`(?:|a)*` and `(?:a|)*`
-select different spans in Rust regex). There is no fallback that silently
-changes those semantics.
+It explicitly rejects capture-sensitive operations and unbounded repetition
+unless its body has `minimum_len() == Some(n)` for `n > 0` or it matches the
+normalization above. The normalization removes capture wrappers only under the
+capture-free operation contract and emits the equivalent positive-width
+`A*`; its inspection and graph emission are charged to the same work limits.
+Other nullable (`Some(0)`) and every unknown/empty-language (`None`) body
+minimum remain rejected: `None` is not treated as a non-nullability
+certificate. The restriction is required because K0's generation
+deduplication does not in general prove ordered nullable-loop priority
+(`(?:|a)*` and `(?:a|)*` select different spans in Rust regex). There is no
+fallback that silently changes those semantics.
 
 ## Bounded construction
 
@@ -57,6 +62,8 @@ while requested storage is separately preflighted and fallibly reserved.
 `LowerStats::erased_captures` is the source HIR's count of distinct explicit
 capture annotations. It is intentionally not multiplied when a finite repeat
 emits several copies of the same annotated subexpression.
+`LowerStats::normalized_nullable_repetitions` separately records each
+certified nested nullable repetition removed before graph emission.
 
 Edge order is semantic data: earlier alternation branches have higher
 priority, and loop-versus-exit ordering represents greediness. Assertions are
@@ -87,8 +94,9 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
   semantics; the `fre` facade refuses non-LF profiles before selecting K0.
 - Capture-sensitive search is unavailable. Capture syntax may be erased only
   after the caller selects the capture-free operation contract.
-- Unbounded nullable or unknown-minimum bodies are rejected pending an ordered
-  closure proof; finite nullable repetition remains acyclic and supported.
+- Unbounded nullable or unknown-minimum bodies outside the explicitly proved
+  capture-free atom normalization are rejected pending an ordered closure
+  proof; finite nullable repetition remains acyclic and supported.
 - The output is a portable K0 `RawPlan`/`Automaton`. This crate contains no JIT,
   AOT, SIMD, multi-pattern, replacement, or aggregate-iteration implementation
   and makes no claim yet about beating an upstream engine.

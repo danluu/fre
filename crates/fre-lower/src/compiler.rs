@@ -71,6 +71,7 @@ struct Compiler<'h> {
     work: u64,
     peak_stack_items: usize,
     erased_captures: usize,
+    normalized_nullable_repetitions: usize,
 }
 
 impl<'h> Compiler<'h> {
@@ -89,6 +90,7 @@ impl<'h> Compiler<'h> {
             work: 0,
             peak_stack_items: 0,
             erased_captures,
+            normalized_nullable_repetitions: 0,
         }
     }
 
@@ -128,6 +130,7 @@ impl<'h> Compiler<'h> {
             states: self.states.len(),
             edges: self.edges,
             erased_captures: self.erased_captures,
+            normalized_nullable_repetitions: self.normalized_nullable_repetitions,
         };
         let raw = self.into_raw(start)?;
         Ok((raw, stats))
@@ -198,6 +201,21 @@ impl<'h> Compiler<'h> {
                 if repetition.max.is_none()
                     && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
                 {
+                    if let Some((sub, greedy)) = self.normalized_nullable_repetition(repetition)? {
+                        self.normalized_nullable_repetitions = self
+                            .normalized_nullable_repetitions
+                            .checked_add(1)
+                            .ok_or(LowerError::ArithmeticOverflow {
+                                computation: "normalized nullable repetition count",
+                            })?;
+                        self.push_task(Task::FinishRepetition {
+                            min: 0,
+                            max: None,
+                            greedy,
+                            copies: 1,
+                        })?;
+                        return self.push_task(Task::Visit(sub));
+                    }
                     return Err(LowerError::Unsupported(
                         UnsupportedFeature::UncertifiedUnboundedRepetition,
                     ));
@@ -219,6 +237,49 @@ impl<'h> Compiler<'h> {
                 Ok(())
             }
         }
+    }
+
+    /// Prove the capture-free identity `(A*){m,} == A*` or
+    /// `(A?){m,} == A*` for a positive-width atom `A`.
+    ///
+    /// The inner repetition must prefer its consuming branch. Nested `A*` is
+    /// admitted only when the outer repetition is also greedy. For `A?`, the
+    /// outer repetition's greed controls how many one-atom iterations are
+    /// selected; a lazy outer repetition is admitted only at minimum zero.
+    /// Capture wrappers may be erased because `compile` has already rejected
+    /// capture-sensitive operations. Empty alternatives, assertions, lazy
+    /// inner repetitions and compound bodies remain outside this theorem.
+    fn normalized_nullable_repetition(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<(&'h Hir, bool)>, LowerError> {
+        let nested = self.capture_free_node(&outer.sub)?;
+        let HirKind::Repetition(inner) = nested.kind() else {
+            return Ok(None);
+        };
+        if inner.min != 0 || !inner.greedy {
+            return Ok(None);
+        }
+        let greedy = match inner.max {
+            Some(1) if outer.greedy || outer.min == 0 => outer.greedy,
+            None if outer.greedy => true,
+            None | Some(_) => return Ok(None),
+        };
+        let atom = self.capture_free_node(&inner.sub)?;
+        if !matches!(atom.properties().minimum_len(), Some(minimum) if minimum > 0)
+            || !matches!(atom.kind(), HirKind::Literal(_) | HirKind::Class(_))
+        {
+            return Ok(None);
+        }
+        Ok(Some((atom, greedy)))
+    }
+
+    fn capture_free_node(&mut self, mut hir: &'h Hir) -> Result<&'h Hir, LowerError> {
+        while let HirKind::Capture(capture) = hir.kind() {
+            self.charge(1, "capture-free nullable normalization")?;
+            hir = &capture.sub;
+        }
+        Ok(hir)
     }
 
     fn finish_concat(&mut self, count: usize) -> Result<(), LowerError> {
