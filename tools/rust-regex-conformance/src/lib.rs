@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod adapter;
+mod doctest_api;
 mod feature_matrix;
 mod misc_regression_api;
 mod replacement_api;
@@ -28,6 +29,11 @@ pub use adapter::{
     AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
+};
+pub use doctest_api::{
+    DOCTEST_API_CASES, DOCTEST_API_REPORT_SCHEMA, DoctestCapability, DoctestCounts,
+    DoctestDisposition, DoctestReceipt, DoctestReport, DoctestReportPayload, DoctestSourceFile,
+    DoctestSourceIdentity, build_doctest_report, read_doctest_report, write_doctest_report,
 };
 pub use feature_matrix::{
     FEATURE_MATRIX_CONFIGURATIONS, FEATURE_MATRIX_DECLARED_FEATURES, FEATURE_MATRIX_REPORT_SCHEMA,

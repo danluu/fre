@@ -72,6 +72,22 @@ obligations through FRE's aggregate search-step API. Each obligation emits a
 mandatory pass, mismatch, unsupported or fault receipt, including empty,
 zero-width, rejected-range and Unicode step sequences.
 
+The public-doctest adapter authenticates the published package receipt,
+original manifest, `README.md`, and all seven Rust source files that contribute
+default-feature rustdoc tests. It derives and hashes every applicable fenced
+obligation from those exact bytes: five README examples, 56 builder examples,
+two bytes-module examples, 23 crate-level examples, 60 examples for each
+string/bytes regex module, and 18 for each string/bytes set module. The one
+upstream `ignore` doctest remains an obligation; non-Rust `text` and `toml`
+fences are the only source-authenticated non-doctest blocks. All 242 obligations
+receive a mandatory pass, mismatch, unsupported or fault receipt. The initial
+FRE execution slice passes 127, with 115 explicit unsupported receipts and no
+mismatch or fault. It exercises builder configuration, text/byte search,
+complete iteration, split/splitn, capture metadata and set behavior without
+re-counting the separately owned replacement, searcher or misc test suites.
+The derived obligation-inventory SHA-256 is
+`028754b101949945211bfb067736739d703d2979719f9f7186d5b282955f70cb`.
+
 ## Reproduce
 
 Use a clean checkout at the exact revision:
@@ -117,6 +133,13 @@ cargo run -p rust-regex-conformance -- run-feature-matrix \
   /tmp/fre-rust-regex-feature-matrix-report.json
 cargo run -p rust-regex-conformance -- verify-feature-matrix-report \
   /tmp/fre-rust-regex-feature-matrix-report.json
+
+cargo run -p rust-regex-conformance -- run-doctest-api \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-doctest-api-report.json
+
+cargo run -p rust-regex-conformance -- verify-doctest-api-report \
+  /tmp/fre-rust-regex-doctest-api-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -129,13 +152,12 @@ cargo run -p rust-regex-conformance -- \
 
 ## Scope boundary
 
-The authenticated inventory plus the TOML, replacement and searcher adapters
+The authenticated inventory plus the TOML, replacement, searcher, misc and
+public-doctest adapters
 do not yet:
 
 - provide general Rust text beyond the proved slices, byte sets, capture
   full match iteration;
-- produce mandatory reports for the remaining upstream doctests (the Cargo
-  feature matrix has its own authenticated 25-row report);
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
   release qualification.
