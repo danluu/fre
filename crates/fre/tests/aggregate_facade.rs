@@ -8,8 +8,6 @@ use fre::{
     LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
-use regex_syntax::hir::Look;
-
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
     AggregateStrategy::ReverseSequentialRows,
@@ -311,21 +309,26 @@ fn unicode_word_boundary_routes_through_continuation_exactly() {
 }
 
 #[test]
-fn crlf_assertions_remain_typed_refusals() {
+fn crlf_assertions_route_through_the_exact_continuation() {
     let mut crlf_profile = RustProfile::regex_1_12_4();
     crlf_profile.options.crlf = true;
-    assert!(matches!(
-        AggregateBuilder::new(r"(?m:^)")
-            .profile(crlf_profile)
-            .plan_selection(AggregatePlanSelection::ForceContinuation)
-            .build_count(),
-        Err(AggregateBuildError::ContinuationCompile {
-            source: AggregateEngineError::Unsupported(fre::AggregateUnsupported::Look(
-                Look::StartCRLF,
-            )),
-            ..
-        })
-    ));
+    let haystack = b"a\r\nb\rc\nd";
+    let expected = regex::bytes::Regex::new(r"(?Rm:^)")
+        .unwrap()
+        .find_iter(haystack)
+        .count();
+    let compiled = AggregateBuilder::new(r"(?m:^)")
+        .profile(crlf_profile)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .expect("CRLF continuation");
+    assert_eq!(
+        compiled
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        u64::try_from(expected).unwrap()
+    );
 }
 
 #[test]

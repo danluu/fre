@@ -144,7 +144,13 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
         (r"^((?:é|a)*)$", "éaé"),
         (r"([\p{Greek}]+)", "aΔδ東京"),
         (r"(\b)", "éa 東京_42"),
+        (r"(\B)", "éa 東京_42"),
+        (r"(\b{start})", "éa 東京_42"),
+        (r"(\b{end})", "éa 東京_42"),
+        (r"(\b{start-half})", "éa 東京_42"),
+        (r"(\b{end-half})", "éa 東京_42"),
         (r"(?m:^([^\n]*))", "éa\n東京\n"),
+        (r"(?Rm:^([^\r\n]*))", "éa\r\n東京\r末"),
     ];
     for (pattern, haystack) in cases {
         let regex = PortableTextCaptureBuilder::new(pattern)
@@ -358,6 +364,7 @@ fn unicode_capture_classes_and_admitted_contextual_looks_execute() {
         ))
     ));
     assert_count(r"(?m:^([^\n]+))", b"a\nb\n");
+    assert_count(r"(?Rm:^([^\r\n]+))", b"a\r\nb\rc\n");
     assert_count(r"(?-u:\b)([A-Za-z_]+)(?-u:\b)", b"a-b_c 42");
     assert_count(r"(?-u:\b{start})([A-Za-z_]+)", b"a-b_c 42");
     let word_pattern = r"([\p{L}]+)\b";

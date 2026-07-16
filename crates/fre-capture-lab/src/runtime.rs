@@ -35,20 +35,35 @@ pub(crate) fn assertion_matches(
             position == window.start || left_byte.is_some_and(|&byte| byte == b'\n')
         }
         Assertion::EndLf => position == window.end || right_byte.is_some_and(|&byte| byte == b'\n'),
+        Assertion::StartCrlf => {
+            position == window.start
+                || left_byte == Some(&b'\n')
+                || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+        }
+        Assertion::EndCrlf => {
+            position == window.end
+                || right_byte == Some(&b'\r')
+                || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+        }
         Assertion::WordAscii => left_ascii_word != right_ascii_word,
         Assertion::WordAsciiNegate => left_ascii_word == right_ascii_word,
         Assertion::WordStartAscii => !left_ascii_word && right_ascii_word,
         Assertion::WordEndAscii => left_ascii_word && !right_ascii_word,
         Assertion::WordStartHalfAscii => !left_ascii_word,
         Assertion::WordEndHalfAscii => !right_ascii_word,
-        Assertion::WordUnicode => {
+        assertion @ (Assertion::WordUnicode
+        | Assertion::WordUnicodeNegate
+        | Assertion::WordStartUnicode
+        | Assertion::WordEndUnicode
+        | Assertion::WordStartHalfUnicode
+        | Assertion::WordEndHalfUnicode) => {
             let before = haystack
                 .get(window.start..position)
                 .ok_or(SearchError::InvalidWindow)?;
             let after = haystack
                 .get(position..window.end)
                 .ok_or(SearchError::InvalidWindow)?;
-            unicode_word(decode_last_scalar(before))? != unicode_word(decode_first_scalar(after))?
+            unicode_assertion_matches(assertion, before, after)?
         }
     })
 }
@@ -62,6 +77,28 @@ fn unicode_word(scalar: Option<char>) -> Result<bool, SearchError> {
         return Ok(false);
     };
     regex_syntax::try_is_word_character(scalar).map_err(|_| SearchError::InvalidProgram)
+}
+
+fn unicode_assertion_matches(
+    assertion: Assertion,
+    before: &[u8],
+    after: &[u8],
+) -> Result<bool, SearchError> {
+    let left_scalar = decode_last_scalar(before);
+    let right_scalar = decode_first_scalar(after);
+    let left_valid = before.is_empty() || left_scalar.is_some();
+    let right_valid = after.is_empty() || right_scalar.is_some();
+    let left_word = unicode_word(left_scalar)?;
+    let right_word = unicode_word(right_scalar)?;
+    Ok(match assertion {
+        Assertion::WordUnicode => left_word != right_word,
+        Assertion::WordUnicodeNegate => left_valid && right_valid && left_word == right_word,
+        Assertion::WordStartUnicode => !left_word && right_word,
+        Assertion::WordEndUnicode => left_word && !right_word,
+        Assertion::WordStartHalfUnicode => left_valid && !left_word,
+        Assertion::WordEndHalfUnicode => right_valid && !right_word,
+        _ => return Err(SearchError::InvalidProgram),
+    })
 }
 
 fn decode_first_scalar(bytes: &[u8]) -> Option<char> {

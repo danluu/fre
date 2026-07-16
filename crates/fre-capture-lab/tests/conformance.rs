@@ -236,6 +236,8 @@ fn contextual_line_and_word_assertions_match_pinned_regex() {
     let assertions = [
         Assertion::StartLf,
         Assertion::EndLf,
+        Assertion::StartCrlf,
+        Assertion::EndCrlf,
         Assertion::WordAscii,
         Assertion::WordAsciiNegate,
         Assertion::WordStartAscii,
@@ -243,16 +245,33 @@ fn contextual_line_and_word_assertions_match_pinned_regex() {
         Assertion::WordStartHalfAscii,
         Assertion::WordEndHalfAscii,
         Assertion::WordUnicode,
+        Assertion::WordUnicodeNegate,
+        Assertion::WordStartUnicode,
+        Assertion::WordEndUnicode,
+        Assertion::WordStartHalfUnicode,
+        Assertion::WordEndHalfUnicode,
     ];
     let haystacks: &[&[u8]] = &[
         b"",
-        b"a-\n_b",
+        b"a-\n_b\r\nc\rd",
         "é-東京_42\n".as_bytes(),
         &[0xFF, b'a', 0x80, b'_', b'\n'],
     ];
     for assertion in assertions {
         let ast = Ast::Assert(assertion).capture(1);
         for &haystack in haystacks {
+            if core::str::from_utf8(haystack).is_err()
+                && matches!(
+                    assertion,
+                    Assertion::WordUnicodeNegate
+                        | Assertion::WordStartUnicode
+                        | Assertion::WordEndUnicode
+                        | Assertion::WordStartHalfUnicode
+                        | Assertion::WordEndHalfUnicode
+                )
+            {
+                continue;
+            }
             assert_case(&ast, haystack, Window::all(haystack));
             let mut embedded = Vec::with_capacity(haystack.len() + 2);
             embedded.push(b'x');
@@ -730,6 +749,8 @@ fn render(ast: &Ast) -> String {
             Assertion::End => r"\z",
             Assertion::StartLf => r"(?m:^)",
             Assertion::EndLf => r"(?m:$)",
+            Assertion::StartCrlf => r"(?Rm:^)",
+            Assertion::EndCrlf => r"(?Rm:$)",
             Assertion::WordAscii => r"(?-u:\b)",
             Assertion::WordAsciiNegate => r"(?-u:\B)",
             Assertion::WordStartAscii => r"(?-u:\b{start})",
@@ -737,6 +758,11 @@ fn render(ast: &Ast) -> String {
             Assertion::WordStartHalfAscii => r"(?-u:\b{start-half})",
             Assertion::WordEndHalfAscii => r"(?-u:\b{end-half})",
             Assertion::WordUnicode => r"\b",
+            Assertion::WordUnicodeNegate => r"\B",
+            Assertion::WordStartUnicode => r"\b{start}",
+            Assertion::WordEndUnicode => r"\b{end}",
+            Assertion::WordStartHalfUnicode => r"\b{start-half}",
+            Assertion::WordEndHalfUnicode => r"\b{end-half}",
         }
         .to_owned(),
     }

@@ -20,6 +20,10 @@ pub enum Assertion {
     StartLf,
     /// End of the logical window or immediately before LF.
     EndLf,
+    /// Beginning of a CRLF-aware line without splitting a CRLF pair.
+    StartCrlf,
+    /// End of a CRLF-aware line without splitting a CRLF pair.
+    EndCrlf,
     /// ASCII word boundary.
     WordAscii,
     /// Negated ASCII word boundary.
@@ -34,6 +38,16 @@ pub enum Assertion {
     WordEndHalfAscii,
     /// Positive Unicode word boundary using the pinned UTS#18 word set.
     WordUnicode,
+    /// Negated Unicode word boundary.
+    WordUnicodeNegate,
+    /// Start of a Unicode word.
+    WordStartUnicode,
+    /// End of a Unicode word.
+    WordEndUnicode,
+    /// Left half of a Unicode word-start predicate.
+    WordStartHalfUnicode,
+    /// Right half of a Unicode word-end predicate.
+    WordEndHalfUnicode,
 }
 
 /// Syntax accepted by the capture laboratory.

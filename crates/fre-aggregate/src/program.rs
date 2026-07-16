@@ -32,15 +32,15 @@ impl ByteSet {
 /// A constant-time zero-width predicate admitted by the continuation engine.
 ///
 /// This is deliberately distinct from `regex_syntax::hir::Look`: every
-/// variant here has one audited implementation below, while HIR variants that
-/// require direction-specific Unicode word state or CRLF state remain typed
-/// refusals.
+/// variant here has one audited implementation below.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Assertion {
     StartText,
     EndText,
     StartLf,
     EndLf,
+    StartCrlf,
+    EndCrlf,
     WordAscii,
     WordAsciiNegate,
     WordStartAscii,
@@ -48,29 +48,34 @@ pub(crate) enum Assertion {
     WordStartHalfAscii,
     WordEndHalfAscii,
     WordUnicode,
+    WordUnicodeNegate,
+    WordStartUnicode,
+    WordEndUnicode,
+    WordStartHalfUnicode,
+    WordEndHalfUnicode,
 }
 
 impl Assertion {
-    pub(crate) const fn from_look(look: Look) -> Option<Self> {
+    pub(crate) const fn from_look(look: Look) -> Self {
         match look {
-            Look::Start => Some(Self::StartText),
-            Look::End => Some(Self::EndText),
-            Look::StartLF => Some(Self::StartLf),
-            Look::EndLF => Some(Self::EndLf),
-            Look::WordAscii => Some(Self::WordAscii),
-            Look::WordAsciiNegate => Some(Self::WordAsciiNegate),
-            Look::WordStartAscii => Some(Self::WordStartAscii),
-            Look::WordEndAscii => Some(Self::WordEndAscii),
-            Look::WordStartHalfAscii => Some(Self::WordStartHalfAscii),
-            Look::WordEndHalfAscii => Some(Self::WordEndHalfAscii),
-            Look::WordUnicode => Some(Self::WordUnicode),
-            Look::StartCRLF
-            | Look::EndCRLF
-            | Look::WordUnicodeNegate
-            | Look::WordStartUnicode
-            | Look::WordEndUnicode
-            | Look::WordStartHalfUnicode
-            | Look::WordEndHalfUnicode => None,
+            Look::Start => Self::StartText,
+            Look::End => Self::EndText,
+            Look::StartLF => Self::StartLf,
+            Look::EndLF => Self::EndLf,
+            Look::WordAscii => Self::WordAscii,
+            Look::WordAsciiNegate => Self::WordAsciiNegate,
+            Look::WordStartAscii => Self::WordStartAscii,
+            Look::WordEndAscii => Self::WordEndAscii,
+            Look::WordStartHalfAscii => Self::WordStartHalfAscii,
+            Look::WordEndHalfAscii => Self::WordEndHalfAscii,
+            Look::WordUnicode => Self::WordUnicode,
+            Look::StartCRLF => Self::StartCrlf,
+            Look::EndCRLF => Self::EndCrlf,
+            Look::WordUnicodeNegate => Self::WordUnicodeNegate,
+            Look::WordStartUnicode => Self::WordStartUnicode,
+            Look::WordEndUnicode => Self::WordEndUnicode,
+            Look::WordStartHalfUnicode => Self::WordStartHalfUnicode,
+            Look::WordEndHalfUnicode => Self::WordEndHalfUnicode,
         }
     }
 
@@ -87,7 +92,26 @@ impl Assertion {
             Self::WordStartHalfAscii => 8,
             Self::WordEndHalfAscii => 9,
             Self::WordUnicode => 10,
+            Self::StartCrlf => 11,
+            Self::EndCrlf => 12,
+            Self::WordUnicodeNegate => 13,
+            Self::WordStartUnicode => 14,
+            Self::WordEndUnicode => 15,
+            Self::WordStartHalfUnicode => 16,
+            Self::WordEndHalfUnicode => 17,
         }
+    }
+
+    pub(crate) const fn is_unicode_word(self) -> bool {
+        matches!(
+            self,
+            Self::WordUnicode
+                | Self::WordUnicodeNegate
+                | Self::WordStartUnicode
+                | Self::WordEndUnicode
+                | Self::WordStartHalfUnicode
+                | Self::WordEndHalfUnicode
+        )
     }
 }
 
@@ -145,13 +169,28 @@ impl<'h> AssertionContext<'h> {
             Assertion::EndLf => {
                 absolute == self.haystack.len() || right_byte.is_some_and(|&byte| byte == b'\n')
             }
+            Assertion::StartCrlf => {
+                absolute == 0
+                    || left_byte == Some(&b'\n')
+                    || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+            }
+            Assertion::EndCrlf => {
+                absolute == self.haystack.len()
+                    || right_byte == Some(&b'\r')
+                    || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+            }
             Assertion::WordAscii => left_word != right_word,
             Assertion::WordAsciiNegate => left_word == right_word,
             Assertion::WordStartAscii => !left_word && right_word,
             Assertion::WordEndAscii => left_word && !right_word,
             Assertion::WordStartHalfAscii => !left_word,
             Assertion::WordEndHalfAscii => !right_word,
-            Assertion::WordUnicode => {
+            assertion @ (Assertion::WordUnicode
+            | Assertion::WordUnicodeNegate
+            | Assertion::WordStartUnicode
+            | Assertion::WordEndUnicode
+            | Assertion::WordStartHalfUnicode
+            | Assertion::WordEndHalfUnicode) => {
                 let before = self
                     .haystack
                     .get(..absolute)
@@ -160,9 +199,7 @@ impl<'h> AssertionContext<'h> {
                     .haystack
                     .get(absolute..)
                     .ok_or(Error::InternalInvariant("Unicode assertion suffix missing"))?;
-                let word_before = unicode_word_scalar(decode_last_scalar(before))?;
-                let word_after = unicode_word_scalar(decode_first_scalar(after))?;
-                word_before != word_after
+                unicode_assertion_matches(assertion, before, after)?
             }
         })
     }
@@ -182,6 +219,32 @@ fn unicode_word_scalar(scalar: Option<char>) -> Result<bool, Error> {
     };
     regex_syntax::try_is_word_character(scalar)
         .map_err(|_| Error::InternalInvariant("pinned Unicode word table is unavailable"))
+}
+
+fn unicode_assertion_matches(
+    assertion: Assertion,
+    before: &[u8],
+    after: &[u8],
+) -> Result<bool, Error> {
+    let left_scalar = decode_last_scalar(before);
+    let right_scalar = decode_first_scalar(after);
+    let left_valid = before.is_empty() || left_scalar.is_some();
+    let right_valid = after.is_empty() || right_scalar.is_some();
+    let left_word = unicode_word_scalar(left_scalar)?;
+    let right_word = unicode_word_scalar(right_scalar)?;
+    Ok(match assertion {
+        Assertion::WordUnicode => left_word != right_word,
+        Assertion::WordUnicodeNegate => left_valid && right_valid && left_word == right_word,
+        Assertion::WordStartUnicode => !left_word && right_word,
+        Assertion::WordEndUnicode => left_word && !right_word,
+        Assertion::WordStartHalfUnicode => left_valid && !left_word,
+        Assertion::WordEndHalfUnicode => right_valid && !right_word,
+        _ => {
+            return Err(Error::InternalInvariant(
+                "non-Unicode assertion in Unicode dispatch",
+            ));
+        }
+    })
 }
 
 fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
@@ -233,10 +296,7 @@ impl Program {
         self.insts.iter().any(|inst| {
             matches!(
                 inst,
-                Inst::Assert {
-                    assertion: Assertion::WordUnicode,
-                    ..
-                }
+                Inst::Assert { assertion, .. } if assertion.is_unicode_word()
             )
         })
     }

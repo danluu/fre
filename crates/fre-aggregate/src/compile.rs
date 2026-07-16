@@ -14,9 +14,8 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 /// empty HIR cannot reveal whether Unicode mode was enabled. Passing this
 /// token asserts both the pinned parser configuration and the empty-match
 /// boundary policy. Unicode-on callers receive literals, byte classes, Unicode
-/// scalar classes lowered to canonical UTF-8 paths, byte-oriented assertions,
-/// positive Unicode word boundaries, and their regular composition. The other
-/// Unicode word assertion forms remain typed refusals.
+/// scalar classes lowered to canonical UTF-8 paths, every pinned look
+/// assertion, and their regular composition.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
     unicode: bool,
@@ -324,10 +323,7 @@ fn validate_hir(
                     Resource::ClassRanges,
                 )?;
             }
-            HirKind::Look(look) => {
-                if Assertion::from_look(*look).is_none() {
-                    return Err(Error::Unsupported(Unsupported::Look(*look)));
-                }
+            HirKind::Look(_) => {
                 budget.record_look_assertion()?;
             }
             HirKind::Capture(capture) => match capture_policy {
@@ -527,8 +523,7 @@ impl<'a> Builder<'a> {
                 self.compile_unicode_class(class, continuation)
             }
             HirKind::Look(look) => {
-                let assertion = Assertion::from_look(*look)
-                    .ok_or(Error::Unsupported(Unsupported::Look(*look)))?;
+                let assertion = Assertion::from_look(*look);
                 self.push(Inst::Assert {
                     assertion,
                     next: continuation,

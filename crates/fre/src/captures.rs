@@ -1122,6 +1122,21 @@ fn lower_hir(
             Ok(Ast::Assert(CaptureAssertion::WordEndHalfAscii))
         }
         HirKind::Look(Look::WordUnicode) => Ok(Ast::Assert(CaptureAssertion::WordUnicode)),
+        HirKind::Look(Look::StartCRLF) => Ok(Ast::Assert(CaptureAssertion::StartCrlf)),
+        HirKind::Look(Look::EndCRLF) => Ok(Ast::Assert(CaptureAssertion::EndCrlf)),
+        HirKind::Look(Look::WordUnicodeNegate) => {
+            Ok(Ast::Assert(CaptureAssertion::WordUnicodeNegate))
+        }
+        HirKind::Look(Look::WordStartUnicode) => {
+            Ok(Ast::Assert(CaptureAssertion::WordStartUnicode))
+        }
+        HirKind::Look(Look::WordEndUnicode) => Ok(Ast::Assert(CaptureAssertion::WordEndUnicode)),
+        HirKind::Look(Look::WordStartHalfUnicode) => {
+            Ok(Ast::Assert(CaptureAssertion::WordStartHalfUnicode))
+        }
+        HirKind::Look(Look::WordEndHalfUnicode) => {
+            Ok(Ast::Assert(CaptureAssertion::WordEndHalfUnicode))
+        }
         HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
             *look,
         ))),
