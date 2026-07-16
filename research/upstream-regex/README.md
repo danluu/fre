@@ -109,6 +109,14 @@ cargo run -p rust-regex-conformance -- run-searcher-api \
 
 cargo run -p rust-regex-conformance -- verify-searcher-api-report \
   /tmp/fre-rust-regex-searcher-api-report.json
+
+mkdir -p /tmp/fre-rust-regex-feature-target
+cargo run -p rust-regex-conformance -- run-feature-matrix \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-feature-target \
+  /tmp/fre-rust-regex-feature-matrix-report.json
+cargo run -p rust-regex-conformance -- verify-feature-matrix-report \
+  /tmp/fre-rust-regex-feature-matrix-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -126,8 +134,8 @@ do not yet:
 
 - provide general Rust text beyond the proved slices, byte sets, capture
   full match iteration;
-- produce mandatory reports for the remaining upstream doctest or
-  feature-matrix tests;
+- produce mandatory reports for the remaining upstream doctests (the Cargo
+  feature matrix has its own authenticated 25-row report);
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
   release qualification.

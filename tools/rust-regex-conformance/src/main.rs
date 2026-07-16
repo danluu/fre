@@ -1,11 +1,13 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
 use rust_regex_conformance::{
-    authenticate_candidate_source, build_adapter_report, build_inventory,
-    build_misc_regression_report, build_replacement_api_report, build_searcher_api_report,
-    load_executable_cases, read_adapter_report, read_inventory, read_misc_regression_report,
-    read_replacement_api_report, read_searcher_api_report, write_adapter_report, write_inventory,
-    write_misc_regression_report, write_replacement_api_report, write_searcher_api_report,
+    authenticate_candidate_source, build_adapter_report, build_feature_matrix_report,
+    build_inventory, build_misc_regression_report, build_replacement_api_report,
+    build_searcher_api_report, load_executable_cases, read_adapter_report,
+    read_feature_matrix_report, read_inventory, read_misc_regression_report,
+    read_replacement_api_report, read_searcher_api_report, write_adapter_report,
+    write_feature_matrix_report, write_inventory, write_misc_regression_report,
+    write_replacement_api_report, write_searcher_api_report,
 };
 
 fn main() -> ExitCode {
@@ -101,10 +103,64 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-replacement-api-report" => verify_replacement_api_report(&mut args)?,
         "run-misc-regression-api" => run_misc_regression_api(&mut args)?,
         "verify-misc-regression-api-report" => verify_misc_regression_api_report(&mut args)?,
+        "run-feature-matrix" => run_feature_matrix(&mut args)?,
+        "verify-feature-matrix-report" => verify_feature_matrix_report(&mut args)?,
         "run-searcher-api" => run_searcher_api(&mut args)?,
         "verify-searcher-api-report" => verify_searcher_api_report(&mut args)?,
         "-h" | "--help" | "help" => println!("{}", usage()),
         _ => return Err(usage().into()),
+    }
+    Ok(())
+}
+
+fn run_feature_matrix(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_package = PathBuf::from(args.next().ok_or(usage())?);
+    let candidate_path = PathBuf::from(args.next().ok_or(usage())?);
+    let target_dir = PathBuf::from(args.next().ok_or(usage())?);
+    let output = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let report = build_feature_matrix_report(&upstream_package, &candidate_path, &target_dir)?;
+    write_feature_matrix_report(&output, &report)?;
+    let counts = &report.payload.counts;
+    println!(
+        "feature-matrix candidate={} pass={} unsupported_profile={} unsupported_toolchain={} unsupported_api={} fault={} total={} payload_sha256={}",
+        report.payload.candidate.revision,
+        counts.pass,
+        counts.unsupported_profile,
+        counts.unsupported_toolchain,
+        counts.unsupported_api,
+        counts.fault,
+        counts.total,
+        report.payload_sha256
+    );
+    if counts.fault != 0 {
+        return Err("feature matrix contains fault dispositions".into());
+    }
+    Ok(())
+}
+
+fn verify_feature_matrix_report(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let report = read_feature_matrix_report(&report_path)?;
+    let counts = &report.payload.counts;
+    println!(
+        "verified feature-matrix candidate={} pass={} unsupported_profile={} unsupported_toolchain={} unsupported_api={} fault={} total={} payload_sha256={}",
+        report.payload.candidate.revision,
+        counts.pass,
+        counts.unsupported_profile,
+        counts.unsupported_toolchain,
+        counts.unsupported_api,
+        counts.fault,
+        counts.total,
+        report.payload_sha256
+    );
+    if counts.fault != 0 {
+        return Err("feature matrix contains fault dispositions".into());
     }
     Ok(())
 }
@@ -273,5 +329,5 @@ fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT"
+    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT"
 }

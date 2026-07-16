@@ -15,7 +15,7 @@ already inventoried by `regex-1.12.4-inventory.json`.
 | `tests/regression_fuzz.rs` | Complete 5/5 mandatory dispositions; the upstream ignored expensive case remains explicit unsupported evidence |
 | `tests/suite_{string,bytes,string_set,bytes_set}.rs` | These are upstream adapters over the TOML corpus; their input obligations are covered by the existing 16,450-row report rather than counted again |
 | crate doctests | Not yet inventoried as individual obligations |
-| Cargo feature matrix | Feature declarations are pinned by authenticated `Cargo.toml.orig`, but build/test combinations are not yet mandatory dispositions |
+| Cargo feature matrix | Complete 25-row mandatory gate over all 22 declarations: 23 stable offline/locked library builds, two explicit nightly-toolchain outcomes, and source-equivalent FRE profile evidence or an explicit profile/API gap for every row |
 
 The replacement adapter authenticates `.cargo_vcs_info.json`,
 `Cargo.toml.orig`, and the entire `tests/replace.rs` byte stream before running.
@@ -39,3 +39,17 @@ It executes every upstream empty, adjacent, rejected-range, zero-width and
 Unicode step-sequence obligation through FRE's real aggregate search-step API.
 All 11 fixed-order obligations must produce pass, mismatch, unsupported or
 fault receipts; omission and filtering are not report states.
+
+The feature-matrix gate authenticates the packaged crate's original and
+normalized manifests, lockfile, VCS receipt, library sources and integration
+entrypoint before invoking Cargo. Its denominator covers default, no-default,
+`std`, `perf`, `unicode`, Rebar, logging and deprecated-alias compositions;
+every individual performance and Unicode data feature; and both nightly
+feature names. Stable configurations run `cargo check --offline --locked
+--lib` in isolated target directories. A pass additionally requires a real
+FRE high-level or Rebar semantic-profile check. Configurations whose partial
+Unicode availability cannot be represented by `RustProfile`, and stable
+toolchains that cannot enable `pattern`, remain typed unsupported outcomes.
+The crates.io package omits `tests/fuzz/mod.rs` and three Fowler files, so the
+report also records why that package cannot honestly execute the complete
+upstream integration target.
