@@ -175,6 +175,13 @@ construction so it can be measured before untimed verification, while
 artifact that can be called once for first-operation or primed once and called
 again for steady-operation. Input length, pattern order, profile, operation,
 selected plan, and derived limits remain bound at each step.
+The all-model candidate raw producer rejects malformed identity and invalid
+model/boundary combinations before invoking its measurement closure, derives
+the exact preparation/prime state, and emits canonical
+`fre.rebar.performance-raw.v1` with ordered input hashes, comparator, plan,
+result digest, and fresh-process token. Fixed-duration tests prove its output
+passes the complete semantic-contract validator. The runner still needs to
+connect these two seams and perform the required prime/warm construction.
 
 The performance gate still needs an authorized executor/collector for the
 paired timing and resource schedules, `regex-redux` after semantic support
