@@ -3,12 +3,12 @@
 use core::fmt;
 
 use fre_syntax::{CanonicalPattern, ParseError, ParseRequest, ParseSummary};
-use regex_syntax::hir::{Look, LookSet};
+use regex_syntax::hir::{Hir, HirKind, Look, LookSet};
 
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
     PortableBuilder, PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits,
-    SearchWindow, finite,
+    SearchWindow, charge_planner, finite, reserve_planner,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -42,6 +42,15 @@ pub enum PortableTextProof {
         /// Every nullable assertion path is false inside a valid UTF-8 scalar.
         empty_match_utf8_boundary_safe: bool,
     },
+    /// The profiles have the same ordered top-level alternatives after
+    /// removing corresponding alternatives that provably match no string.
+    /// Every remaining alternative is byte-for-byte identical HIR and the
+    /// complete language has positive width, so byte execution cannot expose
+    /// a match at an interior UTF-8 offset.
+    ImpossibleAlternativesElidedUtf8Hir {
+        minimum_match_bytes: usize,
+        elided_alternatives: usize,
+    },
     /// The profiles produced an identical UTF-8 HIR, but a nullable assertion
     /// can succeed inside a scalar when executed as bytes. The internal K0
     /// plan therefore synthesizes a scalar-boundary guard at every candidate
@@ -62,6 +71,8 @@ pub enum PortableTextBuildError {
     BytesProofSyntax(ParseError),
     /// Checked finite-language extraction could not complete.
     FiniteProof(BuildError),
+    /// Checked non-finite text/bytes equivalence traversal could not complete.
+    EquivalenceProof(BuildError),
     /// The profiles are outside both bounded text-equivalence proof slices.
     NonFiniteLanguage,
     /// `RustText` and `RustBytes` produced different ordered finite languages.
@@ -87,6 +98,9 @@ impl fmt::Display for PortableTextBuildError {
                 write!(formatter, "Rust bytes proof syntax failed: {error}")
             }
             Self::FiniteProof(error) => write!(formatter, "finite-language proof failed: {error}"),
+            Self::EquivalenceProof(error) => {
+                write!(formatter, "text/bytes equivalence proof failed: {error}")
+            }
             Self::NonFiniteLanguage => formatter.write_str(
                 "pattern is outside the UTF-8 equivalence slices proved by the text facade",
             ),
@@ -112,7 +126,9 @@ impl std::error::Error for PortableTextBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TextSyntax(error) | Self::BytesProofSyntax(error) => Some(error),
-            Self::FiniteProof(error) | Self::Portable(error) => Some(error),
+            Self::FiniteProof(error) | Self::EquivalenceProof(error) | Self::Portable(error) => {
+                Some(error)
+            }
             Self::NonFiniteLanguage
             | Self::ProfileLanguageMismatch
             | Self::InvalidUtf8Word
@@ -446,7 +462,7 @@ fn prove_equivalence(
         (Some(text_language), Some(bytes_language)) => {
             finite_equivalence(&text_language, &bytes_language)
         }
-        (None, None) => hir_equivalence(text, bytes, line_terminator),
+        (None, None) => hir_equivalence(text, bytes, line_terminator, limits.max_planner_work),
         (Some(_), None) | (None, Some(_)) => Err(PortableTextBuildError::ProfileLanguageMismatch),
     }
 }
@@ -477,18 +493,34 @@ fn hir_equivalence(
     text: &regex_syntax::hir::Hir,
     bytes: &regex_syntax::hir::Hir,
     line_terminator: u8,
+    work_limit: u64,
 ) -> Result<PortableTextProof, PortableTextBuildError> {
     let properties = text.properties();
-    let minimum_match_bytes = properties
-        .minimum_len()
-        .ok_or(PortableTextBuildError::NonFiniteLanguage)?;
+    if !properties.is_utf8() {
+        return Err(PortableTextBuildError::NonFiniteLanguage);
+    }
+    if text != bytes || properties.minimum_len().is_none() {
+        let Some((minimum_match_bytes, elided_alternatives)) =
+            ordered_top_level_alternatives_equal_after_impossible_elision(text, bytes, work_limit)
+                .map_err(PortableTextBuildError::EquivalenceProof)?
+        else {
+            return Err(PortableTextBuildError::NonFiniteLanguage);
+        };
+        return Ok(PortableTextProof::ImpossibleAlternativesElidedUtf8Hir {
+            minimum_match_bytes,
+            elided_alternatives,
+        });
+    }
+    let minimum_match_bytes =
+        properties
+            .minimum_len()
+            .ok_or(PortableTextBuildError::InternalInvariant(
+                "checked HIR minimum disappeared",
+            ))?;
     let look_set = properties.look_set();
     let has_look_assertions = !look_set.is_empty();
     let empty_match_utf8_boundary_safe =
         minimum_match_bytes > 0 || looks_are_utf8_boundary_safe(look_set, line_terminator);
-    if text != bytes || !properties.is_utf8() {
-        return Err(PortableTextBuildError::NonFiniteLanguage);
-    }
     if empty_match_utf8_boundary_safe {
         Ok(PortableTextProof::IdenticalUtf8Hir {
             minimum_match_bytes,
@@ -501,6 +533,272 @@ fn hir_equivalence(
             has_look_assertions,
         })
     }
+}
+
+/// Compare one deliberately narrow normalization slice used only for the
+/// text/bytes proof. Corresponding top-level alternatives may be removed only
+/// when a structural proof shows both can never match. Every retained branch
+/// must remain exactly equal, positive-width and in the same order.
+fn ordered_top_level_alternatives_equal_after_impossible_elision(
+    text: &Hir,
+    bytes: &Hir,
+    work_limit: u64,
+) -> Result<Option<(usize, usize)>, BuildError> {
+    let (HirKind::Alternation(text), HirKind::Alternation(bytes)) = (text.kind(), bytes.kind())
+    else {
+        return Ok(None);
+    };
+    if text.len() != bytes.len() {
+        return Ok(None);
+    }
+    let mut work = 0_u64;
+    let mut elided = 0_usize;
+    let mut minimum_match_bytes = None;
+    let mut tasks = Vec::new();
+    let mut values = Vec::new();
+    for (text_branch, bytes_branch) in text.iter().zip(bytes) {
+        if text_branch == bytes_branch {
+            if let Some(branch_minimum) = text_branch.properties().minimum_len() {
+                if branch_minimum == 0 {
+                    return Ok(None);
+                }
+                minimum_match_bytes = Some(
+                    minimum_match_bytes
+                        .map_or(branch_minimum, |minimum: usize| minimum.min(branch_minimum)),
+                );
+                continue;
+            }
+        }
+        let text_impossible = provably_impossible_with_buffers(
+            text_branch,
+            &mut work,
+            work_limit,
+            &mut tasks,
+            &mut values,
+        )?;
+        let bytes_impossible = provably_impossible_with_buffers(
+            bytes_branch,
+            &mut work,
+            work_limit,
+            &mut tasks,
+            &mut values,
+        )?;
+        if text_impossible && bytes_impossible {
+            elided = elided.checked_add(1).ok_or(BuildError::PlannerWorkLimit {
+                needed: u64::MAX,
+                limit: work_limit,
+            })?;
+            continue;
+        }
+        if text_impossible || bytes_impossible || text_branch != bytes_branch {
+            return Ok(None);
+        }
+        let Some(branch_minimum) = text_branch.properties().minimum_len() else {
+            return Ok(None);
+        };
+        if branch_minimum == 0 {
+            return Ok(None);
+        }
+        minimum_match_bytes = Some(
+            minimum_match_bytes
+                .map_or(branch_minimum, |minimum: usize| minimum.min(branch_minimum)),
+        );
+    }
+    Ok(match (minimum_match_bytes, elided) {
+        (Some(minimum), elided) if elided > 0 => Some((minimum, elided)),
+        _ => None,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ImpossibleTask<'h> {
+    Visit(&'h Hir),
+    FinishConcat(usize),
+    FinishAlternation(usize),
+    FinishRepetition { minimum: u32 },
+}
+
+/// Prove emptiness using only HIR constructors whose Boolean language rule is
+/// exact. This deliberately does not infer contradictions between assertions.
+fn provably_impossible(hir: &Hir, work: &mut u64, work_limit: u64) -> Result<bool, BuildError> {
+    let mut tasks = Vec::new();
+    let mut values = Vec::new();
+    provably_impossible_with_buffers(hir, work, work_limit, &mut tasks, &mut values)
+}
+
+fn provably_impossible_with_buffers<'h>(
+    hir: &'h Hir,
+    work: &mut u64,
+    work_limit: u64,
+    tasks: &mut Vec<ImpossibleTask<'h>>,
+    values: &mut Vec<bool>,
+) -> Result<bool, BuildError> {
+    tasks.clear();
+    values.clear();
+    reserve_planner(
+        tasks,
+        1,
+        work,
+        work_limit,
+        "text equivalence impossible-proof tasks",
+    )?;
+    tasks.push(ImpossibleTask::Visit(hir));
+    while let Some(task) = tasks.pop() {
+        match task {
+            ImpossibleTask::Visit(hir) => match hir.kind() {
+                HirKind::Class(class) => {
+                    push_impossible_value(values, class.is_empty(), work, work_limit)?
+                }
+                HirKind::Capture(capture) => push_impossible_task(
+                    tasks,
+                    ImpossibleTask::Visit(&capture.sub),
+                    work,
+                    work_limit,
+                )?,
+                HirKind::Concat(parts) => {
+                    push_impossible_tasks(
+                        tasks,
+                        ImpossibleTask::FinishConcat(parts.len()),
+                        parts,
+                        work,
+                        work_limit,
+                    )?;
+                }
+                HirKind::Alternation(branches) => {
+                    push_impossible_tasks(
+                        tasks,
+                        ImpossibleTask::FinishAlternation(branches.len()),
+                        branches,
+                        work,
+                        work_limit,
+                    )?;
+                }
+                HirKind::Repetition(repetition) => {
+                    push_impossible_task(
+                        tasks,
+                        ImpossibleTask::FinishRepetition {
+                            minimum: repetition.min,
+                        },
+                        work,
+                        work_limit,
+                    )?;
+                    push_impossible_task(
+                        tasks,
+                        ImpossibleTask::Visit(&repetition.sub),
+                        work,
+                        work_limit,
+                    )?;
+                }
+                HirKind::Empty | HirKind::Literal(_) | HirKind::Look(_) => {
+                    push_impossible_value(values, false, work, work_limit)?;
+                }
+            },
+            ImpossibleTask::FinishConcat(count) => {
+                finish_impossible_values(values, count, false, work, work_limit)?;
+            }
+            ImpossibleTask::FinishAlternation(count) => {
+                finish_impossible_values(values, count, true, work, work_limit)?;
+            }
+            ImpossibleTask::FinishRepetition { minimum } => {
+                let child = values.pop().ok_or(BuildError::InternalInvariant(
+                    "missing impossible repetition value",
+                ))?;
+                push_impossible_value(values, minimum > 0 && child, work, work_limit)?;
+            }
+        }
+    }
+    let proved = values.pop().ok_or(BuildError::InternalInvariant(
+        "missing impossible proof result",
+    ))?;
+    if !values.is_empty() {
+        return Err(BuildError::InternalInvariant(
+            "extra impossible proof results",
+        ));
+    }
+    Ok(proved)
+}
+
+fn push_impossible_task<'h>(
+    tasks: &mut Vec<ImpossibleTask<'h>>,
+    task: ImpossibleTask<'h>,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<(), BuildError> {
+    reserve_planner(
+        tasks,
+        1,
+        work,
+        work_limit,
+        "text equivalence impossible-proof tasks",
+    )?;
+    tasks.push(task);
+    Ok(())
+}
+
+fn push_impossible_tasks<'h>(
+    tasks: &mut Vec<ImpossibleTask<'h>>,
+    finish: ImpossibleTask<'h>,
+    children: &'h [Hir],
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<(), BuildError> {
+    let additional = children
+        .len()
+        .checked_add(1)
+        .ok_or(BuildError::PlannerWorkLimit {
+            needed: u64::MAX,
+            limit: work_limit,
+        })?;
+    reserve_planner(
+        tasks,
+        additional,
+        work,
+        work_limit,
+        "text equivalence impossible-proof tasks",
+    )?;
+    tasks.push(finish);
+    tasks.extend(children.iter().rev().map(ImpossibleTask::Visit));
+    Ok(())
+}
+
+fn push_impossible_value(
+    values: &mut Vec<bool>,
+    value: bool,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<(), BuildError> {
+    reserve_planner(
+        values,
+        1,
+        work,
+        work_limit,
+        "text equivalence impossible-proof values",
+    )?;
+    values.push(value);
+    Ok(())
+}
+
+fn finish_impossible_values(
+    values: &mut Vec<bool>,
+    count: usize,
+    identity: bool,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<(), BuildError> {
+    let start = values
+        .len()
+        .checked_sub(count)
+        .ok_or(BuildError::InternalInvariant(
+            "missing impossible child values",
+        ))?;
+    charge_planner(work, u64::try_from(count).unwrap_or(u64::MAX), work_limit)?;
+    let result = if identity {
+        values[start..].iter().all(|&value| value)
+    } else {
+        values[start..].iter().any(|&value| value)
+    };
+    values.truncate(start);
+    push_impossible_value(values, result, work, work_limit)
 }
 
 fn looks_are_utf8_boundary_safe(looks: LookSet, line_terminator: u8) -> bool {
@@ -630,6 +928,125 @@ impl PortableTextRegex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn impossible_alternative_elision_is_ordered_and_dead_on_both_profiles() {
+        let text_dead = Hir::concat(vec![Hir::fail(), Hir::literal("text".as_bytes())]);
+        let bytes_dead = Hir::concat(vec![Hir::fail(), Hir::literal("bytes".as_bytes())]);
+        let live = Hir::literal("B".as_bytes());
+        let text = Hir::alternation(vec![text_dead.clone(), live.clone()]);
+        let bytes = Hir::alternation(vec![bytes_dead.clone(), live]);
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &bytes, u64::MAX,)
+                .unwrap(),
+            Some((1, 1))
+        );
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &text, u64::MAX,)
+                .unwrap(),
+            Some((1, 1))
+        );
+
+        let different_live =
+            Hir::alternation(vec![bytes_dead.clone(), Hir::literal("C".as_bytes())]);
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text,
+                &different_live,
+                u64::MAX,
+            )
+            .unwrap(),
+            None
+        );
+        let live_replacement = Hir::alternation(vec![Hir::empty(), Hir::literal("B".as_bytes())]);
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text,
+                &live_replacement,
+                u64::MAX,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text_dead,
+                &bytes_dead,
+                u64::MAX,
+            )
+            .unwrap(),
+            None
+        );
+
+        let text_nullable = Hir::alternation(vec![text_dead.clone(), Hir::empty()]);
+        let bytes_nullable = Hir::alternation(vec![bytes_dead.clone(), Hir::empty()]);
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text_nullable,
+                &bytes_nullable,
+                u64::MAX,
+            )
+            .unwrap(),
+            None
+        );
+
+        let text_live = Hir::concat(vec![
+            Hir::alternation(vec![Hir::fail(), Hir::literal("X".as_bytes())]),
+            Hir::literal("A".as_bytes()),
+        ]);
+        let bytes_live = Hir::concat(vec![
+            Hir::alternation(vec![Hir::fail(), Hir::literal("Y".as_bytes())]),
+            Hir::literal("A".as_bytes()),
+        ]);
+        let text = Hir::alternation(vec![text_live, Hir::literal("B".as_bytes())]);
+        let bytes = Hir::alternation(vec![bytes_live, Hir::literal("B".as_bytes())]);
+        assert_eq!(
+            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &bytes, u64::MAX,)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn impossible_subtree_proof_uses_exact_boolean_language_rules() {
+        fn parsed(pattern: &str) -> Hir {
+            regex_syntax::Parser::new()
+                .parse(pattern)
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"))
+        }
+
+        for pattern in [
+            r".*[a&&b]A",
+            r"([a&&b])A",
+            r"[a&&b]+A",
+            r"(?:[a&&b]|[^\s\S])A",
+        ] {
+            let mut work = 0;
+            assert!(
+                provably_impossible(&parsed(pattern), &mut work, u64::MAX).unwrap(),
+                "pattern={pattern:?}"
+            );
+        }
+        for pattern in [
+            r"(?:[a&&b]|X)A",
+            r"[a&&b]*A",
+            r"[a&&b]?A",
+            r"[a&&b]{0,1}A",
+            r"^$A",
+        ] {
+            let mut work = 0;
+            assert!(
+                !provably_impossible(&parsed(pattern), &mut work, u64::MAX).unwrap(),
+                "pattern={pattern:?}"
+            );
+        }
+
+        let mut work = 0;
+        assert!(matches!(
+            provably_impossible(&parsed(r".*[a&&b]A"), &mut work, 0),
+            Err(BuildError::PlannerWorkLimit { .. })
+        ));
+    }
 
     #[test]
     fn finite_unicode_languages_match_pinned_rust_text() {

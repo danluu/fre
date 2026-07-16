@@ -648,6 +648,9 @@ fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
             | PortableTextBuildError::FiniteProof(
                 BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
             )
+            | PortableTextBuildError::EquivalenceProof(
+                BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+            )
             | PortableTextBuildError::Portable(
                 BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
             ),
@@ -678,12 +681,14 @@ fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
             CapabilityId::RustTextFacade,
             "build.text-bytes-equivalence-gap",
         )),
-        Err(PortableTextBuildError::FiniteProof(_) | PortableTextBuildError::Portable(_)) => {
-            TextBuildAttempt::Unsupported(unsupported(
-                CapabilityId::RustTextFacade,
-                "build.portable-subset-gap",
-            ))
-        }
+        Err(
+            PortableTextBuildError::FiniteProof(_)
+            | PortableTextBuildError::EquivalenceProof(_)
+            | PortableTextBuildError::Portable(_),
+        ) => TextBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextFacade,
+            "build.portable-subset-gap",
+        )),
         Err(PortableTextBuildError::TextSyntax(_)) => {
             TextBuildAttempt::Fault(fault("build.text-syntax-unexpected-error"))
         }
@@ -791,6 +796,9 @@ fn build_text_set(case: &CaseReceipt, input: &ExecutableCase) -> TextSetBuildAtt
                 | PortableTextBuildError::FiniteProof(
                     BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
                 )
+                | PortableTextBuildError::EquivalenceProof(
+                    BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+                )
                 | PortableTextBuildError::Portable(
                     BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
                 ),
@@ -828,7 +836,10 @@ fn build_text_set(case: &CaseReceipt, input: &ExecutableCase) -> TextSetBuildAtt
             "build.text-set-bytes-equivalence-gap",
         )),
         Err(PortableTextRegexSetBuildError::Pattern {
-            source: PortableTextBuildError::FiniteProof(_) | PortableTextBuildError::Portable(_),
+            source:
+                PortableTextBuildError::FiniteProof(_)
+                | PortableTextBuildError::EquivalenceProof(_)
+                | PortableTextBuildError::Portable(_),
             ..
         }) => TextSetBuildAttempt::Unsupported(unsupported(
             CapabilityId::RustTextSetFacade,
