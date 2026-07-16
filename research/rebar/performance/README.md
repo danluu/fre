@@ -169,6 +169,12 @@ limits, source-order/profile checks, and selected-plan labels as semantic
 qualification, and preserves fresh construction for compile versus retained
 construction for operation models. Other models remain exactly one-pattern.
 Its legacy duration/count output is not yet an all-model raw evidence record.
+The shared aggregate lifecycle API additionally defers every compile
+construction so it can be measured before untimed verification, while
+`count`/`count-spans` retain one authenticated single- or multi-pattern
+artifact that can be called once for first-operation or primed once and called
+again for steady-operation. Input length, pattern order, profile, operation,
+selected plan, and derived limits remain bound at each step.
 
 The performance gate still needs an authorized executor/collector for the
 paired timing and resource schedules, `regex-redux` after semantic support

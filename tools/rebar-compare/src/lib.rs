@@ -19,14 +19,15 @@ use std::{fmt::Write as _, io::Write as _};
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
-    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyExecutionSource,
+    AggregateBuilder, AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
+    AggregateFiniteLiteralIdentity, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRunLimits, AggregateOperation, AggregateOperationLimits,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
-    AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
     CaptureExecutionSource, CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRunLimits,
     CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, LiteralAggregateBuildError,
@@ -914,6 +915,430 @@ fn aggregate_many_builder_with_limits<'a>(
         .case_insensitive(case_insensitive)
         .limits(aggregate_many_build_limits(limits))
         .strategy(AggregateStrategy::ReverseSequentialRows)
+}
+
+/// Reconstructible compile request for one exact authenticated aggregate row.
+///
+/// Construction is deliberately deferred so an executor can place precisely
+/// one fresh public construction inside a contracted measurement boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentFreAggregateCompileLifecycle {
+    patterns: Vec<String>,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+}
+
+/// Fresh complete compile artifact returned by one deferred construction.
+#[derive(Debug)]
+pub struct CurrentFreAggregateCompileArtifact {
+    inner: CurrentFreAggregateCompileArtifactInner,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation inside the exact fresh-construction boundary"
+)]
+enum CurrentFreAggregateCompileArtifactInner {
+    Single(AggregateCompileRegex),
+    Many(AggregateManyCompileRegex),
+}
+
+impl CurrentFreAggregateCompileLifecycle {
+    /// Construct one fresh complete public artifact. Builder configuration and
+    /// construction are both inside this call; semantic verification is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an exact builder refusal/fault without selecting another plan.
+    pub fn construct(&self) -> Result<CurrentFreAggregateCompileArtifact, CompareError> {
+        let inner = if self.patterns.len() == 1 {
+            CurrentFreAggregateCompileArtifactInner::Single(
+                current_fre_rebar_aggregate_builder(
+                    self.patterns[0].clone(),
+                    self.unicode,
+                    self.case_insensitive,
+                )
+                .build_compile()
+                .map_err(|error| {
+                    CompareError::new(format!("FRE compile lifecycle construction: {error}"))
+                })?,
+            )
+        } else {
+            CurrentFreAggregateCompileArtifactInner::Many(
+                current_fre_rebar_aggregate_many_builder(
+                    &self.patterns,
+                    self.unicode,
+                    self.case_insensitive,
+                )
+                .build_compile()
+                .map_err(|error| {
+                    CompareError::new(format!("FRE compile-many lifecycle construction: {error}"))
+                })?,
+            )
+        };
+        Ok(CurrentFreAggregateCompileArtifact { inner })
+    }
+}
+
+impl CurrentFreAggregateCompileArtifact {
+    /// Authenticate the selected plan and return its exact semantic plan label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this artifact does not bind the lifecycle's exact
+    /// pattern order, profile, operation, and selected-plan semantics.
+    pub fn plan(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+    ) -> Result<&'static str, CompareError> {
+        match (&self.inner, lifecycle.patterns.as_slice()) {
+            (CurrentFreAggregateCompileArtifactInner::Single(regex), [_]) => {
+                current_fre_rebar_validate_aggregate_identity(
+                    regex.build_report(),
+                    lifecycle.unicode,
+                    "compile",
+                )?;
+                Ok(match regex.build_report().plan {
+                    AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
+                    AggregatePlanKind::UnicodeScalarClass => {
+                        "compile-aggregate-unicode-scalar-class"
+                    }
+                    AggregatePlanKind::FiniteLiteralDfa => "compile-aggregate-finite-literal-dfa",
+                    AggregatePlanKind::ContinuationProgram => {
+                        "compile-aggregate-continuation-program"
+                    }
+                })
+            }
+            (CurrentFreAggregateCompileArtifactInner::Many(regex), patterns)
+                if patterns.len() > 1 =>
+            {
+                current_fre_rebar_validate_aggregate_many_identity(
+                    patterns,
+                    regex.build_report(),
+                    lifecycle.unicode,
+                    lifecycle.case_insensitive,
+                    "compile",
+                )?;
+                Ok(match regex.build_report().plan {
+                    AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
+                    AggregateManyPlanKind::ContinuationProgram => {
+                        "compile-many-continuation-program"
+                    }
+                })
+            }
+            _ => Err(CompareError::new(
+                "FRE compile artifact multiplicity differs from its lifecycle",
+            )),
+        }
+    }
+
+    /// Verify the compiled artifact outside its construction measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for lifecycle identity mismatch, input-length mismatch,
+    /// limit derivation failure, or retained-plan execution failure.
+    pub fn verify(
+        &self,
+        lifecycle: &CurrentFreAggregateCompileLifecycle,
+        haystack: &[u8],
+    ) -> Result<u64, CompareError> {
+        let _ = self.plan(lifecycle)?;
+        if haystack.len() != lifecycle.haystack_len {
+            return Err(CompareError::new(format!(
+                "compile lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                lifecycle.haystack_len
+            )));
+        }
+        match &self.inner {
+            CurrentFreAggregateCompileArtifactInner::Single(regex) => {
+                let limits =
+                    current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report())?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        CompareError::new(format!("FRE compile lifecycle verification: {error}"))
+                    })
+            }
+            CurrentFreAggregateCompileArtifactInner::Many(regex) => {
+                let limits = current_fre_rebar_aggregate_many_run_limits(
+                    haystack.len(),
+                    regex.build_report(),
+                )?;
+                regex
+                    .verify_count(haystack, limits)
+                    .map(|result| result.value())
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE compile-many lifecycle verification: {error}"
+                        ))
+                    })
+            }
+        }
+    }
+}
+
+/// Create a deferred aggregate compile lifecycle bound to one input length.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set.
+pub fn current_fre_rebar_aggregate_compile_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateCompileLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "FRE aggregate compile lifecycle requires at least one pattern",
+        ));
+    }
+    Ok(CurrentFreAggregateCompileLifecycle {
+        patterns: patterns.to_vec(),
+        unicode,
+        case_insensitive,
+        haystack_len,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CurrentFreAggregateOperationModel {
+    Count,
+    SpanSum,
+}
+
+impl CurrentFreAggregateOperationModel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::SpanSum => "count-spans",
+        }
+    }
+}
+
+/// One already-built aggregate artifact for first/steady public operations.
+#[derive(Debug)]
+pub struct CurrentFreAggregateOperationLifecycle {
+    model: CurrentFreAggregateOperationModel,
+    plan: &'static str,
+    haystack_len: usize,
+    inner: CurrentFreAggregateOperationInner,
+}
+
+#[derive(Debug)]
+enum CurrentFreAggregateOperationInner {
+    CountSingle(AggregateCountRegex, AggregateRunLimits),
+    CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
+    SpanSumSingle(AggregateSpanSumRegex, AggregateRunLimits),
+    SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
+}
+
+impl CurrentFreAggregateOperationLifecycle {
+    /// Exact Rebar model retained by this artifact.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Exact authenticated construction-selected plan label.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        self.plan
+    }
+
+    /// Execute one complete public operation on the same retained artifact.
+    /// Calling this once is the first-operation boundary; an untimed call then
+    /// another call is the steady-operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for input-length mismatch or retained-plan refusal.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "aggregate operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        match &self.inner {
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+                .count_value(haystack, limits)
+                .map_err(|error| CompareError::new(format!("FRE count lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
+                .count_value(haystack, *limits)
+                .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
+                .span_sum_value(haystack, limits)
+                .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => {
+                regex.span_sum_value(haystack, *limits).map_err(|error| {
+                    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+                })
+            }
+        }
+    }
+}
+
+/// Build one exact aggregate operation lifecycle outside the measured public
+/// operation boundary.
+///
+/// # Errors
+///
+/// Returns an error for an empty pattern set, non-operation model, builder
+/// refusal, semantic identity mismatch, or limit-derivation failure.
+pub fn current_fre_rebar_aggregate_operation_lifecycle(
+    model: &str,
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    if patterns.is_empty() {
+        return Err(CompareError::new(
+            "FRE aggregate operation lifecycle requires at least one pattern",
+        ));
+    }
+    match model {
+        "count" => {
+            build_current_fre_count_lifecycle(patterns, unicode, case_insensitive, haystack_len)
+        }
+        "count-spans" => {
+            build_current_fre_span_sum_lifecycle(patterns, unicode, case_insensitive, haystack_len)
+        }
+        other => Err(CompareError::new(format!(
+            "unexpected aggregate operation lifecycle model {other}"
+        ))),
+    }
+}
+
+fn build_current_fre_count_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let (plan, inner) = if let [pattern] = patterns {
+        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
+            .build_count()
+            .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
+        current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
+        let plan = aggregate_single_plan_label("count", regex.build_report().plan);
+        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits),
+        )
+    } else {
+        let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
+            .build_count()
+            .map_err(|error| {
+                CompareError::new(format!("FRE count-many lifecycle build: {error}"))
+            })?;
+        current_fre_rebar_validate_aggregate_many_identity(
+            patterns,
+            regex.build_report(),
+            unicode,
+            case_insensitive,
+            "count",
+        )?;
+        let plan = aggregate_many_plan_label("count", regex.build_report().plan);
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::CountMany(regex, limits),
+        )
+    };
+    Ok(CurrentFreAggregateOperationLifecycle {
+        model: CurrentFreAggregateOperationModel::Count,
+        plan,
+        haystack_len,
+        inner,
+    })
+}
+
+fn build_current_fre_span_sum_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let (plan, inner) = if let [pattern] = patterns {
+        let regex = current_fre_rebar_aggregate_builder(pattern.clone(), unicode, case_insensitive)
+            .build_span_sum()
+            .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle build: {error}")))?;
+        current_fre_rebar_validate_aggregate_identity(
+            regex.build_report(),
+            unicode,
+            "count-spans",
+        )?;
+        let plan = aggregate_single_plan_label("count-spans", regex.build_report().plan);
+        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits),
+        )
+    } else {
+        let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
+            .build_span_sum()
+            .map_err(|error| {
+                CompareError::new(format!("FRE span-sum-many lifecycle build: {error}"))
+            })?;
+        current_fre_rebar_validate_aggregate_many_identity(
+            patterns,
+            regex.build_report(),
+            unicode,
+            case_insensitive,
+            "count-spans",
+        )?;
+        let plan = aggregate_many_plan_label("count-spans", regex.build_report().plan);
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack_len, regex.build_report())?;
+        (
+            plan,
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits),
+        )
+    };
+    Ok(CurrentFreAggregateOperationLifecycle {
+        model: CurrentFreAggregateOperationModel::SpanSum,
+        plan,
+        haystack_len,
+        inner,
+    })
+}
+
+fn aggregate_single_plan_label(model: &str, plan: AggregatePlanKind) -> &'static str {
+    match (model, plan) {
+        ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
+        ("compile", AggregatePlanKind::UnicodeScalarClass) => {
+            "compile-aggregate-unicode-scalar-class"
+        }
+        ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
+        ("compile", AggregatePlanKind::ContinuationProgram) => {
+            "compile-aggregate-continuation-program"
+        }
+        (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
+        (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
+        (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
+    }
+}
+
+fn aggregate_many_plan_label(model: &str, plan: AggregateManyPlanKind) -> &'static str {
+    match (model, plan) {
+        ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
+        ("compile", AggregateManyPlanKind::ContinuationProgram) => {
+            "compile-many-continuation-program"
+        }
+        (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
+        (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
+    }
 }
 
 /// Construct the exact portable-search builder used by the authenticated
@@ -5289,6 +5714,106 @@ mod tests {
             ),
             0,
             "compile-many-continuation-program",
+        );
+    }
+
+    #[test]
+    fn aggregate_lifecycles_separate_construction_from_same_artifact_operations() {
+        let haystack = b"aba aba";
+        let single_patterns = vec!["aba".to_string()];
+        let compile = current_fre_rebar_aggregate_compile_lifecycle(
+            &single_patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("single compile lifecycle");
+        let first_artifact = compile.construct().expect("first fresh compile artifact");
+        assert_eq!(
+            first_artifact.plan(&compile).expect("single compile plan"),
+            "compile-aggregate-exact-literal"
+        );
+        assert_eq!(
+            first_artifact
+                .verify(&compile, haystack)
+                .expect("single compile verification"),
+            2
+        );
+        let second_artifact = compile.construct().expect("second fresh compile artifact");
+        assert_eq!(
+            second_artifact
+                .verify(&compile, haystack)
+                .expect("second compile verification"),
+            2
+        );
+        assert!(second_artifact.verify(&compile, b"aba").is_err());
+
+        let continuation_patterns = vec!["a+".to_string(), "b+".to_string()];
+        let continuation_haystack = b"aa bbb";
+        let compile_many = current_fre_rebar_aggregate_compile_lifecycle(
+            &continuation_patterns,
+            false,
+            false,
+            continuation_haystack.len(),
+        )
+        .expect("compile-many lifecycle");
+        let artifact = compile_many.construct().expect("compile-many artifact");
+        assert_eq!(
+            artifact.plan(&compile_many).expect("compile-many plan"),
+            "compile-many-continuation-program"
+        );
+        assert_eq!(
+            artifact
+                .verify(&compile_many, continuation_haystack)
+                .expect("compile-many verification"),
+            2
+        );
+
+        let count = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &continuation_patterns,
+            false,
+            false,
+            continuation_haystack.len(),
+        )
+        .expect("count-many lifecycle");
+        assert_eq!(count.model(), "count");
+        assert_eq!(count.plan(), "aggregate-many-continuation-program");
+        assert_eq!(
+            count
+                .execute(continuation_haystack)
+                .expect("first count operation"),
+            2
+        );
+        assert_eq!(
+            count
+                .execute(continuation_haystack)
+                .expect("steady count operation"),
+            2
+        );
+        assert!(count.execute(b"aa").is_err());
+
+        let span_sum = current_fre_rebar_aggregate_operation_lifecycle(
+            "count-spans",
+            &single_patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("single span-sum lifecycle");
+        assert_eq!(span_sum.model(), "count-spans");
+        assert_eq!(span_sum.plan(), "aggregate-exact-literal");
+        assert_eq!(span_sum.execute(haystack).expect("span-sum operation"), 6);
+        assert!(current_fre_rebar_aggregate_compile_lifecycle(&[], false, false, 0).is_err());
+        assert!(
+            current_fre_rebar_aggregate_operation_lifecycle(
+                "compile",
+                &single_patterns,
+                false,
+                false,
+                haystack.len(),
+            )
+            .is_err()
         );
     }
 
