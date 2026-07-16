@@ -783,7 +783,7 @@ impl RowStore {
             core::mem::size_of::<usize>(),
             Resource::RandomAccessBytes,
         )?;
-        let (row, next_row) = rows.split_at_mut(states);
+        let (mut row, mut next_row) = rows.split_at_mut(states);
         let build_scratch = row_bytes;
         enforce(
             build_scratch,
@@ -864,7 +864,7 @@ impl RowStore {
                 Resource::SequentialBytes,
             )?;
             write_offset = end;
-            row.swap_with_slice(next_row);
+            core::mem::swap(&mut row, &mut next_row);
         }
         if write_offset != store.len() {
             return Err(Error::InternalInvariant("row-log store length mismatch"));
