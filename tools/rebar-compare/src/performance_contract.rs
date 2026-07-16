@@ -638,6 +638,36 @@ pub struct PerformanceCandidateObservationIdentity {
     pub process_token_sha256: String,
 }
 
+/// Complete identity provisioned to one Rust-regex or RE2 all-model
+/// reference arm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformanceReferenceObservationIdentity {
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact benchmark name.
+    pub benchmark: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Exact lifecycle boundary.
+    pub boundary: String,
+    /// Exact reference comparator executed by this process.
+    pub comparator: String,
+    /// Complete input identity recomputed from runner input.
+    pub input: InputReceipt,
+    /// Exact semantic reducer expected from the measured operation.
+    pub expected: u64,
+    /// Unique token provisioned for this fresh process.
+    pub process_token_sha256: String,
+}
+
 /// One self-identifying all-model timing arm.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1479,6 +1509,57 @@ where
     Ok(observation)
 }
 
+/// Measure one exact Rust-regex or RE2 reference operation and construct its
+/// canonical all-model raw arm. The caller owns lifecycle preparation and
+/// supplies the measurement closure, permitting deterministic no-clock tests.
+///
+/// # Errors
+///
+/// Returns an error before measurement for malformed identity or an invalid
+/// model/boundary pair, and after measurement for failure, a wrong reducer,
+/// zero/overflowed duration, or inconsistent output.
+pub fn produce_performance_reference_observation<F>(
+    identity: &PerformanceReferenceObservationIdentity,
+    measure: F,
+) -> Result<PerformanceRawObservation, ContractError>
+where
+    F: FnOnce() -> Result<(Duration, u64), CompareError>,
+{
+    validate_performance_reference_identity_shape(identity)?;
+    let (preparation, priming_operations) =
+        raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
+    let (elapsed, actual) = measure()
+        .map_err(|error| ContractError::new(format!("performance measurement: {error}")))?;
+    let elapsed_ns = u64::try_from(elapsed.as_nanos())
+        .map_err(|_| ContractError::new("performance duration does not fit u64"))?;
+    let observation = PerformanceRawObservation {
+        schema: PERFORMANCE_RAW_SCHEMA.to_string(),
+        contract_id: identity.contract_id.clone(),
+        canonical_commit: identity.canonical_commit.clone(),
+        canonical_tree: identity.canonical_tree.clone(),
+        semantic_receipts_sha256: identity.semantic_receipts_sha256.clone(),
+        job_id: identity.job_id.clone(),
+        benchmark: identity.benchmark.clone(),
+        model: identity.model.clone(),
+        boundary: identity.boundary.clone(),
+        comparator: identity.comparator.clone(),
+        arm: CapturePairArm::Reference,
+        candidate_plan: None,
+        candidate_runtime: None,
+        input: identity.input.clone(),
+        expected: identity.expected,
+        actual,
+        preparation,
+        priming_operations,
+        measured_operations: 1,
+        elapsed_ns,
+        result_sha256: digest(&actual.to_le_bytes()),
+        process_token_sha256: identity.process_token_sha256.clone(),
+    };
+    validate_performance_raw_observation_shape(&observation, CapturePairArm::Reference)?;
+    Ok(observation)
+}
+
 /// Execute the explicit first/steady schedule and construct one raw capture
 /// observation. The caller supplies the measurement closure, which permits
 /// deterministic no-clock validation fixtures.
@@ -2202,6 +2283,27 @@ fn validate_performance_candidate_identity_shape(
         }
         (_, None) => {}
     }
+    require_digest(&identity.process_token_sha256, "performance process token")?;
+    validate_performance_input_shape(&identity.input)?;
+    let _ = raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
+    Ok(())
+}
+
+fn validate_performance_reference_identity_shape(
+    identity: &PerformanceReferenceObservationIdentity,
+) -> Result<(), ContractError> {
+    require_token(&identity.contract_id, "performance contract ID")?;
+    require_oid(&identity.canonical_commit, "performance canonical commit")?;
+    require_oid(&identity.canonical_tree, "performance canonical tree")?;
+    require_digest(
+        &identity.semantic_receipts_sha256,
+        "performance semantic receipts",
+    )?;
+    require_token(&identity.job_id, "performance job ID")?;
+    require_text(&identity.benchmark, "performance benchmark")?;
+    require_token(&identity.model, "performance model")?;
+    require_token(&identity.boundary, "performance boundary")?;
+    require_token(&identity.comparator, "performance comparator")?;
     require_digest(&identity.process_token_sha256, "performance process token")?;
     validate_performance_input_shape(&identity.input)?;
     let _ = raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
@@ -5453,6 +5555,165 @@ mod tests {
                 &universe,
                 &wrong_plan,
                 CapturePairArm::Candidate,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixed-duration fixture covers every reference lifecycle and fail-closed identity validation"
+    )]
+    fn reference_raw_producer_binds_identity_and_every_lifecycle_without_a_clock() {
+        let identity = PerformanceReferenceObservationIdentity {
+            contract_id: "fixture-performance-contract-v1".to_string(),
+            canonical_commit: "a".repeat(40),
+            canonical_tree: "b".repeat(40),
+            semantic_receipts_sha256: "c".repeat(64),
+            job_id: "fixture/count-many@rust/regex".to_string(),
+            benchmark: "fixture/count-many".to_string(),
+            model: "count".to_string(),
+            boundary: "first-public-operation".to_string(),
+            comparator: "rust-regex-1.12.4".to_string(),
+            input: InputReceipt {
+                pattern_sha256: vec!["d".repeat(64), "e".repeat(64)],
+                haystack_sha256: "f".repeat(64),
+                haystack_bytes: 11,
+                unicode: true,
+                case_insensitive: false,
+            },
+            expected: 3,
+            process_token_sha256: digest(b"reference raw producer token"),
+        };
+        let first = produce_performance_reference_observation(&identity, || {
+            Ok((Duration::from_nanos(17), 3))
+        })
+        .expect("fixed first-operation reference sample");
+        assert_eq!(first.arm, CapturePairArm::Reference);
+        assert_eq!(first.candidate_plan, None);
+        assert_eq!(first.candidate_runtime, None);
+        assert_eq!(
+            first.preparation,
+            PerformanceLifecyclePreparation::BuiltArtifact
+        );
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.elapsed_ns, 17);
+        assert_eq!(first.result_sha256, digest(&3_u64.to_le_bytes()));
+        let bytes = performance_raw_observation_bytes(&first).expect("raw serialization");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+
+        let mut steady_identity = identity.clone();
+        steady_identity.boundary = "steady-public-operation".to_string();
+        steady_identity.process_token_sha256 = digest(b"reference steady token");
+        let steady = produce_performance_reference_observation(&steady_identity, || {
+            Ok((Duration::from_nanos(19), 3))
+        })
+        .expect("fixed steady-operation reference sample");
+        assert_eq!(
+            steady.preparation,
+            PerformanceLifecyclePreparation::PrimedArtifact
+        );
+        assert_eq!(steady.priming_operations, 1);
+
+        for (boundary, preparation) in [
+            (
+                "cold-public-compile",
+                PerformanceLifecyclePreparation::ColdProcess,
+            ),
+            (
+                "allocator-warm-public-compile",
+                PerformanceLifecyclePreparation::AllocatorInitialized,
+            ),
+        ] {
+            let mut compile_identity = identity.clone();
+            compile_identity.model = "compile".to_string();
+            compile_identity.boundary = boundary.to_string();
+            let observation = produce_performance_reference_observation(&compile_identity, || {
+                Ok((Duration::from_nanos(23), 3))
+            })
+            .expect("fixed compile reference sample");
+            assert_eq!(observation.preparation, preparation);
+            assert_eq!(observation.priming_operations, 0);
+        }
+
+        let measured = std::cell::Cell::new(false);
+        let mut malformed = identity.clone();
+        malformed.boundary = "cold-public-compile".to_string();
+        assert!(
+            produce_performance_reference_observation(&malformed, || {
+                measured.set(true);
+                Ok((Duration::from_nanos(1), 3))
+            })
+            .is_err()
+        );
+        assert!(!measured.get(), "malformed identity ran the measurement");
+        malformed = identity.clone();
+        malformed.comparator = "rust regex".to_string();
+        assert!(
+            produce_performance_reference_observation(&malformed, || {
+                measured.set(true);
+                Ok((Duration::from_nanos(1), 3))
+            })
+            .is_err()
+        );
+        assert!(!measured.get(), "malformed comparator ran the measurement");
+        assert!(
+            produce_performance_reference_observation(&identity, || { Ok((Duration::ZERO, 3)) })
+                .is_err()
+        );
+        assert!(
+            produce_performance_reference_observation(&identity, || {
+                Ok((Duration::from_nanos(1), 2))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reference_raw_producer_yields_a_contract_valid_arm() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let (job_id, semantic) = universe
+            .rows
+            .iter()
+            .find(|(_, row)| row.status == RowSemanticStatus::Supported && row.model == "count")
+            .expect("supported count row");
+        let comparator = contract.reporting.comparators[0].id.clone();
+        let identity = PerformanceReferenceObservationIdentity {
+            contract_id: contract.contract_id.clone(),
+            canonical_commit: contract.canonical.commit.clone(),
+            canonical_tree: contract.canonical.tree.clone(),
+            semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+            job_id: job_id.clone(),
+            benchmark: semantic.benchmark.clone(),
+            model: semantic.model.clone(),
+            boundary: "first-public-operation".to_string(),
+            comparator,
+            input: semantic.input.clone(),
+            expected: semantic.expected,
+            process_token_sha256: digest(b"contract-valid reference process"),
+        };
+        let observation = produce_performance_reference_observation(&identity, || {
+            Ok((Duration::from_nanos(29), semantic.expected))
+        })
+        .expect("produce contract-valid reference arm");
+        validate_performance_raw_observation(
+            &contract,
+            &universe,
+            &observation,
+            CapturePairArm::Reference,
+        )
+        .expect("reference arm validates against semantic contract");
+
+        let mut candidate_claim = observation;
+        candidate_claim.candidate_plan = Some("aggregate-exact-literal".to_string());
+        assert!(
+            validate_performance_raw_observation(
+                &contract,
+                &universe,
+                &candidate_claim,
+                CapturePairArm::Reference,
             )
             .is_err()
         );
