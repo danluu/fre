@@ -5373,9 +5373,14 @@ mod tests {
         assert_eq!(grep.execute(haystack).expect("steady grep operation"), 12);
 
         assert!(current_fre_rebar_capture_lifecycle("count", "a", false, false, 1).is_err());
-        assert!(
+        let unicode =
             current_fre_rebar_capture_lifecycle("count-captures", r"(\pL)", true, false, 3)
-                .is_err()
+                .expect("Unicode count-captures lifecycle");
+        assert_eq!(unicode.model(), "count-captures");
+        assert_eq!(unicode.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(
+            unicode.execute("雪".as_bytes()).expect("Unicode capture"),
+            2
         );
     }
 
