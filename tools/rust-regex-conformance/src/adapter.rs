@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn text_slice_and_complete_match_iteration_execute_while_capture_gap_is_explicit() {
+    fn text_slice_and_complete_match_iteration_execute_with_utf8_guarded_boundaries() {
         let case = fixture_case(true, false, None);
         let input = fixture_input(vec![ExpectedCaptures {
             pattern_id: 0,
@@ -1767,12 +1767,21 @@ mod tests {
 
         let mut unproved = input.clone();
         unproved.patterns = vec![r"\B".to_owned()];
+        unproved.expected = vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 1 })],
+        }];
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCompile, &text_case, &unproved),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::RustTextFacade,
-                ref reason_code,
-            } if reason_code == "build.text-equivalence-proof-gap"
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &text_case, &unproved),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextFindIter, &text_case, &unproved),
+            AdapterDisposition::Pass { .. }
         ));
     }
 
@@ -1878,19 +1887,27 @@ mod tests {
     }
 
     #[test]
-    fn text_set_proof_gaps_remain_typed_unsupported() {
+    fn text_set_utf8_guarded_boundaries_execute() {
         let mut case = fixture_case(true, true, None);
         case.match_kind = MatchKind::All;
         case.search_kind = SearchKind::Overlapping;
         case.unicode = true;
-        let mut input = fixture_input(Vec::new());
+        let mut input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 1 })],
+        }]);
         input.patterns = vec![r"(?-u:\B)".to_owned()];
         assert!(matches!(
             execute_case(AdapterSurface::RustTextSetCompile, &case, &input),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::RustTextSetFacade,
-                ref reason_code,
-            } if reason_code == "build.text-set-equivalence-proof-gap"
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetIsMatch, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &case, &input),
+            AdapterDisposition::Pass { .. }
         ));
     }
 
