@@ -142,6 +142,7 @@ impl<'h> AssertionContext<'h> {
         })
     }
 
+    #[inline]
     pub(crate) fn is_match(
         self,
         assertion: Assertion,
@@ -156,35 +157,83 @@ impl<'h> AssertionContext<'h> {
             .base
             .checked_add(local_position)
             .ok_or(Error::InternalInvariant("assertion position overflow"))?;
-        let left_byte = absolute
-            .checked_sub(1)
-            .and_then(|index| self.haystack.get(index));
-        let right_byte = self.haystack.get(absolute);
-        let left_word = left_byte.is_some_and(|&byte| is_ascii_word(byte));
-        let right_word = right_byte.is_some_and(|&byte| is_ascii_word(byte));
+        // Dispatch before loading either adjacent byte. Absolute anchors need
+        // neither, line anchors need at most their relevant side, and half
+        // word assertions classify only one side. This is evaluated for every
+        // assertion state at every admitted input boundary.
         Ok(match assertion {
             Assertion::StartText => absolute == 0,
             Assertion::EndText => absolute == self.haystack.len(),
-            Assertion::StartLf => absolute == 0 || left_byte.is_some_and(|&byte| byte == b'\n'),
+            Assertion::StartLf => {
+                absolute == 0
+                    || absolute
+                        .checked_sub(1)
+                        .and_then(|index| self.haystack.get(index))
+                        .is_some_and(|&byte| byte == b'\n')
+            }
             Assertion::EndLf => {
-                absolute == self.haystack.len() || right_byte.is_some_and(|&byte| byte == b'\n')
+                absolute == self.haystack.len()
+                    || self
+                        .haystack
+                        .get(absolute)
+                        .is_some_and(|&byte| byte == b'\n')
             }
             Assertion::StartCrlf => {
-                absolute == 0
-                    || left_byte == Some(&b'\n')
-                    || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+                if absolute == 0 {
+                    true
+                } else {
+                    let left_byte = absolute
+                        .checked_sub(1)
+                        .and_then(|index| self.haystack.get(index));
+                    let right_byte = self.haystack.get(absolute);
+                    left_byte == Some(&b'\n')
+                        || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+                }
             }
             Assertion::EndCrlf => {
-                absolute == self.haystack.len()
-                    || right_byte == Some(&b'\r')
-                    || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+                if absolute == self.haystack.len() {
+                    true
+                } else {
+                    let left_byte = absolute
+                        .checked_sub(1)
+                        .and_then(|index| self.haystack.get(index));
+                    let right_byte = self.haystack.get(absolute);
+                    right_byte == Some(&b'\r')
+                        || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+                }
             }
-            Assertion::WordAscii => left_word != right_word,
-            Assertion::WordAsciiNegate => left_word == right_word,
-            Assertion::WordStartAscii => !left_word && right_word,
-            Assertion::WordEndAscii => left_word && !right_word,
-            Assertion::WordStartHalfAscii => !left_word,
-            Assertion::WordEndHalfAscii => !right_word,
+            assertion @ (Assertion::WordAscii
+            | Assertion::WordAsciiNegate
+            | Assertion::WordStartAscii
+            | Assertion::WordEndAscii) => {
+                let left_word = absolute
+                    .checked_sub(1)
+                    .and_then(|index| self.haystack.get(index))
+                    .is_some_and(|&byte| is_ascii_word(byte));
+                let right_word = self
+                    .haystack
+                    .get(absolute)
+                    .is_some_and(|&byte| is_ascii_word(byte));
+                match assertion {
+                    Assertion::WordAscii => left_word != right_word,
+                    Assertion::WordAsciiNegate => left_word == right_word,
+                    Assertion::WordStartAscii => !left_word && right_word,
+                    Assertion::WordEndAscii => left_word && !right_word,
+                    _ => {
+                        return Err(Error::InternalInvariant(
+                            "non-ASCII assertion in ASCII dispatch",
+                        ));
+                    }
+                }
+            }
+            Assertion::WordStartHalfAscii => !absolute
+                .checked_sub(1)
+                .and_then(|index| self.haystack.get(index))
+                .is_some_and(|&byte| is_ascii_word(byte)),
+            Assertion::WordEndHalfAscii => !self
+                .haystack
+                .get(absolute)
+                .is_some_and(|&byte| is_ascii_word(byte)),
             assertion @ (Assertion::WordUnicode
             | Assertion::WordUnicodeNegate
             | Assertion::WordStartUnicode
