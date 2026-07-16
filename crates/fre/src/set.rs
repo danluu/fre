@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 2;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 3;
 
 /// Complete construction limits for one portable Rust-byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +48,7 @@ pub struct PortableRegexSetBuildReport {
     pub source_capacity_bytes: usize,
     pub regex_capacity_bytes: usize,
     pub matcher_source_bytes: usize,
+    pub capture_name_storage_bytes: usize,
     pub plan_storage_bytes: usize,
     pub charged_persistent_bytes: usize,
 }
@@ -292,6 +293,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
 
         let mut source_buffer_capacity = 0_usize;
         let mut matcher_source_bytes = 0_usize;
+        let mut capture_name_storage_bytes = 0_usize;
         let mut plan_storage_bytes = 0_usize;
         for (index, pattern) in self.patterns.iter().enumerate() {
             let mut owned_pattern = String::new();
@@ -323,12 +325,18 @@ impl<'a> PortableRegexSetBuilder<'a> {
                 regex.build_report().source_storage_bytes,
                 "matcher source byte sum",
             )?;
+            capture_name_storage_bytes = checked_add(
+                capture_name_storage_bytes,
+                regex.build_report().capture_name_storage_bytes,
+                "capture-name storage byte sum",
+            )?;
             let charged = checked_sum(
                 [
                     source_slot_capacity,
                     source_buffer_capacity,
                     regex_capacity_bytes,
                     matcher_source_bytes,
+                    capture_name_storage_bytes,
                     plan_storage_bytes,
                 ],
                 "charged persistent bytes",
@@ -348,6 +356,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
                 source_capacity_bytes,
                 regex_capacity_bytes,
                 matcher_source_bytes,
+                capture_name_storage_bytes,
                 plan_storage_bytes,
             ],
             "complete charged persistent bytes",
@@ -361,6 +370,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
             source_capacity_bytes,
             regex_capacity_bytes,
             matcher_source_bytes,
+            capture_name_storage_bytes,
             plan_storage_bytes,
             charged_persistent_bytes,
         };

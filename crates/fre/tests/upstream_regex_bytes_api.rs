@@ -24,8 +24,10 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "try_from_string",
     "bytes_match_len",
     "bytes_match_range",
+    "bytes_regex_capture_names",
     "bytes_regex_captures_len",
     "bytes_regex_static_captures_len",
+    "misc_capture_names",
 ];
 
 #[test]
@@ -37,9 +39,132 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 10);
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 3);
-    assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 2);
+    assert_eq!(UPSTREAM_API_IDS.len(), 12);
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 4);
+    assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 3);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated cross-plan capture-name matrix is clearer as one differential test"
+)]
+fn capture_name_metadata_matches_pinned_bytes_across_every_portable_plan() {
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let cases = [
+        (
+            "(?P<literal>(Sherlock))",
+            PlanKind::ExactLiteral,
+            PortableBuilder::new("(?P<literal>(Sherlock))")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            "a|(?P<suffix>(ab))",
+            PlanKind::PackedLiteralSet,
+            PortableBuilder::new("a|(?P<suffix>(ab))")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            "(?P<first>foobar)|foobaz|(?P<third>fooquux)",
+            PlanKind::LiteralSetDfa,
+            PortableBuilder::new("(?P<first>foobar)|foobaz|(?P<third>fooquux)")
+                .unicode(false)
+                .limits(dfa_limits)
+                .build(),
+        ),
+        (
+            "(?P<run>([a-z]+)Z)",
+            PlanKind::RequiredLiteral,
+            PortableBuilder::new("(?P<run>([a-z]+)Z)")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            r"(?P<run>\A([a-z]+)Z)",
+            PlanKind::ForwardAnchored,
+            PortableBuilder::new(r"(?P<run>\A([a-z]+)Z)")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            r"(?P<word>\b(\w{2,})\b)",
+            PlanKind::UnicodeWordRun,
+            PortableBuilder::new(r"(?P<word>\b(\w{2,})\b)").build(),
+        ),
+        (
+            "(?P<outer>(?P<inner>ab)+)",
+            PlanKind::K0,
+            PortableBuilder::new("(?P<outer>(?P<inner>ab)+)")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build(),
+        ),
+    ];
+
+    for (pattern, expected_plan, built) in cases {
+        let fre = built.unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(pattern.contains(r"\w"))
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+        assert_eq!(fre.build_report().plan, expected_plan, "{pattern:?}");
+
+        let mut actual_names = fre.capture_names();
+        assert_eq!(
+            actual_names.size_hint(),
+            (fre.captures_len(), Some(fre.captures_len())),
+            "{pattern:?}"
+        );
+        assert_eq!(actual_names.clone().count(), fre.captures_len());
+        let actual: Vec<_> = actual_names.by_ref().collect();
+        let expected: Vec<_> = upstream.capture_names().collect();
+        assert_eq!(actual, expected, "{pattern:?}");
+        assert_eq!(actual_names.next(), None);
+        assert_eq!(actual_names.next(), None);
+
+        let expected_storage = core::mem::size_of::<Option<Box<str>>>()
+            .checked_mul(expected.len())
+            .and_then(|slots| {
+                expected
+                    .iter()
+                    .flatten()
+                    .try_fold(slots, |total, name| total.checked_add(name.len()))
+            })
+            .expect("capture-name storage fixture fits usize");
+        assert_eq!(
+            fre.build_report().capture_name_storage_bytes,
+            expected_storage,
+            "{pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_names_match_every_pinned_doctest_and_misc_shape() {
+    for pattern in [
+        "",
+        r"[a&&b]",
+        r"(.)(?P<a>.)",
+        r"(?<a>.(?<b>.))(.)(?:.)(?<c>.)",
+    ] {
+        let fre = PortableRegex::new(pattern)
+            .unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::Regex::new(pattern)
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+        assert_eq!(
+            fre.capture_names().collect::<Vec<_>>(),
+            upstream.capture_names().collect::<Vec<_>>(),
+            "{pattern:?}"
+        );
+    }
 }
 
 #[test]
@@ -377,17 +502,26 @@ fn string_conversions_share_new_semantics_and_preserve_typed_errors() {
 }
 
 #[test]
-fn set_persistent_limit_charges_each_matcher_source_identity() {
-    let patterns = vec!["a".to_owned(), "bc|de".to_owned()];
+fn set_persistent_limit_charges_matcher_source_and_capture_name_identity() {
+    let patterns = vec!["(?P<one>a)".to_owned(), "(?P<pair>bc)|de".to_owned()];
     let probe = PortableRegexSet::new(&patterns).expect("set source accounting probe");
     let report = probe.build_report();
     let expected_matcher_sources = patterns.iter().map(String::len).sum::<usize>();
     assert_eq!(report.matcher_source_bytes, expected_matcher_sources);
+    let expected_capture_names = patterns
+        .iter()
+        .map(|pattern| {
+            let regex = PortableRegex::new(pattern).expect("capture-name accounting probe");
+            regex.build_report().capture_name_storage_bytes
+        })
+        .sum::<usize>();
+    assert_eq!(report.capture_name_storage_bytes, expected_capture_names);
     assert_eq!(
         report.charged_persistent_bytes,
         report.source_capacity_bytes
             + report.regex_capacity_bytes
             + report.matcher_source_bytes
+            + report.capture_name_storage_bytes
             + report.plan_storage_bytes
     );
 

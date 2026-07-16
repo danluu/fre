@@ -20,6 +20,8 @@
 
 use core::fmt;
 
+use regex_syntax::hir::{Hir, HirKind};
+
 mod aggregate;
 mod aggregate_many;
 mod captures;
@@ -128,7 +130,7 @@ pub use fre_automata::{
 pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 3;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 4;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -242,6 +244,8 @@ pub struct BuildReport {
     pub plan_storage_bytes: usize,
     /// Exact retained bytes for the original pattern source.
     pub source_storage_bytes: usize,
+    /// Exact logical heap bytes retained for indexed capture-name metadata.
+    pub capture_name_storage_bytes: usize,
     /// Total capture slots, including the implicit whole-match slot.
     pub captures_len: usize,
     /// Capture slots present in every possible match, including the implicit
@@ -396,6 +400,116 @@ impl From<ForwardAnchoredBuildError> for BuildError {
     fn from(value: ForwardAnchoredBuildError) -> Self {
         Self::ForwardAnchored(value)
     }
+}
+
+#[derive(Debug)]
+struct CaptureNameMetadata {
+    names: Box<[Option<Box<str>>]>,
+    storage_bytes: usize,
+}
+
+fn capture_name_metadata(
+    hir: &Hir,
+    captures_len: usize,
+    hir_nodes: u64,
+) -> Result<CaptureNameMetadata, BuildError> {
+    if captures_len == 0 {
+        return Err(BuildError::InternalInvariant(
+            "capture metadata omitted the implicit whole-match slot",
+        ));
+    }
+    let hir_nodes = usize::try_from(hir_nodes)
+        .map_err(|_| BuildError::InternalInvariant("HIR node count does not fit usize"))?;
+    if hir_nodes == 0 {
+        return Err(BuildError::InternalInvariant(
+            "capture metadata received an empty HIR inventory",
+        ));
+    }
+
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(captures_len)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "capture-name slots",
+            additional: captures_len,
+        })?;
+    names.resize_with(captures_len, || None);
+
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(captures_len)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "capture-name validation bitmap",
+            additional: captures_len,
+        })?;
+    seen.resize(captures_len, false);
+    seen[0] = true;
+
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(hir_nodes)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "capture-name HIR traversal",
+            additional: hir_nodes,
+        })?;
+    stack.push(hir);
+    let mut visited = 0_usize;
+    while let Some(node) = stack.pop() {
+        visited = visited.checked_add(1).ok_or(BuildError::InternalInvariant(
+            "capture-name HIR traversal count overflowed",
+        ))?;
+        if visited > hir_nodes {
+            return Err(BuildError::InternalInvariant(
+                "capture-name traversal exceeded parsed HIR accounting",
+            ));
+        }
+        if let HirKind::Capture(capture) = node.kind() {
+            let index = usize::try_from(capture.index).map_err(|_| {
+                BuildError::InternalInvariant("capture-name index does not fit usize")
+            })?;
+            if index == 0 || index >= captures_len {
+                return Err(BuildError::InternalInvariant(
+                    "capture-name index is outside parsed capture cardinality",
+                ));
+            }
+            if seen[index] {
+                return Err(BuildError::InternalInvariant(
+                    "capture-name index appeared more than once in canonical HIR",
+                ));
+            }
+            seen[index] = true;
+            names[index].clone_from(&capture.name);
+        }
+        for child in node.kind().subs() {
+            if stack.len() >= hir_nodes {
+                return Err(BuildError::InternalInvariant(
+                    "capture-name traversal stack exceeded parsed HIR accounting",
+                ));
+            }
+            stack.push(child);
+        }
+    }
+    if visited != hir_nodes || seen.iter().any(|was_seen| !was_seen) {
+        return Err(BuildError::InternalInvariant(
+            "capture-name metadata differs from parsed HIR accounting",
+        ));
+    }
+
+    let slot_bytes = core::mem::size_of::<Option<Box<str>>>()
+        .checked_mul(names.len())
+        .ok_or(BuildError::InternalInvariant(
+            "capture-name slot byte accounting overflowed",
+        ))?;
+    let storage_bytes = names.iter().try_fold(slot_bytes, |total, name| {
+        total
+            .checked_add(name.as_deref().map_or(0, str::len))
+            .ok_or(BuildError::InternalInvariant(
+                "capture-name string byte accounting overflowed",
+            ))
+    })?;
+    Ok(CaptureNameMetadata {
+        names: names.into_boxed_slice(),
+        storage_bytes,
+    })
 }
 
 /// Per-search accounting with the selected plan kept explicit.
@@ -858,6 +972,10 @@ impl PortableBuilder {
                 ))
             })
             .transpose()?;
+        let CaptureNameMetadata {
+            names: capture_names,
+            storage_bytes: capture_name_storage_bytes,
+        } = capture_name_metadata(&rust.hir, captures_len, syntax.hir_nodes)?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         if self.selection == PlanSelection::ForceK0 {
             let lowered =
@@ -869,6 +987,7 @@ impl PortableBuilder {
             let plan = automaton.stats();
             return Ok(PortableRegex {
                 source,
+                capture_names,
                 plan: PortablePlan::K0(automaton),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -883,6 +1002,7 @@ impl PortableBuilder {
                     edges: plan.edges(),
                     plan_storage_bytes: plan.storage_bytes(),
                     source_storage_bytes,
+                    capture_name_storage_bytes,
                     captures_len,
                     static_captures_len,
                     minimum_match_bytes,
@@ -896,6 +1016,7 @@ impl PortableBuilder {
         {
             return Ok(PortableRegex {
                 source,
+                capture_names,
                 plan: PortablePlan::UnicodeWordRun(plan),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -910,6 +1031,7 @@ impl PortableBuilder {
                     edges: 0,
                     plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
                     source_storage_bytes,
+                    capture_name_storage_bytes,
                     captures_len,
                     static_captures_len,
                     minimum_match_bytes,
@@ -937,6 +1059,7 @@ impl PortableBuilder {
                     let build = plan.build_accounting();
                     return Ok(PortableRegex {
                         source,
+                        capture_names,
                         plan: PortablePlan::ForwardEndFixed(plan),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -951,6 +1074,7 @@ impl PortableBuilder {
                             edges: 0,
                             plan_storage_bytes: build.persistent_bytes,
                             source_storage_bytes,
+                            capture_name_storage_bytes,
                             captures_len,
                             static_captures_len,
                             minimum_match_bytes,
@@ -969,6 +1093,7 @@ impl PortableBuilder {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
                             source,
+                            capture_names,
                             plan: PortablePlan::ForwardAnchored(plan),
                             profile: profile.clone(),
                             limits: self.limits,
@@ -983,6 +1108,7 @@ impl PortableBuilder {
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
+                                capture_name_storage_bytes,
                                 captures_len,
                                 static_captures_len,
                                 minimum_match_bytes,
@@ -1016,6 +1142,7 @@ impl PortableBuilder {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
                             source,
+                            capture_names,
                             plan: PortablePlan::RequiredLiteral(plan),
                             profile: profile.clone(),
                             limits: self.limits,
@@ -1030,6 +1157,7 @@ impl PortableBuilder {
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
+                                capture_name_storage_bytes,
                                 captures_len,
                                 static_captures_len,
                                 minimum_match_bytes,
@@ -1060,6 +1188,7 @@ impl PortableBuilder {
                 let storage = literal.storage_bytes();
                 return Ok(PortableRegex {
                     source,
+                    capture_names,
                     plan: PortablePlan::ExactLiteral(literal),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -1074,6 +1203,7 @@ impl PortableBuilder {
                         edges: 0,
                         plan_storage_bytes: storage,
                         source_storage_bytes,
+                        capture_name_storage_bytes,
                         captures_len,
                         static_captures_len,
                         minimum_match_bytes,
@@ -1089,6 +1219,7 @@ impl PortableBuilder {
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
                         source,
+                        capture_names,
                         plan: PortablePlan::PackedLiteralSet(packed),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -1103,6 +1234,7 @@ impl PortableBuilder {
                             edges: 0,
                             plan_storage_bytes: storage,
                             source_storage_bytes,
+                            capture_name_storage_bytes,
                             captures_len,
                             static_captures_len,
                             minimum_match_bytes,
@@ -1115,6 +1247,7 @@ impl PortableBuilder {
                 let storage = literal_set.build_accounting().persistent_bytes;
                 return Ok(PortableRegex {
                     source,
+                    capture_names,
                     plan: PortablePlan::LiteralSetDfa(literal_set),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -1129,6 +1262,7 @@ impl PortableBuilder {
                         edges: 0,
                         plan_storage_bytes: storage,
                         source_storage_bytes,
+                        capture_name_storage_bytes,
                         captures_len,
                         static_captures_len,
                         minimum_match_bytes,
@@ -1147,6 +1281,7 @@ impl PortableBuilder {
         let plan = automaton.stats();
         Ok(PortableRegex {
             source,
+            capture_names,
             plan: PortablePlan::K0(automaton),
             profile: profile.clone(),
             limits: self.limits,
@@ -1161,6 +1296,7 @@ impl PortableBuilder {
                 edges: plan.edges(),
                 plan_storage_bytes: plan.storage_bytes(),
                 source_storage_bytes,
+                capture_name_storage_bytes,
                 captures_len,
                 static_captures_len,
                 minimum_match_bytes,
@@ -1174,11 +1310,40 @@ impl PortableBuilder {
 /// Immutable, shareable matcher for the certified capture-free byte subset.
 pub struct PortableRegex {
     source: Box<str>,
+    capture_names: Box<[Option<Box<str>>]>,
     plan: PortablePlan,
     profile: CompatibilityProfile,
     limits: BuildLimits,
     report: BuildReport,
 }
+
+/// An iterator over capture names in opening-parenthesis index order.
+///
+/// The first item is always `None` for the implicit whole-match slot. Unnamed
+/// explicit groups also yield `None`.
+#[derive(Clone, Debug)]
+pub struct PortableCaptureNames<'r> {
+    names: core::slice::Iter<'r, Option<Box<str>>>,
+}
+
+impl<'r> Iterator for PortableCaptureNames<'r> {
+    type Item = Option<&'r str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.names.next().map(Option::as_deref)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.names.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.names.len()
+    }
+}
+
+impl ExactSizeIterator for PortableCaptureNames<'_> {}
+impl core::iter::FusedIterator for PortableCaptureNames<'_> {}
 
 impl fmt::Display for PortableRegex {
     /// Show the original regular expression source.
@@ -1263,6 +1428,17 @@ impl PortableRegex {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.source
+    }
+
+    /// Iterate over every capture slot's optional name in capture-index order.
+    ///
+    /// This metadata is retained before capture-erasing execution planning,
+    /// so it remains identical across every portable plan family.
+    #[must_use]
+    pub fn capture_names(&self) -> PortableCaptureNames<'_> {
+        PortableCaptureNames {
+            names: self.capture_names.iter(),
+        }
     }
 
     /// Return the number of capture slots, including the implicit unnamed
