@@ -9,8 +9,9 @@ use std::{
 };
 
 use fre::{
-    PortableBuilder, PortableFindIterLimits, PortableRegexSetBuilder, PortableRegexSetRunLimits,
-    SearchLimits,
+    CaptureAggregateLimits, CaptureSearchLimits, PortableBuilder, PortableFindIterLimits,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuilder,
+    PortableTextCaptureBuilder, RustProfile, SearchLimits, SearchWindow,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1205,6 +1206,81 @@ fn join_ids(ids: &[usize]) -> String {
 fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
     let id = obligation.case_id.as_str();
     let probe = match id {
+        "README.md:34" => CoreProbe::TextCaptures {
+            pattern: r"(?x)
+(?P<year>\d{4})  # the year
+-
+(?P<month>\d{2}) # the month
+-
+(?P<day>\d{2})   # the day
+",
+            haystack: "2010-03-14",
+            selectors: &[
+                CaptureSelector::Name("year"),
+                CaptureSelector::Name("month"),
+                CaptureSelector::Name("day"),
+            ],
+            collection: CaptureCollection::First,
+            expected: "2010|03|14",
+        },
+        "README.md:56" => CoreProbe::TextCaptures {
+            pattern: r"(\d{4})-(\d{2})-(\d{2})",
+            haystack: "On 2010-03-14, foo happened. On 2014-10-14, bar happened.",
+            selectors: &[
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::All,
+            expected: "2010|03|14,2014|10|14",
+        },
+        "src/lib.rs:16" => CoreProbe::TextCaptures {
+            pattern: r"(?m)^([^:]+):([0-9]+):(.+)$",
+            haystack: "path/to/foo:54:Blue Harvest\npath/to/bar:90:Something, Something, Something, Dark Side\npath/to/baz:3:It's a Trap!\n",
+            selectors: &[
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::All,
+            expected: "path/to/foo|54|Blue Harvest,path/to/bar|90|Something, Something, Something, Dark Side,path/to/baz|3|It's a Trap!",
+        },
+        "src/lib.rs:99" => CoreProbe::TextCaptures {
+            pattern: r"Homer (.)\. Simpson",
+            haystack: "Homer J. Simpson",
+            selectors: &[CaptureSelector::Index(1)],
+            collection: CaptureCollection::First,
+            expected: "J",
+        },
+        "src/lib.rs:157" => CoreProbe::TextCaptures {
+            pattern: r"Homer (?<middle>.)\. Simpson",
+            haystack: "Homer J. Simpson",
+            selectors: &[CaptureSelector::Name("middle")],
+            collection: CaptureCollection::First,
+            expected: "J",
+        },
+        "src/lib.rs:271" => CoreProbe::TextCaptures {
+            pattern: r"(?<y>[0-9]{4})-(?<m>[0-9]{2})-(?<d>[0-9]{2})",
+            haystack: "What do 1865-04-14, 1881-07-02, 1901-09-06 and 1963-11-22 have in common?",
+            selectors: &[
+                CaptureSelector::Name("y"),
+                CaptureSelector::Name("m"),
+                CaptureSelector::Name("d"),
+            ],
+            collection: CaptureCollection::All,
+            expected: "1865|04|14,1881|07|02,1901|09|06,1963|11|22",
+        },
+        "src/lib.rs:303" => CoreProbe::TextCaptures {
+            pattern: r"([0-9]{4})-([0-9]{2})-([0-9]{2})",
+            haystack: "What do 1865-04-14, 1881-07-02, 1901-09-06 and 1963-11-22 have in common?",
+            selectors: &[
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::All,
+            expected: "1865|04|14,1881|07|02,1901|09|06,1963|11|22",
+        },
         "src/lib.rs:216" => CoreProbe::IsMatch {
             pattern: r"^\d{4}-\d{2}-\d{2}$",
             haystack: "2010-03-14",
@@ -1280,6 +1356,56 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
             haystack: "Retroactively relinquishing remunerations is reprehensible.",
             expected: "0-13,14-27,28-41,45-58",
         },
+        "src/regex/string.rs:51" => CoreProbe::TextCaptures {
+            pattern: r"(?m)^\s*(\S+)\s+([0-9]+)\s+(true|false)\s*$",
+            haystack: "\nrabbit         54 true\ngroundhog 2 true\ndoes not match\nfox   109    false\n",
+            selectors: &[
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::All,
+            expected: "rabbit|54|true,groundhog|2|true,fox|109|false",
+        },
+        "src/regex/string.rs:292" | "src/regex/string.rs:344" => CoreProbe::TextCaptures {
+            pattern: r"'([^']+)'\s+\((\d{4})\)",
+            haystack: "Not my favorite movie: 'Citizen Kane' (1941).",
+            selectors: &[
+                CaptureSelector::Index(0),
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+            ],
+            collection: CaptureCollection::First,
+            expected: "'Citizen Kane' (1941)|Citizen Kane|1941",
+        },
+        "src/regex/string.rs:315" => CoreProbe::TextCaptures {
+            pattern: r"'(?<title>[^']+)'\s+\((?<year>\d{4})\)",
+            haystack: "Not my favorite movie: 'Citizen Kane' (1941).",
+            selectors: &[
+                CaptureSelector::Index(0),
+                CaptureSelector::Name("title"),
+                CaptureSelector::Name("year"),
+            ],
+            collection: CaptureCollection::First,
+            expected: "'Citizen Kane' (1941)|Citizen Kane|1941",
+        },
+        "src/regex/string.rs:381" => CoreProbe::TextCaptures {
+            pattern: r"'([^']+)'\s+\(([0-9]{4})\)",
+            haystack: "'Citizen Kane' (1941), 'The Wizard of Oz' (1939), 'M' (1931).",
+            selectors: &[CaptureSelector::Index(1), CaptureSelector::Index(2)],
+            collection: CaptureCollection::All,
+            expected: "Citizen Kane|1941,The Wizard of Oz|1939,M|1931",
+        },
+        "src/regex/string.rs:400" => CoreProbe::TextCaptures {
+            pattern: r"'(?<title>[^']+)'\s+\((?<year>[0-9]{4})\)",
+            haystack: "'Citizen Kane' (1941), 'The Wizard of Oz' (1939), 'M' (1931).",
+            selectors: &[
+                CaptureSelector::Name("title"),
+                CaptureSelector::Name("year"),
+            ],
+            collection: CaptureCollection::All,
+            expected: "Citizen Kane|1941,The Wizard of Oz|1939,M|1931",
+        },
         "src/regex/string.rs:442" | "src/regex/bytes.rs:442" => CoreProbe::Split {
             pattern: r"[ \t]+",
             haystack: b"a b \t  c\td    e",
@@ -1340,6 +1466,10 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
             limit: Some(3),
             expected: "4d617279,686164,61206c6974746c65206c616d62",
         },
+        "src/regex/string.rs:1060" => CoreProbe::ContextIsMatch { text: true },
+        "src/regex/bytes.rs:1073" => CoreProbe::ContextIsMatch { text: false },
+        "src/regex/string.rs:1094" => CoreProbe::ContextFind { text: true },
+        "src/regex/bytes.rs:1105" => CoreProbe::ContextFind { text: false },
         "src/regex/string.rs:1268" | "src/regex/bytes.rs:1269" => CoreProbe::AsStr {
             pattern: r"foo\w+bar",
             expected: r"foo\w+bar",
@@ -1352,6 +1482,82 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
             pattern: r"\p{Greek}+",
             haystack: "Greek: αβγδ",
             expected: "7-15",
+        },
+        "src/regex/string.rs:1632" => CoreProbe::TextCaptures {
+            pattern: r"(?<first>\w)(\w)(?:\w)\w(?<last>\w)",
+            haystack: "toady",
+            selectors: &[
+                CaptureSelector::Index(0),
+                CaptureSelector::Name("first"),
+                CaptureSelector::Index(2),
+                CaptureSelector::Name("last"),
+            ],
+            collection: CaptureCollection::First,
+            expected: "toady|t|o|y",
+        },
+        "src/regex/string.rs:1660" => CoreProbe::TextCaptures {
+            pattern: r"[a-z]+(?:([0-9]+)|([A-Z]+))",
+            haystack: "abc123",
+            selectors: &[CaptureSelector::Index(1), CaptureSelector::Index(2)],
+            collection: CaptureCollection::First,
+            expected: "123|",
+        },
+        "src/regex/string.rs:1685" => CoreProbe::TextCaptures {
+            pattern: r"[a-z]+([0-9]+)",
+            haystack: "   abc123-def",
+            selectors: &[CaptureSelector::Index(0)],
+            collection: CaptureCollection::First,
+            expected: "abc123",
+        },
+        "src/regex/string.rs:1715" => CoreProbe::TextCaptures {
+            pattern: r"[a-z]+(?:(?<numbers>[0-9]+)|(?<letters>[A-Z]+))",
+            haystack: "abc123",
+            selectors: &[
+                CaptureSelector::Name("numbers"),
+                CaptureSelector::Name("letters"),
+            ],
+            collection: CaptureCollection::First,
+            expected: "123|",
+        },
+        "src/regex/string.rs:1763" => CoreProbe::TextCaptures {
+            pattern: r"([0-9]{4})-([0-9]{2})-([0-9]{2})",
+            haystack: "On 2010-03-14, I became a Tennessee lamb.",
+            selectors: &[
+                CaptureSelector::Index(0),
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::First,
+            expected: "2010-03-14|2010|03|14",
+        },
+        "src/regex/string.rs:1781" => CoreProbe::TextCaptures {
+            pattern: r"([0-9]{4})-([0-9]{2})-([0-9]{2})",
+            haystack: "1973-01-05, 1975-08-25 and 1980-10-18",
+            selectors: &[
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::All,
+            expected: "1973|01|05,1975|08|25,1980|10|18",
+        },
+        "src/regex/string.rs:1900" => CoreProbe::TextCaptures {
+            pattern: r"(\w)(\d)?(\w)",
+            haystack: "AZ",
+            selectors: &[
+                CaptureSelector::Index(0),
+                CaptureSelector::Index(1),
+                CaptureSelector::Index(2),
+                CaptureSelector::Index(3),
+            ],
+            collection: CaptureCollection::First,
+            expected: "AZ|A||Z",
+        },
+        "src/regex/string.rs:1928" => CoreProbe::TextCapturesLen {
+            pattern: r"(\w)(\d)?(\w)",
+            haystack: "AZ",
+            expected: "4",
         },
         _ => return None,
     };
@@ -1375,6 +1581,24 @@ enum CoreProbe {
         haystack: &'static str,
         expected: &'static str,
     },
+    ContextIsMatch {
+        text: bool,
+    },
+    ContextFind {
+        text: bool,
+    },
+    TextCaptures {
+        pattern: &'static str,
+        haystack: &'static str,
+        selectors: &'static [CaptureSelector],
+        collection: CaptureCollection,
+        expected: &'static str,
+    },
+    TextCapturesLen {
+        pattern: &'static str,
+        haystack: &'static str,
+        expected: &'static str,
+    },
     AsStr {
         pattern: &'static str,
         expected: &'static str,
@@ -1389,6 +1613,18 @@ enum CoreProbe {
     CaptureNamesEmpty,
     CapturesLen,
     StaticCapturesLen,
+}
+
+#[derive(Clone, Copy)]
+enum CaptureSelector {
+    Index(usize),
+    Name(&'static str),
+}
+
+#[derive(Clone, Copy)]
+enum CaptureCollection {
+    First,
+    All,
 }
 
 #[allow(
@@ -1423,6 +1659,33 @@ fn run_core_probe(probe: CoreProbe) -> Execution {
             let regex = build_regex(PortableBuilder::new(pattern))?;
             let observed = all_ranges(&regex, haystack.as_bytes())?;
             Ok((expected.as_bytes().to_vec(), observed.into_bytes()))
+        }
+        CoreProbe::ContextIsMatch { text } => run_context_probe(text, false),
+        CoreProbe::ContextFind { text } => run_context_probe(text, true),
+        CoreProbe::TextCaptures {
+            pattern,
+            haystack,
+            selectors,
+            collection,
+            expected,
+        } => {
+            let observed = run_text_capture_probe(pattern, haystack, selectors, collection)?;
+            Ok((expected.as_bytes().to_vec(), observed.into_bytes()))
+        }
+        CoreProbe::TextCapturesLen {
+            pattern,
+            haystack,
+            expected,
+        } => {
+            let regex = build_text_capture_regex(pattern)?;
+            let (captures, _) = regex
+                .captures(haystack, CaptureSearchLimits::default())
+                .map_err(|_| unsupported("doctest.text-capture-search-refused"))?;
+            let captures = captures.ok_or_else(|| fault("doctest.text-capture-missing"))?;
+            Ok((
+                expected.as_bytes().to_vec(),
+                captures.len().to_string().into_bytes(),
+            ))
         }
         CoreProbe::AsStr { pattern, expected } => {
             let regex = build_regex(PortableBuilder::new(pattern))?;
@@ -1509,6 +1772,148 @@ fn run_core_probe(probe: CoreProbe) -> Execution {
                 b"1,2,2,3,_,_,_,2".to_vec(),
                 observations.join(",").into_bytes(),
             ))
+        }
+    }
+}
+
+fn run_context_probe(text: bool, range: bool) -> Execution {
+    const PATTERN: &str = r"\bchew\b";
+    const HAYSTACK: &str = "eschew";
+    let expected = if range { "0-4,_" } else { "true,false" };
+    let observed = if text {
+        let regex = PortableTextBuilder::new(PATTERN)
+            .profile(RustProfile::regex_1_12_4())
+            .build()
+            .map_err(|_| unsupported("doctest.context-text-build-refused"))?;
+        let sliced = if range {
+            regex
+                .find(&HAYSTACK[2..], SearchLimits::unlimited())
+                .map_err(|_| unsupported("doctest.context-text-search-refused"))?
+                .0
+                .map_or_else(
+                    || "_".to_owned(),
+                    |matched| format!("{}-{}", matched.start(), matched.end()),
+                )
+        } else {
+            regex
+                .is_match(&HAYSTACK[2..], SearchLimits::unlimited())
+                .map_err(|_| unsupported("doctest.context-text-search-refused"))?
+                .0
+                .to_string()
+        };
+        let contextual = regex
+            .find_window(
+                HAYSTACK,
+                SearchWindow::new(2, HAYSTACK.len()),
+                SearchLimits::unlimited(),
+            )
+            .map_err(|_| unsupported("doctest.context-text-search-refused"))?
+            .0;
+        let contextual = if range {
+            contextual.map_or_else(
+                || "_".to_owned(),
+                |matched| format!("{}-{}", matched.start(), matched.end()),
+            )
+        } else {
+            contextual.is_some().to_string()
+        };
+        format!("{sliced},{contextual}")
+    } else {
+        let regex = build_regex(PortableBuilder::new(PATTERN))?;
+        let sliced = if range {
+            one_range(&regex, &HAYSTACK.as_bytes()[2..])?
+        } else {
+            is_match(&regex, &HAYSTACK.as_bytes()[2..])?.to_string()
+        };
+        let contextual = regex
+            .find_window(
+                HAYSTACK.as_bytes(),
+                SearchWindow::new(2, HAYSTACK.len()),
+                SearchLimits::unlimited(),
+            )
+            .map_err(|_| unsupported("doctest.context-byte-search-refused"))?
+            .0;
+        let contextual = if range {
+            contextual.map_or_else(
+                || "_".to_owned(),
+                |matched| format!("{}-{}", matched.start(), matched.end()),
+            )
+        } else {
+            contextual.is_some().to_string()
+        };
+        format!("{sliced},{contextual}")
+    };
+    Ok((expected.as_bytes().to_vec(), observed.into_bytes()))
+}
+
+fn build_text_capture_regex(
+    pattern: &str,
+) -> Result<fre::PortableTextCaptureRegex, ExecutionRefusal> {
+    PortableTextCaptureBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .build()
+        .map_err(|error| match error {
+            fre::PortableTextCaptureBuildError::InternalInvariant(_)
+            | fre::PortableTextCaptureBuildError::Capture(
+                fre::CaptureBuildError::InternalInvariant(_),
+            ) => fault("doctest.text-capture-build-internal-failure"),
+            _ => unsupported("doctest.text-capture-build-refused"),
+        })
+}
+
+fn run_text_capture_probe(
+    pattern: &str,
+    haystack: &str,
+    selectors: &[CaptureSelector],
+    collection: CaptureCollection,
+) -> Result<String, ExecutionRefusal> {
+    let regex = build_text_capture_regex(pattern)?;
+    match collection {
+        CaptureCollection::First => {
+            let (captures, _) = regex
+                .captures(haystack, CaptureSearchLimits::default())
+                .map_err(|_| unsupported("doctest.text-capture-search-refused"))?;
+            let captures = captures.ok_or_else(|| fault("doctest.text-capture-missing"))?;
+            Ok(selectors
+                .iter()
+                .map(|selector| match selector {
+                    CaptureSelector::Index(index) => captures
+                        .get(*index)
+                        .map_or("", fre::PortableTextCaptureMatch::as_str),
+                    CaptureSelector::Name(name) => captures
+                        .name(name)
+                        .map_or("", fre::PortableTextCaptureMatch::as_str),
+                })
+                .collect::<Vec<_>>()
+                .join("|"))
+        }
+        CaptureCollection::All => {
+            let report = regex
+                .captures_iter(haystack, CaptureAggregateLimits::default())
+                .map_err(|_| unsupported("doctest.text-capture-iteration-refused"))?;
+            let mut observations = Vec::with_capacity(report.captures.len());
+            for record in &report.captures {
+                let mut values = Vec::with_capacity(selectors.len());
+                for selector in selectors {
+                    let group = match selector {
+                        CaptureSelector::Index(index) => record.groups.get(*index),
+                        CaptureSelector::Name(name) => record
+                            .groups
+                            .iter()
+                            .find(|group| group.name.as_deref() == Some(*name)),
+                    }
+                    .ok_or_else(|| fault("doctest.text-capture-group-missing"))?;
+                    let value = match group.span {
+                        None => "",
+                        Some(span) => haystack
+                            .get(span.start..span.end)
+                            .ok_or_else(|| fault("doctest.text-capture-span-invalid"))?,
+                    };
+                    values.push(value);
+                }
+                observations.push(values.join("|"));
+            }
+            Ok(observations.join(","))
         }
     }
 }
@@ -1835,8 +2240,16 @@ mod tests {
     fn complete_report_has_one_disposition_per_obligation() {
         let report = build_doctest_report(&package_root(), candidate()).unwrap();
         eprintln!("doctest counts={:?}", report.payload.counts);
-        assert_eq!(DOCTEST_API_CASES, report.payload.counts.total);
-        assert_eq!(0, report.payload.counts.fault);
+        assert_eq!(
+            DoctestCounts {
+                pass: 152,
+                mismatch: 0,
+                unsupported: 90,
+                fault: 0,
+                total: DOCTEST_API_CASES,
+            },
+            report.payload.counts
+        );
         report.validate().unwrap();
     }
 
