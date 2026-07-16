@@ -1,6 +1,7 @@
 use fre::{
     AggregateBuilder, AggregateOperation, CaptureExpansionError, CaptureExpansionLimits,
-    LiteralReplacementErrorSource, LiteralReplacementLimits, PortableBuilder, RustProfile,
+    FunctionalReplacementErrorSource, LiteralReplacementErrorSource, LiteralReplacementLimits,
+    PortableBuilder, RustProfile,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -152,6 +153,9 @@ const PORTED_CAPTURE_TEMPLATE_IDS: &[&str] = &[
     "capture_longest_possible_name",
     "replacen_with_captures",
 ];
+
+const PORTED_FUNCTIONAL_MATCH_IDS: &[&str] =
+    &["closure_returning_reference", "closure_returning_value"];
 
 #[derive(Clone, Copy, Debug)]
 enum ReplaceMode {
@@ -309,8 +313,9 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
         INVENTORY
             .iter()
             .filter(|case| case.capability == Capability::FunctionalReplacer)
-            .count(),
-        2
+            .map(|case| case.id)
+            .collect::<Vec<_>>(),
+        PORTED_FUNCTIONAL_MATCH_IDS
     );
     assert_eq!(
         INVENTORY
@@ -322,6 +327,175 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     for case in INVENTORY {
         assert!(case.capability.id().starts_with("replacement."));
     }
+}
+
+#[test]
+fn ported_upstream_functional_replacer_cases_pass() {
+    let limits = LiteralReplacementLimits::default();
+
+    let returning_reference = AggregateBuilder::new(r"([0-9]+)")
+        .profile(RustProfile::regex_1_12_4())
+        .build_spans()
+        .expect("functional borrowed replacement selector");
+    let mut reference_calls = 0_usize;
+    let actual = returning_reference
+        .replace_with_match(
+            b"age: 26",
+            |matched, haystack| {
+                reference_calls = reference_calls.saturating_add(1);
+                &haystack[matched.start()..matched.start().saturating_add(1)]
+            },
+            limits,
+        )
+        .expect(PORTED_FUNCTIONAL_MATCH_IDS[0]);
+    assert_eq!(actual.as_bytes(), b"age: 2");
+    assert_eq!(reference_calls, 1);
+    assert_eq!(actual.report().accounting.replacements, 1);
+
+    let returning_value = AggregateBuilder::new(r"[0-9]+")
+        .profile(RustProfile::regex_1_12_4())
+        .build_spans()
+        .expect("functional owned replacement selector");
+    let mut value_calls = 0_usize;
+    let actual = returning_value
+        .replace_with_match(
+            b"age: 26",
+            |_, _| {
+                value_calls = value_calls.saturating_add(1);
+                "Z".to_owned()
+            },
+            limits,
+        )
+        .expect(PORTED_FUNCTIONAL_MATCH_IDS[1]);
+    assert_eq!(actual.as_bytes(), b"age: Z");
+    assert_eq!(value_calls, 1);
+    assert_eq!(actual.report().accounting.replacements, 1);
+}
+
+#[test]
+fn functional_replacen_matches_pinned_bytes_on_empty_progress_and_invalid_bytes() {
+    let haystacks: &[&[u8]] = &[b"", b"ab", b"aaaa", &[b'a', 0xFF, b'b']];
+    let patterns = ["", "a*?", r"[a-c\xFF]+"];
+    let limits = [0, 1, 2, usize::MAX];
+
+    for pattern in patterns {
+        let fre = AggregateBuilder::new(pattern)
+            .profile(RustProfile::regex_1_12_4())
+            .unicode(false)
+            .build_spans()
+            .unwrap_or_else(|error| panic!("FRE rejected {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+
+        for &haystack in haystacks {
+            for &limit in &limits {
+                let expected =
+                    upstream.replacen(haystack, limit, |captures: &regex::bytes::Captures<'_>| {
+                        let matched = captures.get(0).expect("whole-match capture");
+                        vec![
+                            u8::try_from(matched.start() & 0xFF).expect("masked start fits u8"),
+                            u8::try_from(matched.len() & 0xFF).expect("masked length fits u8"),
+                        ]
+                    });
+                let actual = fre
+                    .replacen_with_match(
+                        haystack,
+                        limit,
+                        |matched, _| {
+                            vec![
+                                u8::try_from(matched.start() & 0xFF).expect("masked start fits u8"),
+                                u8::try_from(matched.len() & 0xFF).expect("masked length fits u8"),
+                            ]
+                        },
+                        LiteralReplacementLimits::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "functional replacement failed for {pattern:?}/{haystack:?}/{limit}: \
+                             {error}"
+                        )
+                    });
+                assert_eq!(
+                    actual.as_bytes(),
+                    expected.as_ref(),
+                    "{pattern:?}/{haystack:?}/{limit}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_replacement_output_limit_and_accounting_are_exact() {
+    let regex = AggregateBuilder::new("a")
+        .unicode(false)
+        .build_spans()
+        .expect("functional resource-bound selector");
+    let baseline = regex
+        .replace_all_with_match(
+            b"aba",
+            |_, _| b"XYZ".as_slice(),
+            LiteralReplacementLimits::default(),
+        )
+        .expect("functional accounting baseline");
+    assert_eq!(baseline.as_bytes(), b"XYZbXYZ");
+    assert_eq!(baseline.report().accounting.selected_matches, 2);
+    assert_eq!(baseline.report().accounting.replacements, 2);
+    assert_eq!(baseline.report().accounting.span_visits, 2);
+    assert_eq!(baseline.report().accounting.haystack_bytes_copied, 1);
+    assert_eq!(baseline.report().accounting.replacement_bytes_copied, 6);
+    assert_eq!(baseline.report().accounting.output_bytes, 7);
+
+    let exact = LiteralReplacementLimits {
+        max_output_bytes: baseline.report().accounting.output_bytes,
+        ..LiteralReplacementLimits::default()
+    };
+    regex
+        .replace_all_with_match(b"aba", |_, _| b"XYZ".as_slice(), exact)
+        .expect("exact functional output limit");
+
+    let mut calls = 0_usize;
+    let error = regex
+        .replace_all_with_match(
+            b"aba",
+            |_, _| {
+                calls = calls.saturating_add(1);
+                b"XYZ".as_slice()
+            },
+            LiteralReplacementLimits {
+                max_output_bytes: exact.max_output_bytes - 1,
+                ..exact
+            },
+        )
+        .expect_err("one below exact functional output must refuse");
+    assert_eq!(calls, 2, "each attempted replacement invokes once");
+    assert!(matches!(
+        error.source,
+        FunctionalReplacementErrorSource::OutputBytesLimit {
+            needed: 7,
+            limit: 6
+        }
+    ));
+    assert_eq!(error.identity.max_output_bytes, 6);
+
+    let mut limited_calls = 0_usize;
+    let limited = regex
+        .replacen_with_match(
+            b"aba",
+            1,
+            |_, _| {
+                limited_calls = limited_calls.saturating_add(1);
+                b"XYZ".as_slice()
+            },
+            exact,
+        )
+        .expect("functional replacen limit");
+    assert_eq!(limited.as_bytes(), b"XYZba");
+    assert_eq!(limited_calls, 1);
+    assert_eq!(limited.report().accounting.selected_matches, 2);
+    assert_eq!(limited.report().accounting.replacements, 1);
 }
 
 fn assert_capture_template_matches_pinned(

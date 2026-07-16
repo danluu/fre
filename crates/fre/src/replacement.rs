@@ -2,7 +2,7 @@ use core::fmt;
 
 use crate::{
     AggregateCacheIdentity, AggregateExecutionDetails, AggregateExecutionSource,
-    AggregateRunLimits, AggregateSpans, AggregateSpansRegex, PortableRegex,
+    AggregateRunLimits, AggregateSpans, AggregateSpansRegex, Match, PortableRegex,
 };
 
 /// A byte source accepted by the literal/no-expansion replacement facade.
@@ -226,6 +226,10 @@ impl Default for LiteralReplacementLimits {
     }
 }
 
+/// Functional replacement uses the same complete-span and output-byte policy
+/// as literal replacement.
+pub type FunctionalReplacementLimits = LiteralReplacementLimits;
+
 /// Complete semantic and resource identity for one replacement invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiteralReplacementIdentity {
@@ -371,6 +375,158 @@ impl std::error::Error for LiteralReplacementErrorSource {
     }
 }
 
+/// Complete semantic and resource identity for one functional whole-match
+/// replacement invocation.
+///
+/// The callback is deliberately not part of this identity: it is caller code
+/// executed synchronously and is never cached or persisted by FRE. The fixed
+/// identity covers the selector, replacement count and every FRE-owned output
+/// resource bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionalReplacementIdentity {
+    /// Identity of the complete-span selector used without fallback.
+    pub selector: AggregateCacheIdentity,
+    /// Rust-compatible `replacen` limit. Zero means replace all matches.
+    pub limit: usize,
+    /// Output-allocation ceiling checked before every FRE-owned growth.
+    pub max_output_bytes: usize,
+}
+
+/// Exact deterministic counters for one functional replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FunctionalReplacementAccounting {
+    /// Complete matches selected before the `replacen` bound is applied.
+    pub selected_matches: usize,
+    /// Matches actually replaced and callbacks invoked.
+    pub replacements: usize,
+    /// Selected spans visited by the single callback/copy pass.
+    pub span_visits: usize,
+    /// Original haystack bytes copied from unmatched regions.
+    pub haystack_bytes_copied: usize,
+    /// Callback-produced bytes copied into the output.
+    pub replacement_bytes_copied: usize,
+    /// Exact final output length.
+    pub output_bytes: usize,
+}
+
+/// Successful functional replacement evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionalReplacementReport {
+    /// Complete invocation identity, including all FRE-owned resource limits.
+    pub identity: FunctionalReplacementIdentity,
+    /// Selected-plan counters and certificate from complete span execution.
+    pub selector_details: AggregateExecutionDetails,
+    /// Exact callback and copy-loop accounting.
+    pub accounting: FunctionalReplacementAccounting,
+}
+
+/// Owned result of one bounded functional replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionalReplacementResult {
+    bytes: Vec<u8>,
+    report: FunctionalReplacementReport,
+}
+
+impl FunctionalReplacementResult {
+    /// Borrow the replaced bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the result and return the replaced bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Auditable selected-plan and functional replacement accounting.
+    #[must_use]
+    pub const fn report(&self) -> &FunctionalReplacementReport {
+        &self.report
+    }
+}
+
+/// Typed failure after functional replacement semantics and limits are fixed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionalReplacementError {
+    /// Complete attempted invocation identity.
+    pub identity: Box<FunctionalReplacementIdentity>,
+    /// Selected-plan, size, quota, allocation or invariant failure.
+    pub source: FunctionalReplacementErrorSource,
+}
+
+impl fmt::Display for FunctionalReplacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "functional replacement with replacen limit {} failed: {}",
+            self.identity.limit, self.source
+        )
+    }
+}
+
+impl std::error::Error for FunctionalReplacementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.source {
+            FunctionalReplacementErrorSource::Selector(source) => Some(source),
+            FunctionalReplacementErrorSource::OutputSizeOverflow
+            | FunctionalReplacementErrorSource::OutputBytesLimit { .. }
+            | FunctionalReplacementErrorSource::AllocationFailed { .. }
+            | FunctionalReplacementErrorSource::InternalInvariant(_) => None,
+        }
+    }
+}
+
+/// Precise source of a functional replacement failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionalReplacementErrorSource {
+    /// Complete span selection refused under its fixed plan and limits.
+    Selector(AggregateExecutionSource),
+    /// Exact output-size accounting overflowed `usize`.
+    OutputSizeOverflow,
+    /// Exact output length exceeded the caller's ceiling.
+    OutputBytesLimit { needed: usize, limit: usize },
+    /// A checked incremental output reservation failed.
+    AllocationFailed { requested: usize },
+    /// A fully admitted selector span violated the facade contract.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for FunctionalReplacementErrorSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selector(source) => source.fmt(formatter),
+            Self::OutputSizeOverflow => formatter.write_str("exact output size overflowed usize"),
+            Self::OutputBytesLimit { needed, limit } => write!(
+                formatter,
+                "output needs {needed} bytes, exceeding the {limit}-byte limit"
+            ),
+            Self::AllocationFailed { requested } => {
+                write!(formatter, "failed to grow output to {requested} bytes")
+            }
+            Self::InternalInvariant(detail) => {
+                write!(
+                    formatter,
+                    "functional replacement invariant failed: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FunctionalReplacementErrorSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Selector(source) => Some(source),
+            Self::OutputSizeOverflow
+            | Self::OutputBytesLimit { .. }
+            | Self::AllocationFailed { .. }
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
 impl PortableRegex {
     /// Expand one pinned Rust bytes replacement template from capture values.
     ///
@@ -442,6 +598,152 @@ impl PortableRegex {
 }
 
 impl AggregateSpansRegex {
+    /// Replace the first match with bytes returned by a whole-match callback.
+    ///
+    /// The callback receives the selected span and the complete original
+    /// haystack, so it can return either owned bytes or a borrowed subslice.
+    /// It is invoked at most once.
+    pub fn replace_with_match<'h, F, R>(
+        &self,
+        haystack: &'h [u8],
+        replacement: F,
+        limits: impl core::borrow::Borrow<FunctionalReplacementLimits>,
+    ) -> Result<FunctionalReplacementResult, FunctionalReplacementError>
+    where
+        F: FnMut(Match, &'h [u8]) -> R,
+        R: LiteralReplacer,
+    {
+        self.replacen_with_match(haystack, 1, replacement, limits)
+    }
+
+    /// Replace every non-overlapping match with bytes returned by a
+    /// whole-match callback.
+    ///
+    /// Callback order, absolute anchor context and adjacent-empty progress all
+    /// come from the fully admitted complete-span sequence.
+    pub fn replace_all_with_match<'h, F, R>(
+        &self,
+        haystack: &'h [u8],
+        replacement: F,
+        limits: impl core::borrow::Borrow<FunctionalReplacementLimits>,
+    ) -> Result<FunctionalReplacementResult, FunctionalReplacementError>
+    where
+        F: FnMut(Match, &'h [u8]) -> R,
+        R: LiteralReplacer,
+    {
+        self.replacen_with_match(haystack, 0, replacement, limits)
+    }
+
+    /// Replace at most `limit` complete non-overlapping matches using a
+    /// whole-match callback. A zero limit replaces all matches, matching Rust
+    /// regex's `replacen` contract.
+    ///
+    /// This floor deliberately exposes only group zero; capture-aware
+    /// callbacks remain a separate capability. FRE invokes the callback once
+    /// per replaced match and immediately copies its returned bytes. Before
+    /// every FRE-owned vector growth, the exact resulting length is checked
+    /// against `max_output_bytes` and the growth uses a fallible reservation.
+    /// Allocations performed internally by caller code are outside FRE's
+    /// resource accounting.
+    pub fn replacen_with_match<'h, F, R>(
+        &self,
+        haystack: &'h [u8],
+        limit: usize,
+        mut replacement: F,
+        limits: impl core::borrow::Borrow<FunctionalReplacementLimits>,
+    ) -> Result<FunctionalReplacementResult, FunctionalReplacementError>
+    where
+        F: FnMut(Match, &'h [u8]) -> R,
+        R: LiteralReplacer,
+    {
+        let limits = *limits.borrow();
+        let spans =
+            self.spans(haystack, limits.aggregate)
+                .map_err(|error| FunctionalReplacementError {
+                    identity: Box::new(FunctionalReplacementIdentity {
+                        selector: *error.identity,
+                        limit,
+                        max_output_bytes: limits.max_output_bytes,
+                    }),
+                    source: FunctionalReplacementErrorSource::Selector(error.source),
+                })?;
+        let selector_report = spans.report().clone();
+        let identity = FunctionalReplacementIdentity {
+            selector: selector_report.identity,
+            limit,
+            max_output_bytes: limits.max_output_bytes,
+        };
+        let replacement_count = if limit == 0 { usize::MAX } else { limit };
+        let mut output = Vec::new();
+        let mut cursor = 0_usize;
+        let mut replacements = 0_usize;
+        let mut span_visits = 0_usize;
+        let mut haystack_bytes_copied = 0_usize;
+        let mut replacement_bytes_copied = 0_usize;
+
+        for matched in spans.iter().take(replacement_count) {
+            if matched.start < cursor || matched.end < matched.start || matched.end > haystack.len()
+            {
+                return Err(functional_replacement_error(
+                    &identity,
+                    FunctionalReplacementErrorSource::InternalInvariant(
+                        "selector spans are not ordered within the haystack",
+                    ),
+                ));
+            }
+            let gap = &haystack[cursor..matched.start];
+            functional_extend(&mut output, gap, &identity)?;
+            haystack_bytes_copied =
+                functional_checked_add(&identity, haystack_bytes_copied, gap.len())?;
+
+            let produced = replacement(matched, haystack);
+            let bytes = produced.literal_bytes();
+            functional_extend(&mut output, bytes, &identity)?;
+            replacement_bytes_copied =
+                functional_checked_add(&identity, replacement_bytes_copied, bytes.len())?;
+            replacements = functional_checked_add(&identity, replacements, 1)?;
+            span_visits = functional_checked_add(&identity, span_visits, 1)?;
+            cursor = matched.end;
+        }
+
+        let tail = haystack.get(cursor..).ok_or_else(|| {
+            functional_replacement_error(
+                &identity,
+                FunctionalReplacementErrorSource::InternalInvariant(
+                    "selector span ended outside the haystack",
+                ),
+            )
+        })?;
+        functional_extend(&mut output, tail, &identity)?;
+        haystack_bytes_copied =
+            functional_checked_add(&identity, haystack_bytes_copied, tail.len())?;
+        let accounted_output =
+            functional_checked_add(&identity, haystack_bytes_copied, replacement_bytes_copied)?;
+        if output.len() != accounted_output {
+            return Err(functional_replacement_error(
+                &identity,
+                FunctionalReplacementErrorSource::InternalInvariant(
+                    "copy loop and accounted output lengths differ",
+                ),
+            ));
+        }
+        Ok(FunctionalReplacementResult {
+            bytes: output,
+            report: FunctionalReplacementReport {
+                identity,
+                selector_details: selector_report.details,
+                accounting: FunctionalReplacementAccounting {
+                    selected_matches: spans.len(),
+                    replacements,
+                    span_visits,
+                    haystack_bytes_copied,
+                    replacement_bytes_copied,
+                    output_bytes: accounted_output,
+                },
+            },
+        })
+    }
+
     /// Replace the first match with literal bytes.
     ///
     /// The replacement is equivalent to `regex::bytes::NoExpand`: dollar
@@ -564,6 +866,59 @@ impl AggregateSpansRegex {
                 accounting,
             },
         })
+    }
+}
+
+fn functional_extend(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    identity: &FunctionalReplacementIdentity,
+) -> Result<(), FunctionalReplacementError> {
+    let needed = output.len().checked_add(bytes.len()).ok_or_else(|| {
+        functional_replacement_error(
+            identity,
+            FunctionalReplacementErrorSource::OutputSizeOverflow,
+        )
+    })?;
+    if needed > identity.max_output_bytes {
+        return Err(functional_replacement_error(
+            identity,
+            FunctionalReplacementErrorSource::OutputBytesLimit {
+                needed,
+                limit: identity.max_output_bytes,
+            },
+        ));
+    }
+    output.try_reserve_exact(bytes.len()).map_err(|_| {
+        functional_replacement_error(
+            identity,
+            FunctionalReplacementErrorSource::AllocationFailed { requested: needed },
+        )
+    })?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn functional_checked_add(
+    identity: &FunctionalReplacementIdentity,
+    current: usize,
+    amount: usize,
+) -> Result<usize, FunctionalReplacementError> {
+    current.checked_add(amount).ok_or_else(|| {
+        functional_replacement_error(
+            identity,
+            FunctionalReplacementErrorSource::OutputSizeOverflow,
+        )
+    })
+}
+
+fn functional_replacement_error(
+    identity: &FunctionalReplacementIdentity,
+    source: FunctionalReplacementErrorSource,
+) -> FunctionalReplacementError {
+    FunctionalReplacementError {
+        identity: Box::new(identity.clone()),
+        source,
     }
 }
 

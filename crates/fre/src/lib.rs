@@ -93,9 +93,12 @@ pub use fre_kernels::{
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
-    CaptureExpansionReport, CaptureExpansionResult, LiteralReplacementAccounting,
-    LiteralReplacementError, LiteralReplacementErrorSource, LiteralReplacementIdentity,
-    LiteralReplacementLimits, LiteralReplacementReport, LiteralReplacementResult, LiteralReplacer,
+    CaptureExpansionReport, CaptureExpansionResult, FunctionalReplacementAccounting,
+    FunctionalReplacementError, FunctionalReplacementErrorSource, FunctionalReplacementIdentity,
+    FunctionalReplacementLimits, FunctionalReplacementReport, FunctionalReplacementResult,
+    LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
+    LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
+    LiteralReplacementResult, LiteralReplacer,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
