@@ -1,7 +1,9 @@
 //! Honest operation-specific facade for the currently certified FRE subsets.
 //!
 //! [`PortableRegex`] provides bounded single-search operations for the HIR
-//! subset that `fre-lower` can prove exact. [`AggregateBuilder`] constructs
+//! subset that `fre-lower` can prove exact. [`PortableRegexSetBuilder`]
+//! composes independently admitted matchers with exact ascending pattern-ID
+//! semantics. [`AggregateBuilder`] constructs
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match compile/count/
@@ -25,6 +27,7 @@ mod finite;
 mod forward_anchored;
 mod replacement;
 mod required_literal;
+mod set;
 mod split;
 mod unicode_word_run;
 
@@ -90,6 +93,12 @@ pub use replacement::{
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
     LiteralReplacementResult,
+};
+pub use set::{
+    PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,
+    PortableRegexSetBuildLimits, PortableRegexSetBuildReport, PortableRegexSetBuilder,
+    PortableRegexSetExecutionError, PortableRegexSetExecutionReport, PortableRegexSetRunLimits,
+    PortableSetMatches, PortableSetMatchesIntoIter, PortableSetMatchesIter,
 };
 pub use split::AggregateSplit;
 
