@@ -9,7 +9,8 @@ use std::{
 };
 
 use fre::{
-    CaptureAggregateLimits, CaptureSearchLimits, PortableBuilder, PortableFindIterLimits,
+    AggregateBuilder, CaptureAggregateLimits, CaptureBuilder, CaptureExpansionLimits,
+    CaptureSearchLimits, LiteralReplacementLimits, PortableBuilder, PortableFindIterLimits,
     PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuilder,
     PortableTextCaptureBuilder, RustProfile, SearchLimits, SearchWindow,
 };
@@ -1199,12 +1200,295 @@ fn join_ids(ids: &[usize]) -> String {
         .join(",")
 }
 
+#[derive(Clone, Copy)]
+enum ReplacementProbeKind {
+    Literal,
+    CaptureTemplate,
+    FallibleWordLengths,
+    ReusedLiteral,
+}
+
+#[derive(Clone, Copy)]
+struct ReplacementProbe {
+    kind: ReplacementProbeKind,
+    pattern: &'static str,
+    haystack: &'static [u8],
+    replacement: &'static [u8],
+    limit: usize,
+    expected: &'static [u8],
+}
+
+const FIELD_HAYSTACK: &[u8] = b"\nGreetings  1973\nWild\t1973\nBornToRun\t\t\t\t1975\nDarkness                    1978\nTheRiver 1980\n";
+const FIELD_REPLACED_ALL: &[u8] =
+    b"\n1973 Greetings\n1973 Wild\n1975 BornToRun\n1978 Darkness\n1980 TheRiver\n";
+const FIELD_REPLACED_TWO: &[u8] = b"\n1973 Greetings\n1973 Wild\nBornToRun\t\t\t\t1975\nDarkness                    1978\nTheRiver 1980\n";
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source-line table binds each authenticated replacement doctest to one shared probe"
+)]
+fn replacement_probe(id: &str) -> Option<ReplacementProbe> {
+    let probe = match id {
+        "src/lib.rs:334" | "src/lib.rs:355" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})",
+            haystack: b"1973-01-05, 1975-08-25 and 1980-10-18",
+            replacement: b"$m/$d/$y",
+            limit: 0,
+            expected: b"01/05/1973, 08/25/1975 and 10/18/1980",
+        },
+        "src/regex/string.rs:672" | "src/regex/bytes.rs:681" => ReplacementProbe {
+            kind: ReplacementProbeKind::Literal,
+            pattern: r"[^01]+",
+            haystack: b"1078910",
+            replacement: b"",
+            limit: 1,
+            expected: b"1010",
+        },
+        "src/regex/string.rs:684" | "src/regex/bytes.rs:693" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"([^,\s]+),\s+(\S+)",
+            haystack: b"Springsteen, Bruce",
+            replacement: b"$2 $1",
+            limit: 1,
+            expected: b"Bruce Springsteen",
+        },
+        "src/regex/string.rs:699"
+        | "src/regex/bytes.rs:712"
+        | "src/regex/string.rs:2435"
+        | "src/regex/bytes.rs:2426" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"(?<last>[^,\s]+),\s+(?<first>\S+)",
+            haystack: b"Springsteen, Bruce",
+            replacement: b"$first $last",
+            limit: 1,
+            expected: b"Bruce Springsteen",
+        },
+        "src/regex/string.rs:715" | "src/regex/bytes.rs:728" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"(?<first>\w+)\s+(?<second>\w+)",
+            haystack: b"deep fried",
+            replacement: b"${first}_$second",
+            limit: 1,
+            expected: b"deep_fried",
+        },
+        "src/regex/string.rs:731"
+        | "src/regex/bytes.rs:744"
+        | "src/regex/string.rs:2591"
+        | "src/regex/bytes.rs:2603" => ReplacementProbe {
+            kind: ReplacementProbeKind::Literal,
+            pattern: r"(?<last>[^,\s]+),\s+(\S+)",
+            haystack: b"Springsteen, Bruce",
+            replacement: b"$2 $last",
+            limit: 1,
+            expected: b"$2 $last",
+        },
+        "src/regex/string.rs:779" | "src/regex/bytes.rs:792" => ReplacementProbe {
+            kind: ReplacementProbeKind::FallibleWordLengths,
+            pattern: r"\w+",
+            haystack: b"",
+            replacement: b"",
+            limit: 0,
+            expected: b"ok:2 3 3 3?|error:true",
+        },
+        "src/regex/string.rs:821" | "src/regex/bytes.rs:834" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"(?m)^(\S+)[\s--\r\n]+(\S+)$",
+            haystack: FIELD_HAYSTACK,
+            replacement: b"$2 $1",
+            limit: 0,
+            expected: FIELD_REPLACED_ALL,
+        },
+        "src/regex/string.rs:886" | "src/regex/bytes.rs:899" => ReplacementProbe {
+            kind: ReplacementProbeKind::CaptureTemplate,
+            pattern: r"(?m)^(\S+)[\s--\r\n]+(\S+)$",
+            haystack: FIELD_HAYSTACK,
+            replacement: b"$2 $1",
+            limit: 2,
+            expected: FIELD_REPLACED_TWO,
+        },
+        "src/regex/string.rs:2482" | "src/regex/bytes.rs:2474" => ReplacementProbe {
+            kind: ReplacementProbeKind::ReusedLiteral,
+            pattern: "a",
+            haystack: b"a",
+            replacement: b"aa",
+            limit: 0,
+            expected: b"aaaa",
+        },
+        _ => return None,
+    };
+    Some(probe)
+}
+
+fn run_replacement_probe(probe: ReplacementProbe) -> Execution {
+    let observed = match probe.kind {
+        ReplacementProbeKind::Literal => run_literal_replacement(probe)?,
+        ReplacementProbeKind::CaptureTemplate => run_capture_template_replacement(probe)?,
+        ReplacementProbeKind::FallibleWordLengths => run_fallible_word_length_probe()?,
+        ReplacementProbeKind::ReusedLiteral => run_reused_literal_probe(probe)?,
+    };
+    Ok((probe.expected.to_vec(), observed))
+}
+
+fn replacement_selector(pattern: &str) -> Result<fre::AggregateSpansRegex, ExecutionRefusal> {
+    AggregateBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .build_spans()
+        .map_err(|_| unsupported("doctest.replacement-selector-build-refused"))
+}
+
+fn run_literal_replacement(probe: ReplacementProbe) -> Result<Vec<u8>, ExecutionRefusal> {
+    replacement_selector(probe.pattern)?
+        .replacen_literal(
+            probe.haystack,
+            probe.limit,
+            probe.replacement,
+            LiteralReplacementLimits::default(),
+        )
+        .map(fre::LiteralReplacementResult::into_bytes)
+        .map_err(|_| unsupported("doctest.literal-replacement-refused"))
+}
+
+fn run_capture_template_replacement(probe: ReplacementProbe) -> Result<Vec<u8>, ExecutionRefusal> {
+    let captures = CaptureBuilder::new(probe.pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .build()
+        .map_err(|_| unsupported("doctest.replacement-capture-build-refused"))?
+        .captures_iter(probe.haystack, CaptureAggregateLimits::default())
+        .map_err(|_| unsupported("doctest.replacement-capture-search-refused"))?;
+    let template_regex =
+        build_regex(PortableBuilder::new(probe.pattern).profile(RustProfile::regex_1_12_4()))?;
+    let limit = if probe.limit == 0 {
+        usize::MAX
+    } else {
+        probe.limit
+    };
+    let mut output = Vec::new();
+    let mut cursor = 0_usize;
+    for record in captures.captures.iter().take(limit) {
+        let overall = record
+            .overall()
+            .ok_or_else(|| fault("doctest.replacement-overall-missing"))?;
+        if overall.start < cursor
+            || overall.end < overall.start
+            || overall.end > probe.haystack.len()
+        {
+            return Err(fault("doctest.replacement-span-invalid"));
+        }
+        output.extend_from_slice(&probe.haystack[cursor..overall.start]);
+        let values = record
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(expected_index, group)| {
+                let actual_index = usize::try_from(group.index)
+                    .map_err(|_| fault("doctest.replacement-capture-index-invalid"))?;
+                if actual_index != expected_index {
+                    return Err(fault("doctest.replacement-capture-order-invalid"));
+                }
+                group
+                    .span
+                    .map(|span| {
+                        probe
+                            .haystack
+                            .get(span.start..span.end)
+                            .ok_or_else(|| fault("doctest.replacement-span-invalid"))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expansion = template_regex
+            .expand_capture_template(
+                &values,
+                probe.replacement,
+                CaptureExpansionLimits::default(),
+            )
+            .map_err(|_| unsupported("doctest.replacement-expansion-refused"))?;
+        output.extend_from_slice(expansion.as_bytes());
+        cursor = overall.end;
+    }
+    output.extend_from_slice(
+        probe
+            .haystack
+            .get(cursor..)
+            .ok_or_else(|| fault("doctest.replacement-tail-invalid"))?,
+    );
+    Ok(output)
+}
+
+fn word_length_replacement(haystack: &[u8]) -> Result<Result<Vec<u8>, ()>, ExecutionRefusal> {
+    let captures = CaptureBuilder::new(r"\w+")
+        .profile(RustProfile::regex_1_12_4())
+        .build()
+        .map_err(|_| unsupported("doctest.replacement-capture-build-refused"))?
+        .captures_iter(haystack, CaptureAggregateLimits::default())
+        .map_err(|_| unsupported("doctest.replacement-capture-search-refused"))?;
+    let mut output = Vec::new();
+    let mut cursor = 0_usize;
+    for record in &captures.captures {
+        let overall = record
+            .overall()
+            .ok_or_else(|| fault("doctest.replacement-overall-missing"))?;
+        if overall.start < cursor || overall.end > haystack.len() {
+            return Err(fault("doctest.replacement-span-invalid"));
+        }
+        let matched_bytes = overall
+            .end
+            .checked_sub(overall.start)
+            .ok_or_else(|| fault("doctest.replacement-span-invalid"))?;
+        if matched_bytes >= 5 {
+            return Ok(Err(()));
+        }
+        output.extend_from_slice(&haystack[cursor..overall.start]);
+        output.extend_from_slice(matched_bytes.to_string().as_bytes());
+        cursor = overall.end;
+    }
+    output.extend_from_slice(
+        haystack
+            .get(cursor..)
+            .ok_or_else(|| fault("doctest.replacement-tail-invalid"))?,
+    );
+    Ok(Ok(output))
+}
+
+fn run_fallible_word_length_probe() -> Result<Vec<u8>, ExecutionRefusal> {
+    let success = word_length_replacement(b"hi how are you?")?
+        .map_err(|()| fault("doctest.replacement-unexpected-callback-error"))?;
+    let failure = word_length_replacement(b"hi there")?.is_err();
+    Ok(format!("ok:{}|error:{failure}", String::from_utf8_lossy(&success)).into_bytes())
+}
+
+fn run_reused_literal_probe(probe: ReplacementProbe) -> Result<Vec<u8>, ExecutionRefusal> {
+    let regex = replacement_selector(probe.pattern)?;
+    let first = regex
+        .replace_all_literal(
+            probe.haystack,
+            probe.replacement,
+            LiteralReplacementLimits::default(),
+        )
+        .map_err(|_| unsupported("doctest.literal-replacement-refused"))?;
+    regex
+        .replace_all_literal(
+            first.as_bytes(),
+            probe.replacement,
+            LiteralReplacementLimits::default(),
+        )
+        .map(fre::LiteralReplacementResult::into_bytes)
+        .map_err(|_| unsupported("doctest.literal-replacement-refused"))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the fixed pinned source-line table prevents silently filtered doctest obligations"
 )]
 fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
     let id = obligation.case_id.as_str();
+    if matches!(id, "README.md:151" | "src/lib.rs:381") {
+        return Some(run_set_probe(SetProbe::Matches));
+    }
+    if let Some(spec) = replacement_probe(id) {
+        return Some(run_replacement_probe(spec));
+    }
     let probe = match id {
         "README.md:34" => CoreProbe::TextCaptures {
             pattern: r"(?x)
@@ -1341,6 +1625,7 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
             haystack: "phone: 111-222-3333",
             expected: "7-19",
         },
+        "src/regex/string.rs:86" => CoreProbe::PatternSurface,
         "src/regex/string.rs:196" | "src/regex/bytes.rs:194" => CoreProbe::IsMatch {
             pattern: r"\b\w{13}\b",
             haystack: "I categorically deny having triskaidekaphobia.",
@@ -1566,6 +1851,7 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
 
 #[derive(Clone, Copy)]
 enum CoreProbe {
+    PatternSurface,
     IsMatch {
         pattern: &'static str,
         haystack: &'static str,
@@ -1633,6 +1919,7 @@ enum CaptureCollection {
 )]
 fn run_core_probe(probe: CoreProbe) -> Execution {
     match probe {
+        CoreProbe::PatternSurface => run_pattern_surface_probe(),
         CoreProbe::IsMatch {
             pattern,
             haystack,
@@ -1774,6 +2061,23 @@ fn run_core_probe(probe: CoreProbe) -> Execution {
             ))
         }
     }
+}
+
+fn run_pattern_surface_probe() -> Execution {
+    const HAYSTACK: &[u8] = b"a111b222c";
+    let regex = build_regex(PortableBuilder::new(r"\d+"))?;
+    let matched = is_match(&regex, HAYSTACK)?;
+    let first = one_range(&regex, HAYSTACK)?;
+    let ranges = all_ranges(&regex, HAYSTACK)?;
+    let fields = regex
+        .split(HAYSTACK, PortableFindIterLimits::unlimited())
+        .map_err(|_| unsupported("doctest.split-setup-refused"))?;
+    let mut split = Vec::new();
+    for field in fields {
+        split.push(hex(field.map_err(|_| unsupported("doctest.split-refused"))?));
+    }
+    let observed = format!("{matched}|{first}|{ranges}|{}", split.join(","));
+    Ok((b"true|1-4|1-4,5-8|61,62,63".to_vec(), observed.into_bytes()))
 }
 
 fn run_context_probe(text: bool, range: bool) -> Execution {
@@ -2242,9 +2546,9 @@ mod tests {
         eprintln!("doctest counts={:?}", report.payload.counts);
         assert_eq!(
             DoctestCounts {
-                pass: 152,
+                pass: 179,
                 mismatch: 0,
-                unsupported: 90,
+                unsupported: 63,
                 fault: 0,
                 total: DOCTEST_API_CASES,
             },
