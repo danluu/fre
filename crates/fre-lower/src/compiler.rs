@@ -239,67 +239,71 @@ impl<'h> Compiler<'h> {
                 }
                 Ok(())
             }
-            HirKind::Repetition(repetition) => {
-                if repetition.max.is_none()
-                    && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
-                {
-                    if let Some((look, consuming)) =
-                        self.normalized_ordered_start_look_alternation_repetition(repetition)?
-                    {
-                        self.increment_nullable_normalization_count()?;
-                        self.push_task(Task::FinishOrderedStartLookAlternationRepetition {
-                            look,
-                            min: repetition.min,
-                        })?;
-                        return self.push_task(Task::Visit(consuming));
-                    }
-                    if let Some(consuming) =
-                        self.normalized_ordered_empty_alternation_repetition(repetition)?
-                    {
-                        self.increment_nullable_normalization_count()?;
-                        self.push_task(Task::FinishOrderedEmptyAlternationRepetition {
-                            min: repetition.min,
-                        })?;
-                        return self.push_task(Task::Visit(consuming));
-                    }
-                    if let Some((look, atom)) =
-                        self.normalized_ordered_word_look_alternation_plus(repetition)?
-                    {
-                        self.increment_nullable_normalization_count()?;
-                        self.push_task(Task::FinishOrderedWordLookAlternationPlus { look })?;
-                        return self.push_task(Task::Visit(atom));
-                    }
-                    if let Some((sub, greedy)) = self.normalized_nullable_repetition(repetition)? {
-                        self.increment_nullable_normalization_count()?;
-                        self.push_task(Task::FinishRepetition {
-                            min: 0,
-                            max: None,
-                            greedy,
-                            copies: 1,
-                        })?;
-                        return self.push_task(Task::Visit(sub));
-                    }
-                    return Err(LowerError::Unsupported(
-                        UnsupportedFeature::UncertifiedUnboundedRepetition,
-                    ));
-                }
-                let copies_u32 = repetition.max.unwrap_or_else(|| repetition.min.max(1));
-                let copies =
-                    usize::try_from(copies_u32).map_err(|_| LowerError::ArithmeticOverflow {
-                        computation: "repetition copy count conversion",
-                    })?;
-                self.push_task(Task::FinishRepetition {
-                    min: repetition.min,
-                    max: repetition.max,
-                    greedy: repetition.greedy,
-                    copies,
-                })?;
-                for _ in 0..copies {
-                    self.push_task(Task::Visit(&repetition.sub))?;
-                }
-                Ok(())
-            }
+            HirKind::Repetition(repetition) => self.visit_repetition(repetition),
         }
+    }
+
+    fn visit_repetition(
+        &mut self,
+        repetition: &'h regex_syntax::hir::Repetition,
+    ) -> Result<(), LowerError> {
+        if repetition.max.is_none()
+            && !matches!(repetition.sub.properties().minimum_len(), Some(min) if min > 0)
+        {
+            if let Some((look, consuming)) =
+                self.normalized_ordered_start_look_alternation_repetition(repetition)?
+            {
+                self.increment_nullable_normalization_count()?;
+                self.push_task(Task::FinishOrderedStartLookAlternationRepetition {
+                    look,
+                    min: repetition.min,
+                })?;
+                return self.push_task(Task::Visit(consuming));
+            }
+            if let Some(consuming) =
+                self.normalized_ordered_empty_alternation_repetition(repetition)?
+            {
+                self.increment_nullable_normalization_count()?;
+                self.push_task(Task::FinishOrderedEmptyAlternationRepetition {
+                    min: repetition.min,
+                })?;
+                return self.push_task(Task::Visit(consuming));
+            }
+            if let Some((look, atom)) =
+                self.normalized_ordered_word_look_alternation_plus(repetition)?
+            {
+                self.increment_nullable_normalization_count()?;
+                self.push_task(Task::FinishOrderedWordLookAlternationPlus { look })?;
+                return self.push_task(Task::Visit(atom));
+            }
+            if let Some((sub, greedy)) = self.normalized_nullable_repetition(repetition)? {
+                self.increment_nullable_normalization_count()?;
+                self.push_task(Task::FinishRepetition {
+                    min: 0,
+                    max: None,
+                    greedy,
+                    copies: 1,
+                })?;
+                return self.push_task(Task::Visit(sub));
+            }
+            return Err(LowerError::Unsupported(
+                UnsupportedFeature::UncertifiedUnboundedRepetition,
+            ));
+        }
+        let copies_u32 = repetition.max.unwrap_or_else(|| repetition.min.max(1));
+        let copies = usize::try_from(copies_u32).map_err(|_| LowerError::ArithmeticOverflow {
+            computation: "repetition copy count conversion",
+        })?;
+        self.push_task(Task::FinishRepetition {
+            min: repetition.min,
+            max: repetition.max,
+            greedy: repetition.greedy,
+            copies,
+        })?;
+        for _ in 0..copies {
+            self.push_task(Task::Visit(&repetition.sub))?;
+        }
+        Ok(())
     }
 
     fn increment_nullable_normalization_count(&mut self) -> Result<(), LowerError> {
