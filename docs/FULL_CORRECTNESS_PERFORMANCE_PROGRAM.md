@@ -84,9 +84,9 @@ information is invalid.
 - Private candidate `bdf1ca60` has sealed no-clock evidence for 296 pass and 48
   unsupported, with 39 gains and no lost base pass. It remains outside canonical
   main pending an authorized integration decision.
-- The visible non-Rebar holdout has 1,014 receipts, 990 pass and 24 unsupported,
-  but is deliberately bytes-only, Unicode-off, capture-free, and non-normative
-  for performance.
+- The visible non-Rebar holdout has 1,014 receipts and current main produces
+  1,014 exact passes with no unsupported outcome, but it is deliberately
+  bytes-only, Unicode-off, capture-free, and non-normative for performance.
 - `fre-conformance` is a small byte-only capture-free gate. It is not the
   upstream Rust suite.
 - No imported complete upstream Rust test inventory or product-wide capability
