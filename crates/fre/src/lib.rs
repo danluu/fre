@@ -683,19 +683,77 @@ impl From<ForwardAnchoredBuildError> for BuildError {
 #[derive(Debug)]
 struct CaptureNameMetadata {
     names: Box<[Option<Box<str>>]>,
+    captures_len: usize,
     storage_bytes: usize,
+}
+
+fn capture_slot_len(
+    hir: &Hir,
+    explicit_captures: usize,
+    hir_nodes: usize,
+) -> Result<usize, BuildError> {
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(hir_nodes)
+        .map_err(|_| BuildError::AllocationFailed {
+            structure: "capture-slot HIR traversal",
+            additional: hir_nodes,
+        })?;
+    stack.push(hir);
+    let mut visited = 0_usize;
+    let mut capture_nodes = 0_usize;
+    let mut maximum_index = 0_usize;
+    while let Some(node) = stack.pop() {
+        visited = visited.checked_add(1).ok_or(BuildError::InternalInvariant(
+            "capture-slot HIR traversal count overflowed",
+        ))?;
+        if visited > hir_nodes {
+            return Err(BuildError::InternalInvariant(
+                "capture-slot traversal exceeded parsed HIR accounting",
+            ));
+        }
+        if let HirKind::Capture(capture) = node.kind() {
+            let index = usize::try_from(capture.index).map_err(|_| {
+                BuildError::InternalInvariant("capture-slot index does not fit usize")
+            })?;
+            if index == 0 {
+                return Err(BuildError::InternalInvariant(
+                    "canonical HIR used the implicit whole-match capture index",
+                ));
+            }
+            capture_nodes = capture_nodes
+                .checked_add(1)
+                .ok_or(BuildError::InternalInvariant(
+                    "capture-slot count overflowed",
+                ))?;
+            maximum_index = maximum_index.max(index);
+        }
+        for child in node.kind().subs() {
+            if stack.len() >= hir_nodes {
+                return Err(BuildError::InternalInvariant(
+                    "capture-slot traversal stack exceeded parsed HIR accounting",
+                ));
+            }
+            stack.push(child);
+        }
+    }
+    if visited != hir_nodes || capture_nodes != explicit_captures {
+        return Err(BuildError::InternalInvariant(
+            "capture-slot metadata differs from parsed HIR accounting",
+        ));
+    }
+    maximum_index
+        .checked_add(1)
+        .ok_or(BuildError::InternalInvariant(
+            "capture count including group zero overflowed usize",
+        ))
 }
 
 fn capture_name_metadata(
     hir: &Hir,
-    captures_len: usize,
+    explicit_captures: usize,
     hir_nodes: u64,
 ) -> Result<CaptureNameMetadata, BuildError> {
-    if captures_len == 0 {
-        return Err(BuildError::InternalInvariant(
-            "capture metadata omitted the implicit whole-match slot",
-        ));
-    }
     let hir_nodes = usize::try_from(hir_nodes)
         .map_err(|_| BuildError::InternalInvariant("HIR node count does not fit usize"))?;
     if hir_nodes == 0 {
@@ -703,6 +761,8 @@ fn capture_name_metadata(
             "capture metadata received an empty HIR inventory",
         ));
     }
+
+    let captures_len = capture_slot_len(hir, explicit_captures, hir_nodes)?;
 
     let mut names = Vec::new();
     names
@@ -766,7 +826,9 @@ fn capture_name_metadata(
             stack.push(child);
         }
     }
-    if visited != hir_nodes || seen.iter().any(|was_seen| !was_seen) {
+    if visited != hir_nodes
+        || seen.iter().skip(1).filter(|was_seen| **was_seen).count() != explicit_captures
+    {
         return Err(BuildError::InternalInvariant(
             "capture-name metadata differs from parsed HIR accounting",
         ));
@@ -786,6 +848,7 @@ fn capture_name_metadata(
     })?;
     Ok(CaptureNameMetadata {
         names: names.into_boxed_slice(),
+        captures_len,
         storage_bytes,
     })
 }
@@ -1243,12 +1306,6 @@ impl PortableBuilder {
                 "syntax capture count differs from HIR properties",
             ));
         }
-        let captures_len =
-            explicit_captures
-                .checked_add(1)
-                .ok_or(BuildError::InternalInvariant(
-                    "capture count including group zero overflowed usize",
-                ))?;
         let static_captures_len = rust
             .hir
             .properties()
@@ -1261,8 +1318,9 @@ impl PortableBuilder {
             .transpose()?;
         let CaptureNameMetadata {
             names: capture_names,
+            captures_len,
             storage_bytes: capture_name_storage_bytes,
-        } = capture_name_metadata(&rust.hir, captures_len, syntax.hir_nodes)?;
+        } = capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         if self.selection == PlanSelection::ForceK0 {
             let lowered =

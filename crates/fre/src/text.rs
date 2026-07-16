@@ -585,6 +585,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_count_capture_does_not_break_text_construction() {
+        let pattern = "(a){0}(a)";
+        let fre = PortableTextRegex::new(pattern)
+            .unwrap_or_else(|error| panic!("zero-count capture must compile: {error:?}"));
+        assert_eq!(fre.inner.captures_len(), 3);
+        assert_eq!(fre.inner.static_captures_len(), Some(2));
+        assert_eq!(
+            fre.inner.capture_names().collect::<Vec<_>>(),
+            vec![None, None, None]
+        );
+        let upstream = regex::Regex::new(pattern).expect("pinned Rust text accepts fixture");
+        assert_eq!(upstream.captures_len(), 3);
+        assert_eq!(upstream.static_captures_len(), Some(2));
+        let haystack = "a";
+        let expected = upstream
+            .find(haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        let (actual, _) = fre
+            .find(haystack, SearchLimits::unlimited())
+            .expect("FRE text search executes");
+        assert_eq!(
+            actual.map(|matched| (matched.start(), matched.end())),
+            expected
+        );
+    }
+
+    #[test]
     fn contextual_text_windows_require_scalar_boundaries_and_keep_anchor_context() {
         let haystack = "éa";
         let regex = PortableTextRegex::new(r"^a|a$").unwrap();
