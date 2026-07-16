@@ -36,9 +36,13 @@ pub enum EdgeKind {
     AssertHaystackStart,
     /// Zero-width assertion at the end of the original haystack.
     AssertHaystackEnd,
-    /// Zero-width assertion at original-haystack start or after an LF byte.
+    /// Zero-width assertion at original-haystack start or after the configured
+    /// line-terminator byte. The variant name mirrors regex-syntax's
+    /// historical `StartLF` name; LF is the default, not a hard-coded value.
     AssertLineStartLf,
-    /// Zero-width assertion at original-haystack end or before an LF byte.
+    /// Zero-width assertion at original-haystack end or before the configured
+    /// line-terminator byte. The variant name mirrors regex-syntax's
+    /// historical `EndLF` name; LF is the default, not a hard-coded value.
     AssertLineEndLf,
     /// Zero-width ASCII word boundary; only `[A-Za-z0-9_]` are word bytes.
     AssertWordAscii,
@@ -63,8 +67,8 @@ impl EdgeKind {
             Self::ByteRange => "byte-range",
             Self::AssertHaystackStart => "start-assertion",
             Self::AssertHaystackEnd => "end-assertion",
-            Self::AssertLineStartLf => "LF-line-start-assertion",
-            Self::AssertLineEndLf => "LF-line-end-assertion",
+            Self::AssertLineStartLf => "configured-line-start-assertion",
+            Self::AssertLineEndLf => "configured-line-end-assertion",
             Self::AssertWordAscii => "ASCII-word-boundary-assertion",
             Self::AssertWordAsciiNegate => "ASCII-not-word-boundary-assertion",
             Self::AssertWordStartAscii => "ASCII-word-start-assertion",
@@ -233,6 +237,7 @@ pub struct Automaton {
     pub(crate) edge_kinds: Box<[EdgeKind]>,
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
+    line_terminator: u8,
     stats: PlanStats,
 }
 
@@ -256,8 +261,26 @@ impl Automaton {
             edge_kinds: raw.edge_kinds.into_boxed_slice(),
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
+            line_terminator: b'\n',
             stats,
         })
+    }
+
+    /// Bind the byte observed by line-start and line-end assertion edges.
+    ///
+    /// The byte is immutable after publication and adds no heap storage. Raw
+    /// standalone automata default to LF; profile-aware facades call this
+    /// before exposing the validated plan.
+    #[must_use]
+    pub const fn with_line_terminator(mut self, line_terminator: u8) -> Self {
+        self.line_terminator = line_terminator;
+        self
+    }
+
+    /// Byte observed by line-start and line-end assertion edges.
+    #[must_use]
+    pub const fn line_terminator(&self) -> u8 {
+        self.line_terminator
     }
 
     #[must_use]

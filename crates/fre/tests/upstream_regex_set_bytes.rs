@@ -15,6 +15,9 @@ const UPSTREAM_SET_SHA256: &str =
 const UPSTREAM_BUILDERS_PATH: &str = "src/builders.rs";
 const UPSTREAM_BUILDERS_SHA256: &str =
     "d08f5867d8b994395546e318860d05e00cd70347223505b43d578b8d1477fe8f";
+const UPSTREAM_SUITE_PATH: &str = "tests/suite_bytes_set.rs";
+const UPSTREAM_SUITE_SHA256: &str =
+    "db85513e87429fc68904270a0f414e75ae0b7c6b7deb1c66f05eb4f98b09c67a";
 
 const UPSTREAM_DOCTEST_IDS: &[&str] = &[
     "limitations_two_pass",
@@ -65,6 +68,8 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_SET_SHA256.len(), 64);
     assert_eq!(UPSTREAM_BUILDERS_PATH, "src/builders.rs");
     assert_eq!(UPSTREAM_BUILDERS_SHA256.len(), 64);
+    assert_eq!(UPSTREAM_SUITE_PATH, "tests/suite_bytes_set.rs");
+    assert_eq!(UPSTREAM_SUITE_SHA256.len(), 64);
     assert_eq!(UPSTREAM_DOCTEST_IDS.len(), 18);
     assert_eq!(UPSTREAM_DOCTEST_IDS[0], "limitations_two_pass");
     assert_eq!(UPSTREAM_DOCTEST_IDS[17], "owned_into_iter");
@@ -326,6 +331,39 @@ fn set_profile_options_apply_identically_to_every_pattern() {
         &fre.pattern_build_report(1)
             .expect("second pattern report")
             .profile
+    );
+}
+
+#[test]
+fn upstream_bytes_set_builder_line_terminator_applies_to_every_pattern_and_range() {
+    let patterns = sources(&[r"(?m:^a)", r"(?m:a$)", r"(?m:^$)"]);
+    let line_terminator = 0x00;
+    let fre = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .line_terminator(line_terminator)
+        .build()
+        .expect("configured FRE set");
+    let mut upstream = regex::bytes::RegexSetBuilder::new(&patterns);
+    upstream.unicode(false).line_terminator(line_terminator);
+    let upstream = upstream.build().expect("configured upstream set");
+    let haystacks: &[&[u8]] = &[b"", b"a", b"x\0a\0", b"\n\0\0a", &[0xFF, 0x00, b'a']];
+
+    for haystack in haystacks {
+        for start in 0..=haystack.len() {
+            let expected: Vec<_> = upstream.matches_at(haystack, start).into_iter().collect();
+            let actual: Vec<_> = fre
+                .matches_at(haystack, start, PortableRegexSetRunLimits::unlimited())
+                .expect("configured FRE set search")
+                .into_iter()
+                .collect();
+            assert_eq!(actual, expected, "{haystack:?}/{start}");
+        }
+    }
+    assert_eq!(
+        fre.pattern_build_report(0)
+            .expect("first configured pattern report")
+            .profile,
+        fre::CompatibilityProfile::RustBytes(fre.build_report().profile.clone())
     );
 }
 

@@ -156,6 +156,13 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set the byte recognized by multiline `^` and `$` in every pattern.
+    #[must_use]
+    pub fn line_terminator(mut self, line_terminator: u8) -> Self {
+        self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
     /// Replace all set-wide and per-pattern construction limits.
     #[must_use]
     pub const fn limits(mut self, limits: PortableRegexSetBuildLimits) -> Self {

@@ -4,15 +4,17 @@
 //! expressions whose HIR has an exact byte-automaton representation: empty
 //! expressions, byte literals and byte classes, Unicode scalar classes lowered
 //! to canonical valid-UTF-8 byte paths, concatenation, ordered alternation,
-//! greedy or lazy repetition, whole-haystack start/end assertions, LF line
-//! assertions, ASCII word assertions, and positive Unicode word boundaries.
+//! greedy or lazy repetition, whole-haystack start/end assertions, configured
+//! single-byte line assertions, ASCII word assertions, and positive Unicode
+//! word boundaries.
 //! CRLF and remaining Unicode-word assertions, plus
 //! capture-sensitive operations are rejected explicitly.
 //!
 //! `RustParsed` does not retain a high-level regex builder's separately
-//! configured runtime line byte. This layer therefore implements the literal
-//! LF semantics named by `StartLF`/`EndLF`; profile-aware callers must refuse
-//! or carry any non-LF runtime configuration before lowering.
+//! configured runtime line byte. Standalone lowered automata therefore use LF
+//! by default. Profile-aware callers bind their line byte on the validated
+//! automaton before publication; `StartLF`/`EndLF` are regex-syntax's
+//! historical variant names, not a requirement to hard-code LF.
 //!
 //! Construction is iterative. HIR traversal, repetition expansion, graph
 //! patching, and final table construction use explicit, quota-checked work

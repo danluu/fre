@@ -116,6 +116,25 @@ fn assertion_at(kind: EdgeKind, haystack: &[u8], at: usize) -> bool {
         .is_some()
 }
 
+fn configured_assertion_at(
+    kind: EdgeKind,
+    line_terminator: u8,
+    haystack: &[u8],
+    at: usize,
+) -> bool {
+    assertion(kind)
+        .with_line_terminator(line_terminator)
+        .prepare::<Span>()
+        .search_window(
+            haystack,
+            SearchWindow::new(at, at),
+            SearchLimits::unlimited(),
+        )
+        .expect("unlimited configured assertion search")
+        .into_output()
+        .is_some()
+}
+
 type UnicodeBoundaryCase<'a> = (&'a [u8], &'a [(usize, bool)]);
 
 fn literal(bytes: &[u8]) -> Automaton {
@@ -401,6 +420,34 @@ fn assertion_edges_match_an_independent_absolute_byte_oracle() {
                     reference_assertion(kind, haystack, at).then_some(MatchSpan::new(at, at));
                 assert_eq!(actual, expected, "{kind:?}/{haystack:?}/{at}");
             }
+        }
+    }
+}
+
+#[test]
+fn line_assertions_observe_the_immutable_configured_byte() {
+    let haystack = [b'\n', b'\r', 0x00, 0xFF];
+    for line_terminator in haystack {
+        let start = assertion(EdgeKind::AssertLineStartLf).with_line_terminator(line_terminator);
+        assert_eq!(start.line_terminator(), line_terminator);
+        for at in 0..=haystack.len() {
+            let expected_start = at == 0 || haystack.get(at - 1) == Some(&line_terminator);
+            let expected_end = at == haystack.len() || haystack.get(at) == Some(&line_terminator);
+            assert_eq!(
+                configured_assertion_at(
+                    EdgeKind::AssertLineStartLf,
+                    line_terminator,
+                    &haystack,
+                    at,
+                ),
+                expected_start,
+                "start terminator={line_terminator:#04X} at={at}"
+            );
+            assert_eq!(
+                configured_assertion_at(EdgeKind::AssertLineEndLf, line_terminator, &haystack, at,),
+                expected_end,
+                "end terminator={line_terminator:#04X} at={at}"
+            );
         }
     }
 }

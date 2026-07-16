@@ -678,8 +678,12 @@ fn expand_root(
                 // Reverse push produces forward edge order under a LIFO stack.
                 for edge in automaton.state_edges(thread.state).rev() {
                     meter.charge(1, position)?;
-                    let enabled =
-                        zero_width_edge_enabled(automaton.edge_kinds[edge], haystack, position)?;
+                    let enabled = zero_width_edge_enabled(
+                        automaton,
+                        automaton.edge_kinds[edge],
+                        haystack,
+                        position,
+                    )?;
                     if enabled {
                         workspace.push_stack(Thread {
                             state: automaton.edge_targets[edge],
@@ -694,6 +698,7 @@ fn expand_root(
 }
 
 fn zero_width_edge_enabled(
+    automaton: &Automaton,
     kind: EdgeKind,
     haystack: &[u8],
     position: usize,
@@ -706,10 +711,9 @@ fn zero_width_edge_enabled(
             || position
                 .checked_sub(1)
                 .and_then(|index| haystack.get(index))
-                .is_some_and(|&byte| byte == b'\n')),
-        EdgeKind::AssertLineEndLf => {
-            Ok(position == haystack.len() || haystack.get(position) == Some(&b'\n'))
-        }
+                .is_some_and(|&byte| byte == automaton.line_terminator())),
+        EdgeKind::AssertLineEndLf => Ok(position == haystack.len()
+            || haystack.get(position) == Some(&automaton.line_terminator())),
         EdgeKind::AssertWordAscii
         | EdgeKind::AssertWordAsciiNegate
         | EdgeKind::AssertWordStartAscii

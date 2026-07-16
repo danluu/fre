@@ -45,6 +45,27 @@ fn pinned_with_unicode(pattern: &str, unicode: bool) -> MetaRegex {
         .unwrap_or_else(|error| panic!("pinned oracle rejected {pattern:?}: {error}"))
 }
 
+fn pinned_with_line_terminator(pattern: &str, line_terminator: u8) -> MetaRegex {
+    MetaRegex::builder()
+        .configure(
+            MetaRegex::config()
+                .utf8_empty(false)
+                .line_terminator(line_terminator),
+        )
+        .syntax(
+            syntax::Config::new()
+                .utf8(false)
+                .unicode(false)
+                .line_terminator(line_terminator),
+        )
+        .build(pattern)
+        .unwrap_or_else(|error| {
+            panic!(
+                "pinned oracle rejected {pattern:?} with line byte {line_terminator:#04X}: {error}"
+            )
+        })
+}
+
 fn independent_is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_digit() || byte.is_ascii_uppercase() || byte.is_ascii_lowercase()
 }
@@ -729,26 +750,6 @@ fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
         )))
     ));
 
-    let mut custom_line = RustProfile::regex_1_12_4();
-    custom_line.options.line_terminator = b'\r';
-    let custom = PortableBuilder::new(r"(?m:^a)")
-        .profile(custom_line.clone())
-        .unicode(false)
-        .plan_selection(PlanSelection::ForceK0)
-        .build()
-        .expect_err("a non-LF line assertion must remain a typed refusal");
-    assert!(matches!(
-        custom,
-        BuildError::UnsupportedLineTerminator {
-            line_terminator: b'\r'
-        }
-    ));
-    PortableBuilder::new("literal")
-        .profile(custom_line)
-        .unicode(false)
-        .build()
-        .expect("a custom terminator does not affect assertion-free literals");
-
     let local_ascii_pattern = r"(?-u:\b)a";
     let local_ascii = PortableBuilder::new(local_ascii_pattern)
         .profile(RustProfile::rebar_1_12_4())
@@ -779,4 +780,71 @@ fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
             Look::WordUnicodeNegate
         )))
     ));
+}
+
+#[test]
+fn representative_configured_line_bytes_match_pinned_ranged_search_and_reuse() {
+    const PATTERNS: &[&str] = &[r"(?m:^a)", r"(?m:a$)", r"(?m:^$)", r"(?m:^a$)"];
+    const LINE_TERMINATORS: &[u8] = &[0x00, b'\r', 0xFF];
+
+    for &line_terminator in LINE_TERMINATORS {
+        let haystacks = byte_strings(3, &[b'a', b'b', b'\n', line_terminator]);
+        for pattern in PATTERNS {
+            let fre = PortableBuilder::new(*pattern)
+                .profile(RustProfile::regex_1_12_4())
+                .unicode(false)
+                .line_terminator(line_terminator)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "portable build failed for {pattern:?} with line byte \
+                         {line_terminator:#04X}: {error}"
+                    )
+                });
+            assert_eq!(fre.build_report().plan, PlanKind::K0);
+            assert_eq!(
+                fre.profile(),
+                &fre::CompatibilityProfile::RustBytes({
+                    let mut profile = RustProfile::regex_1_12_4();
+                    profile.options.unicode = false;
+                    profile.options.line_terminator = line_terminator;
+                    profile
+                })
+            );
+            let upstream = pinned_with_line_terminator(pattern, line_terminator);
+            let mut session = fre
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("configured K0 session");
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = upstream
+                            .find(Input::new(haystack).span(start..end))
+                            .map(|matched| (matched.start(), matched.end()));
+                        let cold = fre
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        let reused = session
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        assert_eq!(
+                            cold, expected,
+                            "cold {pattern:?}/{line_terminator:#04X}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            reused, expected,
+                            "reused {pattern:?}/{line_terminator:#04X}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

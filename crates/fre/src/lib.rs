@@ -118,7 +118,6 @@ use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, ParseSummary, SafetyEnvelope,
 };
-use regex_syntax::hir::Look;
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
 
@@ -254,8 +253,6 @@ pub enum BuildError {
     Syntax(fre_syntax::ParseError),
     /// The syntax was valid but is outside the certified portable lowering.
     Lower(fre_lower::LowerError),
-    /// K0 line assertions currently carry the pinned LF terminator only.
-    UnsupportedLineTerminator { line_terminator: u8 },
     /// Operation-specific kernel construction failure.
     Literal(LiteralError),
     /// Ordered finite-literal DFA construction failure.
@@ -284,10 +281,6 @@ impl fmt::Display for BuildError {
         match self {
             Self::Syntax(error) => write!(f, "syntax construction failed: {error}"),
             Self::Lower(error) => write!(f, "portable lowering failed: {error}"),
-            Self::UnsupportedLineTerminator { line_terminator } => write!(
-                f,
-                "portable line assertions require LF, but the profile uses byte 0x{line_terminator:02X}"
-            ),
             Self::Literal(error) => write!(f, "literal-plan construction failed: {error}"),
             Self::LiteralSet(error) => {
                 write!(f, "literal-set DFA construction failed: {error}")
@@ -331,7 +324,6 @@ impl std::error::Error for BuildError {
             Self::RequiredLiteral(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::RequiredLiteralShape
-            | Self::UnsupportedLineTerminator { .. }
             | Self::ForwardAnchoredShape
             | Self::PlannerWorkLimit { .. }
             | Self::AllocationFailed { .. }
@@ -606,6 +598,13 @@ impl PortableBuilder {
         self
     }
 
+    /// Set the byte recognized by multiline `^` and `$` assertions.
+    #[must_use]
+    pub fn line_terminator(mut self, line_terminator: u8) -> Self {
+        self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
     /// Replace every checked construction limit.
     #[must_use]
     pub const fn limits(mut self, limits: BuildLimits) -> Self {
@@ -645,20 +644,14 @@ impl PortableBuilder {
                 "Rust bytes request produced a non-Rust canonical pattern",
             ));
         };
-        let looks = rust.hir.properties().look_set();
-        if self.profile.options.line_terminator != b'\n'
-            && (looks.contains(Look::StartLF) || looks.contains(Look::EndLF))
-        {
-            return Err(BuildError::UnsupportedLineTerminator {
-                line_terminator: self.profile.options.line_terminator,
-            });
-        }
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         if self.selection == PlanSelection::ForceK0 {
             let lowered =
                 fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?;
             let lowering = lowered.stats();
-            let automaton = lowered.into_automaton();
+            let automaton = lowered
+                .into_automaton()
+                .with_line_terminator(self.profile.options.line_terminator);
             let plan = automaton.stats();
             return Ok(PortableRegex {
                 plan: PortablePlan::K0(automaton),
@@ -902,7 +895,9 @@ impl PortableBuilder {
         let lowered =
             fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?;
         let lowering = lowered.stats();
-        let automaton = lowered.into_automaton();
+        let automaton = lowered
+            .into_automaton()
+            .with_line_terminator(self.profile.options.line_terminator);
         let plan = automaton.stats();
         Ok(PortableRegex {
             plan: PortablePlan::K0(automaton),
