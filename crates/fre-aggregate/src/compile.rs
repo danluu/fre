@@ -5,7 +5,7 @@ use regex_syntax::utf8::Utf8Sequences;
 
 use crate::accounting::CompileAccounting;
 use crate::error::{add, enforce, mul};
-use crate::program::{Assertion, ByteSet, Inst, Program};
+use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program};
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
 /// Explicit semantic profile asserted by direct HIR callers.
@@ -801,7 +801,7 @@ fn translate_progress(
     }
 }
 
-type ProgramCertificate = (Vec<usize>, Vec<Option<usize>>, usize);
+type ProgramCertificate = (Vec<usize>, Vec<usize>, usize);
 
 fn certify_program(
     insts: &[Inst],
@@ -879,10 +879,10 @@ fn certify_program(
     for inst in insts {
         budget.charge(1)?;
         if matches!(inst, Inst::Split { .. }) {
-            split_rank.push(Some(split_count));
+            split_rank.push(split_count);
             split_count = add(split_count, 1, Resource::ProgramStates)?;
         } else {
-            split_rank.push(None);
+            split_rank.push(NO_SPLIT_RANK);
         }
     }
     Ok((order, split_rank, split_count))
@@ -903,11 +903,7 @@ fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
 fn program_bytes(states: usize, order: usize, ranks: usize) -> Result<usize, Error> {
     let insts = mul(states, core::mem::size_of::<Inst>(), Resource::ProgramBytes)?;
     let order = mul(order, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
-    let ranks = mul(
-        ranks,
-        core::mem::size_of::<Option<usize>>(),
-        Resource::ProgramBytes,
-    )?;
+    let ranks = mul(ranks, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
     add(
         add(insts, order, Resource::ProgramBytes)?,
         ranks,
