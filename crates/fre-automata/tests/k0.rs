@@ -334,6 +334,39 @@ fn positive_unicode_word_boundary_is_scalar_exact_on_arbitrary_bytes() {
     }
 }
 
+#[test]
+fn crlf_and_directional_unicode_assertions_are_context_exact() {
+    let crlf = b"a\r\nb\rc\n";
+    for (kind, matching) in [
+        (EdgeKind::AssertLineStartCrlf, &[0_usize, 3, 5, 7][..]),
+        (EdgeKind::AssertLineEndCrlf, &[1_usize, 4, 6, 7][..]),
+    ] {
+        for at in 0..=crlf.len() {
+            assert_eq!(assertion_at(kind, crlf, at), matching.contains(&at));
+        }
+    }
+
+    let unicode = " α-β ".as_bytes();
+    for (kind, matching) in [
+        (EdgeKind::AssertWordUnicodeNegate, &[0_usize, 7][..]),
+        (EdgeKind::AssertWordStartUnicode, &[1_usize, 4][..]),
+        (EdgeKind::AssertWordEndUnicode, &[3_usize, 6][..]),
+        (
+            EdgeKind::AssertWordStartHalfUnicode,
+            &[0_usize, 1, 4, 7][..],
+        ),
+        (EdgeKind::AssertWordEndHalfUnicode, &[0_usize, 3, 6, 7][..]),
+    ] {
+        for at in 0..=unicode.len() {
+            assert_eq!(
+                assertion_at(kind, unicode, at),
+                matching.contains(&at),
+                "{kind:?} at {at}"
+            );
+        }
+    }
+}
+
 const ASSERTION_KINDS: [EdgeKind; 10] = [
     EdgeKind::AssertHaystackStart,
     EdgeKind::AssertHaystackEnd,

@@ -6,8 +6,6 @@ use fre_lower::{
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
 };
-use regex_syntax::hir::Look;
-
 fn profile(unicode: bool) -> CompatibilityProfile {
     let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = unicode;
@@ -129,6 +127,8 @@ fn lowering_maps_each_portable_assertion_to_a_distinct_edge_kind() {
         (r"\z", EdgeKind::AssertHaystackEnd),
         (r"(?m:^)", EdgeKind::AssertLineStartLf),
         (r"(?m:$)", EdgeKind::AssertLineEndLf),
+        (r"(?Rm:^)", EdgeKind::AssertLineStartCrlf),
+        (r"(?Rm:$)", EdgeKind::AssertLineEndCrlf),
         (r"\b", EdgeKind::AssertWordAscii),
         (r"\B", EdgeKind::AssertWordAsciiNegate),
         (r"\b{start}", EdgeKind::AssertWordStartAscii),
@@ -156,18 +156,25 @@ fn lowering_maps_each_portable_assertion_to_a_distinct_edge_kind() {
 }
 
 #[test]
-fn lowering_maps_positive_unicode_word_boundary_without_approximating_it() {
-    let parsed = parsed(r"\b", true);
-    let lowered = lower_raw(
-        &parsed,
-        OperationSemantics::CaptureFree,
-        LowerLimits::default(),
-    )
-    .expect("positive Unicode word boundary lowers");
-    assert_eq!(
-        lowered.plan().edge_kinds.as_slice(),
-        &[EdgeKind::AssertWordUnicode]
-    );
+fn lowering_maps_every_unicode_word_boundary_without_approximating_it() {
+    let cases = [
+        (r"\b", EdgeKind::AssertWordUnicode),
+        (r"\B", EdgeKind::AssertWordUnicodeNegate),
+        (r"\b{start}", EdgeKind::AssertWordStartUnicode),
+        (r"\b{end}", EdgeKind::AssertWordEndUnicode),
+        (r"\b{start-half}", EdgeKind::AssertWordStartHalfUnicode),
+        (r"\b{end-half}", EdgeKind::AssertWordEndHalfUnicode),
+    ];
+    for (pattern, expected) in cases {
+        let parsed = parsed(pattern, true);
+        let lowered = lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("failed to lower {pattern:?}: {error}"));
+        assert_eq!(lowered.plan().edge_kinds.as_slice(), &[expected]);
+    }
     assert_eq!(
         tuple(find_unicode(r"\b\w{2,}\b", "-αβ-".as_bytes())),
         Some((1, 5))
@@ -322,30 +329,6 @@ fn lf_and_ascii_word_assertions_retain_original_haystack_context() {
 
 #[test]
 fn unsupported_semantics_are_never_silently_approximated() {
-    let crlf = parsed("(?mR:$)", false);
-    assert!(matches!(
-        lower_raw(
-            &crlf,
-            OperationSemantics::CaptureFree,
-            LowerLimits::default()
-        ),
-        Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::EndCRLF
-        )))
-    ));
-
-    let unicode_word = parsed(r"\B", true);
-    assert!(matches!(
-        lower_raw(
-            &unicode_word,
-            OperationSemantics::CaptureFree,
-            LowerLimits::default()
-        ),
-        Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::WordUnicodeNegate
-        )))
-    ));
-
     let no_capture_nodes = parsed("abc", false);
     assert!(matches!(
         lower_raw(

@@ -168,17 +168,13 @@ impl<'h> Compiler<'h> {
                     Look::WordStartHalfAscii => EdgeKind::AssertWordStartHalfAscii,
                     Look::WordEndHalfAscii => EdgeKind::AssertWordEndHalfAscii,
                     Look::WordUnicode => EdgeKind::AssertWordUnicode,
-                    Look::StartCRLF
-                    | Look::EndCRLF
-                    | Look::WordUnicodeNegate
-                    | Look::WordStartUnicode
-                    | Look::WordEndUnicode
-                    | Look::WordStartHalfUnicode
-                    | Look::WordEndHalfUnicode => {
-                        return Err(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-                            *look,
-                        )));
-                    }
+                    Look::StartCRLF => EdgeKind::AssertLineStartCrlf,
+                    Look::EndCRLF => EdgeKind::AssertLineEndCrlf,
+                    Look::WordUnicodeNegate => EdgeKind::AssertWordUnicodeNegate,
+                    Look::WordStartUnicode => EdgeKind::AssertWordStartUnicode,
+                    Look::WordEndUnicode => EdgeKind::AssertWordEndUnicode,
+                    Look::WordStartHalfUnicode => EdgeKind::AssertWordStartHalfUnicode,
+                    Look::WordEndHalfUnicode => EdgeKind::AssertWordEndHalfUnicode,
                 };
                 let fragment = self.assertion_fragment(kind)?;
                 self.push_fragment(fragment)

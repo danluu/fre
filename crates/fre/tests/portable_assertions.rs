@@ -7,7 +7,6 @@ use fre::{
     BuildError, BuildLimits, K0SearchError, PlanKind, PlanSelection, PortableBuilder, RustProfile,
     SearchAccounting, SearchLimits, SearchSessionLimits, SearchWindow,
 };
-use fre_lower::{LowerError, UnsupportedFeature};
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
 use regex_syntax::hir::Look;
 
@@ -715,19 +714,36 @@ fn ascii_word_runs_select_a_byte_linear_plan_and_match_pinned_ranges() {
 }
 
 #[test]
-fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
-    let crlf = PortableBuilder::new(r"(?mR:$)")
+fn crlf_and_every_unicode_word_assertion_match_pinned_ranges() {
+    let crlf_pattern = r"(?mR:$)";
+    let crlf = PortableBuilder::new(crlf_pattern)
         .profile(RustProfile::rebar_1_12_4())
         .unicode(false)
         .plan_selection(PlanSelection::ForceK0)
         .build()
-        .expect_err("CRLF-aware end assertion must remain unsupported");
-    assert!(matches!(
-        crlf,
-        BuildError::Lower(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::EndCRLF
-        )))
-    ));
+        .expect("CRLF-aware end assertion");
+    let crlf_haystack = b"a\r\nb\rc\n";
+    let crlf_expected = pinned_with_unicode(crlf_pattern, false)
+        .find_iter(crlf_haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect::<Vec<_>>();
+    let mut crlf_actual = Vec::new();
+    for start in 0..=crlf_haystack.len() {
+        if let Some(matched) = crlf
+            .find_window(
+                crlf_haystack,
+                SearchWindow::new(start, crlf_haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0
+        {
+            crlf_actual.push((matched.start(), matched.end()));
+        }
+    }
+    crlf_actual.sort_unstable();
+    crlf_actual.dedup();
+    assert_eq!(crlf_actual, crlf_expected);
 
     let mut custom_line = RustProfile::regex_1_12_4();
     custom_line.options.line_terminator = b'\r';
@@ -767,16 +783,28 @@ fn crlf_and_nonpositive_unicode_word_assertions_remain_exact_typed_refusals() {
         .map(|matched| (matched.start(), matched.end()));
     assert_eq!(actual, expected);
 
-    let unicode = PortableBuilder::new(r"\B")
-        .profile(RustProfile::rebar_1_12_4())
-        .unicode(true)
-        .plan_selection(PlanSelection::ForceK0)
-        .build()
-        .expect_err("negated Unicode word boundary must remain unsupported");
-    assert!(matches!(
-        unicode,
-        BuildError::Lower(LowerError::Unsupported(UnsupportedFeature::LookAssertion(
-            Look::WordUnicodeNegate
-        )))
-    ));
+    let unicode_haystack = " α-β ".as_bytes();
+    for pattern in [
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        r"\b{start-half}",
+        r"\b{end-half}",
+    ] {
+        let regex = PortableBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(true)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap_or_else(|error| panic!("{pattern:?}: {error}"));
+        let expected = pinned_with_unicode(pattern, true)
+            .find(unicode_haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        let actual = regex
+            .find(unicode_haystack, SearchLimits::unlimited())
+            .unwrap()
+            .0
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(actual, expected, "{pattern:?}");
+    }
 }
