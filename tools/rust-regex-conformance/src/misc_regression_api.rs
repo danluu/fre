@@ -155,7 +155,6 @@ struct SourceSpec {
 
 #[derive(Clone, Copy, Debug)]
 enum CaseKind {
-    Unsupported(&'static str),
     PatternFormatting(&'static str),
     CaptureNames,
     CaptureIndexPanicUsize,
@@ -378,8 +377,8 @@ const CASES: [MiscRegressionCase; MISC_REGRESSION_API_CASES] = [
         "fuzz1",
         2,
         IgnoredExpensiveConstructor,
-        CaseKind::Unsupported("regression-fuzz.ignored-expensive-not-executed"),
-        b""
+        CaseKind::ValidConstructor(r"1}{55}{0}*{1}{55}{55}{5}*{1}{55}+{56}|;**"),
+        b"valid"
     ),
     case!(
         "empty_any_errors_no_panic",
@@ -620,7 +619,6 @@ impl MiscRegressionCounts {
 
 fn execute_case(case: MiscRegressionCase) -> Result<Vec<u8>, ExecutionRefusal> {
     match case.kind {
-        CaseKind::Unsupported(reason_code) => Err(unsupported(reason_code)),
         CaseKind::PatternFormatting(pattern) => execute_pattern_formatting(pattern),
         CaseKind::CaptureNames => execute_capture_names(),
         CaseKind::CaptureIndexPanicUsize => execute_capture_index_panic_usize(),
@@ -1091,10 +1089,10 @@ mod tests {
             });
         }
         let counts = MiscRegressionCounts::from_receipts(&receipts).unwrap();
-        assert_eq!(counts.pass, 24);
+        assert_eq!(counts.pass, 25);
         assert_eq!(counts.total, MISC_REGRESSION_API_CASES);
         assert_eq!(counts.mismatch, 0);
-        assert_eq!(counts.unsupported, 1);
+        assert_eq!(counts.unsupported, 0);
         assert_eq!(counts.fault, 0);
         let payload = MiscRegressionReportPayload {
             source,
