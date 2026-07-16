@@ -157,6 +157,31 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set case-insensitive mode before parsing every pattern.
+    ///
+    /// Inline `i` flag groups may still override this setting locally, just as
+    /// they do in the pinned Rust bytes set builder.
+    #[must_use]
+    pub fn case_insensitive(mut self, enabled: bool) -> Self {
+        self.profile.options.case_insensitive = enabled;
+        self
+    }
+
+    /// Set multiline mode for `^` and `$` in every pattern.
+    #[must_use]
+    pub fn multi_line(mut self, enabled: bool) -> Self {
+        self.profile.options.multi_line = enabled;
+        self
+    }
+
+    /// Set whether `.` matches the configured line terminator in every
+    /// pattern.
+    #[must_use]
+    pub fn dot_matches_new_line(mut self, enabled: bool) -> Self {
+        self.profile.options.dot_matches_new_line = enabled;
+        self
+    }
+
     /// Set the byte recognized by multiline `^` and `$` in every pattern.
     #[must_use]
     pub fn line_terminator(mut self, line_terminator: u8) -> Self {
