@@ -1430,6 +1430,74 @@ pub fn read_performance_raw_observation(
     Ok(observation)
 }
 
+/// Serialize one complete all-model candidate/reference pair as canonical
+/// compact JSON plus LF.
+pub fn performance_pair_evidence_bytes(
+    evidence: &PerformancePairEvidence,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(evidence)
+        .map_err(|error| ContractError::new(format!("serialize performance pair: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read one canonically serialized all-model candidate/reference pair.
+pub fn read_performance_pair_evidence(
+    path: &Path,
+) -> Result<PerformancePairEvidence, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let evidence: PerformancePairEvidence = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_pair_evidence_bytes(&evidence)? != bytes {
+        return Err(ContractError::new(format!(
+            "performance pair {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(evidence)
+}
+
+/// Publish one canonically serialized all-model pair to a new path without
+/// overwrite.
+pub fn write_new_performance_pair_evidence(
+    path: &Path,
+    evidence: &PerformancePairEvidence,
+) -> Result<(), ContractError> {
+    let parent = path.parent().ok_or_else(|| {
+        ContractError::new(format!(
+            "performance pair path {} has no parent",
+            path.display()
+        ))
+    })?;
+    if !parent.is_dir() {
+        return Err(ContractError::new(format!(
+            "performance pair parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    let bytes = performance_pair_evidence_bytes(evidence)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            ContractError::new(format!(
+                "create new performance pair {}: {error}",
+                path.display()
+            ))
+        })?;
+    output.write_all(&bytes).map_err(|error| {
+        ContractError::new(format!(
+            "write performance pair {}: {error}",
+            path.display()
+        ))
+    })?;
+    output.sync_all().map_err(|error| {
+        ContractError::new(format!("sync performance pair {}: {error}", path.display()))
+    })
+}
+
 /// Serialize one all-model raw resource arm as canonical compact JSON plus LF.
 pub fn performance_resource_observation_bytes(
     observation: &PerformanceResourceRawObservation,
@@ -2110,40 +2178,7 @@ fn collect_performance_pair_groups(
     let mut process_tokens = BTreeSet::new();
     let mut groups = PerformancePairGroups::new();
     for (slot, pair) in schedule.slots.iter().zip(evidence) {
-        if &pair.slot != slot {
-            return Err(ContractError::new(format!(
-                "performance evidence slot differs at sequence {}",
-                slot.sequence
-            )));
-        }
-        validate_performance_raw_observation(
-            contract,
-            universe,
-            &pair.candidate,
-            CapturePairArm::Candidate,
-        )?;
-        validate_performance_raw_observation(
-            contract,
-            universe,
-            &pair.reference,
-            CapturePairArm::Reference,
-        )?;
-        if pair.candidate.job_id != slot.job_id
-            || pair.candidate.model != slot.model
-            || pair.candidate.boundary != slot.boundary
-            || pair.candidate.comparator != slot.comparator
-            || pair.reference.job_id != slot.job_id
-            || pair.reference.model != slot.model
-            || pair.reference.boundary != slot.boundary
-            || pair.reference.comparator != slot.comparator
-            || pair.candidate.input != pair.reference.input
-            || pair.candidate.expected != pair.reference.expected
-        {
-            return Err(ContractError::new(format!(
-                "performance evidence identity differs from sequence {}",
-                slot.sequence
-            )));
-        }
+        validate_performance_pair_evidence(contract, universe, slot, pair)?;
         for token in [
             pair.candidate.process_token_sha256.as_str(),
             pair.reference.process_token_sha256.as_str(),
@@ -2170,6 +2205,59 @@ fn collect_performance_pair_groups(
             ));
     }
     Ok(groups)
+}
+
+/// Validate one complete pair against its exact schedule slot. This is the
+/// durable publication boundary used by a pair executor before a raw arm can
+/// enter a complete schedule evidence set.
+pub fn validate_performance_pair_evidence(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    slot: &PerformancePairSlot,
+    evidence: &PerformancePairEvidence,
+) -> Result<(), ContractError> {
+    if &evidence.slot != slot {
+        return Err(ContractError::new(format!(
+            "performance pair slot differs at sequence {}",
+            slot.sequence
+        )));
+    }
+    validate_performance_raw_observation(
+        contract,
+        universe,
+        &evidence.candidate,
+        CapturePairArm::Candidate,
+    )?;
+    validate_performance_raw_observation(
+        contract,
+        universe,
+        &evidence.reference,
+        CapturePairArm::Reference,
+    )?;
+    if evidence.candidate.job_id != slot.job_id
+        || evidence.candidate.model != slot.model
+        || evidence.candidate.boundary != slot.boundary
+        || evidence.candidate.comparator != slot.comparator
+        || evidence.reference.job_id != slot.job_id
+        || evidence.reference.model != slot.model
+        || evidence.reference.boundary != slot.boundary
+        || evidence.reference.comparator != slot.comparator
+        || evidence.candidate.input != evidence.reference.input
+        || evidence.candidate.expected != evidence.reference.expected
+    {
+        return Err(ContractError::new(format!(
+            "performance pair identity differs from sequence {}",
+            slot.sequence
+        )));
+    }
+    if evidence.candidate.process_token_sha256 == evidence.reference.process_token_sha256 {
+        return Err(ContractError::new(format!(
+            "performance pair reuses a process token at sequence {}",
+            slot.sequence
+        )));
+    }
+    let _ = capture_ratio_ppm(evidence.candidate.elapsed_ns, evidence.reference.elapsed_ns)?;
+    Ok(())
 }
 
 /// Validate one all-model raw arm against the exact contract, semantic row,
@@ -6029,6 +6117,55 @@ mod tests {
                 &wrong_boundary,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn one_all_model_pair_has_canonical_nonoverwriting_publication() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let schedule =
+            generate_performance_pair_schedule(&contract, &universe).expect("all-model schedule");
+        let evidence = fixture_performance_evidence(&contract, &universe, &schedule);
+        let slot = &schedule.slots[0];
+        let pair = &evidence[0];
+        validate_performance_pair_evidence(&contract, &universe, slot, pair)
+            .expect("exact pair validates");
+
+        let bytes = performance_pair_evidence_bytes(pair).expect("pair serialization");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<PerformancePairEvidence>(&bytes).expect("pair round trip"),
+            *pair
+        );
+        let path = std::env::temp_dir().join(format!(
+            "fre-performance-pair-selftest-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        write_new_performance_pair_evidence(&path, pair).expect("publish pair");
+        assert_eq!(
+            read_performance_pair_evidence(&path).expect("read pair"),
+            *pair
+        );
+        assert!(write_new_performance_pair_evidence(&path, pair).is_err());
+        fs::remove_file(path).expect("remove pair fixture");
+
+        let mut wrong_slot = pair.clone();
+        wrong_slot.slot.sequence += 1;
+        assert!(
+            validate_performance_pair_evidence(&contract, &universe, slot, &wrong_slot).is_err()
+        );
+        let mut reused_token = pair.clone();
+        reused_token.reference.process_token_sha256 =
+            reused_token.candidate.process_token_sha256.clone();
+        assert!(
+            validate_performance_pair_evidence(&contract, &universe, slot, &reused_token).is_err()
+        );
+        let mut wrong_arm = pair.clone();
+        wrong_arm.reference.arm = CapturePairArm::Candidate;
+        assert!(
+            validate_performance_pair_evidence(&contract, &universe, slot, &wrong_arm).is_err()
         );
     }
 
