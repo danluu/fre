@@ -167,6 +167,7 @@ pub struct PortableTextBuilder {
     profile: RustProfile,
     limits: BuildLimits,
     selection: PlanSelection,
+    set_admitted: bool,
 }
 
 impl PortableTextBuilder {
@@ -178,6 +179,7 @@ impl PortableTextBuilder {
             profile: RustProfile::default(),
             limits: BuildLimits::default(),
             selection: PlanSelection::Auto,
+            set_admitted: false,
         }
     }
 
@@ -209,6 +211,12 @@ impl PortableTextBuilder {
         self
     }
 
+    /// Use the already-completed aggregate Rust-set constructor admission.
+    pub(crate) const fn after_set_admission(mut self) -> Self {
+        self.set_admitted = true;
+        self
+    }
+
     /// Prove one text/bytes equivalence theorem and build the immutable text
     /// matcher.
     ///
@@ -219,11 +227,14 @@ impl PortableTextBuilder {
     /// disagree or portable construction fails.
     pub fn build(self) -> Result<PortableTextRegex, PortableTextBuildError> {
         let text_profile = CompatibilityProfile::RustText(self.profile.clone());
-        let text = fre_syntax::parse(
-            ParseRequest::rust(self.pattern.clone(), text_profile.clone())
-                .with_admission(self.limits.admission)
-                .with_safety_envelope(self.limits.syntax_safety),
-        )
+        let text_request = ParseRequest::rust(self.pattern.clone(), text_profile.clone())
+            .with_admission(self.limits.admission)
+            .with_safety_envelope(self.limits.syntax_safety);
+        let text = if self.set_admitted {
+            fre_syntax::parse_rust_regex_set_constituent(text_request)
+        } else {
+            fre_syntax::parse(text_request)
+        }
         .map_err(PortableTextBuildError::TextSyntax)?;
         let text_syntax = text.summary.clone();
         let CanonicalPattern::Rust(text_pattern) = text.pattern else {
@@ -233,11 +244,14 @@ impl PortableTextBuilder {
         };
 
         let bytes_profile = CompatibilityProfile::RustBytes(self.profile.clone());
-        let bytes = fre_syntax::parse(
-            ParseRequest::rust(self.pattern.clone(), bytes_profile)
-                .with_admission(self.limits.admission)
-                .with_safety_envelope(self.limits.syntax_safety),
-        )
+        let bytes_request = ParseRequest::rust(self.pattern.clone(), bytes_profile)
+            .with_admission(self.limits.admission)
+            .with_safety_envelope(self.limits.syntax_safety);
+        let bytes = if self.set_admitted {
+            fre_syntax::parse_rust_regex_set_constituent(bytes_request)
+        } else {
+            fre_syntax::parse(bytes_request)
+        }
         .map_err(PortableTextBuildError::BytesProofSyntax)?;
         let bytes_syntax = bytes.summary.clone();
         let CanonicalPattern::Rust(bytes_pattern) = bytes.pattern else {
@@ -257,6 +271,7 @@ impl PortableTextBuilder {
             .profile(self.profile)
             .limits(self.limits)
             .plan_selection(self.selection)
+            .after_set_admission_if(self.set_admitted)
             .build()
             .map_err(PortableTextBuildError::Portable)?;
         let report = PortableTextBuildReport {
