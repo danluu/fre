@@ -1585,6 +1585,7 @@ fn plan_name(plan: PlanKind) -> &'static str {
         PlanKind::RequiredLiteral => "required-literal",
         PlanKind::ForwardAnchored => "forward-anchored",
         PlanKind::K0 => "k0",
+        PlanKind::UnicodeWordRun => "unicode-word-run",
     }
 }
 
@@ -2052,6 +2053,11 @@ fn elapsed_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_public_plan_has_a_stable_receipt_name() {
+        assert_eq!(plan_name(PlanKind::UnicodeWordRun), "unicode-word-run");
+    }
 
     #[test]
     fn expanded_digest_uses_cross_width_canonical_framing() {
