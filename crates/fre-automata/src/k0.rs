@@ -399,6 +399,7 @@ pub(crate) fn search(
     haystack: &[u8],
     window: SearchWindow,
     limits: SearchLimits,
+    earliest: bool,
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let layout = WorkspaceLayout::for_automaton(automaton)?;
@@ -424,7 +425,15 @@ pub(crate) fn search(
         },
     )?;
     let setup = workspace.construction_accounting();
-    execute(automaton, haystack, window, &mut workspace, limits, setup)
+    execute(
+        automaton,
+        haystack,
+        window,
+        &mut workspace,
+        limits,
+        setup,
+        earliest,
+    )
 }
 
 pub(crate) fn search_with_workspace(
@@ -433,6 +442,7 @@ pub(crate) fn search_with_workspace(
     window: SearchWindow,
     workspace: &mut K0Workspace,
     limits: SearchLimits,
+    earliest: bool,
 ) -> Result<UntypedReport, SearchError> {
     execute(
         automaton,
@@ -441,6 +451,7 @@ pub(crate) fn search_with_workspace(
         workspace,
         limits,
         SetupAccounting::empty(workspace.retained_bytes, true),
+        earliest,
     )
 }
 
@@ -451,6 +462,7 @@ fn execute(
     workspace: &mut K0Workspace,
     limits: SearchLimits,
     mut setup: SetupAccounting,
+    earliest: bool,
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let (mut meter, setup_work) =
@@ -475,6 +487,10 @@ fn execute(
             &mut meter,
             &mut pending,
         )?;
+
+        if earliest && pending.is_some() {
+            break;
+        }
 
         // All live states are higher priority than `pending`. If none remain,
         // the pending match is irrevocably selected.

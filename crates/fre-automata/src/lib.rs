@@ -21,8 +21,8 @@ mod k0;
 mod plan;
 
 pub use contract::{
-    Exists, MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport, SelectedEnd,
-    SetupAccounting, Span, TypedPlan,
+    EarliestEnd, Exists, MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport,
+    SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{K0Workspace, WorkspaceLayout, WorkspaceLimits};

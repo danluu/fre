@@ -102,7 +102,7 @@ pub use set::{
 };
 pub use split::AggregateSplit;
 
-use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};
+use fre_automata::{Automaton, EarliestEnd, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{
     AbsoluteEndFixedPlan, ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError,
     ForwardAnchoredBuildLimits, ForwardAnchoredPlan, ForwardAnchoredSearchAccounting,
@@ -1229,6 +1229,132 @@ impl PortableRegex {
         }
     }
 
+    /// Return the end offset at the first boundary where a match is detected.
+    ///
+    /// Like the pinned Rust bytes API, this may be shorter than the end of the
+    /// leftmost-first match returned by [`Self::find`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if scratch/work limits refuse the operation.
+    pub fn shortest_match(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_match_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return the first detected match end at or after `start`.
+    ///
+    /// Assertions inspect the complete original haystack and the returned
+    /// offset remains relative to it. Unlike the pinned Rust API, an
+    /// out-of-bounds `start` is returned as a typed error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a resource refusal.
+    pub fn shortest_match_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    fn shortest_match_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        match &self.plan {
+            PortablePlan::ExactLiteral(literal) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) =
+                    literal.find_window(haystack, literal_window, literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
+            PortablePlan::PackedLiteralSet(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    packed_literal_set_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::PackedLiteralSet(accounting),
+                ))
+            }
+            PortablePlan::LiteralSetDfa(literal_set) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    literal_set_limits(limits),
+                )?;
+                let end = if self.report.minimum_match_bytes == Some(0) {
+                    Some(window.start())
+                } else {
+                    matched.map(|(_, end)| end)
+                };
+                Ok((end, SearchAccounting::LiteralSetDfa(accounting)))
+            }
+            PortablePlan::RequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::ForwardAnchored(forward) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = forward.find_window(
+                    haystack,
+                    literal_window,
+                    forward_anchored_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::ForwardEndFixed(fixed) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) =
+                    fixed.find_window(haystack, literal_window, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::K0(automaton) => {
+                let report = automaton
+                    .prepare::<EarliestEnd>()
+                    .search_window(haystack, window, limits)?;
+                let accounting = report.accounting();
+                Ok((report.into_output(), SearchAccounting::K0(accounting)))
+            }
+            PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
+        }
+    }
+
     /// Return the selected match end without materializing its start.
     ///
     /// # Errors
@@ -1598,6 +1724,59 @@ impl PortableSearchSession<'_> {
             } => {
                 let report = automaton
                     .prepare::<Exists>()
+                    .search_window_with_workspace(haystack, window, workspace, limits)?;
+                let accounting = report.accounting();
+                Ok((report.into_output(), SearchAccounting::K0(accounting)))
+            }
+        }
+    }
+
+    /// Return the first detected match end, reusing K0 state when applicable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same per-invocation limits as
+    /// [`PortableRegex::shortest_match`].
+    pub fn shortest_match(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_match_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return the first detected match end at or after `start`, reusing K0
+    /// state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::shortest_match_at`].
+    pub fn shortest_match_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        self.shortest_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    fn shortest_match_window(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.shortest_match_window(haystack, window, limits)
+            }
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => {
+                let report = automaton
+                    .prepare::<EarliestEnd>()
                     .search_window_with_workspace(haystack, window, workspace, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))

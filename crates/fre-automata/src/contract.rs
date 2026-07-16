@@ -8,6 +8,8 @@ use crate::{Automaton, K0Workspace, SearchError, SearchLimits, SearchWindow};
 pub enum OutputContract {
     /// Whether a selected match exists.
     Exists,
+    /// The ending byte offset at the first accepting search boundary.
+    EarliestEnd,
     /// The ending byte offset of the selected match.
     SelectedEnd,
     /// The starting and ending byte offsets of the selected match.
@@ -202,6 +204,9 @@ pub trait Operation: sealed::Sealed {
     const CONTRACT: OutputContract;
 
     #[doc(hidden)]
+    const EARLIEST: bool;
+
+    #[doc(hidden)]
     fn project(found: Option<MatchSpan>) -> Self::Output;
 }
 
@@ -215,9 +220,27 @@ impl Operation for Exists {
     type Output = bool;
 
     const CONTRACT: OutputContract = OutputContract::Exists;
+    const EARLIEST: bool = false;
 
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.is_some()
+    }
+}
+
+/// End offset at the first boundary where the executor detects a match.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EarliestEnd;
+
+impl sealed::Sealed for EarliestEnd {}
+
+impl Operation for EarliestEnd {
+    type Output = Option<usize>;
+
+    const CONTRACT: OutputContract = OutputContract::EarliestEnd;
+    const EARLIEST: bool = true;
+
+    fn project(found: Option<MatchSpan>) -> Self::Output {
+        found.map(MatchSpan::end)
     }
 }
 
@@ -231,6 +254,7 @@ impl Operation for SelectedEnd {
     type Output = Option<usize>;
 
     const CONTRACT: OutputContract = OutputContract::SelectedEnd;
+    const EARLIEST: bool = false;
 
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.map(MatchSpan::end)
@@ -247,6 +271,7 @@ impl Operation for Span {
     type Output = Option<MatchSpan>;
 
     const CONTRACT: OutputContract = OutputContract::Span;
+    const EARLIEST: bool = false;
 
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found
@@ -295,7 +320,7 @@ impl<O: Operation> TypedPlan<'_, O> {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<SearchReport<O::Output>, SearchError> {
-        let report = crate::k0::search(self.automaton, haystack, window, limits)?;
+        let report = crate::k0::search(self.automaton, haystack, window, limits, O::EARLIEST)?;
         Ok(SearchReport::new(
             O::project(report.found),
             report.accounting,
@@ -334,8 +359,14 @@ impl<O: Operation> TypedPlan<'_, O> {
         workspace: &mut K0Workspace,
         limits: SearchLimits,
     ) -> Result<SearchReport<O::Output>, SearchError> {
-        let report =
-            crate::k0::search_with_workspace(self.automaton, haystack, window, workspace, limits)?;
+        let report = crate::k0::search_with_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            limits,
+            O::EARLIEST,
+        )?;
         Ok(SearchReport::new(
             O::project(report.found),
             report.accounting,

@@ -1,7 +1,7 @@
 use fre_automata::{
-    Automaton, CompileError, CompileLimits, EdgeKind, Exists, K0Workspace, MalformedPlan,
-    MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow,
-    SelectedEnd, Span, StateRole, WorkspaceLimits,
+    Automaton, CompileError, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace,
+    MalformedPlan, MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits,
+    SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 
 #[derive(Clone)]
@@ -227,6 +227,15 @@ fn ordered_alternation_prefers_the_first_successful_path() {
     assert_eq!(find(&short_first, b"ab"), Some(MatchSpan::new(0, 1)));
     assert_eq!(find(&long_first, b"ab"), Some(MatchSpan::new(0, 2)));
     assert_eq!(find(&long_first, b"ax"), Some(MatchSpan::new(0, 1)));
+    let earliest = long_first
+        .prepare::<EarliestEnd>()
+        .search(b"ab", SearchLimits::unlimited())
+        .unwrap();
+    assert_eq!(earliest.into_output(), Some(1));
+    assert_eq!(
+        long_first.prepare::<EarliestEnd>().contract(),
+        OutputContract::EarliestEnd
+    );
 }
 
 #[test]
