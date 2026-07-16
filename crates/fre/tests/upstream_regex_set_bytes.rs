@@ -66,6 +66,55 @@ fn ids(set: &PortableRegexSet, haystack: &[u8]) -> Vec<usize> {
 }
 
 #[test]
+fn authenticated_corpus_byte_set_slice_matches_pinned_arbitrary_byte_semantics() {
+    let cases: &[(&[&str], &[u8], bool)] = &[
+        (&[""], "☃".as_bytes(), true),
+        (&[""], &[0xE2, 0x98], true),
+        (&[r"(?-u)^path1/[^/]*$"], b"path1/foo", true),
+        (
+            &[r"^(\w+) (\w+)$", r"^(\S+) (\S+)$"],
+            b"Bruce Springsteen",
+            false,
+        ),
+        (
+            &[r"^(\w+) (\w+)$", r"^[A-Z](\S+) [A-Z](\S+)$"],
+            b"Bruce Springsteen",
+            false,
+        ),
+        (
+            &[r"^(\w+) (\w+)$", r"^([A-Z])(\S+) ([A-Z])(\S+)$"],
+            b"Bruce Springsteen",
+            false,
+        ),
+    ];
+
+    for &(patterns, haystack, unicode) in cases {
+        let owned = sources(patterns);
+        let fre = PortableRegexSetBuilder::new(&owned)
+            .unicode(unicode)
+            .build()
+            .unwrap_or_else(|error| panic!("FRE rejected {patterns:?}: {error}"));
+        let mut upstream = regex::bytes::RegexSetBuilder::new(patterns);
+        upstream.unicode(unicode);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {patterns:?}: {error}"));
+        assert_eq!(
+            fre.is_match(haystack, PortableRegexSetRunLimits::unlimited())
+                .expect("bounded FRE set search")
+                .0,
+            upstream.is_match(haystack),
+            "is_match differs for {patterns:?} on {haystack:?}"
+        );
+        assert_eq!(
+            ids(&fre, haystack),
+            upstream.matches(haystack).into_iter().collect::<Vec<_>>(),
+            "matching IDs differ for {patterns:?} on {haystack:?}"
+        );
+    }
+}
+
+#[test]
 fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
     let profile = RustProfile::regex_1_12_4();
     assert_eq!(profile.regex.vcs_revision.commit(), UPSTREAM_REVISION);
