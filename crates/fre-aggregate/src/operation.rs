@@ -761,17 +761,15 @@ impl RowStore {
         let allocated_store = store.capacity();
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
         let mut record = zeroed_bytes(requirements.record_bytes, Resource::ScratchBytes)?;
-        let mut row = zeroed_usizes(program.insts.len(), Resource::RandomAccessBytes)?;
-        let mut next_row = zeroed_usizes(program.insts.len(), Resource::RandomAccessBytes)?;
+        let states = program.insts.len();
+        let row_words = add(states, states, Resource::RandomAccessBytes)?;
+        let mut rows = zeroed_usizes(row_words, Resource::RandomAccessBytes)?;
         let row_bytes = mul(
-            add(
-                row.capacity(),
-                next_row.capacity(),
-                Resource::RandomAccessBytes,
-            )?,
+            rows.capacity(),
             core::mem::size_of::<usize>(),
             Resource::RandomAccessBytes,
         )?;
+        let (row, next_row) = rows.split_at_mut(states);
         let build_scratch = add(row_bytes, record.capacity(), Resource::ScratchBytes)?;
         enforce(
             build_scratch,
@@ -849,14 +847,12 @@ impl RowStore {
                 Resource::SequentialBytes,
             )?;
             write_offset = end;
-            row.swap_with_slice(&mut next_row);
+            row.swap_with_slice(next_row);
         }
         if write_offset != store.len() {
             return Err(Error::InternalInvariant("row-log store length mismatch"));
         }
         drop(record);
-        drop(row);
-        drop(next_row);
         accounting.random_access_peak_bytes = build_scratch;
         accounting.scratch_peak_bytes = build_scratch;
         accounting.log_bytes = allocated_store;
