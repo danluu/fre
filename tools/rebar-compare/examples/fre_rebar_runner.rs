@@ -1740,7 +1740,11 @@ mod tests {
             },
         )
         .expect_err("malformed identity fails before constructing an invalid pattern");
-        assert!(error.to_string().contains("performance canonical commit"));
+        assert!(
+            error
+                .to_string()
+                .contains("performance tested-source commit")
+        );
         assert!(!ran.get(), "malformed identity reached measurement");
 
         let mut wrong_runtime = first_expectations;
