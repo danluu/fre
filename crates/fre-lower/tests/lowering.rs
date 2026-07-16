@@ -306,7 +306,6 @@ fn ordered_empty_first_repetition_proof_remains_narrow() {
         r"(?:|a?)*",
         r"(?:|a|b)*",
         r"(?:|ab)*b",
-        r"x(?:|[ab])+b",
     ] {
         let parsed = parsed(pattern, false);
         assert!(
@@ -732,8 +731,9 @@ fn ordered_empty_nullable_repetitions_match_pinned_upstream_at_every_start() {
         r"(?:|a)+b",
         r"(?:|[a\n])*b?",
         r"(?:|ab)+",
+        r"x(?:|[ab])+b",
     ];
-    let alphabet = [b'a', b'b', b'\n'];
+    let alphabet = [b'a', b'b', b'\n', b'x'];
     let mut haystacks = vec![Vec::new()];
     for len in 1..=5 {
         let count = alphabet

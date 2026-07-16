@@ -462,14 +462,17 @@ impl<'h> Compiler<'h> {
 
     /// Prove a cycle-free implementation of greedy `(?:E|C)*` and
     /// `(?:E|C)+`, where `E` is exactly empty and every successful `C` path
-    /// consumes at least one byte.
+    /// consumes exactly one byte.
     ///
     /// Leftmost-first execution first permits the empty branch. If a suffix
     /// rejects that path, ordinary backtracking may select `C`. After `C` has
     /// consumed, the upstream empty-loop guard suppresses `E`, leaving only
     /// another consuming iteration or the repetition exit. Encoding those as
     /// separate initial and loop splits preserves the priority without a
-    /// nullable cycle.
+    /// nullable cycle. Restricting `C` to one byte is necessary when a suffix
+    /// can backtrack into the repetition: a multi-byte `C` can otherwise
+    /// change which start and end the suffix selects. The separate root-only
+    /// proof may still erase any positive-width `C` because it has no suffix.
     fn normalized_ordered_empty_alternation_repetition(
         &mut self,
         outer: &'h regex_syntax::hir::Repetition,
@@ -492,7 +495,8 @@ impl<'h> Compiler<'h> {
         if !matches!(
             consuming_branch.properties().minimum_len(),
             Some(minimum) if minimum > 0
-        ) {
+        ) || consuming_branch.properties().maximum_len() != Some(1)
+        {
             return Ok(None);
         }
         Ok(Some(consuming_branch))
