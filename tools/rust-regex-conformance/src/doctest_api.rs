@@ -16,6 +16,7 @@ use fre::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::doctest_byte_captures::{ByteCaptureRefusal, execute_byte_capture_doctest};
 use crate::doctest_capture_metadata::{CaptureMetadataRefusal, execute_capture_metadata_doctest};
 use crate::{CandidateIdentity, InventoryError, UPSTREAM_REPOSITORY, UPSTREAM_REVISION, sha256};
 
@@ -1496,6 +1497,12 @@ fn execute_core_doctest(obligation: &Obligation) -> OptionalExecution {
             CaptureMetadataRefusal::Fault(reason_code) => fault(reason_code),
         }));
     }
+    if let Some(execution) = execute_byte_capture_doctest(id) {
+        return Some(execution.map_err(|refusal| match refusal {
+            ByteCaptureRefusal::Unsupported(reason_code) => unsupported(reason_code),
+            ByteCaptureRefusal::Fault(reason_code) => fault(reason_code),
+        }));
+    }
     let probe = match id {
         "README.md:34" => CoreProbe::TextCaptures {
             pattern: r"(?x)
@@ -2553,9 +2560,9 @@ mod tests {
         eprintln!("doctest counts={:?}", report.payload.counts);
         assert_eq!(
             DoctestCounts {
-                pass: 193,
+                pass: 214,
                 mismatch: 0,
-                unsupported: 49,
+                unsupported: 28,
                 fault: 0,
                 total: DOCTEST_API_CASES,
             },

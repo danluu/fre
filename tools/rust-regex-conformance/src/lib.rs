@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 mod adapter;
 mod doctest_api;
+mod doctest_byte_captures;
 mod doctest_capture_metadata;
 mod feature_matrix;
 mod misc_regression_api;
