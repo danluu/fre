@@ -29,6 +29,7 @@ pub use profile::{
     UnicodeVersion, UpstreamRevision,
 };
 pub use re2::{Re2Capability, Re2CapabilityStatus, Re2Surface, re2_surface_inventory};
+pub use rust::validate_rust_bytes_set;
 
 /// Parses one pattern under an immutable, versioned compatibility profile.
 ///

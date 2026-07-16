@@ -20,6 +20,7 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_regex_builder_ignore_whitespace",
     "bytes_regex_builder_octal",
     "bytes_regex_builder_size_limit",
+    "bytes_regex_set_builder_size_limit",
     "bytes_regex_builder_dfa_size_limit",
     "bytes_regex_builder_nest_limit",
 ];
@@ -31,7 +32,7 @@ fn authenticated_bytes_builder_flag_inventory_has_no_silent_omissions() {
     assert_eq!(profile.regex.checksum, UPSTREAM_PACKAGE_SHA256);
     assert_eq!(UPSTREAM_PATH, "src/builders.rs");
     assert_eq!(UPSTREAM_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 10);
+    assert_eq!(UPSTREAM_API_IDS.len(), 11);
 }
 
 #[test]
@@ -104,6 +105,90 @@ fn size_limit_matches_pinned_compiled_nfa_admission_and_error_class() {
             }
         }
     }
+}
+
+#[test]
+fn set_size_limit_matches_the_pinned_combined_capture_free_program() {
+    let patterns = vec!["(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)".to_owned()];
+    let capture_erasure_limit = (0..=16_384)
+        .step_by(8)
+        .find(|&limit| {
+            let mut upstream_set = regex::bytes::RegexSetBuilder::new(&patterns);
+            upstream_set.unicode(false).size_limit(limit);
+            let mut upstream_single = regex::bytes::RegexBuilder::new(&patterns[0]);
+            upstream_single.unicode(false).size_limit(limit);
+            upstream_set.build().is_ok() && upstream_single.build().is_err()
+        })
+        .expect("pinned set capture erasure must have a smaller admission threshold");
+
+    let fre = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .size_limit(capture_erasure_limit)
+        .build()
+        .expect("FRE must apply the set limit after capture erasure, not per pattern");
+    assert_eq!(fre.len(), 1);
+    let single_error = PortableBuilder::new(&patterns[0])
+        .profile(fre.build_report().profile.clone())
+        .unicode(false)
+        .build()
+        .expect_err("a set-constructor profile must not bypass single-regex admission");
+    assert_eq!(
+        single_error.failure_class(),
+        BuildFailureClass::ExpectedInvalid
+    );
+    for profile in
+        core::iter::once(&fre.build_report().profile).chain((0..fre.len()).map(|index| {
+            let CompatibilityProfile::RustBytes(profile) = &fre
+                .pattern_build_report(index)
+                .expect("constituent build report")
+                .profile
+            else {
+                panic!("set constituent published a non-bytes profile");
+            };
+            profile
+        }))
+    {
+        let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } = &profile.constructor
+        else {
+            panic!("configured set lost its set-constructor identity");
+        };
+        assert_eq!(
+            *size_limit,
+            u64::try_from(capture_erasure_limit).unwrap_or(u64::MAX)
+        );
+    }
+
+    let combined_patterns: Vec<String> = ["alpha", "bravo", "charlie", "delta", "echo"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let combined_limit = (0..=16_384)
+        .step_by(8)
+        .find(|&limit| {
+            let mut upstream_set = regex::bytes::RegexSetBuilder::new(&combined_patterns);
+            upstream_set.unicode(false).size_limit(limit);
+            let every_single_passes = combined_patterns.iter().all(|pattern| {
+                let mut single = regex::bytes::RegexBuilder::new(pattern);
+                single.unicode(false).size_limit(limit);
+                single.build().is_ok()
+            });
+            every_single_passes && upstream_set.build().is_err()
+        })
+        .expect("pinned combined set must exceed its constituents at one exact limit");
+    let error = PortableRegexSetBuilder::new(&combined_patterns)
+        .unicode(false)
+        .size_limit(combined_limit)
+        .build()
+        .expect_err("FRE must reject the same combined-program size boundary");
+    let PortableRegexSetBuildError::CombinedConstructor { source } = error else {
+        panic!("combined size refusal lost its constructor source: {error}");
+    };
+    assert_eq!(
+        source.category,
+        fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig {
+            limit: u64::try_from(combined_limit).unwrap_or(u64::MAX),
+        }
+    );
 }
 
 #[test]
@@ -201,7 +286,8 @@ fn dfa_size_limit_set_builder_applies_to_every_pattern_identity() {
             profile
         }))
     {
-        let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } = &profile.constructor
+        let fre_syntax::RustConstructor::RegexSetBuilder { dfa_size_limit, .. } =
+            &profile.constructor
         else {
             panic!("configured set lost its high-level constructor identity");
         };

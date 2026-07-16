@@ -1,4 +1,4 @@
-use regex_automata::{MatchKind, meta};
+use regex_automata::{MatchKind, meta, nfa::thompson::WhichCaptures, util::syntax};
 use regex_syntax::{
     ParserBuilder,
     hir::{Class, Hir, HirKind},
@@ -7,7 +7,8 @@ use regex_syntax::{
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustConstructor, RustOptions, RustParsed, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
+    RustConstructor, RustOptions, RustParsed, RustProfile, SCHEMA_VERSION, SafetyEnvelope,
+    UnicodeVersion,
 };
 
 pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseError> {
@@ -85,13 +86,17 @@ fn enforce_high_level_size_limit(
         CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => rust,
         CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
     };
-    let RustConstructor::RegexBuilder {
-        size_limit,
-        dfa_size_limit,
-        ..
-    } = rust.constructor
-    else {
-        return Ok(());
+    let (size_limit, dfa_size_limit) = match rust.constructor {
+        RustConstructor::RegexBuilder {
+            size_limit,
+            dfa_size_limit,
+            ..
+        } => (size_limit, dfa_size_limit),
+        // A set builder applies this limit once to its combined capture-free
+        // NFA in `validate_rust_bytes_set`, never to a constituent pattern.
+        RustConstructor::RegexSetBuilder { .. } | RustConstructor::RebarMeta { .. } => {
+            return Ok(());
+        }
     };
     let limit = usize::try_from(size_limit).map_err(|_| {
         ParseError::new(
@@ -137,6 +142,95 @@ fn enforce_high_level_size_limit(
         })
 }
 
+/// Validate the pinned high-level Rust bytes set constructor as one combined
+/// capture-free program.
+///
+/// Callers must first parse every constituent pattern through [`crate::parse`]
+/// so FRE's syntax safety envelope and indexed diagnostics remain the first
+/// boundary. This function then reproduces the pinned `regex` 1.12.4
+/// `bytes::RegexSetBuilder` meta construction, including its combined NFA
+/// size limit and capture erasure.
+///
+/// Non-high-level profiles have no corresponding set-constructor contract and
+/// are left unchanged.
+///
+/// # Errors
+///
+/// Returns the pinned compiled-too-big category for a combined NFA limit, or
+/// an upstream syntax category if the already-parsed inputs unexpectedly fail
+/// during the independent combined construction.
+pub fn validate_rust_bytes_set(
+    patterns: &[String],
+    profile: &RustProfile,
+) -> Result<(), ParseError> {
+    let compatibility = CompatibilityProfile::RustBytes(profile.clone());
+    validate_rust_configuration(&compatibility, &profile.options)?;
+    let RustConstructor::RegexSetBuilder {
+        size_limit,
+        dfa_size_limit,
+        ..
+    } = profile.constructor
+    else {
+        return Ok(());
+    };
+    let size_limit = usize::try_from(size_limit).map_err(|_| {
+        ParseError::new(
+            compatibility.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "the high-level Rust regex set size limit does not fit this target",
+        )
+    })?;
+    let dfa_size_limit = usize::try_from(dfa_size_limit).map_err(|_| {
+        ParseError::new(
+            compatibility.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "the high-level Rust regex set DFA size limit does not fit this target",
+        )
+    })?;
+    let options = &profile.options;
+    let meta_config = meta::Config::new()
+        .nfa_size_limit(Some(size_limit))
+        .hybrid_cache_capacity(dfa_size_limit)
+        .match_kind(MatchKind::All)
+        .utf8_empty(false)
+        .which_captures(WhichCaptures::None)
+        .line_terminator(options.line_terminator);
+    let syntax_config = syntax::Config::new()
+        .case_insensitive(options.case_insensitive)
+        .multi_line(options.multi_line)
+        .dot_matches_new_line(options.dot_matches_new_line)
+        .crlf(options.crlf)
+        .line_terminator(options.line_terminator)
+        .swap_greed(options.swap_greed)
+        .ignore_whitespace(options.ignore_whitespace)
+        .unicode(options.unicode)
+        .utf8(false)
+        .nest_limit(options.nest_limit)
+        .octal(options.octal);
+    meta::Builder::new()
+        .configure(meta_config)
+        .syntax(syntax_config)
+        .build_many(patterns)
+        .map(|_| ())
+        .map_err(|error| {
+            if let Some(limit) = error.size_limit() {
+                ParseError::new(
+                    compatibility,
+                    ErrorCategory::UpstreamRustCompiledTooBig {
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    },
+                    format!("Compiled regex exceeds size limit of {limit} bytes."),
+                )
+            } else {
+                ParseError::new(
+                    compatibility,
+                    ErrorCategory::UpstreamRustSyntax,
+                    error.to_string(),
+                )
+            }
+        })
+}
+
 fn rebar_options_match_runner_surface(options: &RustOptions) -> bool {
     let exposed = RustOptions {
         unicode: options.unicode,
@@ -157,6 +251,15 @@ fn validate_rust_configuration(
     let supported_constructor = match (&rust.constructor, profile) {
         (
             RustConstructor::RegexBuilder {
+                size_limit,
+                dfa_size_limit,
+                text_syntax_utf8,
+                bytes_syntax_utf8,
+                text_utf8_empty,
+                bytes_utf8_empty,
+                match_kind: crate::RustMatchKind::LeftmostFirst,
+            }
+            | RustConstructor::RegexSetBuilder {
                 size_limit,
                 dfa_size_limit,
                 text_syntax_utf8,

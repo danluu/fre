@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 3;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 4;
 
 /// Complete construction limits for one portable Rust-byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +77,9 @@ pub enum PortableRegexSetBuildError {
         index: usize,
         source: BuildError,
     },
+    CombinedConstructor {
+        source: fre_syntax::ParseError,
+    },
     ArithmeticOverflow {
         computation: &'static str,
     },
@@ -109,6 +112,12 @@ impl fmt::Display for PortableRegexSetBuildError {
             Self::Pattern { index, source } => {
                 write!(f, "portable regex set pattern {index} failed: {source}")
             }
+            Self::CombinedConstructor { source } => {
+                write!(
+                    f,
+                    "portable regex set combined construction failed: {source}"
+                )
+            }
             Self::ArithmeticOverflow { computation } => {
                 write!(f, "portable regex set overflow computing {computation}")
             }
@@ -120,6 +129,7 @@ impl std::error::Error for PortableRegexSetBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Pattern { source, .. } => Some(source),
+            Self::CombinedConstructor { source } => Some(source),
             _ => None,
         }
     }
@@ -139,7 +149,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     pub fn new(patterns: &'a [String]) -> Self {
         Self {
             patterns,
-            profile: RustProfile::default(),
+            profile: RustProfile::regex_set_1_12_4(),
             limits: PortableRegexSetBuildLimits::default(),
         }
     }
@@ -147,7 +157,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// Select the complete pinned Rust release and builder-option identity.
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
-        self.profile = profile;
+        self.profile = profile.into_regex_set_builder();
         self
     }
 
@@ -232,6 +242,23 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set the pinned high-level set builder's approximate compiled-regex
+    /// limit for the combined capture-free program.
+    ///
+    /// Unlike a single-pattern builder, this limit is evaluated once across
+    /// every pattern after each constituent passes FRE's syntax and plan
+    /// admission. It is never approximated as an independent per-pattern
+    /// limit.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexSetBuilder { size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
+        self
+    }
+
     /// Set the pinned high-level builder's lazy-DFA cache capacity identity
     /// for every pattern.
     ///
@@ -242,7 +269,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// is left unchanged.
     #[must_use]
     pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
-        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+        if let fre_syntax::RustConstructor::RegexSetBuilder { dfa_size_limit, .. } =
             &mut self.profile.constructor
         {
             *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -339,7 +366,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
             )?;
 
             let regex = PortableBuilder::new(pattern.as_str())
-                .profile(self.profile.clone())
+                .set_constituent_profile(self.profile.clone())
                 .limits(self.limits.pattern)
                 .build()
                 .map_err(|source| PortableRegexSetBuildError::Pattern { index, source })?;
@@ -373,6 +400,9 @@ impl<'a> PortableRegexSetBuilder<'a> {
             patterns.push(owned_pattern);
             regexes.push(regex);
         }
+
+        fre_syntax::validate_rust_bytes_set(self.patterns, &self.profile)
+            .map_err(|source| PortableRegexSetBuildError::CombinedConstructor { source })?;
 
         let source_capacity_bytes = checked_add(
             source_slot_capacity,
