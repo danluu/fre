@@ -32,6 +32,11 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_regex_capture_names",
     "bytes_regex_captures_len",
     "bytes_regex_static_captures_len",
+    "bytes_regex_capture_locations",
+    "bytes_regex_locations_alias",
+    "bytes_capture_locations_get",
+    "bytes_capture_locations_len",
+    "bytes_capture_locations_pos_alias",
     "misc_capture_names",
 ];
 
@@ -44,7 +49,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 17);
+    assert_eq!(UPSTREAM_API_IDS.len(), 22);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 5);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 4);
 }
@@ -284,6 +289,88 @@ fn static_capture_cardinality_matches_every_pinned_doctest_shape() {
             upstream.static_captures_len(),
             "{pattern:?}"
         );
+    }
+}
+
+#[test]
+fn fresh_capture_location_buffers_match_pinned_bytes_metadata() {
+    let dfa_limits = BuildLimits {
+        packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+            max_patterns: 0,
+            ..fre_kernels::PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let cases = [
+        (
+            "exact literal",
+            PlanKind::ExactLiteral,
+            PortableBuilder::new("(?P<literal>Sherlock)")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            "finite language DFA",
+            PlanKind::LiteralSetDfa,
+            PortableBuilder::new("(?P<first>foobar)|foobaz|(?P<third>fooquux)")
+                .unicode(false)
+                .limits(dfa_limits)
+                .build(),
+        ),
+        (
+            "required literal",
+            PlanKind::RequiredLiteral,
+            PortableBuilder::new("(?P<run>[a-z]+)Z")
+                .unicode(false)
+                .build(),
+        ),
+        (
+            "Unicode word run",
+            PlanKind::UnicodeWordRun,
+            PortableBuilder::new(r"(?P<word>\b\w{2,}\b)").build(),
+        ),
+        (
+            "generic K0",
+            PlanKind::K0,
+            PortableBuilder::new("((?:ab)+)")
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build(),
+        ),
+    ];
+
+    for (name, expected_plan, fre) in cases {
+        let fre = fre.unwrap_or_else(|error| panic!("failed to build {name}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(fre.as_str())
+            .unicode(matches!(expected_plan, PlanKind::UnicodeWordRun))
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {name}: {error}"));
+        assert_eq!(fre.build_report().plan, expected_plan, "{name}");
+
+        let actual = fre.capture_locations();
+        let alias: fre::PortableLocations = fre.locations();
+        let expected = upstream.capture_locations();
+        assert_eq!(actual.len(), fre.captures_len(), "{name}");
+        assert_eq!(actual.len(), expected.len(), "{name}");
+        assert_eq!(alias.len(), expected.len(), "{name}");
+
+        for index in 0..expected.len() {
+            assert_eq!(actual.get(index), expected.get(index), "{name}, {index}");
+            assert_eq!(actual.pos(index), expected.pos(index), "{name}, {index}");
+            assert_eq!(
+                alias.get(index),
+                expected.get(index),
+                "alias {name}, {index}"
+            );
+        }
+        for index in [expected.len(), usize::MAX] {
+            assert_eq!(actual.get(index), expected.get(index), "{name}, {index}");
+            assert_eq!(actual.pos(index), expected.pos(index), "{name}, {index}");
+        }
+
+        let cloned = actual.clone();
+        assert_eq!(cloned.len(), actual.len(), "clone {name}");
+        assert_eq!(format!("{cloned:?}"), format!("{actual:?}"), "clone {name}");
     }
 }
 

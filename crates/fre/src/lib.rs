@@ -1809,6 +1809,52 @@ impl<'r> Iterator for PortableCaptureNames<'r> {
 impl ExactSizeIterator for PortableCaptureNames<'_> {}
 impl core::iter::FusedIterator for PortableCaptureNames<'_> {}
 
+/// Reusable byte offsets for every capture slot in a portable regex.
+///
+/// A newly allocated buffer contains no matched locations. Its cardinality is
+/// nevertheless fixed by the regex and includes the implicit whole-match slot
+/// at index zero. This is the allocation and metadata half of the pinned Rust
+/// bytes `CaptureLocations` contract; capture-reading execution will populate
+/// the same buffer type when that API is admitted.
+#[derive(Clone, Debug)]
+pub struct PortableCaptureLocations {
+    slots: Box<[Option<(usize, usize)>]>,
+}
+
+/// Compatibility alias mirroring the pinned bytes API's legacy `Locations`.
+#[doc(hidden)]
+pub type PortableLocations = PortableCaptureLocations;
+
+#[allow(
+    clippy::len_without_is_empty,
+    reason = "the pinned buffer always has the implicit whole-match slot and exposes len without is_empty"
+)]
+impl PortableCaptureLocations {
+    /// Return the matched byte offsets for capture slot `index`.
+    ///
+    /// A fresh buffer and an unmatched slot both return `None`. An index that
+    /// is not a capture slot also returns `None`.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<(usize, usize)> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    /// Return the fixed number of capture slots represented by this buffer.
+    ///
+    /// This is always at least one because slot zero is the whole match.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Compatibility alias mirroring the pinned bytes API's legacy `pos`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pos(&self, index: usize) -> Option<(usize, usize)> {
+        self.get(index)
+    }
+}
+
 impl Clone for PortableRegex {
     /// Rebuild an equivalent immutable matcher under its original profile,
     /// limits, and planner-selection contract.
@@ -1949,6 +1995,24 @@ impl PortableRegex {
     #[must_use]
     pub const fn static_captures_len(&self) -> Option<usize> {
         self.report.static_captures_len
+    }
+
+    /// Allocate fresh reusable locations for every capture slot.
+    ///
+    /// The returned buffer has the same fixed cardinality as
+    /// [`Self::captures_len`] and initially contains no matched offsets.
+    #[must_use]
+    pub fn capture_locations(&self) -> PortableCaptureLocations {
+        PortableCaptureLocations {
+            slots: vec![None; self.captures_len()].into_boxed_slice(),
+        }
+    }
+
+    /// Compatibility alias mirroring the pinned bytes API's legacy method.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn locations(&self) -> PortableCaptureLocations {
+        self.capture_locations()
     }
 
     /// The immutable compatibility profile used during parsing.
