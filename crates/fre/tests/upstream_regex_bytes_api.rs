@@ -25,6 +25,9 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "try_from_string",
     "bytes_match_len",
     "bytes_match_range",
+    "bytes_match_as_bytes",
+    "bytes_match_into_bytes",
+    "bytes_match_into_range",
     "bytes_regex_capture_names",
     "bytes_regex_captures_len",
     "bytes_regex_static_captures_len",
@@ -40,7 +43,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 13);
+    assert_eq!(UPSTREAM_API_IDS.len(), 16);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 5);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 3);
 }
@@ -382,11 +385,15 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
             upstream.unwrap_or_else(|error| panic!("pinned regex rejected {name}: {error}"));
         assert_eq!(fre.build_report().plan, expected_plan, "{name}");
 
-        let actual = fre
+        let (actual, offset_accounting) = fre
             .find(haystack, fre::SearchLimits::unlimited())
-            .unwrap_or_else(|error| panic!("FRE search failed for {name}: {error}"))
-            .0
-            .unwrap_or_else(|| panic!("FRE found no match for {name}"));
+            .unwrap_or_else(|error| panic!("FRE search failed for {name}: {error}"));
+        let actual = actual.unwrap_or_else(|| panic!("FRE found no match for {name}"));
+        let (borrowed, borrowed_accounting) = fre
+            .find_borrowed(haystack, fre::SearchLimits::unlimited())
+            .unwrap_or_else(|error| panic!("FRE borrowed search failed for {name}: {error}"));
+        let borrowed =
+            borrowed.unwrap_or_else(|| panic!("FRE borrowed search found no match for {name}"));
         let expected = upstream
             .find(haystack)
             .unwrap_or_else(|| panic!("pinned regex found no match for {name}"));
@@ -397,6 +404,18 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
         assert_eq!(actual.len(), expected.len(), "{name}");
         assert_eq!(actual.range(), expected.range(), "{name}");
         assert_eq!(&haystack[actual.range()], expected.as_bytes(), "{name}");
+
+        assert_eq!(borrowed.start(), expected.start(), "{name}");
+        assert_eq!(borrowed.end(), expected.end(), "{name}");
+        assert_eq!(borrowed.is_empty(), expected.is_empty(), "{name}");
+        assert_eq!(borrowed.len(), expected.len(), "{name}");
+        assert_eq!(borrowed.range(), expected.range(), "{name}");
+        assert_eq!(borrowed.as_bytes(), expected.as_bytes(), "{name}");
+        let borrowed_bytes: &[u8] = borrowed.into();
+        let borrowed_range: core::ops::Range<usize> = borrowed.into();
+        assert_eq!(borrowed_bytes, expected.as_bytes(), "{name}");
+        assert_eq!(borrowed_range, expected.range(), "{name}");
+        assert_eq!(borrowed_accounting, offset_accounting, "{name}");
     }
 }
 

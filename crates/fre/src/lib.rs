@@ -229,6 +229,68 @@ impl Match {
     }
 }
 
+/// A byte match that retains the exact original haystack it was selected from.
+///
+/// [`Match`] remains the small offset-only value used by accounting-oriented
+/// APIs. This companion preserves the pinned Rust bytes API's borrowed-match
+/// contract, including direct access to the matched bytes and lossless
+/// conversion to either the bytes or their original range.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ByteMatch<'h> {
+    haystack: &'h [u8],
+    span: Match,
+}
+
+impl<'h> ByteMatch<'h> {
+    /// Inclusive byte start in the original haystack.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.span.start()
+    }
+
+    /// Exclusive byte end in the original haystack.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.span.end()
+    }
+
+    /// Whether the selected match consumed no bytes.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.span.is_empty()
+    }
+
+    /// Number of matched bytes.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.span.len()
+    }
+
+    /// Half-open byte range in the original haystack.
+    #[must_use]
+    pub const fn range(self) -> core::ops::Range<usize> {
+        self.span.range()
+    }
+
+    /// The exact bytes selected from the original haystack.
+    #[must_use]
+    pub fn as_bytes(&self) -> &'h [u8] {
+        &self.haystack[self.span.range()]
+    }
+}
+
+impl<'h> From<ByteMatch<'h>> for &'h [u8] {
+    fn from(matched: ByteMatch<'h>) -> Self {
+        matched.as_bytes()
+    }
+}
+
+impl From<ByteMatch<'_>> for core::ops::Range<usize> {
+    fn from(matched: ByteMatch<'_>) -> Self {
+        matched.range()
+    }
+}
+
 /// Auditable construction facts for one portable plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildReport {
@@ -1974,6 +2036,25 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return the profile-selected leftmost-first match while retaining the
+    /// exact original haystack.
+    ///
+    /// This is the borrowed-byte companion to [`Self::find`]. It preserves the
+    /// same selected span and execution accounting, while [`ByteMatch`]
+    /// supplies the pinned Rust bytes match accessors and conversions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if scratch/work limits refuse the operation.
+    pub fn find_borrowed<'h>(
+        &self,
+        haystack: &'h [u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<ByteMatch<'h>>, SearchAccounting), SearchError> {
+        let (matched, accounting) = self.find(haystack, limits)?;
+        Ok((matched.map(|span| ByteMatch { haystack, span }), accounting))
     }
 
     /// Iterate over every non-overlapping match with Rust bytes empty-match
