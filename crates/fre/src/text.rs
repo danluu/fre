@@ -562,6 +562,81 @@ mod tests {
     }
 
     #[test]
+    fn normalized_nullable_atom_repetitions_match_complete_text_iteration() {
+        fn spans(regex: &PortableTextRegex, haystack: &str) -> Vec<(usize, usize)> {
+            let mut spans = Vec::new();
+            let mut start = 0;
+            let mut last_match_end = None;
+            loop {
+                let (matched, _) = regex
+                    .find_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .expect("normalized nullable text search executes");
+                let Some(matched) = matched else {
+                    break;
+                };
+                if matched.is_empty() && last_match_end == Some(matched.end()) {
+                    let Some(character) = haystack[start..].chars().next() else {
+                        break;
+                    };
+                    start = start.saturating_add(character.len_utf8());
+                    continue;
+                }
+                spans.push((matched.start(), matched.end()));
+                start = matched.end();
+                last_match_end = Some(matched.end());
+            }
+            spans
+        }
+
+        let patterns = [
+            "(a*)*",
+            "(a*)+",
+            "([ab]*)*",
+            "([^b]*)*",
+            "X(.?){0,}Y",
+            "X(.?){8,}Y",
+            "(?:(?:.?)*?)=",
+            "(?:(?:.?)*)=",
+        ];
+        let haystacks = [
+            "",
+            "a",
+            "aaaaaax",
+            "ababab",
+            "aaaabcde",
+            "X1234567Y",
+            "a=b=c",
+            "🦀=東京=",
+        ];
+        for pattern in patterns {
+            let fre = PortableTextRegex::new(pattern)
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+            let lowering = fre
+                .build_report()
+                .portable
+                .lowering
+                .expect("normalized nullable shape selects K0");
+            assert_eq!(lowering.normalized_nullable_repetitions(), 1);
+            let upstream = regex::Regex::new(pattern).expect("pinned Rust text accepts fixture");
+            for haystack in haystacks {
+                let expected = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    spans(&fre, haystack),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn utf8_safe_repetition_is_proved_and_unproved_shapes_are_refused() {
         let repeated = PortableTextRegex::new("a+").expect("positive UTF-8 repetition is proved");
         assert_eq!(
