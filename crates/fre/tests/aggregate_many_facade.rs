@@ -337,6 +337,62 @@ fn complete_spans_enforce_output_admission_before_publication() {
     ));
 }
 
+#[test]
+fn complete_spans_publish_an_exact_operation_specific_scratch_limit() {
+    let values = patterns(&["ab", "a"]);
+    let baseline = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_spans()
+        .unwrap();
+    let scratch_bytes = baseline.build_report().composition.scratch_bytes;
+    assert!(scratch_bytes > 0);
+    assert_eq!(
+        0,
+        baseline
+            .build_report()
+            .composition
+            .literal_view_capacity_bytes
+    );
+
+    let exact_limits = AggregateManyBuildLimits {
+        max_composition_scratch_bytes: scratch_bytes,
+        ..AggregateManyBuildLimits::default()
+    };
+    let exact = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .limits(exact_limits)
+        .build_spans()
+        .unwrap();
+    assert_eq!(
+        scratch_bytes,
+        exact.build_report().composition.scratch_bytes
+    );
+
+    let below_limits = AggregateManyBuildLimits {
+        max_composition_scratch_bytes: scratch_bytes - 1,
+        ..AggregateManyBuildLimits::default()
+    };
+    assert!(matches!(
+        AggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(below_limits)
+            .build_spans(),
+        Err(AggregateManyBuildError::CompositionScratchLimit {
+            needed,
+            limit
+        }) if needed == scratch_bytes && limit == scratch_bytes - 1
+    ));
+
+    assert!(matches!(
+        AggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(exact_limits)
+            .build_count(),
+        Err(AggregateManyBuildError::CompositionScratchLimit { needed, limit })
+            if needed > limit && limit == scratch_bytes
+    ));
+}
+
 fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
     let mut all = vec![Vec::new()];
     let mut frontier = vec![Vec::new()];

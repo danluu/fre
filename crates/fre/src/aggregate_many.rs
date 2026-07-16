@@ -603,11 +603,19 @@ impl<'a> AggregateManyBuilder<'a> {
                 computation: "logical HIR vector bytes",
             },
         )?;
-        let logical_literal_view_bytes = count.checked_mul(size_of::<&[u8]>()).ok_or(
-            AggregateManyBuildError::ArithmeticOverflow {
-                computation: "logical literal-view bytes",
-            },
-        )?;
+        // Complete spans always use the continuation engine. They never build
+        // the temporary ordered-literal view vector, so charging that vector
+        // here would make the published exact scratch requirement unusable as
+        // a construction limit.
+        let logical_literal_view_bytes = if operation == AggregateManyOperation::Spans {
+            0
+        } else {
+            count.checked_mul(size_of::<&[u8]>()).ok_or(
+                AggregateManyBuildError::ArithmeticOverflow {
+                    computation: "logical literal-view bytes",
+                },
+            )?
+        };
         let logical_scratch = logical_hir_bytes
             .checked_add(logical_literal_view_bytes)
             .ok_or(AggregateManyBuildError::ArithmeticOverflow {
