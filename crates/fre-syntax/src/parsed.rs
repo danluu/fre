@@ -24,6 +24,12 @@ impl PatternBytes {
         &self.0
     }
 
+    /// Consume this source identity without copying its retained bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
     /// Exact retained byte capacity of this owned source identity.
     #[must_use]
     pub fn capacity_bytes(&self) -> usize {

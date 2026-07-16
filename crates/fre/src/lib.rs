@@ -128,7 +128,7 @@ pub use fre_automata::{
 pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 1;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 2;
 
 /// Construction limits whose identities affect admission or lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +217,8 @@ pub struct BuildReport {
     pub edges: usize,
     /// Immutable logical table payload bytes.
     pub plan_storage_bytes: usize,
+    /// Exact retained bytes for the original pattern source.
+    pub source_storage_bytes: usize,
     /// Exact minimum bytes consumed by any match, or `None` if the HIR's
     /// language is empty. This is preserved for future aggregate routing.
     pub minimum_match_bytes: Option<usize>,
@@ -637,6 +639,12 @@ impl PortableBuilder {
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
         let parsed = fre_syntax::parse(request)?;
+        let source = String::from_utf8(parsed.key.pattern.into_bytes())
+            .map_err(|_| {
+                BuildError::InternalInvariant("Rust parse retained a non-UTF-8 source pattern")
+            })?
+            .into_boxed_str();
+        let source_storage_bytes = source.len();
         let admission = parsed.admission_status;
         let syntax = parsed.summary;
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
@@ -654,6 +662,7 @@ impl PortableBuilder {
                 .with_line_terminator(self.profile.options.line_terminator);
             let plan = automaton.stats();
             return Ok(PortableRegex {
+                source,
                 plan: PortablePlan::K0(automaton),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -667,6 +676,7 @@ impl PortableBuilder {
                     states: plan.states(),
                     edges: plan.edges(),
                     plan_storage_bytes: plan.storage_bytes(),
+                    source_storage_bytes,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
@@ -677,6 +687,7 @@ impl PortableBuilder {
             && let Some(plan) = unicode_word_run::extract(&rust.hir)
         {
             return Ok(PortableRegex {
+                source,
                 plan: PortablePlan::UnicodeWordRun(plan),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -690,6 +701,7 @@ impl PortableBuilder {
                     states: 0,
                     edges: 0,
                     plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
+                    source_storage_bytes,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
@@ -714,6 +726,7 @@ impl PortableBuilder {
                     .map_err(BuildError::ForwardAnchored)?;
                     let build = plan.build_accounting();
                     return Ok(PortableRegex {
+                        source,
                         plan: PortablePlan::ForwardEndFixed(plan),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -727,6 +740,7 @@ impl PortableBuilder {
                             states: 0,
                             edges: 0,
                             plan_storage_bytes: build.persistent_bytes,
+                            source_storage_bytes,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: Some(build),
@@ -742,6 +756,7 @@ impl PortableBuilder {
                     Ok(plan) => {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
+                            source,
                             plan: PortablePlan::ForwardAnchored(plan),
                             profile: profile.clone(),
                             limits: self.limits,
@@ -755,6 +770,7 @@ impl PortableBuilder {
                                 states: 0,
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
+                                source_storage_bytes,
                                 minimum_match_bytes,
                                 required_literal: None,
                                 forward_anchored: Some(build),
@@ -785,6 +801,7 @@ impl PortableBuilder {
                     Ok(plan) => {
                         let build = plan.build_accounting();
                         return Ok(PortableRegex {
+                            source,
                             plan: PortablePlan::RequiredLiteral(plan),
                             profile: profile.clone(),
                             limits: self.limits,
@@ -798,6 +815,7 @@ impl PortableBuilder {
                                 states: 0,
                                 edges: 0,
                                 plan_storage_bytes: build.persistent_bytes,
+                                source_storage_bytes,
                                 minimum_match_bytes,
                                 required_literal: Some(build),
                                 forward_anchored: None,
@@ -825,6 +843,7 @@ impl PortableBuilder {
                 let literal = LiteralPlan::new(&words[0], self.limits.literal)?;
                 let storage = literal.storage_bytes();
                 return Ok(PortableRegex {
+                    source,
                     plan: PortablePlan::ExactLiteral(literal),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -838,6 +857,7 @@ impl PortableBuilder {
                         states: 0,
                         edges: 0,
                         plan_storage_bytes: storage,
+                        source_storage_bytes,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
@@ -850,6 +870,7 @@ impl PortableBuilder {
                 {
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
+                        source,
                         plan: PortablePlan::PackedLiteralSet(packed),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -863,6 +884,7 @@ impl PortableBuilder {
                             states: 0,
                             edges: 0,
                             plan_storage_bytes: storage,
+                            source_storage_bytes,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: None,
@@ -872,6 +894,7 @@ impl PortableBuilder {
                 let literal_set = LiteralSetPlan::new(&words, self.limits.literal_set)?;
                 let storage = literal_set.build_accounting().persistent_bytes;
                 return Ok(PortableRegex {
+                    source,
                     plan: PortablePlan::LiteralSetDfa(literal_set),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -885,6 +908,7 @@ impl PortableBuilder {
                         states: 0,
                         edges: 0,
                         plan_storage_bytes: storage,
+                        source_storage_bytes,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
@@ -900,6 +924,7 @@ impl PortableBuilder {
             .with_line_terminator(self.profile.options.line_terminator);
         let plan = automaton.stats();
         Ok(PortableRegex {
+            source,
             plan: PortablePlan::K0(automaton),
             profile: profile.clone(),
             limits: self.limits,
@@ -913,6 +938,7 @@ impl PortableBuilder {
                 states: plan.states(),
                 edges: plan.edges(),
                 plan_storage_bytes: plan.storage_bytes(),
+                source_storage_bytes,
                 minimum_match_bytes,
                 required_literal: None,
                 forward_anchored: None,
@@ -922,12 +948,53 @@ impl PortableBuilder {
 }
 
 /// Immutable, shareable matcher for the certified capture-free byte subset.
-#[derive(Debug)]
 pub struct PortableRegex {
+    source: Box<str>,
     plan: PortablePlan,
     profile: CompatibilityProfile,
     limits: BuildLimits,
     report: BuildReport,
+}
+
+impl fmt::Display for PortableRegex {
+    /// Show the original regular expression source.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for PortableRegex {
+    /// Show the original source under the facade's honest public type name.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PortableRegex")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl core::str::FromStr for PortableRegex {
+    type Err = BuildError;
+
+    fn from_str(pattern: &str) -> Result<Self, Self::Err> {
+        Self::new(pattern)
+    }
+}
+
+impl TryFrom<&str> for PortableRegex {
+    type Error = BuildError;
+
+    fn try_from(pattern: &str) -> Result<Self, Self::Error> {
+        Self::new(pattern)
+    }
+}
+
+impl TryFrom<String> for PortableRegex {
+    type Error = BuildError;
+
+    fn try_from(pattern: String) -> Result<Self, Self::Error> {
+        Self::new(pattern)
+    }
 }
 
 #[derive(Debug)]
@@ -966,6 +1033,12 @@ impl PortableRegex {
     /// [`PortableBuilder::build`].
     pub fn new(pattern: impl Into<String>) -> Result<Self, BuildError> {
         PortableBuilder::new(pattern).build()
+    }
+
+    /// Return the original pattern source exactly as supplied at construction.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.source
     }
 
     /// The immutable compatibility profile used during parsing.
