@@ -105,7 +105,9 @@ fn validate_rust_configuration(
             _,
         ) => {
             *size_limit == 10 * (1 << 20)
-                && *dfa_size_limit == 2 * (1 << 20)
+                // The upstream public option accepts any `usize` and only
+                // changes lazy-DFA cache behavior, not parser semantics.
+                && usize::try_from(*dfa_size_limit).is_ok()
                 && *text_syntax_utf8
                 && !*bytes_syntax_utf8
                 && *text_utf8_empty

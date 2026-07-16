@@ -1206,6 +1206,18 @@ impl PortableBuilder {
         self
     }
 
+    /// Set CRLF mode for the complete pattern before parsing.
+    ///
+    /// This makes both carriage return and line feed line terminators for
+    /// dot and multiline assertions. Inline `R` flag groups may still
+    /// override this setting locally, just as they do in the pinned Rust
+    /// bytes builder.
+    #[must_use]
+    pub fn crlf(mut self, enabled: bool) -> Self {
+        self.profile.options.crlf = enabled;
+        self
+    }
+
     /// Swap greedy and lazy repetition semantics before parsing.
     ///
     /// Inline `U` flag groups may still override this setting locally, just as
@@ -1242,6 +1254,24 @@ impl PortableBuilder {
     #[must_use]
     pub fn line_terminator(mut self, line_terminator: u8) -> Self {
         self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
+    /// Set the pinned high-level builder's lazy-DFA cache capacity identity.
+    ///
+    /// FRE's portable plans do not use the upstream lazy-DFA cache, so this
+    /// option cannot weaken their independently checked construction and
+    /// execution limits. It is nevertheless retained in the compatibility
+    /// profile exactly because it is part of the public Rust bytes builder
+    /// configuration. The distinct direct-Rebar constructor profile has no
+    /// corresponding high-level option and is left unchanged.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 

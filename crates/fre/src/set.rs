@@ -183,6 +183,16 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Set CRLF mode for every pattern before parsing.
+    ///
+    /// Inline `R` flag groups may still override this setting locally, just
+    /// as they do in the pinned Rust bytes set builder.
+    #[must_use]
+    pub fn crlf(mut self, enabled: bool) -> Self {
+        self.profile.options.crlf = enabled;
+        self
+    }
+
     /// Swap greedy and lazy repetition semantics before parsing every pattern.
     ///
     /// Inline `U` flag groups may still override this setting locally, just as
@@ -219,6 +229,24 @@ impl<'a> PortableRegexSetBuilder<'a> {
     #[must_use]
     pub fn line_terminator(mut self, line_terminator: u8) -> Self {
         self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
+    /// Set the pinned high-level builder's lazy-DFA cache capacity identity
+    /// for every pattern.
+    ///
+    /// FRE's portable plans do not use this upstream cache. Each constituent
+    /// matcher still retains the configured value while enforcing FRE's
+    /// independent construction and execution limits. The distinct direct-
+    /// Rebar constructor profile has no corresponding high-level option and
+    /// is left unchanged.
+    #[must_use]
+    pub fn dfa_size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { dfa_size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *dfa_size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 
