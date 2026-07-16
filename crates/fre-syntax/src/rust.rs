@@ -1,3 +1,4 @@
+use regex_automata::{MatchKind, meta};
 use regex_syntax::{
     ParserBuilder,
     hir::{Class, Hir, HirKind},
@@ -58,6 +59,7 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
             record
         }
     })?;
+    enforce_high_level_size_limit(&hir, &profile, options)?;
     let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
     let summary = summarize_hir(&hir, source_bytes, &profile, admission, safety)?;
     Ok(ParseRecord {
@@ -72,6 +74,67 @@ pub(crate) fn parse_rust(request: ParseRequest) -> Result<ParseRecord, ParseErro
         summary,
         pattern: CanonicalPattern::Rust(RustParsed { hir }),
     })
+}
+
+fn enforce_high_level_size_limit(
+    hir: &Hir,
+    profile: &CompatibilityProfile,
+    options: &RustOptions,
+) -> Result<(), ParseError> {
+    let rust = match profile {
+        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => rust,
+        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+    };
+    let RustConstructor::RegexBuilder {
+        size_limit,
+        dfa_size_limit,
+        ..
+    } = rust.constructor
+    else {
+        return Ok(());
+    };
+    let limit = usize::try_from(size_limit).map_err(|_| {
+        ParseError::new(
+            profile.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "the high-level Rust regex size limit does not fit this target",
+        )
+    })?;
+    let dfa_size_limit = usize::try_from(dfa_size_limit).map_err(|_| {
+        ParseError::new(
+            profile.clone(),
+            ErrorCategory::InvalidConfiguration,
+            "the high-level Rust regex DFA size limit does not fit this target",
+        )
+    })?;
+    let utf8_empty = matches!(profile, CompatibilityProfile::RustText(_));
+    let config = meta::Config::new()
+        .nfa_size_limit(Some(limit))
+        .hybrid_cache_capacity(dfa_size_limit)
+        .match_kind(MatchKind::LeftmostFirst)
+        .utf8_empty(utf8_empty)
+        .line_terminator(options.line_terminator);
+    meta::Builder::new()
+        .configure(config)
+        .build_from_hir(hir)
+        .map(|_| ())
+        .map_err(|error| {
+            if let Some(limit) = error.size_limit() {
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::UpstreamRustCompiledTooBig {
+                        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                    },
+                    format!("Compiled regex exceeds size limit of {limit} bytes."),
+                )
+            } else {
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::UpstreamRustSyntax,
+                    error.to_string(),
+                )
+            }
+        })
 }
 
 fn rebar_options_match_runner_surface(options: &RustOptions) -> bool {
@@ -104,9 +167,10 @@ fn validate_rust_configuration(
             },
             _,
         ) => {
-            *size_limit == 10 * (1 << 20)
-                // The upstream public option accepts any `usize` and only
-                // changes lazy-DFA cache behavior, not parser semantics.
+            // Exact compiled-size admission is enforced after HIR parsing.
+            usize::try_from(*size_limit).is_ok()
+                // The DFA option accepts any `usize` and only changes lazy-
+                // DFA cache behavior, not constructor acceptance.
                 && usize::try_from(*dfa_size_limit).is_ok()
                 && *text_syntax_utf8
                 && !*bytes_syntax_utf8

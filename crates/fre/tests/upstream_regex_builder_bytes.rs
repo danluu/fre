@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    BuildError, CompatibilityProfile, PlanSelection, PortableBuilder, PortableRegexSetBuildError,
-    PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile, SearchLimits,
+    BuildError, BuildFailureClass, CompatibilityProfile, PlanSelection, PortableBuilder,
+    PortableRegexSetBuildError, PortableRegexSetBuilder, PortableRegexSetRunLimits, RustProfile,
+    SearchLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -18,6 +19,7 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_regex_builder_swap_greed",
     "bytes_regex_builder_ignore_whitespace",
     "bytes_regex_builder_octal",
+    "bytes_regex_builder_size_limit",
     "bytes_regex_builder_dfa_size_limit",
     "bytes_regex_builder_nest_limit",
 ];
@@ -29,7 +31,79 @@ fn authenticated_bytes_builder_flag_inventory_has_no_silent_omissions() {
     assert_eq!(profile.regex.checksum, UPSTREAM_PACKAGE_SHA256);
     assert_eq!(UPSTREAM_PATH, "src/builders.rs");
     assert_eq!(UPSTREAM_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 9);
+    assert_eq!(UPSTREAM_API_IDS.len(), 10);
+}
+
+#[test]
+fn size_limit_matches_pinned_compiled_nfa_admission_and_error_class() {
+    let mut upstream_example = regex::bytes::RegexBuilder::new(r"\w");
+    upstream_example.size_limit(45_000);
+    assert!(matches!(
+        upstream_example.build(),
+        Err(regex::Error::CompiledTooBig(45_000))
+    ));
+    let fre_example = PortableBuilder::new(r"\w")
+        .size_limit(45_000)
+        .build()
+        .expect_err("the pinned size-limit doctest pattern must be rejected before planning");
+    assert_eq!(
+        fre_example.failure_class(),
+        BuildFailureClass::ExpectedInvalid
+    );
+
+    let patterns = ["Sherlock", "a|ab", "(?:ab)+", "(?P<word>ab)"];
+    let limits = [0, 1, 64, 128, 256, 512, 1_024, 2_048, 8_192, 45_000];
+
+    for pattern in patterns {
+        for size_limit in limits {
+            let mut upstream = regex::bytes::RegexBuilder::new(pattern);
+            upstream.unicode(false).size_limit(size_limit);
+            let expected = upstream.build();
+            let actual = PortableBuilder::new(pattern)
+                .unicode(false)
+                .size_limit(size_limit)
+                .build();
+
+            assert_eq!(
+                actual.is_ok(),
+                expected.is_ok(),
+                "pattern={pattern:?}, size_limit={size_limit}, FRE={actual:?}, upstream={expected:?}"
+            );
+            match (actual, expected) {
+                (Ok(fre), Ok(_)) => {
+                    let CompatibilityProfile::RustBytes(profile) = fre.profile() else {
+                        panic!("portable bytes builder published a non-bytes profile");
+                    };
+                    let fre_syntax::RustConstructor::RegexBuilder {
+                        size_limit: retained,
+                        ..
+                    } = &profile.constructor
+                    else {
+                        panic!("configured builder lost its high-level constructor identity");
+                    };
+                    assert_eq!(*retained, u64::try_from(size_limit).unwrap_or(u64::MAX));
+                }
+                (Err(error), Err(regex::Error::CompiledTooBig(limit))) => {
+                    assert_eq!(limit, size_limit);
+                    assert_eq!(error.failure_class(), BuildFailureClass::ExpectedInvalid);
+                    let BuildError::Syntax(error) = error else {
+                        panic!(
+                            "compiled-too-big refusal did not originate in constructor admission"
+                        );
+                    };
+                    assert_eq!(
+                        error.category,
+                        fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig {
+                            limit: u64::try_from(size_limit).unwrap_or(u64::MAX),
+                        }
+                    );
+                }
+                (actual, expected) => panic!(
+                    "unexpected size-limit result for {pattern:?}/{size_limit}: FRE={actual:?}, upstream={expected:?}"
+                ),
+            }
+        }
+    }
 }
 
 #[test]
