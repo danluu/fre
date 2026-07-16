@@ -44,6 +44,8 @@ use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod performance_contract;
+
 /// Stable schema for deterministic semantic comparison reports.
 pub const REPORT_SCHEMA: &str = "fre.rebar.comparison.v2";
 /// Non-normative local timing-slice schema for exact-literal receipts.
