@@ -40,6 +40,7 @@ const UPSTREAM_DOCTEST_IDS: &[&str] = &[
     "owned_into_iter",
 ];
 const UPSTREAM_CALLER_BUFFER_IDS: &[&str] = &["matches_read_at", "read_matches_at"];
+const UPSTREAM_TRAIT_IDS: &[&str] = &["bytes_regex_set_debug"];
 
 fn sources(patterns: &[&str]) -> Vec<String> {
     patterns
@@ -75,9 +76,27 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
         UPSTREAM_CALLER_BUFFER_IDS,
         ["matches_read_at", "read_matches_at"]
     );
+    assert_eq!(UPSTREAM_TRAIT_IDS, ["bytes_regex_set_debug"]);
     assert_eq!(UPSTREAM_DOCTEST_IDS.len(), 18);
     assert_eq!(UPSTREAM_DOCTEST_IDS[0], "limitations_two_pass");
     assert_eq!(UPSTREAM_DOCTEST_IDS[17], "owned_into_iter");
+}
+
+#[test]
+fn debug_shows_only_original_patterns_like_the_pinned_bytes_set() {
+    let patterns = [r#"a"b"#, r"\n", "α", "duplicate", "duplicate"];
+    let fre = PortableRegexSet::new(patterns).expect("FRE debug pattern set");
+    let upstream = regex::bytes::RegexSet::new(patterns).expect("pinned debug pattern set");
+    let pinned = format!("{upstream:?}");
+    let pinned_pretty = format!("{upstream:#?}");
+    let expected = pinned.replacen("RegexSet", "PortableRegexSet", 1);
+    let expected_pretty = pinned_pretty.replacen("RegexSet", "PortableRegexSet", 1);
+
+    assert_eq!(format!("{fre:?}"), expected);
+    assert_eq!(format!("{fre:#?}"), expected_pretty);
+
+    let empty = PortableRegexSet::empty();
+    assert_eq!(format!("{empty:?}"), "PortableRegexSet([])");
 }
 
 #[test]

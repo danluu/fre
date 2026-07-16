@@ -383,11 +383,16 @@ impl<'a> PortableRegexSetBuilder<'a> {
 }
 
 /// Immutable set of independently admitted portable Rust-byte matchers.
-#[derive(Debug)]
 pub struct PortableRegexSet {
     patterns: Vec<String>,
     regexes: Vec<PortableRegex>,
     report: PortableRegexSetBuildReport,
+}
+
+impl fmt::Debug for PortableRegexSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "PortableRegexSet({:?})", self.patterns())
+    }
 }
 
 impl PortableRegexSet {
