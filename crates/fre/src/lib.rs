@@ -235,7 +235,7 @@ impl Match {
 /// APIs. This companion preserves the pinned Rust bytes API's borrowed-match
 /// contract, including direct access to the matched bytes and lossless
 /// conversion to either the bytes or their original range.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ByteMatch<'h> {
     haystack: &'h [u8],
     span: Match,
@@ -277,6 +277,62 @@ impl<'h> ByteMatch<'h> {
     pub fn as_bytes(&self) -> &'h [u8] {
         &self.haystack[self.span.range()]
     }
+}
+
+impl fmt::Debug for ByteMatch<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ByteMatch")
+            .field("start", &self.start())
+            .field("end", &self.end())
+            .field("bytes", &DebugMatchBytes(self.as_bytes()))
+            .finish()
+    }
+}
+
+/// Pinned Rust-regex debug escaping for a byte match's selected haystack.
+///
+/// Valid UTF-8 is formatted like a Rust string while each byte that cannot be
+/// decoded is emitted as a lower-case hexadecimal escape. Keeping this helper
+/// private avoids adding a formatting type to the public compatibility
+/// surface.
+struct DebugMatchBytes<'a>(&'a [u8]);
+
+impl fmt::Debug for DebugMatchBytes<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("\"")?;
+        let mut bytes = self.0;
+        while !bytes.is_empty() {
+            match core::str::from_utf8(bytes) {
+                Ok(valid) => {
+                    write_debug_match_str(formatter, valid)?;
+                    bytes = &[];
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    let valid = core::str::from_utf8(&bytes[..valid_up_to])
+                        .expect("UTF-8 error's valid prefix must decode");
+                    write_debug_match_str(formatter, valid)?;
+                    write!(formatter, r"\x{:02x}", bytes[valid_up_to])?;
+                    bytes = &bytes[valid_up_to.saturating_add(1)..];
+                }
+            }
+        }
+        formatter.write_str("\"")
+    }
+}
+
+fn write_debug_match_str(formatter: &mut fmt::Formatter<'_>, valid: &str) -> fmt::Result {
+    for character in valid.chars() {
+        match character {
+            '\0' => formatter.write_str("\\0")?,
+            '\u{1}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{19}' | '\u{7f}' => {
+                write!(formatter, "\\x{:02x}", u32::from(character))?;
+            }
+            _ => write!(formatter, "{}", character.escape_debug())?,
+        }
+    }
+    Ok(())
 }
 
 impl<'h> From<ByteMatch<'h>> for &'h [u8] {

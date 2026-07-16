@@ -28,6 +28,7 @@ const UPSTREAM_API_IDS: &[&str] = &[
     "bytes_match_as_bytes",
     "bytes_match_into_bytes",
     "bytes_match_into_range",
+    "bytes_match_debug",
     "bytes_regex_capture_names",
     "bytes_regex_captures_len",
     "bytes_regex_static_captures_len",
@@ -43,7 +44,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_BYTES_SHA256.len(), 64);
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
-    assert_eq!(UPSTREAM_API_IDS.len(), 16);
+    assert_eq!(UPSTREAM_API_IDS.len(), 17);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 5);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 3);
 }
@@ -416,6 +417,76 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
         assert_eq!(borrowed_bytes, expected.as_bytes(), "{name}");
         assert_eq!(borrowed_range, expected.range(), "{name}");
         assert_eq!(borrowed_accounting, offset_accounting, "{name}");
+    }
+}
+
+#[test]
+fn borrowed_match_debug_matches_pinned_utf8_and_byte_escaping() {
+    fn assert_debug(pattern: &str, unicode: bool, haystack: &[u8]) {
+        let fre = PortableBuilder::new(pattern)
+            .unicode(unicode)
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(unicode)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+
+        let (actual, _) = fre
+            .find_borrowed(haystack, fre::SearchLimits::unlimited())
+            .unwrap_or_else(|error| panic!("FRE search failed for {pattern:?}: {error}"));
+        let actual = actual.unwrap_or_else(|| panic!("FRE found no match for {pattern:?}"));
+        let expected = upstream
+            .find(haystack)
+            .unwrap_or_else(|| panic!("pinned regex found no match for {pattern:?}"));
+
+        let pinned = format!("{expected:?}");
+        let pinned_pretty = format!("{expected:#?}");
+        assert_eq!(
+            format!("{actual:?}"),
+            format!(
+                "ByteMatch{}",
+                pinned
+                    .strip_prefix("Match")
+                    .expect("pinned byte match Debug prefix")
+            ),
+            "pattern={pattern:?}, haystack={haystack:?}"
+        );
+        assert_eq!(
+            format!("{actual:#?}"),
+            format!(
+                "ByteMatch{}",
+                pinned_pretty
+                    .strip_prefix("Match")
+                    .expect("pinned pretty byte match Debug prefix")
+            ),
+            "pretty pattern={pattern:?}, haystack={haystack:?}"
+        );
+    }
+
+    assert_debug("Sherlock", false, b"prefix Sherlock suffix");
+    assert_debug(
+        r"\p{Greek}+",
+        true,
+        "Greek: \u{3b1}\u{3b2}\u{3b3}\u{3b4}".as_bytes(),
+    );
+    assert_debug("^", false, b"\xFF");
+
+    let every_byte: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+    assert_debug("(?s:.)+", false, &every_byte);
+
+    let malformed_utf8: &[&[u8]] = &[
+        b"\xC2",
+        b"\xC2A",
+        b"\xE2\x82",
+        b"\xE2(\xA1",
+        b"\xF0\x9F\x92",
+        b"\xF0(\x8C\xBC",
+        b"\xED\xA0\x80",
+        b"\xC0\xAF",
+    ];
+    for haystack in malformed_utf8 {
+        assert_debug("(?s:.)+", false, haystack);
     }
 }
 
