@@ -18,12 +18,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod adapter;
+mod replacement_api;
 
 pub use adapter::{
     ADAPTER_ID, ADAPTER_REPORT_SCHEMA, AdapterDispositionCounts, AdapterReport,
     AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
+};
+pub use replacement_api::{
+    REPLACEMENT_API_CASES, REPLACEMENT_API_REPORT_SCHEMA, ReplacementApiCounts,
+    ReplacementApiDisposition, ReplacementApiReceipt, ReplacementApiReport,
+    ReplacementApiReportPayload, ReplacementCapability, ReplacementSourceIdentity,
+    build_replacement_api_report, read_replacement_api_report, write_replacement_api_report,
 };
 
 /// Checked-in manifest schema.
