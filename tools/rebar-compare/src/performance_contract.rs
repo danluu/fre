@@ -32,6 +32,8 @@ pub const PERFORMANCE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.performance-pair-s
 pub const PERFORMANCE_RAW_SCHEMA: &str = "fre.rebar.performance-raw.v1";
 /// Stable schema for one all-model resource observation arm.
 pub const PERFORMANCE_RESOURCE_RAW_SCHEMA: &str = "fre.rebar.performance-resource-raw.v1";
+/// Stable schema for deterministic current-FRE runner route admission.
+pub const PERFORMANCE_RUNNER_MANIFEST_SCHEMA: &str = "fre.rebar.performance-runner-manifest.v1";
 /// Stable schema for one raw Rust/RE2 capture reference arm.
 pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
 /// Stable schema for one raw capture resource-observation arm.
@@ -731,6 +733,60 @@ pub struct PerformanceResourcePairEvidence {
     pub reference: PerformanceResourceRawObservation,
 }
 
+/// Exact current-FRE runner family admitted for one supported semantic row.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerformanceRunnerRoute {
+    /// One-pattern aggregate compile/count/span-sum lifecycle.
+    AggregateSingle,
+    /// Ordered multi-pattern aggregate compile/count/span-sum lifecycle.
+    AggregateMany,
+    /// Portable line-oriented grep lifecycle.
+    PortableGrep,
+    /// Persistent-history capture lifecycle.
+    Capture,
+}
+
+/// One supported row's exact candidate runner admission record.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRunnerRow {
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Authenticated candidate plan.
+    pub candidate_plan: String,
+    /// Number of exact pattern identities in the semantic input.
+    pub pattern_count: usize,
+    /// Admitted candidate runner family.
+    pub route: PerformanceRunnerRoute,
+    /// Every exact lifecycle boundary required for this row.
+    pub boundaries: Vec<String>,
+    /// Pair slots generated for passing comparators on this row.
+    pub pair_slots: usize,
+    /// Explicit unavailable boundary/comparator points on this row.
+    pub unavailable_points: usize,
+}
+
+/// Complete deterministic current-FRE runner admission manifest.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRunnerManifest {
+    /// Runner manifest schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Exactly one row for every supported current-FRE semantic receipt.
+    pub rows: Vec<PerformanceRunnerRow>,
+}
+
 /// One raw pinned-reference arm corresponding to a schedule slot.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1218,6 +1274,69 @@ pub fn write_new_performance_pair_schedule(
         .map_err(|error| ContractError::new(format!("sync schedule {}: {error}", path.display())))
 }
 
+/// Serialize a current-FRE runner manifest as canonical compact JSON plus LF.
+pub fn performance_runner_manifest_bytes(
+    manifest: &PerformanceRunnerManifest,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(manifest)
+        .map_err(|error| ContractError::new(format!("serialize runner manifest: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read a canonically serialized current-FRE runner manifest.
+pub fn read_performance_runner_manifest(
+    path: &Path,
+) -> Result<PerformanceRunnerManifest, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let manifest: PerformanceRunnerManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_runner_manifest_bytes(&manifest)? != bytes {
+        return Err(ContractError::new(format!(
+            "performance runner manifest {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(manifest)
+}
+
+/// Publish a current-FRE runner manifest to a new path without overwrite.
+pub fn write_new_performance_runner_manifest(
+    path: &Path,
+    manifest: &PerformanceRunnerManifest,
+) -> Result<(), ContractError> {
+    let parent = path.parent().ok_or_else(|| {
+        ContractError::new(format!(
+            "runner manifest path {} has no parent",
+            path.display()
+        ))
+    })?;
+    if !parent.is_dir() {
+        return Err(ContractError::new(format!(
+            "runner manifest parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    let bytes = performance_runner_manifest_bytes(manifest)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            ContractError::new(format!(
+                "create new runner manifest {}: {error}",
+                path.display()
+            ))
+        })?;
+    output.write_all(&bytes).map_err(|error| {
+        ContractError::new(format!("write runner manifest {}: {error}", path.display()))
+    })?;
+    output.sync_all().map_err(|error| {
+        ContractError::new(format!("sync runner manifest {}: {error}", path.display()))
+    })
+}
+
 /// Serialize one all-model raw timing arm as canonical compact JSON plus LF.
 pub fn performance_raw_observation_bytes(
     observation: &PerformanceRawObservation,
@@ -1503,6 +1622,164 @@ pub fn validate_performance_pair_schedule(
         ));
     }
     Ok(())
+}
+
+/// Generate the exact current-FRE runner route for every supported semantic
+/// row. Unknown plan/model/pattern-count combinations fail closed.
+pub fn generate_performance_runner_manifest(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<PerformanceRunnerManifest, ContractError> {
+    validate_contract(contract)?;
+    let rows = performance_runner_rows(contract, universe)?;
+    let manifest = PerformanceRunnerManifest {
+        schema: PERFORMANCE_RUNNER_MANIFEST_SCHEMA.to_string(),
+        contract_id: contract.contract_id.clone(),
+        canonical_commit: contract.canonical.commit.clone(),
+        canonical_tree: contract.canonical.tree.clone(),
+        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+        rows,
+    };
+    validate_performance_runner_manifest(contract, universe, &manifest)?;
+    Ok(manifest)
+}
+
+fn performance_runner_rows(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<Vec<PerformanceRunnerRow>, ContractError> {
+    let models: BTreeMap<&str, &ModelContract> = contract
+        .models
+        .iter()
+        .map(|model| (model.model.as_str(), model))
+        .collect();
+    let mut rows = Vec::with_capacity(contract.semantic.supported_rows);
+    for (job_id, semantic) in &universe.rows {
+        if semantic.status != RowSemanticStatus::Supported {
+            continue;
+        }
+        let plan = semantic.candidate_plan.as_deref().ok_or_else(|| {
+            ContractError::new(format!("supported row {job_id:?} has no candidate plan"))
+        })?;
+        require_token(plan, "performance runner candidate plan")?;
+        let pattern_count = semantic.input.pattern_sha256.len();
+        let route = performance_runner_route(&semantic.model, plan, pattern_count)?;
+        let model = models.get(semantic.model.as_str()).ok_or_else(|| {
+            ContractError::new(format!("runner model {:?} is absent", semantic.model))
+        })?;
+        let passing = semantic
+            .comparator_statuses
+            .values()
+            .filter(|status| **status == Some(Status::Pass))
+            .count();
+        let unavailable_comparators = contract
+            .reporting
+            .comparators
+            .len()
+            .checked_sub(passing)
+            .ok_or_else(|| ContractError::new("runner comparator count underflow"))?;
+        let points = model
+            .lifecycle_boundaries
+            .len()
+            .checked_mul(passing)
+            .ok_or_else(|| ContractError::new("runner available-point overflow"))?;
+        let pair_slots = points
+            .checked_mul(
+                usize::try_from(contract.reporting.pairs_per_comparator)
+                    .map_err(|_| ContractError::new("runner pair count does not fit usize"))?,
+            )
+            .ok_or_else(|| ContractError::new("runner pair-slot overflow"))?;
+        let unavailable_points = model
+            .lifecycle_boundaries
+            .len()
+            .checked_mul(unavailable_comparators)
+            .ok_or_else(|| ContractError::new("runner unavailable-point overflow"))?;
+        rows.push(PerformanceRunnerRow {
+            job_id: job_id.clone(),
+            model: semantic.model.clone(),
+            candidate_plan: plan.to_string(),
+            pattern_count,
+            route,
+            boundaries: model.lifecycle_boundaries.clone(),
+            pair_slots,
+            unavailable_points,
+        });
+    }
+    if rows.len() != contract.semantic.supported_rows {
+        return Err(ContractError::new(format!(
+            "runner manifest has {} supported rows, expected {}",
+            rows.len(),
+            contract.semantic.supported_rows
+        )));
+    }
+    Ok(rows)
+}
+
+/// Validate a runner manifest by exact deterministic regeneration.
+pub fn validate_performance_runner_manifest(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    manifest: &PerformanceRunnerManifest,
+) -> Result<(), ContractError> {
+    validate_contract(contract)?;
+    if manifest.schema != PERFORMANCE_RUNNER_MANIFEST_SCHEMA
+        || manifest.contract_id != contract.contract_id
+        || manifest.canonical_commit != contract.canonical.commit
+        || manifest.canonical_tree != contract.canonical.tree
+        || manifest.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+    {
+        return Err(ContractError::new(
+            "performance runner manifest identity differs from the contract",
+        ));
+    }
+    let expected_rows = performance_runner_rows(contract, universe)?;
+    if manifest.rows != expected_rows {
+        return Err(ContractError::new(
+            "performance runner manifest rows differ from exact regeneration",
+        ));
+    }
+    Ok(())
+}
+
+fn performance_runner_route(
+    model: &str,
+    plan: &str,
+    pattern_count: usize,
+) -> Result<PerformanceRunnerRoute, ContractError> {
+    let route = match (model, plan, pattern_count) {
+        (
+            "compile",
+            "compile-aggregate-exact-literal"
+            | "compile-aggregate-unicode-scalar-class"
+            | "compile-aggregate-finite-literal-dfa"
+            | "compile-aggregate-continuation-program",
+            1,
+        )
+        | (
+            "count" | "count-spans",
+            "aggregate-exact-literal"
+            | "aggregate-unicode-scalar-class"
+            | "aggregate-finite-literal-dfa"
+            | "aggregate-continuation-program",
+            1,
+        ) => PerformanceRunnerRoute::AggregateSingle,
+        ("compile", "compile-many-ordered-literal" | "compile-many-continuation-program", 2..)
+        | (
+            "count" | "count-spans",
+            "aggregate-many-ordered-literal" | "aggregate-many-continuation-program",
+            2..,
+        ) => PerformanceRunnerRoute::AggregateMany,
+        ("grep", "portable-single-search", 1) => PerformanceRunnerRoute::PortableGrep,
+        ("count-captures" | "grep-captures", crate::CURRENT_FRE_CAPTURE_PLAN, 1) => {
+            PerformanceRunnerRoute::Capture
+        }
+        _ => {
+            return Err(ContractError::new(format!(
+                "unsupported performance runner route model={model:?} plan={plan:?} patterns={pattern_count}"
+            )));
+        }
+    };
+    Ok(route)
 }
 
 fn performance_schedule_contents(
@@ -4021,13 +4298,14 @@ mod tests {
 
     fn bind_fixture_candidate_plan(mut receipt: Receipt) -> Receipt {
         if receipt.status == Status::Pass {
-            receipt.candidate_plan = Some(
-                if matches!(receipt.model.as_str(), "count-captures" | "grep-captures") {
-                    crate::CURRENT_FRE_CAPTURE_PLAN.to_string()
-                } else {
-                    format!("fixture-{}-plan", receipt.model)
-                },
-            );
+            let plan = match receipt.model.as_str() {
+                "compile" => "compile-aggregate-exact-literal",
+                "count" | "count-spans" => "aggregate-exact-literal",
+                "grep" => "portable-single-search",
+                "count-captures" | "grep-captures" => crate::CURRENT_FRE_CAPTURE_PLAN,
+                other => panic!("fixture has no supported runner plan for {other:?}"),
+            };
+            receipt.candidate_plan = Some(plan.to_string());
         }
         receipt
     }
@@ -4766,6 +5044,135 @@ mod tests {
         let mut incomplete = schedule;
         incomplete.slots.pop();
         assert!(validate_performance_pair_schedule(&contract, &universe, &incomplete).is_err());
+    }
+
+    #[test]
+    fn runner_manifest_is_complete_deterministic_and_canonical() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let manifest =
+            generate_performance_runner_manifest(&contract, &universe).expect("runner manifest");
+        assert_eq!(manifest.rows.len(), 257);
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .filter(|row| row.route == PerformanceRunnerRoute::AggregateSingle)
+                .count(),
+            238
+        );
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .filter(|row| row.route == PerformanceRunnerRoute::AggregateMany)
+                .count(),
+            0
+        );
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .filter(|row| row.route == PerformanceRunnerRoute::PortableGrep)
+                .count(),
+            11
+        );
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .filter(|row| row.route == PerformanceRunnerRoute::Capture)
+                .count(),
+            8
+        );
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .map(|row| row.pair_slots)
+                .sum::<usize>(),
+            6_168
+        );
+        assert_eq!(
+            manifest
+                .rows
+                .iter()
+                .map(|row| row.unavailable_points)
+                .sum::<usize>(),
+            0
+        );
+        let bytes = performance_runner_manifest_bytes(&manifest).expect("manifest serialization");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<PerformanceRunnerManifest>(&bytes)
+                .expect("runner manifest round trip"),
+            manifest
+        );
+
+        let mut altered = manifest.clone();
+        altered.rows[0].pair_slots += 1;
+        assert!(validate_performance_runner_manifest(&contract, &universe, &altered).is_err());
+
+        let path = std::env::temp_dir().join(format!(
+            "fre-performance-runner-manifest-selftest-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        write_new_performance_runner_manifest(&path, &manifest).expect("publish runner manifest");
+        assert_eq!(
+            read_performance_runner_manifest(&path).expect("read runner manifest"),
+            manifest
+        );
+        assert!(write_new_performance_runner_manifest(&path, &manifest).is_err());
+        fs::remove_file(path).expect("remove runner manifest fixture");
+    }
+
+    #[test]
+    fn runner_manifest_admits_multi_pattern_and_rejects_plan_aliases() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let mut many_universe = universe.clone();
+        let compile_job = many_universe
+            .rows
+            .iter()
+            .find(|(_, row)| row.status == RowSemanticStatus::Supported && row.model == "compile")
+            .map(|(job_id, _)| job_id.clone())
+            .expect("supported compile fixture");
+        let compile_row = many_universe
+            .rows
+            .get_mut(&compile_job)
+            .expect("compile fixture row");
+        compile_row.candidate_plan = Some("compile-many-ordered-literal".to_string());
+        compile_row.input.pattern_sha256.push("3".repeat(64));
+        let many_manifest = generate_performance_runner_manifest(&contract, &many_universe)
+            .expect("multi-pattern route");
+        assert_eq!(
+            many_manifest
+                .rows
+                .iter()
+                .find(|row| row.job_id == compile_job)
+                .expect("multi-pattern manifest row")
+                .route,
+            PerformanceRunnerRoute::AggregateMany
+        );
+
+        let mut bad_multiplicity = many_universe.clone();
+        bad_multiplicity
+            .rows
+            .get_mut(&compile_job)
+            .expect("compile fixture row")
+            .candidate_plan = Some("compile-aggregate-exact-literal".to_string());
+        assert!(
+            generate_performance_runner_manifest(&contract, &bad_multiplicity).is_err(),
+            "a single-pattern plan must reject a multi-pattern input"
+        );
+        let mut bad_plan = universe.clone();
+        bad_plan
+            .rows
+            .get_mut(&compile_job)
+            .expect("compile fixture row")
+            .candidate_plan = Some("fixture-unadmitted-plan".to_string());
+        assert!(generate_performance_runner_manifest(&contract, &bad_plan).is_err());
     }
 
     #[test]

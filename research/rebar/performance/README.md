@@ -71,6 +71,29 @@ semantic reasons. The schedule covers every supported model and boundary;
 unsupported. Schedule publication is canonical, deterministic, and
 non-overwriting.
 
+Generate the deterministic current-FRE runner admission manifest without
+executing a benchmark:
+
+```text
+cargo run -p rebar-compare --bin performance-contract -- \
+  generate-runner-manifest \
+  research/rebar/performance/current-main-a1a87d11-contract.json \
+  /Users/danluu/dev/fre \
+  /absolute/path/to/full344.json \
+  /new/path/current-main-runner-manifest.json
+```
+
+For the accepted report this binds all 257 supported rows to an exact runner
+family: 234 one-pattern aggregate rows, four ordered multi-pattern aggregate
+rows, 11 portable grep rows, and eight capture rows. The four multi-pattern
+rows are the dictionary compile/count pair, the Nosey Parker compile row, and
+the literal-alternation pattern-per-word count row. Candidate plan names and
+pattern multiplicity are checked together, so an unknown plan or a
+single/multi alias fails closed. The manifest also recomputes the exact 5,772
+pair slots and 66 unavailable points from the semantic universe. This is an
+execution admission artifact; it does not itself provide the still-required
+multi-pattern runner implementation or run timing.
+
 Each scheduled arm has one canonical `fre.rebar.performance-raw.v1` record.
 It binds the exact contract/canonical/semantic identity, job, model, lifecycle
 boundary, comparator and candidate/reference role, complete input and reducer,
