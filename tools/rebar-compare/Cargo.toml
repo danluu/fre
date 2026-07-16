@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 bstr = { version = "=1.12.1", default-features = false, features = ["std"] }
 fre = { path = "../../crates/fre" }
+libc = "=0.2.186"
 rebar-expand = { path = "../rebar-expand" }
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 regex-automata = "=0.4.14"

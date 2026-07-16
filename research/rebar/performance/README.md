@@ -233,5 +233,22 @@ same-UID mutation between the final pathname check and `exec` is outside this
 wrapper's threat boundary and requires executor isolation or descriptor-based
 execution.
 
+The canonical `fre.rebar.performance-execution-packet.v1` closes the
+authorization boundary before that executor runs. Its independently published
+digest binds the exact contract, accepted semantic report, expanded Rebar
+manifest, complete pair schedule, runner manifest, executor, candidate and
+reference wrappers, per-comparator upstream runtimes and versions, timing
+authority, and hard process/I/O limits. Validation recomputes every
+contract-derived digest and requires each reference runtime to equal the
+matching semantic adapter; accepting a packet and an expected hash from one
+unauthenticated command line is explicitly insufficient. A separate canonical
+`fre.rebar.performance-pair-task.v1` declares two distinct process tokens for
+one exact schedule sequence and attempt ID. A still-required atomic executor
+ledger must reserve and consume those tokens, reject replay, and require a new
+prepublished task for every retry. These records are source-only admission
+primitives; the executor must authenticate the lease and binaries, derive the
+two lifecycle-specific KLV forms, run each arm in exact counterbalanced order,
+and publish a provenance envelope rather than accepting naked pair JSON.
+
 The performance gate still needs the authenticated pair executor and resource
 collector, and `regex-redux` after semantic support exists.

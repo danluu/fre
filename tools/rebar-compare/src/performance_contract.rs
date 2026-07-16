@@ -7,7 +7,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Path,
     process::Command,
     time::Duration,
@@ -34,6 +35,11 @@ pub const PERFORMANCE_RAW_SCHEMA: &str = "fre.rebar.performance-raw.v2";
 pub const PERFORMANCE_RESOURCE_RAW_SCHEMA: &str = "fre.rebar.performance-resource-raw.v1";
 /// Stable schema for deterministic current-FRE runner route admission.
 pub const PERFORMANCE_RUNNER_MANIFEST_SCHEMA: &str = "fre.rebar.performance-runner-manifest.v1";
+/// Stable schema for an independently authorized all-model timing execution
+/// packet.
+pub const PERFORMANCE_EXECUTION_PACKET_SCHEMA: &str = "fre.rebar.performance-execution-packet.v1";
+/// Stable schema for one immutable attempt at one exact pair-schedule slot.
+pub const PERFORMANCE_PAIR_TASK_SCHEMA: &str = "fre.rebar.performance-pair-task.v1";
 /// Stable schema for one raw Rust/RE2 capture reference arm.
 pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
 /// Stable schema for one raw capture resource-observation arm.
@@ -853,6 +859,136 @@ pub struct PerformanceRunnerManifest {
     pub rows: Vec<PerformanceRunnerRow>,
 }
 
+/// Exact executable and version policy authorized for timing execution.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceExecutablePolicy {
+    /// SHA-256 of the exact executable bytes.
+    pub sha256: String,
+    /// Exact executable length.
+    pub bytes: u64,
+    /// Exact one-line `--version` stdout, including LF.
+    pub version_stdout: String,
+    /// SHA-256 of the exact version stdout bytes.
+    pub version_stdout_sha256: String,
+    /// Source commit bound by the authenticated build receipt.
+    pub source_commit: String,
+    /// Source tree bound by the authenticated build receipt.
+    pub source_tree: String,
+    /// Immutable build receipt that binds executable bytes to source and build
+    /// policy.
+    pub build_receipt_sha256: String,
+}
+
+/// Packet-bound timing authority required before either arm may execute.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceTimingAuthorityPolicy {
+    /// Stable authorization/lease protocol.
+    pub protocol_id: String,
+    /// Exact coordinator executable or policy digest.
+    pub coordinator_sha256: String,
+    /// Immutable authorization receipt digest. Receipt owner, scope, TTL and
+    /// packet binding are authenticated by the independent publication and
+    /// later live-lease transitions, not inferred from this digest.
+    pub authorization_receipt_sha256: String,
+    /// Required resource scope; currently exactly `timing`.
+    pub required_scope: String,
+}
+
+/// Hard process and I/O limits for one pair attempt.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformancePairExecutionLimits {
+    /// Maximum bytes in either canonical KLV arm.
+    pub max_klv_bytes: u64,
+    /// Maximum retained child stdout bytes.
+    pub max_stdout_bytes: u64,
+    /// Maximum retained child stderr bytes.
+    pub max_stderr_bytes: u64,
+    /// Hard process-group deadline for one arm.
+    pub arm_deadline_ms: u64,
+}
+
+/// Independently authorized executable, input, and timing policy for a
+/// complete all-model pair campaign.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceExecutionPacket {
+    /// Packet schema.
+    pub schema: String,
+    /// SHA-256 of the exact contract bytes.
+    pub contract_sha256: String,
+    /// SHA-256 of the exact accepted semantic report.
+    pub semantic_report_sha256: String,
+    /// SHA-256 of the exact expanded Rebar manifest.
+    pub expanded_manifest_sha256: String,
+    /// SHA-256 of the canonical complete pair schedule.
+    pub pair_schedule_sha256: String,
+    /// SHA-256 of the canonical current-FRE runner manifest.
+    pub runner_manifest_sha256: String,
+    /// Exact canonical commit repeated from the contract.
+    pub canonical_commit: String,
+    /// Exact canonical tree repeated from the contract.
+    pub canonical_tree: String,
+    /// Exact semantic adapter implemented by the candidate wrapper.
+    pub candidate_adapter: String,
+    /// Pair executor authorized by the timing authority.
+    pub executor: PerformanceExecutablePolicy,
+    /// Current-FRE candidate wrapper authorized for every candidate arm.
+    pub candidate_wrapper: PerformanceExecutablePolicy,
+    /// Reference adapter wrapper authorized for every reference arm.
+    pub reference_wrapper: PerformanceExecutablePolicy,
+    /// Exact upstream runtime authorized for each comparator ID.
+    pub reference_runners: BTreeMap<String, PerformanceExecutablePolicy>,
+    /// External timing authorization protocol.
+    pub timing_authority: PerformanceTimingAuthorityPolicy,
+    /// Hard per-attempt limits.
+    pub limits: PerformancePairExecutionLimits,
+}
+
+/// One prepublished attempt declaration at one exact schedule sequence.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformancePairTask {
+    /// Task schema.
+    pub schema: String,
+    /// Independently authorized execution-packet digest.
+    pub execution_packet_sha256: String,
+    /// Exact global pair-schedule sequence.
+    pub sequence: usize,
+    /// Stable declared attempt ID. The executor ledger must reject reuse.
+    pub attempt_id: String,
+    /// Candidate process token digest reserved by the executor ledger.
+    pub candidate_process_token_sha256: String,
+    /// Reference process token digest reserved by the executor ledger.
+    pub reference_process_token_sha256: String,
+}
+
+/// Opaque proof that one execution packet passed independent authorization
+/// and every contract-derived validation. Task admission requires this value
+/// so packet validation cannot be accidentally skipped.
+#[derive(Debug)]
+pub struct ValidatedPerformanceExecutionContext {
+    universe: SemanticUniverse,
+    packet_sha256: String,
+    pair_schedule_sha256: String,
+}
+
+impl ValidatedPerformanceExecutionContext {
+    /// Authenticated semantic universe used for raw-arm validation.
+    #[must_use]
+    pub const fn universe(&self) -> &SemanticUniverse {
+        &self.universe
+    }
+
+    /// Independently authorized packet digest.
+    #[must_use]
+    pub fn packet_sha256(&self) -> &str {
+        &self.packet_sha256
+    }
+}
+
 /// One raw pinned-reference arm corresponding to a schedule slot.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1403,6 +1539,119 @@ pub fn write_new_performance_runner_manifest(
     })
 }
 
+/// Serialize an authorized performance execution packet as canonical compact
+/// JSON plus LF.
+pub fn performance_execution_packet_bytes(
+    packet: &PerformanceExecutionPacket,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(packet)
+        .map_err(|error| ContractError::new(format!("serialize execution packet: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read one canonically serialized authorized execution packet.
+pub fn read_performance_execution_packet(
+    path: &Path,
+) -> Result<PerformanceExecutionPacket, ContractError> {
+    let bytes = read_bounded_regular_file(path, 1_048_576, "execution packet")?;
+    let packet: PerformanceExecutionPacket = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_execution_packet_bytes(&packet)? != bytes {
+        return Err(ContractError::new(format!(
+            "execution packet {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(packet)
+}
+
+/// Serialize one prepublished pair task as canonical compact JSON plus LF.
+pub fn performance_pair_task_bytes(task: &PerformancePairTask) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(task)
+        .map_err(|error| ContractError::new(format!("serialize pair task: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read one canonically serialized prepublished pair task.
+pub fn read_performance_pair_task(path: &Path) -> Result<PerformancePairTask, ContractError> {
+    let bytes = read_bounded_regular_file(path, 65_536, "performance pair task")?;
+    let task: PerformancePairTask = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_pair_task_bytes(&task)? != bytes {
+        return Err(ContractError::new(format!(
+            "pair task {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(task)
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>, ContractError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ContractError::new(format!("{label} {} has no parent", path.display())))?;
+    let parent_file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)
+        .map_err(|error| {
+            ContractError::new(format!("open parent {}: {error}", parent.display()))
+        })?;
+    let parent_metadata = parent_file.metadata().map_err(|error| {
+        ContractError::new(format!("inspect parent {}: {error}", parent.display()))
+    })?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| ContractError::new(format!("open {}: {error}", path.display())))?;
+    let before = file
+        .metadata()
+        .map_err(|error| ContractError::new(format!("inspect {}: {error}", path.display())))?;
+    if !parent_metadata.file_type().is_dir()
+        || parent_metadata.mode() & 0o7777 != 0o700
+        || !before.file_type().is_file()
+        || before.len() > max_bytes
+        || before.mode() & 0o7777 != 0o400
+        || before.nlink() != 1
+        || before.uid() != parent_metadata.uid()
+    {
+        return Err(ContractError::new(format!(
+            "{label} {} is not in an owner-private same-owner directory as a mode-0400 nlink-1 bounded regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let after = file
+        .metadata()
+        .map_err(|error| ContractError::new(format!("reinspect {}: {error}", path.display())))?;
+    if u64::try_from(bytes.len()) != Ok(before.len())
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mode() != after.mode()
+        || before.nlink() != after.nlink()
+        || before.uid() != after.uid()
+        || before.gid() != after.gid()
+    {
+        return Err(ContractError::new(format!(
+            "{label} {} changed while it was read",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Serialize one all-model raw timing arm as canonical compact JSON plus LF.
 pub fn performance_raw_observation_bytes(
     observation: &PerformanceRawObservation,
@@ -1458,8 +1707,10 @@ pub fn read_performance_pair_evidence(
     Ok(evidence)
 }
 
-/// Publish one canonically serialized all-model pair to a new path without
-/// overwrite.
+/// Write one canonically serialized intermediate all-model pair to a new path
+/// without overwrite. This helper does not provide crash-atomic owner-only
+/// publication and therefore cannot substitute for the authenticated final
+/// execution envelope.
 pub fn write_new_performance_pair_evidence(
     path: &Path,
     evidence: &PerformancePairEvidence,
@@ -1977,6 +2228,305 @@ pub fn validate_performance_runner_manifest(
     Ok(())
 }
 
+/// Validate an execution packet against a digest obtained from an independent
+/// authorization transition, then recompute every contract-derived artifact
+/// identity. Supplying a packet and its digest through one unauthenticated
+/// channel does not establish authority. Executable build policies and timing
+/// authority remain packet-authorized; reference runtime digests are also
+/// required to equal the matching authenticated semantic adapter. The
+/// independent packet-publication transition must authenticate each named
+/// build-receipt body and the owned timing-authorization receipt (including
+/// owner, scope, TTL, and packet binding); this validator binds their digests
+/// without claiming to validate absent receipt bytes.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "keeping every exact packet input and derived provenance check in one admission transaction prevents ambient authority or partial validation"
+)]
+pub fn validate_performance_execution_packet(
+    contract: &PerformanceContract,
+    contract_bytes: &[u8],
+    semantic_report_bytes: &[u8],
+    expanded_manifest_bytes: &[u8],
+    schedule: &PerformancePairSchedule,
+    runner_manifest: &PerformanceRunnerManifest,
+    packet: &PerformanceExecutionPacket,
+    authorized_packet_sha256: &str,
+) -> Result<ValidatedPerformanceExecutionContext, ContractError> {
+    require_digest(
+        authorized_packet_sha256,
+        "authorized performance execution packet",
+    )?;
+    if digest(&performance_execution_packet_bytes(packet)?) != authorized_packet_sha256 {
+        return Err(ContractError::new(
+            "execution packet differs from the independently authorized digest",
+        ));
+    }
+    validate_contract(contract)?;
+    let decoded_contract: PerformanceContract = serde_json::from_slice(contract_bytes)
+        .map_err(|error| ContractError::new(format!("decode execution contract: {error}")))?;
+    if &decoded_contract != contract {
+        return Err(ContractError::new(
+            "execution contract bytes differ from the supplied contract",
+        ));
+    }
+    let universe = validate_semantic_report(contract, semantic_report_bytes)?;
+    validate_performance_pair_schedule(contract, &universe, schedule)?;
+    validate_performance_runner_manifest(contract, &universe, runner_manifest)?;
+    let schedule_bytes = performance_pair_schedule_bytes(schedule)?;
+    let runner_manifest_bytes = performance_runner_manifest_bytes(runner_manifest)?;
+    if packet.schema != PERFORMANCE_EXECUTION_PACKET_SCHEMA
+        || packet.contract_sha256 != digest(contract_bytes)
+        || packet.semantic_report_sha256 != digest(semantic_report_bytes)
+        || packet.expanded_manifest_sha256 != digest(expanded_manifest_bytes)
+        || packet.expanded_manifest_sha256 != contract.semantic.manifest_sha256
+        || packet.pair_schedule_sha256 != digest(&schedule_bytes)
+        || packet.runner_manifest_sha256 != digest(&runner_manifest_bytes)
+        || packet.canonical_commit != contract.canonical.commit
+        || packet.canonical_tree != contract.canonical.tree
+        || packet.candidate_adapter != contract.semantic.fre_adapter
+    {
+        return Err(ContractError::new(
+            "execution packet schema or contract-derived identity mismatch",
+        ));
+    }
+    validate_performance_executable_policy(&packet.executor, "pair executor")?;
+    validate_performance_executable_policy(&packet.candidate_wrapper, "candidate wrapper")?;
+    validate_performance_executable_policy(&packet.reference_wrapper, "reference wrapper")?;
+    let wrapper_digests = [
+        packet.executor.sha256.as_str(),
+        packet.candidate_wrapper.sha256.as_str(),
+        packet.reference_wrapper.sha256.as_str(),
+    ];
+    if wrapper_digests.into_iter().collect::<BTreeSet<_>>().len() != wrapper_digests.len() {
+        return Err(ContractError::new(
+            "executor and candidate/reference wrapper digests are not distinct",
+        ));
+    }
+    validate_performance_timing_authority(&packet.timing_authority)?;
+    validate_performance_execution_limits(&packet.limits)?;
+
+    let report: Report = serde_json::from_slice(semantic_report_bytes)
+        .map_err(|error| ContractError::new(format!("decode semantic adapters: {error}")))?;
+    let comparator_ids = contract
+        .reporting
+        .comparators
+        .iter()
+        .map(|comparator| comparator.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let runner_ids = packet
+        .reference_runners
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if runner_ids != comparator_ids {
+        return Err(ContractError::new(
+            "execution packet reference runner set differs from contract comparators",
+        ));
+    }
+    for comparator in &contract.reporting.comparators {
+        let policy = packet
+            .reference_runners
+            .get(&comparator.id)
+            .ok_or_else(|| ContractError::new("execution packet reference runner is absent"))?;
+        validate_performance_executable_policy(policy, "reference runner")?;
+        let mut adapters = report
+            .adapters
+            .iter()
+            .filter(|adapter| adapter.adapter == comparator.semantic_adapter);
+        let adapter = adapters.next().ok_or_else(|| {
+            ContractError::new(format!(
+                "semantic report lacks reference adapter {:?}",
+                comparator.semantic_adapter
+            ))
+        })?;
+        if adapters.next().is_some() {
+            return Err(ContractError::new(format!(
+                "semantic report duplicates reference adapter {:?}",
+                comparator.semantic_adapter
+            )));
+        }
+        let runtime = adapter.runtime_sha256.as_deref().ok_or_else(|| {
+            ContractError::new(format!(
+                "semantic reference adapter {:?} has no runtime digest",
+                comparator.semantic_adapter
+            ))
+        })?;
+        require_digest(runtime, "semantic reference runtime")?;
+        if runtime != policy.sha256 {
+            return Err(ContractError::new(format!(
+                "packet runner for comparator {:?} differs from semantic runtime",
+                comparator.id
+            )));
+        }
+    }
+    Ok(ValidatedPerformanceExecutionContext {
+        universe,
+        packet_sha256: authorized_packet_sha256.to_string(),
+        pair_schedule_sha256: packet.pair_schedule_sha256.clone(),
+    })
+}
+
+fn validate_performance_executable_policy(
+    policy: &PerformanceExecutablePolicy,
+    label: &str,
+) -> Result<(), ContractError> {
+    const MAX_EXECUTABLE_BYTES: u64 = 1_073_741_824;
+    const MAX_VERSION_BYTES: usize = 4_096;
+    require_digest(&policy.sha256, &format!("{label} digest"))?;
+    require_digest(
+        &policy.version_stdout_sha256,
+        &format!("{label} version digest"),
+    )?;
+    if policy.bytes == 0 || policy.bytes > MAX_EXECUTABLE_BYTES {
+        return Err(ContractError::new(format!(
+            "{label} length is zero or exceeds {MAX_EXECUTABLE_BYTES}"
+        )));
+    }
+    let Some(version) = policy.version_stdout.strip_suffix('\n') else {
+        return Err(ContractError::new(format!(
+            "{label} version is not exactly LF terminated"
+        )));
+    };
+    if version.is_empty()
+        || policy.version_stdout.len() > MAX_VERSION_BYTES
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        || digest(policy.version_stdout.as_bytes()) != policy.version_stdout_sha256
+    {
+        return Err(ContractError::new(format!(
+            "{label} version output is empty, multiline, or has the wrong digest"
+        )));
+    }
+    require_oid(&policy.source_commit, &format!("{label} source commit"))?;
+    require_oid(&policy.source_tree, &format!("{label} source tree"))?;
+    require_digest(
+        &policy.build_receipt_sha256,
+        &format!("{label} build receipt"),
+    )?;
+    if policy.build_receipt_sha256 == policy.sha256
+        || policy.build_receipt_sha256 == policy.version_stdout_sha256
+    {
+        return Err(ContractError::new(format!(
+            "{label} build receipt digest aliases executable or version bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_performance_timing_authority(
+    authority: &PerformanceTimingAuthorityPolicy,
+) -> Result<(), ContractError> {
+    require_token(&authority.protocol_id, "timing authority protocol")?;
+    require_digest(
+        &authority.coordinator_sha256,
+        "timing authority coordinator",
+    )?;
+    require_digest(
+        &authority.authorization_receipt_sha256,
+        "timing authority receipt",
+    )?;
+    if authority.required_scope != "timing" {
+        return Err(ContractError::new(
+            "performance execution requires exact timing resource scope",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_performance_execution_limits(
+    limits: &PerformancePairExecutionLimits,
+) -> Result<(), ContractError> {
+    const REQUIRED_KLV_BYTES: u64 = 64 * 1_048_576;
+    const REQUIRED_OUTPUT_BYTES: u64 = 1_048_576;
+    const REQUIRED_ARM_DEADLINE_MS: u64 = 3_600_000;
+    if limits.max_klv_bytes != REQUIRED_KLV_BYTES
+        || limits.max_stdout_bytes != REQUIRED_OUTPUT_BYTES
+        || limits.max_stderr_bytes != REQUIRED_OUTPUT_BYTES
+        || limits.arm_deadline_ms != REQUIRED_ARM_DEADLINE_MS
+    {
+        return Err(ContractError::new(
+            "performance execution KLV, output, or deadline limit is invalid",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one prepublished task using the opaque context produced by full
+/// packet admission plus an externally authorized task digest, then return its
+/// exact schedule slot. Supplying a task and its digest through one
+/// unauthenticated channel does not establish authority; the caller must
+/// obtain the task digest from its immutable publication transition. This
+/// single-task check does not persist global uniqueness or consumed state;
+/// the publication ledger must reject attempt/token reuse across tasks and
+/// consume both tokens once either arm starts.
+pub fn validate_performance_pair_task(
+    context: &ValidatedPerformanceExecutionContext,
+    packet: &PerformanceExecutionPacket,
+    packet_bytes: &[u8],
+    schedule: &PerformancePairSchedule,
+    task: &PerformancePairTask,
+    authorized_task_sha256: &str,
+) -> Result<PerformancePairSlot, ContractError> {
+    require_digest(authorized_task_sha256, "authorized performance pair task")?;
+    if performance_execution_packet_bytes(packet)? != packet_bytes
+        || digest(packet_bytes) != context.packet_sha256
+        || packet.schema != PERFORMANCE_EXECUTION_PACKET_SCHEMA
+        || digest(&performance_pair_task_bytes(task)?) != authorized_task_sha256
+        || task.schema != PERFORMANCE_PAIR_TASK_SCHEMA
+        || task.execution_packet_sha256 != context.packet_sha256
+        || packet.pair_schedule_sha256 != context.pair_schedule_sha256
+        || digest(&performance_pair_schedule_bytes(schedule)?) != context.pair_schedule_sha256
+    {
+        return Err(ContractError::new(
+            "pair task packet bytes, authorization, schema, or schedule mismatch",
+        ));
+    }
+    validate_performance_attempt_id(&task.attempt_id, task.sequence)?;
+    require_digest(
+        &task.candidate_process_token_sha256,
+        "candidate pair process token",
+    )?;
+    require_digest(
+        &task.reference_process_token_sha256,
+        "reference pair process token",
+    )?;
+    if task.candidate_process_token_sha256 == task.reference_process_token_sha256 {
+        return Err(ContractError::new(
+            "candidate and reference pair process tokens are identical",
+        ));
+    }
+    let slot = schedule.slots.get(task.sequence).ok_or_else(|| {
+        ContractError::new("performance pair task sequence is outside the schedule")
+    })?;
+    if slot.sequence != task.sequence {
+        return Err(ContractError::new(
+            "performance pair task sequence is not the canonical slot index",
+        ));
+    }
+    Ok(slot.clone())
+}
+
+fn validate_performance_attempt_id(value: &str, sequence: usize) -> Result<(), ContractError> {
+    let prefix = format!("P{sequence}-A");
+    let Some(nonce) = value.strip_prefix(&prefix) else {
+        return Err(ContractError::new(
+            "performance pair attempt ID does not bind its sequence",
+        ));
+    };
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ContractError::new(
+            "performance pair attempt ID requires a 128-bit lowercase-hex nonce",
+        ));
+    }
+    Ok(())
+}
+
 fn performance_runner_route(
     model: &str,
     plan: &str,
@@ -2207,9 +2757,10 @@ fn collect_performance_pair_groups(
     Ok(groups)
 }
 
-/// Validate one complete pair against its exact schedule slot. This is the
-/// durable publication boundary used by a pair executor before a raw arm can
-/// enter a complete schedule evidence set.
+/// Validate the semantic payload of one complete pair against its exact
+/// schedule slot. Production evidence additionally requires the authenticated
+/// execution packet, task, lease, KLV, executable, and raw-arm provenance
+/// envelope.
 pub fn validate_performance_pair_evidence(
     contract: &PerformanceContract,
     universe: &SemanticUniverse,
@@ -4833,13 +5384,13 @@ mod tests {
                     adapter: rust,
                     identity: "fixture Rust".to_string(),
                     availability: "fixture".to_string(),
-                    runtime_sha256: None,
+                    runtime_sha256: Some("4".repeat(64)),
                 },
                 AdapterIdentity {
                     adapter: re2,
                     identity: "fixture RE2".to_string(),
                     availability: "fixture".to_string(),
-                    runtime_sha256: None,
+                    runtime_sha256: Some("5".repeat(64)),
                 },
             ],
             coverage: Coverage {
@@ -6009,6 +6560,391 @@ mod tests {
             .expect("compile fixture row")
             .candidate_plan = Some("fixture-unadmitted-plan".to_string());
         assert!(generate_performance_runner_manifest(&contract, &bad_plan).is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one no-clock packet fixture covers exact artifact derivation, executable provenance, authorization, limits, and task identity"
+    )]
+    fn execution_packet_and_pair_task_are_exact_and_authorized() {
+        fn executable(seed: char, version: &str) -> PerformanceExecutablePolicy {
+            let version_stdout = format!("{version}\n");
+            PerformanceExecutablePolicy {
+                sha256: seed.to_string().repeat(64),
+                bytes: 4_096,
+                version_stdout_sha256: digest(version_stdout.as_bytes()),
+                version_stdout,
+                source_commit: "a".repeat(40),
+                source_tree: "b".repeat(40),
+                build_receipt_sha256: digest(format!("fixture build receipt {seed}").as_bytes()),
+            }
+        }
+
+        let expanded_manifest = b"fixture expanded manifest\n";
+        let mut contract = contract();
+        contract.semantic.manifest_sha256 = digest(expanded_manifest);
+        let (semantic_bytes, universe) = synthetic_semantic_report(&mut contract);
+        let mut contract_bytes = serde_json::to_vec(&contract).expect("serialize contract");
+        contract_bytes.push(b'\n');
+        let schedule =
+            generate_performance_pair_schedule(&contract, &universe).expect("pair schedule");
+        let runner_manifest =
+            generate_performance_runner_manifest(&contract, &universe).expect("runner manifest");
+        let mut packet = PerformanceExecutionPacket {
+            schema: PERFORMANCE_EXECUTION_PACKET_SCHEMA.to_string(),
+            contract_sha256: digest(&contract_bytes),
+            semantic_report_sha256: digest(&semantic_bytes),
+            expanded_manifest_sha256: digest(expanded_manifest),
+            pair_schedule_sha256: digest(
+                &performance_pair_schedule_bytes(&schedule).expect("schedule bytes"),
+            ),
+            runner_manifest_sha256: digest(
+                &performance_runner_manifest_bytes(&runner_manifest).expect("manifest bytes"),
+            ),
+            canonical_commit: contract.canonical.commit.clone(),
+            canonical_tree: contract.canonical.tree.clone(),
+            candidate_adapter: contract.semantic.fre_adapter.clone(),
+            executor: executable('6', "fixture-pair-executor-v1"),
+            candidate_wrapper: executable('7', "fixture-candidate-wrapper-v1"),
+            reference_wrapper: executable('8', "fixture-reference-wrapper-v1"),
+            reference_runners: BTreeMap::from([
+                (
+                    contract.reporting.comparators[0].id.clone(),
+                    executable('4', "fixture-rust-reference-v1"),
+                ),
+                (
+                    contract.reporting.comparators[1].id.clone(),
+                    executable('5', "fixture-re2-reference-v1"),
+                ),
+            ]),
+            timing_authority: PerformanceTimingAuthorityPolicy {
+                protocol_id: "fixture-timing-authority-v1".to_string(),
+                coordinator_sha256: "9".repeat(64),
+                authorization_receipt_sha256: "a".repeat(64),
+                required_scope: "timing".to_string(),
+            },
+            limits: PerformancePairExecutionLimits {
+                max_klv_bytes: 64 * 1_048_576,
+                max_stdout_bytes: 1_048_576,
+                max_stderr_bytes: 1_048_576,
+                arm_deadline_ms: 3_600_000,
+            },
+        };
+        let packet_bytes = performance_execution_packet_bytes(&packet).expect("packet bytes");
+        let packet_sha256 = digest(&packet_bytes);
+        let original = packet.clone();
+        let validate_packet = |value: &PerformanceExecutionPacket| {
+            let bytes = performance_execution_packet_bytes(value).expect("packet bytes");
+            validate_performance_execution_packet(
+                &contract,
+                &contract_bytes,
+                &semantic_bytes,
+                expanded_manifest,
+                &schedule,
+                &runner_manifest,
+                value,
+                &digest(&bytes),
+            )
+        };
+        let context = validate_packet(&packet).expect("exact execution packet validates");
+        assert_eq!(context.universe().len(), universe.len());
+        assert_eq!(context.packet_sha256(), packet_sha256);
+        assert!(
+            validate_performance_execution_packet(
+                &contract,
+                &contract_bytes,
+                &semantic_bytes,
+                expanded_manifest,
+                &schedule,
+                &runner_manifest,
+                &packet,
+                &"f".repeat(64),
+            )
+            .is_err()
+        );
+        let task = PerformancePairTask {
+            schema: PERFORMANCE_PAIR_TASK_SCHEMA.to_string(),
+            execution_packet_sha256: packet_sha256.clone(),
+            sequence: 0,
+            attempt_id: format!("P0-A{}", "d".repeat(32)),
+            candidate_process_token_sha256: "b".repeat(64),
+            reference_process_token_sha256: "c".repeat(64),
+        };
+        let task_bytes = performance_pair_task_bytes(&task).expect("task bytes");
+        let validate_task = |value: &PerformancePairTask,
+                             value_schedule: &PerformancePairSchedule| {
+            let bytes = performance_pair_task_bytes(value).expect("task bytes");
+            validate_performance_pair_task(
+                &context,
+                &original,
+                &packet_bytes,
+                value_schedule,
+                value,
+                &digest(&bytes),
+            )
+        };
+        assert_eq!(
+            validate_task(&task, &schedule).expect("authorized task"),
+            schedule.slots[0]
+        );
+        let mut forged_schedule = schedule.clone();
+        forged_schedule.slots[0].boundary = "forged-boundary".to_string();
+        assert!(validate_task(&task, &forged_schedule).is_err());
+        assert_eq!(task_bytes.last(), Some(&b'\n'));
+        assert!(
+            validate_performance_pair_task(
+                &context,
+                &packet,
+                &packet_bytes,
+                &schedule,
+                &task,
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+        let fixture_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock after epoch")
+            .as_nanos();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "fre-performance-execution-admission-selftest-{}-{fixture_nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&fixture_root).expect("create private admission fixture");
+        fs::set_permissions(
+            &fixture_root,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("protect admission fixture");
+        let packet_path = fixture_root.join("packet.json");
+        let task_path = fixture_root.join("task.json");
+        fs::write(&packet_path, &packet_bytes).expect("write packet fixture");
+        fs::write(&task_path, &task_bytes).expect("write task fixture");
+        fs::set_permissions(
+            &packet_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+        )
+        .expect("protect packet fixture");
+        fs::set_permissions(
+            &task_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+        )
+        .expect("protect task fixture");
+        assert_eq!(
+            read_performance_execution_packet(&packet_path).expect("read packet fixture"),
+            packet
+        );
+        assert_eq!(
+            read_performance_pair_task(&task_path).expect("read task fixture"),
+            task
+        );
+        let symlink_path = fixture_root.join("task-symlink.json");
+        std::os::unix::fs::symlink(&task_path, &symlink_path).expect("create task symlink");
+        assert!(read_performance_pair_task(&symlink_path).is_err());
+        fs::remove_file(symlink_path).expect("remove task symlink");
+
+        let hardlink_path = fixture_root.join("task-hardlink.json");
+        fs::hard_link(&task_path, &hardlink_path).expect("create task hardlink");
+        assert!(read_performance_pair_task(&hardlink_path).is_err());
+        fs::remove_file(hardlink_path).expect("remove task hardlink");
+
+        let loose_path = fixture_root.join("task-loose.json");
+        fs::write(&loose_path, &task_bytes).expect("write loose task");
+        assert!(read_performance_pair_task(&loose_path).is_err());
+        fs::remove_file(loose_path).expect("remove loose task");
+
+        let oversized_path = fixture_root.join("packet-oversized.json");
+        fs::write(&oversized_path, vec![b'x'; 1_048_577]).expect("write oversized packet");
+        fs::set_permissions(
+            &oversized_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+        )
+        .expect("protect oversized packet");
+        assert!(read_performance_execution_packet(&oversized_path).is_err());
+        fs::remove_file(oversized_path).expect("remove oversized packet");
+
+        let unknown_path = fixture_root.join("task-unknown.json");
+        let mut unknown = task_bytes.clone();
+        unknown.splice(
+            unknown.len() - 2..unknown.len() - 2,
+            b",\"unknown\":0".iter().copied(),
+        );
+        fs::write(&unknown_path, unknown).expect("write unknown-field task");
+        fs::set_permissions(
+            &unknown_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+        )
+        .expect("protect unknown-field task");
+        assert!(read_performance_pair_task(&unknown_path).is_err());
+        fs::remove_file(unknown_path).expect("remove unknown-field task");
+
+        fs::remove_file(packet_path).expect("remove packet fixture");
+        fs::remove_file(task_path).expect("remove task fixture");
+        fs::remove_dir(fixture_root).expect("remove admission fixture");
+
+        validate_performance_execution_limits(&original.limits).expect("reviewed exact limits");
+        let mut invalid_limits = Vec::new();
+        for value in [0, 64 * 1_048_576 - 1, 64 * 1_048_576 + 1] {
+            let mut limits = original.limits.clone();
+            limits.max_klv_bytes = value;
+            invalid_limits.push(limits);
+        }
+        for value in [0, 65_536, 1_048_575, 1_048_577] {
+            let mut limits = original.limits.clone();
+            limits.max_stdout_bytes = value;
+            invalid_limits.push(limits);
+            let mut limits = original.limits.clone();
+            limits.max_stderr_bytes = value;
+            invalid_limits.push(limits);
+        }
+        for value in [0, 999, 60_000, 3_599_999, 3_600_001] {
+            let mut limits = original.limits.clone();
+            limits.arm_deadline_ms = value;
+            invalid_limits.push(limits);
+        }
+        assert!(
+            invalid_limits
+                .iter()
+                .all(|limits| validate_performance_execution_limits(limits).is_err())
+        );
+
+        let valid_executable = original.candidate_wrapper.clone();
+        validate_performance_executable_policy(&valid_executable, "fixture executable")
+            .expect("exact executable policy");
+        let mut invalid_executables = Vec::new();
+        let mut invalid = valid_executable.clone();
+        invalid.bytes = 0;
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.bytes = 1_073_741_825;
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.version_stdout = "no-final-lf".to_string();
+        invalid.version_stdout_sha256 = digest(invalid.version_stdout.as_bytes());
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.version_stdout = "control\tbyte\n".to_string();
+        invalid.version_stdout_sha256 = digest(invalid.version_stdout.as_bytes());
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.version_stdout = format!("{}\n", "x".repeat(4_096));
+        invalid.version_stdout_sha256 = digest(invalid.version_stdout.as_bytes());
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.version_stdout_sha256 = "f".repeat(64);
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.source_commit = "malformed".to_string();
+        invalid_executables.push(invalid);
+        let mut invalid = valid_executable.clone();
+        invalid.build_receipt_sha256 = invalid.sha256.clone();
+        invalid_executables.push(invalid);
+        assert!(invalid_executables.iter().all(|policy| {
+            validate_performance_executable_policy(policy, "fixture executable").is_err()
+        }));
+
+        packet
+            .reference_runners
+            .get_mut(&contract.reporting.comparators[0].id)
+            .expect("Rust runner")
+            .sha256 = "d".repeat(64);
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet
+            .reference_runners
+            .remove(&contract.reporting.comparators[0].id);
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet
+            .reference_runners
+            .insert("extra-comparator".to_string(), executable('d', "extra-v1"));
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet.candidate_wrapper = packet.executor.clone();
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet.candidate_wrapper.version_stdout.push('\n');
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet.timing_authority.required_scope = "build".to_string();
+        assert!(validate_packet(&packet).is_err());
+        packet = original.clone();
+        packet.limits.arm_deadline_ms = 0;
+        assert!(validate_packet(&packet).is_err());
+
+        let invalid_semantic_runtime = |report: Report| {
+            let report_bytes = report_bytes(&report).expect("altered semantic report bytes");
+            let mut altered_contract = contract.clone();
+            altered_contract.semantic.accepted_report_sha256 = vec![digest(&report_bytes)];
+            let mut altered_contract_bytes =
+                serde_json::to_vec(&altered_contract).expect("altered contract bytes");
+            altered_contract_bytes.push(b'\n');
+            let mut altered_packet = original.clone();
+            altered_packet.contract_sha256 = digest(&altered_contract_bytes);
+            altered_packet.semantic_report_sha256 = digest(&report_bytes);
+            let altered_packet_bytes =
+                performance_execution_packet_bytes(&altered_packet).expect("altered packet bytes");
+            validate_performance_execution_packet(
+                &altered_contract,
+                &altered_contract_bytes,
+                &report_bytes,
+                expanded_manifest,
+                &schedule,
+                &runner_manifest,
+                &altered_packet,
+                &digest(&altered_packet_bytes),
+            )
+            .is_err()
+        };
+        let mut missing_runtime: Report =
+            serde_json::from_slice(&semantic_bytes).expect("fixture semantic report");
+        missing_runtime
+            .adapters
+            .iter_mut()
+            .find(|adapter| adapter.adapter == contract.reporting.comparators[0].semantic_adapter)
+            .expect("Rust semantic adapter")
+            .runtime_sha256 = None;
+        assert!(invalid_semantic_runtime(missing_runtime));
+        let mut duplicate_runtime: Report =
+            serde_json::from_slice(&semantic_bytes).expect("fixture semantic report");
+        let duplicate = duplicate_runtime
+            .adapters
+            .iter()
+            .find(|adapter| adapter.adapter == contract.reporting.comparators[0].semantic_adapter)
+            .expect("Rust semantic adapter")
+            .clone();
+        duplicate_runtime.adapters.push(duplicate);
+        assert!(invalid_semantic_runtime(duplicate_runtime));
+
+        let mut wrong_task = task.clone();
+        wrong_task.reference_process_token_sha256 =
+            wrong_task.candidate_process_token_sha256.clone();
+        assert!(validate_task(&wrong_task, &schedule).is_err());
+        wrong_task = task.clone();
+        wrong_task.sequence = schedule.slots.len();
+        assert!(validate_task(&wrong_task, &schedule).is_err());
+        wrong_task = task.clone();
+        wrong_task.execution_packet_sha256 = "e".repeat(64);
+        assert!(validate_task(&wrong_task, &schedule).is_err());
+        wrong_task = task.clone();
+        wrong_task.schema = "wrong-task-schema".to_string();
+        assert!(validate_task(&wrong_task, &schedule).is_err());
+        wrong_task = task.clone();
+        wrong_task.candidate_process_token_sha256 = "not-a-digest".to_string();
+        assert!(validate_task(&wrong_task, &schedule).is_err());
+        for invalid_attempt in [
+            format!("P0-A{}", "A".repeat(32)),
+            format!("P1-A{}", "d".repeat(32)),
+            "../escape".to_string(),
+            format!(".P0-A{}", "d".repeat(32)),
+            format!("P0-A{}", "d".repeat(31)),
+            format!("P0-A{}\0", "d".repeat(32)),
+        ] {
+            wrong_task = task.clone();
+            wrong_task.attempt_id = invalid_attempt;
+            assert!(validate_task(&wrong_task, &schedule).is_err());
+        }
     }
 
     #[test]
