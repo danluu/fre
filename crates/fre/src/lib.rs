@@ -130,6 +130,17 @@ pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as Unic
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 2;
 
+/// Escapes all regular-expression meta characters in `pattern`.
+///
+/// The returned string is safe to use as a literal in a Rust-compatible
+/// regular expression. Its behavior is pinned by FRE's exact
+/// `regex-syntax` 0.8.11 dependency, which is also part of
+/// [`RustProfile::regex_1_12_4`].
+#[must_use]
+pub fn escape(pattern: &str) -> String {
+    regex_syntax::escape(pattern)
+}
+
 /// Construction limits whose identities affect admission or lowering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildLimits {
