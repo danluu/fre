@@ -51,6 +51,26 @@ reference is `pending`; a missing or nonpassing reference is
 `not-comparable` with a reason. The generator validates its own output before
 publication.
 
+Generate the canonical all-model fresh-process pair schedule without running
+any benchmark:
+
+```text
+cargo run -p rebar-compare --bin performance-contract -- \
+  generate-pair-schedule \
+  research/rebar/performance/current-main-a1a87d11-contract.json \
+  /Users/danluu/dev/fre \
+  /absolute/path/to/full344.json \
+  /new/path/current-main-pair-schedule.json
+```
+
+For the accepted current-main report this produces 5,772 six-pair slots and
+11,544 fresh-process arms across 962 available lifecycle/comparator points.
+The other 66 points remain explicit unavailable records with their exact
+semantic reasons. The schedule covers every supported model and boundary;
+`regex-redux` has no slots because its sole current FRE row is semantically
+unsupported. Schedule publication is canonical, deterministic, and
+non-overwriting.
+
 Validate a coverage-complete draft or final pointwise observation file:
 
 ```text

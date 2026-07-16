@@ -1,10 +1,11 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use rebar_compare::performance_contract::{
-    generate_draft_observations, read_capture_lifecycle_observation, read_contract,
-    read_observations, resolve_exact_main, validate_capture_lifecycle_observation,
-    validate_contract, validate_exact_main, validate_observations, validate_semantic_report,
-    write_new_observations,
+    PerformanceContract, generate_draft_observations, generate_performance_pair_schedule,
+    read_capture_lifecycle_observation, read_contract, read_observations, resolve_exact_main,
+    validate_capture_lifecycle_observation, validate_contract, validate_exact_main,
+    validate_observations, validate_semantic_report, write_new_observations,
+    write_new_performance_pair_schedule,
 };
 
 fn main() -> ExitCode {
@@ -89,6 +90,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 output_path.display()
             );
         }
+        "generate-pair-schedule" => {
+            let semantic_path = path_argument(&mut arguments, "SEMANTIC_REPORT")?;
+            let output_path = path_argument(&mut arguments, "OUTPUT")?;
+            require_end(arguments)?;
+            generate_pair_schedule_output(&contract, &semantic_path, &output_path)?;
+        }
         "validate-capture-observation" => {
             let semantic_path = path_argument(&mut arguments, "SEMANTIC_REPORT")?;
             let observation_path = path_argument(&mut arguments, "RAW_OBSERVATION")?;
@@ -126,5 +133,31 @@ fn require_end(
     if arguments.next().is_some() {
         return Err("unexpected extra argument".into());
     }
+    Ok(())
+}
+
+fn generate_pair_schedule_output(
+    contract: &PerformanceContract,
+    semantic_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let semantic_bytes = fs::read(semantic_path)?;
+    let universe = validate_semantic_report(contract, &semantic_bytes)?;
+    let schedule = generate_performance_pair_schedule(contract, &universe)?;
+    write_new_performance_pair_schedule(output_path, &schedule)?;
+    let process_arms = schedule
+        .slots
+        .len()
+        .checked_mul(2)
+        .ok_or("schedule process-arm count overflow")?;
+    println!(
+        "contract={} semantic={} pairs={} process-arms={} unavailable={} output={}",
+        contract.contract_id,
+        contract.semantic.receipts_sha256,
+        schedule.slots.len(),
+        process_arms,
+        schedule.unavailable.len(),
+        output_path.display()
+    );
     Ok(())
 }

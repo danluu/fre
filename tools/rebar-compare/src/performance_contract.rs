@@ -26,6 +26,8 @@ pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observa
 pub const CAPTURE_LIFECYCLE_RAW_SCHEMA: &str = "fre.rebar.capture-lifecycle-raw.v1";
 /// Stable schema for a deterministic fresh-process capture pair schedule.
 pub const CAPTURE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.capture-pair-schedule.v1";
+/// Stable schema for the complete all-model fresh-process pair schedule.
+pub const PERFORMANCE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.performance-pair-schedule.v1";
 /// Stable schema for one raw Rust/RE2 capture reference arm.
 pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
 /// Stable schema for one raw capture resource-observation arm.
@@ -523,6 +525,64 @@ pub struct CapturePairSchedule {
     pub unavailable: Vec<CaptureUnavailableComparator>,
 }
 
+/// One pair slot in the complete all-model performance schedule.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct PerformancePairSlot {
+    /// Global pair sequence.
+    pub sequence: usize,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Exact lifecycle boundary ID from the contract.
+    pub boundary: String,
+    /// Comparator ID from the contract.
+    pub comparator: String,
+    /// Zero-based pair index within this point.
+    pub pair_index: u32,
+    /// Alternating fresh-process arm order.
+    pub order: [CapturePairArm; 2],
+}
+
+/// One all-model comparator point omitted from pair execution.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceUnavailableComparator {
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Exact lifecycle boundary ID from the contract.
+    pub boundary: String,
+    /// Comparator ID from the contract.
+    pub comparator: String,
+    /// Exact semantic absence/nonpass reason.
+    pub reason: String,
+}
+
+/// Complete deterministic fresh-process schedule for every supported model.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PerformancePairSchedule {
+    /// Schedule schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Pairs required for every available comparator point.
+    pub pairs_per_comparator: u32,
+    /// Every available all-model pair slot in execution order.
+    pub slots: Vec<PerformancePairSlot>,
+    /// Every unavailable comparator point, retained explicitly.
+    pub unavailable: Vec<PerformanceUnavailableComparator>,
+}
+
 /// One raw pinned-reference arm corresponding to a schedule slot.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -949,6 +1009,63 @@ pub fn write_new_observations(
     })
 }
 
+/// Serialize an all-model pair schedule as canonical compact JSON plus LF.
+pub fn performance_pair_schedule_bytes(
+    schedule: &PerformancePairSchedule,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(schedule)
+        .map_err(|error| ContractError::new(format!("serialize performance schedule: {error}")))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read a canonically serialized all-model pair schedule.
+pub fn read_performance_pair_schedule(
+    path: &Path,
+) -> Result<PerformancePairSchedule, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let schedule: PerformancePairSchedule = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if performance_pair_schedule_bytes(&schedule)? != bytes {
+        return Err(ContractError::new(format!(
+            "performance pair schedule {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(schedule)
+}
+
+/// Publish an all-model pair schedule to a new path without overwrite.
+pub fn write_new_performance_pair_schedule(
+    path: &Path,
+    schedule: &PerformancePairSchedule,
+) -> Result<(), ContractError> {
+    let parent = path.parent().ok_or_else(|| {
+        ContractError::new(format!("schedule path {} has no parent", path.display()))
+    })?;
+    if !parent.is_dir() {
+        return Err(ContractError::new(format!(
+            "schedule parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    let bytes = performance_pair_schedule_bytes(schedule)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            ContractError::new(format!("create new schedule {}: {error}", path.display()))
+        })?;
+    output.write_all(&bytes).map_err(|error| {
+        ContractError::new(format!("write schedule {}: {error}", path.display()))
+    })?;
+    output
+        .sync_all()
+        .map_err(|error| ContractError::new(format!("sync schedule {}: {error}", path.display())))
+}
+
 /// Execute the explicit first/steady schedule and construct one raw capture
 /// observation. The caller supplies the measurement closure, which permits
 /// deterministic no-clock validation fixtures.
@@ -1131,6 +1248,126 @@ pub fn validate_capture_pair_schedule(
     Ok(())
 }
 
+/// Generate the complete deterministic fresh-process pair schedule for every
+/// supported semantic row, contracted lifecycle boundary, and comparator.
+pub fn generate_performance_pair_schedule(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<PerformancePairSchedule, ContractError> {
+    validate_contract(contract)?;
+    let (slots, unavailable) = performance_schedule_contents(contract, universe)?;
+    let schedule = PerformancePairSchedule {
+        schema: PERFORMANCE_PAIR_SCHEDULE_SCHEMA.to_string(),
+        contract_id: contract.contract_id.clone(),
+        canonical_commit: contract.canonical.commit.clone(),
+        canonical_tree: contract.canonical.tree.clone(),
+        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+        pairs_per_comparator: contract.reporting.pairs_per_comparator,
+        slots,
+        unavailable,
+    };
+    validate_performance_pair_schedule(contract, universe, &schedule)?;
+    Ok(schedule)
+}
+
+/// Validate an all-model pair schedule by recomputing its complete slot and
+/// unavailable-point sets from the authenticated semantic denominator.
+pub fn validate_performance_pair_schedule(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    schedule: &PerformancePairSchedule,
+) -> Result<(), ContractError> {
+    validate_contract(contract)?;
+    if schedule.schema != PERFORMANCE_PAIR_SCHEDULE_SCHEMA
+        || schedule.contract_id != contract.contract_id
+        || schedule.canonical_commit != contract.canonical.commit
+        || schedule.canonical_tree != contract.canonical.tree
+        || schedule.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+        || schedule.pairs_per_comparator != contract.reporting.pairs_per_comparator
+    {
+        return Err(ContractError::new(
+            "performance pair schedule schema, contract, semantic identity, or pair count mismatch",
+        ));
+    }
+    let (expected_slots, expected_unavailable) = performance_schedule_contents(contract, universe)?;
+    if schedule.slots != expected_slots || schedule.unavailable != expected_unavailable {
+        return Err(ContractError::new(
+            "performance pair schedule differs from the all-model semantic universe",
+        ));
+    }
+    Ok(())
+}
+
+fn performance_schedule_contents(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<
+    (
+        Vec<PerformancePairSlot>,
+        Vec<PerformanceUnavailableComparator>,
+    ),
+    ContractError,
+> {
+    let models: BTreeMap<&str, &ModelContract> = contract
+        .models
+        .iter()
+        .map(|model| (model.model.as_str(), model))
+        .collect();
+    let mut slots = Vec::new();
+    let mut unavailable = Vec::new();
+    let mut sequence = 0_usize;
+    for (job_id, semantic) in &universe.rows {
+        if semantic.status != RowSemanticStatus::Supported {
+            continue;
+        }
+        let model = models.get(semantic.model.as_str()).ok_or_else(|| {
+            ContractError::new(format!("performance model {:?} is absent", semantic.model))
+        })?;
+        for boundary in &model.lifecycle_boundaries {
+            for comparator in &contract.reporting.comparators {
+                let status = semantic
+                    .comparator_statuses
+                    .get(&comparator.id)
+                    .copied()
+                    .flatten();
+                if status == Some(Status::Pass) {
+                    for pair_index in 0..contract.reporting.pairs_per_comparator {
+                        slots.push(PerformancePairSlot {
+                            sequence,
+                            job_id: job_id.clone(),
+                            model: semantic.model.clone(),
+                            boundary: boundary.clone(),
+                            comparator: comparator.id.clone(),
+                            pair_index,
+                            order: pair_order(pair_index),
+                        });
+                        sequence = sequence
+                            .checked_add(1)
+                            .ok_or_else(|| ContractError::new("performance schedule overflow"))?;
+                    }
+                } else {
+                    unavailable.push(PerformanceUnavailableComparator {
+                        job_id: job_id.clone(),
+                        model: semantic.model.clone(),
+                        boundary: boundary.clone(),
+                        comparator: comparator.id.clone(),
+                        reason: comparator_unavailable_reason(status),
+                    });
+                }
+            }
+        }
+    }
+    Ok((slots, unavailable))
+}
+
+const fn pair_order(pair_index: u32) -> [CapturePairArm; 2] {
+    if pair_index.is_multiple_of(2) {
+        [CapturePairArm::Candidate, CapturePairArm::Reference]
+    } else {
+        [CapturePairArm::Reference, CapturePairArm::Candidate]
+    }
+}
+
 fn capture_schedule_contents(
     contract: &PerformanceContract,
     universe: &SemanticUniverse,
@@ -1163,11 +1400,6 @@ fn capture_schedule_contents(
                     .flatten();
                 if status == Some(Status::Pass) {
                     for pair_index in 0..pair_count {
-                        let order = if pair_index.is_multiple_of(2) {
-                            [CapturePairArm::Candidate, CapturePairArm::Reference]
-                        } else {
-                            [CapturePairArm::Reference, CapturePairArm::Candidate]
-                        };
                         slots.push(CapturePairSlot {
                             sequence,
                             job_id: job_id.clone(),
@@ -1175,7 +1407,7 @@ fn capture_schedule_contents(
                             boundary,
                             comparator: comparator.id.clone(),
                             pair_index,
-                            order,
+                            order: pair_order(pair_index),
                         });
                         sequence = sequence
                             .checked_add(1)
@@ -3577,6 +3809,87 @@ mod tests {
         assert!(
             apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &wrong_slot,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn all_model_schedule_is_complete_deterministic_and_canonical() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let schedule =
+            generate_performance_pair_schedule(&contract, &universe).expect("all-model schedule");
+        assert_eq!(schedule.slots.len(), 6_168);
+        assert_eq!(schedule.slots.len().checked_mul(2), Some(12_336));
+        assert!(schedule.unavailable.is_empty());
+        assert!(schedule.slots.iter().enumerate().all(|(sequence, slot)| {
+            slot.sequence == sequence && slot.order == pair_order(slot.pair_index)
+        }));
+        let by_model: BTreeMap<&str, usize> = REBAR_MODELS
+            .into_iter()
+            .map(|model| {
+                (
+                    model,
+                    schedule
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.model == model)
+                        .count(),
+                )
+            })
+            .collect();
+        assert_eq!(by_model["compile"], 672);
+        assert_eq!(by_model["count"], 2_400);
+        assert_eq!(by_model["count-captures"], 72);
+        assert_eq!(by_model["count-spans"], 2_640);
+        assert_eq!(by_model["grep"], 264);
+        assert_eq!(by_model["grep-captures"], 120);
+        assert_eq!(by_model["regex-redux"], 0);
+        assert_eq!(
+            schedule
+                .slots
+                .iter()
+                .filter(|slot| matches!(slot.model.as_str(), "count-captures" | "grep-captures"))
+                .count(),
+            192
+        );
+        let bytes = performance_pair_schedule_bytes(&schedule).expect("schedule serialization");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<PerformancePairSchedule>(&bytes).expect("schedule round trip"),
+            schedule
+        );
+        let mut incomplete = schedule;
+        incomplete.slots.pop();
+        assert!(validate_performance_pair_schedule(&contract, &universe, &incomplete).is_err());
+    }
+
+    #[test]
+    fn all_model_schedule_retains_exact_unavailable_points() {
+        let mut contract = contract();
+        let (_, mut universe) = synthetic_semantic_report(&mut contract);
+        let comparator = contract.reporting.comparators[1].id.clone();
+        let row = universe
+            .rows
+            .iter_mut()
+            .find(|(_, row)| row.status == RowSemanticStatus::Supported && row.model == "count")
+            .expect("supported count row");
+        row.1.comparator_statuses.insert(comparator.clone(), None);
+        let unavailable_job = row.0.clone();
+        let schedule =
+            generate_performance_pair_schedule(&contract, &universe).expect("all-model schedule");
+        assert_eq!(schedule.slots.len(), 6_156);
+        assert_eq!(schedule.unavailable.len(), 2);
+        assert!(schedule.unavailable.iter().all(|point| {
+            point.job_id == unavailable_job
+                && point.model == "count"
+                && point.comparator == comparator
+                && point.reason == "semantic report has no matching comparator receipt"
+        }));
+        assert!(
+            !schedule
+                .slots
+                .iter()
+                .any(|slot| slot.job_id == unavailable_job && slot.comparator == comparator)
         );
     }
 
