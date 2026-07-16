@@ -1110,62 +1110,117 @@ impl PortableRegex {
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Whether a selected match exists at or after `start`.
+    ///
+    /// Assertions inspect the complete original haystack. Unlike the pinned
+    /// Rust API, an out-of-bounds `start` is returned as a typed error instead
+    /// of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a resource refusal.
+    pub fn is_match_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Whether a selected match exists wholly inside a search range.
+    ///
+    /// Assertions retain original-haystack context. K0 executes its typed
+    /// existence contract directly instead of materializing a match span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    pub fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
         match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
-                let (matched, accounting) = literal.find(haystack, literal_limits(limits))?;
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) =
+                    literal.find_window(haystack, literal_window, literal_limits(limits))?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::ExactLiteral(accounting),
                 ))
             }
             PortablePlan::PackedLiteralSet(literal_set) => {
-                let (matched, accounting) =
-                    literal_set.find(haystack, packed_literal_set_limits(limits))?;
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    packed_literal_set_limits(limits),
+                )?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::PackedLiteralSet(accounting),
                 ))
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
-                let (matched, accounting) =
-                    literal_set.find(haystack, literal_set_limits(limits))?;
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = literal_set.find_window(
+                    haystack,
+                    literal_window,
+                    literal_set_limits(limits),
+                )?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::LiteralSetDfa(accounting),
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
-                let (matched, accounting) =
-                    required.find(haystack, required_literal_limits(limits))?;
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
             PortablePlan::ForwardAnchored(forward) => {
-                let (matched, accounting) =
-                    forward.find(haystack, forward_anchored_limits(limits))?;
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = forward.find_window(
+                    haystack,
+                    literal_window,
+                    forward_anchored_limits(limits),
+                )?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
             PortablePlan::ForwardEndFixed(fixed) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) =
-                    fixed.find(haystack, forward_anchored_limits(limits))?;
+                    fixed.find_window(haystack, literal_window, forward_anchored_limits(limits))?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
             PortablePlan::K0(automaton) => {
-                let report = automaton.prepare::<Exists>().search(haystack, limits)?;
+                let report = automaton
+                    .prepare::<Exists>()
+                    .search_window(haystack, window, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
             PortablePlan::UnicodeWordRun(plan) => {
-                let (matched, accounting) =
-                    plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((
                     matched.is_some(),
                     SearchAccounting::UnicodeWordRun(accounting),
@@ -1261,6 +1316,24 @@ impl PortableRegex {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return the selected match at or after `start`.
+    ///
+    /// Assertions inspect the complete original haystack and returned offsets
+    /// remain relative to it. Unlike the pinned Rust API, an out-of-bounds
+    /// `start` is returned as a typed error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid start or a resource refusal.
+    pub fn find_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Search a range while assertions retain original-haystack context.
@@ -1484,15 +1557,48 @@ impl PortableSearchSession<'_> {
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Whether a selected match exists at or after `start`, reusing K0 state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::is_match_at`].
+    pub fn is_match_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        self.is_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Whether a selected match exists wholly inside a range, reusing K0
+    /// state and retaining original-haystack assertion context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::is_match_window`].
+    pub fn is_match_window(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
         match &mut self.plan {
-            PortableSearchSessionPlan::Native(regex) => regex.is_match(haystack, limits),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.is_match_window(haystack, window, limits)
+            }
             PortableSearchSessionPlan::K0 {
                 automaton,
                 workspace,
             } => {
                 let report = automaton
                     .prepare::<Exists>()
-                    .search_with_workspace(haystack, workspace, limits)?;
+                    .search_window_with_workspace(haystack, window, workspace, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
@@ -1537,6 +1643,21 @@ impl PortableSearchSession<'_> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.find_window(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Return the selected match at or after `start`, reusing K0 state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`PortableRegex::find_at`].
+    pub fn find_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        self.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
     /// Search a range while assertions retain original-haystack context.
