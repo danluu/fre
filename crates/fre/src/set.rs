@@ -928,6 +928,13 @@ pub struct PortableSetMatches {
 }
 
 impl PortableSetMatches {
+    pub(crate) const fn from_flags_and_report(
+        flags: Vec<u8>,
+        report: PortableRegexSetExecutionReport,
+    ) -> Self {
+        Self { flags, report }
+    }
+
     /// Whether at least one pattern matched.
     #[must_use]
     pub const fn matched_any(&self) -> bool {

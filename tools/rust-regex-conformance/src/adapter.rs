@@ -10,10 +10,11 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder,
-    PortableTextCaptureBuildError, PortableTextCaptureBuilder, PortableTextCaptureRegex,
-    PortableTextRegex, PortableTextSearchError, RustProfile, SearchError, SearchLimits,
-    SearchWindow,
+    PortableBuilder, PortableRegex, PortableRegexSetRunLimits, PortableTextBuildError,
+    PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
+    PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
+    PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, PortableTextSearchError,
+    RustProfile, SearchError, SearchLimits, SearchWindow,
 };
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
@@ -29,11 +30,11 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v7";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v8";
 
 const LIMITATIONS: [&str; 3] = [
-    "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
-    "the production FRE facade has no Rust text or bytes RegexSet matcher",
+    "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
+    "the production FRE facade has no Rust bytes RegexSet matcher",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
 ];
 
@@ -157,12 +158,9 @@ fn execute_case(
         AdapterSurface::RustTextFindIter => execute_text_find(case, input),
         AdapterSurface::RustTextCapturesIter => execute_text_captures(case, input),
         AdapterSurface::RustBytesCapturesIter => execute_bytes_captures(case, input),
-        AdapterSurface::RustTextSetCompile
-        | AdapterSurface::RustTextSetIsMatch
-        | AdapterSurface::RustTextSetWhich => unsupported(
-            CapabilityId::RustTextSetFacade,
-            "facade.rust-text-set-missing",
-        ),
+        AdapterSurface::RustTextSetCompile => execute_text_set_compile(case, input),
+        AdapterSurface::RustTextSetIsMatch => execute_text_set_is_match(case, input),
+        AdapterSurface::RustTextSetWhich => execute_text_set_which(case, input),
         AdapterSurface::RustBytesSetCompile
         | AdapterSurface::RustBytesSetIsMatch
         | AdapterSurface::RustBytesSetWhich => unsupported(
@@ -517,6 +515,7 @@ enum SemanticValue {
     IsMatch(bool),
     Matches(Vec<ExpectedSpan>),
     Captures(Vec<ExpectedCaptures>),
+    PatternIds(Vec<usize>),
 }
 
 enum BuildAttempt {
@@ -528,6 +527,13 @@ enum BuildAttempt {
 
 enum TextBuildAttempt {
     Built(Box<PortableTextRegex>),
+    Rejected,
+    Unsupported(AdapterDisposition),
+    Fault(AdapterDisposition),
+}
+
+enum TextSetBuildAttempt {
+    Built(Box<PortableTextRegexSet>),
     Rejected,
     Unsupported(AdapterDisposition),
     Fault(AdapterDisposition),
@@ -678,6 +684,169 @@ fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
             TextBuildAttempt::Fault(fault("build.text-syntax-unexpected-error"))
         }
         Err(_) => TextBuildAttempt::Fault(fault("build.text-unclassified-error")),
+    }
+}
+
+fn execute_text_set_compile(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::CompileAccepted(case.compiles);
+    match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(_) => compare(&expected, &SemanticValue::CompileAccepted(true)),
+        TextSetBuildAttempt::Rejected => compare(&expected, &SemanticValue::CompileAccepted(false)),
+        TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
+            disposition
+        }
+    }
+}
+
+fn execute_text_set_is_match(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::IsMatch(!input.expected.is_empty());
+    let set = match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(set) => set,
+        TextSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    match set.is_match(haystack, PortableRegexSetRunLimits::unlimited()) {
+        Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed)),
+        Err(_) => unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.text-set-execution-refused",
+        ),
+    }
+}
+
+fn execute_text_set_which(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::PatternIds(expected_pattern_ids(input));
+    let set = match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(set) => set,
+        TextSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    match set.matches(haystack, PortableRegexSetRunLimits::unlimited()) {
+        Ok(observed) => compare(
+            &expected,
+            &SemanticValue::PatternIds(observed.iter().collect()),
+        ),
+        Err(_) => unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.text-set-execution-refused",
+        ),
+    }
+}
+
+fn expected_pattern_ids(input: &ExecutableCase) -> Vec<usize> {
+    input
+        .expected
+        .iter()
+        .map(|matched| matched.pattern_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn build_text_set(case: &CaseReceipt, input: &ExecutableCase) -> TextSetBuildAttempt {
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = case.case_insensitive;
+    profile.options.unicode = case.unicode;
+    profile.options.line_terminator = input.line_terminator;
+    match PortableTextRegexSetBuilder::new(&input.patterns)
+        .profile(profile)
+        .build()
+    {
+        Ok(set) => TextSetBuildAttempt::Built(Box::new(set)),
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source: PortableTextBuildError::TextSyntax(error),
+            ..
+        }) if matches!(&error.category, ErrorCategory::UpstreamRustSyntax) => {
+            TextSetBuildAttempt::Rejected
+        }
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source:
+                PortableTextBuildError::InternalInvariant(_)
+                | PortableTextBuildError::FiniteProof(
+                    BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+                )
+                | PortableTextBuildError::Portable(
+                    BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+                ),
+            ..
+        }) => TextSetBuildAttempt::Fault(fault("build.text-set-pattern-internal-fault")),
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source: PortableTextBuildError::TextSyntax(error),
+            ..
+        }) if matches!(
+            &error.category,
+            ErrorCategory::FreResourceLimit { .. }
+                | ErrorCategory::StrictQualificationFailure { .. }
+        ) =>
+        {
+            TextSetBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustTextSetFacade,
+                "build.text-set-syntax-resource-envelope",
+            ))
+        }
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source: PortableTextBuildError::NonFiniteLanguage,
+            ..
+        }) => TextSetBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextSetFacade,
+            "build.text-set-equivalence-proof-gap",
+        )),
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source:
+                PortableTextBuildError::BytesProofSyntax(_)
+                | PortableTextBuildError::ProfileLanguageMismatch
+                | PortableTextBuildError::InvalidUtf8Word,
+            ..
+        }) => TextSetBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextSetFacade,
+            "build.text-set-bytes-equivalence-gap",
+        )),
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source: PortableTextBuildError::FiniteProof(_) | PortableTextBuildError::Portable(_),
+            ..
+        }) => TextSetBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextSetFacade,
+            "build.text-set-portable-subset-gap",
+        )),
+        Err(PortableTextRegexSetBuildError::Pattern {
+            source: PortableTextBuildError::TextSyntax(_),
+            ..
+        }) => TextSetBuildAttempt::Fault(fault("build.text-set-syntax-unexpected-error")),
+        Err(
+            PortableTextRegexSetBuildError::PatternLimit { .. }
+            | PortableTextRegexSetBuildError::PatternBytesLimit { .. }
+            | PortableTextRegexSetBuildError::PersistentLimit { .. },
+        ) => TextSetBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextSetFacade,
+            "build.text-set-resource-envelope",
+        )),
+        Err(
+            PortableTextRegexSetBuildError::AllocationFailed { .. }
+            | PortableTextRegexSetBuildError::ArithmeticOverflow { .. },
+        ) => TextSetBuildAttempt::Fault(fault("build.text-set-internal-fault")),
+        Err(_) => TextSetBuildAttempt::Fault(fault("build.text-set-unclassified-error")),
     }
 }
 
@@ -1483,6 +1652,66 @@ mod tests {
                 capability: CapabilityId::RustTextFacade,
                 ref reason_code,
             } if reason_code == "build.text-equivalence-proof-gap"
+        ));
+    }
+
+    #[test]
+    fn text_set_surfaces_compile_match_and_deduplicate_pattern_ids() {
+        let mut case = fixture_case(true, true, None);
+        case.pattern_count = 2;
+        case.match_kind = MatchKind::All;
+        case.search_kind = SearchKind::Overlapping;
+        case.unicode = true;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["a".to_owned(), "a|é".to_owned()],
+            haystack: "baé".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 4 },
+            line_terminator: b'\n',
+            expected: vec![
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+                },
+                ExpectedCaptures {
+                    pattern_id: 1,
+                    groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+                },
+                ExpectedCaptures {
+                    pattern_id: 1,
+                    groups: vec![Some(ExpectedSpan { start: 2, end: 4 })],
+                },
+            ],
+        };
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetIsMatch, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert_eq!(expected_pattern_ids(&input), vec![0, 1]);
+    }
+
+    #[test]
+    fn text_set_proof_gaps_remain_typed_unsupported() {
+        let mut case = fixture_case(true, true, None);
+        case.match_kind = MatchKind::All;
+        case.search_kind = SearchKind::Overlapping;
+        case.unicode = true;
+        let mut input = fixture_input(Vec::new());
+        input.patterns = vec![r"(?-u:\B)".to_owned()];
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetCompile, &case, &input),
+            AdapterDisposition::Unsupported {
+                capability: CapabilityId::RustTextSetFacade,
+                ref reason_code,
+            } if reason_code == "build.text-set-equivalence-proof-gap"
         ));
     }
 
