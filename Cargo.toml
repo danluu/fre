@@ -23,6 +23,7 @@ members = [
     "tools/rebar-expand",
     "tools/rebar-compare",
     "tools/rebar-manifest",
+    "tools/rust-regex-conformance",
     "tools/fre-holdout",
     "tools/fre-unsafe-lint-boundary",
 ]
