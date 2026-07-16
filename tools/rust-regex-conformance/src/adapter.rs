@@ -29,12 +29,12 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v6";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v7";
 
 const LIMITATIONS: [&str; 3] = [
     "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE facade has no Rust text or bytes RegexSet matcher",
-    "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/non-Unicode-RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
+    "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
 ];
 
 /// Half-open search range decoded from one upstream case.

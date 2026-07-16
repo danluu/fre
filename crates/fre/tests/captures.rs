@@ -140,6 +140,10 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
         (r"(a*)", "éba"),
         (r"((a)?)(b)?", "éab b"),
         (r"(é+)", "aéé東京"),
+        (r"(\w+)", "éa 東京_42"),
+        (r"(.)", "é東京"),
+        (r"^((?:é|a)*)$", "éaé"),
+        (r"([\p{Greek}]+)", "aΔδ東京"),
     ];
     for (pattern, haystack) in cases {
         let regex = PortableTextCaptureBuilder::new(pattern)
@@ -173,9 +177,9 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
     }
 
     assert!(matches!(
-        PortableTextCaptureBuilder::new(r"(\w+)")
+        PortableTextCaptureBuilder::new(r"(\b)")
             .build()
-            .expect_err("Unicode word HIR differs from the byte-stable proof"),
+            .expect_err("word look is outside the tagged executor"),
         PortableTextCaptureBuildError::ProfileHirMismatch
             | PortableTextCaptureBuildError::BytesProofSyntax(_)
             | PortableTextCaptureBuildError::Capture(_)
@@ -307,13 +311,60 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
 }
 
 #[test]
-fn uncertified_unicode_and_word_look_remain_typed_refusals() {
-    assert!(
-        CaptureBuilder::new(r"(\p{L}+)")
+fn unicode_capture_classes_execute_while_word_look_remains_a_typed_refusal() {
+    let pattern = r"([\p{L}\p{N}_]+)";
+    let haystack = b"abc \xCE\x94\xCE\xB4 42 \xFF";
+    let reference = RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode byte reference")
+        .captures_iter(haystack)
+        .map(|captures| captures.iter().flatten().count())
+        .sum::<usize>();
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode capture lowering");
+    let actual = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("Unicode capture execution")
+        .accounting
+        .count;
+    assert_eq!(actual, reference);
+    let hir_starved = fre::CaptureBuildLimits {
+        max_hir_work: regex.build_report().hir.work.saturating_sub(1),
+        ..fre::CaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
             .unicode(true)
-            .build()
-            .is_err()
-    );
+            .limits(hir_starved)
+            .build(),
+        Err(fre::CaptureBuildError::HirResource {
+            resource: "work",
+            ..
+        })
+    ));
+    let engine = fre::CaptureEngineBuildLimits {
+        max_ast_nodes: regex.build_report().engine.ast_nodes.saturating_sub(1),
+        ..fre::CaptureEngineBuildLimits::default()
+    };
+    let ast_starved = fre::CaptureBuildLimits {
+        engine,
+        ..fre::CaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
+            .unicode(true)
+            .limits(ast_starved)
+            .build(),
+        Err(fre::CaptureBuildError::Engine(
+            fre::CaptureEngineBuildError::Resource {
+                kind: CaptureResource::AstNodes,
+                ..
+            }
+        ))
+    ));
     assert!(
         CaptureBuilder::new(r"\b(a)\b")
             .unicode(false)

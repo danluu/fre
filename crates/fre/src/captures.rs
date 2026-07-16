@@ -21,7 +21,10 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::hir::{Class, Hir, HirKind, Look};
+use regex_syntax::{
+    hir::{Class, ClassUnicode, Hir, HirKind, Look},
+    utf8::Utf8Sequences,
+};
 
 /// Capture-aware operation included in construction and execution identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,8 +43,6 @@ pub enum CapturePlanKind {
 /// HIR forms deliberately outside the certified capture compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureUnsupported {
-    /// General Unicode lowering has not passed the byte-offset differential gate.
-    Unicode,
     /// A look assertion has not been implemented by the tagged program.
     Look(Look),
 }
@@ -80,12 +81,16 @@ pub struct CaptureBuildLimits {
 
 impl Default for CaptureBuildLimits {
     fn default() -> Self {
+        let engine = EngineBuildLimits {
+            max_ast_nodes: 65_536,
+            ..EngineBuildLimits::default()
+        };
         Self {
             admission: AdmissionPolicy::default(),
             syntax_safety: SafetyEnvelope::default(),
             max_hir_work: 1_000_000,
             max_hir_depth: 250,
-            engine: EngineBuildLimits::default(),
+            engine,
             selector: SelectorCompileLimits::default(),
         }
     }
@@ -355,7 +360,7 @@ pub struct PortableTextCaptureBuildReport {
     pub profile: CompatibilityProfile,
     /// Bounded public `RustText` parse.
     pub text_syntax: ParseSummary,
-    /// Independently parsed non-Unicode `RustBytes` proof HIR.
+    /// Independently parsed same-option `RustBytes` proof HIR.
     pub bytes_syntax: ParseSummary,
     /// Construction report for the byte-stable tagged executor.
     pub capture: CaptureBuildReport,
@@ -367,7 +372,7 @@ pub struct PortableTextCaptureBuildReport {
 pub enum PortableTextCaptureBuildError {
     /// Public `RustText` parsing rejected the pattern.
     TextSyntax(ParseError),
-    /// Independent non-Unicode `RustBytes` proof parsing rejected the pattern.
+    /// Independent same-option `RustBytes` proof parsing rejected the pattern.
     BytesProofSyntax(ParseError),
     /// The two capture-preserving HIRs are not exactly equal.
     ProfileHirMismatch,
@@ -514,8 +519,7 @@ impl PortableTextCaptureBuilder {
             ));
         };
 
-        let mut bytes_profile = self.profile.clone();
-        bytes_profile.options.unicode = false;
+        let bytes_profile = self.profile.clone();
         let bytes = fre_syntax::parse(
             fre_syntax::ParseRequest::rust(
                 self.pattern.clone(),
@@ -628,8 +632,8 @@ pub struct CaptureBuilder {
 }
 
 impl CaptureBuilder {
-    /// Start from the pinned Rust byte profile. Unicode defaults to enabled and
-    /// is an explicit refusal until variable-width capture offsets qualify.
+    /// Start from the pinned Rust byte profile. Unicode defaults to enabled;
+    /// scalar classes lower to checked canonical UTF-8 byte sequences.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {
@@ -681,18 +685,20 @@ impl CaptureBuilder {
         let syntax_key = Arc::new(parsed.key);
         let admission = parsed.admission_status;
         let syntax = parsed.summary;
-        if unicode {
-            return Err(CaptureBuildError::Unsupported(CaptureUnsupported::Unicode));
-        }
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
             return Err(CaptureBuildError::InternalInvariant(
                 "Rust byte request produced non-Rust syntax",
             ));
         };
         let mut accounting = CaptureHirAccounting::default();
+        let selector_profile = if unicode {
+            SelectorProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
+        } else {
+            SelectorProfile::PINNED_1_12_4
+        };
         let selector = SelectorRegex::from_hir_erasing_captures_for_whole_match(
             &rust.hir,
-            SelectorProfile::PINNED_1_12_4,
+            selector_profile,
             limits.selector,
         )
         .map_err(CaptureBuildError::Selector)?;
@@ -1093,9 +1099,7 @@ fn lower_hir(
             );
             Ok(Ast::Class(ranges))
         }
-        HirKind::Class(Class::Unicode(_)) => {
-            Err(CaptureBuildError::Unsupported(CaptureUnsupported::Unicode))
-        }
+        HirKind::Class(Class::Unicode(class)) => lower_unicode_class(class, limits, accounting),
         HirKind::Look(Look::Start) => Ok(Ast::Start),
         HirKind::Look(Look::End) => Ok(Ast::End),
         HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
@@ -1133,6 +1137,61 @@ fn lower_hir(
             lower_children(children, depth, limits, accounting, Ast::Alt)
         }
     }
+}
+
+fn lower_unicode_class(
+    class: &ClassUnicode,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Ast, CaptureBuildError> {
+    let mut branches = Vec::new();
+    for scalar_range in class.ranges() {
+        charge_hir(accounting, 1, limits.max_hir_work)?;
+        for sequence in Utf8Sequences::new(scalar_range.start(), scalar_range.end()) {
+            charge_hir(accounting, 1, limits.max_hir_work)?;
+            let byte_ranges = sequence.as_slice();
+            charge_hir(accounting, byte_ranges.len(), limits.max_hir_work)?;
+            let mut parts = Vec::new();
+            parts.try_reserve_exact(byte_ranges.len()).map_err(|_| {
+                CaptureBuildError::Allocation {
+                    structure: "Unicode class sequence",
+                    items: byte_ranges.len(),
+                }
+            })?;
+            for range in byte_ranges {
+                accounting.class_ranges = checked_dimension_add(
+                    accounting.class_ranges,
+                    1,
+                    "class ranges",
+                    limits.max_hir_work,
+                )?;
+                let mut ranges = Vec::new();
+                ranges
+                    .try_reserve_exact(1)
+                    .map_err(|_| CaptureBuildError::Allocation {
+                        structure: "Unicode byte range",
+                        items: 1,
+                    })?;
+                ranges.push((range.start, range.end));
+                parts.push(Ast::Class(ranges));
+            }
+            branches
+                .try_reserve(1)
+                .map_err(|_| CaptureBuildError::Allocation {
+                    structure: "Unicode class branch",
+                    items: 1,
+                })?;
+            branches.push(concat_or_empty(parts));
+        }
+    }
+    Ok(match branches.len() {
+        0 => Ast::Class(Vec::new()),
+        1 => branches
+            .into_iter()
+            .next()
+            .unwrap_or(Ast::Class(Vec::new())),
+        _ => Ast::Alt(branches),
+    })
 }
 
 fn lower_children(
