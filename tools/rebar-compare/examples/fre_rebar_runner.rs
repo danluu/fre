@@ -15,13 +15,16 @@ use std::{
 
 use bstr::ByteSlice;
 use fre::{
-    AggregateBuildReport, AggregateBuilder, AggregatePlanKind, PlanKind, SearchSessionLimits,
+    AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyPlanKind, AggregatePlanKind, PlanKind, SearchSessionLimits,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
     current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
     current_fre_rebar_validate_aggregate_identity,
+    current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
         CaptureLifecycleRawObservation, capture_lifecycle_observation_bytes,
@@ -60,7 +63,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2 report={REPORT_SCHEMA} aggregate-explain=10 aggregate-many=compile+count+count-spans facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -341,9 +344,18 @@ impl Benchmark {
         if benchmark.max_iters != 1 || benchmark.max_warmup_iters != 0 {
             return Err("formal FRE timing requires max-iters=1 and max-warmup-iters=0".into());
         }
-        if benchmark.patterns.len() != 1 {
+        if benchmark.patterns.is_empty() {
+            return Err("FRE KLV runner requires at least one pattern".into());
+        }
+        if benchmark.patterns.len() != 1
+            && !matches!(
+                benchmark.model.as_str(),
+                "compile" | "count" | "count-spans"
+            )
+        {
             return Err(format!(
-                "FRE KLV runner requires one pattern, got {}",
+                "FRE KLV model {:?} requires one pattern, got {}",
+                benchmark.model,
                 benchmark.patterns.len()
             )
             .into());
@@ -428,6 +440,14 @@ fn aggregate_builder(benchmark: &Benchmark) -> AggregateBuilder {
     )
 }
 
+fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
+    current_fre_rebar_aggregate_many_builder(
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+    )
+}
+
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     match (model, report.plan) {
         ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
@@ -445,6 +465,17 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
     }
 }
 
+fn aggregate_many_plan(model: &str, report: &AggregateManyBuildReport) -> &'static str {
+    match (model, report.plan) {
+        ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
+        ("compile", AggregateManyPlanKind::ContinuationProgram) => {
+            "compile-many-continuation-program"
+        }
+        (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
+        (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
+    }
+}
+
 fn require_aggregate_plan(
     model: &str,
     report: &AggregateBuildReport,
@@ -459,10 +490,33 @@ fn require_aggregate_plan(
     )
 }
 
+fn require_aggregate_many_plan(
+    benchmark: &Benchmark,
+    model: &str,
+    report: &AggregateManyBuildReport,
+    expectations: &Expectations,
+) -> Result<(), DynError> {
+    current_fre_rebar_validate_aggregate_many_identity(
+        &benchmark.patterns,
+        report,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        model,
+    )?;
+    require_optional(
+        "plan",
+        expectations.plan.as_deref(),
+        aggregate_many_plan(model, report),
+    )
+}
+
 fn model_compile(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_compile_many(benchmark, expectations);
+    }
     let haystack = benchmark.haystack.as_slice();
     let warmup_start = Instant::now();
     for _ in 0..benchmark.max_warmup_iters {
@@ -508,10 +562,48 @@ fn model_compile(
     Ok(samples)
 }
 
+fn model_compile_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let haystack = benchmark.haystack.as_slice();
+    let warmup_start = Instant::now();
+    for _ in 0..benchmark.max_warmup_iters {
+        let artifact = aggregate_many_builder(benchmark).build_compile()?;
+        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
+        let _ = artifact.verify_count(haystack, limits)?;
+        if warmup_start.elapsed() >= benchmark.max_warmup_time {
+            break;
+        }
+    }
+
+    let mut samples = Vec::new();
+    let run_start = Instant::now();
+    for _ in 0..benchmark.max_iters {
+        let sample_start = Instant::now();
+        let artifact = aggregate_many_builder(benchmark).build_compile()?;
+        let duration = sample_start.elapsed();
+        require_aggregate_many_plan(benchmark, "compile", artifact.build_report(), expectations)?;
+        let limits =
+            current_fre_rebar_aggregate_many_run_limits(haystack.len(), artifact.build_report())?;
+        let count = artifact.verify_count(haystack, limits)?.value();
+        samples.push(Sample { duration, count });
+        if run_start.elapsed() >= benchmark.max_time {
+            break;
+        }
+    }
+    Ok(samples)
+}
+
 fn model_count(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_count_many(benchmark, expectations);
+    }
     let regex = aggregate_builder(benchmark).build_count()?;
     require_aggregate_plan(
         "count",
@@ -533,10 +625,34 @@ fn model_count(
     )
 }
 
+fn model_count_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let regex = aggregate_many_builder(benchmark).build_count()?;
+    require_aggregate_many_plan(benchmark, "count", regex.build_report(), expectations)?;
+    let limits = current_fre_rebar_aggregate_many_run_limits(
+        benchmark.haystack.len(),
+        regex.build_report(),
+    )?;
+    run(
+        benchmark,
+        || {
+            regex
+                .count_value(&benchmark.haystack, limits)
+                .map_err(Into::into)
+        },
+        Ok,
+    )
+}
+
 fn model_count_spans(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if benchmark.patterns.len() > 1 {
+        return model_count_spans_many(benchmark, expectations);
+    }
     let regex = aggregate_builder(benchmark).build_span_sum()?;
     require_aggregate_plan(
         "count-spans",
@@ -547,6 +663,27 @@ fn model_count_spans(
     let limits =
         current_fre_rebar_aggregate_run_limits(benchmark.haystack.len(), regex.build_report())?;
     let limits = &limits;
+    run(
+        benchmark,
+        || {
+            regex
+                .span_sum_value(&benchmark.haystack, limits)
+                .map_err(Into::into)
+        },
+        Ok,
+    )
+}
+
+fn model_count_spans_many(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let regex = aggregate_many_builder(benchmark).build_span_sum()?;
+    require_aggregate_many_plan(benchmark, "count-spans", regex.build_report(), expectations)?;
+    let limits = current_fre_rebar_aggregate_many_run_limits(
+        benchmark.haystack.len(),
+        regex.build_report(),
+    )?;
     run(
         benchmark,
         || {
@@ -720,6 +857,22 @@ mod tests {
         output
     }
 
+    fn multi_klv(model: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        field(&mut output, "name", b"test/model/multi");
+        field(&mut output, "model", model.as_bytes());
+        field(&mut output, "case-insensitive", b"false");
+        field(&mut output, "unicode", b"false");
+        field(&mut output, "max-iters", b"1");
+        field(&mut output, "max-warmup-iters", b"0");
+        field(&mut output, "max-time", b"1000");
+        field(&mut output, "max-warmup-time", b"100");
+        field(&mut output, "pattern", b"cat");
+        field(&mut output, "pattern", b"dog");
+        field(&mut output, "haystack", b"cat dog cat");
+        output
+    }
+
     fn capture_benchmark(model: &str, pattern: &str, haystack: &[u8]) -> Benchmark {
         Benchmark {
             name: format!("test/model/{model}"),
@@ -757,6 +910,180 @@ mod tests {
         assert_eq!(benchmark.pattern(), "a:b");
         assert_eq!(benchmark.haystack, b"a:b\n\xFF");
         assert_eq!(benchmark.max_iters, 1);
+    }
+
+    #[test]
+    fn parses_multiple_patterns_only_for_aggregate_models() {
+        for model in ["compile", "count", "count-spans"] {
+            let benchmark = Benchmark::parse(&multi_klv(model)).expect("aggregate multi KLV");
+            assert_eq!(benchmark.patterns, ["cat", "dog"]);
+        }
+        for model in ["grep", "count-captures", "grep-captures"] {
+            assert!(Benchmark::parse(&multi_klv(model)).is_err());
+        }
+    }
+
+    #[test]
+    fn multi_pattern_lifecycles_bind_order_and_plan_without_timing() {
+        let benchmark = Benchmark::parse(&multi_klv("count")).expect("multi count KLV");
+        let expected = Expectations {
+            plan: Some("aggregate-many-ordered-literal".to_string()),
+            ..Expectations::default()
+        };
+        let count = aggregate_many_builder(&benchmark)
+            .build_count()
+            .expect("multi count artifact");
+        require_aggregate_many_plan(&benchmark, "count", count.build_report(), &expected)
+            .expect("multi count identity");
+        let count_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            count.build_report(),
+        )
+        .expect("multi count limits");
+        assert_eq!(
+            count
+                .count_value(&benchmark.haystack, count_limits)
+                .expect("multi count execution"),
+            3
+        );
+
+        let spans = aggregate_many_builder(&benchmark)
+            .build_span_sum()
+            .expect("multi span-sum artifact");
+        require_aggregate_many_plan(&benchmark, "count-spans", spans.build_report(), &expected)
+            .expect("multi span-sum identity");
+        let span_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            spans.build_report(),
+        )
+        .expect("multi span-sum limits");
+        assert_eq!(
+            spans
+                .span_sum_value(&benchmark.haystack, span_limits)
+                .expect("multi span-sum execution"),
+            9
+        );
+
+        let compile = aggregate_many_builder(&benchmark)
+            .build_compile()
+            .expect("multi compile artifact");
+        let compile_expected = Expectations {
+            plan: Some("compile-many-ordered-literal".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &benchmark,
+            "compile",
+            compile.build_report(),
+            &compile_expected,
+        )
+        .expect("multi compile identity");
+        let compile_limits = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            compile.build_report(),
+        )
+        .expect("multi compile limits");
+        assert_eq!(
+            compile
+                .verify_count(&benchmark.haystack, compile_limits)
+                .expect("multi compile verification")
+                .value(),
+            3
+        );
+
+        let mut wrong_order = benchmark.patterns.clone();
+        wrong_order.reverse();
+        assert!(
+            current_fre_rebar_validate_aggregate_many_identity(
+                &wrong_order,
+                count.build_report(),
+                false,
+                false,
+                "count",
+            )
+            .is_err()
+        );
+
+        let continuation = Benchmark {
+            patterns: vec!["a+".to_string(), "b+".to_string()],
+            haystack: b"aa bbb".to_vec(),
+            ..benchmark
+        };
+        let continuation_count = aggregate_many_builder(&continuation)
+            .build_count()
+            .expect("multi continuation artifact");
+        let continuation_expected = Expectations {
+            plan: Some("aggregate-many-continuation-program".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &continuation,
+            "count",
+            continuation_count.build_report(),
+            &continuation_expected,
+        )
+        .expect("multi continuation identity");
+        let continuation_limits = current_fre_rebar_aggregate_many_run_limits(
+            continuation.haystack.len(),
+            continuation_count.build_report(),
+        )
+        .expect("multi continuation limits");
+        assert_eq!(
+            continuation_count
+                .count_value(&continuation.haystack, continuation_limits)
+                .expect("multi continuation execution"),
+            2
+        );
+
+        let continuation_compile = aggregate_many_builder(&continuation)
+            .build_compile()
+            .expect("multi continuation compile artifact");
+        let continuation_compile_expected = Expectations {
+            plan: Some("compile-many-continuation-program".to_string()),
+            ..Expectations::default()
+        };
+        require_aggregate_many_plan(
+            &continuation,
+            "compile",
+            continuation_compile.build_report(),
+            &continuation_compile_expected,
+        )
+        .expect("multi continuation compile identity");
+        let continuation_compile_limits = current_fre_rebar_aggregate_many_run_limits(
+            continuation.haystack.len(),
+            continuation_compile.build_report(),
+        )
+        .expect("multi continuation compile limits");
+        assert_eq!(
+            continuation_compile
+                .verify_count(&continuation.haystack, continuation_compile_limits)
+                .expect("multi continuation compile verification")
+                .value(),
+            2
+        );
+
+        let unicode = Benchmark {
+            patterns: vec!["Δ".to_string(), "β".to_string()],
+            unicode: true,
+            haystack: "Δ β Δ".as_bytes().to_vec(),
+            ..continuation
+        };
+        let unicode_count = aggregate_many_builder(&unicode)
+            .build_count()
+            .expect("Unicode ordered-many count artifact");
+        require_aggregate_many_plan(&unicode, "count", unicode_count.build_report(), &expected)
+            .expect("Unicode ordered-many count identity");
+        let unicode_limits = current_fre_rebar_aggregate_many_run_limits(
+            unicode.haystack.len(),
+            unicode_count.build_report(),
+        )
+        .expect("Unicode ordered-many limits");
+        assert_eq!(
+            unicode_count
+                .count_value(&unicode.haystack, unicode_limits)
+                .expect("Unicode ordered-many execution"),
+            3
+        );
     }
 
     #[test]

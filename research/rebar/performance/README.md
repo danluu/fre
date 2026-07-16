@@ -163,6 +163,14 @@ inside a six-sample set are rejected. Cold compile, allocator-warm compile,
 first-operation, steady-operation, and composite resource medians remain
 distinct lifecycle observations.
 
+The FRE KLV candidate runner accepts ordered multi-pattern inputs for
+`compile`, `count`, and `count-spans`, uses the same authenticated builder,
+limits, source-order/profile checks, and selected-plan labels as semantic
+qualification, and preserves fresh construction for compile versus retained
+construction for operation models. Other models remain exactly one-pattern.
+Its legacy duration/count output is not yet an all-model raw evidence record.
+
 The performance gate still needs an authorized executor/collector for the
 paired timing and resource schedules, `regex-redux` after semantic support
-exists, and an authenticated runner path for multi-pattern rows.
+exists, and an authenticated all-model raw-record adapter around the admitted
+candidate runners.

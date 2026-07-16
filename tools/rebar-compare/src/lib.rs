@@ -890,6 +890,32 @@ pub fn current_fre_rebar_aggregate_builder(
         .strategy(AggregateStrategy::ReverseSequentialRows)
 }
 
+/// Construct the exact ordered multi-pattern aggregate builder used by the
+/// authenticated current-FRE Rebar adapter.
+#[must_use]
+pub fn current_fre_rebar_aggregate_many_builder(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+) -> AggregateManyBuilder<'_> {
+    let limits = RunLimits::default();
+    aggregate_many_builder_with_limits(patterns, unicode, case_insensitive, &limits)
+}
+
+fn aggregate_many_builder_with_limits<'a>(
+    patterns: &'a [String],
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> AggregateManyBuilder<'a> {
+    AggregateManyBuilder::new(patterns)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(aggregate_many_build_limits(limits))
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+}
+
 /// Construct the exact portable-search builder used by the authenticated
 /// current-FRE Rebar adapter.
 ///
@@ -1063,6 +1089,20 @@ pub fn current_fre_rebar_aggregate_run_limits(
         .map_err(|error| CompareError::new(error.message))
 }
 
+/// Derive the exact whole-operation limits used by the authenticated
+/// current-FRE Rebar adapter for one already-published multi-pattern plan.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if a bound cannot be represented.
+pub fn current_fre_rebar_aggregate_many_run_limits(
+    haystack_len: usize,
+    report: &AggregateManyBuildReport,
+) -> Result<AggregateManyRunLimits, CompareError> {
+    aggregate_many_run_limits(haystack_len, report, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
+}
+
 /// Check the aggregate semantic identity required by the authenticated adapter
 /// for one operation model.
 ///
@@ -1097,6 +1137,34 @@ pub fn current_fre_rebar_validate_aggregate_identity(
         )));
     }
     require_unicode_plan_identity(report, unicode, literal_operation)
+        .map_err(|error| CompareError::new(error.message))
+}
+
+/// Check the ordered multi-pattern semantic identity required by the
+/// authenticated adapter for one operation model.
+///
+/// # Errors
+///
+/// Returns an identity error for an unexpected model, profile, source order,
+/// operation, or selected-plan semantic certificate.
+pub fn current_fre_rebar_validate_aggregate_many_identity(
+    patterns: &[String],
+    report: &AggregateManyBuildReport,
+    unicode: bool,
+    case_insensitive: bool,
+    model: &str,
+) -> Result<(), CompareError> {
+    let operation = match model {
+        "compile" => AggregateManyOperation::Compile,
+        "count" => AggregateManyOperation::Count,
+        "count-spans" => AggregateManyOperation::SpanSum,
+        other => {
+            return Err(CompareError::new(format!(
+                "unexpected aggregate-many model {other}"
+            )));
+        }
+    };
+    require_aggregate_many_report_identity(patterns, unicode, case_insensitive, report, operation)
         .map_err(|error| CompareError::new(error.message))
 }
 
@@ -3086,22 +3154,36 @@ fn require_aggregate_many_identity(
     report: &AggregateManyBuildReport,
     operation: AggregateManyOperation,
 ) -> Result<(), ExecutionError> {
+    require_aggregate_many_report_identity(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        report,
+        operation,
+    )
+}
+
+fn require_aggregate_many_report_identity(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    report: &AggregateManyBuildReport,
+    operation: AggregateManyOperation,
+) -> Result<(), ExecutionError> {
     let mut expected_profile = rebar_profile();
-    expected_profile.options.unicode = request.unicode;
-    expected_profile.options.case_insensitive = request.case_insensitive;
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = case_insensitive;
     if report.profile != expected_profile || report.operation != operation {
         return Err(ExecutionError::fault(
             "FRE ordered build-many profile/operation identity mismatch",
         ));
     }
-    if report.patterns.len() != request.patterns.len() {
+    if report.patterns.len() != patterns.len() {
         return Err(ExecutionError::fault(
             "FRE ordered build-many pattern identity count mismatch",
         ));
     }
-    for (ordinal, (pattern_report, source)) in
-        report.patterns.iter().zip(request.patterns).enumerate()
-    {
+    for (ordinal, (pattern_report, source)) in report.patterns.iter().zip(patterns).enumerate() {
         if pattern_report.ordinal != ordinal
             || pattern_report.syntax_key.pattern.as_bytes() != source.as_bytes()
             || pattern_report.syntax_key.profile
@@ -3116,14 +3198,14 @@ fn require_aggregate_many_identity(
         AggregateManyPlanIdentity::OrderedLiteral { semantics, .. } => Some(semantics),
         AggregateManyPlanIdentity::Continuation(_) => None,
     };
-    if request.unicode
+    if unicode
         && literal_semantics != Some(AggregateManyLiteralSemantics::UnicodeOnNonemptyUtf8Literals)
     {
         return Err(ExecutionError::fault(
             "FRE Unicode ordered build-many literal proof identity mismatch",
         ));
     }
-    if !request.unicode
+    if !unicode
         && literal_semantics.is_some_and(|semantics| {
             semantics != AggregateManyLiteralSemantics::UnicodeOffByteBoundaries
         })
@@ -3285,14 +3367,14 @@ fn fre_aggregate_many_count(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_count()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_count()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Count)?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
@@ -3316,14 +3398,14 @@ fn fre_aggregate_many_compile(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_compile()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_compile()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(
         request,
         regex.build_report(),
@@ -3351,14 +3433,14 @@ fn fre_aggregate_many_span_sum(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    let regex = AggregateManyBuilder::new(request.patterns)
-        .profile(rebar_profile())
-        .unicode(request.unicode)
-        .case_insensitive(request.case_insensitive)
-        .limits(aggregate_many_build_limits(limits))
-        .strategy(AggregateStrategy::ReverseSequentialRows)
-        .build_span_sum()
-        .map_err(|error| aggregate_many_build_error(&error))?;
+    let regex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_span_sum()
+    .map_err(|error| aggregate_many_build_error(&error))?;
     require_aggregate_many_identity(
         request,
         regex.build_report(),
