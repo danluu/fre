@@ -1,8 +1,12 @@
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
-    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, PortableTextCaptureBuilder,
 };
+use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
+
+type GroupFixture = (u32, Option<String>, Option<(usize, usize)>);
+type CaptureFixture = Vec<GroupFixture>;
 
 fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
     let regex = RegexBuilder::new(pattern)
@@ -28,6 +32,156 @@ fn assert_count(pattern: &str, haystack: &[u8]) {
         result.identity.plan,
         regex.cache_identity(CaptureRunLimits::default()).plan
     );
+}
+
+fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {
+    let regex = RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("reference pattern");
+    let names = regex
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    regex
+        .captures_iter(haystack)
+        .map(|captures| {
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, matched)| {
+                    (
+                        u32::try_from(index).unwrap(),
+                        names[index].clone(),
+                        matched.map(|matched| (matched.start(), matched.end())),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
+    let cases: &[(&str, &[u8])] = &[
+        (r"(?P<left>a)|(b)", b"ab"),
+        (r"()|a", b"a"),
+        (r"(a*)", b"ba"),
+        (r"((a)?)(b)?", b"ab b"),
+        (r"(?-u:([\x80-\xFF]+))", &[0xFF, 0x80, b' ', 0xFE]),
+    ];
+    for &(pattern, haystack) in cases {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let limits = CaptureAggregateLimits::default();
+        let report = regex
+            .captures_iter(haystack, limits)
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let actual = report
+            .captures
+            .iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.index,
+                            group.name.clone(),
+                            group.span.map(|span| (span.start, span.end)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, reference_records(pattern, haystack), "{pattern:?}");
+        assert_eq!(report.identity, regex.iteration_identity(limits));
+        assert_eq!(
+            report.identity.syntax,
+            regex.build_report().plan_identity.syntax
+        );
+    }
+}
+
+fn reference_text_records(pattern: &str, haystack: &str) -> Vec<CaptureFixture> {
+    let regex = TextRegexBuilder::new(pattern)
+        .build()
+        .expect("reference text pattern");
+    let names = regex
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    regex
+        .captures_iter(haystack)
+        .map(|captures| {
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, matched)| {
+                    (
+                        u32::try_from(index).unwrap(),
+                        names[index].clone(),
+                        matched.map(|matched| (matched.start(), matched.end())),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
+    let cases = [
+        (r"(?P<left>a)|(b)", "éab"),
+        (r"()|a", "éa"),
+        (r"(a*)", "éba"),
+        (r"((a)?)(b)?", "éab b"),
+        (r"(é+)", "aéé東京"),
+        (r"(\w+)", "éa 東京_42"),
+        (r"(.)", "é東京"),
+        (r"^((?:é|a)*)$", "éaé"),
+        (r"([\p{Greek}]+)", "aΔδ東京"),
+        (r"(\b)", "éa 東京_42"),
+        (r"(\B)", "éa 東京_42"),
+        (r"(\b{start})", "éa 東京_42"),
+        (r"(\b{end})", "éa 東京_42"),
+        (r"(\b{start-half})", "éa 東京_42"),
+        (r"(\b{end-half})", "éa 東京_42"),
+        (r"(?m:^([^\n]*))", "éa\n東京\n"),
+        (r"(?Rm:^([^\r\n]*))", "éa\r\n東京\r末"),
+    ];
+    for (pattern, haystack) in cases {
+        let regex = PortableTextCaptureBuilder::new(pattern)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let report = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let actual = report
+            .captures
+            .iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.index,
+                            group.name.clone(),
+                            group.span.map(|span| (span.start, span.end)),
+                        )
+                    })
+                    .collect::<CaptureFixture>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            reference_text_records(pattern, haystack),
+            "{pattern:?}"
+        );
+    }
 }
 
 #[test]
@@ -155,19 +309,93 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
 }
 
 #[test]
-fn uncertified_unicode_and_word_look_remain_typed_refusals() {
-    assert!(
-        CaptureBuilder::new(r"(\p{L}+)")
+fn unicode_capture_classes_and_admitted_contextual_looks_execute() {
+    let pattern = r"([\p{L}\p{N}_]+)";
+    let haystack = b"abc \xCE\x94\xCE\xB4 42 \xFF";
+    let reference = RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode byte reference")
+        .captures_iter(haystack)
+        .map(|captures| captures.iter().flatten().count())
+        .sum::<usize>();
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode capture lowering");
+    let actual = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("Unicode capture execution")
+        .accounting
+        .count;
+    assert_eq!(actual, reference);
+    let hir_starved = fre::CaptureBuildLimits {
+        max_hir_work: regex.build_report().hir.work.saturating_sub(1),
+        ..fre::CaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
             .unicode(true)
-            .build()
-            .is_err()
-    );
-    assert!(
-        CaptureBuilder::new(r"\b(a)\b")
-            .unicode(false)
-            .build()
-            .is_err()
-    );
+            .limits(hir_starved)
+            .build(),
+        Err(fre::CaptureBuildError::HirResource {
+            resource: "work",
+            ..
+        })
+    ));
+    let engine = fre::CaptureEngineBuildLimits {
+        max_ast_nodes: regex.build_report().engine.ast_nodes.saturating_sub(1),
+        ..fre::CaptureEngineBuildLimits::default()
+    };
+    let ast_starved = fre::CaptureBuildLimits {
+        engine,
+        ..fre::CaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
+            .unicode(true)
+            .limits(ast_starved)
+            .build(),
+        Err(fre::CaptureBuildError::Engine(
+            fre::CaptureEngineBuildError::Resource {
+                kind: CaptureResource::AstNodes,
+                ..
+            }
+        ))
+    ));
+    assert_count(r"(?m:^([^\n]+))", b"a\nb\n");
+    assert_count(r"(?Rm:^([^\r\n]+))", b"a\r\nb\rc\n");
+    assert_count(r"(?-u:\b)([A-Za-z_]+)(?-u:\b)", b"a-b_c 42");
+    assert_count(r"(?-u:\b{start})([A-Za-z_]+)", b"a-b_c 42");
+    let word_pattern = r"([\p{L}]+)\b";
+    let word_haystack = "éa 東京_42".as_bytes();
+    let word_reference = RegexBuilder::new(word_pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode word reference")
+        .captures_iter(word_haystack)
+        .map(|captures| captures.iter().flatten().count())
+        .sum::<usize>();
+    let word_actual = CaptureBuilder::new(word_pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode word capture")
+        .count_captures(word_haystack, CaptureRunLimits::default())
+        .expect("Unicode word execution")
+        .accounting
+        .count;
+    assert_eq!(word_actual, word_reference);
+
+    let mut custom_line = fre::RustProfile::default();
+    custom_line.options.line_terminator = b'\r';
+    assert!(matches!(
+        CaptureBuilder::new(r"(?m:^)(a)")
+            .profile(custom_line)
+            .build(),
+        Err(fre::CaptureBuildError::Unsupported(
+            fre::CaptureUnsupported::Look(_)
+        ))
+    ));
 }
 
 #[test]

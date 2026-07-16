@@ -44,6 +44,10 @@ pub enum EdgeKind {
     /// line-terminator byte. The variant name mirrors regex-syntax's
     /// historical `EndLF` name; LF is the default, not a hard-coded value.
     AssertLineEndLf,
+    /// Zero-width CRLF-aware line start without splitting a CRLF pair.
+    AssertLineStartCrlf,
+    /// Zero-width CRLF-aware line end without splitting a CRLF pair.
+    AssertLineEndCrlf,
     /// Zero-width ASCII word boundary; only `[A-Za-z0-9_]` are word bytes.
     AssertWordAscii,
     /// Zero-width negated ASCII word boundary assertion.
@@ -58,6 +62,16 @@ pub enum EdgeKind {
     AssertWordEndHalfAscii,
     /// Zero-width positive Unicode word boundary using the UTS#18 `\w` set.
     AssertWordUnicode,
+    /// Zero-width negated Unicode word boundary.
+    AssertWordUnicodeNegate,
+    /// Zero-width start-of-Unicode-word assertion.
+    AssertWordStartUnicode,
+    /// Zero-width end-of-Unicode-word assertion.
+    AssertWordEndUnicode,
+    /// Zero-width left half of a Unicode word-start assertion.
+    AssertWordStartHalfUnicode,
+    /// Zero-width right half of a Unicode word-end assertion.
+    AssertWordEndHalfUnicode,
 }
 
 impl EdgeKind {
@@ -69,6 +83,8 @@ impl EdgeKind {
             Self::AssertHaystackEnd => "end-assertion",
             Self::AssertLineStartLf => "configured-line-start-assertion",
             Self::AssertLineEndLf => "configured-line-end-assertion",
+            Self::AssertLineStartCrlf => "CRLF-line-start-assertion",
+            Self::AssertLineEndCrlf => "CRLF-line-end-assertion",
             Self::AssertWordAscii => "ASCII-word-boundary-assertion",
             Self::AssertWordAsciiNegate => "ASCII-not-word-boundary-assertion",
             Self::AssertWordStartAscii => "ASCII-word-start-assertion",
@@ -76,6 +92,11 @@ impl EdgeKind {
             Self::AssertWordStartHalfAscii => "ASCII-word-start-half-assertion",
             Self::AssertWordEndHalfAscii => "ASCII-word-end-half-assertion",
             Self::AssertWordUnicode => "Unicode-word-boundary-assertion",
+            Self::AssertWordUnicodeNegate => "Unicode-not-word-boundary-assertion",
+            Self::AssertWordStartUnicode => "Unicode-word-start-assertion",
+            Self::AssertWordEndUnicode => "Unicode-word-end-assertion",
+            Self::AssertWordStartHalfUnicode => "Unicode-word-start-half-assertion",
+            Self::AssertWordEndHalfUnicode => "Unicode-word-end-half-assertion",
         }
     }
 

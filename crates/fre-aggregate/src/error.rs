@@ -11,9 +11,7 @@ pub enum Unsupported {
     UnicodeClass,
     /// Captures are not erased by this capture-free operation boundary.
     Capture,
-    /// Unicode word assertion forms other than the positive boundary and
-    /// CRLF-aware line assertions are not yet admitted by the continuation
-    /// engine.
+    /// A look assertion outside the audited continuation subset.
     Look(Look),
 }
 

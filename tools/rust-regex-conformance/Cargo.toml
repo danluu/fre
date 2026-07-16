@@ -1,0 +1,20 @@
+[package]
+name = "rust-regex-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Authenticated inventory and adapter contracts for the pinned Rust regex suite"
+
+[dependencies]
+bstr = { version = "=1.12.1", default-features = false, features = ["std"] }
+fre = { path = "../../crates/fre" }
+fre-syntax = { path = "../../crates/fre-syntax" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+toml = "=1.1.2"
+
+[lints]
+workspace = true

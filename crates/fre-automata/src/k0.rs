@@ -730,6 +730,24 @@ fn zero_width_edge_enabled(
                 .is_some_and(|&byte| byte == automaton.line_terminator())),
         EdgeKind::AssertLineEndLf => Ok(position == haystack.len()
             || haystack.get(position) == Some(&automaton.line_terminator())),
+        EdgeKind::AssertLineStartCrlf => {
+            let before = position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index));
+            let after = haystack.get(position);
+            Ok(position == 0
+                || before == Some(&b'\n')
+                || (before == Some(&b'\r') && after != Some(&b'\n')))
+        }
+        EdgeKind::AssertLineEndCrlf => {
+            let before = position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index));
+            let after = haystack.get(position);
+            Ok(position == haystack.len()
+                || after == Some(&b'\r')
+                || (after == Some(&b'\n') && before != Some(&b'\r')))
+        }
         EdgeKind::AssertWordAscii
         | EdgeKind::AssertWordAsciiNegate
         | EdgeKind::AssertWordStartAscii
@@ -757,12 +775,13 @@ fn zero_width_edge_enabled(
                 }
             })
         }
-        EdgeKind::AssertWordUnicode => {
-            let word_before =
-                decode_last_utf8(&haystack[..position]).is_some_and(is_unicode_word_character);
-            let word_after =
-                decode_utf8(&haystack[position..]).is_some_and(is_unicode_word_character);
-            Ok(word_before != word_after)
+        kind @ (EdgeKind::AssertWordUnicode
+        | EdgeKind::AssertWordUnicodeNegate
+        | EdgeKind::AssertWordStartUnicode
+        | EdgeKind::AssertWordEndUnicode
+        | EdgeKind::AssertWordStartHalfUnicode
+        | EdgeKind::AssertWordEndHalfUnicode) => {
+            unicode_assertion_matches(kind, haystack, position)
         }
         EdgeKind::ByteRange => Err(SearchError::InternalInvariant {
             detail: "split state contained a consuming edge",
@@ -777,6 +796,42 @@ fn is_ascii_word(byte: u8) -> bool {
 fn is_unicode_word_character(character: char) -> bool {
     regex_syntax::try_is_word_character(character)
         .expect("fre-automata enables regex-syntax's Unicode Perl tables")
+}
+
+fn unicode_assertion_matches(
+    kind: EdgeKind,
+    haystack: &[u8],
+    position: usize,
+) -> Result<bool, SearchError> {
+    let before = haystack
+        .get(..position)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "Unicode assertion prefix missing",
+        })?;
+    let after = haystack
+        .get(position..)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "Unicode assertion suffix missing",
+        })?;
+    let left_scalar = decode_last_utf8(before);
+    let right_scalar = decode_utf8(after);
+    let left_valid = before.is_empty() || left_scalar.is_some();
+    let right_valid = after.is_empty() || right_scalar.is_some();
+    let left_word = left_scalar.is_some_and(is_unicode_word_character);
+    let right_word = right_scalar.is_some_and(is_unicode_word_character);
+    Ok(match kind {
+        EdgeKind::AssertWordUnicode => left_word != right_word,
+        EdgeKind::AssertWordUnicodeNegate => left_valid && right_valid && left_word == right_word,
+        EdgeKind::AssertWordStartUnicode => !left_word && right_word,
+        EdgeKind::AssertWordEndUnicode => left_word && !right_word,
+        EdgeKind::AssertWordStartHalfUnicode => left_valid && !left_word,
+        EdgeKind::AssertWordEndHalfUnicode => right_valid && !right_word,
+        _ => {
+            return Err(SearchError::InternalInvariant {
+                detail: "non-Unicode edge in Unicode assertion dispatch",
+            });
+        }
+    })
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<char> {

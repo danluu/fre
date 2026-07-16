@@ -35,7 +35,7 @@ pub enum UnsupportedFeature {
     /// Legacy source-compatible identity; current scalar-class lowering emits
     /// exact UTF-8 byte paths or a typed resource/allocation error instead.
     UnicodeClass,
-    /// CRLF-aware and Unicode look assertions are not represented.
+    /// Reserved typed identity for a future HIR look variant.
     LookAssertion(Look),
     /// K0 has no capture-preserving output path yet.
     CaptureSensitiveOperation,
@@ -47,12 +47,7 @@ impl fmt::Display for UnsupportedFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnicodeClass => f.write_str("Unicode scalar class (legacy unsupported identity)"),
-            Self::LookAssertion(look) => {
-                write!(
-                    f,
-                    "look assertion {look:?} (CRLF and Unicode look assertions are not implemented)"
-                )
-            }
+            Self::LookAssertion(look) => write!(f, "look assertion {look:?}"),
             Self::CaptureSensitiveOperation => {
                 f.write_str("capture-sensitive operation (capture preservation is not implemented)")
             }

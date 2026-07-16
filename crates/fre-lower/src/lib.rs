@@ -5,10 +5,9 @@
 //! expressions, byte literals and byte classes, Unicode scalar classes lowered
 //! to canonical valid-UTF-8 byte paths, concatenation, ordered alternation,
 //! greedy or lazy repetition, whole-haystack start/end assertions, configured
-//! single-byte line assertions, ASCII word assertions, and positive Unicode
-//! word boundaries.
-//! CRLF and remaining Unicode-word assertions, plus
-//! capture-sensitive operations are rejected explicitly.
+//! single-byte and CRLF-aware line assertions, and every pinned ASCII or
+//! Unicode word assertion. Capture-sensitive operations are rejected
+//! explicitly.
 //!
 //! `RustParsed` does not retain a high-level regex builder's separately
 //! configured runtime line byte. Standalone lowered automata therefore use LF

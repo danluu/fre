@@ -15,13 +15,12 @@ The first certificate covers:
 - concatenation and ordered leftmost-first alternation;
 - finite greedy or lazy repetition, plus unbounded repetition whose body must
   consume at least one byte;
-- whole-original-haystack `Start` and `End`, LF line, ASCII word assertions,
-  and positive Unicode word boundaries; and
+- every pinned absolute, LF and CRLF line assertion plus every ASCII and
+  Unicode word assertion; and
 - capture-node erasure only when the operation planner declares a
   capture-free output contract.
 
-It explicitly rejects CRLF and nonpositive Unicode word assertions, all
-capture-sensitive operations, and unbounded repetition unless its body has
+It explicitly rejects capture-sensitive operations and unbounded repetition unless its body has
 `minimum_len() == Some(n)` for `n > 0`.
 Both nullable (`Some(0)`) and unknown/empty-language (`None`) body minima are
 rejected: `None` is not treated as a non-nullability certificate. The
@@ -78,12 +77,11 @@ with the explicit Rebar profile: `regex` 1.12.4, `regex-automata` 0.4.14 and
 
 - This crate lowers `RustParsed` HIR only. It does not implement the RE2 parser
   surface or decide strict upstream constructor admission.
-- Unicode scalar classes compile to valid-UTF-8 byte paths. Positive Unicode
-  word boundaries decode at most one scalar on each side and classify it with
+- Unicode scalar classes compile to valid-UTF-8 byte paths. Unicode word
+  assertions decode at most one scalar on each side and classify it with
   the pinned UTS#18 Perl-word table. Invalid UTF-8 is exact non-word context.
-- Absolute, LF line, ASCII word, and positive Unicode word-boundary assertions
-  are emitted. CRLF and negated/start/end/half Unicode word assertions remain
-  typed refusals.
+- Every pinned absolute, LF, CRLF, ASCII-word and Unicode-word assertion is
+  emitted as its own typed edge.
 - `RustParsed` HIR does not retain a high-level builder's separately configured
   runtime line byte. This crate gives `StartLF`/`EndLF` their literal LF HIR
   semantics; the `fre` facade refuses non-LF profiles before selecting K0.

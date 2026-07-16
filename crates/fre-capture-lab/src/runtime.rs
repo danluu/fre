@@ -2,12 +2,131 @@
 
 use std::mem::size_of;
 
+use crate::ast::Assertion;
 use crate::compile::Program;
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{CaptureRecord, GroupRecord, Span, Window};
 
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
+
+pub(crate) fn assertion_matches(
+    assertion: Assertion,
+    haystack: &[u8],
+    window: Window,
+    position: usize,
+) -> Result<bool, SearchError> {
+    if position < window.start || position > window.end || window.end > haystack.len() {
+        return Err(SearchError::InvalidWindow);
+    }
+    let left_byte = position
+        .checked_sub(1)
+        .filter(|&index| index >= window.start)
+        .and_then(|index| haystack.get(index));
+    let right_byte = (position < window.end)
+        .then(|| haystack.get(position))
+        .flatten();
+    let left_ascii_word = left_byte.is_some_and(|&byte| is_ascii_word(byte));
+    let right_ascii_word = right_byte.is_some_and(|&byte| is_ascii_word(byte));
+    Ok(match assertion {
+        Assertion::Start => position == window.start,
+        Assertion::End => position == window.end,
+        Assertion::StartLf => {
+            position == window.start || left_byte.is_some_and(|&byte| byte == b'\n')
+        }
+        Assertion::EndLf => position == window.end || right_byte.is_some_and(|&byte| byte == b'\n'),
+        Assertion::StartCrlf => {
+            position == window.start
+                || left_byte == Some(&b'\n')
+                || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+        }
+        Assertion::EndCrlf => {
+            position == window.end
+                || right_byte == Some(&b'\r')
+                || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+        }
+        Assertion::WordAscii => left_ascii_word != right_ascii_word,
+        Assertion::WordAsciiNegate => left_ascii_word == right_ascii_word,
+        Assertion::WordStartAscii => !left_ascii_word && right_ascii_word,
+        Assertion::WordEndAscii => left_ascii_word && !right_ascii_word,
+        Assertion::WordStartHalfAscii => !left_ascii_word,
+        Assertion::WordEndHalfAscii => !right_ascii_word,
+        assertion @ (Assertion::WordUnicode
+        | Assertion::WordUnicodeNegate
+        | Assertion::WordStartUnicode
+        | Assertion::WordEndUnicode
+        | Assertion::WordStartHalfUnicode
+        | Assertion::WordEndHalfUnicode) => {
+            let before = haystack
+                .get(window.start..position)
+                .ok_or(SearchError::InvalidWindow)?;
+            let after = haystack
+                .get(position..window.end)
+                .ok_or(SearchError::InvalidWindow)?;
+            unicode_assertion_matches(assertion, before, after)?
+        }
+    })
+}
+
+const fn is_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn unicode_word(scalar: Option<char>) -> Result<bool, SearchError> {
+    let Some(scalar) = scalar else {
+        return Ok(false);
+    };
+    regex_syntax::try_is_word_character(scalar).map_err(|_| SearchError::InvalidProgram)
+}
+
+fn unicode_assertion_matches(
+    assertion: Assertion,
+    before: &[u8],
+    after: &[u8],
+) -> Result<bool, SearchError> {
+    let left_scalar = decode_last_scalar(before);
+    let right_scalar = decode_first_scalar(after);
+    let left_valid = before.is_empty() || left_scalar.is_some();
+    let right_valid = after.is_empty() || right_scalar.is_some();
+    let left_word = unicode_word(left_scalar)?;
+    let right_word = unicode_word(right_scalar)?;
+    Ok(match assertion {
+        Assertion::WordUnicode => left_word != right_word,
+        Assertion::WordUnicodeNegate => left_valid && right_valid && left_word == right_word,
+        Assertion::WordStartUnicode => !left_word && right_word,
+        Assertion::WordEndUnicode => left_word && !right_word,
+        Assertion::WordStartHalfUnicode => left_valid && !left_word,
+        Assertion::WordEndHalfUnicode => right_valid && !right_word,
+        _ => return Err(SearchError::InvalidProgram),
+    })
+}
+
+fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
+    let first = *bytes.first()?;
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    core::str::from_utf8(bytes.get(..width)?)
+        .ok()?
+        .chars()
+        .next()
+}
+
+fn decode_last_scalar(bytes: &[u8]) -> Option<char> {
+    let end = bytes.len();
+    let mut start = end.checked_sub(1)?;
+    let limit = end.saturating_sub(4);
+    while start > limit && matches!(bytes[start], 0x80..=0xBF) {
+        start = start.checked_sub(1)?;
+    }
+    let encoded = bytes.get(start..end)?;
+    let scalar = decode_first_scalar(encoded)?;
+    (scalar.len_utf8() == encoded.len()).then_some(scalar)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Admission {

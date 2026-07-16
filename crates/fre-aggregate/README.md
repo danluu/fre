@@ -13,16 +13,16 @@ subset is:
 - empty, byte literals, byte classes, and Unicode scalar classes lowered to
   bounded canonical one- through four-byte UTF-8 paths;
 - concatenation and ordered alternation;
-- absolute `Start` and `End`, LF-aware `StartLF` and `EndLF`, and all six
-  ASCII word assertion variants;
+- absolute, LF-aware and CRLF-aware line assertions, all six ASCII word
+  assertions, and all six Unicode word assertions;
 - arbitrary nested finite or open greedy/lazy repetitions.
 
 The default compiler entry point rejects capture nodes. The explicit
 whole-match entry point treats capture children transparently inside the
 bounded validation/lowering traversals and reports exact erased annotations
-and work; it does not implement a capture API. Unicode word assertion forms
-other than the positive boundary and CRLF-aware line assertions are typed
-refusals. This crate makes no RE2 or capture-history claim.
+and work; it does not implement a capture API. CRLF-aware line and all Unicode
+word assertion forms use audited contextual predicates. This crate makes no
+RE2 or capture-history claim.
 
 ## Construction
 

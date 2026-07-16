@@ -778,6 +778,58 @@ fn every_admitted_assertion_matches_pinned_rust_and_independent_byte_oracle() {
 }
 
 #[test]
+fn crlf_and_directional_unicode_assertions_match_pinned_rust() {
+    let crlf_haystacks: &[&[u8]] = &[b"", b"a\r\nb\rc\nd", b"\r\n\r\n"];
+    for pattern in [r"(?Rm:^)", r"(?Rm:$)"] {
+        let regex = compile(pattern);
+        for &haystack in crlf_haystacks {
+            let expected = upstream(pattern, haystack);
+            for strategy in STRATEGIES {
+                let actual = regex
+                    .admit_spans(
+                        haystack,
+                        0..haystack.len(),
+                        strategy,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.as_slice(), expected, "{strategy:?} {pattern:?}");
+            }
+        }
+    }
+
+    let unicode_haystacks: &[&[u8]] = &[
+        b"",
+        b"ascii - 42",
+        "é-東京_42".as_bytes(),
+        "雪 Ж".as_bytes(),
+    ];
+    for pattern in [
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        r"\b{start-half}",
+        r"\b{end-half}",
+    ] {
+        let regex = compile_unicode(pattern);
+        for &haystack in unicode_haystacks {
+            let expected = upstream_unicode(pattern, haystack);
+            for strategy in STRATEGIES {
+                let actual = regex
+                    .admit_spans(
+                        haystack,
+                        0..haystack.len(),
+                        strategy,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.as_slice(), expected, "{strategy:?} {pattern:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn nested_nullable_assertions_preserve_priority_and_same_boundary_acyclicity() {
     let patterns = [
         r"(?:(?m:^)|\b|a)*",
@@ -1118,25 +1170,6 @@ fn unsupported_hir_is_a_typed_refusal() {
         ),
         Err(Error::Unsupported(Unsupported::Capture))
     ));
-    let unsupported_looks = [
-        Look::StartCRLF,
-        Look::EndCRLF,
-        Look::WordUnicodeNegate,
-        Look::WordStartUnicode,
-        Look::WordEndUnicode,
-        Look::WordStartHalfUnicode,
-        Look::WordEndHalfUnicode,
-    ];
-    for look in unsupported_looks {
-        assert!(matches!(
-            CompiledRegex::from_hir(
-                &Hir::look(look),
-                RustByteProfile::PINNED_1_12_4,
-                CompileLimits::default()
-            ),
-            Err(Error::Unsupported(Unsupported::Look(actual))) if actual == look
-        ));
-    }
 }
 
 #[test]
