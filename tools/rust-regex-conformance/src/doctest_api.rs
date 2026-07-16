@@ -16,6 +16,7 @@ use fre::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::doctest_builder_remaining::{BuilderRefusal, execute_remaining_builder_doctest};
 use crate::doctest_byte_captures::{ByteCaptureRefusal, execute_byte_capture_doctest};
 use crate::doctest_capture_metadata::{CaptureMetadataRefusal, execute_capture_metadata_doctest};
 use crate::{CandidateIdentity, InventoryError, UPSTREAM_REPOSITORY, UPSTREAM_REVISION, sha256};
@@ -734,6 +735,12 @@ fn execute(obligation: &Obligation) -> OptionalExecution {
 }
 
 fn execute_builder(line: usize) -> OptionalExecution {
+    if let Some(execution) = execute_remaining_builder_doctest(line) {
+        return Some(execution.map_err(|refusal| match refusal {
+            BuilderRefusal::Unsupported(reason_code) => unsupported(reason_code),
+            BuilderRefusal::Fault(reason_code) => fault(reason_code),
+        }));
+    }
     let (kind, set) = match line {
         271 | 1426 => (BuilderProbe::UnicodeWord, false),
         850 | 2025 => (BuilderProbe::UnicodeWord, true),
@@ -2560,9 +2567,9 @@ mod tests {
         eprintln!("doctest counts={:?}", report.payload.counts);
         assert_eq!(
             DoctestCounts {
-                pass: 214,
+                pass: 228,
                 mismatch: 0,
-                unsupported: 28,
+                unsupported: 14,
                 fault: 0,
                 total: DOCTEST_API_CASES,
             },
