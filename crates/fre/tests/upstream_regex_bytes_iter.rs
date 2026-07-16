@@ -60,7 +60,140 @@ struct DifferentialCase {
 
 #[test]
 fn find_iter_matches_pinned_bytes_across_every_portable_plan() {
-    let cases = [
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"ab",
+        b"abab",
+        b"xxfoobaz-alphaZ-Sherlock",
+        " αβ ab 雪_42 ".as_bytes(),
+        &[0xFF, b'a', b'b', b'Z', 0x80],
+    ];
+
+    for case in differential_cases() {
+        let fre = build_case(case);
+        assert_eq!(fre.build_report().plan, case.expected_plan, "{case:?}");
+        let mut upstream = regex::bytes::RegexBuilder::new(case.pattern);
+        upstream.unicode(case.unicode);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {case:?}: {error}"));
+
+        for &haystack in haystacks {
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            let (actual, accounting) = collect(&fre, haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| panic!("portable iteration failed for {case:?}: {error}"));
+            let actual: Vec<_> = actual
+                .iter()
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            assert_eq!(actual, expected, "case={case:?}, haystack={haystack:?}");
+            assert_eq!(accounting.matches, expected.len());
+            assert!(accounting.search_calls >= accounting.matches);
+        }
+    }
+}
+
+#[test]
+fn borrowed_find_iter_matches_pinned_bytes_across_every_portable_plan() {
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"ab",
+        b"abab",
+        b"xxfoobaz-alphaZ-Sherlock",
+        " αβ ab 雪_42 ".as_bytes(),
+        &[0xFF, b'a', b'b', b'Z', 0x80],
+    ];
+
+    for case in differential_cases() {
+        let fre = build_case(case);
+        let mut upstream = regex::bytes::RegexBuilder::new(case.pattern);
+        upstream.unicode(case.unicode);
+        let upstream = upstream
+            .build()
+            .unwrap_or_else(|error| panic!("pinned regex rejected {case:?}: {error}"));
+
+        for &haystack in haystacks {
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.range(), matched.as_bytes().to_vec()))
+                .collect();
+            let mut iterator = fre
+                .find_iter_borrowed(haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("borrowed iterator construction failed for {case:?}: {error}")
+                });
+            let mut actual = Vec::new();
+            for matched in iterator.by_ref() {
+                let matched = matched.unwrap_or_else(|error| {
+                    panic!("borrowed iteration failed for {case:?}: {error}")
+                });
+                let bytes: &[u8] = matched.into();
+                let range: core::ops::Range<usize> = matched.into();
+                assert_eq!(matched.as_bytes(), bytes);
+                actual.push((range, bytes.to_vec()));
+            }
+            assert_eq!(actual, expected, "case={case:?}, haystack={haystack:?}");
+            assert!(iterator.next().is_none(), "borrowed iterator must fuse");
+
+            let borrowed_accounting = iterator.accounting();
+            let (_, offset_accounting) =
+                collect(&fre, haystack, PortableFindIterLimits::unlimited()).unwrap_or_else(
+                    |error| panic!("offset accounting probe failed for {case:?}: {error}"),
+                );
+            assert_eq!(borrowed_accounting, offset_accounting);
+        }
+    }
+}
+
+#[test]
+fn borrowed_find_iter_preserves_limit_errors_workspace_and_fusion() {
+    let regex = PortableBuilder::new("")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("empty portable regex");
+    let (_, probe) = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
+        .expect("unlimited accounting probe");
+    let limits = PortableFindIterLimits {
+        max_search_calls: probe.search_calls - 1,
+        ..PortableFindIterLimits::unlimited()
+    };
+    let mut matches = regex
+        .find_iter_borrowed(b"ab", limits)
+        .expect("borrowed iterator workspace construction");
+    assert!(
+        matches
+            .workspace_setup_accounting()
+            .expect("forced K0 must retain one workspace")
+            .retained_bytes()
+            > 0
+    );
+
+    let mut emitted = 0_usize;
+    let error = loop {
+        match matches.next() {
+            Some(Ok(_)) => emitted = emitted.saturating_add(1),
+            Some(Err(error)) => break error,
+            None => panic!("borrowed iterator silently exhausted below its exact limit"),
+        }
+    };
+    assert_eq!(emitted, probe.matches);
+    assert_eq!(
+        error,
+        PortableFindIterError::SearchCallLimit {
+            needed: probe.search_calls,
+            limit: probe.search_calls - 1,
+        }
+    );
+    assert_eq!(matches.accounting().search_calls, probe.search_calls - 1);
+    assert!(matches.next().is_none(), "terminal refusal must fuse");
+}
+
+fn differential_cases() -> [DifferentialCase; 8] {
+    [
         DifferentialCase {
             pattern: "ab",
             unicode: false,
@@ -117,41 +250,7 @@ fn find_iter_matches_pinned_bytes_across_every_portable_plan() {
             force_literal_set_dfa: false,
             expected_plan: PlanKind::K0,
         },
-    ];
-    let haystacks: &[&[u8]] = &[
-        b"",
-        b"ab",
-        b"abab",
-        b"xxfoobaz-alphaZ-Sherlock",
-        " αβ ab 雪_42 ".as_bytes(),
-        &[0xFF, b'a', b'b', b'Z', 0x80],
-    ];
-
-    for case in cases {
-        let fre = build_case(case);
-        assert_eq!(fre.build_report().plan, case.expected_plan, "{case:?}");
-        let mut upstream = regex::bytes::RegexBuilder::new(case.pattern);
-        upstream.unicode(case.unicode);
-        let upstream = upstream
-            .build()
-            .unwrap_or_else(|error| panic!("pinned regex rejected {case:?}: {error}"));
-
-        for &haystack in haystacks {
-            let expected: Vec<_> = upstream
-                .find_iter(haystack)
-                .map(|matched| (matched.start(), matched.end()))
-                .collect();
-            let (actual, accounting) = collect(&fre, haystack, PortableFindIterLimits::unlimited())
-                .unwrap_or_else(|error| panic!("portable iteration failed for {case:?}: {error}"));
-            let actual: Vec<_> = actual
-                .iter()
-                .map(|matched| (matched.start(), matched.end()))
-                .collect();
-            assert_eq!(actual, expected, "case={case:?}, haystack={haystack:?}");
-            assert_eq!(accounting.matches, expected.len());
-            assert!(accounting.search_calls >= accounting.matches);
-        }
-    }
+    ]
 }
 
 #[test]

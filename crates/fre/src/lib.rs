@@ -795,7 +795,8 @@ impl Default for PortableFindIterLimits {
     }
 }
 
-/// Exact no-clock accounting accumulated by [`PortableMatches`].
+/// Exact no-clock accounting accumulated by [`PortableMatches`] or
+/// [`PortableByteMatches`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PortableFindIterAccounting {
     /// Contextual search invocations, including the final miss and suppressed
@@ -2087,6 +2088,29 @@ impl PortableRegex {
         })
     }
 
+    /// Iterate over every non-overlapping match while retaining the exact
+    /// original haystack in each emitted [`ByteMatch`].
+    ///
+    /// Selection, empty-match progress, workspace reuse, resource limits and
+    /// accounting are identical to [`Self::find_iter`]. The companion
+    /// [`PortableByteMatches`] iterator only projects each selected span into
+    /// the pinned Rust bytes match-value contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same construction contract as
+    /// [`Self::find_iter`]. Per-search and whole-iterator failures are yielded
+    /// as [`PortableFindIterError`] items.
+    pub fn find_iter_borrowed<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableByteMatches<'r, 'h>, SearchError> {
+        Ok(PortableByteMatches {
+            inner: self.find_iter(haystack, limits)?,
+        })
+    }
+
     /// Return the selected match at or after `start`.
     ///
     /// Assertions inspect the complete original haystack and returned offsets
@@ -2633,6 +2657,43 @@ impl Iterator for PortableMatches<'_, '_> {
 }
 
 impl core::iter::FusedIterator for PortableMatches<'_, '_> {}
+
+/// Fallible iterator over borrowed, non-overlapping byte matches.
+///
+/// This is the match-value projection of [`PortableMatches`]. It retains the
+/// complete original haystack for [`ByteMatch::as_bytes`] while delegating all
+/// search and progress state to the offset iterator.
+#[derive(Debug)]
+pub struct PortableByteMatches<'r, 'h> {
+    inner: PortableMatches<'r, 'h>,
+}
+
+impl PortableByteMatches<'_, '_> {
+    /// Exact counters accumulated through the most recent iterator action.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.inner.accounting()
+    }
+
+    /// One-time K0 workspace setup facts, or `None` for native plans.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.inner.workspace_setup_accounting()
+    }
+}
+
+impl<'h> Iterator for PortableByteMatches<'_, 'h> {
+    type Item = Result<ByteMatch<'h>, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let haystack = self.inner.haystack;
+        self.inner
+            .next()
+            .map(|result| result.map(|span| ByteMatch { haystack, span }))
+    }
+}
+
+impl core::iter::FusedIterator for PortableByteMatches<'_, '_> {}
 
 pub(crate) fn reserve_planner<T>(
     values: &mut Vec<T>,
