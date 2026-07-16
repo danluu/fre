@@ -8,7 +8,10 @@ use std::{
 };
 
 use bstr::ByteVec;
-use fre::{BuildError, PortableBuilder, PortableRegex, RustProfile, SearchLimits};
+use fre::{
+    BuildError, PortableBuilder, PortableRegex, PortableTextBuildError, PortableTextBuilder,
+    PortableTextRegex, RustProfile, SearchLimits,
+};
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
 
@@ -23,10 +26,10 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this first portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v1";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v2";
 
 const LIMITATIONS: [&str; 4] = [
-    "the production FRE facade has no Rust text matcher",
+    "the production FRE Rust text matcher is restricted to finite languages proved byte-equivalent under RustText and RustBytes parsing",
     "the production FRE facade has no Rust text or bytes RegexSet matcher",
     "the production FRE facade has no capture iterator",
     "the production FRE facade has no complete match iterator; find-iter executes only empty-result or match-limit-one obligations",
@@ -147,11 +150,14 @@ fn execute_case(
         return AdapterDisposition::NotApplicable { reason };
     }
     match surface {
-        AdapterSurface::RustTextCompile
-        | AdapterSurface::RustTextIsMatch
-        | AdapterSurface::RustTextFindIter
-        | AdapterSurface::RustTextCapturesIter => {
-            unsupported(CapabilityId::RustTextFacade, "facade.rust-text-missing")
+        AdapterSurface::RustTextCompile => execute_text_compile(case, input),
+        AdapterSurface::RustTextIsMatch => execute_text_is_match(case, input),
+        AdapterSurface::RustTextFindIter => execute_text_find(case, input),
+        AdapterSurface::RustTextCapturesIter | AdapterSurface::RustBytesCapturesIter => {
+            unsupported(
+                CapabilityId::CaptureIteration,
+                "operation.captures-iter-missing",
+            )
         }
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
@@ -164,10 +170,6 @@ fn execute_case(
         | AdapterSurface::RustBytesSetWhich => unsupported(
             CapabilityId::RustBytesSetFacade,
             "facade.rust-bytes-set-missing",
-        ),
-        AdapterSurface::RustBytesCapturesIter => unsupported(
-            CapabilityId::CaptureIteration,
-            "operation.captures-iter-missing",
         ),
         AdapterSurface::RustBytesCompile => execute_bytes_compile(case, input),
         AdapterSurface::RustBytesIsMatch => execute_bytes_is_match(case, input),
@@ -525,6 +527,159 @@ enum BuildAttempt {
     Fault(AdapterDisposition),
 }
 
+enum TextBuildAttempt {
+    Built(Box<PortableTextRegex>),
+    Rejected,
+    Unsupported(AdapterDisposition),
+    Fault(AdapterDisposition),
+}
+
+fn execute_text_compile(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::CompileAccepted(case.compiles);
+    match build_text(case, input) {
+        TextBuildAttempt::Built(_) => compare(&expected, &SemanticValue::CompileAccepted(true)),
+        TextBuildAttempt::Rejected => compare(&expected, &SemanticValue::CompileAccepted(false)),
+        TextBuildAttempt::Unsupported(disposition) | TextBuildAttempt::Fault(disposition) => {
+            disposition
+        }
+    }
+}
+
+fn execute_text_is_match(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    let expected = SemanticValue::IsMatch(!input.expected.is_empty());
+    let regex = match build_text(case, input) {
+        TextBuildAttempt::Built(regex) => regex,
+        TextBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextBuildAttempt::Unsupported(disposition) | TextBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    match regex.is_match(haystack, SearchLimits::unlimited()) {
+        Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed)),
+        Err(_) => unsupported(
+            CapabilityId::RustTextFacade,
+            "search.portable-execution-refused",
+        ),
+    }
+}
+
+fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
+    if !input.expected.is_empty() && case.match_limit != Some(1) {
+        return unsupported(CapabilityId::FindIteration, "operation.find-iter-missing");
+    }
+    let Ok(expected_spans) = expected_spans(input) else {
+        return fault("adapter.expected-group-zero-missing");
+    };
+    let expected = SemanticValue::Matches(expected_spans);
+    let regex = match build_text(case, input) {
+        TextBuildAttempt::Built(regex) => regex,
+        TextBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextBuildAttempt::Unsupported(disposition) | TextBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    match regex.find(haystack, SearchLimits::unlimited()) {
+        Ok((matched, _)) => {
+            let observed = matched
+                .map(|matched| ExpectedSpan {
+                    start: matched.start(),
+                    end: matched.end(),
+                })
+                .into_iter()
+                .collect();
+            compare(&expected, &SemanticValue::Matches(observed))
+        }
+        Err(_) => unsupported(
+            CapabilityId::RustTextFacade,
+            "search.portable-execution-refused",
+        ),
+    }
+}
+
+fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
+    let Some(pattern) = input.patterns.first() else {
+        return TextBuildAttempt::Fault(fault("adapter.single-pattern-missing"));
+    };
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = case.case_insensitive;
+    profile.options.unicode = case.unicode;
+    profile.options.line_terminator = input.line_terminator;
+    match PortableTextBuilder::new(pattern.clone())
+        .profile(profile)
+        .build()
+    {
+        Ok(regex) => TextBuildAttempt::Built(Box::new(regex)),
+        Err(PortableTextBuildError::TextSyntax(error))
+            if matches!(&error.category, ErrorCategory::UpstreamRustSyntax) =>
+        {
+            TextBuildAttempt::Rejected
+        }
+        Err(
+            PortableTextBuildError::InternalInvariant(_)
+            | PortableTextBuildError::FiniteProof(
+                BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+            )
+            | PortableTextBuildError::Portable(
+                BuildError::AllocationFailed { .. } | BuildError::InternalInvariant(_),
+            ),
+        ) => TextBuildAttempt::Fault(fault("build.text-internal-fault")),
+        Err(PortableTextBuildError::TextSyntax(error))
+            if matches!(
+                &error.category,
+                ErrorCategory::FreResourceLimit { .. }
+                    | ErrorCategory::StrictQualificationFailure { .. }
+            ) =>
+        {
+            TextBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustTextFacade,
+                "build.syntax-resource-envelope",
+            ))
+        }
+        Err(PortableTextBuildError::NonFiniteLanguage) => {
+            TextBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustTextFacade,
+                "build.text-finite-language-gap",
+            ))
+        }
+        Err(
+            PortableTextBuildError::BytesProofSyntax(_)
+            | PortableTextBuildError::ProfileLanguageMismatch
+            | PortableTextBuildError::InvalidUtf8Word,
+        ) => TextBuildAttempt::Unsupported(unsupported(
+            CapabilityId::RustTextFacade,
+            "build.text-bytes-equivalence-gap",
+        )),
+        Err(PortableTextBuildError::FiniteProof(_) | PortableTextBuildError::Portable(_)) => {
+            TextBuildAttempt::Unsupported(unsupported(
+                CapabilityId::RustTextFacade,
+                "build.portable-subset-gap",
+            ))
+        }
+        Err(PortableTextBuildError::TextSyntax(_)) => {
+            TextBuildAttempt::Fault(fault("build.text-syntax-unexpected-error"))
+        }
+        Err(_) => TextBuildAttempt::Fault(fault("build.text-unclassified-error")),
+    }
+}
+
 fn execute_bytes_compile(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
     let expected = SemanticValue::CompileAccepted(case.compiles);
     match build_bytes(case, input) {
@@ -562,18 +717,7 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
     if !input.expected.is_empty() && case.match_limit != Some(1) {
         return unsupported(CapabilityId::FindIteration, "operation.find-iter-missing");
     }
-    let expected_spans = input
-        .expected
-        .iter()
-        .map(|matched| {
-            matched
-                .groups
-                .first()
-                .and_then(|group| *group)
-                .ok_or_else(|| InventoryError::new("expected match lacks participating group zero"))
-        })
-        .collect::<Result<Vec<_>, _>>();
-    let Ok(expected_spans) = expected_spans else {
+    let Ok(expected_spans) = expected_spans(input) else {
         return fault("adapter.expected-group-zero-missing");
     };
     let expected = SemanticValue::Matches(expected_spans);
@@ -606,6 +750,20 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
             "search.portable-execution-refused",
         ),
     }
+}
+
+fn expected_spans(input: &ExecutableCase) -> Result<Vec<ExpectedSpan>, InventoryError> {
+    input
+        .expected
+        .iter()
+        .map(|matched| {
+            matched
+                .groups
+                .first()
+                .and_then(|group| *group)
+                .ok_or_else(|| InventoryError::new("expected match lacks participating group zero"))
+        })
+        .collect()
 }
 
 fn build_bytes(case: &CaseReceipt, input: &ExecutableCase) -> BuildAttempt {
@@ -1025,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn text_capture_and_unbounded_find_gaps_are_explicit() {
+    fn text_finite_slice_executes_and_remaining_operation_gaps_are_explicit() {
         let case = fixture_case(true, false, None);
         let input = fixture_input(vec![ExpectedCaptures {
             pattern_id: 0,
@@ -1046,10 +1204,7 @@ mod tests {
         let text_case = fixture_case(true, true, None);
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCompile, &text_case, &input),
-            AdapterDisposition::Unsupported {
-                capability: CapabilityId::RustTextFacade,
-                ..
-            }
+            AdapterDisposition::Pass { .. }
         ));
         assert!(matches!(
             execute_case(AdapterSurface::RustBytesCapturesIter, &case, &input),
@@ -1057,6 +1212,26 @@ mod tests {
                 capability: CapabilityId::CaptureIteration,
                 ..
             }
+        ));
+
+        let text_limited = fixture_case(true, true, Some(1));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &text_limited, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextFindIter, &text_limited, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut nonfinite = input.clone();
+        nonfinite.patterns = vec!["a+".to_owned()];
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCompile, &text_case, &nonfinite),
+            AdapterDisposition::Unsupported {
+                capability: CapabilityId::RustTextFacade,
+                ref reason_code,
+            } if reason_code == "build.text-finite-language-gap"
         ));
     }
 

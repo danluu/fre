@@ -22,6 +22,7 @@ mod captures;
 mod finite;
 mod forward_anchored;
 mod required_literal;
+mod text;
 mod unicode_word_run;
 
 pub use aggregate::{
@@ -81,6 +82,9 @@ pub use fre_kernels::{
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+};
+pub use text::{
+    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextRegex,
 };
 
 use fre_automata::{Automaton, Exists, K0Workspace, SelectedEnd, Span};

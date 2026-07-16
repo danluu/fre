@@ -36,10 +36,13 @@ terminator and expected capture records, and emits all 16,450 dispositions in
 one payload-hashed report. It executes the real `fre::PortableBuilder` Rust
 bytes facade for compile and `is_match`, plus `find` when an empty expected
 sequence or upstream `match-limit = 1` makes the facade's single-result API a
-complete comparator. Missing Rust text, set, capture-iteration and general
-match-iteration APIs are stable `unsupported` receipts. Inapplicable upstream
-surface combinations remain separately typed, and panics become `fault`
-receipts without truncating the cross product.
+complete comparator. A theorem-gated `fre::PortableTextBuilder` additionally
+executes finite languages only after independent RustText and RustBytes parses
+produce the same ordered language and every word is valid UTF-8. Missing set,
+capture-iteration, general match-iteration and non-finite text execution remain
+stable `unsupported` receipts. Inapplicable upstream surface combinations
+remain separately typed, and panics become `fault` receipts without truncating
+the cross product.
 
 ## Reproduce
 
@@ -72,7 +75,8 @@ cargo run -p rust-regex-conformance -- \
 The authenticated inventory and first adapter cover the upstream TOML/Fowler
 corpus only. They do not yet:
 
-- provide Rust text, set, capture-iteration, or full match-iteration facades;
+- provide general non-finite Rust text, set, capture-iteration, or full
+  match-iteration facades;
 - inventory the upstream Rust API regression, replacement, searcher, doctest,
   or feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;
