@@ -131,7 +131,7 @@ pub use fre_automata::{
 pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 4;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 5;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -165,6 +165,9 @@ pub struct BuildLimits {
     pub forward_anchored: ForwardAnchoredBuildLimits,
     /// Maximum checked planner traversal/copy work.
     pub max_planner_work: u64,
+    /// Maximum logical bytes retained by the published source, capture-name
+    /// metadata and selected execution plan.
+    pub max_persistent_bytes: usize,
 }
 
 impl Default for BuildLimits {
@@ -179,6 +182,7 @@ impl Default for BuildLimits {
             required_literal: RequiredLiteralBuildLimits::default(),
             forward_anchored: ForwardAnchoredBuildLimits::default(),
             max_planner_work: 8_000_000,
+            max_persistent_bytes: 268_435_456,
         }
     }
 }
@@ -247,6 +251,10 @@ pub struct BuildReport {
     pub source_storage_bytes: usize,
     /// Exact logical heap bytes retained for indexed capture-name metadata.
     pub capture_name_storage_bytes: usize,
+    /// Checked sum of source, capture-name and selected-plan logical bytes.
+    pub charged_persistent_bytes: usize,
+    /// Total persistent-byte ceiling enforced before publication.
+    pub persistent_byte_limit: usize,
     /// Total capture slots, including the implicit whole-match slot.
     pub captures_len: usize,
     /// Capture slots present in every possible match, including the implicit
@@ -302,6 +310,10 @@ pub enum BuildError {
     ForwardAnchoredShape,
     /// Checked planner work was exhausted before plan selection.
     PlannerWorkLimit { needed: u64, limit: u64 },
+    /// Persistent-byte accounting overflowed `usize`.
+    PersistentBytesOverflow,
+    /// The completed matcher exceeded the total persistent-byte ceiling.
+    PersistentBytesLimit { needed: usize, limit: usize },
     /// A planner buffer could not be reserved.
     AllocationFailed {
         structure: &'static str,
@@ -335,6 +347,13 @@ impl fmt::Display for BuildError {
             Self::PlannerWorkLimit { needed, limit } => {
                 write!(f, "planner needs {needed} work units, exceeding {limit}")
             }
+            Self::PersistentBytesOverflow => {
+                f.write_str("portable matcher persistent-byte accounting overflowed usize")
+            }
+            Self::PersistentBytesLimit { needed, limit } => write!(
+                f,
+                "portable matcher needs {needed} persistent bytes, exceeding {limit}"
+            ),
             Self::AllocationFailed {
                 structure,
                 additional,
@@ -361,9 +380,27 @@ impl std::error::Error for BuildError {
             Self::RequiredLiteralShape
             | Self::ForwardAnchoredShape
             | Self::PlannerWorkLimit { .. }
+            | Self::PersistentBytesOverflow
+            | Self::PersistentBytesLimit { .. }
             | Self::AllocationFailed { .. }
             | Self::InternalInvariant(_) => None,
         }
+    }
+}
+
+impl BuildReport {
+    fn enforce_persistent_limit(mut self, limit: usize) -> Result<Self, BuildError> {
+        let needed = self
+            .source_storage_bytes
+            .checked_add(self.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(self.plan_storage_bytes))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        if needed > limit {
+            return Err(BuildError::PersistentBytesLimit { needed, limit });
+        }
+        self.charged_persistent_bytes = needed;
+        self.persistent_byte_limit = limit;
+        Ok(self)
     }
 }
 
@@ -911,6 +948,14 @@ impl PortableBuilder {
         self
     }
 
+    /// Set the total logical persistent-byte ceiling for the published
+    /// matcher without changing any plan-specific construction limits.
+    #[must_use]
+    pub const fn max_persistent_bytes(mut self, limit: usize) -> Self {
+        self.limits.max_persistent_bytes = limit;
+        self
+    }
+
     /// Force one plan so tests and qualification cannot accidentally exercise
     /// an alternative implementation.
     #[must_use]
@@ -1005,12 +1050,15 @@ impl PortableBuilder {
                     plan_storage_bytes: plan.storage_bytes(),
                     source_storage_bytes,
                     capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
                     captures_len,
                     static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
-                },
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
         if self.selection == PlanSelection::Auto
@@ -1035,12 +1083,15 @@ impl PortableBuilder {
                     plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
                     source_storage_bytes,
                     capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
                     captures_len,
                     static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
                     forward_anchored: None,
-                },
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
         let mut planner_work = 0_u64;
@@ -1079,12 +1130,15 @@ impl PortableBuilder {
                             plan_storage_bytes: build.persistent_bytes,
                             source_storage_bytes,
                             capture_name_storage_bytes,
+                            charged_persistent_bytes: 0,
+                            persistent_byte_limit: 0,
                             captures_len,
                             static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: Some(build),
-                        },
+                        }
+                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                     });
                 }
                 match ForwardAnchoredPlan::build(
@@ -1114,12 +1168,15 @@ impl PortableBuilder {
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
                                 capture_name_storage_bytes,
+                                charged_persistent_bytes: 0,
+                                persistent_byte_limit: 0,
                                 captures_len,
                                 static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: None,
                                 forward_anchored: Some(build),
-                            },
+                            }
+                            .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                         });
                     }
                     Err(error)
@@ -1164,12 +1221,15 @@ impl PortableBuilder {
                                 plan_storage_bytes: build.persistent_bytes,
                                 source_storage_bytes,
                                 capture_name_storage_bytes,
+                                charged_persistent_bytes: 0,
+                                persistent_byte_limit: 0,
                                 captures_len,
                                 static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: Some(build),
                                 forward_anchored: None,
-                            },
+                            }
+                            .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                         });
                     }
                     Err(error)
@@ -1211,12 +1271,15 @@ impl PortableBuilder {
                         plan_storage_bytes: storage,
                         source_storage_bytes,
                         capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
                         captures_len,
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
-                    },
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                 });
             }
             if words.len() > 1 {
@@ -1243,12 +1306,15 @@ impl PortableBuilder {
                             plan_storage_bytes: storage,
                             source_storage_bytes,
                             capture_name_storage_bytes,
+                            charged_persistent_bytes: 0,
+                            persistent_byte_limit: 0,
                             captures_len,
                             static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
                             forward_anchored: None,
-                        },
+                        }
+                        .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                     });
                 }
                 let literal_set = LiteralSetPlan::new(&words, self.limits.literal_set)?;
@@ -1272,12 +1338,15 @@ impl PortableBuilder {
                         plan_storage_bytes: storage,
                         source_storage_bytes,
                         capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
                         captures_len,
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
                         forward_anchored: None,
-                    },
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                 });
             }
         }
@@ -1307,12 +1376,15 @@ impl PortableBuilder {
                 plan_storage_bytes: plan.storage_bytes(),
                 source_storage_bytes,
                 capture_name_storage_bytes,
+                charged_persistent_bytes: 0,
+                persistent_byte_limit: 0,
                 captures_len,
                 static_captures_len,
                 minimum_match_bytes,
                 required_literal: None,
                 forward_anchored: None,
-            },
+            }
+            .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
         })
     }
 }
