@@ -65,7 +65,8 @@ pub use captures::{
     CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation, CapturePlanIdentity,
     CapturePlanKind, CaptureRegex, CaptureRunLimits, CaptureUnsupported,
     PortableTextCaptureBuildError, PortableTextCaptureBuildReport, PortableTextCaptureBuilder,
-    PortableTextCaptureIterationError, PortableTextCaptureRegex,
+    PortableTextCaptureIterationError, PortableTextCaptureMatch, PortableTextCaptureRegex,
+    PortableTextCaptureSearchError, PortableTextCaptures,
 };
 pub use fre_aggregate::{
     CompileAccounting as AggregateCompileAccounting, CompileLimits as AggregateCompileLimits,
@@ -78,8 +79,9 @@ pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
     BuildLimits as CaptureEngineBuildLimits, BuildReport as CaptureEngineBuildReport,
     CaptureCountOutcome, CaptureRecord, GroupRecord as CaptureGroupRecord,
-    ResourceKind as CaptureResource, SearchError as CaptureSearchError,
-    SearchLimits as CaptureSearchLimits, Span as CaptureSpan,
+    ResourceKind as CaptureResource, RunReport as CaptureSearchAccounting,
+    SearchError as CaptureSearchError, SearchLimits as CaptureSearchLimits,
+    SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan,
 };
 pub use fre_kernels::{
     LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,

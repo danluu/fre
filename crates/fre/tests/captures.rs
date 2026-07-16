@@ -185,6 +185,53 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
 }
 
 #[test]
+fn single_text_capture_view_supports_numeric_name_and_borrowed_indexing() {
+    fn named_len(haystack: &str) -> usize {
+        let regex = PortableTextCaptureBuilder::new(r"^(?P<name>.+)$")
+            .build()
+            .expect("text capture build");
+        let (captures, accounting) = regex
+            .captures(haystack, CaptureSearchLimits::default())
+            .expect("bounded text capture search");
+        assert!(accounting.state_visits > 0);
+        let captures = captures.expect("capture record");
+        captures["name"].len()
+    }
+
+    let regex = PortableTextCaptureBuilder::new(r"^(?P<name>.+)$")
+        .build()
+        .expect("text capture build");
+    let (captures, _) = regex
+        .captures("abc", CaptureSearchLimits::default())
+        .expect("bounded text capture search");
+    let captures = captures.expect("capture record");
+    assert_eq!(captures.len(), 2);
+    assert!(!captures.is_empty());
+    assert_eq!(captures.get(0).expect("whole match").as_str(), "abc");
+    assert_eq!(captures.get(1).expect("numeric group").as_str(), "abc");
+    assert_eq!(captures.name("name").expect("named group").as_str(), "abc");
+    assert_eq!(&captures[0], "abc");
+    assert_eq!(&captures[1], "abc");
+    assert_eq!(&captures["name"], "abc");
+    assert_eq!(named_len("123"), 3);
+}
+
+#[test]
+fn single_text_capture_indexing_panics_for_missing_slots_and_names() {
+    let regex = PortableTextCaptureBuilder::new(r"^(?P<name>.+)$")
+        .build()
+        .expect("text capture build");
+    let (captures, _) = regex
+        .captures("abc", CaptureSearchLimits::default())
+        .expect("bounded text capture search");
+    let captures = captures.expect("capture record");
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| &captures[2])).is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| &captures["missing"])).is_err()
+    );
+}
+
+#[test]
 fn cross_family_capture_reducers_match_pinned_rust_bytes() {
     let cases: &[(&str, &[u8])] = &[
         (r"(a)(b)?", b"a ab"),

@@ -15,8 +15,9 @@ use fre_capture_lab::{
     AggregateLimits, AggregateOutcome, Assertion as CaptureAssertion, Ast,
     BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
     BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, CaptureRecord, Greed,
-    HistoryRegex, Program, ResourceKind as EngineResource, SearchError as EngineSearchError,
-    Span as EngineSpan, Window,
+    HistoryRegex, Program, ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
+    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
+    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
@@ -438,6 +439,160 @@ pub enum PortableTextCaptureIterationError {
     },
 }
 
+/// Failure from one bounded Rust text capture search.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PortableTextCaptureSearchError {
+    /// The persistent-history executor refused the bounded search.
+    Capture(EngineSearchError),
+    /// A selected capture record did not contain its whole-match slot.
+    MissingOverall,
+    /// A selected record's vector position and declared group index differed.
+    InvalidCaptureIndex {
+        /// Position in the selected record.
+        expected: usize,
+        /// Index declared by the capture engine.
+        actual: u32,
+    },
+    /// A selected group span was not a valid slice of the UTF-8 haystack.
+    InvalidUtf8Capture {
+        /// Numeric capture slot.
+        group_index: usize,
+        /// Inclusive byte offset.
+        start: usize,
+        /// Exclusive byte offset.
+        end: usize,
+    },
+}
+
+impl fmt::Display for PortableTextCaptureSearchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capture(error) => error.fmt(formatter),
+            Self::MissingOverall => formatter.write_str("text capture match lacks group zero"),
+            Self::InvalidCaptureIndex { expected, actual } => write!(
+                formatter,
+                "text capture slot {expected} declared group index {actual}",
+            ),
+            Self::InvalidUtf8Capture {
+                group_index,
+                start,
+                end,
+            } => write!(
+                formatter,
+                "text capture group {group_index} has non-boundary span [{start}, {end})",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PortableTextCaptureSearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(error) => Some(error),
+            Self::MissingOverall
+            | Self::InvalidCaptureIndex { .. }
+            | Self::InvalidUtf8Capture { .. } => None,
+        }
+    }
+}
+
+/// One borrowed UTF-8 capture match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableTextCaptureMatch<'h> {
+    haystack: &'h str,
+    span: EngineSpan,
+}
+
+impl<'h> PortableTextCaptureMatch<'h> {
+    /// Inclusive byte offset in the original haystack.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.span.start
+    }
+
+    /// Exclusive byte offset in the original haystack.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.span.end
+    }
+
+    /// Borrow the matched text with the haystack's lifetime.
+    #[must_use]
+    pub fn as_str(self) -> &'h str {
+        &self.haystack[self.span.start..self.span.end]
+    }
+}
+
+/// Borrowed capture groups from one selected Rust text match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortableTextCaptures<'h> {
+    haystack: &'h str,
+    record: CaptureRecord,
+}
+
+impl<'h> PortableTextCaptures<'h> {
+    /// Number of capture slots, including group zero.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.record.groups.len()
+    }
+
+    /// Capture records always include group zero.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.record.groups.is_empty()
+    }
+
+    /// Return one participating capture by numeric index.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<PortableTextCaptureMatch<'h>> {
+        let group = self.record.groups.get(index)?;
+        let span = group.span?;
+        Some(PortableTextCaptureMatch {
+            haystack: self.haystack,
+            span,
+        })
+    }
+
+    /// Return one participating capture by name.
+    #[must_use]
+    pub fn name(&self, name: &str) -> Option<PortableTextCaptureMatch<'h>> {
+        let group = self
+            .record
+            .groups
+            .iter()
+            .find(|group| group.name.as_deref() == Some(name))?;
+        let span = group.span?;
+        Some(PortableTextCaptureMatch {
+            haystack: self.haystack,
+            span,
+        })
+    }
+}
+
+impl core::ops::Index<usize> for PortableTextCaptures<'_> {
+    type Output = str;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index)
+            .unwrap_or_else(|| panic!("capture group {index} did not participate"))
+            .as_str()
+    }
+}
+
+impl core::ops::Index<&str> for PortableTextCaptures<'_> {
+    type Output = str;
+
+    fn index(&self, name: &str) -> &Self::Output {
+        self.name(name)
+            .unwrap_or_else(|| {
+                panic!("capture group {name:?} does not exist or did not participate")
+            })
+            .as_str()
+    }
+}
+
 impl fmt::Display for PortableTextCaptureIterationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -569,6 +724,58 @@ impl PortableTextCaptureRegex {
     #[must_use]
     pub const fn build_report(&self) -> &PortableTextCaptureBuildReport {
         &self.report
+    }
+
+    /// Return the selected leftmost-first capture record while borrowing every
+    /// participating group from the original UTF-8 haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableTextCaptureSearchError::Capture`] when the bounded
+    /// persistent-history search is refused. Any violation of the
+    /// construction-time UTF-8 proof is reported as a typed invariant error.
+    pub fn captures<'h>(
+        &self,
+        haystack: &'h str,
+        limits: EngineSearchLimits,
+    ) -> Result<
+        (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
+        PortableTextCaptureSearchError,
+    > {
+        let outcome = self
+            .inner
+            .captures(haystack.as_bytes(), limits)
+            .map_err(PortableTextCaptureSearchError::Capture)?;
+        let accounting = outcome.report;
+        let Some(record) = outcome.captures else {
+            return Ok((None, accounting));
+        };
+        if record.overall().is_none() {
+            return Err(PortableTextCaptureSearchError::MissingOverall);
+        }
+        for (group_index, group) in record.groups.iter().enumerate() {
+            if usize::try_from(group.index) != Ok(group_index) {
+                return Err(PortableTextCaptureSearchError::InvalidCaptureIndex {
+                    expected: group_index,
+                    actual: group.index,
+                });
+            }
+            let Some(span) = group.span else {
+                continue;
+            };
+            if span.start > span.end
+                || span.end > haystack.len()
+                || !haystack.is_char_boundary(span.start)
+                || !haystack.is_char_boundary(span.end)
+            {
+                return Err(PortableTextCaptureSearchError::InvalidUtf8Capture {
+                    group_index,
+                    start: span.start,
+                    end: span.end,
+                });
+            }
+        }
+        Ok((Some(PortableTextCaptures { haystack, record }), accounting))
     }
 
     /// Materialize complete text captures while removing only empty records
@@ -777,6 +984,17 @@ impl CaptureRegex {
             build_limits: self.build_limits,
             run_limits,
         }
+    }
+
+    /// Return the first leftmost-first capture record under explicit
+    /// per-search limits, together with exact execution accounting.
+    pub fn captures(
+        &self,
+        haystack: &[u8],
+        limits: EngineSearchLimits,
+    ) -> Result<EngineSearchOutcome, EngineSearchError> {
+        self.engine
+            .captures(haystack, Window::all(haystack), limits)
     }
 
     /// Collect every non-overlapping leftmost-first match and every capture

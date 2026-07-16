@@ -29,8 +29,9 @@ The misc/regression adapter independently authenticates those package and VCS
 files plus all bytes of `tests/misc.rs`, `tests/regression.rs`, and
 `tests/regression_fuzz.rs`. Its fixed 25-obligation order admits only pass,
 mismatch, unsupported, or fault receipts. Unsupported formatting/index
-operator/type-lifetime surfaces and the upstream ignored expensive constructor
-remain visible rather than being silently filtered.
+operator/type-lifetime surfaces execute through FRE's bounded borrowed text
+capture view. The upstream ignored expensive constructor remains visible as
+the suite's sole unsupported receipt rather than being silently filtered.
 
 The searcher adapter independently authenticates the same package identity and
 the complete `tests/searcher.rs` byte stream (SHA-256

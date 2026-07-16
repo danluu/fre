@@ -8,8 +8,9 @@ use std::{
 };
 
 use fre::{
-    BuildFailureClass, CaptureAggregateLimits, CaptureBuilder, PortableBuilder,
-    PortableFindIterLimits, PortableTextBuilder, RustProfile, SearchLimits,
+    BuildFailureClass, CaptureAggregateLimits, CaptureBuilder, CaptureSearchLimits,
+    PortableBuilder, PortableFindIterLimits, PortableRegex, PortableTextBuilder,
+    PortableTextCaptureBuilder, PortableTextCaptures, RustProfile, SearchLimits,
 };
 use serde::{Deserialize, Serialize};
 
@@ -155,7 +156,11 @@ struct SourceSpec {
 #[derive(Clone, Copy, Debug)]
 enum CaseKind {
     Unsupported(&'static str),
+    PatternFormatting(&'static str),
     CaptureNames,
+    CaptureIndexPanicUsize,
+    CaptureIndexPanicName,
+    CaptureIndexLifetime,
     CaptureRecord {
         pattern: &'static str,
         haystack: &'static [u8],
@@ -210,8 +215,8 @@ const CASES: [MiscRegressionCase; MISC_REGRESSION_API_CASES] = [
         "regex_string",
         0,
         PatternFormatting,
-        CaseKind::Unsupported("misc.pattern-display-debug-unavailable"),
-        b""
+        CaseKind::PatternFormatting(r"[a-zA-Z0-9]+"),
+        b"true|true|true"
     ),
     case!(
         "capture_names",
@@ -234,22 +239,22 @@ const CASES: [MiscRegressionCase; MISC_REGRESSION_API_CASES] = [
         "capture_index_panic_usize",
         0,
         CaptureIndexing,
-        CaseKind::Unsupported("misc.capture-index-operator-unavailable"),
-        b""
+        CaseKind::CaptureIndexPanicUsize,
+        b"panic"
     ),
     case!(
         "capture_index_panic_name",
         0,
         CaptureIndexing,
-        CaseKind::Unsupported("misc.capture-name-index-operator-unavailable"),
-        b""
+        CaseKind::CaptureIndexPanicName,
+        b"panic"
     ),
     case!(
         "capture_index_lifetime",
         0,
         CaptureIndexing,
-        CaseKind::Unsupported("misc.capture-index-lifetime-surface-unavailable"),
-        b""
+        CaseKind::CaptureIndexLifetime,
+        b"3"
     ),
     case!(
         "capture_misc",
@@ -616,7 +621,11 @@ impl MiscRegressionCounts {
 fn execute_case(case: MiscRegressionCase) -> Result<Vec<u8>, ExecutionRefusal> {
     match case.kind {
         CaseKind::Unsupported(reason_code) => Err(unsupported(reason_code)),
+        CaseKind::PatternFormatting(pattern) => execute_pattern_formatting(pattern),
         CaseKind::CaptureNames => execute_capture_names(),
+        CaseKind::CaptureIndexPanicUsize => execute_capture_index_panic_usize(),
+        CaseKind::CaptureIndexPanicName => execute_capture_index_panic_name(),
+        CaseKind::CaptureIndexLifetime => execute_capture_index_lifetime(),
         CaseKind::CaptureRecord { pattern, haystack } => execute_capture_record(pattern, haystack),
         CaseKind::ValidConstructor(pattern) => execute_valid_constructor(pattern),
         CaseKind::InvalidConstructors(patterns) => execute_invalid_constructors(patterns),
@@ -628,6 +637,68 @@ fn execute_case(case: MiscRegressionCase) -> Result<Vec<u8>, ExecutionRefusal> {
             positive,
         } => execute_text_matches(pattern, negative, positive),
     }
+}
+
+fn execute_pattern_formatting(pattern: &str) -> Result<Vec<u8>, ExecutionRefusal> {
+    let regex = PortableRegex::new(pattern).map_err(|error| build_refusal(&error))?;
+    Ok(format!(
+        "{}|{}|{}",
+        regex.as_str() == pattern,
+        regex.to_string() == pattern,
+        format!("{regex:?}") == format!("PortableRegex({pattern:?})")
+    )
+    .into_bytes())
+}
+
+fn indexed_text_captures<'h>(
+    pattern: &str,
+    haystack: &'h str,
+) -> Result<PortableTextCaptures<'h>, ExecutionRefusal> {
+    let regex = PortableTextCaptureBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .build()
+        .map_err(|_| unsupported("misc-regression.text-capture-build-refused"))?;
+    let (captures, _) = regex
+        .captures(haystack, CaptureSearchLimits::default())
+        .map_err(|_| unsupported("misc-regression.text-capture-search-refused"))?;
+    captures.ok_or_else(|| fault("misc-regression.text-capture-record-missing"))
+}
+
+fn execute_capture_index_panic_usize() -> Result<Vec<u8>, ExecutionRefusal> {
+    let captures = indexed_text_captures(r"^(?P<name>.+)$", "abc")?;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _ = &captures[2];
+    }))
+    .is_err();
+    Ok(if panicked {
+        b"panic".as_slice()
+    } else {
+        b"no-panic".as_slice()
+    }
+    .to_vec())
+}
+
+fn execute_capture_index_panic_name() -> Result<Vec<u8>, ExecutionRefusal> {
+    let captures = indexed_text_captures(r"^(?P<name>.+)$", "abc")?;
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _ = &captures["bad name"];
+    }))
+    .is_err();
+    Ok(if panicked {
+        b"panic".as_slice()
+    } else {
+        b"no-panic".as_slice()
+    }
+    .to_vec())
+}
+
+fn execute_capture_index_lifetime() -> Result<Vec<u8>, ExecutionRefusal> {
+    fn matched_len(haystack: &str) -> Result<usize, ExecutionRefusal> {
+        let captures = indexed_text_captures(r"(?P<number>[0-9]+)", haystack)?;
+        Ok(captures["number"].len())
+    }
+
+    Ok(matched_len("123")?.to_string().into_bytes())
 }
 
 fn execute_capture_names() -> Result<Vec<u8>, ExecutionRefusal> {
@@ -1020,10 +1091,10 @@ mod tests {
             });
         }
         let counts = MiscRegressionCounts::from_receipts(&receipts).unwrap();
-        assert_eq!(counts.pass, 20);
+        assert_eq!(counts.pass, 24);
         assert_eq!(counts.total, MISC_REGRESSION_API_CASES);
         assert_eq!(counts.mismatch, 0);
-        assert_eq!(counts.unsupported, 5);
+        assert_eq!(counts.unsupported, 1);
         assert_eq!(counts.fault, 0);
         let payload = MiscRegressionReportPayload {
             source,
