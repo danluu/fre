@@ -6,8 +6,7 @@ const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
 const UPSTREAM_PACKAGE_SHA256: &str =
     "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba";
 const UPSTREAM_PATH: &str = "testdata/empty.toml";
-const UPSTREAM_SHA256: &str =
-    "738dbe92fbd8971385a1cf3affb0e956e5b692c858b9b48439d718f10801c08e";
+const UPSTREAM_SHA256: &str = "738dbe92fbd8971385a1cf3affb0e956e5b692c858b9b48439d718f10801c08e";
 const QUALIFIED_IDS: &[&str] = &["600", "610"];
 const EXPECTED: &[(usize, usize)] = &[(0, 0), (1, 1), (2, 2), (3, 3)];
 
