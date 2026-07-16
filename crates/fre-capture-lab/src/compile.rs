@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::mem::size_of;
 
-use crate::ast::{Ast, Greed};
+use crate::ast::{Assertion, Ast, Greed};
 use crate::error::{BuildError, ResourceKind};
 use crate::limits::BuildLimits;
 use crate::profile::CaptureProfile;
@@ -40,8 +40,7 @@ pub(crate) enum State {
     Byte { ranges: Vec<(u8, u8)>, next: usize },
     Split { first: usize, second: usize },
     Save { slot: usize, next: usize },
-    AssertStart { next: usize },
-    AssertEnd { next: usize },
+    Assert { assertion: Assertion, next: usize },
     Epsilon { next: usize },
     Match,
     Fail,
@@ -196,7 +195,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
             .checked_add(1)
             .ok_or(BuildError::BoundOverflow(ResourceKind::AstDepth))?;
         match node {
-            Ast::Empty | Ast::Byte(_) | Ast::Start | Ast::End => {}
+            Ast::Empty | Ast::Byte(_) | Ast::Start | Ast::End | Ast::Assert(_) => {}
             Ast::Class(ranges) => validate_ranges(ranges)?,
             Ast::Concat(children) | Ast::Alt(children) => {
                 stack
@@ -490,8 +489,9 @@ impl Compiler {
                 copied.extend_from_slice(ranges);
                 self.byte(copied)
             }
-            Ast::Start => self.assert_start(),
-            Ast::End => self.assert_end(),
+            Ast::Start => self.assertion(Assertion::Start),
+            Ast::End => self.assertion(Assertion::End),
+            Ast::Assert(assertion) => self.assertion(*assertion),
             Ast::Concat(children) => self.concat(children),
             Ast::Alt(children) => self.alt(children),
             Ast::Repeat {
@@ -531,16 +531,11 @@ impl Compiler {
         })
     }
 
-    fn assert_start(&mut self) -> Result<Fragment, BuildError> {
-        let id = self.add_state(State::AssertStart { next: UNSET })?;
-        Ok(Fragment {
-            start: id,
-            outs: self.one_out(Patch::Next(id))?,
-        })
-    }
-
-    fn assert_end(&mut self) -> Result<Fragment, BuildError> {
-        let id = self.add_state(State::AssertEnd { next: UNSET })?;
+    fn assertion(&mut self, assertion: Assertion) -> Result<Fragment, BuildError> {
+        let id = self.add_state(State::Assert {
+            assertion,
+            next: UNSET,
+        })?;
         Ok(Fragment {
             start: id,
             outs: self.one_out(Patch::Next(id))?,
@@ -759,7 +754,7 @@ impl Compiler {
     fn nullable(&mut self, ast: &Ast) -> Result<bool, BuildError> {
         self.tick()?;
         match ast {
-            Ast::Empty | Ast::Start | Ast::End => Ok(true),
+            Ast::Empty | Ast::Start | Ast::End | Ast::Assert(_) => Ok(true),
             Ast::Byte(_) | Ast::Class(_) => Ok(false),
             Ast::Capture { child, .. } => self.nullable(child),
             Ast::Repeat { child, min, .. } => {
@@ -808,8 +803,7 @@ impl Compiler {
                 Patch::Next(_),
                 State::Byte { next, .. }
                 | State::Save { next, .. }
-                | State::AssertStart { next }
-                | State::AssertEnd { next }
+                | State::Assert { next, .. }
                 | State::Epsilon { next },
             ) => *next = target,
             (Patch::SplitFirst(_), State::Split { first, .. }) => *first = target,

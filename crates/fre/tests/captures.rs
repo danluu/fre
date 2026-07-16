@@ -1,7 +1,6 @@
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
-    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, PortableTextCaptureBuildError,
-    PortableTextCaptureBuilder,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, PortableTextCaptureBuilder,
 };
 use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
@@ -144,6 +143,8 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
         (r"(.)", "é東京"),
         (r"^((?:é|a)*)$", "éaé"),
         (r"([\p{Greek}]+)", "aΔδ東京"),
+        (r"(\b)", "éa 東京_42"),
+        (r"(?m:^([^\n]*))", "éa\n東京\n"),
     ];
     for (pattern, haystack) in cases {
         let regex = PortableTextCaptureBuilder::new(pattern)
@@ -175,15 +176,6 @@ fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
             "{pattern:?}"
         );
     }
-
-    assert!(matches!(
-        PortableTextCaptureBuilder::new(r"(\b)")
-            .build()
-            .expect_err("word look is outside the tagged executor"),
-        PortableTextCaptureBuildError::ProfileHirMismatch
-            | PortableTextCaptureBuildError::BytesProofSyntax(_)
-            | PortableTextCaptureBuildError::Capture(_)
-    ));
 }
 
 #[test]
@@ -311,7 +303,7 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
 }
 
 #[test]
-fn unicode_capture_classes_execute_while_word_look_remains_a_typed_refusal() {
+fn unicode_capture_classes_and_admitted_contextual_looks_execute() {
     let pattern = r"([\p{L}\p{N}_]+)";
     let haystack = b"abc \xCE\x94\xCE\xB4 42 \xFF";
     let reference = RegexBuilder::new(pattern)
@@ -365,12 +357,38 @@ fn unicode_capture_classes_execute_while_word_look_remains_a_typed_refusal() {
             }
         ))
     ));
-    assert!(
-        CaptureBuilder::new(r"\b(a)\b")
-            .unicode(false)
-            .build()
-            .is_err()
-    );
+    assert_count(r"(?m:^([^\n]+))", b"a\nb\n");
+    assert_count(r"(?-u:\b)([A-Za-z_]+)(?-u:\b)", b"a-b_c 42");
+    assert_count(r"(?-u:\b{start})([A-Za-z_]+)", b"a-b_c 42");
+    let word_pattern = r"([\p{L}]+)\b";
+    let word_haystack = "éa 東京_42".as_bytes();
+    let word_reference = RegexBuilder::new(word_pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode word reference")
+        .captures_iter(word_haystack)
+        .map(|captures| captures.iter().flatten().count())
+        .sum::<usize>();
+    let word_actual = CaptureBuilder::new(word_pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode word capture")
+        .count_captures(word_haystack, CaptureRunLimits::default())
+        .expect("Unicode word execution")
+        .accounting
+        .count;
+    assert_eq!(word_actual, word_reference);
+
+    let mut custom_line = fre::RustProfile::default();
+    custom_line.options.line_terminator = b'\r';
+    assert!(matches!(
+        CaptureBuilder::new(r"(?m:^)(a)")
+            .profile(custom_line)
+            .build(),
+        Err(fre::CaptureBuildError::Unsupported(
+            fre::CaptureUnsupported::Look(_)
+        ))
+    ));
 }
 
 #[test]

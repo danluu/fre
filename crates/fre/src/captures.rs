@@ -12,10 +12,11 @@ use fre_aggregate::{
     RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
-    AggregateLimits, AggregateOutcome, Ast, BuildError as EngineBuildError,
-    BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport, CaptureCountOutcome,
-    CaptureProfile, CaptureRecord, Greed, HistoryRegex, Program, ResourceKind as EngineResource,
-    SearchError as EngineSearchError, Span as EngineSpan, Window,
+    AggregateLimits, AggregateOutcome, Assertion as CaptureAssertion, Ast,
+    BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
+    BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, CaptureRecord, Greed,
+    HistoryRegex, Program, ResourceKind as EngineResource, SearchError as EngineSearchError,
+    Span as EngineSpan, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
@@ -675,6 +676,7 @@ impl CaptureBuilder {
     pub fn build(self) -> Result<CaptureRegex, CaptureBuildError> {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
+        let line_terminator = self.profile.options.line_terminator;
         let profile = CompatibilityProfile::RustBytes(self.profile);
         let parsed = fre_syntax::parse(
             fre_syntax::ParseRequest::rust(self.pattern, profile)
@@ -703,7 +705,7 @@ impl CaptureBuilder {
         )
         .map_err(CaptureBuildError::Selector)?;
         let selector_accounting = selector.compile_accounting();
-        let ast = lower_hir(&rust.hir, 1, &limits, &mut accounting)?;
+        let ast = lower_hir(&rust.hir, 1, line_terminator, &limits, &mut accounting)?;
         let program =
             Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
         let engine_report = program.build_report().clone();
@@ -1034,6 +1036,7 @@ fn checked_capture_add(
 fn lower_hir(
     hir: &Hir,
     depth: usize,
+    line_terminator: u8,
     limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
 ) -> Result<Ast, CaptureBuildError> {
@@ -1102,6 +1105,23 @@ fn lower_hir(
         HirKind::Class(Class::Unicode(class)) => lower_unicode_class(class, limits, accounting),
         HirKind::Look(Look::Start) => Ok(Ast::Start),
         HirKind::Look(Look::End) => Ok(Ast::End),
+        HirKind::Look(Look::StartLF) if line_terminator == b'\n' => {
+            Ok(Ast::Assert(CaptureAssertion::StartLf))
+        }
+        HirKind::Look(Look::EndLF) if line_terminator == b'\n' => {
+            Ok(Ast::Assert(CaptureAssertion::EndLf))
+        }
+        HirKind::Look(Look::WordAscii) => Ok(Ast::Assert(CaptureAssertion::WordAscii)),
+        HirKind::Look(Look::WordAsciiNegate) => Ok(Ast::Assert(CaptureAssertion::WordAsciiNegate)),
+        HirKind::Look(Look::WordStartAscii) => Ok(Ast::Assert(CaptureAssertion::WordStartAscii)),
+        HirKind::Look(Look::WordEndAscii) => Ok(Ast::Assert(CaptureAssertion::WordEndAscii)),
+        HirKind::Look(Look::WordStartHalfAscii) => {
+            Ok(Ast::Assert(CaptureAssertion::WordStartHalfAscii))
+        }
+        HirKind::Look(Look::WordEndHalfAscii) => {
+            Ok(Ast::Assert(CaptureAssertion::WordEndHalfAscii))
+        }
+        HirKind::Look(Look::WordUnicode) => Ok(Ast::Assert(CaptureAssertion::WordUnicode)),
         HirKind::Look(look) => Err(CaptureBuildError::Unsupported(CaptureUnsupported::Look(
             *look,
         ))),
@@ -1111,6 +1131,7 @@ fn lower_hir(
             child: Box::new(lower_hir(
                 capture.sub.as_ref(),
                 next_depth(depth)?,
+                line_terminator,
                 limits,
                 accounting,
             )?),
@@ -1119,6 +1140,7 @@ fn lower_hir(
             child: Box::new(lower_hir(
                 repetition.sub.as_ref(),
                 next_depth(depth)?,
+                line_terminator,
                 limits,
                 accounting,
             )?),
@@ -1130,12 +1152,22 @@ fn lower_hir(
                 Greed::Lazy
             },
         }),
-        HirKind::Concat(children) => {
-            lower_children(children, depth, limits, accounting, Ast::Concat)
-        }
-        HirKind::Alternation(children) => {
-            lower_children(children, depth, limits, accounting, Ast::Alt)
-        }
+        HirKind::Concat(children) => lower_children(
+            children,
+            depth,
+            line_terminator,
+            limits,
+            accounting,
+            Ast::Concat,
+        ),
+        HirKind::Alternation(children) => lower_children(
+            children,
+            depth,
+            line_terminator,
+            limits,
+            accounting,
+            Ast::Alt,
+        ),
     }
 }
 
@@ -1197,6 +1229,7 @@ fn lower_unicode_class(
 fn lower_children(
     children: &[Hir],
     depth: usize,
+    line_terminator: u8,
     limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
     construct: fn(Vec<Ast>) -> Ast,
@@ -1210,7 +1243,13 @@ fn lower_children(
         })?;
     let child_depth = next_depth(depth)?;
     for child in children {
-        lowered.push(lower_hir(child, child_depth, limits, accounting)?);
+        lowered.push(lower_hir(
+            child,
+            child_depth,
+            line_terminator,
+            limits,
+            accounting,
+        )?);
     }
     Ok(construct(lowered))
 }

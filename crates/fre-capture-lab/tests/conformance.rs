@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fre_capture_lab::{
-    AggregateLimits, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
+    AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
     GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError, SearchLimits, Span,
     Window,
 };
@@ -229,6 +229,45 @@ fn window_offsets_and_anchor_context_are_exact() {
     let haystack = b"xay";
     assert_case(&ast, haystack, Window { start: 1, end: 2 });
     assert_case(&ast, haystack, Window { start: 0, end: 2 });
+}
+
+#[test]
+fn contextual_line_and_word_assertions_match_pinned_regex() {
+    let assertions = [
+        Assertion::StartLf,
+        Assertion::EndLf,
+        Assertion::WordAscii,
+        Assertion::WordAsciiNegate,
+        Assertion::WordStartAscii,
+        Assertion::WordEndAscii,
+        Assertion::WordStartHalfAscii,
+        Assertion::WordEndHalfAscii,
+        Assertion::WordUnicode,
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"a-\n_b",
+        "é-東京_42\n".as_bytes(),
+        &[0xFF, b'a', 0x80, b'_', b'\n'],
+    ];
+    for assertion in assertions {
+        let ast = Ast::Assert(assertion).capture(1);
+        for &haystack in haystacks {
+            assert_case(&ast, haystack, Window::all(haystack));
+            let mut embedded = Vec::with_capacity(haystack.len() + 2);
+            embedded.push(b'x');
+            embedded.extend_from_slice(haystack);
+            embedded.push(b'y');
+            assert_case(
+                &ast,
+                &embedded,
+                Window {
+                    start: 1,
+                    end: haystack.len() + 1,
+                },
+            );
+        }
+    }
 }
 
 #[test]
@@ -686,5 +725,19 @@ fn render(ast: &Ast) -> String {
         } => format!("({})", render(child)),
         Ast::Start => r"\A".to_owned(),
         Ast::End => r"\z".to_owned(),
+        Ast::Assert(assertion) => match assertion {
+            Assertion::Start => r"\A",
+            Assertion::End => r"\z",
+            Assertion::StartLf => r"(?m:^)",
+            Assertion::EndLf => r"(?m:$)",
+            Assertion::WordAscii => r"(?-u:\b)",
+            Assertion::WordAsciiNegate => r"(?-u:\B)",
+            Assertion::WordStartAscii => r"(?-u:\b{start})",
+            Assertion::WordEndAscii => r"(?-u:\b{end})",
+            Assertion::WordStartHalfAscii => r"(?-u:\b{start-half})",
+            Assertion::WordEndHalfAscii => r"(?-u:\b{end-half})",
+            Assertion::WordUnicode => r"\b",
+        }
+        .to_owned(),
     }
 }

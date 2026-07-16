@@ -27,7 +27,7 @@ mod model;
 mod profile;
 mod runtime;
 
-pub use ast::{Ast, Greed};
+pub use ast::{Assertion, Ast, Greed};
 pub use compile::{BuildReport, Program};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use history::HistoryRegex;

@@ -7,7 +7,9 @@ use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{AggregateOutcome, CandidateKind, RunReport, SearchOutcome, Window};
-use crate::runtime::{admit_inline, canonicalize, check, checked_add, validate_window};
+use crate::runtime::{
+    admit_inline, assertion_matches, canonicalize, check, checked_add, validate_window,
+};
 
 #[derive(Clone, Debug)]
 struct Thread {
@@ -199,6 +201,7 @@ impl InlineRegex {
                         slots,
                     },
                     pos,
+                    haystack,
                     window,
                     &mut counters,
                     limits,
@@ -255,6 +258,7 @@ impl InlineRegex {
                             slots: thread.slots,
                         },
                         next_pos,
+                        haystack,
                         window,
                         &mut counters,
                         limits,
@@ -348,6 +352,7 @@ fn add_thread(
     generation: usize,
     initial: Thread,
     pos: usize,
+    haystack: &[u8],
     window: Window,
     counters: &mut Counters,
     limits: SearchLimits,
@@ -377,14 +382,8 @@ fn add_thread(
                 thread.pc = *next;
                 stack.push(thread);
             }
-            State::AssertStart { next } => {
-                if pos == window.start {
-                    thread.pc = *next;
-                    stack.push(thread);
-                }
-            }
-            State::AssertEnd { next } => {
-                if pos == window.end {
+            State::Assert { assertion, next } => {
+                if assertion_matches(*assertion, haystack, window, pos)? {
                     thread.pc = *next;
                     stack.push(thread);
                 }

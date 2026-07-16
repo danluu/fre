@@ -9,6 +9,33 @@ pub enum Greed {
     Lazy,
 }
 
+/// A zero-width predicate with exact logical-window context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Assertion {
+    /// Beginning of the logical window.
+    Start,
+    /// End of the logical window.
+    End,
+    /// Beginning of the logical window or immediately after LF.
+    StartLf,
+    /// End of the logical window or immediately before LF.
+    EndLf,
+    /// ASCII word boundary.
+    WordAscii,
+    /// Negated ASCII word boundary.
+    WordAsciiNegate,
+    /// Start of an ASCII word.
+    WordStartAscii,
+    /// End of an ASCII word.
+    WordEndAscii,
+    /// Left half of an ASCII word-start predicate.
+    WordStartHalfAscii,
+    /// Right half of an ASCII word-end predicate.
+    WordEndHalfAscii,
+    /// Positive Unicode word boundary using the pinned UTS#18 word set.
+    WordUnicode,
+}
+
 /// Syntax accepted by the capture laboratory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Ast {
@@ -46,6 +73,8 @@ pub enum Ast {
     Start,
     /// End of the logical window.
     End,
+    /// Another admitted zero-width assertion.
+    Assert(Assertion),
 }
 
 impl Ast {
