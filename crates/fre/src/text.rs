@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn utf8_start_guarded_ascii_half_looks_match_pinned_text_exhaustively() {
+    fn utf8_start_guarded_ascii_looks_match_pinned_text_exhaustively() {
         fn spans(regex: &PortableTextRegex, haystack: &str) -> Vec<(usize, usize)> {
             let mut spans = Vec::new();
             let mut start = 0_usize;

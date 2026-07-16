@@ -1765,22 +1765,22 @@ mod tests {
             AdapterDisposition::Pass { .. }
         ));
 
-        let mut unproved = input.clone();
-        unproved.patterns = vec![r"\B".to_owned()];
-        unproved.expected = vec![ExpectedCaptures {
+        let mut guarded = input.clone();
+        guarded.patterns = vec![r"\B".to_owned()];
+        guarded.expected = vec![ExpectedCaptures {
             pattern_id: 0,
             groups: vec![Some(ExpectedSpan { start: 1, end: 1 })],
         }];
         assert!(matches!(
-            execute_case(AdapterSurface::RustTextCompile, &text_case, &unproved),
+            execute_case(AdapterSurface::RustTextCompile, &text_case, &guarded),
             AdapterDisposition::Pass { .. }
         ));
         assert!(matches!(
-            execute_case(AdapterSurface::RustTextIsMatch, &text_case, &unproved),
+            execute_case(AdapterSurface::RustTextIsMatch, &text_case, &guarded),
             AdapterDisposition::Pass { .. }
         ));
         assert!(matches!(
-            execute_case(AdapterSurface::RustTextFindIter, &text_case, &unproved),
+            execute_case(AdapterSurface::RustTextFindIter, &text_case, &guarded),
             AdapterDisposition::Pass { .. }
         ));
     }
@@ -1887,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn text_set_utf8_guarded_boundaries_execute() {
+    fn text_set_scalar_guarded_ascii_assertions_execute() {
         let mut case = fixture_case(true, true, None);
         case.match_kind = MatchKind::All;
         case.search_kind = SearchKind::Overlapping;
