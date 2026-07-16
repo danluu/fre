@@ -472,6 +472,7 @@ impl BuildError {
             Self::Syntax(error) => match &error.category {
                 fre_syntax::ErrorCategory::InvalidPatternEncoding
                 | fre_syntax::ErrorCategory::UpstreamRustSyntax
+                | fre_syntax::ErrorCategory::UpstreamRustCompiledTooBig { .. }
                 | fre_syntax::ErrorCategory::Re2Syntax { .. } => BuildFailureClass::ExpectedInvalid,
                 fre_syntax::ErrorCategory::FreResourceLimit { .. }
                 | fre_syntax::ErrorCategory::StrictQualificationFailure { .. } => {
@@ -1182,6 +1183,24 @@ impl PortableBuilder {
     #[must_use]
     pub fn line_terminator(mut self, line_terminator: u8) -> Self {
         self.profile.options.line_terminator = line_terminator;
+        self
+    }
+
+    /// Set the pinned high-level builder's approximate compiled-regex limit.
+    ///
+    /// FRE applies this limit with the same pinned meta-construction path and
+    /// configuration used by `regex` 1.12.4 before selecting an FRE executor.
+    /// A pattern that exceeds the limit is therefore an upstream constructor
+    /// rejection, not an FRE capability or plan-resource refusal. The
+    /// distinct direct-Rebar constructor profile has no corresponding high-
+    /// level option and is left unchanged.
+    #[must_use]
+    pub fn size_limit(mut self, bytes: usize) -> Self {
+        if let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } =
+            &mut self.profile.constructor
+        {
+            *size_limit = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
         self
     }
 

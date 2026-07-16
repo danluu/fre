@@ -141,11 +141,13 @@ fn failure_classifier_separates_capability_limit_configuration_and_fault() {
     assert_eq!(limited.failure_class(), BuildFailureClass::ResourceLimit);
 
     let mut profile = RustProfile::regex_1_12_4();
-    let fre_syntax::RustConstructor::RegexBuilder { size_limit, .. } = &mut profile.constructor
+    let fre_syntax::RustConstructor::RegexBuilder {
+        text_syntax_utf8, ..
+    } = &mut profile.constructor
     else {
         panic!("pinned high-level profile lost its RegexBuilder constructor");
     };
-    *size_limit = 1;
+    *text_syntax_utf8 = false;
     let invalid_configuration = PortableBuilder::new("a")
         .profile(profile)
         .build()

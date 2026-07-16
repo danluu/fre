@@ -259,6 +259,7 @@ name = "fre-syntax"
 version = "0.1.0"
 dependencies = [
  "fre-re2-syntax",
+ "regex-automata",
  "regex-syntax",
 ]
 

@@ -15,6 +15,9 @@ pub struct SourceSpan {
 pub enum ErrorCategory {
     InvalidPatternEncoding,
     UpstreamRustSyntax,
+    UpstreamRustCompiledTooBig {
+        limit: u64,
+    },
     Re2Syntax {
         /// Numeric `RE2::ErrorCode` at the pinned revision.
         code: u8,
