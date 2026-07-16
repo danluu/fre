@@ -984,6 +984,13 @@ impl PlanCore {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = 0_u64;
+        let mut current_slot =
+            haystack
+                .len()
+                .checked_rem(ring.len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "count DP initial ring slot",
+                })?;
         for position in (0..=haystack.len()).rev() {
             if position < haystack.len() {
                 state = self.dfa.next(state, haystack[position]);
@@ -1002,20 +1009,15 @@ impl PlanCore {
                     progressed: next_initial,
                 },
                 Some((_, length)) => {
-                    let target = checked_dp_target(
+                    let target_slot = checked_dp_target_slot(
                         position,
+                        current_slot,
                         length,
                         haystack.len(),
                         self.build.max_pattern_bytes,
                         ring.len(),
                     )?;
-                    let slot =
-                        target
-                            .checked_rem(ring.len())
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "count DP target ring slot",
-                            })?;
-                    let future = ring[slot].progressed;
+                    let future = ring[target_slot].progressed;
                     let count = future
                         .checked_add(1)
                         .ok_or(ReduceError::ArithmeticOverflow {
@@ -1027,13 +1029,11 @@ impl PlanCore {
                     }
                 }
             };
-            let slot = position
-                .checked_rem(ring.len())
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "count DP current ring slot",
-                })?;
-            ring[slot] = value;
+            ring[current_slot] = value;
             next_initial = value.initial;
+            if position != 0 {
+                current_slot = previous_dp_ring_slot(current_slot, ring.len())?;
+            }
         }
         debug_assert!(next_initial <= upper.count);
         Ok(ReduceActualCounters {
@@ -1058,6 +1058,13 @@ impl PlanCore {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = SpanState::default();
+        let mut current_slot =
+            haystack
+                .len()
+                .checked_rem(ring.len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "span DP initial ring slot",
+                })?;
         for position in (0..=haystack.len()).rev() {
             if position < haystack.len() {
                 state = self.dfa.next(state, haystack[position]);
@@ -1078,20 +1085,15 @@ impl PlanCore {
                     span_sum: next_initial.span_sum,
                 },
                 Some((_, length)) => {
-                    let target = checked_dp_target(
+                    let target_slot = checked_dp_target_slot(
                         position,
+                        current_slot,
                         length,
                         haystack.len(),
                         self.build.max_pattern_bytes,
                         ring.len(),
                     )?;
-                    let slot =
-                        target
-                            .checked_rem(ring.len())
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "span DP target ring slot",
-                            })?;
-                    let future = ring[slot];
+                    let future = ring[target_slot];
                     let initial_count = future.progressed_count.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual span match count",
@@ -1113,13 +1115,11 @@ impl PlanCore {
                     }
                 }
             };
-            let slot = position
-                .checked_rem(ring.len())
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "span DP current ring slot",
-                })?;
-            ring[slot] = value;
+            ring[current_slot] = value;
             next_initial = value;
+            if position != 0 {
+                current_slot = previous_dp_ring_slot(current_slot, ring.len())?;
+            }
         }
         debug_assert!(next_initial.initial_count <= upper.count);
         debug_assert!(next_initial.span_sum <= upper.span_sum);
@@ -1579,16 +1579,18 @@ fn validate_ring(actual: usize, expected: usize) -> Result<(), ReduceError> {
     Ok(())
 }
 
-fn checked_dp_target(
+#[inline]
+fn checked_dp_target_slot(
     position: usize,
+    current_slot: usize,
     length: usize,
     haystack_len: usize,
     max_pattern_len: usize,
     ring_len: usize,
 ) -> Result<usize, ReduceError> {
-    if length == 0 || length > max_pattern_len || length >= ring_len {
+    if current_slot >= ring_len || length == 0 || length > max_pattern_len || length >= ring_len {
         return Err(ReduceError::InternalInvariant {
-            detail: "DFA nonempty output length fits the compiled width and DP ring",
+            detail: "DFA output and current slot fit the compiled width and DP ring",
         });
     }
     let target = position
@@ -1601,7 +1603,43 @@ fn checked_dp_target(
             detail: "DFA output cannot extend past the haystack",
         });
     }
-    Ok(target)
+    let unwrapped_slot =
+        current_slot
+            .checked_add(length)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "DP target ring slot",
+            })?;
+    Ok(if unwrapped_slot >= ring_len {
+        unwrapped_slot
+            .checked_sub(ring_len)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "wrapped DP target ring slot",
+            })?
+    } else {
+        unwrapped_slot
+    })
+}
+
+#[inline]
+fn previous_dp_ring_slot(current_slot: usize, ring_len: usize) -> Result<usize, ReduceError> {
+    if current_slot >= ring_len {
+        return Err(ReduceError::InternalInvariant {
+            detail: "DP current slot fits the ring",
+        });
+    }
+    if current_slot == 0 {
+        ring_len
+            .checked_sub(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "DP previous ring slot",
+            })
+    } else {
+        current_slot
+            .checked_sub(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "DP previous ring slot",
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1612,8 +1650,36 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, ReduceError,
-        ReduceLimits,
+        ReduceLimits, checked_dp_target_slot, previous_dp_ring_slot,
     };
+
+    #[test]
+    fn rolling_dp_slots_match_direct_remainders() {
+        for ring_len in 2_usize..=65 {
+            for position in 0_usize..=256 {
+                let current_slot = position % ring_len;
+                for length in 1_usize..ring_len {
+                    let haystack_len = position.checked_add(length).unwrap();
+                    assert_eq!(
+                        checked_dp_target_slot(
+                            position,
+                            current_slot,
+                            length,
+                            haystack_len,
+                            ring_len.checked_sub(1).unwrap(),
+                            ring_len,
+                        )
+                        .unwrap(),
+                        haystack_len % ring_len,
+                    );
+                }
+                let previous = previous_dp_ring_slot(current_slot, ring_len).unwrap();
+                if position != 0 {
+                    assert_eq!(previous, position.checked_sub(1).unwrap() % ring_len);
+                }
+            }
+        }
+    }
 
     fn regex(patterns: &[Vec<u8>]) -> Regex {
         let mut source = String::from("(?:");
