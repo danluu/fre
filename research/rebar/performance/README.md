@@ -91,7 +91,20 @@ pending capture comparison points to measured points in the original 344-row
 draft. Semantically missing/nonpassing comparators receive no slots and remain
 explicitly `not-comparable`.
 
-The performance gate still needs an authorized executor/collector for this
-schedule, allocation/memory metrics, `regex-redux` after semantic support
+Observation schema v2 keeps timing and resource state independent at every
+exact job/boundary/comparator point. Each candidate and reference arm reports
+allocator-call count, allocated bytes, bytes still live after the boundary,
+and process peak RSS through an expected collector ID and immutable collector
+digest. The raw resource record also binds canonical/semantic/input/result,
+candidate plan or reference role, lifecycle priming, and a unique process
+token. Complete deterministic fixtures convert 256 capture resource summaries
+(32 points times four metrics times two arms) into the same 344-row draft.
+Each metric can be explicitly unavailable for one engine without fabricating a
+zero or erasing other measured metrics; mixed states or inconsistent reasons
+inside a six-sample set are rejected. First-operation and steady-operation
+resource medians remain distinct lifecycle observations.
+
+The performance gate still needs an authorized executor/collector for the
+paired timing and resource schedules, `regex-redux` after semantic support
 exists, multi-pattern support, and conversion of the remaining model
 placeholders without altering the denominator.

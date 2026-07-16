@@ -21,13 +21,15 @@ use crate::{CompareError, CurrentFreCaptureLifecycle, InputReceipt, Report, Stat
 /// Stable schema for a performance qualification contract.
 pub const PERFORMANCE_CONTRACT_SCHEMA: &str = "fre.rebar.performance-contract.v1";
 /// Stable schema for pointwise performance observations.
-pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observations.v1";
+pub const PERFORMANCE_OBSERVATIONS_SCHEMA: &str = "fre.rebar.performance-observations.v2";
 /// Stable schema for one raw current-FRE capture lifecycle sample.
 pub const CAPTURE_LIFECYCLE_RAW_SCHEMA: &str = "fre.rebar.capture-lifecycle-raw.v1";
 /// Stable schema for a deterministic fresh-process capture pair schedule.
 pub const CAPTURE_PAIR_SCHEDULE_SCHEMA: &str = "fre.rebar.capture-pair-schedule.v1";
 /// Stable schema for one raw Rust/RE2 capture reference arm.
 pub const CAPTURE_REFERENCE_RAW_SCHEMA: &str = "fre.rebar.capture-reference-raw.v1";
+/// Stable schema for one raw capture resource-observation arm.
+pub const CAPTURE_RESOURCE_RAW_SCHEMA: &str = "fre.rebar.capture-resource-raw.v1";
 /// Complete Rebar operation-model universe.
 pub const REBAR_MODELS: [&str; 7] = [
     "compile",
@@ -229,6 +231,60 @@ pub enum ComparisonStatus {
     Pending,
 }
 
+/// State of one engine's resource metric at one lifecycle boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceMetricStatus {
+    /// A draft declares the metric but has no observation yet.
+    Pending,
+    /// The complete fresh-process sample set produced a median value.
+    Measured,
+    /// The authenticated collector cannot provide this metric.
+    Unavailable,
+    /// The semantic comparator point does not exist, so no metric applies.
+    NotComparable,
+}
+
+/// One engine's aggregate for one resource metric.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceArmSummary {
+    /// Pending, measured, or explicitly unavailable.
+    pub status: ResourceMetricStatus,
+    /// Exact collector identity for measured or probed-unavailable evidence.
+    pub collector: Option<ResourceCollectorIdentity>,
+    /// Median raw metric value across the contracted pair count.
+    pub median: Option<u64>,
+    /// Number of fresh-process samples represented by the median.
+    pub sample_count: Option<u32>,
+    /// Required explanation for pending or unavailable metrics.
+    pub reason: Option<String>,
+}
+
+/// Candidate and reference aggregates for one resource metric.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcePairSummary {
+    /// Current-FRE resource aggregate.
+    pub candidate: ResourceArmSummary,
+    /// Rust-regex or RE2 resource aggregate.
+    pub reference: ResourceArmSummary,
+}
+
+/// Allocation, retained, and process-peak resources for one exact point.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonResourceObservation {
+    /// Number of allocator calls inside the lifecycle boundary.
+    pub allocation_count: ResourcePairSummary,
+    /// Total allocator bytes requested inside the lifecycle boundary.
+    pub allocated_bytes: ResourcePairSummary,
+    /// Live bytes retained after the lifecycle boundary completes.
+    pub persistent_bytes: ResourcePairSummary,
+    /// Process high-water resident set during the lifecycle boundary.
+    pub peak_rss_bytes: ResourcePairSummary,
+}
+
 /// One pointwise comparison summary.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -247,6 +303,8 @@ pub struct ComparisonObservation {
     pub pointwise_pass: Option<bool>,
     /// Required explanation for pending or non-comparable points.
     pub reason: Option<String>,
+    /// Resource observations kept separate from elapsed-time state.
+    pub resources: ComparisonResourceObservation,
 }
 
 /// All comparator observations at one lifecycle boundary.
@@ -519,6 +577,104 @@ pub struct CapturePairEvidence {
     pub reference: CaptureReferenceRawObservation,
 }
 
+/// Engine arm whose resources were observed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceObservationArm {
+    /// Current FRE.
+    Candidate,
+    /// The comparator named by the enclosing schedule slot.
+    Reference,
+}
+
+/// Authenticated identity of the resource collector expected by conversion.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceCollectorIdentity {
+    /// Stable collector/probe configuration ID.
+    pub collector_id: String,
+    /// SHA-256 of the exact collector executable or immutable probe bundle.
+    pub collector_sha256: String,
+}
+
+/// One unaggregated resource metric from a fresh process.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RawResourceMetric {
+    /// Raw evidence is measured or explicitly unavailable; never pending.
+    pub status: ResourceMetricStatus,
+    /// Raw metric value when measured.
+    pub value: Option<u64>,
+    /// Exact collector reason when unavailable.
+    pub reason: Option<String>,
+}
+
+/// One self-identifying candidate or reference resource arm.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureResourceRawObservation {
+    /// Raw resource observation schema.
+    pub schema: String,
+    /// Exact performance contract ID.
+    pub contract_id: String,
+    /// Exact canonical commit.
+    pub canonical_commit: String,
+    /// Exact canonical tree.
+    pub canonical_tree: String,
+    /// Exact semantic receipt digest.
+    pub semantic_receipts_sha256: String,
+    /// Exact semantic job ID.
+    pub job_id: String,
+    /// Exact benchmark name.
+    pub benchmark: String,
+    /// Exact Rebar model.
+    pub model: String,
+    /// Exact lifecycle boundary measured in this process.
+    pub boundary: CaptureLifecycleBoundary,
+    /// Comparator point to which this arm belongs.
+    pub comparator: String,
+    /// Candidate or reference engine arm.
+    pub arm: ResourceObservationArm,
+    /// Current-FRE plan for a candidate arm; absent for a reference arm.
+    pub candidate_plan: Option<String>,
+    /// Complete semantic input identity.
+    pub input: InputReceipt,
+    /// Exact semantic reducer expected by the collector.
+    pub expected: u64,
+    /// Reducer returned by the observed lifecycle operation.
+    pub actual: u64,
+    /// Untimed lifecycle operations completed before resource observation.
+    pub priming_operations: u8,
+    /// Lifecycle operations included in this resource observation.
+    pub observed_operations: u8,
+    /// SHA-256 of `actual.to_le_bytes()`.
+    pub result_sha256: String,
+    /// Exact authenticated resource collector.
+    pub collector: ResourceCollectorIdentity,
+    /// Unique token provisioned for this fresh collector process.
+    pub process_token_sha256: String,
+    /// Allocator calls inside the exact boundary.
+    pub allocation_count: RawResourceMetric,
+    /// Allocator bytes requested inside the exact boundary.
+    pub allocated_bytes: RawResourceMetric,
+    /// Live bytes retained when the exact boundary completes.
+    pub persistent_bytes: RawResourceMetric,
+    /// Process high-water resident set during the exact boundary.
+    pub peak_rss_bytes: RawResourceMetric,
+}
+
+/// Candidate and reference resource arms for one deterministic pair slot.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureResourcePairEvidence {
+    /// Exact schedule slot.
+    pub slot: CapturePairSlot,
+    /// Current-FRE resource arm.
+    pub candidate: CaptureResourceRawObservation,
+    /// Rust/RE2 resource arm.
+    pub reference: CaptureResourceRawObservation,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SemanticRow {
     benchmark: String,
@@ -540,6 +696,22 @@ pub struct SemanticUniverse {
 type CapturePointKey = (String, CaptureLifecycleBoundary, String);
 type CapturePairMeasurement = (u32, u64, bool);
 type CapturePairGroups = BTreeMap<CapturePointKey, Vec<CapturePairMeasurement>>;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ResourceMetricKind {
+    AllocationCount,
+    AllocatedBytes,
+    PersistentBytes,
+    PeakRssBytes,
+}
+type ResourcePointKey = (
+    String,
+    CaptureLifecycleBoundary,
+    String,
+    ResourceObservationArm,
+    ResourceMetricKind,
+);
+type ResourceMetricSamples = Vec<(u32, RawResourceMetric)>;
+type ResourceMetricGroups = BTreeMap<ResourcePointKey, ResourceMetricSamples>;
 
 impl SemanticUniverse {
     /// Number of fixed-denominator rows.
@@ -643,6 +815,7 @@ pub fn generate_draft_observations(
 }
 
 fn draft_comparison(comparator: &str, reference_status: Option<Status>) -> ComparisonObservation {
+    let resources = draft_resource_observation(reference_status);
     let (status, reason) = match reference_status {
         Some(Status::Pass) => (
             ComparisonStatus::Pending,
@@ -668,6 +841,62 @@ fn draft_comparison(comparator: &str, reference_status: Option<Status>) -> Compa
         candidate_wins: None,
         pointwise_pass: None,
         reason: Some(reason),
+        resources,
+    }
+}
+
+fn draft_resource_observation(reference_status: Option<Status>) -> ComparisonResourceObservation {
+    let pair = if reference_status == Some(Status::Pass) {
+        ResourcePairSummary {
+            candidate: pending_resource_arm(),
+            reference: pending_resource_arm(),
+        }
+    } else {
+        let reason = comparator_unavailable_reason(reference_status);
+        ResourcePairSummary {
+            candidate: not_comparable_resource_arm(&reason),
+            reference: not_comparable_resource_arm(&reason),
+        }
+    };
+    ComparisonResourceObservation {
+        allocation_count: pair.clone(),
+        allocated_bytes: pair.clone(),
+        persistent_bytes: pair.clone(),
+        peak_rss_bytes: pair,
+    }
+}
+
+fn pending_resource_arm() -> ResourceArmSummary {
+    ResourceArmSummary {
+        status: ResourceMetricStatus::Pending,
+        collector: None,
+        median: None,
+        sample_count: None,
+        reason: Some("resource observation not run".to_string()),
+    }
+}
+
+fn unavailable_resource_arm(
+    reason: &str,
+    sample_count: u32,
+    collector: &ResourceCollectorIdentity,
+) -> ResourceArmSummary {
+    ResourceArmSummary {
+        status: ResourceMetricStatus::Unavailable,
+        collector: Some(collector.clone()),
+        median: None,
+        sample_count: Some(sample_count),
+        reason: Some(reason.to_string()),
+    }
+}
+
+fn not_comparable_resource_arm(reason: &str) -> ResourceArmSummary {
+    ResourceArmSummary {
+        status: ResourceMetricStatus::NotComparable,
+        collector: None,
+        median: None,
+        sample_count: None,
+        reason: Some(reason.to_string()),
     }
 }
 
@@ -1049,6 +1278,438 @@ pub fn apply_capture_pair_evidence(
     Ok(observations)
 }
 
+/// Convert a complete authenticated resource sample set for the capture pair
+/// schedule into the same coverage-complete 344-row draft. Timing fields are
+/// preserved exactly; allocation activity, retained bytes, and peak RSS have
+/// independent measured/unavailable states for each engine arm.
+pub fn apply_capture_resource_evidence(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    draft: &PerformanceObservations,
+    schedule: &CapturePairSchedule,
+    collector: &ResourceCollectorIdentity,
+    evidence: &[CaptureResourcePairEvidence],
+) -> Result<PerformanceObservations, ContractError> {
+    validate_capture_pair_schedule(contract, universe, schedule)?;
+    validate_observations(contract, universe, draft)?;
+    validate_resource_collector(collector)?;
+    if draft.phase != ObservationPhase::Draft {
+        return Err(ContractError::new(
+            "capture resource conversion requires a draft observation artifact",
+        ));
+    }
+    let groups =
+        collect_capture_resource_groups(contract, universe, schedule, collector, evidence)?;
+    let mut observations = draft.clone();
+    for ((job_id, boundary, comparator, arm, metric), samples) in groups {
+        let summary = aggregate_resource_samples(contract, &samples, metric, collector)?;
+        let target = capture_resource_arm_mut(
+            &mut observations,
+            &job_id,
+            boundary,
+            &comparator,
+            arm,
+            metric,
+        )?;
+        if target.status != ResourceMetricStatus::Pending {
+            return Err(ContractError::new(format!(
+                "capture resource point {job_id:?}/{boundary:?}/{comparator:?}/{arm:?}/{metric:?} is not pending"
+            )));
+        }
+        *target = summary;
+    }
+    for unavailable in &schedule.unavailable {
+        let comparison = capture_comparison_mut(
+            &mut observations,
+            &unavailable.job_id,
+            unavailable.boundary,
+            &unavailable.comparator,
+        )?;
+        validate_not_comparable_resource_observation(&comparison.resources, &unavailable.reason)?;
+    }
+    validate_observations(contract, universe, &observations)?;
+    Ok(observations)
+}
+
+fn validate_resource_collector(collector: &ResourceCollectorIdentity) -> Result<(), ContractError> {
+    require_token(&collector.collector_id, "resource collector ID")?;
+    require_digest(&collector.collector_sha256, "resource collector digest")
+}
+
+fn collect_capture_resource_groups(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    schedule: &CapturePairSchedule,
+    collector: &ResourceCollectorIdentity,
+    evidence: &[CaptureResourcePairEvidence],
+) -> Result<ResourceMetricGroups, ContractError> {
+    if evidence.len() != schedule.slots.len() {
+        return Err(ContractError::new(format!(
+            "capture resource evidence has {} pairs, schedule requires {}",
+            evidence.len(),
+            schedule.slots.len()
+        )));
+    }
+    let mut process_tokens = BTreeSet::new();
+    let mut groups = ResourceMetricGroups::new();
+    for (slot, pair) in schedule.slots.iter().zip(evidence) {
+        if &pair.slot != slot {
+            return Err(ContractError::new(format!(
+                "capture resource evidence slot differs at sequence {}",
+                slot.sequence
+            )));
+        }
+        validate_capture_resource_observation(
+            contract,
+            universe,
+            collector,
+            &pair.candidate,
+            ResourceObservationArm::Candidate,
+        )?;
+        validate_capture_resource_observation(
+            contract,
+            universe,
+            collector,
+            &pair.reference,
+            ResourceObservationArm::Reference,
+        )?;
+        if pair.candidate.job_id != slot.job_id
+            || pair.candidate.model != slot.model
+            || pair.candidate.boundary != slot.boundary
+            || pair.candidate.comparator != slot.comparator
+            || pair.reference.job_id != slot.job_id
+            || pair.reference.model != slot.model
+            || pair.reference.boundary != slot.boundary
+            || pair.reference.comparator != slot.comparator
+            || pair.candidate.input != pair.reference.input
+            || pair.candidate.expected != pair.reference.expected
+        {
+            return Err(ContractError::new(format!(
+                "capture resource evidence identity differs from sequence {}",
+                slot.sequence
+            )));
+        }
+        for token in [
+            pair.candidate.process_token_sha256.as_str(),
+            pair.reference.process_token_sha256.as_str(),
+        ] {
+            if !process_tokens.insert(token) {
+                return Err(ContractError::new(format!(
+                    "capture resource process token is reused at sequence {}",
+                    slot.sequence
+                )));
+            }
+        }
+        insert_resource_arm_samples(&mut groups, slot, &pair.candidate);
+        insert_resource_arm_samples(&mut groups, slot, &pair.reference);
+    }
+    Ok(groups)
+}
+
+fn insert_resource_arm_samples(
+    groups: &mut ResourceMetricGroups,
+    slot: &CapturePairSlot,
+    observation: &CaptureResourceRawObservation,
+) {
+    for (metric, sample) in [
+        (
+            ResourceMetricKind::AllocationCount,
+            &observation.allocation_count,
+        ),
+        (
+            ResourceMetricKind::AllocatedBytes,
+            &observation.allocated_bytes,
+        ),
+        (
+            ResourceMetricKind::PersistentBytes,
+            &observation.persistent_bytes,
+        ),
+        (
+            ResourceMetricKind::PeakRssBytes,
+            &observation.peak_rss_bytes,
+        ),
+    ] {
+        groups
+            .entry((
+                slot.job_id.clone(),
+                slot.boundary,
+                slot.comparator.clone(),
+                observation.arm,
+                metric,
+            ))
+            .or_default()
+            .push((slot.pair_index, sample.clone()));
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "raw identity, semantic binding, arm binding, and all four metric states are one fail-closed validation transaction"
+)]
+/// Validate one raw capture resource arm against its contract, semantic point,
+/// expected collector, lifecycle boundary, and engine role.
+pub fn validate_capture_resource_observation(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+    collector: &ResourceCollectorIdentity,
+    observation: &CaptureResourceRawObservation,
+    expected_arm: ResourceObservationArm,
+) -> Result<(), ContractError> {
+    if observation.schema != CAPTURE_RESOURCE_RAW_SCHEMA
+        || observation.contract_id != contract.contract_id
+        || observation.canonical_commit != contract.canonical.commit
+        || observation.canonical_tree != contract.canonical.tree
+        || observation.semantic_receipts_sha256 != contract.semantic.receipts_sha256
+        || observation.collector != *collector
+        || observation.arm != expected_arm
+    {
+        return Err(ContractError::new(
+            "capture resource schema, contract, semantic, collector, or arm identity mismatch",
+        ));
+    }
+    require_token(&observation.job_id, "capture resource job ID")?;
+    require_text(&observation.benchmark, "capture resource benchmark")?;
+    require_token(&observation.model, "capture resource model")?;
+    require_token(&observation.comparator, "capture resource comparator")?;
+    require_digest(
+        &observation.process_token_sha256,
+        "capture resource process token",
+    )?;
+    require_digest(&observation.result_sha256, "capture resource result digest")?;
+    if observation.actual != observation.expected
+        || observation.priming_operations != observation.boundary.priming_operations()
+        || observation.observed_operations != 1
+        || observation.result_sha256 != digest(&observation.actual.to_le_bytes())
+    {
+        return Err(ContractError::new(
+            "capture resource reducer or result digest is inconsistent",
+        ));
+    }
+    let semantic = universe.rows.get(&observation.job_id).ok_or_else(|| {
+        ContractError::new("capture resource job is absent from semantic denominator")
+    })?;
+    let comparator_status = semantic
+        .comparator_statuses
+        .get(&observation.comparator)
+        .copied()
+        .flatten();
+    if semantic.status != RowSemanticStatus::Supported
+        || semantic.model != observation.model
+        || semantic.benchmark != observation.benchmark
+        || semantic.input != observation.input
+        || semantic.expected != observation.expected
+        || comparator_status != Some(Status::Pass)
+    {
+        return Err(ContractError::new(
+            "capture resource arm differs from its passing semantic point",
+        ));
+    }
+    match expected_arm {
+        ResourceObservationArm::Candidate => {
+            if observation.candidate_plan != semantic.candidate_plan {
+                return Err(ContractError::new(
+                    "candidate resource arm has the wrong authenticated plan",
+                ));
+            }
+        }
+        ResourceObservationArm::Reference => {
+            if observation.candidate_plan.is_some() {
+                return Err(ContractError::new(
+                    "reference resource arm must not claim a candidate plan",
+                ));
+            }
+        }
+    }
+    let model = contract
+        .models
+        .iter()
+        .find(|model| model.model == observation.model)
+        .ok_or_else(|| ContractError::new("capture resource model is absent"))?;
+    if !contract
+        .reporting
+        .comparators
+        .iter()
+        .any(|comparator| comparator.id == observation.comparator)
+        || !model
+            .lifecycle_boundaries
+            .iter()
+            .any(|boundary| boundary == observation.boundary.as_str())
+    {
+        return Err(ContractError::new(
+            "capture resource comparator or lifecycle boundary is not contracted",
+        ));
+    }
+    for (metric, sample) in [
+        (
+            ResourceMetricKind::AllocationCount,
+            &observation.allocation_count,
+        ),
+        (
+            ResourceMetricKind::AllocatedBytes,
+            &observation.allocated_bytes,
+        ),
+        (
+            ResourceMetricKind::PersistentBytes,
+            &observation.persistent_bytes,
+        ),
+        (
+            ResourceMetricKind::PeakRssBytes,
+            &observation.peak_rss_bytes,
+        ),
+    ] {
+        validate_raw_resource_metric(sample, metric)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_resource_metric(
+    sample: &RawResourceMetric,
+    metric: ResourceMetricKind,
+) -> Result<(), ContractError> {
+    match sample.status {
+        ResourceMetricStatus::Measured => {
+            let value = sample.value.ok_or_else(|| {
+                ContractError::new(format!("measured {metric:?} resource sample has no value"))
+            })?;
+            if sample.reason.is_some() || (metric == ResourceMetricKind::PeakRssBytes && value == 0)
+            {
+                return Err(ContractError::new(format!(
+                    "measured {metric:?} resource sample has a reason or invalid value"
+                )));
+            }
+        }
+        ResourceMetricStatus::Unavailable => {
+            if sample.value.is_some() || sample.reason.as_deref().is_none_or(str::is_empty) {
+                return Err(ContractError::new(format!(
+                    "unavailable {metric:?} resource sample has a value or lacks a reason"
+                )));
+            }
+        }
+        ResourceMetricStatus::Pending | ResourceMetricStatus::NotComparable => {
+            return Err(ContractError::new(format!(
+                "raw {metric:?} resource sample must be measured or unavailable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_resource_samples(
+    contract: &PerformanceContract,
+    samples: &[(u32, RawResourceMetric)],
+    metric: ResourceMetricKind,
+    collector: &ResourceCollectorIdentity,
+) -> Result<ResourceArmSummary, ContractError> {
+    let mut samples = samples.to_vec();
+    samples.sort_unstable_by_key(|sample| sample.0);
+    let expected = contract.reporting.pairs_per_comparator;
+    let expected_len = usize::try_from(expected)
+        .map_err(|_| ContractError::new("resource sample count does not fit usize"))?;
+    if samples.len() != expected_len
+        || samples
+            .iter()
+            .enumerate()
+            .any(|(index, sample)| u32::try_from(index) != Ok(sample.0))
+    {
+        return Err(ContractError::new(format!(
+            "{metric:?} resource sample set has incomplete pair indices"
+        )));
+    }
+    if samples
+        .iter()
+        .all(|sample| sample.1.status == ResourceMetricStatus::Measured)
+    {
+        let values: Result<Vec<u64>, ContractError> = samples
+            .iter()
+            .map(|sample| {
+                sample
+                    .1
+                    .value
+                    .ok_or_else(|| ContractError::new("measured resource sample has no value"))
+            })
+            .collect();
+        return Ok(ResourceArmSummary {
+            status: ResourceMetricStatus::Measured,
+            collector: Some(collector.clone()),
+            median: Some(capture_median(&values?)?),
+            sample_count: Some(expected),
+            reason: None,
+        });
+    }
+    if samples
+        .iter()
+        .all(|sample| sample.1.status == ResourceMetricStatus::Unavailable)
+    {
+        let reasons: BTreeSet<&str> = samples
+            .iter()
+            .filter_map(|sample| sample.1.reason.as_deref())
+            .collect();
+        if reasons.len() != 1 {
+            return Err(ContractError::new(format!(
+                "{metric:?} unavailable resource samples disagree on reason"
+            )));
+        }
+        return Ok(unavailable_resource_arm(
+            reasons
+                .first()
+                .copied()
+                .ok_or_else(|| ContractError::new("resource reason set is empty"))?,
+            expected,
+            collector,
+        ));
+    }
+    Err(ContractError::new(format!(
+        "{metric:?} resource samples mix measured and unavailable states"
+    )))
+}
+
+fn capture_resource_arm_mut<'a>(
+    observations: &'a mut PerformanceObservations,
+    job_id: &str,
+    boundary: CaptureLifecycleBoundary,
+    comparator: &str,
+    arm: ResourceObservationArm,
+    metric: ResourceMetricKind,
+) -> Result<&'a mut ResourceArmSummary, ContractError> {
+    let comparison = capture_comparison_mut(observations, job_id, boundary, comparator)?;
+    let pair = match metric {
+        ResourceMetricKind::AllocationCount => &mut comparison.resources.allocation_count,
+        ResourceMetricKind::AllocatedBytes => &mut comparison.resources.allocated_bytes,
+        ResourceMetricKind::PersistentBytes => &mut comparison.resources.persistent_bytes,
+        ResourceMetricKind::PeakRssBytes => &mut comparison.resources.peak_rss_bytes,
+    };
+    Ok(match arm {
+        ResourceObservationArm::Candidate => &mut pair.candidate,
+        ResourceObservationArm::Reference => &mut pair.reference,
+    })
+}
+
+fn validate_not_comparable_resource_observation(
+    resources: &ComparisonResourceObservation,
+    reason: &str,
+) -> Result<(), ContractError> {
+    for pair in [
+        &resources.allocation_count,
+        &resources.allocated_bytes,
+        &resources.persistent_bytes,
+        &resources.peak_rss_bytes,
+    ] {
+        for arm in [&pair.candidate, &pair.reference] {
+            if arm.status != ResourceMetricStatus::NotComparable
+                || arm.collector.is_some()
+                || arm.median.is_some()
+                || arm.sample_count.is_some()
+                || arm.reason.as_deref() != Some(reason)
+            {
+                return Err(ContractError::new(
+                    "semantically unavailable comparator has inconsistent resource state",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn collect_capture_pair_groups(
     contract: &PerformanceContract,
     universe: &SemanticUniverse,
@@ -1341,6 +2002,36 @@ pub fn read_capture_lifecycle_observation(
     if capture_lifecycle_observation_bytes(&observation)? != bytes {
         return Err(ContractError::new(format!(
             "raw capture observation {} is not canonical serialization",
+            path.display()
+        )));
+    }
+    Ok(observation)
+}
+
+/// Serialize one raw capture resource arm as canonical compact JSON plus LF.
+pub fn capture_resource_observation_bytes(
+    observation: &CaptureResourceRawObservation,
+) -> Result<Vec<u8>, ContractError> {
+    let mut bytes = serde_json::to_vec(observation).map_err(|error| {
+        ContractError::new(format!(
+            "serialize raw capture resource observation: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read a canonically serialized raw capture resource arm.
+pub fn read_capture_resource_observation(
+    path: &Path,
+) -> Result<CaptureResourceRawObservation, ContractError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
+    let observation: CaptureResourceRawObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))?;
+    if capture_resource_observation_bytes(&observation)? != bytes {
+        return Err(ContractError::new(format!(
+            "raw capture resource observation {} is not canonical serialization",
             path.display()
         )));
     }
@@ -2029,6 +2720,7 @@ fn validate_comparison(
     observation: &ComparisonObservation,
     reference_status: Option<Status>,
 ) -> Result<(), ContractError> {
+    validate_comparison_resources(contract, phase, &observation.resources, reference_status)?;
     match (reference_status, observation.status) {
         (Some(Status::Pass), ComparisonStatus::Measured) => {
             let ratio = observation
@@ -2074,6 +2766,102 @@ fn validate_comparison(
             return Err(ContractError::new(
                 "unavailable or nonpassing comparator must be explicitly not comparable",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_comparison_resources(
+    contract: &PerformanceContract,
+    phase: ObservationPhase,
+    resources: &ComparisonResourceObservation,
+    reference_status: Option<Status>,
+) -> Result<(), ContractError> {
+    if reference_status != Some(Status::Pass) {
+        return validate_not_comparable_resource_observation(
+            resources,
+            &comparator_unavailable_reason(reference_status),
+        );
+    }
+    for (metric, pair) in [
+        (
+            ResourceMetricKind::AllocationCount,
+            &resources.allocation_count,
+        ),
+        (
+            ResourceMetricKind::AllocatedBytes,
+            &resources.allocated_bytes,
+        ),
+        (
+            ResourceMetricKind::PersistentBytes,
+            &resources.persistent_bytes,
+        ),
+        (ResourceMetricKind::PeakRssBytes, &resources.peak_rss_bytes),
+    ] {
+        validate_resource_arm_summary(contract, phase, metric, &pair.candidate)?;
+        validate_resource_arm_summary(contract, phase, metric, &pair.reference)?;
+    }
+    Ok(())
+}
+
+fn validate_resource_arm_summary(
+    contract: &PerformanceContract,
+    phase: ObservationPhase,
+    metric: ResourceMetricKind,
+    summary: &ResourceArmSummary,
+) -> Result<(), ContractError> {
+    match summary.status {
+        ResourceMetricStatus::Pending if phase == ObservationPhase::Draft => {
+            if summary.collector.is_some()
+                || summary.median.is_some()
+                || summary.sample_count.is_some()
+                || summary.reason.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(ContractError::new(format!(
+                    "pending {metric:?} resource summary has values or lacks a reason"
+                )));
+            }
+        }
+        ResourceMetricStatus::Pending => {
+            return Err(ContractError::new(format!(
+                "qualification cannot retain pending {metric:?} resources"
+            )));
+        }
+        ResourceMetricStatus::Measured => {
+            let collector = summary.collector.as_ref().ok_or_else(|| {
+                ContractError::new(format!("measured {metric:?} resource has no collector"))
+            })?;
+            validate_resource_collector(collector)?;
+            let median = summary.median.ok_or_else(|| {
+                ContractError::new(format!("measured {metric:?} resource has no median"))
+            })?;
+            if summary.sample_count != Some(contract.reporting.pairs_per_comparator)
+                || summary.reason.is_some()
+                || (metric == ResourceMetricKind::PeakRssBytes && median == 0)
+            {
+                return Err(ContractError::new(format!(
+                    "measured {metric:?} resource has wrong count, reason, or value"
+                )));
+            }
+        }
+        ResourceMetricStatus::Unavailable => {
+            let collector = summary.collector.as_ref().ok_or_else(|| {
+                ContractError::new(format!("unavailable {metric:?} resource has no collector"))
+            })?;
+            validate_resource_collector(collector)?;
+            if summary.median.is_some()
+                || summary.sample_count != Some(contract.reporting.pairs_per_comparator)
+                || summary.reason.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(ContractError::new(format!(
+                    "unavailable {metric:?} resource has a median, wrong count, or lacks a reason"
+                )));
+            }
+        }
+        ResourceMetricStatus::NotComparable => {
+            return Err(ContractError::new(format!(
+                "passing comparator cannot have not-comparable {metric:?} resources"
+            )));
         }
     }
     Ok(())
@@ -2393,6 +3181,95 @@ mod tests {
             .collect()
     }
 
+    fn measured_resource(value: u64) -> RawResourceMetric {
+        RawResourceMetric {
+            status: ResourceMetricStatus::Measured,
+            value: Some(value),
+            reason: None,
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "small fixed no-clock fixture values make boundary and arm medians visibly distinct"
+    )]
+    fn fixture_capture_resource_evidence(
+        contract: &PerformanceContract,
+        universe: &SemanticUniverse,
+        schedule: &CapturePairSchedule,
+        collector: &ResourceCollectorIdentity,
+    ) -> Vec<CaptureResourcePairEvidence> {
+        schedule
+            .slots
+            .iter()
+            .map(|slot| {
+                let semantic = &universe.rows[&slot.job_id];
+                let boundary_offset = match slot.boundary {
+                    CaptureLifecycleBoundary::FirstPublicOperation => 0,
+                    CaptureLifecycleBoundary::SteadyPublicOperation => 100,
+                };
+                let pair_offset = u64::from(slot.pair_index);
+                let raw = |arm: ResourceObservationArm, base: u64| CaptureResourceRawObservation {
+                    schema: CAPTURE_RESOURCE_RAW_SCHEMA.to_string(),
+                    contract_id: contract.contract_id.clone(),
+                    canonical_commit: contract.canonical.commit.clone(),
+                    canonical_tree: contract.canonical.tree.clone(),
+                    semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+                    job_id: slot.job_id.clone(),
+                    benchmark: semantic.benchmark.clone(),
+                    model: semantic.model.clone(),
+                    boundary: slot.boundary,
+                    comparator: slot.comparator.clone(),
+                    arm,
+                    candidate_plan: (arm == ResourceObservationArm::Candidate)
+                        .then(|| semantic.candidate_plan.clone())
+                        .flatten(),
+                    input: semantic.input.clone(),
+                    expected: semantic.expected,
+                    actual: semantic.expected,
+                    priming_operations: slot.boundary.priming_operations(),
+                    observed_operations: 1,
+                    result_sha256: digest(&semantic.expected.to_le_bytes()),
+                    collector: collector.clone(),
+                    process_token_sha256: digest(
+                        format!("resource:{arm:?}:{}", slot.sequence).as_bytes(),
+                    ),
+                    allocation_count: measured_resource(base + boundary_offset + pair_offset),
+                    allocated_bytes: measured_resource(base * 10 + boundary_offset + pair_offset),
+                    persistent_bytes: measured_resource(base * 100 + boundary_offset + pair_offset),
+                    peak_rss_bytes: measured_resource(base * 1_000 + boundary_offset + pair_offset),
+                };
+                CaptureResourcePairEvidence {
+                    slot: slot.clone(),
+                    candidate: raw(ResourceObservationArm::Candidate, 10),
+                    reference: raw(ResourceObservationArm::Reference, 20),
+                }
+            })
+            .collect()
+    }
+
+    fn resource_status_count(
+        observations: &PerformanceObservations,
+        status: ResourceMetricStatus,
+    ) -> usize {
+        observations
+            .rows
+            .iter()
+            .flat_map(|row| &row.boundaries)
+            .flat_map(|boundary| &boundary.comparisons)
+            .flat_map(|comparison| {
+                [
+                    &comparison.resources.allocation_count,
+                    &comparison.resources.allocated_bytes,
+                    &comparison.resources.persistent_bytes,
+                    &comparison.resources.peak_rss_bytes,
+                ]
+            })
+            .flat_map(|pair| [&pair.candidate, &pair.reference])
+            .filter(|summary| summary.status == status)
+            .count()
+    }
+
     fn comparison_status_count(
         observations: &PerformanceObservations,
         status: ComparisonStatus,
@@ -2446,6 +3323,15 @@ mod tests {
             generate_draft_observations(&contract, &universe).expect("draft generation succeeds");
         validate_observations(&contract, &universe, &observations)
             .expect("coverage-complete draft validates");
+        assert_eq!(observations.schema, PERFORMANCE_OBSERVATIONS_SCHEMA);
+        assert_eq!(
+            resource_status_count(&observations, ResourceMetricStatus::Pending),
+            8_224
+        );
+        assert_eq!(
+            resource_status_count(&observations, ResourceMetricStatus::NotComparable),
+            0
+        );
 
         let encoded = observation_bytes(&observations).expect("draft serializes");
         let decoded: PerformanceObservations =
@@ -2695,6 +3581,254 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test covers complete conversion, composition, boundary separation, and primary rejection cases"
+    )]
+    fn capture_resources_convert_independently_at_each_boundary() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let schedule =
+            generate_capture_pair_schedule(&contract, &universe).expect("capture schedule");
+        let collector = ResourceCollectorIdentity {
+            collector_id: "fixture-allocation-rss-v1".to_string(),
+            collector_sha256: digest(b"fixture resource collector"),
+        };
+        let timing_evidence = fixture_capture_evidence(&contract, &universe, &schedule);
+        let timed =
+            apply_capture_pair_evidence(&contract, &universe, &draft, &schedule, &timing_evidence)
+                .expect("capture timing evidence converts first");
+        let evidence =
+            fixture_capture_resource_evidence(&contract, &universe, &schedule, &collector);
+        assert_eq!(evidence.len(), 192);
+        let raw_bytes = capture_resource_observation_bytes(&evidence[0].candidate)
+            .expect("resource raw serialization");
+        assert_eq!(raw_bytes.last(), Some(&b'\n'));
+        let decoded: CaptureResourceRawObservation =
+            serde_json::from_slice(&raw_bytes).expect("resource raw round trip");
+        assert_eq!(decoded, evidence[0].candidate);
+        let converted = apply_capture_resource_evidence(
+            &contract, &universe, &timed, &schedule, &collector, &evidence,
+        )
+        .expect("complete no-clock resource evidence converts");
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::Measured),
+            256
+        );
+        assert_eq!(
+            comparison_status_count(&converted, ComparisonStatus::Measured),
+            32
+        );
+        let first_slot = &schedule.slots[0];
+        let first = capture_comparison_mut(
+            &mut converted.clone(),
+            &first_slot.job_id,
+            CaptureLifecycleBoundary::FirstPublicOperation,
+            &first_slot.comparator,
+        )
+        .expect("first resource comparison")
+        .clone();
+        let steady = capture_comparison_mut(
+            &mut converted.clone(),
+            &first_slot.job_id,
+            CaptureLifecycleBoundary::SteadyPublicOperation,
+            &first_slot.comparator,
+        )
+        .expect("steady resource comparison")
+        .clone();
+        assert_eq!(first.status, ComparisonStatus::Measured);
+        assert_eq!(first.resources.allocation_count.candidate.median, Some(12));
+        assert_eq!(first.resources.allocated_bytes.candidate.median, Some(102));
+        assert_eq!(
+            first.resources.persistent_bytes.candidate.median,
+            Some(1_002)
+        );
+        assert_eq!(
+            first.resources.peak_rss_bytes.candidate.median,
+            Some(10_002)
+        );
+        assert_eq!(
+            steady.resources.allocation_count.candidate.median,
+            Some(112)
+        );
+        assert_eq!(
+            steady.resources.peak_rss_bytes.reference.median,
+            Some(20_102)
+        );
+        assert_eq!(
+            first.resources.peak_rss_bytes.candidate.sample_count,
+            Some(6)
+        );
+        assert_eq!(
+            first.resources.peak_rss_bytes.candidate.collector,
+            Some(collector.clone())
+        );
+
+        let mut missing = evidence.clone();
+        missing.pop();
+        assert!(
+            apply_capture_resource_evidence(
+                &contract, &universe, &draft, &schedule, &collector, &missing,
+            )
+            .is_err()
+        );
+        let mut wrong_collector = evidence.clone();
+        wrong_collector[0].candidate.collector.collector_sha256 = digest(b"other collector");
+        assert!(
+            apply_capture_resource_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &collector,
+                &wrong_collector,
+            )
+            .is_err()
+        );
+        let mut reused_process = evidence.clone();
+        reused_process[1].reference.process_token_sha256 =
+            reused_process[0].candidate.process_token_sha256.clone();
+        assert!(
+            apply_capture_resource_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &collector,
+                &reused_process,
+            )
+            .is_err()
+        );
+        let mut pending_raw = evidence.clone();
+        pending_raw[0].candidate.allocation_count = RawResourceMetric {
+            status: ResourceMetricStatus::Pending,
+            value: None,
+            reason: Some("not collected".to_string()),
+        };
+        assert!(
+            apply_capture_resource_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &collector,
+                &pending_raw,
+            )
+            .is_err()
+        );
+        let mut wrong_lifecycle = evidence.clone();
+        wrong_lifecycle[0].candidate.priming_operations = 1;
+        assert!(
+            apply_capture_resource_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &collector,
+                &wrong_lifecycle,
+            )
+            .is_err()
+        );
+        let mut wrong_boundary = evidence;
+        wrong_boundary[0].candidate.boundary = CaptureLifecycleBoundary::SteadyPublicOperation;
+        assert!(
+            apply_capture_resource_evidence(
+                &contract,
+                &universe,
+                &draft,
+                &schedule,
+                &collector,
+                &wrong_boundary,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_resource_metric_unavailability_is_arm_specific_and_strict() {
+        let mut contract = contract();
+        let (_, universe) = synthetic_semantic_report(&mut contract);
+        let draft = generate_draft_observations(&contract, &universe).expect("draft");
+        let schedule =
+            generate_capture_pair_schedule(&contract, &universe).expect("capture schedule");
+        let collector = ResourceCollectorIdentity {
+            collector_id: "fixture-allocation-rss-v1".to_string(),
+            collector_sha256: digest(b"fixture resource collector"),
+        };
+        let mut evidence =
+            fixture_capture_resource_evidence(&contract, &universe, &schedule, &collector);
+        let point = (
+            schedule.slots[0].job_id.clone(),
+            schedule.slots[0].boundary,
+            schedule.slots[0].comparator.clone(),
+        );
+        for pair in evidence.iter_mut().filter(|pair| {
+            pair.slot.job_id == point.0
+                && pair.slot.boundary == point.1
+                && pair.slot.comparator == point.2
+        }) {
+            pair.reference.peak_rss_bytes = RawResourceMetric {
+                status: ResourceMetricStatus::Unavailable,
+                value: None,
+                reason: Some("reference collector exposes no process RSS".to_string()),
+            };
+        }
+        let converted = apply_capture_resource_evidence(
+            &contract, &universe, &draft, &schedule, &collector, &evidence,
+        )
+        .expect("one explicitly unavailable resource metric converts");
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::Measured),
+            255
+        );
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::Unavailable),
+            1
+        );
+        let unavailable =
+            capture_comparison_mut(&mut converted.clone(), &point.0, point.1, &point.2)
+                .expect("resource comparison")
+                .resources
+                .peak_rss_bytes
+                .reference
+                .clone();
+        assert_eq!(unavailable.status, ResourceMetricStatus::Unavailable);
+        assert_eq!(unavailable.collector, Some(collector.clone()));
+        assert_eq!(unavailable.median, None);
+        assert_eq!(unavailable.sample_count, Some(6));
+        assert_eq!(
+            unavailable.reason.as_deref(),
+            Some("reference collector exposes no process RSS")
+        );
+
+        let mixed_index = evidence
+            .iter()
+            .position(|pair| {
+                pair.slot.job_id == point.0
+                    && pair.slot.boundary == point.1
+                    && pair.slot.comparator == point.2
+            })
+            .expect("point evidence");
+        let mut disagree = evidence.clone();
+        disagree[mixed_index].reference.peak_rss_bytes.reason =
+            Some("different unavailable reason".to_string());
+        assert!(
+            apply_capture_resource_evidence(
+                &contract, &universe, &draft, &schedule, &collector, &disagree,
+            )
+            .is_err()
+        );
+        evidence[mixed_index].reference.peak_rss_bytes = measured_resource(20_000);
+        assert!(
+            apply_capture_resource_evidence(
+                &contract, &universe, &draft, &schedule, &collector, &evidence,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn unavailable_capture_comparator_gets_no_slots_and_stays_explicit() {
         let mut contract = contract();
         let (_, mut universe) = synthetic_semantic_report(&mut contract);
@@ -2734,6 +3868,14 @@ mod tests {
             comparison_status_count(&converted, ComparisonStatus::Measured),
             30
         );
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::NotComparable),
+            16
+        );
+        assert_eq!(
+            resource_status_count(&converted, ResourceMetricStatus::Unavailable),
+            0
+        );
         for point in &schedule.unavailable {
             let comparison = converted
                 .rows
@@ -2753,6 +3895,8 @@ mod tests {
                 .expect("unavailable comparison remains present");
             assert_eq!(comparison.status, ComparisonStatus::NotComparable);
             assert_eq!(comparison.reason.as_deref(), Some(point.reason.as_str()));
+            validate_not_comparable_resource_observation(&comparison.resources, &point.reason)
+                .expect("unavailable comparator resources remain explicit");
         }
     }
 
