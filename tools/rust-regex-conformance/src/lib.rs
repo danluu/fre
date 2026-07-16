@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 mod adapter;
 mod replacement_api;
+mod searcher_api;
 
 pub use adapter::{
     ADAPTER_ID, ADAPTER_REPORT_SCHEMA, AdapterDispositionCounts, AdapterReport,
@@ -31,6 +32,12 @@ pub use replacement_api::{
     ReplacementApiDisposition, ReplacementApiReceipt, ReplacementApiReport,
     ReplacementApiReportPayload, ReplacementCapability, ReplacementSourceIdentity,
     build_replacement_api_report, read_replacement_api_report, write_replacement_api_report,
+};
+pub use searcher_api::{
+    SEARCHER_API_CASES, SEARCHER_API_REPORT_SCHEMA, SearcherApiCounts, SearcherApiDisposition,
+    SearcherApiReceipt, SearcherApiReport, SearcherApiReportPayload, SearcherCapability,
+    SearcherSourceIdentity, SearcherStep, build_searcher_api_report, read_searcher_api_report,
+    write_searcher_api_report,
 };
 
 /// Checked-in manifest schema.

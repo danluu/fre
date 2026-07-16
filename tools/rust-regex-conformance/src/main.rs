@@ -2,9 +2,9 @@ use std::{env, path::PathBuf, process::ExitCode};
 
 use rust_regex_conformance::{
     authenticate_candidate_source, build_adapter_report, build_inventory,
-    build_replacement_api_report, load_executable_cases, read_adapter_report, read_inventory,
-    read_replacement_api_report, write_adapter_report, write_inventory,
-    write_replacement_api_report,
+    build_replacement_api_report, build_searcher_api_report, load_executable_cases,
+    read_adapter_report, read_inventory, read_replacement_api_report, read_searcher_api_report,
+    write_adapter_report, write_inventory, write_replacement_api_report, write_searcher_api_report,
 };
 
 fn main() -> ExitCode {
@@ -98,6 +98,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-report" => verify_adapter_report(&mut args)?,
         "run-replacement-api" => run_replacement_api(&mut args)?,
         "verify-replacement-api-report" => verify_replacement_api_report(&mut args)?,
+        "run-searcher-api" => run_searcher_api(&mut args)?,
+        "verify-searcher-api-report" => verify_searcher_api_report(&mut args)?,
         "-h" | "--help" | "help" => println!("{}", usage()),
         _ => return Err(usage().into()),
     }
@@ -171,6 +173,50 @@ fn verify_replacement_api_report(
     Ok(())
 }
 
+fn run_searcher_api(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_package = PathBuf::from(args.next().ok_or(usage())?);
+    let candidate_path = PathBuf::from(args.next().ok_or(usage())?);
+    let output = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let candidate = authenticate_candidate_source(&candidate_path)?;
+    let report = build_searcher_api_report(&upstream_package, candidate)?;
+    write_searcher_api_report(&output, &report)?;
+    let counts = &report.payload.counts;
+    println!(
+        "searcher-api candidate={} pass={} mismatch={} unsupported={} fault={} total={} payload_sha256={}",
+        report.payload.candidate.revision,
+        counts.pass,
+        counts.mismatch,
+        counts.unsupported,
+        counts.fault,
+        counts.total,
+        report.payload_sha256
+    );
+    Ok(())
+}
+
+fn verify_searcher_api_report(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let report = read_searcher_api_report(&report_path)?;
+    let counts = &report.payload.counts;
+    println!(
+        "verified searcher-api candidate={} pass={} mismatch={} unsupported={} fault={} total={} payload_sha256={}",
+        report.payload.candidate.revision,
+        counts.pass,
+        counts.mismatch,
+        counts.unsupported,
+        counts.fault,
+        counts.total,
+        report.payload_sha256
+    );
+    Ok(())
+}
+
 fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
     if let Some(extra) = args.next() {
         Err(format!("unexpected argument {extra:?}; {}", usage()))
@@ -180,5 +226,5 @@ fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT"
+    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT"
 }

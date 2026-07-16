@@ -9,7 +9,7 @@ already inventoried by `regex-1.12.4-inventory.json`.
 | Upstream source | Status in the report-producing tool |
 | --- | --- |
 | `tests/replace.rs` | Complete executable adapter: 26/26 named obligations, each with a mandatory disposition |
-| `tests/searcher.rs` | Eleven behaviors have executable FRE coverage in `crates/fre/tests/upstream_searcher.rs`; a payload-hashed tool report remains |
+| `tests/searcher.rs` | Complete executable adapter: 11/11 named obligations, each with a mandatory disposition |
 | `tests/misc.rs` | Source-level constructor, capture metadata/indexing and pathological-search audit remains |
 | `tests/regression.rs` | Ten source-level regression tests remain to be moved into mandatory receipts |
 | `tests/regression_fuzz.rs` | Five source-level fuzz regressions, including one ignored expensive case, remain |
@@ -24,3 +24,11 @@ The source file SHA-256 is
 Its fixed obligation order prevents omission or filtering: report validation
 rejects missing, reordered, duplicated, falsely passing, or source-unbound
 receipts.
+
+The searcher adapter independently authenticates the same package identity and
+the complete `tests/searcher.rs` byte stream (SHA-256
+`04152e5c86431deec0c196d2564a11bc4ec36f14c77e8c16a2f9d1cbc9fc574e`).
+It executes every upstream empty, adjacent, rejected-range, zero-width and
+Unicode step-sequence obligation through FRE's real aggregate search-step API.
+All 11 fixed-order obligations must produce pass, mismatch, unsupported or
+fault receipts; omission and filtering are not report states.

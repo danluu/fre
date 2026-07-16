@@ -63,6 +63,13 @@ The executable split is nine literal/`NoExpand` cases, nine capture-template
 cases, two functional-replacer cases and six owned/borrowed/`Cow<str>` type
 surface cases.
 
+The pattern-searcher adapter covers the complete non-TOML
+`tests/searcher.rs` source at the same pin. It authenticates the published
+crate identity and complete Rust source file before executing all 11 named
+obligations through FRE's aggregate search-step API. Each obligation emits a
+mandatory pass, mismatch, unsupported or fault receipt, including empty,
+zero-width, rejected-range and Unicode step sequences.
+
 ## Reproduce
 
 Use a clean checkout at the exact revision:
@@ -86,6 +93,13 @@ cargo run -p rust-regex-conformance -- run-replacement-api \
 
 cargo run -p rust-regex-conformance -- verify-replacement-api-report \
   /tmp/fre-rust-regex-replacement-api-report.json
+
+cargo run -p rust-regex-conformance -- run-searcher-api \
+  "$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/regex-1.12.4" \
+  "$PWD" /tmp/fre-rust-regex-searcher-api-report.json
+
+cargo run -p rust-regex-conformance -- verify-searcher-api-report \
+  /tmp/fre-rust-regex-searcher-api-report.json
 ```
 
 Regeneration is explicit and writes only the requested manifest path:
@@ -98,12 +112,13 @@ cargo run -p rust-regex-conformance -- \
 
 ## Scope boundary
 
-The authenticated inventory plus the TOML and replacement adapters do not yet:
+The authenticated inventory plus the TOML, replacement and searcher adapters
+do not yet:
 
 - provide general Rust text beyond the proved slices, byte sets, capture
   iteration, or full match iteration;
 - produce mandatory reports for the remaining upstream Rust API regression,
-  searcher, doctest, or feature-matrix tests;
+  doctest, or feature-matrix tests;
 - inventory the separate `regex-syntax` and `regex-automata` suites;
 - establish constructor-admission, correctness, coverage, performance, or
   release qualification.
