@@ -493,7 +493,6 @@ impl Requirements {
                     core::mem::size_of::<usize>(),
                     Resource::RandomAccessBytes,
                 )?;
-                let random = add(row_bytes, record, Resource::RandomAccessBytes)?;
                 let sequential = mul(
                     log,
                     add(passes, 1, Resource::SequentialBytes)?,
@@ -508,7 +507,7 @@ impl Requirements {
                     passes,
                     Resource::ExecutionWork,
                 )?;
-                (0, record, random, random, log, sequential, replay)
+                (0, record, row_bytes, row_bytes, log, sequential, replay)
             }
         };
         enforce(
@@ -760,7 +759,6 @@ impl RowStore {
         let mut store = zeroed_bytes(requirements.requested_log_bytes, Resource::LogBytes)?;
         let allocated_store = store.capacity();
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
-        let mut record = zeroed_bytes(requirements.record_bytes, Resource::ScratchBytes)?;
         let mut row = zeroed_usizes(program.insts.len(), Resource::RandomAccessBytes)?;
         let mut next_row = zeroed_usizes(program.insts.len(), Resource::RandomAccessBytes)?;
         let row_bytes = mul(
@@ -772,7 +770,7 @@ impl RowStore {
             core::mem::size_of::<usize>(),
             Resource::RandomAccessBytes,
         )?;
-        let build_scratch = add(row_bytes, record.capacity(), Resource::ScratchBytes)?;
+        let build_scratch = row_bytes;
         enforce(
             build_scratch,
             limits.max_random_access_bytes,
@@ -791,7 +789,11 @@ impl RowStore {
         let boundaries = add(haystack.len(), 1, Resource::Boundaries)?;
         let mut write_offset = 0_usize;
         for position in (0..boundaries).rev() {
-            record.fill(0);
+            let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
+            let record = store
+                .get_mut(write_offset..end)
+                .ok_or(Error::InternalInvariant("row-log write outside store"))?;
+            let input = haystack.get(position).copied();
             for &pc in &program.epsilon_order {
                 charge_state(accounting, requirements.work_bound);
                 let value = match program.instruction(pc)? {
@@ -802,7 +804,7 @@ impl RowStore {
                     Inst::Match => encode(position)?,
                     Inst::Consume { bytes, next } => {
                         charge_transition(accounting, requirements.work_bound);
-                        if position < haystack.len() && bytes.contains(haystack[position]) {
+                        if input.is_some_and(|byte| bytes.contains(byte)) {
                             next_row[*next]
                         } else {
                             0
@@ -825,7 +827,7 @@ impl RowStore {
                         let rank = program.split_rank[pc]
                             .ok_or(Error::InternalInvariant("split state has no decision rank"))?;
                         if preferred_value != 0 {
-                            set_bit(&mut record, rank)?;
+                            set_bit(record, rank)?;
                             preferred_value
                         } else {
                             charge_transition(accounting, requirements.work_bound);
@@ -836,16 +838,11 @@ impl RowStore {
                 row[pc] = value;
             }
             if row[program.entry] != 0 {
-                set_bit(&mut record, program.split_count)?;
+                set_bit(record, program.split_count)?;
             }
-            let end = add(write_offset, record.len(), Resource::LogBytes)?;
-            store
-                .get_mut(write_offset..end)
-                .ok_or(Error::InternalInvariant("row-log write outside store"))?
-                .copy_from_slice(&record);
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
-                record.len(),
+                requirements.record_bytes,
                 Resource::SequentialBytes,
             )?;
             write_offset = end;
@@ -854,7 +851,6 @@ impl RowStore {
         if write_offset != store.len() {
             return Err(Error::InternalInvariant("row-log store length mismatch"));
         }
-        drop(record);
         drop(row);
         drop(next_row);
         accounting.random_access_peak_bytes = build_scratch;
