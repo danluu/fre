@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod adapter;
+mod feature_matrix;
 mod misc_regression_api;
 mod replacement_api;
 mod searcher_api;
@@ -27,6 +28,12 @@ pub use adapter::{
     AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
+};
+pub use feature_matrix::{
+    FEATURE_MATRIX_CONFIGURATIONS, FEATURE_MATRIX_DECLARED_FEATURES, FEATURE_MATRIX_REPORT_SCHEMA,
+    FeatureMatrixCounts, FeatureMatrixDisposition, FeatureMatrixReport, FeatureMatrixReportPayload,
+    FeatureMatrixUnsupportedKind, build_feature_matrix_report, read_feature_matrix_report,
+    write_feature_matrix_report,
 };
 pub use misc_regression_api::{
     MISC_REGRESSION_API_CASES, MISC_REGRESSION_API_REPORT_SCHEMA, MiscRegressionCapability,
