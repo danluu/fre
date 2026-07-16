@@ -892,6 +892,15 @@ fn assertion_execution_accounting_and_work_limits_are_exact() {
         }
         assert!(accounting.assertion_checks <= accounting.transition_checks);
         assert!(accounting.work <= baseline.certificate().work_bound);
+        assert_eq!(
+            accounting.work,
+            accounting.state_evaluations
+                + accounting.transition_checks
+                + accounting.root_probes
+                + accounting.replay_steps
+                + accounting.successful_paths,
+            "{strategy:?} admitted work must equal the disjoint charged counters"
+        );
 
         regex
             .admit_spans(
