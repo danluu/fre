@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::Write as _,
     path::Path,
     process::Command,
 };
@@ -329,6 +330,155 @@ pub fn read_observations(path: &Path) -> Result<PerformanceObservations, Contrac
         .map_err(|error| ContractError::new(format!("read {}: {error}", path.display())))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| ContractError::new(format!("decode {}: {error}", path.display())))
+}
+
+/// Generate an honest coverage-complete pending draft without running timing.
+///
+/// Passing semantic comparator receipts become explicit `pending` points.
+/// Missing or nonpassing comparator receipts become explicit
+/// `not-comparable` points. Unsupported FRE rows retain their exact semantic
+/// reason and never acquire timing boundaries.
+pub fn generate_draft_observations(
+    contract: &PerformanceContract,
+    universe: &SemanticUniverse,
+) -> Result<PerformanceObservations, ContractError> {
+    validate_contract(contract)?;
+    let models: BTreeMap<&str, &ModelContract> = contract
+        .models
+        .iter()
+        .map(|model| (model.model.as_str(), model))
+        .collect();
+    let mut rows = Vec::with_capacity(universe.rows.len());
+    for (job_id, semantic) in &universe.rows {
+        let boundaries = if semantic.status == RowSemanticStatus::Supported {
+            let model = models.get(semantic.model.as_str()).ok_or_else(|| {
+                ContractError::new(format!(
+                    "semantic universe model {:?} is absent from contract",
+                    semantic.model
+                ))
+            })?;
+            let mut boundaries = Vec::with_capacity(model.lifecycle_boundaries.len());
+            for boundary in &model.lifecycle_boundaries {
+                let mut comparisons = Vec::with_capacity(contract.reporting.comparators.len());
+                for comparator in &contract.reporting.comparators {
+                    let reference_status = semantic
+                        .comparator_statuses
+                        .get(&comparator.id)
+                        .copied()
+                        .ok_or_else(|| {
+                            ContractError::new(format!(
+                                "semantic universe row {job_id:?} lacks comparator {:?}",
+                                comparator.id
+                            ))
+                        })?;
+                    comparisons.push(draft_comparison(&comparator.id, reference_status));
+                }
+                boundaries.push(BoundaryObservation {
+                    boundary: boundary.clone(),
+                    comparisons,
+                });
+            }
+            boundaries
+        } else {
+            Vec::new()
+        };
+        rows.push(PerformanceRow {
+            job_id: job_id.clone(),
+            model: semantic.model.clone(),
+            semantic_status: semantic.status,
+            reason: semantic.reason.clone(),
+            boundaries,
+        });
+    }
+    let observations = PerformanceObservations {
+        schema: PERFORMANCE_OBSERVATIONS_SCHEMA.to_string(),
+        contract_id: contract.contract_id.clone(),
+        canonical_commit: contract.canonical.commit.clone(),
+        canonical_tree: contract.canonical.tree.clone(),
+        semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
+        phase: ObservationPhase::Draft,
+        rows,
+    };
+    validate_observations(contract, universe, &observations)?;
+    Ok(observations)
+}
+
+fn draft_comparison(comparator: &str, reference_status: Option<Status>) -> ComparisonObservation {
+    let (status, reason) = match reference_status {
+        Some(Status::Pass) => (
+            ComparisonStatus::Pending,
+            "passing semantic comparator available; timing not run".to_string(),
+        ),
+        Some(status) => (
+            ComparisonStatus::NotComparable,
+            format!(
+                "semantic comparator is not a pass: {}",
+                status_label(status)
+            ),
+        ),
+        None => (
+            ComparisonStatus::NotComparable,
+            "semantic report has no matching comparator receipt".to_string(),
+        ),
+    };
+    ComparisonObservation {
+        comparator: comparator.to_string(),
+        status,
+        ratio_ppm: None,
+        pair_count: None,
+        candidate_wins: None,
+        pointwise_pass: None,
+        reason: Some(reason),
+    }
+}
+
+const fn status_label(status: Status) -> &'static str {
+    match status {
+        Status::Pass => "pass",
+        Status::Fail => "fail",
+        Status::Unsupported => "unsupported",
+        Status::Unresolved => "unresolved",
+        Status::Fault => "fault",
+    }
+}
+
+/// Serialize observations in one deterministic compact JSON representation.
+pub fn observation_bytes(observations: &PerformanceObservations) -> Result<Vec<u8>, ContractError> {
+    serde_json::to_vec(observations)
+        .map_err(|error| ContractError::new(format!("serialize observations: {error}")))
+}
+
+/// Publish observations to a new path without overwriting prior evidence.
+pub fn write_new_observations(
+    path: &Path,
+    observations: &PerformanceObservations,
+) -> Result<(), ContractError> {
+    let parent = path.parent().ok_or_else(|| {
+        ContractError::new(format!("observation path {} has no parent", path.display()))
+    })?;
+    if !parent.is_dir() {
+        return Err(ContractError::new(format!(
+            "observation parent {} is not a directory",
+            parent.display()
+        )));
+    }
+    let bytes = observation_bytes(observations)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            ContractError::new(format!(
+                "create new observation {}: {error}",
+                path.display()
+            ))
+        })?;
+    output.write_all(&bytes).map_err(|error| {
+        ContractError::new(format!("write observation {}: {error}", path.display()))
+    })?;
+    output.sync_all().map_err(|error| {
+        ContractError::new(format!("sync observation {}: {error}", path.display()))
+    })
 }
 
 /// Resolve the exact protected main commit and tree from `repo`.
@@ -1302,61 +1452,6 @@ mod tests {
         (bytes, universe)
     }
 
-    fn draft_observations(
-        contract: &PerformanceContract,
-        universe: &SemanticUniverse,
-    ) -> PerformanceObservations {
-        let models: BTreeMap<&str, &ModelContract> = contract
-            .models
-            .iter()
-            .map(|model| (model.model.as_str(), model))
-            .collect();
-        let mut rows = Vec::new();
-        for (job_id, semantic) in &universe.rows {
-            let boundaries = if semantic.status == RowSemanticStatus::Supported {
-                models[semantic.model.as_str()]
-                    .lifecycle_boundaries
-                    .iter()
-                    .map(|boundary| BoundaryObservation {
-                        boundary: boundary.clone(),
-                        comparisons: contract
-                            .reporting
-                            .comparators
-                            .iter()
-                            .map(|comparator| ComparisonObservation {
-                                comparator: comparator.id.clone(),
-                                status: ComparisonStatus::Pending,
-                                ratio_ppm: None,
-                                pair_count: None,
-                                candidate_wins: None,
-                                pointwise_pass: None,
-                                reason: Some("preregistered; timing not run".to_string()),
-                            })
-                            .collect(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            rows.push(PerformanceRow {
-                job_id: job_id.clone(),
-                model: semantic.model.clone(),
-                semantic_status: semantic.status,
-                reason: semantic.reason.clone(),
-                boundaries,
-            });
-        }
-        PerformanceObservations {
-            schema: PERFORMANCE_OBSERVATIONS_SCHEMA.to_string(),
-            contract_id: contract.contract_id.clone(),
-            canonical_commit: contract.canonical.commit.clone(),
-            canonical_tree: contract.canonical.tree.clone(),
-            semantic_receipts_sha256: contract.semantic.receipts_sha256.clone(),
-            phase: ObservationPhase::Draft,
-            rows,
-        }
-    }
-
     #[test]
     fn checked_in_contract_covers_every_model_and_exact_main() {
         let contract = contract();
@@ -1393,13 +1488,34 @@ mod tests {
     fn pointwise_draft_reports_every_row_boundary_and_comparator() {
         let mut contract = contract();
         let (_, universe) = synthetic_semantic_report(&mut contract);
-        let observations = draft_observations(&contract, &universe);
+        let observations =
+            generate_draft_observations(&contract, &universe).expect("draft generation succeeds");
         validate_observations(&contract, &universe, &observations)
             .expect("coverage-complete draft validates");
+
+        let encoded = observation_bytes(&observations).expect("draft serializes");
+        let decoded: PerformanceObservations =
+            serde_json::from_slice(&encoded).expect("draft round trips");
+        assert_eq!(decoded, observations);
 
         let mut hidden_row = observations.clone();
         hidden_row.rows.pop();
         assert!(validate_observations(&contract, &universe, &hidden_row).is_err());
+
+        let mut duplicate_row = observations.clone();
+        duplicate_row.rows[1] = duplicate_row.rows[0].clone();
+        assert!(validate_observations(&contract, &universe, &duplicate_row).is_err());
+
+        let mut wrong_model = observations.clone();
+        wrong_model.rows[0].model = "grep".to_string();
+        assert!(validate_observations(&contract, &universe, &wrong_model).is_err());
+
+        let mut wrong_support = observations.clone();
+        wrong_support.rows[0].semantic_status = match wrong_support.rows[0].semantic_status {
+            RowSemanticStatus::Supported => RowSemanticStatus::Unsupported,
+            RowSemanticStatus::Unsupported => RowSemanticStatus::Supported,
+        };
+        assert!(validate_observations(&contract, &universe, &wrong_support).is_err());
 
         let mut hidden_comparator = observations.clone();
         let supported = hidden_comparator
@@ -1415,7 +1531,8 @@ mod tests {
     fn qualification_rejects_pending_or_inconsistent_pointwise_results() {
         let mut contract = contract();
         let (_, universe) = synthetic_semantic_report(&mut contract);
-        let mut observations = draft_observations(&contract, &universe);
+        let mut observations =
+            generate_draft_observations(&contract, &universe).expect("draft generation succeeds");
         observations.phase = ObservationPhase::Qualification;
         assert!(validate_observations(&contract, &universe, &observations).is_err());
 

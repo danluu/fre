@@ -1,8 +1,9 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use rebar_compare::performance_contract::{
-    read_contract, read_observations, resolve_exact_main, validate_contract, validate_exact_main,
-    validate_observations, validate_semantic_report,
+    generate_draft_observations, read_contract, read_observations, resolve_exact_main,
+    validate_contract, validate_exact_main, validate_observations, validate_semantic_report,
+    write_new_observations,
 };
 
 fn main() -> ExitCode {
@@ -69,6 +70,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 contract.semantic.receipts_sha256,
                 observations.rows.len(),
                 observations.phase
+            );
+        }
+        "generate-draft" => {
+            let semantic_path = path_argument(&mut arguments, "SEMANTIC_REPORT")?;
+            let output_path = path_argument(&mut arguments, "OUTPUT")?;
+            require_end(arguments)?;
+            let semantic_bytes = fs::read(&semantic_path)?;
+            let universe = validate_semantic_report(&contract, &semantic_bytes)?;
+            let observations = generate_draft_observations(&contract, &universe)?;
+            write_new_observations(&output_path, &observations)?;
+            println!(
+                "contract={} semantic={} rows={} phase=draft output={}",
+                contract.contract_id,
+                contract.semantic.receipts_sha256,
+                observations.rows.len(),
+                output_path.display()
             );
         }
         other => return Err(format!("unknown command {other:?}").into()),
