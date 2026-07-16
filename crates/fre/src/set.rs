@@ -182,6 +182,38 @@ impl<'a> PortableRegexSetBuilder<'a> {
         self
     }
 
+    /// Swap greedy and lazy repetition semantics before parsing every pattern.
+    ///
+    /// Inline `U` flag groups may still override this setting locally, just as
+    /// they do in the pinned Rust bytes set builder.
+    #[must_use]
+    pub fn swap_greed(mut self, enabled: bool) -> Self {
+        self.profile.options.swap_greed = enabled;
+        self
+    }
+
+    /// Set verbose mode for every pattern before parsing, ignoring unescaped
+    /// pattern whitespace and treating `#` as the start of a line comment.
+    #[must_use]
+    pub fn ignore_whitespace(mut self, enabled: bool) -> Self {
+        self.profile.options.ignore_whitespace = enabled;
+        self
+    }
+
+    /// Enable or disable octal escape syntax in every pattern before parsing.
+    #[must_use]
+    pub fn octal(mut self, enabled: bool) -> Self {
+        self.profile.options.octal = enabled;
+        self
+    }
+
+    /// Set the parser's abstract-syntax-tree nesting limit for every pattern.
+    #[must_use]
+    pub fn nest_limit(mut self, limit: u32) -> Self {
+        self.profile.options.nest_limit = limit;
+        self
+    }
+
     /// Set the byte recognized by multiline `^` and `$` in every pattern.
     #[must_use]
     pub fn line_terminator(mut self, line_terminator: u8) -> Self {
