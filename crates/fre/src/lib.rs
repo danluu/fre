@@ -92,9 +92,10 @@ pub use fre_kernels::{
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
 };
 pub use replacement::{
-    LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
-    LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
-    LiteralReplacementResult, LiteralReplacer,
+    CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
+    CaptureExpansionReport, CaptureExpansionResult, LiteralReplacementAccounting,
+    LiteralReplacementError, LiteralReplacementErrorSource, LiteralReplacementIdentity,
+    LiteralReplacementLimits, LiteralReplacementReport, LiteralReplacementResult, LiteralReplacer,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

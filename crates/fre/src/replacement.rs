@@ -2,7 +2,7 @@ use core::fmt;
 
 use crate::{
     AggregateCacheIdentity, AggregateExecutionDetails, AggregateExecutionSource,
-    AggregateRunLimits, AggregateSpans, AggregateSpansRegex,
+    AggregateRunLimits, AggregateSpans, AggregateSpansRegex, PortableRegex,
 };
 
 /// A byte source accepted by the literal/no-expansion replacement facade.
@@ -63,6 +63,147 @@ impl<T: LiteralReplacer + ?Sized> LiteralReplacer for &T {
         (*self).literal_bytes()
     }
 }
+
+/// Per-call resource policy for expanding one capture replacement template.
+///
+/// Expansion first computes the exact output length and charged work without
+/// allocating. It then reserves the complete output once and performs a
+/// second parse/copy pass under the same pinned replacement grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureExpansionLimits {
+    /// Maximum number of bytes in the expanded template.
+    pub max_output_bytes: usize,
+    /// Maximum charged template-scan, name-lookup and copy work.
+    pub max_work: usize,
+}
+
+impl Default for CaptureExpansionLimits {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: 67_108_864,
+            max_work: 268_435_456,
+        }
+    }
+}
+
+/// Exact deterministic counters for one capture-template expansion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureExpansionAccounting {
+    /// Conservative parser scan work charged across preflight and copy passes.
+    ///
+    /// This is triangular in template length because malformed nested braced
+    /// references can make the pinned grammar revisit a suffix.
+    pub template_bytes_scanned: usize,
+    /// Capture references parsed across one semantic pass.
+    pub capture_references: usize,
+    /// References whose indexed slot participated in this match.
+    pub participating_references: usize,
+    /// Capture-name slots examined across preflight and copy passes.
+    pub name_slots_examined: usize,
+    /// Capture-name comparison work charged across both passes.
+    pub name_bytes_compared: usize,
+    /// Literal template bytes copied after applying `$$` escaping.
+    pub literal_bytes_copied: usize,
+    /// Participating capture bytes copied.
+    pub capture_bytes_copied: usize,
+    /// Exact final output length.
+    pub output_bytes: usize,
+    /// Total charged scan, lookup and byte-copy work.
+    pub work: usize,
+}
+
+/// Complete identity and counters for one capture-template expansion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureExpansionReport {
+    /// Number of capture slots required by the compiled pattern.
+    pub capture_slots: usize,
+    /// Original replacement-template byte length.
+    pub replacement_bytes: usize,
+    /// Exact resource policy applied before allocation.
+    pub limits: CaptureExpansionLimits,
+    /// Deterministic semantic and resource counters.
+    pub accounting: CaptureExpansionAccounting,
+}
+
+/// Owned result of one bounded capture-template expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureExpansionResult {
+    bytes: Vec<u8>,
+    report: CaptureExpansionReport,
+}
+
+impl CaptureExpansionResult {
+    /// Borrow the expanded bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the result and return the expanded bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Exact expansion identity and accounting.
+    #[must_use]
+    pub const fn report(&self) -> &CaptureExpansionReport {
+        &self.report
+    }
+}
+
+/// Typed refusal from bounded capture-template expansion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureExpansionError {
+    /// The supplied capture record did not match the compiled pattern shape.
+    CaptureSlotCount { expected: usize, actual: usize },
+    /// Exact output-size arithmetic overflowed `usize`.
+    OutputSizeOverflow,
+    /// Exact charged-work arithmetic overflowed `usize`.
+    WorkOverflow,
+    /// Exact expanded bytes exceed the caller's output ceiling.
+    OutputBytesLimit { needed: usize, limit: usize },
+    /// Exact charged work exceeds the caller's work ceiling.
+    WorkLimit { needed: usize, limit: usize },
+    /// The single preflighted output reservation failed.
+    AllocationFailed { requested: usize },
+    /// Preflight and copy passes disagreed despite sharing one parser.
+    InternalInvariant(&'static str),
+}
+
+impl fmt::Display for CaptureExpansionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CaptureSlotCount { expected, actual } => write!(
+                formatter,
+                "capture template needs {expected} capture slots, got {actual}"
+            ),
+            Self::OutputSizeOverflow => {
+                formatter.write_str("capture-template output size overflowed usize")
+            }
+            Self::WorkOverflow => {
+                formatter.write_str("capture-template charged work overflowed usize")
+            }
+            Self::OutputBytesLimit { needed, limit } => write!(
+                formatter,
+                "capture-template output needs {needed} bytes, exceeding the {limit}-byte limit"
+            ),
+            Self::WorkLimit { needed, limit } => write!(
+                formatter,
+                "capture-template expansion needs {needed} work, exceeding the {limit}-work limit"
+            ),
+            Self::AllocationFailed { requested } => write!(
+                formatter,
+                "failed to allocate {requested} capture-template output bytes"
+            ),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "capture-template invariant failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaptureExpansionError {}
 
 /// Per-call policy for literal/no-expansion replacement.
 ///
@@ -227,6 +368,76 @@ impl std::error::Error for LiteralReplacementErrorSource {
             | Self::AllocationFailed { .. }
             | Self::InternalInvariant(_) => None,
         }
+    }
+}
+
+impl PortableRegex {
+    /// Expand one pinned Rust bytes replacement template from capture values.
+    ///
+    /// `captures` is in capture-index order and must contain exactly
+    /// [`PortableRegex::captures_len`] slots. `None` represents a capture that
+    /// did not participate. `$N`, `$name`, `${ref}` and `$$` follow the pinned
+    /// `regex` 1.12.4 bytes grammar; unknown, out-of-range and nonparticipating
+    /// references expand to the empty byte string.
+    ///
+    /// This method deliberately performs no regex search. It is the bounded
+    /// interpolation floor shared by future capture-preserving replacement
+    /// operations and accepts capture values materialized by such an
+    /// operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed slot-shape, arithmetic, work, output or allocation
+    /// refusal. Work and output limits are checked before output allocation.
+    pub fn expand_capture_template(
+        &self,
+        captures: &[Option<&[u8]>],
+        replacement: &[u8],
+        limits: CaptureExpansionLimits,
+    ) -> Result<CaptureExpansionResult, CaptureExpansionError> {
+        if captures.len() != self.captures_len() {
+            return Err(CaptureExpansionError::CaptureSlotCount {
+                expected: self.captures_len(),
+                actual: captures.len(),
+            });
+        }
+        let accounting =
+            capture_expansion_preflight(&self.capture_names, captures, replacement, limits)?;
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(accounting.output_bytes)
+            .map_err(|_| CaptureExpansionError::AllocationFailed {
+                requested: accounting.output_bytes,
+            })?;
+        for piece in CaptureTemplateParser::new(replacement) {
+            match piece {
+                CaptureTemplatePiece::Literal(bytes) => output.extend_from_slice(bytes),
+                CaptureTemplatePiece::Capture(reference) => {
+                    let index = capture_reference_index(&self.capture_names, reference);
+                    if let Some(bytes) = index
+                        .and_then(|index| captures.get(index))
+                        .and_then(|capture| *capture)
+                    {
+                        output.extend_from_slice(bytes);
+                    }
+                }
+            }
+        }
+        if output.len() != accounting.output_bytes {
+            return Err(CaptureExpansionError::InternalInvariant(
+                "preflight and copied output lengths differ",
+            ));
+        }
+        Ok(CaptureExpansionResult {
+            bytes: output,
+            report: CaptureExpansionReport {
+                capture_slots: captures.len(),
+                replacement_bytes: replacement.len(),
+                limits,
+                accounting,
+            },
+        })
     }
 }
 
@@ -420,4 +631,257 @@ fn replacement_error(
         identity: Box::new(identity.clone()),
         source,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureTemplatePiece<'a> {
+    Literal(&'a [u8]),
+    Capture(CaptureReference<'a>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureReference<'a> {
+    Index(usize),
+    Name(&'a str),
+}
+
+#[derive(Clone, Debug)]
+struct CaptureTemplateParser<'a> {
+    replacement: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> CaptureTemplateParser<'a> {
+    const fn new(replacement: &'a [u8]) -> Self {
+        Self {
+            replacement,
+            cursor: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for CaptureTemplateParser<'a> {
+    type Item = CaptureTemplatePiece<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.replacement.len() {
+            return None;
+        }
+        let remaining = &self.replacement[self.cursor..];
+        let dollar = remaining.iter().position(|&byte| byte == b'$');
+        let Some(relative_dollar) = dollar else {
+            self.cursor = self.replacement.len();
+            return Some(CaptureTemplatePiece::Literal(remaining));
+        };
+        if relative_dollar != 0 {
+            let start = self.cursor;
+            self.cursor = self.cursor.saturating_add(relative_dollar);
+            return Some(CaptureTemplatePiece::Literal(
+                &self.replacement[start..self.cursor],
+            ));
+        }
+
+        let start = self.cursor;
+        if self.replacement.get(start.saturating_add(1)) == Some(&b'$') {
+            self.cursor = self.cursor.saturating_add(2);
+            return Some(CaptureTemplatePiece::Literal(
+                &self.replacement[start..start.saturating_add(1)],
+            ));
+        }
+        let Some((reference, consumed)) = parse_capture_reference(remaining) else {
+            self.cursor = self.cursor.saturating_add(1);
+            return Some(CaptureTemplatePiece::Literal(
+                &self.replacement[start..self.cursor],
+            ));
+        };
+        self.cursor = self.cursor.saturating_add(consumed);
+        Some(CaptureTemplatePiece::Capture(reference))
+    }
+}
+
+fn parse_capture_reference(replacement: &[u8]) -> Option<(CaptureReference<'_>, usize)> {
+    if replacement.first() != Some(&b'$') {
+        return None;
+    }
+    if replacement.get(1) == Some(&b'{') {
+        let content = &replacement[2..];
+        let closing = content.iter().position(|&byte| byte == b'}')?;
+        let name = core::str::from_utf8(&content[..closing]).ok()?;
+        return Some((capture_reference(name), closing.saturating_add(3)));
+    }
+    let name_len = replacement[1..]
+        .iter()
+        .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = core::str::from_utf8(&replacement[1..=name_len])
+        .expect("unbraced capture references contain only ASCII bytes");
+    Some((capture_reference(name), name_len.saturating_add(1)))
+}
+
+fn capture_reference(name: &str) -> CaptureReference<'_> {
+    name.parse::<usize>()
+        .map_or(CaptureReference::Name(name), CaptureReference::Index)
+}
+
+fn capture_reference_index(
+    names: &[Option<Box<str>>],
+    reference: CaptureReference<'_>,
+) -> Option<usize> {
+    match reference {
+        CaptureReference::Index(index) => Some(index),
+        CaptureReference::Name(name) => names
+            .iter()
+            .position(|candidate| candidate.as_deref() == Some(name)),
+    }
+}
+
+fn capture_expansion_preflight(
+    names: &[Option<Box<str>>],
+    captures: &[Option<&[u8]>],
+    replacement: &[u8],
+    limits: CaptureExpansionLimits,
+) -> Result<CaptureExpansionAccounting, CaptureExpansionError> {
+    let template_scan_one_pass = capture_template_scan_work(replacement.len())?;
+    enforce_capture_work(template_scan_one_pass, limits.max_work)?;
+    let mut capture_references = 0_usize;
+    let mut participating_references = 0_usize;
+    let mut name_slots_one_pass = 0_usize;
+    let mut name_comparison_work_one_pass = 0_usize;
+    let mut literal_bytes_copied = 0_usize;
+    let mut capture_bytes_copied = 0_usize;
+
+    for piece in CaptureTemplateParser::new(replacement) {
+        match piece {
+            CaptureTemplatePiece::Literal(bytes) => {
+                literal_bytes_copied = literal_bytes_copied
+                    .checked_add(bytes.len())
+                    .ok_or(CaptureExpansionError::OutputSizeOverflow)?;
+            }
+            CaptureTemplatePiece::Capture(reference) => {
+                capture_references = capture_references
+                    .checked_add(1)
+                    .ok_or(CaptureExpansionError::WorkOverflow)?;
+                let index = capture_reference_index_preflight(
+                    names,
+                    reference,
+                    template_scan_one_pass,
+                    capture_references,
+                    &mut name_slots_one_pass,
+                    &mut name_comparison_work_one_pass,
+                    limits.max_work,
+                )?;
+                if let Some(bytes) = index
+                    .and_then(|index| captures.get(index))
+                    .and_then(|capture| *capture)
+                {
+                    participating_references = participating_references
+                        .checked_add(1)
+                        .ok_or(CaptureExpansionError::WorkOverflow)?;
+                    capture_bytes_copied = capture_bytes_copied
+                        .checked_add(bytes.len())
+                        .ok_or(CaptureExpansionError::OutputSizeOverflow)?;
+                }
+            }
+        }
+    }
+
+    let output_bytes = literal_bytes_copied
+        .checked_add(capture_bytes_copied)
+        .ok_or(CaptureExpansionError::OutputSizeOverflow)?;
+    if output_bytes > limits.max_output_bytes {
+        return Err(CaptureExpansionError::OutputBytesLimit {
+            needed: output_bytes,
+            limit: limits.max_output_bytes,
+        });
+    }
+    let template_bytes_scanned = template_scan_one_pass
+        .checked_mul(2)
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    let name_slots_examined = name_slots_one_pass
+        .checked_mul(2)
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    let name_bytes_compared = name_comparison_work_one_pass
+        .checked_mul(2)
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    let reference_work = capture_references
+        .checked_mul(2)
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    let work = template_bytes_scanned
+        .checked_add(reference_work)
+        .and_then(|work| work.checked_add(name_bytes_compared))
+        .and_then(|work| work.checked_add(output_bytes))
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    enforce_capture_work(work, limits.max_work)?;
+    Ok(CaptureExpansionAccounting {
+        template_bytes_scanned,
+        capture_references,
+        participating_references,
+        name_slots_examined,
+        name_bytes_compared,
+        literal_bytes_copied,
+        capture_bytes_copied,
+        output_bytes,
+        work,
+    })
+}
+
+fn capture_reference_index_preflight(
+    names: &[Option<Box<str>>],
+    reference: CaptureReference<'_>,
+    template_scan_work: usize,
+    capture_references: usize,
+    name_slots: &mut usize,
+    name_comparison_work: &mut usize,
+    max_work: usize,
+) -> Result<Option<usize>, CaptureExpansionError> {
+    let work = template_scan_work
+        .checked_add(capture_references)
+        .and_then(|work| work.checked_add(*name_comparison_work))
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    enforce_capture_work(work, max_work)?;
+    let name = match reference {
+        CaptureReference::Index(index) => return Ok(Some(index)),
+        CaptureReference::Name(name) => name,
+    };
+
+    for (index, candidate) in names.iter().enumerate() {
+        *name_slots = name_slots
+            .checked_add(1)
+            .ok_or(CaptureExpansionError::WorkOverflow)?;
+        let comparison_work = candidate.as_deref().map_or(1, |candidate| {
+            candidate.len().min(name.len()).saturating_add(1)
+        });
+        *name_comparison_work = name_comparison_work
+            .checked_add(comparison_work)
+            .ok_or(CaptureExpansionError::WorkOverflow)?;
+        let work = template_scan_work
+            .checked_add(capture_references)
+            .and_then(|work| work.checked_add(*name_comparison_work))
+            .ok_or(CaptureExpansionError::WorkOverflow)?;
+        enforce_capture_work(work, max_work)?;
+        if candidate.as_deref() == Some(name) {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+fn capture_template_scan_work(length: usize) -> Result<usize, CaptureExpansionError> {
+    let successor = length
+        .checked_add(1)
+        .ok_or(CaptureExpansionError::WorkOverflow)?;
+    length
+        .checked_mul(successor)
+        .map(|product| product / 2)
+        .ok_or(CaptureExpansionError::WorkOverflow)
+}
+
+fn enforce_capture_work(needed: usize, limit: usize) -> Result<(), CaptureExpansionError> {
+    if needed > limit {
+        return Err(CaptureExpansionError::WorkLimit { needed, limit });
+    }
+    Ok(())
 }

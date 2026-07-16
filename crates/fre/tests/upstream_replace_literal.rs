@@ -1,6 +1,6 @@
 use fre::{
-    AggregateBuilder, AggregateOperation, LiteralReplacementErrorSource, LiteralReplacementLimits,
-    RustProfile,
+    AggregateBuilder, AggregateOperation, CaptureExpansionError, CaptureExpansionLimits,
+    LiteralReplacementErrorSource, LiteralReplacementLimits, PortableBuilder, RustProfile,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -139,6 +139,18 @@ const INVENTORY: &[InventoryCase] = &[
         id: "replacen_with_captures",
         capability: Capability::CaptureExpansion,
     },
+];
+
+const PORTED_CAPTURE_TEMPLATE_IDS: &[&str] = &[
+    "groups",
+    "double_dollar",
+    "named",
+    "number_hyphen",
+    "simple_expand",
+    "literal_dollar1",
+    "literal_dollar2",
+    "capture_longest_possible_name",
+    "replacen_with_captures",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -287,6 +299,12 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
             .count(),
         9
     );
+    let capture_templates: Vec<_> = INVENTORY
+        .iter()
+        .filter(|case| case.capability == Capability::CaptureExpansion)
+        .map(|case| case.id)
+        .collect();
+    assert_eq!(capture_templates, PORTED_CAPTURE_TEMPLATE_IDS);
     assert_eq!(
         INVENTORY
             .iter()
@@ -304,6 +322,174 @@ fn authenticated_upstream_replacement_inventory_has_no_silent_omissions() {
     for case in INVENTORY {
         assert!(case.capability.id().starts_with("replacement."));
     }
+}
+
+fn assert_capture_template_matches_pinned(
+    pattern: &str,
+    haystack: &[u8],
+    replacement: &[u8],
+) -> usize {
+    let fre = PortableBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
+        .unicode(false)
+        .build()
+        .unwrap_or_else(|error| panic!("FRE rejected {pattern:?}: {error}"));
+    let upstream = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap_or_else(|error| panic!("pinned regex rejected {pattern:?}: {error}"));
+    let mut matches = 0_usize;
+    for captures in upstream.captures_iter(haystack) {
+        let values: Vec<_> = captures
+            .iter()
+            .map(|matched| matched.map(|matched| matched.as_bytes()))
+            .collect();
+        let mut expected = Vec::new();
+        captures.expand(replacement, &mut expected);
+        let actual = fre
+            .expand_capture_template(&values, replacement, CaptureExpansionLimits::default())
+            .unwrap_or_else(|error| {
+                panic!("FRE expansion failed for {pattern:?}/{haystack:?}/{replacement:?}: {error}")
+            });
+        assert_eq!(
+            actual.as_bytes(),
+            expected,
+            "{pattern:?}/{haystack:?}/{replacement:?}"
+        );
+        assert_eq!(actual.report().capture_slots, captures.len());
+        assert_eq!(actual.report().replacement_bytes, replacement.len());
+        assert_eq!(
+            actual.report().accounting.output_bytes,
+            actual.as_bytes().len()
+        );
+        matches = matches.saturating_add(1);
+    }
+    matches
+}
+
+#[test]
+fn every_pinned_capture_replacement_template_expands_exactly() {
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        (r"([^ ]+)[ ]+([^ ]+)", b"w1 w2", b"$2 $1"),
+        (r"([^ ]+)[ ]+([^ ]+)", b"w1 w2", b"$2 $$1"),
+        (
+            r"(?P<first>[^ ]+)[ ]+(?P<last>[^ ]+)(?P<space>[ ]*)",
+            b"w1 w2 w3 w4",
+            b"$last $first$space",
+        ),
+        (r"(.)(.)", b"ab", b"$1-$2"),
+        (r"([a-z]) ([a-z])", b"a b", b"$2 $1"),
+        (r"([a-z]+) ([a-z]+)", b"a b", b"$$1"),
+        (r"([a-z]+) ([a-z]+)", b"a b", b"$2 $$c $1"),
+        (r"(.)", b"b", b"${1}a $1a"),
+        (r"([0-9])", b"age: 1234", b"${1}Z"),
+    ];
+    let mut executed = 0_usize;
+    for &(pattern, haystack, replacement) in cases {
+        assert!(assert_capture_template_matches_pinned(pattern, haystack, replacement) > 0);
+        executed = executed.saturating_add(1);
+    }
+    assert_eq!(executed, PORTED_CAPTURE_TEMPLATE_IDS.len());
+}
+
+#[test]
+fn capture_template_grammar_matches_pinned_bytes_on_malformed_and_invalid_inputs() {
+    let pattern = r"(?P<first>a)(?P<optional>b)?(?P<last>c)";
+    let haystack = b"ac";
+    let replacements: &[&[u8]] = &[
+        b"",
+        b"$0/$1/$2/$3/$4",
+        b"$first/$optional/$last/$missing",
+        b"${first}/${optional}/${last}/${missing}",
+        b"$$ $$$ $$$$ $",
+        b"$1a/${1}a/$01/${01}",
+        b"${}/${unterminated/$-/$!",
+        b"prefix\xFF$last\xFE${missing}suffix",
+        b"${\xFF}$last",
+        b"$999999999999999999999999999999999999999999999999999999999999",
+    ];
+    for replacement in replacements {
+        assert_eq!(
+            assert_capture_template_matches_pinned(pattern, haystack, replacement),
+            1,
+            "{replacement:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_template_output_and_work_limits_are_exact_before_publication() {
+    let pattern = r"(?P<first>a)(?P<optional>b)?(?P<last>c)";
+    let fre = PortableBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("bounded capture-template pattern");
+    let captures = [Some(b"ac".as_slice()), Some(b"a"), None, Some(b"c")];
+    let replacement = b"$last-$$-${1}-$missing-$optional";
+    let baseline = fre
+        .expand_capture_template(&captures, replacement, CaptureExpansionLimits::default())
+        .expect("capture-template accounting baseline");
+    assert_eq!(baseline.as_bytes(), b"c-$-a--");
+    assert_eq!(baseline.report().accounting.capture_references, 4);
+    assert_eq!(baseline.report().accounting.participating_references, 2);
+    assert_eq!(
+        baseline.report().accounting.literal_bytes_copied
+            + baseline.report().accounting.capture_bytes_copied,
+        baseline.report().accounting.output_bytes
+    );
+
+    let exact = CaptureExpansionLimits {
+        max_output_bytes: baseline.report().accounting.output_bytes,
+        max_work: baseline.report().accounting.work,
+    };
+    let admitted = fre
+        .expand_capture_template(&captures, replacement, exact)
+        .expect("exact capture-template limits");
+    assert_eq!(admitted.as_bytes(), baseline.as_bytes());
+    assert_eq!(admitted.report().limits, exact);
+
+    let output_error = fre
+        .expand_capture_template(
+            &captures,
+            replacement,
+            CaptureExpansionLimits {
+                max_output_bytes: exact.max_output_bytes - 1,
+                ..exact
+            },
+        )
+        .expect_err("one below exact output must refuse");
+    assert!(matches!(
+        output_error,
+        CaptureExpansionError::OutputBytesLimit { needed, limit }
+            if needed == exact.max_output_bytes && limit + 1 == needed
+    ));
+
+    let work_error = fre
+        .expand_capture_template(
+            &captures,
+            replacement,
+            CaptureExpansionLimits {
+                max_work: exact.max_work - 1,
+                ..exact
+            },
+        )
+        .expect_err("one below exact work must refuse");
+    assert!(matches!(
+        work_error,
+        CaptureExpansionError::WorkLimit { needed, limit }
+            if needed == exact.max_work && limit + 1 == needed
+    ));
+
+    let slot_error = fre
+        .expand_capture_template(&captures[..3], replacement, exact)
+        .expect_err("capture records must retain every pattern slot");
+    assert_eq!(
+        slot_error,
+        CaptureExpansionError::CaptureSlotCount {
+            expected: 4,
+            actual: 3,
+        }
+    );
 }
 
 #[test]
