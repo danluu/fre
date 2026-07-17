@@ -3138,7 +3138,22 @@ fn execute_uniform_capture_scalar(
     grep: bool,
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
-    let operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
+    let line_scan = if grep {
+        Some(CaptureSelectorLedger::preflight_lf_scan(
+            haystack.len(),
+            limits,
+        )?)
+    } else {
+        None
+    };
+    let mut operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
+    if let Some(line_scan) = line_scan {
+        let (remaining_work, _) = line_scan.remaining(limits)?;
+        operation_limits.unicode_scalar.max_work = operation_limits
+            .unicode_scalar
+            .max_work
+            .min(remaining_work);
+    }
     let result = regex.count(haystack, operation_limits).map_err(|error| {
         aggregate_execution_error(
             &error.source,
@@ -6669,6 +6684,25 @@ mod tests {
                     .contains("cumulative public-operation ledger")
             );
         }
+
+        let scalar_patterns = [r"(\pL)".to_string()];
+        let scalar = fre_reducer(
+            CandidateRequest {
+                job_id: "test/scalar-grep-line-preflight",
+                model: "grep-captures",
+                patterns: &scalar_patterns,
+                haystack: layouts[0],
+                unicode: true,
+                case_insensitive: false,
+            },
+            &RunLimits {
+                fre_aggregate_operation_work: layouts[0].len() - 1,
+                fre_aggregate_sequential_bytes: layouts[0].len(),
+                ..RunLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(scalar.message.contains("cumulative public-operation ledger"));
     }
 
     #[test]
