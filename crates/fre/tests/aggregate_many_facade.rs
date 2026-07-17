@@ -1,15 +1,46 @@
 use fre::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateEngineError, AggregateManyBuildError,
-    AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyExecutionDetails,
+    AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyCaptureIneligibility,
+    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyExecutionDetails,
     AggregateManyExecutionSource, AggregateManyOperation, AggregateManyOutput,
     AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateResource,
     AggregateStrategy, CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
-use regex_automata::meta::Regex as MetaRegex;
+use regex_automata::{Input, meta::Regex as MetaRegex};
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn meta_capture_count(patterns: &[String], haystack: &[u8]) -> u64 {
+    let regex = MetaRegex::builder()
+        .configure(MetaRegex::config().utf8_empty(false))
+        .syntax(
+            regex_automata::util::syntax::Config::new()
+                .utf8(false)
+                .unicode(false)
+                .case_insensitive(false),
+        )
+        .build_many(patterns)
+        .unwrap();
+    let mut input = Input::new(haystack);
+    let mut captures = regex.create_captures();
+    let mut count = 0_u64;
+    loop {
+        regex.search_captures(&input, &mut captures);
+        let Some(matched) = captures.get_match() else {
+            break;
+        };
+        assert!(matched.end() > input.start());
+        for index in 0..captures.group_len() {
+            count = count
+                .checked_add(u64::from(captures.get_group(index).is_some()))
+                .unwrap();
+        }
+        input.set_start(matched.end());
+    }
+    count
 }
 
 #[test]
@@ -200,7 +231,7 @@ fn preflight_refuses_cardinality_before_parsing_or_plan_allocation() {
 }
 
 #[test]
-fn complete_spans_dispatch_while_capture_output_remains_a_typed_preflight_refusal() {
+fn complete_spans_and_uniform_capture_count_dispatch_to_typed_wrappers() {
     let values = patterns(&["(a)", "b"]);
     let AggregateManyRegex::Spans(regex) = AggregateManyBuilder::new(&values)
         .unicode(false)
@@ -221,10 +252,169 @@ fn complete_spans_dispatch_while_capture_output_remains_a_typed_preflight_refusa
         .unwrap_err();
     assert!(matches!(
         error,
-        AggregateManyBuildError::UnsupportedOutput {
-            requested: AggregateManyOutput::CaptureCount
+        AggregateManyBuildError::CaptureIneligible {
+            pattern: 1,
+            reason: AggregateManyCaptureIneligibility::CaptureCountNotOne
         }
     ));
+
+    let captured = patterns(&["(a)", "(b)"]);
+    let AggregateManyRegex::CaptureCount(regex) = AggregateManyBuilder::new(&captured)
+        .unicode(false)
+        .build_output(AggregateManyOutput::CaptureCount)
+        .unwrap()
+    else {
+        panic!("capture output published a different operation wrapper");
+    };
+    assert_eq!(
+        AggregateManyOperation::CaptureCount,
+        regex.build_report().operation
+    );
+    assert_eq!(
+        Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty),
+        regex.build_report().capture_semantics
+    );
+    assert_eq!(
+        Some(1),
+        regex.build_report().participating_captures_per_match
+    );
+    assert_eq!(
+        4,
+        regex
+            .count_captures_value(b"ab", AggregateManyCaptureRunLimits::unlimited())
+            .unwrap()
+    );
+}
+
+#[test]
+fn uniform_capture_count_preserves_ordered_pattern_priority() {
+    let longer_first = patterns(&["(a+)", "(a)"]);
+    let shorter_first = patterns(&["(a)", "(a+)"]);
+    let limits = AggregateManyCaptureRunLimits::unlimited();
+
+    let longer = AggregateManyBuilder::new(&longer_first)
+        .unicode(false)
+        .build_capture_count()
+        .unwrap();
+    let shorter = AggregateManyBuilder::new(&shorter_first)
+        .unicode(false)
+        .build_capture_count()
+        .unwrap();
+
+    let longer_result = longer.count_captures(b"aa", limits).unwrap();
+    assert_eq!(1, longer_result.matches());
+    assert_eq!(2, longer_result.capture_events());
+    assert_eq!(2, longer_result.value());
+    assert_eq!(4, shorter.count_captures_value(b"aa", limits).unwrap());
+}
+
+#[test]
+fn capture_count_requires_one_nonempty_whole_match_capture_per_pattern() {
+    let cases = [
+        (
+            patterns(&["(a)", "b"]),
+            1,
+            AggregateManyCaptureIneligibility::CaptureCountNotOne,
+        ),
+        (
+            patterns(&["(a)", "((b))"]),
+            1,
+            AggregateManyCaptureIneligibility::CaptureCountNotOne,
+        ),
+        (
+            patterns(&["(a)", "(?:b(c))"]),
+            1,
+            AggregateManyCaptureIneligibility::CaptureNotAtRoot,
+        ),
+        (
+            patterns(&["(a)", "(b?)"]),
+            1,
+            AggregateManyCaptureIneligibility::EmptyMatchPossible,
+        ),
+    ];
+    for (values, pattern, reason) in cases {
+        let error = AggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AggregateManyBuildError::CaptureIneligible {
+                pattern: actual_pattern,
+                reason: actual_reason,
+            } if actual_pattern == pattern && actual_reason == reason
+        ));
+    }
+}
+
+#[test]
+fn capture_count_admits_result_only_after_exact_reducer_limits() {
+    let values = patterns(&["(a+)", "(b)"]);
+    let regex = AggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_capture_count()
+        .unwrap();
+    let baseline = regex
+        .count_captures(b"aabb", AggregateManyCaptureRunLimits::unlimited())
+        .unwrap();
+    assert_eq!(6, baseline.value());
+    assert_eq!(6, baseline.capture_events());
+
+    let mut exact = AggregateManyCaptureRunLimits::unlimited();
+    exact.max_capture_events = baseline.capture_events();
+    exact.max_capture_count = baseline.value();
+    assert_eq!(baseline, regex.count_captures(b"aabb", exact).unwrap());
+
+    exact.max_capture_events -= 1;
+    assert!(matches!(
+        regex.count_captures(b"aabb", exact).unwrap_err().source,
+        AggregateManyExecutionSource::CaptureEventsLimit {
+            needed: 6,
+            limit: 5
+        }
+    ));
+    exact.max_capture_events += 1;
+    exact.max_capture_count -= 1;
+    assert!(matches!(
+        regex.count_captures(b"aabb", exact).unwrap_err().source,
+        AggregateManyExecutionSource::CaptureCountLimit {
+            needed: 6,
+            limit: 5
+        }
+    ));
+}
+
+#[test]
+fn uniform_capture_count_matches_pinned_build_many_exhaustively() {
+    let pattern_sets = [
+        patterns(&["(a+)", "(a)"]),
+        patterns(&["(a)", "(a+)"]),
+        patterns(&["(ab)", "(a)", "(.)"]),
+        patterns(&["(a|b)", "([^ab]+)"]),
+        patterns(&[r"(\xFF+)", "(.)"]),
+    ];
+    let haystacks = byte_strings(4, &[b'a', b'b', 0xFF]);
+
+    for values in pattern_sets {
+        for strategy in [
+            AggregateStrategy::FullTable,
+            AggregateStrategy::ReverseSequentialRows,
+        ] {
+            let fre = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_capture_count()
+                .unwrap();
+            for haystack in &haystacks {
+                assert_eq!(
+                    meta_capture_count(&values, haystack),
+                    fre.count_captures_value(haystack, AggregateManyCaptureRunLimits::unlimited())
+                        .unwrap(),
+                    "{values:?}/{strategy:?}/{haystack:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -288,7 +478,7 @@ fn complete_spans_preserve_unicode_literal_boundaries_and_schema_identity() {
         .unicode(true)
         .build_spans()
         .unwrap();
-    assert_eq!(2, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
+    assert_eq!(3, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
     assert_eq!(
         AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
         regex.build_report().schema_version
@@ -475,7 +665,7 @@ fn continuation_value_paths_match_diagnostic_values_and_refusals() {
 
 #[test]
 #[ignore = "requires the sealed Rebar Veryl pattern and haystack inputs"]
-fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
+fn sealed_veryl_count_span_sum_and_captures_fit_default_execution_work() {
     let pattern_path = std::env::var("FRE_QUALIFICATION_VERYL_PATTERNS")
         .expect("qualification must bind the sealed Veryl pattern path");
     let haystack_path = std::env::var("FRE_QUALIFICATION_VERYL_HAYSTACK")
@@ -523,6 +713,13 @@ fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
         .strategy(AggregateStrategy::ReverseSequentialRows)
         .build_span_sum()
         .unwrap();
+    let captures = AggregateManyBuilder::new(&patterns)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_capture_count()
+        .unwrap();
     assert_eq!(
         AggregateManyPlanKind::ContinuationProgram,
         count.build_report().plan
@@ -541,6 +738,12 @@ fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
         oracle_span_sum,
         span_sum
             .span_sum_value(&haystack, AggregateManyRunLimits::default())
+            .unwrap()
+    );
+    assert_eq!(
+        124_800,
+        captures
+            .count_captures_value(&haystack, AggregateManyCaptureRunLimits::default())
             .unwrap()
     );
 }

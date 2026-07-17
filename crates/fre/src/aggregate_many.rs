@@ -20,7 +20,7 @@ use fre_syntax::{
 use regex_syntax::hir::{Hir, HirKind};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
-pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 2;
+pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 3;
 
 /// Requested output boundary for ordered multi-pattern construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,7 +29,7 @@ pub enum AggregateManyOutput {
     SpanSum,
     /// Complete non-overlapping whole-match spans.
     Spans,
-    /// Capture histories cannot be represented by whole-match erasure.
+    /// Participating groups when every pattern has the uniform root-capture proof.
     CaptureCount,
 }
 
@@ -38,8 +38,26 @@ pub enum AggregateManyOutput {
 pub enum AggregateManyOperation {
     Compile,
     Count,
+    CaptureCount,
     SpanSum,
     Spans,
+}
+
+/// Structural proof used by ordered multi-pattern capture reduction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateManyCaptureSemantics {
+    /// Every independently parsed pattern is non-nullable and has exactly one
+    /// capture at its HIR root. Therefore every selected match contributes
+    /// exactly the implicit whole-match group and one participating capture.
+    UniformSingleWholeMatchCaptureNonempty,
+}
+
+/// Why one pattern cannot join the capture-erased ordered selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateManyCaptureIneligibility {
+    CaptureCountNotOne,
+    CaptureNotAtRoot,
+    EmptyMatchPossible,
 }
 
 /// Construction-selected implementation family.
@@ -146,6 +164,8 @@ pub struct AggregateManyBuildReport {
     pub plan: AggregateManyPlanKind,
     pub strategy: Option<Strategy>,
     pub captures_erased: usize,
+    pub capture_semantics: Option<AggregateManyCaptureSemantics>,
+    pub participating_captures_per_match: Option<usize>,
     pub composition: AggregateManyCompositionAccounting,
     pub build: AggregateManyBuildAccounting,
     pub plan_identity: AggregateManyPlanIdentity,
@@ -194,6 +214,10 @@ pub enum AggregateManyBuildError {
     },
     UnicodeNonLiteral {
         pattern: usize,
+    },
+    CaptureIneligible {
+        pattern: usize,
+        reason: AggregateManyCaptureIneligibility,
     },
     OrderedLiteralBuild {
         operation: AggregateManyOperation,
@@ -256,6 +280,10 @@ impl fmt::Display for AggregateManyBuildError {
             Self::UnicodeNonLiteral { pattern } => write!(
                 f,
                 "Unicode ordered build-many pattern {pattern} is not one nonempty canonical UTF-8 literal"
+            ),
+            Self::CaptureIneligible { pattern, reason } => write!(
+                f,
+                "ordered build-many capture pattern {pattern} lacks the uniform whole-match proof: {reason:?}"
             ),
             Self::OrderedLiteralBuild { operation, source } => write!(
                 f,
@@ -320,11 +348,46 @@ impl AggregateManyRunLimits {
     }
 }
 
+/// Complete limits for one uniform ordered multi-pattern capture reduction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyCaptureRunLimits {
+    /// Limits for the capture-erased ordered whole-match selector.
+    pub selector: AggregateManyRunLimits,
+    /// Maximum group slots visited by the capture reducer.
+    pub max_capture_events: u64,
+    /// Maximum participating groups in the published result.
+    pub max_capture_count: u64,
+}
+
+impl AggregateManyCaptureRunLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            selector: AggregateManyRunLimits::unlimited(),
+            max_capture_events: u64::MAX,
+            max_capture_count: u64::MAX,
+        }
+    }
+}
+
+impl Default for AggregateManyCaptureRunLimits {
+    fn default() -> Self {
+        Self {
+            selector: AggregateManyRunLimits::default(),
+            max_capture_events: 1_000_000_000,
+            max_capture_count: 1_000_000_000,
+        }
+    }
+}
+
 /// Typed selected-plan execution failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateManyExecutionSource {
     OrderedLiteral(OrderedLiteralAggregateReduceError),
     Continuation(AggregateEngineError),
+    CaptureEventsLimit { needed: u64, limit: u64 },
+    CaptureCountLimit { needed: u64, limit: u64 },
+    ArithmeticOverflow { computation: &'static str },
     InternalInvariant(&'static str),
 }
 
@@ -366,6 +429,37 @@ pub enum AggregateManyExecutionDetails {
 pub struct AggregateManyCountResult {
     value: u64,
     details: AggregateManyExecutionDetails,
+}
+
+/// Complete admitted uniform capture count and selector accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateManyCaptureCountResult {
+    value: u64,
+    matches: u64,
+    capture_events: u64,
+    details: AggregateManyExecutionDetails,
+}
+
+impl AggregateManyCaptureCountResult {
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn matches(&self) -> u64 {
+        self.matches
+    }
+
+    #[must_use]
+    pub const fn capture_events(&self) -> u64 {
+        self.capture_events
+    }
+
+    #[must_use]
+    pub const fn details(&self) -> &AggregateManyExecutionDetails {
+        &self.details
+    }
 }
 
 impl AggregateManyCountResult {
@@ -518,6 +612,15 @@ impl<'a> AggregateManyBuilder<'a> {
             .map(AggregateManyCountRegex)
     }
 
+    /// Construct an ordered multi-pattern capture reducer only when every
+    /// pattern has the same statically proved capture participation.
+    pub fn build_capture_count(
+        self,
+    ) -> Result<AggregateManyCaptureCountRegex, AggregateManyBuildError> {
+        self.build_plan(AggregateManyOperation::CaptureCount)
+            .map(AggregateManyCaptureCountRegex)
+    }
+
     /// Construct and publish a fresh complete ordered multi-pattern artifact.
     ///
     /// [`AggregateManyCompileRegex::verify_count`] executes only the retained
@@ -547,11 +650,11 @@ impl<'a> AggregateManyBuilder<'a> {
     ) -> Result<AggregateManyRegex, AggregateManyBuildError> {
         match output {
             AggregateManyOutput::Count => self.build_count().map(AggregateManyRegex::Count),
+            AggregateManyOutput::CaptureCount => self
+                .build_capture_count()
+                .map(AggregateManyRegex::CaptureCount),
             AggregateManyOutput::SpanSum => self.build_span_sum().map(AggregateManyRegex::SpanSum),
             AggregateManyOutput::Spans => self.build_spans().map(AggregateManyRegex::Spans),
-            AggregateManyOutput::CaptureCount => {
-                Err(AggregateManyBuildError::UnsupportedOutput { requested: output })
-            }
         }
     }
 
@@ -691,6 +794,26 @@ impl<'a> AggregateManyBuilder<'a> {
                     "Rust bytes request produced non-Rust canonical pattern",
                 ));
             };
+            if operation == AggregateManyOperation::CaptureCount {
+                if parsed_captures != 1 {
+                    return Err(AggregateManyBuildError::CaptureIneligible {
+                        pattern: ordinal,
+                        reason: AggregateManyCaptureIneligibility::CaptureCountNotOne,
+                    });
+                }
+                if !matches!(rust.hir.kind(), HirKind::Capture(_)) {
+                    return Err(AggregateManyBuildError::CaptureIneligible {
+                        pattern: ordinal,
+                        reason: AggregateManyCaptureIneligibility::CaptureNotAtRoot,
+                    });
+                }
+                if !matches!(rust.hir.properties().minimum_len(), Some(minimum) if minimum > 0) {
+                    return Err(AggregateManyBuildError::CaptureIneligible {
+                        pattern: ordinal,
+                        reason: AggregateManyCaptureIneligibility::EmptyMatchPossible,
+                    });
+                }
+            }
             reports.push(AggregateManyPatternReport {
                 ordinal,
                 syntax_key: parsed.key,
@@ -781,7 +904,9 @@ impl<'a> AggregateManyBuilder<'a> {
                 literals.push(literal);
             }
             match operation {
-                AggregateManyOperation::Compile | AggregateManyOperation::Count => {
+                AggregateManyOperation::Compile
+                | AggregateManyOperation::Count
+                | AggregateManyOperation::CaptureCount => {
                     let mut literal_limits = self.limits.ordered_literal;
                     literal_limits.max_persistent_bytes = literal_limits
                         .max_persistent_bytes
@@ -904,6 +1029,10 @@ impl<'a> AggregateManyBuilder<'a> {
             plan,
             strategy: (plan == AggregateManyPlanKind::ContinuationProgram).then_some(self.strategy),
             captures_erased: captures,
+            capture_semantics: (operation == AggregateManyOperation::CaptureCount)
+                .then_some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty),
+            participating_captures_per_match: (operation == AggregateManyOperation::CaptureCount)
+                .then_some(1),
             composition,
             build,
             plan_identity,
@@ -921,6 +1050,7 @@ impl<'a> AggregateManyBuilder<'a> {
 #[derive(Debug)]
 pub enum AggregateManyRegex {
     Count(AggregateManyCountRegex),
+    CaptureCount(AggregateManyCaptureCountRegex),
     SpanSum(AggregateManySpanSumRegex),
     Spans(AggregateManySpansRegex),
 }
@@ -1128,6 +1258,95 @@ impl AggregateManyCountRegex {
         limits: AggregateManyRunLimits,
     ) -> Result<u64, AggregateManyExecutionError> {
         self.0.count_value(haystack, limits)
+    }
+}
+
+/// Compiled ordered multi-pattern uniform capture-count operation.
+#[derive(Debug)]
+pub struct AggregateManyCaptureCountRegex(AggregateManyPlan);
+
+impl AggregateManyCaptureCountRegex {
+    #[must_use]
+    pub const fn build_report(&self) -> &AggregateManyBuildReport {
+        &self.0.report
+    }
+
+    pub fn count_captures(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<AggregateManyCaptureCountResult, AggregateManyExecutionError> {
+        let selected = self.0.count(haystack, limits.selector)?;
+        let participating = self
+            .0
+            .report
+            .participating_captures_per_match
+            .ok_or_else(|| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                        "capture-count plan lacks participation proof",
+                    ))
+            })?;
+        if self.0.report.capture_semantics
+            != Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty)
+            || participating != 1
+        {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture-count plan retained an invalid participation proof",
+                )));
+        }
+        let groups_per_match = u64::try_from(participating)
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
+                        computation: "capture groups per match",
+                    })
+            })?;
+        let capture_events = selected
+            .value
+            .checked_mul(groups_per_match)
+            .ok_or_else(|| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
+                        computation: "capture events",
+                    })
+            })?;
+        if capture_events > limits.max_capture_events {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::CaptureEventsLimit {
+                    needed: capture_events,
+                    limit: limits.max_capture_events,
+                }));
+        }
+        let value = capture_events;
+        if value > limits.max_capture_count {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::CaptureCountLimit {
+                    needed: value,
+                    limit: limits.max_capture_count,
+                }));
+        }
+        Ok(AggregateManyCaptureCountResult {
+            value,
+            matches: selected.value,
+            capture_events,
+            details: selected.details,
+        })
+    }
+
+    pub fn count_captures_value(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<u64, AggregateManyExecutionError> {
+        self.count_captures(haystack, limits)
+            .map(|result| result.value)
     }
 }
 

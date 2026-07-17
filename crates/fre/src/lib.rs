@@ -7,8 +7,10 @@
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
 //! `fre-aggregate` Rust-byte subset. [`AggregateManyBuilder`] retains each
 //! pattern's syntax identity and composes ordered whole-match compile/count/
-//! span-sum/complete-span plans without source concatenation. Whole-match
-//! aggregate plans may erase capture annotations. Their complete spans also
+//! span-sum/complete-span plans without source concatenation. It also admits
+//! capture count when every pattern proves the same nonempty root-capture
+//! participation. Whole-match aggregate plans may erase capture annotations.
+//! Their complete spans also
 //! provide bounded byte `split`/`splitn` and literal/no-expansion replacement/
 //! `replacen`.
 //! [`CaptureBuilder`] separately preserves capture histories for the
@@ -55,13 +57,15 @@ pub use aggregate::{
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
     AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
-    AggregateManyCompileRegex, AggregateManyCompositionAccounting, AggregateManyCountRegex,
-    AggregateManyCountResult, AggregateManyExecutionDetails, AggregateManyExecutionError,
-    AggregateManyExecutionSource, AggregateManyLiteralSemantics, AggregateManyOperation,
-    AggregateManyOutput, AggregateManyPatternReport, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateManySpanIter,
-    AggregateManySpanSumRegex, AggregateManySpanSumResult, AggregateManySpans,
-    AggregateManySpansRegex,
+    AggregateManyCaptureCountRegex, AggregateManyCaptureCountResult,
+    AggregateManyCaptureIneligibility, AggregateManyCaptureRunLimits,
+    AggregateManyCaptureSemantics, AggregateManyCompileRegex, AggregateManyCompositionAccounting,
+    AggregateManyCountRegex, AggregateManyCountResult, AggregateManyExecutionDetails,
+    AggregateManyExecutionError, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
+    AggregateManyOperation, AggregateManyOutput, AggregateManyPatternReport,
+    AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
+    AggregateManySpanIter, AggregateManySpanSumRegex, AggregateManySpanSumResult,
+    AggregateManySpans, AggregateManySpansRegex,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,

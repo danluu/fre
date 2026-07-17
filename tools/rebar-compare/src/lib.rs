@@ -24,6 +24,7 @@ use fre::{
     AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
     AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics,
     AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
     AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
@@ -84,7 +85,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v17-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -415,10 +416,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1821,6 +1822,7 @@ pub fn current_fre_rebar_validate_aggregate_many_identity(
     let operation = match model {
         "compile" => AggregateManyOperation::Compile,
         "count" => AggregateManyOperation::Count,
+        "count-captures" => AggregateManyOperation::CaptureCount,
         "count-spans" => AggregateManyOperation::SpanSum,
         other => {
             return Err(CompareError::new(format!(
@@ -2995,6 +2997,9 @@ fn fre_count_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return fre_aggregate_many_capture_count(request, limits);
+    }
     if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
         let actual =
             execute_uniform_capture_scalar(&regex, participating, request.haystack, false, limits)?;
@@ -4698,6 +4703,30 @@ fn require_aggregate_many_report_identity(
             "FRE ordered build-many profile/operation identity mismatch",
         ));
     }
+    match operation {
+        AggregateManyOperation::CaptureCount => {
+            if report.capture_semantics
+                != Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty)
+                || report.participating_captures_per_match != Some(1)
+            {
+                return Err(ExecutionError::fault(
+                    "FRE ordered build-many capture participation identity mismatch",
+                ));
+            }
+        }
+        AggregateManyOperation::Compile
+        | AggregateManyOperation::Count
+        | AggregateManyOperation::SpanSum
+        | AggregateManyOperation::Spans => {
+            if report.capture_semantics.is_some()
+                || report.participating_captures_per_match.is_some()
+            {
+                return Err(ExecutionError::fault(
+                    "FRE non-capture build-many plan retained capture participation identity",
+                ));
+            }
+        }
+    }
     if report.patterns.len() != patterns.len() {
         return Err(ExecutionError::fault(
             "FRE ordered build-many pattern identity count mismatch",
@@ -4857,7 +4886,8 @@ fn aggregate_many_build_error(error: &AggregateManyBuildError) -> ExecutionError
         | AggregateManyBuildError::ReportCapacityLimit { .. }
         | AggregateManyBuildError::PersistentLimit { .. }
         | AggregateManyBuildError::Syntax { .. }
-        | AggregateManyBuildError::UnicodeNonLiteral { .. } => ExecutionError::unsupported(message),
+        | AggregateManyBuildError::UnicodeNonLiteral { .. }
+        | AggregateManyBuildError::CaptureIneligible { .. } => ExecutionError::unsupported(message),
         AggregateManyBuildError::OrderedLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
         }
@@ -4879,7 +4909,12 @@ fn aggregate_many_execution_error(
         AggregateManyExecutionSource::Continuation(source) => {
             aggregate_engine_error(source, message)
         }
-        AggregateManyExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
+        AggregateManyExecutionSource::CaptureEventsLimit { .. }
+        | AggregateManyExecutionSource::CaptureCountLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        AggregateManyExecutionSource::ArithmeticOverflow { .. }
+        | AggregateManyExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
 }
 
@@ -4908,6 +4943,43 @@ fn fre_aggregate_many_count(
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
+    };
+    Ok(FreReduction { actual, plan })
+}
+
+fn fre_aggregate_many_capture_count(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    let regex: AggregateManyCaptureCountRegex = aggregate_many_builder_with_limits(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+    .build_capture_count()
+    .map_err(|error| aggregate_many_build_error(&error))?;
+    require_aggregate_many_identity(
+        request,
+        regex.build_report(),
+        AggregateManyOperation::CaptureCount,
+    )?;
+    let selector = aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let operation_limits = AggregateManyCaptureRunLimits {
+        selector,
+        max_capture_events: limits.reducer_steps,
+        max_capture_count: limits.reducer_steps,
+    };
+    let actual = regex
+        .count_captures_value(request.haystack, operation_limits)
+        .map_err(|error| {
+            let message =
+                format!("FRE ordered build-many capture count refused execution: {error}");
+            aggregate_many_execution_error(&error.source, message)
+        })?;
+    let plan = match regex.build_report().plan {
+        AggregateManyPlanKind::OrderedLiteral => "capture-many-ordered-literal",
+        AggregateManyPlanKind::ContinuationProgram => "capture-many-continuation-program",
     };
     Ok(FreReduction { actual, plan })
 }
@@ -6636,7 +6708,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v17-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -6830,11 +6902,23 @@ mod tests {
         assert_eq!(150_600, haystack.len());
 
         let limits = RunLimits::default();
-        for (model, expected) in [("count", 62_400), ("count-spans", 150_600)] {
+        for (model, expected, plan) in [
+            ("count", 62_400, "aggregate-many-continuation-program"),
+            (
+                "count-spans",
+                150_600,
+                "aggregate-many-continuation-program",
+            ),
+            (
+                "count-captures",
+                124_800,
+                "capture-many-continuation-program",
+            ),
+        ] {
             assert_current_fre_execution(
                 current_fre(model, &patterns, &haystack, false, false, &limits),
                 expected,
-                "aggregate-many-continuation-program",
+                plan,
             );
         }
     }
@@ -7377,6 +7461,37 @@ mod tests {
             2,
             "aggregate-many-ordered-literal",
         );
+    }
+
+    #[test]
+    fn current_fre_uniform_build_many_captures_keep_priority_limits_and_identity() {
+        let limits = RunLimits::default();
+        for (patterns, haystack, expected, plan) in [
+            (
+                vec!["(a+)".to_string(), "(a)".to_string()],
+                b"aa".as_slice(),
+                2,
+                "capture-many-continuation-program",
+            ),
+            (
+                vec!["(a)".to_string(), "(a+)".to_string()],
+                b"aa".as_slice(),
+                4,
+                "capture-many-continuation-program",
+            ),
+            (
+                vec!["(ab)".to_string(), "(a)".to_string()],
+                b"ab".as_slice(),
+                2,
+                "capture-many-ordered-literal",
+            ),
+        ] {
+            assert_current_fre_execution(
+                current_fre("count-captures", &patterns, haystack, false, false, &limits),
+                expected,
+                plan,
+            );
+        }
 
         let captures = current_fre(
             "count-captures",
@@ -7387,8 +7502,54 @@ mod tests {
             &limits,
         );
         assert!(
-            matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("no certified count-captures operation")),
-            "capture output must remain typed unsupported: {captures:?}"
+            matches!(captures, CandidateOutcome::Unsupported(ref reason) if reason.contains("lacks the uniform whole-match proof")),
+            "mixed capture participation must remain typed unsupported: {captures:?}"
+        );
+
+        let mut bounded = limits;
+        bounded.reducer_steps = 1;
+        let capture_limit = current_fre(
+            "count-captures",
+            &["(a+)".to_string(), "(a)".to_string()],
+            b"aa",
+            false,
+            false,
+            &bounded,
+        );
+        assert!(
+            matches!(capture_limit, CandidateOutcome::Unsupported(ref reason) if reason.contains("CaptureEventsLimit")),
+            "capture reducer limit must remain typed unsupported: {capture_limit:?}"
+        );
+
+        let identity_patterns = vec!["(a+)".to_string(), "(a)".to_string()];
+        let capture_plan = AggregateManyBuilder::new(&identity_patterns)
+            .profile(rebar_profile())
+            .unicode(false)
+            .build_capture_count()
+            .unwrap();
+        require_aggregate_many_report_identity(
+            &identity_patterns,
+            false,
+            false,
+            capture_plan.build_report(),
+            AggregateManyOperation::CaptureCount,
+        )
+        .unwrap();
+        let mut malformed_report = capture_plan.build_report().clone();
+        malformed_report.participating_captures_per_match = None;
+        let identity_error = require_aggregate_many_report_identity(
+            &identity_patterns,
+            false,
+            false,
+            &malformed_report,
+            AggregateManyOperation::CaptureCount,
+        )
+        .unwrap_err();
+        assert_eq!(Status::Fault, identity_error.status);
+        assert!(
+            identity_error
+                .message
+                .contains("capture participation identity mismatch")
         );
     }
 
