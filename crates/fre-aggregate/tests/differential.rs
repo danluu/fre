@@ -740,6 +740,48 @@ fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
 }
 
 #[test]
+fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
+    let pattern = r"\b[a-z]+ing\b";
+    let haystack = b"!wording! thing singing! wording?".repeat(64);
+    let regex = compile_unicode_byte_stable(pattern).unwrap();
+    assert_eq!(regex.compile_accounting().required_suffix_bytes, 3);
+    let dense = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let forced_work = dense.certificate().work_bound - 1;
+    let limits = OperationLimits {
+        max_work: forced_work,
+        ..OperationLimits::default()
+    };
+    let ordinary = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    let observed = regex
+        .admit_spans_observed(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(ordinary.as_slice(), observed.as_slice());
+    assert_eq!(ordinary.certificate(), observed.certificate());
+    assert_eq!(ordinary.accounting(), observed.accounting());
+    assert_eq!(ordinary.certificate().work_bound, forced_work);
+    assert!(ordinary.accounting().work <= forced_work);
+}
+
+#[test]
 fn required_suffix_sparse_rows_choose_the_narrower_endpoint_log() {
     let pattern = (1..=40)
         .map(|length| format!(r"a{{{length}}}x"))

@@ -3007,7 +3007,7 @@ impl CaptureSelectorLedger {
         if self.work > limits.fre_aggregate_operation_work
             || self.sequential_bytes > limits.fre_aggregate_sequential_bytes
         {
-            return Err(ExecutionError::fault(
+            return Err(ExecutionError::unsupported(
                 "FRE selector exceeded its cumulative public-operation ledger",
             ));
         }
@@ -6619,13 +6619,19 @@ mod tests {
         assert_eq!(work.remaining(&limits).expect("initial ledger"), (10, 20));
         work.charge(6, 5, 4, &limits).expect("first line");
         assert_eq!(work.remaining(&limits).expect("remaining ledger"), (4, 11));
-        assert!(work.charge(5, 0, 0, &limits).is_err());
+        assert_eq!(
+            work.charge(5, 0, 0, &limits).unwrap_err().status,
+            Status::Unsupported
+        );
 
         let mut sequential = CaptureSelectorLedger::default();
         sequential
             .charge(1, 8, 9, &limits)
             .expect("first sequential line");
-        assert!(sequential.charge(1, 2, 2, &limits).is_err());
+        assert_eq!(
+            sequential.charge(1, 2, 2, &limits).unwrap_err().status,
+            Status::Unsupported
+        );
     }
 
     #[test]
@@ -6670,6 +6676,7 @@ mod tests {
                 ..RunLimits::default()
             };
             let work = execute_grep_captures(&regex, haystack, &work_one_below).unwrap_err();
+            assert_eq!(work.status, Status::Unsupported);
             assert!(work.message.contains("cumulative public-operation ledger"));
             let sequential_one_below = RunLimits {
                 fre_aggregate_operation_work: haystack.len(),
@@ -6678,6 +6685,7 @@ mod tests {
             };
             let sequential =
                 execute_grep_captures(&regex, haystack, &sequential_one_below).unwrap_err();
+            assert_eq!(sequential.status, Status::Unsupported);
             assert!(
                 sequential
                     .message
@@ -6685,24 +6693,89 @@ mod tests {
             );
         }
 
-        let scalar_patterns = [r"(\pL)".to_string()];
-        let scalar = fre_reducer(
+    }
+
+    #[test]
+    fn scalar_capture_grep_lf_scan_shares_one_work_cap() {
+        let defaults = RunLimits::default();
+        let patterns = [r"(\pL)".to_string()];
+        let (regex, participating) = uniform_capture_scalar_regex(
             CandidateRequest {
                 job_id: "test/scalar-grep-line-preflight",
                 model: "grep-captures",
-                patterns: &scalar_patterns,
-                haystack: layouts[0],
+                patterns: &patterns,
+                haystack: b"a",
                 unicode: true,
                 case_insensitive: false,
             },
-            &RunLimits {
-                fre_aggregate_operation_work: layouts[0].len() - 1,
-                fre_aggregate_sequential_bytes: layouts[0].len(),
-                ..RunLimits::default()
-            },
+            &defaults,
         )
-        .unwrap_err();
-        assert!(scalar.message.contains("cumulative public-operation ledger"));
+        .expect("scalar capture fixture");
+        let groups = u64::try_from(participating + 1).unwrap();
+
+        for bytes in [64, 128, 256] {
+            let no_lines = vec![b'a'; bytes];
+            let many_lines = (0..bytes)
+                .map(|index| if index.is_multiple_of(2) { b'a' } else { b'\n' })
+                .collect::<Vec<_>>();
+            let structural_work = aggregate_run_limits(bytes, regex.build_report(), &defaults)
+                .unwrap()
+                .unicode_scalar
+                .max_work;
+            let exact_work = structural_work.checked_add(bytes).unwrap();
+            for haystack in [&no_lines, &many_lines] {
+                let exact = RunLimits {
+                    fre_aggregate_operation_work: exact_work,
+                    fre_aggregate_sequential_bytes: bytes,
+                    ..RunLimits::default()
+                };
+                let expected = u64::try_from(
+                    haystack.iter().filter(|&&byte| byte == b'a').count(),
+                )
+                .unwrap()
+                .checked_mul(groups)
+                .unwrap();
+                assert_eq!(
+                    execute_uniform_capture_scalar(
+                        &regex,
+                        participating,
+                        haystack,
+                        true,
+                        &exact,
+                    )
+                    .unwrap(),
+                    expected
+                );
+
+                let work_one_below = RunLimits {
+                    fre_aggregate_operation_work: exact_work - 1,
+                    ..exact.clone()
+                };
+                let work = execute_uniform_capture_scalar(
+                    &regex,
+                    participating,
+                    haystack,
+                    true,
+                    &work_one_below,
+                )
+                .unwrap_err();
+                assert_eq!(work.status, Status::Unsupported);
+
+                let sequential_one_below = RunLimits {
+                    fre_aggregate_sequential_bytes: bytes - 1,
+                    ..exact.clone()
+                };
+                let sequential = execute_uniform_capture_scalar(
+                    &regex,
+                    participating,
+                    haystack,
+                    true,
+                    &sequential_one_below,
+                )
+                .unwrap_err();
+                assert_eq!(sequential.status, Status::Unsupported);
+            }
+        }
     }
 
     #[test]
