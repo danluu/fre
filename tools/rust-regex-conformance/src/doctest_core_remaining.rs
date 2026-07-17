@@ -144,9 +144,7 @@ fn empty_iteration() -> Result<String, RemainingCoreRefusal> {
         .map(|result| {
             result
                 .map(|matched| format!("{}-{}", matched.start(), matched.end()))
-                .map_err(|_| {
-                    RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused")
-                })
+                .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 

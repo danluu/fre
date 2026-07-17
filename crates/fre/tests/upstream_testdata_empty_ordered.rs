@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-use fre::{
-    PlanKind, PortableFindIterLimits, PortableTextRegex, RustProfile,
-};
+use fre::{PlanKind, PortableFindIterLimits, PortableTextRegex, RustProfile};
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
 const UPSTREAM_PACKAGE_SHA256: &str =

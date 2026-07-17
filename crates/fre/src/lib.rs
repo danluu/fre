@@ -133,8 +133,8 @@ pub use set::{
 };
 pub use split::{AggregateSplit, PortableSplit};
 pub use text::{
-    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextProof,
-    PortableTextMatches, PortableTextRegex, PortableTextSearchError,
+    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextMatches,
+    PortableTextProof, PortableTextRegex, PortableTextSearchError,
 };
 pub use text_set::{
     PORTABLE_TEXT_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableTextRegexSet,
@@ -2714,11 +2714,7 @@ impl PortableRegex {
         haystack: &'h str,
         limits: PortableFindIterLimits,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
-        self.find_iter_with_progress(
-            haystack.as_bytes(),
-            limits,
-            EmptyMatchProgress::Utf8Scalar,
-        )
+        self.find_iter_with_progress(haystack.as_bytes(), limits, EmptyMatchProgress::Utf8Scalar)
     }
 
     fn find_iter_with_progress<'r, 'h>(
