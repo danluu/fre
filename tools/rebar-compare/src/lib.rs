@@ -3091,7 +3091,7 @@ fn execute_uniform_capture_scalar(
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
     let operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
-    let result = regex.count(haystack, &operation_limits).map_err(|error| {
+    let result = regex.count(haystack, operation_limits).map_err(|error| {
         aggregate_execution_error(
             &error.source,
             format!("FRE uniform capture scalar count refused execution: {error}"),
@@ -6536,9 +6536,11 @@ mod tests {
             CURRENT_FRE_CAPTURE_SCALAR_PLAN,
         );
 
-        let mut selector_starved = RunLimits::default();
-        selector_starved.fre_capture_scalar_planner_work = 0;
-        selector_starved.fre_capture_selector_program_bytes = 16 * 1_048_576;
+        let selector_starved = RunLimits {
+            fre_capture_scalar_planner_work: 0,
+            fre_capture_selector_program_bytes: 16 * 1_048_576,
+            ..RunLimits::default()
+        };
         let refusal = current_fre(
             "count-captures",
             &[overlapping.to_string()],
