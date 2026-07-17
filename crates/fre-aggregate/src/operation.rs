@@ -347,12 +347,8 @@ impl CompiledRegex {
             });
         }
         let mut accounting = ExecutionAccounting::default();
-        let utf8_validation = preflight_unicode_word_utf8(
-            &self.program,
-            haystack,
-            limits,
-            &mut accounting,
-        )?;
+        let utf8_validation =
+            preflight_unicode_word_utf8(&self.program, haystack, limits, &mut accounting)?;
         let mut engine_limits = limits;
         engine_limits.max_work = engine_limits.max_work.checked_sub(utf8_validation).ok_or(
             Error::ArithmeticOverflow {
@@ -606,17 +602,9 @@ impl Requirements {
     ) -> Result<Self, Error> {
         self.work_bound = add(self.work_bound, work, Resource::ExecutionWork)?;
         if !OBSERVED_WORK {
-            enforce(
-                self.work_bound,
-                limits.max_work,
-                Resource::ExecutionWork,
-            )?;
+            enforce(self.work_bound, limits.max_work, Resource::ExecutionWork)?;
         }
-        self.sequential_bound = add(
-            self.sequential_bound,
-            work,
-            Resource::SequentialBytes,
-        )?;
+        self.sequential_bound = add(self.sequential_bound, work, Resource::SequentialBytes)?;
         enforce(
             self.sequential_bound,
             limits.max_sequential_bytes,

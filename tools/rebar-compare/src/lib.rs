@@ -2968,10 +2968,7 @@ struct CaptureSelectorLedger {
 }
 
 impl CaptureSelectorLedger {
-    fn preflight_lf_scan(
-        haystack_len: usize,
-        limits: &RunLimits,
-    ) -> Result<Self, ExecutionError> {
+    fn preflight_lf_scan(haystack_len: usize, limits: &RunLimits) -> Result<Self, ExecutionError> {
         if haystack_len > limits.fre_aggregate_operation_work {
             return Err(ExecutionError::unsupported(format!(
                 "FRE grep-captures LF scan requires {haystack_len} work, limit is {}",
@@ -3162,10 +3159,8 @@ fn execute_uniform_capture_scalar(
     let mut operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
     if let Some(line_scan) = line_scan {
         let (remaining_work, _) = line_scan.remaining(limits)?;
-        operation_limits.unicode_scalar.max_work = operation_limits
-            .unicode_scalar
-            .max_work
-            .min(remaining_work);
+        operation_limits.unicode_scalar.max_work =
+            operation_limits.unicode_scalar.max_work.min(remaining_work);
     }
     let result = regex.count(haystack, operation_limits).map_err(|error| {
         aggregate_execution_error(
@@ -6689,8 +6684,14 @@ mod tests {
             .expect("uniform capture fixture");
         let layouts: [&[u8]; 2] = [b"aaaaaaaa", b"a\na\na\na\n"];
         assert_eq!(layouts[0].len(), layouts[1].len());
-        assert_eq!(execute_grep_captures(&regex, layouts[0], &RunLimits::default()).unwrap(), 16);
-        assert_eq!(execute_grep_captures(&regex, layouts[1], &RunLimits::default()).unwrap(), 8);
+        assert_eq!(
+            execute_grep_captures(&regex, layouts[0], &RunLimits::default()).unwrap(),
+            16
+        );
+        assert_eq!(
+            execute_grep_captures(&regex, layouts[1], &RunLimits::default()).unwrap(),
+            8
+        );
         for haystack in layouts {
             let work_one_below = RunLimits {
                 fre_aggregate_operation_work: haystack.len() - 1,
@@ -6714,7 +6715,6 @@ mod tests {
                     .contains("LF scan requires 8 sequential bytes, limit is 7")
             );
         }
-
     }
 
     #[test]
@@ -6766,14 +6766,8 @@ mod tests {
                 };
                 let expected = u64::try_from(bytes).unwrap();
                 assert_eq!(
-                    execute_uniform_capture_scalar(
-                        &regex,
-                        participating,
-                        haystack,
-                        true,
-                        &exact,
-                    )
-                    .unwrap(),
+                    execute_uniform_capture_scalar(&regex, participating, haystack, true, &exact,)
+                        .unwrap(),
                     expected
                 );
 

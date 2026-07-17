@@ -313,7 +313,9 @@ fn unicode_word_property_is_cached_by_the_budgeted_identity_pass() {
         accounting.program_states
     );
     for pattern in [r"\b", r"\b(?:a|ab|abc|abcd|abcde){1,3}\b"] {
-        let sized = compile_unicode_byte_stable(pattern).unwrap().compile_accounting();
+        let sized = compile_unicode_byte_stable(pattern)
+            .unwrap()
+            .compile_accounting();
         assert_eq!(sized.unicode_word_boundary_checks, sized.program_states);
     }
 
@@ -422,12 +424,7 @@ fn unicode_word_utf8_validation_is_prospectively_charged() {
         let mut one_below_sequential = exact;
         one_below_sequential.max_sequential_bytes -= 1;
         expect_resource(
-            regex.admit_count(
-                haystack,
-                0..haystack.len(),
-                strategy,
-                one_below_sequential,
-            ),
+            regex.admit_count(haystack, 0..haystack.len(), strategy, one_below_sequential),
             Resource::SequentialBytes,
         );
     }
