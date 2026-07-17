@@ -12,10 +12,16 @@
 //! Prospective resource ledger: compiler analysis charges each HIR inspection
 //! (1), fixed branch comparison (2 total), literal-byte/self-overlap comparison
 //! (2 per byte), and canonical range inspection (1 per range) before it occurs,
-//! bounded by `H + 2L + R + 2`. Construction admits `6Q + 64` before validation
-//! or allocation; that charge covers canonical and self-overlap comparisons,
-//! two exact allocations and copies, both Finder preprocessors, eight bitmap
-//! word zero-writes, range writes, branches, and plan publication. Persistent,
+//! bounded by `H + 2L + R + 2`. Construction never trusts an iterator length:
+//! it charges before every `next`, validates each yielded range, and writes its
+//! at-most-four bitmap words in that same single traversal. The fixed 64 units
+//! and eight units per retained prefix byte are admitted before construction;
+//! self-overlap comparisons, iterator traversals, six base units per yielded
+//! range, range comparisons/state writes, and four units per touched bitmap
+//! word are then charged before they occur. This also covers two exact
+//! allocations and copies, both linear Finder
+//! preprocessors, eight bitmap zero-writes, branches, and plan publication.
+//! Thus construction is `O(L + R)`, never `O(L * R)` or `O(R^2)`. Persistent,
 //! retained-capacity, and peak admission is `size_of(plan) + L`; construction
 //! scratch, reserve slack, temporary copies, deduplication storage, UTF-8 or
 //! boundary preprocessing, and data-dependent stack/queue storage are zero;
@@ -43,6 +49,11 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
+
+const FIXED_BUILD_WORK: usize = 64;
+const PREFIX_BUILD_WORK_PER_BYTE: usize = 8;
+const RANGE_ITEM_BASE_WORK: usize = 6;
+const BITMAP_WORK_PER_WORD: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -218,10 +229,14 @@ impl ByteClass {
         Self { words: [0; 4] }
     }
 
-    fn insert_range(&mut self, start: u8, end: u8) {
+    fn insert_range(&mut self, start: u8, end: u8, work: &mut BuildWork) -> Result<(), BuildError> {
         let first_word = usize::from(start) >> 6;
         let last_word = usize::from(end) >> 6;
         for word in first_word..=last_word {
+            // Covers the loop traversal, the two boundary comparisons and the
+            // bitmap word write before any of them occurs. A byte range can
+            // touch at most four words, so this remains O(1) per yielded range.
+            work.charge(BITMAP_WORK_PER_WORD)?;
             let low = if word == first_word {
                 u32::from(start) & 63
             } else {
@@ -234,6 +249,7 @@ impl ByteClass {
             };
             self.words[word] |= u64::MAX << low & u64::MAX >> (63 - high);
         }
+        Ok(())
     }
 
     fn contains(self, byte: u8) -> bool {
@@ -267,31 +283,19 @@ impl PrefixClassAlternationPlan {
         limits: BuildLimits,
     ) -> Result<Self, BuildError>
     where
-        I: Clone + ExactSizeIterator<Item = (u8, u8)>,
+        I: Iterator<Item = (u8, u8)>,
     {
         let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
             BuildError::ArithmeticOverflow {
                 computation: "prefix byte total",
             },
         )?;
-        let class_ranges =
-            ranges[0]
-                .len()
-                .checked_add(ranges[1].len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "class range total",
-                })?;
-        let shape_units =
-            prefix_bytes
-                .checked_add(class_ranges)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "shape units",
-                })?;
-        let work_upper_bound = shape_units
-            .checked_mul(6)
-            .and_then(|work| work.checked_add(64))
+        let mut shape_units = prefix_bytes;
+        let prefix_build_work = prefix_bytes
+            .checked_mul(PREFIX_BUILD_WORK_PER_BYTE)
+            .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
             .ok_or(BuildError::ArithmeticOverflow {
-                computation: "build work upper bound",
+                computation: "fixed and prefix build work",
             })?;
         let persistent_bytes =
             size_of::<Self>()
@@ -303,7 +307,6 @@ impl PrefixClassAlternationPlan {
         let peak_bytes = persistent_bytes;
 
         enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
-        enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
         enforce_build(
             scratch_bytes,
             limits.max_scratch_bytes,
@@ -316,24 +319,68 @@ impl PrefixClassAlternationPlan {
         )?;
         enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
 
+        // This reservation precedes prefix validation, allocation, copying,
+        // bitmap initialization and Finder preprocessing. Range-dependent work
+        // is deliberately not guessed from `size_hint`/`ExactSizeIterator`.
+        let mut work = BuildWork::new(limits.max_build_work);
+        work.charge(prefix_build_work)?;
+
         for alternative in 0..2 {
             let prefix = prefixes[alternative];
             if prefix.is_empty() {
                 return Err(BuildError::EmptyPrefix { alternative });
             }
-            if prefix[1..].contains(&prefix[0]) {
-                return Err(BuildError::SelfOverlappingPrefix { alternative });
+            for &byte in &prefix[1..] {
+                work.charge(1)?;
+                if byte == prefix[0] {
+                    return Err(BuildError::SelfOverlappingPrefix { alternative });
+                }
             }
+        }
+
+        let mut classes = [ByteClass::empty(); 2];
+        let mut class_ranges = 0_usize;
+        for (alternative, mut ranges) in ranges.into_iter().enumerate() {
             let mut previous_end = None;
-            let mut saw_range = false;
-            for (start, end) in ranges[alternative].clone() {
-                saw_range = true;
-                if start > end || previous_end.is_some_and(|previous| previous >= start) {
+            loop {
+                // Charge the traversal before calling user-supplied iterator
+                // code. This includes each yielded item and the terminal None.
+                work.charge(1)?;
+                let Some((start, end)) = ranges.next() else {
+                    break;
+                };
+                // Covers accepting the yielded item, both range/shape counter
+                // writes, their checked arithmetic, the shape-limit comparison
+                // and the previous-range presence branch before processing it.
+                work.charge(RANGE_ITEM_BASE_WORK)?;
+                class_ranges =
+                    class_ranges
+                        .checked_add(1)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "class range total",
+                        })?;
+                shape_units = prefix_bytes.checked_add(class_ranges).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "shape units",
+                    },
+                )?;
+                enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
+
+                work.charge(1)?;
+                if start > end {
                     return Err(BuildError::NonCanonicalClass { alternative });
                 }
+                if let Some(previous) = previous_end {
+                    work.charge(1)?;
+                    if previous >= start {
+                        return Err(BuildError::NonCanonicalClass { alternative });
+                    }
+                }
+                work.charge(1)?;
                 previous_end = Some(end);
+                classes[alternative].insert_range(start, end, &mut work)?;
             }
-            if !saw_range {
+            if previous_end.is_none() {
                 return Err(BuildError::EmptyClass { alternative });
             }
         }
@@ -343,12 +390,6 @@ impl PrefixClassAlternationPlan {
         // words before any of that work occurs.
         let first = copy_prefix(prefixes[0], 0)?;
         let second = copy_prefix(prefixes[1], 1)?;
-        let mut classes = [ByteClass::empty(); 2];
-        for alternative in 0..2 {
-            for (start, end) in ranges[alternative].clone() {
-                classes[alternative].insert_range(start, end);
-            }
-        }
         let alternatives = [
             Alternative {
                 finder: FinderBuilder::new().build_forward_owned(first.into_boxed_slice()),
@@ -365,7 +406,7 @@ impl PrefixClassAlternationPlan {
                 prefix_bytes,
                 class_ranges,
                 shape_units,
-                work_upper_bound,
+                work_upper_bound: work.used(),
                 scratch_bytes,
                 persistent_bytes,
                 peak_bytes,
@@ -567,10 +608,42 @@ fn copy_prefix(prefix: &[u8], alternative: usize) -> Result<Vec<u8>, BuildError>
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BuildWork {
+    used: usize,
+    limit: usize,
+}
+
+impl BuildWork {
+    const fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn charge(&mut self, units: usize) -> Result<(), BuildError> {
+        let needed = self
+            .used
+            .checked_add(units)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "charged build work",
+            })?;
+        if needed > self.limit {
+            return Err(BuildError::WorkLimit {
+                needed,
+                limit: self.limit,
+            });
+        }
+        self.used = needed;
+        Ok(())
+    }
+
+    const fn used(self) -> usize {
+        self.used
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BuildResource {
     Shape,
-    Work,
     Scratch,
     Persistent,
     Peak,
@@ -582,7 +655,6 @@ fn enforce_build(needed: usize, limit: usize, resource: BuildResource) -> Result
     }
     Err(match resource {
         BuildResource::Shape => BuildError::ShapeLimit { needed, limit },
-        BuildResource::Work => BuildError::WorkLimit { needed, limit },
         BuildResource::Scratch => BuildError::ScratchLimit { needed, limit },
         BuildResource::Persistent => BuildError::PersistentLimit { needed, limit },
         BuildResource::Peak => BuildError::PeakLimit { needed, limit },
@@ -615,6 +687,8 @@ fn enforce_reduce(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use regex::bytes::RegexBuilder;
 
     use super::*;
@@ -645,6 +719,54 @@ mod tests {
             .find_iter(haystack)
             .map(|matched| matched.start()..matched.end())
             .collect()
+    }
+
+    struct DeceptiveExactRanges {
+        items: &'static [(u8, u8)],
+        position: usize,
+        next_calls: Rc<Cell<usize>>,
+        len_calls: Rc<Cell<usize>>,
+    }
+
+    impl Iterator for DeceptiveExactRanges {
+        type Item = (u8, u8);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.next_calls.set(self.next_calls.get() + 1);
+            let item = self.items.get(self.position).copied();
+            self.position += usize::from(item.is_some());
+            item
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            // Deliberately violates ExactSizeIterator's semantic contract.
+            // Resource safety must depend on actual traversal, not this claim.
+            (0, Some(0))
+        }
+    }
+
+    impl ExactSizeIterator for DeceptiveExactRanges {
+        fn len(&self) -> usize {
+            self.len_calls.set(self.len_calls.get() + 1);
+            0
+        }
+    }
+
+    fn deceptive_ranges(
+        items: &'static [(u8, u8)],
+    ) -> (DeceptiveExactRanges, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let next_calls = Rc::new(Cell::new(0));
+        let len_calls = Rc::new(Cell::new(0));
+        (
+            DeceptiveExactRanges {
+                items,
+                position: 0,
+                next_calls: Rc::clone(&next_calls),
+                len_calls: Rc::clone(&len_calls),
+            },
+            next_calls,
+            len_calls,
+        )
     }
 
     #[test]
@@ -706,8 +828,9 @@ mod tests {
         }
 
         // Independent Q/2Q/4Q build adversaries use two canonical ranges and
-        // prefix payloads of Q-2. C=6Q+64 gives 160/256/448 at Q=16/32/64.
-        for (q, expected) in [(16, 160), (32, 256), (64, 448)] {
+        // prefix payloads of Q-2. The single-pass charged ledger gives
+        // 9Q+72 = 216/360/648 at Q=16/32/64.
+        for (q, expected) in [(16, 216), (32, 360), (64, 648)] {
             let per_prefix = (q - 2) / 2;
             let mut first = vec![b'b'; per_prefix];
             let mut second = vec![b'd'; per_prefix];
@@ -722,5 +845,76 @@ mod tests {
             assert_eq!(q, scaled.build_accounting().shape_units);
             assert_eq!(expected, scaled.build_accounting().work_upper_bound);
         }
+    }
+
+    #[test]
+    fn deceptive_exact_size_ranges_are_single_pass_and_exactly_charged() {
+        static FIRST: [(u8, u8); 2] = [(b'a', b'm'), (b'n', b'z')];
+        static SECOND: [(u8, u8); 2] = [(b'0', b'4'), (b'5', b'9')];
+
+        let (first, first_next, first_len) = deceptive_ranges(&FIRST);
+        let (second, second_next, second_len) = deceptive_ranges(&SECOND);
+        let baseline = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [first, second],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let accounting = baseline.build_accounting();
+        assert_eq!(4, accounting.class_ranges);
+        assert_eq!(8, accounting.shape_units);
+        assert_eq!(0, first_len.get());
+        assert_eq!(0, second_len.get());
+        assert_eq!(FIRST.len() + 1, first_next.get());
+        assert_eq!(SECOND.len() + 1, second_next.get());
+
+        let (first, _, first_len) = deceptive_ranges(&FIRST);
+        let (second, _, second_len) = deceptive_ranges(&SECOND);
+        let exact = PrefixClassAlternationPlan::build(
+            [b"ab", b"xy"],
+            [first, second],
+            BuildLimits {
+                max_shape_units: accounting.shape_units,
+                max_build_work: accounting.work_upper_bound,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap();
+        assert_eq!(accounting, exact.build_accounting());
+        assert_eq!(0, first_len.get());
+        assert_eq!(0, second_len.get());
+
+        let (first, _, _) = deceptive_ranges(&FIRST);
+        let (second, _, _) = deceptive_ranges(&SECOND);
+        assert!(matches!(
+            PrefixClassAlternationPlan::build(
+                [b"ab", b"xy"],
+                [first, second],
+                BuildLimits {
+                    max_build_work: accounting.work_upper_bound - 1,
+                    ..BuildLimits::unlimited()
+                },
+            ),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == accounting.work_upper_bound
+                    && limit == accounting.work_upper_bound - 1
+        ));
+
+        let (first, _, _) = deceptive_ranges(&FIRST);
+        let (second, _, _) = deceptive_ranges(&SECOND);
+        assert!(matches!(
+            PrefixClassAlternationPlan::build(
+                [b"ab", b"xy"],
+                [first, second],
+                BuildLimits {
+                    max_shape_units: accounting.shape_units - 1,
+                    ..BuildLimits::unlimited()
+                },
+            ),
+            Err(BuildError::ShapeLimit {
+                needed: 8,
+                limit: 7
+            })
+        ));
     }
 }
