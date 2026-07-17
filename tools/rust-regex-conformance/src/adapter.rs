@@ -1872,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_free_fallback_executes_expensive_group_zero_cases_only() {
+    fn native_capture_envelope_and_capture_free_fallback_remain_distinct() {
         let mut case = fixture_case(true, true, None);
         case.unicode = true;
         case.maximum_expected_capture_slots = 1;
@@ -1886,7 +1886,7 @@ mod tests {
         counted.bounds.end = counted.haystack.len();
         assert!(matches!(
             build_text_captures(&case, &counted),
-            TextCaptureBuildAttempt::Unsupported(_)
+            TextCaptureBuildAttempt::Built(_)
         ));
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCapturesIter, &case, &counted),
@@ -1910,25 +1910,60 @@ mod tests {
         unicode.bounds.end = unicode.haystack.len();
         assert!(matches!(
             build_text_captures(&case, &unicode),
-            TextCaptureBuildAttempt::Unsupported(_)
+            TextCaptureBuildAttempt::Built(_)
         ));
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCapturesIter, &case, &unicode),
             AdapterDisposition::Pass { .. }
         ));
 
-        let mut explicit = counted;
-        explicit.patterns = vec![r"(.{1,2500})".to_owned()];
-        explicit.expected[0]
+        let mut explicit_direct = counted.clone();
+        explicit_direct.patterns = vec![r"(.{1,2500})".to_owned()];
+        explicit_direct.expected[0]
             .groups
             .push(Some(ExpectedSpan { start: 0, end: 1 }));
         case.maximum_expected_capture_slots = 2;
         assert!(matches!(
-            build_text_captures(&case, &explicit),
+            build_text_captures(&case, &explicit_direct),
+            TextCaptureBuildAttempt::Built(_)
+        ));
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustTextCapturesIter,
+                &case,
+                &explicit_direct
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut fallback = counted;
+        fallback.patterns = vec![r"^.{1,2501}".to_owned()];
+        case.maximum_expected_capture_slots = 1;
+        assert!(matches!(
+            build_text_captures(&case, &fallback),
             TextCaptureBuildAttempt::Unsupported(_)
         ));
         assert!(matches!(
-            execute_case(AdapterSurface::RustTextCapturesIter, &case, &explicit),
+            execute_case(AdapterSurface::RustTextCapturesIter, &case, &fallback),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut explicit_fallback = fallback;
+        explicit_fallback.patterns = vec![r"(.{1,2501})".to_owned()];
+        explicit_fallback.expected[0]
+            .groups
+            .push(Some(ExpectedSpan { start: 0, end: 1 }));
+        case.maximum_expected_capture_slots = 2;
+        assert!(matches!(
+            build_text_captures(&case, &explicit_fallback),
+            TextCaptureBuildAttempt::Unsupported(_)
+        ));
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustTextCapturesIter,
+                &case,
+                &explicit_fallback
+            ),
             AdapterDisposition::Unsupported { .. }
         ));
     }

@@ -3,7 +3,7 @@
 use std::mem::size_of;
 
 use crate::ast::Assertion;
-use crate::compile::Program;
+use crate::compile::{Program, State};
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{CaptureRecord, GroupRecord, Span, Window};
@@ -259,7 +259,20 @@ fn admit_history_boundaries(
         state_visit_bound,
         limits.max_state_visits,
     )?;
-    let history_node_bound = state_visit_bound;
+    // `add_thread` marks a program counter before dispatch, and one mark
+    // generation spans all closure roots at an input boundary. Therefore a
+    // Save instruction can append at most one history node per boundary.
+    // Charging every possible state visit as a history append needlessly
+    // refuses large capture-free programs whose only Save instructions are
+    // the two group-zero tags inserted by the compiler.
+    let save_states = program
+        .states
+        .iter()
+        .filter(|state| matches!(state, State::Save { .. }))
+        .count();
+    let history_node_bound = save_states
+        .checked_mul(boundaries)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
     check(
         ResourceKind::HistoryNodes,
         history_node_bound,

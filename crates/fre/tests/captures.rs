@@ -133,6 +133,50 @@ fn reference_text_records(pattern: &str, haystack: &str) -> Vec<CaptureFixture> 
 }
 
 #[test]
+fn pinned_expensive_counted_text_captures_match_upstream() {
+    // Pinned corpus identities:
+    // - expensive/regression-many-repeat-no-stack-overflow
+    // - expensive/backtrack-blow-visited-capacity
+    let cases = [
+        (r"^.{1,2500}", "a"),
+        (
+            r"\pL{50}",
+            "abcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyZZ",
+        ),
+    ];
+    for (pattern, haystack) in cases {
+        let regex = PortableTextCaptureBuilder::new(pattern)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let report = regex
+            .captures_iter(haystack, CaptureAggregateLimits::default())
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let actual = report
+            .captures
+            .iter()
+            .map(|captures| {
+                captures
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.index,
+                            group.name.clone(),
+                            group.span.map(|span| (span.start, span.end)),
+                        )
+                    })
+                    .collect::<CaptureFixture>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            reference_text_records(pattern, haystack),
+            "{pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn exact_hir_text_captures_preserve_utf8_empty_and_group_boundaries() {
     let cases = [
         (r"(a){0}(a)", "a"),

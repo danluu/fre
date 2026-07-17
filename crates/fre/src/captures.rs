@@ -88,9 +88,21 @@ pub struct CaptureBuildLimits {
 
 impl Default for CaptureBuildLimits {
     fn default() -> Self {
+        // These checked ceilings admit the pinned 2,500-scalar dot repeat and
+        // 50-scalar Unicode-letter repeat. They do not preallocate their
+        // maximum state or patch capacities.
         let engine = EngineBuildLimits {
             max_ast_nodes: 65_536,
+            max_repeat_expansion: 2_500,
+            max_states: 262_144,
+            max_patch_entries: 262_144,
             ..EngineBuildLimits::default()
+        };
+        let selector = SelectorCompileLimits {
+            max_repeat_bound: 2_500,
+            max_program_states: 262_144,
+            max_temporary_states: 262_144,
+            ..SelectorCompileLimits::default()
         };
         Self {
             admission: AdmissionPolicy::default(),
@@ -98,7 +110,7 @@ impl Default for CaptureBuildLimits {
             max_hir_work: 1_000_000,
             max_hir_depth: 250,
             engine,
-            selector: SelectorCompileLimits::default(),
+            selector,
         }
     }
 }
