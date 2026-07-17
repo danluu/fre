@@ -558,6 +558,9 @@ impl ReverseRowRequirements {
         let bits = add(program.split_count, 1, Resource::LogBytes)?;
         let decision_record = ceil_div(bits, 8)?;
         let endpoint_record = encoded_width(boundaries);
+        // Equal widths keep the established split/replay certificate. The
+        // endpoint form is selected only when it strictly reduces the bounded
+        // log, containing this construction change to the refusal it solves.
         let (storage, record_bytes, replay_bound) = if endpoint_record < decision_record {
             (RowStorage::ReachableEndpoints, endpoint_record, 0)
         } else {
