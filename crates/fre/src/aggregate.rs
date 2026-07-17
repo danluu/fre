@@ -935,23 +935,23 @@ impl AggregateBuilder {
                     limits.max_unicode_scalar_planner_work,
                     operation == AggregateOperation::SpanSum,
                 )
-                    .map_err(|error| match error {
-                        UnicodeScalarInspectionError::WorkLimit { needed, limit } => {
-                            AggregateBuildError::UnicodeScalarPlannerWorkLimit {
-                                operation,
-                                selection,
-                                needed,
-                                limit,
-                            }
+                .map_err(|error| match error {
+                    UnicodeScalarInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
                         }
-                        UnicodeScalarInspectionError::Overflow => {
-                            AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "Unicode scalar inspection accounting overflow",
-                            }
+                    }
+                    UnicodeScalarInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "Unicode scalar inspection accounting overflow",
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
