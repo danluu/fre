@@ -6,6 +6,7 @@ use fre::{
     AggregateStrategy, CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
+use regex_automata::meta::Regex as MetaRegex;
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -485,6 +486,29 @@ fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
     assert_eq!(88, patterns.len());
     assert_eq!(150_600, haystack.len());
 
+    let oracle = MetaRegex::builder()
+        .configure(MetaRegex::config().utf8_empty(false))
+        .syntax(
+            regex_automata::util::syntax::Config::new()
+                .utf8(false)
+                .unicode(false)
+                .case_insensitive(false),
+        )
+        .build_many(&patterns)
+        .unwrap();
+    let (oracle_count, oracle_span_sum) = oracle
+        .find_iter(&haystack)
+        .try_fold((0_u64, 0_u64), |(count, span_sum), matched| {
+            Some((
+                count.checked_add(1)?,
+                span_sum.checked_add(
+                    u64::try_from(matched.end().checked_sub(matched.start())?).ok()?,
+                )?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((62_400, 150_600), (oracle_count, oracle_span_sum));
+
     let count = AggregateManyBuilder::new(&patterns)
         .profile(RustProfile::rebar_1_12_4())
         .unicode(false)
@@ -508,13 +532,13 @@ fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
         span_sum.build_report().plan
     );
     assert_eq!(
-        124_800,
+        oracle_count,
         count
             .count_value(&haystack, AggregateManyRunLimits::default())
             .unwrap()
     );
     assert_eq!(
-        150_600,
+        oracle_span_sum,
         span_sum
             .span_sum_value(&haystack, AggregateManyRunLimits::default())
             .unwrap()
