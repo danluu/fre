@@ -1318,6 +1318,80 @@ fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions()
 }
 
 #[test]
+fn ordered_captured_unicode_repetitions_use_one_bounded_scalar_run() {
+    // Authenticated Rebar obligations:
+    // - unicode/overlapping-words/english@rust/regex
+    // - unicode/overlapping-words/russian@rust/regex
+    let pattern = r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})";
+    let limits = AggregateBuildLimits {
+        max_unicode_scalar_planner_work: 8_192,
+        ..AggregateBuildLimits::default()
+    };
+    let regex = aggregate_builder(pattern)
+        .unicode(true)
+        .limits(limits)
+        .build_count()
+        .expect("uniform captured alternation");
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert_eq!(regex.build_report().captures_erased, 10);
+    assert!(matches!(
+        regex.build_report().plan_identity,
+        AggregatePlanIdentity::UnicodeScalar(identity)
+            if identity.semantics
+                == AggregateUnicodeScalarSemantics::UnicodeOnUniformCapturedAlternationRepeatedUtf8False
+                && identity.participating_captures_per_match == 1
+                && matches!(
+                    identity.kernel.repetition,
+                    fre::UnicodeScalarAggregateRepetition::RepeatedGreedy {
+                        minimum: 5,
+                        maximum: Some(14),
+                    }
+                )
+    ));
+    for haystack in [
+        "abcdefghijklmn--abcde--абвгдежзийклмн".as_bytes(),
+        "abcd\nабвгде\r\nabcdefghijklmnop".as_bytes(),
+        b"\xFFabcdefghijklmn\x80abcde".as_slice(),
+    ] {
+        let expected = u64::try_from(upstream_profile(pattern, haystack, false, true).len())
+            .expect("upstream count");
+        assert_eq!(
+            regex
+                .count_value(haystack, AggregateRunLimits::default())
+                .expect("scalar count"),
+            expected,
+            "{haystack:?}"
+        );
+    }
+
+    for ineligible in [
+        r"(\p{L}{13})|(\p{L}{14})",
+        r"(\p{L}{14})|(\p{L}{12})",
+        r"(\p{L}{2})|(\p{N}{1})",
+        r"((\p{L}{2}))|(\p{L}{1})",
+        r"([\s\S]{2})|([\s\S]{1})",
+        r"(\p{L}{2}?)|(\p{L}{1})",
+    ] {
+        let fallback = aggregate_builder(ineligible)
+            .unicode(true)
+            .limits(limits)
+            .build_count();
+        match fallback {
+            Ok(fallback) => assert_ne!(
+                fallback.build_report().plan,
+                AggregatePlanKind::UnicodeScalarClass,
+                "ineligible normalization {ineligible:?}"
+            ),
+            Err(AggregateBuildError::ContinuationCompile { .. }) => {}
+            Err(error) => panic!("unexpected fallback {ineligible:?}: {error}"),
+        }
+    }
+}
+
+#[test]
 fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     let pattern = r"(?P<scalar>\pL)";
     let haystack = "A雪1δ".as_bytes();

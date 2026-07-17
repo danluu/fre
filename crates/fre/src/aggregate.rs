@@ -36,7 +36,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 10;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 11;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -143,12 +143,21 @@ pub enum AggregateUnicodeScalarSemantics {
     /// lower-bounded repetition. Bounds remain symbolic in the direct
     /// deterministic reducer.
     UnicodeOnRootClassRepeatedUtf8False,
+    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to an
+    /// ordered alternation of one-capture fixed repetitions over one identical
+    /// scalar class. Descending consecutive bounds are equivalent to one
+    /// greedy bounded repetition, and exactly one user capture participates
+    /// in every nonempty match.
+    UnicodeOnUniformCapturedAlternationRepeatedUtf8False,
 }
 
 /// Facade identity for the construction-selected direct scalar reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateUnicodeScalarIdentity {
     pub semantics: AggregateUnicodeScalarSemantics,
+    /// User capture groups proved to participate in every emitted match.
+    /// Group zero is deliberately excluded.
+    pub participating_captures_per_match: usize,
     pub kernel: UnicodeScalarAggregateOperationIdentity,
 }
 
@@ -960,6 +969,8 @@ impl AggregateBuilder {
             Some(UnicodeScalarInspection::Eligible {
                 class,
                 repetition,
+                semantics,
+                participating_captures_per_match,
                 work,
                 hir_nodes,
                 captures,
@@ -1065,22 +1076,9 @@ impl AggregateBuilder {
                             semantics: if nullable_greedy_span_sum {
                                 AggregateUnicodeScalarSemantics::UnicodeOnRootClassZeroOrMoreGreedySpanSumUtf8False
                             } else {
-                                match repetition {
-                                    UnicodeScalarAggregateRepetition::ExactlyOne => {
-                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
-                                    }
-                                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
-                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
-                                    }
-                                    UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
-                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
-                                    }
-                                    UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
-                                    | UnicodeScalarAggregateRepetition::RepeatedLazy { .. } => {
-                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
-                                    }
-                                }
+                                semantics
                             },
+                            participating_captures_per_match,
                             kernel,
                         },
                     ),
@@ -1594,6 +1592,8 @@ enum UnicodeScalarInspection<'a> {
     Eligible {
         class: &'a ClassUnicode,
         repetition: UnicodeScalarAggregateRepetition,
+        semantics: AggregateUnicodeScalarSemantics,
+        participating_captures_per_match: usize,
         work: usize,
         hir_nodes: usize,
         captures: usize,
@@ -1614,6 +1614,9 @@ fn inspect_unicode_scalar_class(
     limit: usize,
     allow_nullable_greedy_span_sum: bool,
 ) -> Result<UnicodeScalarInspection<'_>, UnicodeScalarInspectionError> {
+    if let HirKind::Alternation(alternatives) = hir.kind() {
+        return inspect_uniform_captured_scalar_alternation(alternatives, limit);
+    }
     let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
@@ -1672,6 +1675,22 @@ fn inspect_unicode_scalar_class(
                     return Ok(UnicodeScalarInspection::Eligible {
                         class,
                         repetition,
+                        semantics: match repetition {
+                            UnicodeScalarAggregateRepetition::ExactlyOne => {
+                                AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
+                            }
+                            UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
+                                AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
+                            }
+                            UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
+                                AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
+                            }
+                            UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
+                            | UnicodeScalarAggregateRepetition::RepeatedLazy { .. } => {
+                                AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
+                            }
+                        },
+                        participating_captures_per_match: captures,
                         work,
                         hir_nodes,
                         captures,
@@ -1684,6 +1703,8 @@ fn inspect_unicode_scalar_class(
                         return Ok(UnicodeScalarInspection::Eligible {
                             class,
                             repetition,
+                            semantics: AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False,
+                            participating_captures_per_match: captures,
                             work,
                             hir_nodes,
                             captures,
@@ -1696,6 +1717,96 @@ fn inspect_unicode_scalar_class(
             _ => return Ok(UnicodeScalarInspection::Ineligible { work }),
         }
     }
+}
+
+fn inspect_uniform_captured_scalar_alternation(
+    alternatives: &[Hir],
+    limit: usize,
+) -> Result<UnicodeScalarInspection<'_>, UnicodeScalarInspectionError> {
+    let mut work = 0_usize;
+    let mut hir_nodes = 1_usize;
+    let mut captures = 0_usize;
+    charge_unicode_scalar_inspection_work(&mut work, limit)?;
+    if alternatives.len() < 2 {
+        return Ok(UnicodeScalarInspection::Ineligible { work });
+    }
+
+    let mut shared_class = None::<&ClassUnicode>;
+    let mut maximum = None::<u32>;
+    let mut previous = None::<u32>;
+    for alternative in alternatives {
+        charge_unicode_scalar_inspection_work(&mut work, limit)?;
+        hir_nodes = hir_nodes
+            .checked_add(1)
+            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+        let HirKind::Capture(capture) = alternative.kind() else {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        };
+        captures = captures
+            .checked_add(1)
+            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+
+        charge_unicode_scalar_inspection_work(&mut work, limit)?;
+        hir_nodes = hir_nodes
+            .checked_add(1)
+            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+        let HirKind::Repetition(repeated) = capture.sub.kind() else {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        };
+        if repeated.min == 0 || repeated.max != Some(repeated.min) || !repeated.greedy {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        }
+        if let Some(previous) = previous {
+            if previous.checked_sub(1) != Some(repeated.min) {
+                return Ok(UnicodeScalarInspection::Ineligible { work });
+            }
+        } else {
+            maximum = Some(repeated.min);
+        }
+        previous = Some(repeated.min);
+
+        charge_unicode_scalar_inspection_work(&mut work, limit)?;
+        hir_nodes = hir_nodes
+            .checked_add(1)
+            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+        let HirKind::Class(Class::Unicode(class)) = repeated.sub.kind() else {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        };
+        if class.ranges().is_empty() {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        }
+        if class.ranges().iter().any(|range| {
+            (range.start() <= '\n' && '\n' <= range.end())
+                || (range.start() <= '\r' && '\r' <= range.end())
+        }) {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        }
+        for _ in class.ranges() {
+            charge_unicode_scalar_inspection_work(&mut work, limit)?;
+        }
+        if shared_class.is_some_and(|shared| shared != class) {
+            return Ok(UnicodeScalarInspection::Ineligible { work });
+        }
+        shared_class.get_or_insert(class);
+    }
+
+    let Some(class) = shared_class else {
+        return Ok(UnicodeScalarInspection::Ineligible { work });
+    };
+    let Some(minimum) = previous else {
+        return Ok(UnicodeScalarInspection::Ineligible { work });
+    };
+    Ok(UnicodeScalarInspection::Eligible {
+        class,
+        repetition: UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum },
+        semantics:
+            AggregateUnicodeScalarSemantics::UnicodeOnUniformCapturedAlternationRepeatedUtf8False,
+        participating_captures_per_match: 1,
+        work,
+        hir_nodes,
+        captures,
+        nullable_greedy_span_sum: false,
+    })
 }
 
 fn charge_unicode_scalar_inspection_work(
