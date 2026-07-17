@@ -1002,9 +1002,23 @@ impl AggregateManyPlan {
             AggregateManyEngine::OrderedLiteralCount(_) => {
                 self.count(haystack, limits).map(|result| result.value)
             }
-            AggregateManyEngine::Continuation(engine) => self
-                .admit_continuation_count(engine, haystack, limits.continuation)
-                .map(|(_, value)| value),
+            AggregateManyEngine::Continuation(engine) => {
+                let value = engine
+                    .count_value(
+                        haystack,
+                        0..haystack.len(),
+                        self.strategy,
+                        limits.continuation,
+                    )
+                    .map_err(|source| {
+                        self.execution_error(AggregateManyExecutionSource::Continuation(source))
+                    })?;
+                u64::try_from(value).map_err(|_| {
+                    self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                        "continuation count does not fit u64",
+                    ))
+                })
+            }
             AggregateManyEngine::OrderedLiteralSpanSum(_) => Err(self.execution_error(
                 AggregateManyExecutionSource::InternalInvariant(
                     "count operation retained a span-sum engine",
@@ -1049,6 +1063,24 @@ impl AggregateManyPlan {
             ))
         })?;
         Ok((admitted, value))
+    }
+
+    fn continuation_span_sum_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: OperationLimits,
+    ) -> Result<u64, AggregateManyExecutionError> {
+        let value = engine
+            .span_sum_value(haystack, 0..haystack.len(), self.strategy, limits)
+            .map_err(|source| {
+                self.execution_error(AggregateManyExecutionSource::Continuation(source))
+            })?;
+        u64::try_from(value).map_err(|_| {
+            self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                "continuation span sum does not fit u64",
+            ))
+        })
     }
 }
 
@@ -1205,10 +1237,10 @@ impl AggregateManySpanSumRegex {
             AggregateManyEngine::OrderedLiteralSpanSum(_) => {
                 self.span_sum(haystack, limits).map(|result| result.value)
             }
-            AggregateManyEngine::Continuation(engine) => self
-                .0
-                .admit_continuation_span_sum(engine, haystack, limits.continuation)
-                .map(|(_, value)| value),
+            AggregateManyEngine::Continuation(engine) => {
+                self.0
+                    .continuation_span_sum_value(engine, haystack, limits.continuation)
+            }
             AggregateManyEngine::OrderedLiteralCount(_) => {
                 Err(self
                     .0

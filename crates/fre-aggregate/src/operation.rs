@@ -211,7 +211,8 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<AdmittedSpans, Error> {
-        let result = self.execute(haystack, range, strategy, OperationKind::Spans, limits)?;
+        let result =
+            self.execute::<false>(haystack, range, strategy, OperationKind::Spans, limits)?;
         Ok(AdmittedSpans {
             common: Common {
                 certificate: result.certificate,
@@ -230,7 +231,8 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<AdmittedCount, Error> {
-        let result = self.execute(haystack, range, strategy, OperationKind::Count, limits)?;
+        let result =
+            self.execute::<false>(haystack, range, strategy, OperationKind::Count, limits)?;
         Ok(AdmittedCount {
             value: result.summary.matches,
             common: Common {
@@ -249,7 +251,8 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<AdmittedSpanSum, Error> {
-        let result = self.execute(haystack, range, strategy, OperationKind::Sum, limits)?;
+        let result =
+            self.execute::<false>(haystack, range, strategy, OperationKind::Sum, limits)?;
         Ok(AdmittedSpanSum {
             value: result.summary.span_sum,
             common: Common {
@@ -260,11 +263,39 @@ impl CompiledRegex {
         })
     }
 
+    /// Evaluate a complete match-count reduction while enforcing execution
+    /// work against the exact observed charge instead of the conservative
+    /// replay upper bound used by an admitted diagnostic result.
+    pub fn count_value(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<usize, Error> {
+        self.execute::<true>(haystack, range, strategy, OperationKind::Count, limits)
+            .map(|result| result.summary.matches)
+    }
+
+    /// Evaluate a complete checked matched-byte sum while enforcing execution
+    /// work against the exact observed charge instead of the conservative
+    /// replay upper bound used by an admitted diagnostic result.
+    pub fn span_sum_value(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<usize, Error> {
+        self.execute::<true>(haystack, range, strategy, OperationKind::Sum, limits)
+            .map(|result| result.summary.span_sum)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "whole-operation admission keeps failure-before-publication ordering auditable"
     )]
-    fn execute(
+    fn execute<const OBSERVED_WORK: bool>(
         &self,
         haystack: &[u8],
         range: Range<usize>,
@@ -288,9 +319,15 @@ impl CompiledRegex {
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
         enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
         let passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let requirements = Requirements::new(&self.program, boundaries, strategy, passes, limits)?;
+        let requirements = Requirements::new::<OBSERVED_WORK>(
+            &self.program,
+            boundaries,
+            strategy,
+            passes,
+            limits,
+        )?;
         let mut accounting = ExecutionAccounting::default();
-        let mut engine = Engine::build(
+        let mut engine = Engine::build::<OBSERVED_WORK>(
             &self.program,
             local,
             assertion_context,
@@ -299,11 +336,12 @@ impl CompiledRegex {
             limits,
             &mut accounting,
         )?;
-        let summary = engine.scan(
+        let summary = engine.scan::<OBSERVED_WORK>(
             &self.program,
             local,
             assertion_context,
             requirements.work_bound,
+            limits.max_work,
             &mut accounting,
             |_| Ok(()),
         )?;
@@ -356,11 +394,12 @@ impl CompiledRegex {
             )?;
             let allocated_peak = engine.peak_with_output(allocated_output_bytes)?;
             enforce(allocated_peak, limits.max_peak_bytes, Resource::PeakBytes)?;
-            let repeated = engine.scan(
+            let repeated = engine.scan::<OBSERVED_WORK>(
                 &self.program,
                 local,
                 assertion_context,
                 requirements.work_bound,
+                limits.max_work,
                 &mut accounting,
                 |span| {
                     spans.push(span);
@@ -443,7 +482,7 @@ struct Requirements {
 }
 
 impl Requirements {
-    fn new(
+    fn new<const OBSERVED_WORK: bool>(
         program: &Program,
         boundaries: usize,
         strategy: Strategy,
@@ -527,7 +566,9 @@ impl Requirements {
             replay,
             Resource::ExecutionWork,
         )?;
-        enforce(work_bound, limits.max_work, Resource::ExecutionWork)?;
+        if !OBSERVED_WORK {
+            enforce(work_bound, limits.max_work, Resource::ExecutionWork)?;
+        }
         Ok(Self {
             table_cells,
             record_bytes,
@@ -544,7 +585,7 @@ enum Engine {
 }
 
 impl Engine {
-    fn build(
+    fn build<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -554,7 +595,7 @@ impl Engine {
         accounting: &mut ExecutionAccounting,
     ) -> Result<Self, Error> {
         match strategy {
-            Strategy::FullTable => FullTable::build(
+            Strategy::FullTable => FullTable::build::<OBSERVED_WORK>(
                 program,
                 haystack,
                 assertions,
@@ -563,7 +604,7 @@ impl Engine {
                 accounting,
             )
             .map(Self::Full),
-            Strategy::ReverseSequentialRows => RowStore::build(
+            Strategy::ReverseSequentialRows => RowStore::build::<OBSERVED_WORK>(
                 program,
                 haystack,
                 assertions,
@@ -575,36 +616,39 @@ impl Engine {
         }
     }
 
-    fn scan(
+    fn scan<const OBSERVED_WORK: bool>(
         &mut self,
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
         admitted_work_bound: usize,
+        caller_work_limit: usize,
         accounting: &mut ExecutionAccounting,
         mut emit: impl FnMut(Span) -> Result<(), Error>,
     ) -> Result<ScanSummary, Error> {
         match self {
-            Self::Full(table) => scan_sequence(
+            Self::Full(table) => scan_sequence::<OBSERVED_WORK>(
                 haystack.len(),
                 assertions.base(),
                 accounting,
                 admitted_work_bound,
+                caller_work_limit,
                 |start, _| table.selected(program, start),
                 &mut emit,
             ),
             Self::Rows(store) => {
                 let mut reader = store.reader();
-                scan_sequence(
+                scan_sequence::<OBSERVED_WORK>(
                     haystack.len(),
                     assertions.base(),
                     accounting,
                     admitted_work_bound,
+                    caller_work_limit,
                     |start, accounting| {
                         if !reader.root(start, accounting)? {
                             return Ok(None);
                         }
-                        RowStore::replay(
+                        RowStore::replay::<OBSERVED_WORK>(
                             program,
                             haystack,
                             assertions,
@@ -612,6 +656,7 @@ impl Engine {
                             &mut reader,
                             accounting,
                             admitted_work_bound,
+                            caller_work_limit,
                         )
                         .map(Some)
                     },
@@ -647,7 +692,7 @@ struct FullTable {
 }
 
 impl FullTable {
-    fn build(
+    fn build<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -690,7 +735,11 @@ impl FullTable {
             let next_row = later_rows.get(..states).unwrap_or(&[]);
             let input = haystack.get(position).copied();
             for &pc in &program.epsilon_order {
-                charge_state(accounting, requirements.work_bound);
+                charge_state::<OBSERVED_WORK>(
+                    accounting,
+                    requirements.work_bound,
+                    limits.max_work,
+                )?;
                 let value = match program.instruction(pc)? {
                     Inst::Unfilled => {
                         return Err(Error::InternalInvariant("unfilled execution state"));
@@ -698,7 +747,11 @@ impl FullTable {
                     Inst::Fail => 0,
                     Inst::Match => encode(position)?,
                     Inst::Consume { bytes, next } => {
-                        charge_transition(accounting, requirements.work_bound);
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
                         if input.is_some_and(|byte| bytes.contains(byte)) {
                             next_row[*next]
                         } else {
@@ -706,7 +759,11 @@ impl FullTable {
                         }
                     }
                     Inst::Assert { assertion, next } => {
-                        charge_assertion(accounting, requirements.work_bound);
+                        charge_assertion::<OBSERVED_WORK>(
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
                         if assertions.is_match(*assertion, position)? {
                             row[*next]
                         } else {
@@ -717,12 +774,20 @@ impl FullTable {
                         preferred,
                         fallback,
                     } => {
-                        charge_transition(accounting, requirements.work_bound);
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
                         let selected = row[*preferred];
                         if selected != 0 {
                             selected
                         } else {
-                            charge_transition(accounting, requirements.work_bound);
+                            charge_transition::<OBSERVED_WORK>(
+                                accounting,
+                                requirements.work_bound,
+                                limits.max_work,
+                            )?;
                             row[*fallback]
                         }
                     }
@@ -764,7 +829,7 @@ impl RowStore {
         clippy::too_many_lines,
         reason = "row construction keeps fixed-buffer lifetime and accounting in one audit unit"
     )]
-    fn build(
+    fn build<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -808,7 +873,7 @@ impl RowStore {
             let terminal_record = store
                 .get_mut(..write_offset)
                 .ok_or(Error::InternalInvariant("terminal row outside row log"))?;
-            Self::build_row::<false>(
+            Self::build_row::<false, OBSERVED_WORK>(
                 program,
                 assertions,
                 haystack.len(),
@@ -818,6 +883,7 @@ impl RowStore {
                 terminal_record,
                 accounting,
                 requirements.work_bound,
+                limits.max_work,
             )?;
         }
         accounting.sequential_bytes_written = add(
@@ -832,7 +898,7 @@ impl RowStore {
             let record = store
                 .get_mut(write_offset..end)
                 .ok_or(Error::InternalInvariant("row-log write outside store"))?;
-            Self::build_row::<true>(
+            Self::build_row::<true, OBSERVED_WORK>(
                 program,
                 assertions,
                 position,
@@ -842,6 +908,7 @@ impl RowStore {
                 record,
                 accounting,
                 requirements.work_bound,
+                limits.max_work,
             )?;
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
@@ -871,7 +938,7 @@ impl RowStore {
         clippy::too_many_arguments,
         reason = "the specialized row loop keeps borrowed buffers and exact accounting explicit"
     )]
-    fn build_row<const HAS_INPUT: bool>(
+    fn build_row<const HAS_INPUT: bool, const OBSERVED_WORK: bool>(
         program: &Program,
         assertions: AssertionContext<'_>,
         position: usize,
@@ -881,16 +948,21 @@ impl RowStore {
         record: &mut [u8],
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        caller_work_limit: usize,
     ) -> Result<(), Error> {
         for &pc in &program.epsilon_order {
-            charge_state(accounting, admitted_work_bound);
+            charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             let value = match program.instruction(pc)? {
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant("unfilled execution state"));
                 }
                 Inst::Fail => 0,
                 Inst::Consume { bytes, next } => {
-                    charge_transition(accounting, admitted_work_bound);
+                    charge_transition::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
                     if HAS_INPUT && bytes.contains(input) {
                         next_row[*next]
                     } else {
@@ -899,7 +971,11 @@ impl RowStore {
                 }
                 Inst::Match => encode(position)?,
                 Inst::Assert { assertion, next } => {
-                    charge_assertion(accounting, admitted_work_bound);
+                    charge_assertion::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
                     if assertions.is_match(*assertion, position)? {
                         row[*next]
                     } else {
@@ -910,7 +986,11 @@ impl RowStore {
                     preferred,
                     fallback,
                 } => {
-                    charge_transition(accounting, admitted_work_bound);
+                    charge_transition::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
                     let preferred_value = row[*preferred];
                     let rank = program.split_rank[pc];
                     if rank == NO_SPLIT_RANK {
@@ -920,7 +1000,11 @@ impl RowStore {
                         set_bit(record, rank)?;
                         preferred_value
                     } else {
-                        charge_transition(accounting, admitted_work_bound);
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
                         row[*fallback]
                     }
                 }
@@ -944,7 +1028,7 @@ impl RowStore {
         }
     }
 
-    fn replay(
+    fn replay<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -952,11 +1036,12 @@ impl RowStore {
         reader: &mut RowReader<'_>,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        caller_work_limit: usize,
     ) -> Result<usize, Error> {
         let mut pc = program.entry;
         let mut position = start;
         loop {
-            charge_replay(accounting, admitted_work_bound);
+            charge_replay::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             match program.instruction(pc)? {
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant("unfilled replay state"));
@@ -975,7 +1060,11 @@ impl RowStore {
                     pc = *next;
                 }
                 Inst::Assert { assertion, next } => {
-                    charge_assertion(accounting, admitted_work_bound);
+                    charge_assertion::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
                     if !assertions.is_match(*assertion, position)? {
                         return Err(Error::InternalInvariant(
                             "row log selected failing assertion",
@@ -1076,11 +1165,12 @@ impl RowReader<'_> {
     }
 }
 
-fn scan_sequence(
+fn scan_sequence<const OBSERVED_WORK: bool>(
     haystack_len: usize,
     base: usize,
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
+    caller_work_limit: usize,
     mut selected: impl FnMut(usize, &mut ExecutionAccounting) -> Result<Option<usize>, Error>,
     emit: &mut impl FnMut(Span) -> Result<(), Error>,
 ) -> Result<ScanSummary, Error> {
@@ -1093,7 +1183,7 @@ fn scan_sequence(
             if start > haystack_len {
                 break None;
             }
-            charge_root(accounting, admitted_work_bound);
+            charge_root::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             if let Some(end) = selected(start, accounting)? {
                 if end < start || end > haystack_len {
                     return Err(Error::InternalInvariant("selected endpoint outside input"));
@@ -1105,7 +1195,7 @@ fn scan_sequence(
         let Some((start, end)) = found else {
             break;
         };
-        charge_event(accounting, admitted_work_bound);
+        charge_event::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
         summary.events = add(summary.events, 1, Resource::MatchEvents)?;
         if start == end && previous_end == Some(start) {
             summary.suppressed = add(summary.suppressed, 1, Resource::MatchEvents)?;
@@ -1137,19 +1227,31 @@ fn scan_sequence(
 
 // `Requirements::new` checked the sum of every possible construction, scan
 // and replay charge before allocation. Consequently each actual counter and
-// their sum fit in `usize` and cannot reach the admitted bound's successor.
-// Keeping that theorem at the operation boundary avoids checked arithmetic and
-// a resource-limit branch in every continuation hot-loop step. Debug builds
-// retain a per-step assertion; every build validates the exact observed sum
-// with checked arithmetic before publishing a result.
+// their sum fit in `usize` and cannot reach the structural bound's successor.
+// Diagnostic result admission rejects a caller limit below that conservative
+// bound before work starts. Value-only reducers instead check each exact
+// observed charge against the caller limit; the const branch is erased from
+// the established diagnostic path.
 #[inline]
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "whole-operation admission proves every actual work counter and their sum fit"
+    reason = "the structural whole-operation bound proves every actual counter fits"
 )]
-fn charge(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
     debug_assert!(accounting.work < admitted_work_bound);
+    if OBSERVED_WORK {
+        enforce(
+            add(accounting.work, 1, Resource::ExecutionWork)?,
+            caller_work_limit,
+            Resource::ExecutionWork,
+        )?;
+    }
     accounting.work += 1;
+    Ok(())
 }
 
 #[inline]
@@ -1157,9 +1259,14 @@ fn charge(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
     clippy::arithmetic_side_effects,
     reason = "state evaluations are a subset of the admitted whole-operation work bound"
 )]
-fn charge_state(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_state<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.state_evaluations += 1;
-    charge(accounting, admitted_work_bound);
+    Ok(())
 }
 
 #[inline]
@@ -1167,9 +1274,14 @@ fn charge_state(accounting: &mut ExecutionAccounting, admitted_work_bound: usize
     clippy::arithmetic_side_effects,
     reason = "transition checks are a subset of the admitted whole-operation work bound"
 )]
-fn charge_transition(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_transition<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.transition_checks += 1;
-    charge(accounting, admitted_work_bound);
+    Ok(())
 }
 
 #[inline]
@@ -1177,9 +1289,14 @@ fn charge_transition(accounting: &mut ExecutionAccounting, admitted_work_bound: 
     clippy::arithmetic_side_effects,
     reason = "assertion checks are a subset of admitted transition checks"
 )]
-fn charge_assertion(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_assertion<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge_transition::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.assertion_checks += 1;
-    charge_transition(accounting, admitted_work_bound);
+    Ok(())
 }
 
 #[inline]
@@ -1187,9 +1304,14 @@ fn charge_assertion(accounting: &mut ExecutionAccounting, admitted_work_bound: u
     clippy::arithmetic_side_effects,
     reason = "root probes are a subset of the admitted whole-operation work bound"
 )]
-fn charge_root(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_root<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.root_probes += 1;
-    charge(accounting, admitted_work_bound);
+    Ok(())
 }
 
 #[inline]
@@ -1197,9 +1319,14 @@ fn charge_root(accounting: &mut ExecutionAccounting, admitted_work_bound: usize)
     clippy::arithmetic_side_effects,
     reason = "replay steps are a subset of the admitted whole-operation work bound"
 )]
-fn charge_replay(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_replay<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.replay_steps += 1;
-    charge(accounting, admitted_work_bound);
+    Ok(())
 }
 
 #[inline]
@@ -1207,9 +1334,14 @@ fn charge_replay(accounting: &mut ExecutionAccounting, admitted_work_bound: usiz
     clippy::arithmetic_side_effects,
     reason = "successful paths are a subset of the admitted whole-operation work bound"
 )]
-fn charge_event(accounting: &mut ExecutionAccounting, admitted_work_bound: usize) {
+fn charge_event<const OBSERVED_WORK: bool>(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<(), Error> {
+    charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.successful_paths += 1;
-    charge(accounting, admitted_work_bound);
+    Ok(())
 }
 
 fn validate_admitted_work(
