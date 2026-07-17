@@ -300,6 +300,14 @@ impl<'h> Compiler<'h> {
                 })?;
                 return self.push_task(Task::Visit(consuming));
             }
+            if let Some(consuming) =
+                self.normalized_ordered_consuming_empty_alternation_repetition(repetition)?
+            {
+                return self.schedule_nullable_repetition(
+                    consuming,
+                    NullableRepetitionNormalization::Star { greedy: true },
+                );
+            }
             if let Some((look, atom)) =
                 self.normalized_ordered_word_look_alternation_plus(repetition)?
             {
@@ -517,6 +525,46 @@ impl<'h> Compiler<'h> {
             Some(minimum) if minimum > 0
         ) || consuming_branch.properties().maximum_len() != Some(1)
         {
+            return Ok(None);
+        }
+        Ok(Some(consuming_branch))
+    }
+
+    /// Prove the capture-free, leftmost-first identity
+    /// `(?:C|empty)* == C*` and `(?:C|empty)+ == C*` for an exactly one-byte
+    /// literal or class `C` under a greedy outer repetition.
+    ///
+    /// At each iteration the ordered consuming branch wins whenever it can.
+    /// Once it cannot, the empty fallback completes that iteration and the
+    /// upstream empty-loop guard exits without revisiting the body. The
+    /// ordinary greedy-star exit preserves the same continuation backtracking
+    /// order while removing the nullable cycle. The one-byte restriction is
+    /// necessary when a suffix can force backtracking: a multi-byte consumer
+    /// can otherwise change the selected match start. Lazy repetition, minima
+    /// above one, additional alternatives and compound or nullable consumers
+    /// remain outside this deliberately narrow proof.
+    fn normalized_ordered_consuming_empty_alternation_repetition(
+        &mut self,
+        outer: &'h regex_syntax::hir::Repetition,
+    ) -> Result<Option<&'h Hir>, LowerError> {
+        if !matches!(outer.min, 0 | 1) || outer.max.is_some() || !outer.greedy {
+            return Ok(None);
+        }
+        let body = self.capture_free_node(&outer.sub)?;
+        let HirKind::Alternation(branches) = body.kind() else {
+            return Ok(None);
+        };
+        let [consuming_branch, empty_branch] = branches.as_slice() else {
+            return Ok(None);
+        };
+        let consuming_branch = self.capture_free_node(consuming_branch)?;
+        if !Self::positive_width_atom(consuming_branch)
+            || consuming_branch.properties().maximum_len() != Some(1)
+        {
+            return Ok(None);
+        }
+        let empty_branch = self.capture_free_node(empty_branch)?;
+        if !matches!(empty_branch.kind(), HirKind::Empty) {
             return Ok(None);
         }
         Ok(Some(consuming_branch))

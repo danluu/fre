@@ -3692,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_empty_first_loop_builds_and_reversed_shape_refuses() {
+    fn certified_ordered_empty_loops_build_through_k0() {
         let certified = PortableBuilder::new("(?:|a)*")
             .unicode(false)
             .build()
@@ -3707,21 +3707,23 @@ mod tests {
             1
         );
 
-        let error = PortableBuilder::new("(?:a|)*")
+        let consuming_first = PortableBuilder::new("(?:a|)*b")
             .unicode(false)
             .build()
-            .expect_err("reversed nullable alternative remains uncertified");
-        assert!(matches!(
-            error,
-            BuildError::Lower(fre_lower::LowerError::Unsupported(
-                UnsupportedFeature::UncertifiedUnboundedRepetition
-            ))
-        ));
+            .expect("one-byte consuming-first nullable loop is normalized");
+        assert_eq!(consuming_first.build_report().plan, PlanKind::K0);
+        let (matched, _) = consuming_first
+            .find(b"aaab", SearchLimits::unlimited())
+            .expect("normalized K0 search succeeds");
+        assert_eq!(
+            matched.map(|matched| (matched.start(), matched.end())),
+            Some((0, 4))
+        );
     }
 
     #[test]
     fn uncertified_nullable_loop_is_a_build_error() {
-        let error = PortableBuilder::new("(?:a|)*")
+        let error = PortableBuilder::new("(?:ab|)*b")
             .unicode(false)
             .build()
             .unwrap_err();
