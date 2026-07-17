@@ -123,8 +123,16 @@ fn ranged_cases() -> Vec<(PortableTextRegex, regex::Regex, PlanKind)> {
             regex::Regex::new("foobar|foobaz|fooquux").expect("pinned literal-set DFA"),
             PlanKind::LiteralSetDfa,
         ),
-        case("[a-z]+Z", PlanKind::RequiredLiteral, PlanSelection::Auto),
-        case(r"\A[a-z]+Z", PlanKind::ForwardAnchored, PlanSelection::Auto),
+        case(
+            "[a-z]+Z",
+            PlanKind::RequiredLiteral,
+            PlanSelection::ForceRequiredLiteral,
+        ),
+        case(
+            r"\A[a-z]+Z",
+            PlanKind::ForwardAnchored,
+            PlanSelection::ForceForwardAnchored,
+        ),
         case("(?:ab)+", PlanKind::K0, PlanSelection::ForceK0),
         case(r"\b\w{2,}\b", PlanKind::UnicodeWordRun, PlanSelection::Auto),
     ]
