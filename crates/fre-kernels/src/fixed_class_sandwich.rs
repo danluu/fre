@@ -434,16 +434,14 @@ impl ByteClass {
     ) -> Result<Self, BuildError> {
         let mut class = Self::default();
         for range in ranges {
-            let first_word = usize::try_from(range.start >> 6).map_err(|_| {
-                BuildError::ArithmeticOverflow {
+            let first_word =
+                usize::try_from(range.start >> 6).map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "fixed class first byte-mask word",
-                }
-            })?;
-            let last_word = usize::try_from(range.end >> 6).map_err(|_| {
-                BuildError::ArithmeticOverflow {
+                })?;
+            let last_word =
+                usize::try_from(range.end >> 6).map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "fixed class last byte-mask word",
-                }
-            })?;
+                })?;
             for word_index in first_word..=last_word {
                 let first_bit = if word_index == first_word {
                     range.start & 63
@@ -455,27 +453,32 @@ impl ByteClass {
                 } else {
                     63
                 };
-                let last_shift = 63_u32.checked_sub(last_bit).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "fixed class byte-mask last shift",
-                    },
-                )?;
-                let first_mask = u64::MAX.checked_shl(first_bit).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "fixed class byte-mask first shift",
-                    },
-                )?;
-                let last_mask = u64::MAX.checked_shr(last_shift).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "fixed class byte-mask last shift",
-                    },
-                )?;
+                let last_shift =
+                    63_u32
+                        .checked_sub(last_bit)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "fixed class byte-mask last shift",
+                        })?;
+                let first_mask =
+                    u64::MAX
+                        .checked_shl(first_bit)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "fixed class byte-mask first shift",
+                        })?;
+                let last_mask =
+                    u64::MAX
+                        .checked_shr(last_shift)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "fixed class byte-mask last shift",
+                        })?;
                 let mask = first_mask & last_mask;
-                let word = class.words.get_mut(word_index).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "fixed class byte-mask word access",
-                    },
-                )?;
+                let word =
+                    class
+                        .words
+                        .get_mut(word_index)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "fixed class byte-mask word access",
+                        })?;
                 *word |= mask;
                 *work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
                     computation: "fixed class byte-mask work",
@@ -957,11 +960,10 @@ impl FixedClassSandwichPlan {
             if let Some(scalar) = decoded.scalar {
                 actual.valid_units = checked_actual_add(actual.valid_units, 1, "valid units")?;
                 let (prefix, middle, suffix, comparisons) = if let Some(classes) = byte_classes {
-                    let byte = u8::try_from(scalar).map_err(|_| {
-                        ReduceError::ArithmeticOverflow {
+                    let byte =
+                        u8::try_from(scalar).map_err(|_| ReduceError::ArithmeticOverflow {
                             computation: "fixed class byte-mask input",
-                        }
-                    })?;
+                        })?;
                     (
                         classes[0].contains(byte),
                         classes[1].contains(byte),
@@ -982,11 +984,8 @@ impl FixedClassSandwichPlan {
                 };
                 actual.membership_tests =
                     checked_actual_add(actual.membership_tests, 3, "membership tests")?;
-                actual.range_comparisons = checked_actual_add(
-                    actual.range_comparisons,
-                    comparisons,
-                    "range comparisons",
-                )?;
+                actual.range_comparisons =
+                    checked_actual_add(actual.range_comparisons, comparisons, "range comparisons")?;
                 let unit = Unit {
                     start: position,
                     end: position.checked_add(decoded.width).ok_or(

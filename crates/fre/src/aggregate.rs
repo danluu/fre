@@ -1947,13 +1947,7 @@ fn inspect_fixed_class_sandwich(
     let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
-    let hir = peel_fixed_class_captures(
-        hir,
-        &mut work,
-        &mut hir_nodes,
-        &mut captures,
-        limit,
-    )?;
+    let hir = peel_fixed_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
     let HirKind::Concat(parts) = hir.kind() else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
@@ -1961,24 +1955,14 @@ fn inspect_fixed_class_sandwich(
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    let prefix_hir = peel_fixed_class_captures(
-        prefix_hir,
-        &mut work,
-        &mut hir_nodes,
-        &mut captures,
-        limit,
-    )?;
+    let prefix_hir =
+        peel_fixed_class_captures(prefix_hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
     let Some(prefix) = inspect_fixed_class_atom(prefix_hir, unicode) else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    let middle_hir = peel_fixed_class_captures(
-        middle_hir,
-        &mut work,
-        &mut hir_nodes,
-        &mut captures,
-        limit,
-    )?;
+    let middle_hir =
+        peel_fixed_class_captures(middle_hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
     let HirKind::Repetition(repeated) = middle_hir.kind() else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
@@ -2000,13 +1984,8 @@ fn inspect_fixed_class_sandwich(
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    let suffix_hir = peel_fixed_class_captures(
-        suffix_hir,
-        &mut work,
-        &mut hir_nodes,
-        &mut captures,
-        limit,
-    )?;
+    let suffix_hir =
+        peel_fixed_class_captures(suffix_hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
     let Some(suffix) = inspect_fixed_class_atom(suffix_hir, unicode) else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };

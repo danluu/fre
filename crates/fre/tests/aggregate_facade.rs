@@ -1223,7 +1223,10 @@ fn fixed_class_sandwich_erases_nested_captures_with_exact_planner_accounting() {
             .unicode(unicode)
             .build_span_sum()
             .unwrap_or_else(|error| panic!("captured span-sum build {pattern:?}: {error}"));
-        assert_eq!(sum.build_report().plan, AggregatePlanKind::FixedClassSandwich);
+        assert_eq!(
+            sum.build_report().plan,
+            AggregatePlanKind::FixedClassSandwich
+        );
         assert_eq!(sum.build_report().captures_erased, 5);
         assert_eq!(
             sum.span_sum_value(haystack, AggregateRunLimits::default())
