@@ -6225,7 +6225,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count", &["a|b".to_string()], b"baab", true, false, &limits),
             4,
-            "aggregate-continuation-program",
+            "aggregate-finite-literal-dfa",
         );
         assert_current_fre_execution(
             current_fre("count", &["a".to_string()], b"baab", true, false, &limits),
@@ -6240,7 +6240,7 @@ mod tests {
             true,
             &limits,
         );
-        assert_current_fre_execution(folded, 1, "aggregate-continuation-program");
+        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-dfa");
         assert_current_fre_execution(
             current_fre(
                 "count",
