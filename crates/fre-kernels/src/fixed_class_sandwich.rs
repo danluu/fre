@@ -4,17 +4,19 @@
 //! plans consume one byte per unit. Unicode-on plans decode each valid UTF-8
 //! scalar once; invalid bytes break the pending window and advance one byte.
 //! A circular `N + 2` unit window retains prefix/middle/suffix membership and
-//! the middle membership total. The reducer therefore checks each candidate
-//! start in constant time, emits the leftmost non-overlapping sequence, and
-//! never constructs a boundary-indexed continuation log.
+//! the middle membership total. Byte plans compile each class to an inline
+//! 256-bit mask; Unicode plans retain bounded binary search over scalar ranges.
+//! The reducer therefore checks each candidate start in constant time, emits
+//! the leftmost non-overlapping sequence, and never constructs a
+//! boundary-indexed continuation log.
 
 use core::{fmt, mem::size_of};
 
 use crate::Window;
 
-pub const PLAN_ID: &str = "fixed-class-sandwich.circular-window.v1";
-pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v1";
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v1";
+pub const PLAN_ID: &str = "fixed-class-sandwich.circular-window-byte-bitsets.v2";
+pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v2";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Semantics {
@@ -419,11 +421,84 @@ struct ScalarRange {
     end: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ByteClass {
+    words: [u64; 4],
+}
+
+impl ByteClass {
+    fn from_ranges(
+        ranges: &[ScalarRange],
+        limits: BuildLimits,
+        work: &mut usize,
+    ) -> Result<Self, BuildError> {
+        let mut class = Self::default();
+        for range in ranges {
+            let first_word = usize::try_from(range.start >> 6).map_err(|_| {
+                BuildError::ArithmeticOverflow {
+                    computation: "fixed class first byte-mask word",
+                }
+            })?;
+            let last_word = usize::try_from(range.end >> 6).map_err(|_| {
+                BuildError::ArithmeticOverflow {
+                    computation: "fixed class last byte-mask word",
+                }
+            })?;
+            for word_index in first_word..=last_word {
+                let first_bit = if word_index == first_word {
+                    range.start & 63
+                } else {
+                    0
+                };
+                let last_bit = if word_index == last_word {
+                    range.end & 63
+                } else {
+                    63
+                };
+                let last_shift = 63_u32.checked_sub(last_bit).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed class byte-mask last shift",
+                    },
+                )?;
+                let first_mask = u64::MAX.checked_shl(first_bit).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed class byte-mask first shift",
+                    },
+                )?;
+                let last_mask = u64::MAX.checked_shr(last_shift).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed class byte-mask last shift",
+                    },
+                )?;
+                let mask = first_mask & last_mask;
+                let word = class.words.get_mut(word_index).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed class byte-mask word access",
+                    },
+                )?;
+                *word |= mask;
+                *work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class byte-mask work",
+                })?;
+                enforce_build(*work, limits.max_build_work, BuildResource::Work)?;
+            }
+        }
+        Ok(class)
+    }
+
+    fn contains(&self, byte: u8) -> bool {
+        let word = usize::from(byte) >> 6;
+        let bit = u32::from(byte) & 63;
+        self.words[word] & (1_u64 << bit) != 0
+    }
+}
+
 #[derive(Debug)]
 pub struct FixedClassSandwichPlan {
     prefix: Box<[ScalarRange]>,
     middle: Box<[ScalarRange]>,
     suffix: Box<[ScalarRange]>,
+    byte_classes: Option<[ByteClass; 3]>,
     semantics: Semantics,
     middle_repetitions: u32,
     window_units: usize,
@@ -526,6 +601,15 @@ impl FixedClassSandwichPlan {
             limits.max_source_ranges,
             BuildResource::Ranges,
         )?;
+        let byte_classes = if semantics == Semantics::RustBytesUnicodeOff {
+            Some([
+                ByteClass::from_ranges(&prefix, limits, &mut work)?,
+                ByteClass::from_ranges(&middle, limits, &mut work)?,
+                ByteClass::from_ranges(&suffix, limits, &mut work)?,
+            ])
+        } else {
+            None
+        };
         work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
             computation: "fixed class repetition work",
         })?;
@@ -581,6 +665,7 @@ impl FixedClassSandwichPlan {
             prefix: prefix.into_boxed_slice(),
             middle: middle.into_boxed_slice(),
             suffix: suffix.into_boxed_slice(),
+            byte_classes,
             semantics,
             middle_repetitions,
             window_units,
@@ -693,12 +778,18 @@ impl FixedClassSandwichPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "fixed class membership tests",
                 })?;
-        let comparison_factor = binary_search_comparison_bound(self.prefix.len())
-            .checked_add(binary_search_comparison_bound(self.middle.len()))
-            .and_then(|count| count.checked_add(binary_search_comparison_bound(self.suffix.len())))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "fixed class comparison factor",
-            })?;
+        let comparison_factor = if self.byte_classes.is_some() {
+            0
+        } else {
+            binary_search_comparison_bound(self.prefix.len())
+                .checked_add(binary_search_comparison_bound(self.middle.len()))
+                .and_then(|count| {
+                    count.checked_add(binary_search_comparison_bound(self.suffix.len()))
+                })
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "fixed class comparison factor",
+                })?
+        };
         let range_comparisons =
             input_bytes
                 .checked_mul(comparison_factor)
@@ -832,6 +923,7 @@ impl FixedClassSandwichPlan {
         let mut head = 0_usize;
         let mut length = 0_usize;
         let mut middle_matches = 0_usize;
+        let byte_classes = self.byte_classes.as_ref();
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
             decode_byte_checks: 0,
@@ -864,19 +956,37 @@ impl FixedClassSandwichPlan {
             actual.reducer_steps = checked_actual_add(actual.reducer_steps, 1, "reducer steps")?;
             if let Some(scalar) = decoded.scalar {
                 actual.valid_units = checked_actual_add(actual.valid_units, 1, "valid units")?;
-                let (prefix, prefix_comparisons) = contains(&self.prefix, scalar)?;
-                let (middle, middle_comparisons) = contains(&self.middle, scalar)?;
-                let (suffix, suffix_comparisons) = contains(&self.suffix, scalar)?;
+                let (prefix, middle, suffix, comparisons) = if let Some(classes) = byte_classes {
+                    let byte = u8::try_from(scalar).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "fixed class byte-mask input",
+                        }
+                    })?;
+                    (
+                        classes[0].contains(byte),
+                        classes[1].contains(byte),
+                        classes[2].contains(byte),
+                        0,
+                    )
+                } else {
+                    let (prefix, prefix_comparisons) = contains(&self.prefix, scalar)?;
+                    let (middle, middle_comparisons) = contains(&self.middle, scalar)?;
+                    let (suffix, suffix_comparisons) = contains(&self.suffix, scalar)?;
+                    let comparisons = prefix_comparisons
+                        .checked_add(middle_comparisons)
+                        .and_then(|value| value.checked_add(suffix_comparisons))
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual fixed class range comparisons",
+                        })?;
+                    (prefix, middle, suffix, comparisons)
+                };
                 actual.membership_tests =
                     checked_actual_add(actual.membership_tests, 3, "membership tests")?;
-                actual.range_comparisons = actual
-                    .range_comparisons
-                    .checked_add(prefix_comparisons)
-                    .and_then(|value| value.checked_add(middle_comparisons))
-                    .and_then(|value| value.checked_add(suffix_comparisons))
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual fixed class range comparisons",
-                    })?;
+                actual.range_comparisons = checked_actual_add(
+                    actual.range_comparisons,
+                    comparisons,
+                    "range comparisons",
+                )?;
                 let unit = Unit {
                     start: position,
                     end: position.checked_add(decoded.width).ok_or(
@@ -1288,6 +1398,66 @@ mod tests {
     }
 
     #[test]
+    fn byte_masks_match_every_canonical_range_value_and_skip_binary_search() {
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(0, 0), (62, 65), (127, 129), (u8::MAX, u8::MAX)],
+            [(1, 1), (126, 129), (191, 193), (254, 254)],
+            [(2, 2), (63, 66), (190, 193), (253, 253)],
+            1,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let build = plan.build_accounting();
+        assert!(build.work > build.source_ranges.checked_add(1).unwrap());
+        let below_work = build.work.checked_sub(1).unwrap();
+        let error = FixedClassSandwichPlan::build_bytes(
+            [(0, 0), (62, 65), (127, 129), (u8::MAX, u8::MAX)],
+            [(1, 1), (126, 129), (191, 193), (254, 254)],
+            [(2, 2), (63, 66), (190, 193), (253, 253)],
+            1,
+            BuildLimits {
+                max_build_work: below_work,
+                ..BuildLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::BuildError::WorkLimit { needed, limit }
+                if needed == build.work && limit.checked_add(1) == Some(build.work)
+        ));
+        let classes = plan.byte_classes.unwrap();
+        for byte in u8::MIN..=u8::MAX {
+            let scalar = u32::from(byte);
+            for (class, ranges) in [
+                (classes[0], plan.prefix.as_ref()),
+                (classes[1], plan.middle.as_ref()),
+                (classes[2], plan.suffix.as_ref()),
+            ] {
+                assert_eq!(
+                    class.contains(byte),
+                    super::contains(ranges, scalar).unwrap().0,
+                    "byte={byte}"
+                );
+            }
+        }
+
+        let counted = plan
+            .count(
+                &[62, 126, 190, 65, 129, 193],
+                ReduceLimits {
+                    max_range_comparisons: 0,
+                    ..ReduceLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(counted.count, 2);
+        assert_eq!(counted.accounting.upper_bounds.range_comparisons, 0);
+        assert_eq!(counted.accounting.actual.range_comparisons, 0);
+        assert_eq!(counted.accounting.identity.plan_id, super::PLAN_ID);
+    }
+
+    #[test]
     fn unicode_windows_decode_once_and_invalid_bytes_break_candidates() {
         let plan = FixedClassSandwichPlan::build_unicode(
             [('a', 'q')],
@@ -1308,6 +1478,8 @@ mod tests {
             assert_eq!(counted.count, expected.0);
             assert_eq!(summed.span_sum, expected.1);
             assert!(counted.accounting.actual.decode_byte_checks <= haystack.len() * 4);
+            assert!(counted.accounting.upper_bounds.range_comparisons > 0);
+            assert!(counted.accounting.actual.range_comparisons > 0);
         }
     }
 
