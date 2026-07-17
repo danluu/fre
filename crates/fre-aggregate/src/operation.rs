@@ -19,9 +19,20 @@ pub struct Span {
 pub enum Strategy {
     /// Materialize one endpoint word per `(input boundary, program state)`.
     FullTable,
-    /// Materialize fixed-size split/root rows in reverse boundary order and
-    /// replay them through a forward-only sequential reader.
+    /// Materialize construction-selected fixed-size split/root decisions or
+    /// reachable endpoints in reverse boundary order and consume them through
+    /// a forward-only sequential reader.
     ReverseSequentialRows,
+}
+
+/// Construction-selected record stored by [`Strategy::ReverseSequentialRows`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RowStorage {
+    /// One preferred/fallback bit per split plus one reachable-root bit.
+    SplitDecisions,
+    /// The selected reachable endpoint, encoded in the fewest whole bytes
+    /// required by the admitted input boundary count.
+    ReachableEndpoints,
 }
 
 /// Marker for complete span iteration.
@@ -73,6 +84,8 @@ pub struct OperationCertificate {
     pub states: usize,
     pub boundaries: usize,
     pub table_cells: usize,
+    pub row_storage: Option<RowStorage>,
+    pub row_record_bytes: usize,
     pub work_bound: usize,
     pub random_access_bytes: usize,
     pub scratch_bytes: usize,
@@ -426,6 +439,8 @@ impl CompiledRegex {
             states: self.program.insts.len(),
             boundaries,
             table_cells: requirements.table_cells,
+            row_storage: requirements.row_storage,
+            row_record_bytes: requirements.record_bytes,
             work_bound: requirements.work_bound,
             random_access_bytes: accounting.random_access_peak_bytes,
             scratch_bytes: accounting.scratch_peak_bytes,
@@ -475,6 +490,7 @@ struct ExecutionResult {
 #[derive(Clone, Copy, Debug)]
 struct Requirements {
     table_cells: usize,
+    row_storage: Option<RowStorage>,
     record_bytes: usize,
     requested_log_bytes: usize,
     sequential_bound: usize,
@@ -511,44 +527,32 @@ impl Requirements {
             passes,
             Resource::ExecutionWork,
         )?;
-        let (table_cells, record_bytes, random, scratch, log, sequential, replay) = match strategy {
-            Strategy::FullTable => {
-                let cells = mul(states, boundaries, Resource::TableCells)?;
-                enforce(cells, limits.max_table_cells, Resource::TableCells)?;
-                let bytes = mul(
-                    cells,
-                    core::mem::size_of::<usize>(),
-                    Resource::RandomAccessBytes,
-                )?;
-                (cells, 0, bytes, bytes, 0, 0, 0)
-            }
-            Strategy::ReverseSequentialRows => {
-                let bits = add(program.split_count, 1, Resource::LogBytes)?;
-                let record = ceil_div(bits, 8)?;
-                let log = mul(record, boundaries, Resource::LogBytes)?;
-                let row_words = mul(states, 2, Resource::RandomAccessBytes)?;
-                let row_bytes = mul(
-                    row_words,
-                    core::mem::size_of::<usize>(),
-                    Resource::RandomAccessBytes,
-                )?;
-                let sequential = mul(
-                    log,
-                    add(passes, 1, Resource::SequentialBytes)?,
-                    Resource::SequentialBytes,
-                )?;
-                let replay = mul(
-                    mul(
-                        mul(states, boundaries, Resource::ExecutionWork)?,
-                        4,
-                        Resource::ExecutionWork,
-                    )?,
-                    passes,
-                    Resource::ExecutionWork,
-                )?;
-                (0, record, row_bytes, row_bytes, log, sequential, replay)
-            }
-        };
+        let (table_cells, row_storage, record_bytes, random, scratch, log, sequential, replay) =
+            match strategy {
+                Strategy::FullTable => {
+                    let cells = mul(states, boundaries, Resource::TableCells)?;
+                    enforce(cells, limits.max_table_cells, Resource::TableCells)?;
+                    let bytes = mul(
+                        cells,
+                        core::mem::size_of::<usize>(),
+                        Resource::RandomAccessBytes,
+                    )?;
+                    (cells, None, 0, bytes, bytes, 0, 0, 0)
+                }
+                Strategy::ReverseSequentialRows => {
+                    let rows = ReverseRowRequirements::new(program, boundaries, passes)?;
+                    (
+                        0,
+                        Some(rows.storage),
+                        rows.record_bytes,
+                        rows.row_bytes,
+                        rows.row_bytes,
+                        rows.log_bytes,
+                        rows.sequential_bound,
+                        rows.replay_bound,
+                    )
+                }
+            };
         enforce(
             random,
             limits.max_random_access_bytes,
@@ -571,10 +575,66 @@ impl Requirements {
         }
         Ok(Self {
             table_cells,
+            row_storage,
             record_bytes,
             requested_log_bytes: log,
             sequential_bound: sequential,
             work_bound,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReverseRowRequirements {
+    storage: RowStorage,
+    record_bytes: usize,
+    row_bytes: usize,
+    log_bytes: usize,
+    sequential_bound: usize,
+    replay_bound: usize,
+}
+
+impl ReverseRowRequirements {
+    fn new(program: &Program, boundaries: usize, passes: usize) -> Result<Self, Error> {
+        let bits = add(program.split_count, 1, Resource::LogBytes)?;
+        let decision_record = ceil_div(bits, 8)?;
+        let endpoint_record = encoded_width(boundaries);
+        // Equal widths keep the established split/replay certificate. The
+        // endpoint form is selected only when it strictly reduces the bounded
+        // log, containing this construction change to the refusal it solves.
+        let (storage, record_bytes, replay_bound) = if endpoint_record < decision_record {
+            (RowStorage::ReachableEndpoints, endpoint_record, 0)
+        } else {
+            let replay = mul(
+                mul(
+                    mul(program.insts.len(), boundaries, Resource::ExecutionWork)?,
+                    4,
+                    Resource::ExecutionWork,
+                )?,
+                passes,
+                Resource::ExecutionWork,
+            )?;
+            (RowStorage::SplitDecisions, decision_record, replay)
+        };
+        let log_bytes = mul(record_bytes, boundaries, Resource::LogBytes)?;
+        let row_words = mul(program.insts.len(), 2, Resource::RandomAccessBytes)?;
+        let row_bytes = mul(
+            row_words,
+            core::mem::size_of::<usize>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let sequential_bound = mul(
+            log_bytes,
+            add(passes, 1, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            storage,
+            record_bytes,
+            row_bytes,
+            log_bytes,
+            sequential_bound,
+            replay_bound,
         })
     }
 }
@@ -649,6 +709,9 @@ impl Engine {
                     admitted_work_bound,
                     caller_work_limit,
                     |start, accounting| {
+                        if reader.storage == RowStorage::ReachableEndpoints {
+                            return reader.endpoint(start, accounting);
+                        }
                         if !reader.root(start, accounting)? {
                             return Ok(None);
                         }
@@ -826,6 +889,7 @@ impl FullTable {
 
 struct RowStore {
     bytes: Vec<u8>,
+    storage: RowStorage,
     record_bytes: usize,
     allocated_store_bytes: usize,
     build_scratch_bytes: usize,
@@ -845,6 +909,9 @@ impl RowStore {
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
     ) -> Result<Self, Error> {
+        let storage = requirements.row_storage.ok_or(Error::InternalInvariant(
+            "reverse rows have no selected record storage",
+        ))?;
         let mut store = zeroed_bytes(requirements.requested_log_bytes, Resource::LogBytes)?;
         let allocated_store = store.capacity();
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
@@ -889,6 +956,7 @@ impl RowStore {
                 row,
                 next_row,
                 terminal_record,
+                storage,
                 accounting,
                 requirements.work_bound,
                 limits.max_work,
@@ -914,6 +982,7 @@ impl RowStore {
                 row,
                 next_row,
                 record,
+                storage,
                 accounting,
                 requirements.work_bound,
                 limits.max_work,
@@ -934,6 +1003,7 @@ impl RowStore {
         accounting.log_bytes = allocated_store;
         Ok(Self {
             bytes: store,
+            storage,
             record_bytes: requirements.record_bytes,
             allocated_store_bytes: allocated_store,
             build_scratch_bytes: build_scratch,
@@ -954,6 +1024,7 @@ impl RowStore {
         row: &mut [usize],
         next_row: &[usize],
         record: &mut [u8],
+        storage: RowStorage,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
         caller_work_limit: usize,
@@ -1005,7 +1076,9 @@ impl RowStore {
                         return Err(Error::InternalInvariant("split state has no decision rank"));
                     }
                     if preferred_value != 0 {
-                        set_bit(record, rank)?;
+                        if storage == RowStorage::SplitDecisions {
+                            set_bit(record, rank)?;
+                        }
                         preferred_value
                     } else {
                         charge_transition::<OBSERVED_WORK>(
@@ -1019,8 +1092,13 @@ impl RowStore {
             };
             row[pc] = value;
         }
-        if row[program.entry] != 0 {
-            set_bit(record, program.split_count)?;
+        match storage {
+            RowStorage::SplitDecisions => {
+                if row[program.entry] != 0 {
+                    set_bit(record, program.split_count)?;
+                }
+            }
+            RowStorage::ReachableEndpoints => write_encoded(record, row[program.entry])?,
         }
         Ok(())
     }
@@ -1028,6 +1106,7 @@ impl RowStore {
     fn reader(&self) -> RowReader<'_> {
         RowReader {
             store: &self.bytes,
+            storage: self.storage,
             record_bytes: self.record_bytes,
             current_record: &[],
             current_position: None,
@@ -1105,6 +1184,7 @@ impl RowStore {
 
 struct RowReader<'a> {
     store: &'a [u8],
+    storage: RowStorage,
     record_bytes: usize,
     current_record: &'a [u8],
     current_position: Option<usize>,
@@ -1113,11 +1193,30 @@ struct RowReader<'a> {
 }
 
 impl RowReader<'_> {
+    fn endpoint(
+        &mut self,
+        position: usize,
+        accounting: &mut ExecutionAccounting,
+    ) -> Result<Option<usize>, Error> {
+        if self.storage != RowStorage::ReachableEndpoints {
+            return Err(Error::InternalInvariant(
+                "split-decision row read as reachable endpoint",
+            ));
+        }
+        self.ensure(position, accounting)?;
+        read_encoded(self.current_record).map(decode)
+    }
+
     fn root(
         &mut self,
         position: usize,
         accounting: &mut ExecutionAccounting,
     ) -> Result<bool, Error> {
+        if self.storage != RowStorage::SplitDecisions {
+            return Err(Error::InternalInvariant(
+                "reachable-endpoint row read as split decisions",
+            ));
+        }
         self.ensure(position, accounting)?;
         read_bit(self.current_record, self.root_rank)
     }
@@ -1128,6 +1227,11 @@ impl RowReader<'_> {
         rank: usize,
         accounting: &mut ExecutionAccounting,
     ) -> Result<bool, Error> {
+        if self.storage != RowStorage::SplitDecisions {
+            return Err(Error::InternalInvariant(
+                "reachable-endpoint row replayed as split decisions",
+            ));
+        }
         self.ensure(position, accounting)?;
         read_bit(self.current_record, rank)
     }
@@ -1412,6 +1516,46 @@ fn ceil_div(value: usize, divisor: usize) -> Result<usize, Error> {
         .ok_or(Error::InternalInvariant("zero row-log divisor"))
 }
 
+fn encoded_width(maximum: usize) -> usize {
+    maximum
+        .to_le_bytes()
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(1, |index| index.saturating_add(1))
+}
+
+fn write_encoded(record: &mut [u8], value: usize) -> Result<(), Error> {
+    let encoded = value.to_le_bytes();
+    let source = encoded.get(..record.len()).ok_or(Error::InternalInvariant(
+        "endpoint record exceeds word width",
+    ))?;
+    if encoded
+        .get(record.len()..)
+        .ok_or(Error::InternalInvariant(
+            "endpoint record exceeds word width",
+        ))?
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(Error::InternalInvariant(
+            "reachable endpoint exceeds admitted record width",
+        ));
+    }
+    record.copy_from_slice(source);
+    Ok(())
+}
+
+fn read_encoded(record: &[u8]) -> Result<usize, Error> {
+    let mut encoded = [0_u8; core::mem::size_of::<usize>()];
+    let target = encoded
+        .get_mut(..record.len())
+        .ok_or(Error::InternalInvariant(
+            "endpoint record exceeds word width",
+        ))?;
+    target.copy_from_slice(record);
+    Ok(usize::from_le_bytes(encoded))
+}
+
 fn set_bit(bytes: &mut [u8], index: usize) -> Result<(), Error> {
     let byte = bytes
         .get_mut(index / 8)
@@ -1476,13 +1620,35 @@ fn operation_identity(plan: PlanId, strategy: Strategy, kind: OperationKind) -> 
 mod tests {
     use crate::accounting::ExecutionAccounting;
 
-    use super::RowReader;
+    use super::{RowReader, RowStorage, decode, encoded_width, read_encoded, write_encoded};
+
+    #[test]
+    fn reachable_endpoint_encoding_covers_arbitrary_word_widths() {
+        let cases = [
+            (0_usize, 1_usize),
+            (1, 1),
+            (255, 1),
+            (256, 2),
+            (65_535, 2),
+            (65_536, 3),
+        ];
+        for (value, width) in cases {
+            assert_eq!(width, encoded_width(value));
+            let mut record = vec![0_u8; width];
+            write_encoded(&mut record, value).unwrap();
+            assert_eq!(value, read_encoded(&record).unwrap());
+        }
+        assert!(write_encoded(&mut [0_u8], 256).is_err());
+        assert_eq!(None, decode(read_encoded(&[0]).unwrap()));
+        assert_eq!(Some(0), decode(read_encoded(&[1]).unwrap()));
+    }
 
     #[test]
     fn row_reader_advances_from_its_authenticated_offset() {
         let store = [30_u8, 31, 20, 21, 10, 11, 0, 1];
         let mut reader = RowReader {
             store: &store,
+            storage: RowStorage::SplitDecisions,
             record_bytes: 2,
             current_record: &[],
             current_position: None,
@@ -1506,5 +1672,25 @@ mod tests {
         reader.ensure(3, &mut accounting).unwrap();
         assert_eq!(accounting.sequential_bytes_read, 8);
         assert!(reader.ensure(2, &mut accounting).is_err());
+    }
+
+    #[test]
+    fn endpoint_row_reader_preserves_failure_and_empty() {
+        let store = [0_u8, 1];
+        let mut reader = RowReader {
+            store: &store,
+            storage: RowStorage::ReachableEndpoints,
+            record_bytes: 1,
+            current_record: &[],
+            current_position: None,
+            current_start: store.len(),
+            root_rank: 0,
+        };
+        let mut accounting = ExecutionAccounting::default();
+
+        assert_eq!(Some(0), reader.endpoint(0, &mut accounting).unwrap());
+        assert_eq!(None, reader.endpoint(1, &mut accounting).unwrap());
+        assert_eq!(2, accounting.sequential_bytes_read);
+        assert!(reader.root(1, &mut accounting).is_err());
     }
 }
