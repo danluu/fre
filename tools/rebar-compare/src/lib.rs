@@ -71,7 +71,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v3";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v14-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -124,6 +124,9 @@ pub struct RunLimits {
     pub fre_aggregate_repeat_bound: u32,
     /// Maximum retained continuation-program capacity for one aggregate plan.
     pub fre_aggregate_program_bytes: usize,
+    /// Maximum retained capture-selector program capacity. This is separate
+    /// from capture-history storage and capture-free aggregate programs.
+    pub fre_capture_selector_program_bytes: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
     pub fre_literal_planner_work: usize,
     /// Maximum exact-literal needle bytes retained by one aggregate plan.
@@ -193,6 +196,7 @@ impl Default for RunLimits {
             fre_aggregate_hir_stack_items: 1 << 16,
             fre_aggregate_repeat_bound: 1 << 10,
             fre_aggregate_program_bytes: 16 * 1_048_576,
+            fre_capture_selector_program_bytes: 32 * 1_048_576,
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
             fre_literal_build_work: 64 * 1_048_576,
@@ -2841,7 +2845,7 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
     };
     let selector = fre::AggregateCompileLimits {
         max_work: limits.fre_aggregate_compile_work,
-        max_program_bytes: limits.fre_aggregate_program_bytes,
+        max_program_bytes: limits.fre_capture_selector_program_bytes,
         ..defaults.selector
     };
     CaptureBuildLimits {
@@ -5527,7 +5531,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v3"
+            "fre-current-aggregate-capture-v14-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("positive-Unicode-word"));
@@ -6364,6 +6368,7 @@ mod tests {
         let run = RunLimits {
             fre_aggregate_compile_work: 17,
             fre_aggregate_program_bytes: 19,
+            fre_capture_selector_program_bytes: 23,
             ..RunLimits::default()
         };
         let defaults = CaptureBuildLimits::default();
@@ -6381,7 +6386,7 @@ mod tests {
             defaults.selector.max_temporary_states
         );
         assert_eq!(mapped.selector.max_work, 17);
-        assert_eq!(mapped.selector.max_program_bytes, 19);
+        assert_eq!(mapped.selector.max_program_bytes, 23);
 
         let pattern = "(a)".repeat(65);
         let patterns = [pattern];
@@ -6397,6 +6402,36 @@ mod tests {
             ),
             66,
             "capture-linear-selector-persistent-history",
+        );
+
+        let overlapping = r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})";
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[overlapping.to_string()],
+                "abcdefghijklmn абвгдежзийклмн".as_bytes(),
+                true,
+                false,
+                &RunLimits::default(),
+            ),
+            4,
+            "capture-linear-selector-persistent-history",
+        );
+
+        let mut selector_starved = RunLimits::default();
+        selector_starved.fre_capture_selector_program_bytes = 16 * 1_048_576;
+        let refusal = current_fre(
+            "count-captures",
+            &[overlapping.to_string()],
+            b"abcdefghijklmn",
+            true,
+            false,
+            &selector_starved,
+        );
+        assert!(
+            matches!(refusal, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("ProgramBytes requires 30675984, limit is 16777216")),
+            "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }
 

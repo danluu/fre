@@ -99,14 +99,19 @@ impl Default for CaptureBuildLimits {
             // resulting states before publishing a program.
             max_captures: 1_024,
             max_repeat_expansion: 2_500,
-            max_states: 262_144,
-            max_patch_entries: 262_144,
+            max_states: 524_288,
+            max_patch_entries: 524_288,
             ..EngineBuildLimits::default()
         };
         let selector = SelectorCompileLimits {
             max_repeat_bound: 2_500,
-            max_program_states: 262_144,
-            max_temporary_states: 262_144,
+            // The authenticated Rebar overlapping-word capture pair expands
+            // ten ordered Unicode-letter repetitions into more than 2^18
+            // capture-erased selector states. Construction remains metered
+            // and bounded; these ceilings do not preallocate either buffer.
+            max_program_states: 524_288,
+            max_temporary_states: 524_288,
+            max_program_bytes: 32 * 1_048_576,
             ..SelectorCompileLimits::default()
         };
         Self {

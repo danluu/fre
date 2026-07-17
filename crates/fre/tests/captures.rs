@@ -333,6 +333,57 @@ fn sixty_five_user_captures_match_pinned_rust_and_remain_bounded() {
     ));
 }
 
+#[test]
+fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
+    // Authenticated Rebar obligations:
+    // - unicode/overlapping-words/english@rust/regex
+    // - unicode/overlapping-words/russian@rust/regex
+    let pattern = r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})";
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("overlapping Unicode-word selector fits the bounded default");
+    assert_eq!(regex.build_report().selector.program_states, 344_385);
+    assert_eq!(regex.build_report().selector.temporary_states_peak, 344_385);
+    assert_eq!(regex.build_report().selector.program_bytes, 30_675_984);
+    assert_eq!(regex.build_report().selector.work, 3_305_876);
+
+    for haystack in [
+        "abcdefghijklmn абвгдежзийклмн",
+        "абвгдежзийклмн abcdefghijklmn",
+    ] {
+        let actual = regex
+            .count_captures(haystack.as_bytes(), CaptureRunLimits::default())
+            .expect("bounded Unicode-word capture reduction")
+            .accounting
+            .count;
+        let expected = RegexBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .expect("pinned Rust reference")
+            .captures_iter(haystack.as_bytes())
+            .map(|captures| captures.iter().flatten().count())
+            .sum::<usize>();
+        assert_eq!(actual, expected, "{haystack:?}");
+    }
+
+    let mut limits = fre::CaptureBuildLimits::default();
+    limits.selector.max_program_states = 262_144;
+    assert!(matches!(
+        CaptureBuilder::new(pattern)
+            .unicode(true)
+            .limits(limits)
+            .build(),
+        Err(fre::CaptureBuildError::Selector(
+            fre::AggregateEngineError::ResourceLimit {
+                resource: fre::AggregateResource::ProgramStates,
+                required: 262_145,
+                limit: 262_144,
+            }
+        ))
+    ));
+}
+
 fn adversarial_operation_work(size: usize) -> (usize, usize) {
     let regex = CaptureBuilder::new(r"(?:a.*z|a)")
         .unicode(false)
