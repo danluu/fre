@@ -236,6 +236,29 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit and evaluate a complete non-overlapping span sequence while
+    /// enforcing execution work against the exact observed charge. This
+    /// retains the full certificate, accounting, and spans required by an
+    /// enclosing reducer that must validate match-level invariants.
+    pub fn admit_spans_observed(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedSpans, Error> {
+        let result =
+            self.execute::<true>(haystack, range, strategy, OperationKind::Spans, limits)?;
+        Ok(AdmittedSpans {
+            common: Common {
+                certificate: result.certificate,
+                accounting: result.accounting,
+                marker: PhantomData,
+            },
+            spans: result.spans,
+        })
+    }
+
     /// Admit and evaluate a complete match-count reduction.
     pub fn admit_count(
         &self,

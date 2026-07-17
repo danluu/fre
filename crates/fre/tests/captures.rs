@@ -298,6 +298,118 @@ fn cross_family_capture_reducers_match_pinned_rust_bytes() {
 }
 
 #[test]
+fn uniform_participation_uses_selector_without_history() {
+    let cases: &[(&str, &[u8])] = &[
+        (r"fn is_(\w+)|fn as_(\w+)", b"fn is_even fn as_byte"),
+        (r"(?s)^((.*)()()($))", b"abc\ndef"),
+        (
+            r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/",
+            b"cargo/registry/src/x/name-1.2.3/",
+        ),
+        (
+            r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/|cargo\\registry\\src\\[^\\]+\\([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)\\",
+            b"cargo/registry/src/x/name-1.2.3/",
+        ),
+        (r"(a){0}(a)", b"a"),
+    ];
+    for &(pattern, haystack) in cases {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            fre::CapturePlanKind::LinearSelectorUniformParticipation,
+            "pattern={pattern:?}"
+        );
+        let limits = CaptureRunLimits {
+            aggregate: CaptureAggregateLimits {
+                per_search: CaptureSearchLimits {
+                    max_state_visits: 0,
+                    max_history_nodes: 0,
+                    max_history_walk: 0,
+                    ..CaptureSearchLimits::default()
+                },
+                max_total_state_visits: 0,
+                max_total_history_nodes: 0,
+                max_total_history_walk: 0,
+                ..CaptureAggregateLimits::default()
+            },
+            ..CaptureRunLimits::default()
+        };
+        let result = regex
+            .count_captures(haystack, limits)
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        assert_eq!(result.accounting.count, reference_count(pattern, haystack));
+        assert_eq!(result.accounting.total_state_visits, 0);
+        assert_eq!(result.accounting.total_history_nodes, 0);
+        assert_eq!(result.accounting.total_history_walk, 0);
+    }
+
+    for pattern in [r"(a)(b)?", r"((a)|(b))+", r"(a)|(b)(c)"] {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            fre::CapturePlanKind::LinearSelectorPersistentHistory,
+            "pattern={pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn uniform_participation_preserves_count_and_event_limits() {
+    let regex = CaptureBuilder::new(r"fn is_(\w+)|fn as_(\w+)")
+        .unicode(false)
+        .build()
+        .expect("uniform alternation build");
+    let haystack = b"fn is_even fn as_byte";
+    let exact = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("uniform exact limits");
+    assert_eq!(exact.accounting.matches, 2);
+    assert_eq!(exact.accounting.count, 4);
+    let count_starved = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_capture_count: exact.accounting.count - 1,
+            ..CaptureAggregateLimits::default()
+        },
+        ..CaptureRunLimits::default()
+    };
+    let count_error = regex
+        .count_captures(haystack, count_starved)
+        .expect_err("uniform count one below must refuse");
+    assert!(matches!(
+        count_error.source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::CaptureCount,
+            required: 4,
+            limit: 3,
+        })
+    ));
+    let event_starved = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_capture_events: 5,
+            ..CaptureAggregateLimits::default()
+        },
+        ..CaptureRunLimits::default()
+    };
+    let event_error = regex
+        .count_captures(haystack, event_starved)
+        .expect_err("uniform events one below must refuse");
+    assert!(matches!(
+        event_error.source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::CaptureEvents,
+            required: 6,
+            limit: 5,
+        })
+    ));
+}
+
+#[test]
 fn sixty_five_user_captures_match_pinned_rust_and_remain_bounded() {
     // This cardinality is shared by the authenticated Veryl lexer rows:
     // curated/05-lexer-veryl/single and wild/parol-veryl/{ascii,unicode}.
@@ -432,8 +544,16 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
     let result = regex
         .count_captures(b"aaabbbccc", CaptureRunLimits::default())
         .expect("fanout reduction");
-    assert!(result.accounting.total_history_nodes <= result.accounting.total_state_visits);
+    assert_eq!(
+        result.identity.plan.plan,
+        fre::CapturePlanKind::LinearSelectorUniformParticipation
+    );
+    assert_eq!(result.accounting.total_history_nodes, 0);
 
+    let history = CaptureBuilder::new(r"(a)(b)?")
+        .unicode(false)
+        .build()
+        .expect("variable-participation build");
     let starved = CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
@@ -445,8 +565,8 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
         },
         ..CaptureRunLimits::default()
     };
-    let error = regex
-        .count_captures(b"a", starved)
+    let error = history
+        .count_captures(b"ab", starved)
         .expect_err("history starvation must refuse");
     assert!(matches!(
         error.source,
@@ -459,12 +579,12 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
 
 #[test]
 fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
-    let regex = CaptureBuilder::new(r"(a)")
+    let regex = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)
         .build()
         .expect("combined-peak build");
     let admitted = regex
-        .count_captures(b"a", CaptureRunLimits::default())
+        .count_captures(b"ab", CaptureRunLimits::default())
         .expect("combined-peak baseline");
     assert!(
         admitted.combined_peak_bytes > admitted.selector_accounting.peak_bytes,
@@ -477,7 +597,7 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
         ..CaptureRunLimits::default()
     };
     let error = regex
-        .count_captures(b"a", constrained)
+        .count_captures(b"ab", constrained)
         .expect_err("combined peak must constrain replay before allocation");
     assert!(matches!(
         error.source,

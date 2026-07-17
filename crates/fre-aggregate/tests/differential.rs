@@ -2209,6 +2209,62 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
 }
 
 #[test]
+fn span_diagnostics_can_use_observed_work_without_losing_evidence() {
+    let regex = compile(r"(?:(?:|a){1,2}?b?)*");
+    let haystack = b"aab";
+    for strategy in STRATEGIES {
+        let diagnostic_spans = regex
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let span_work = diagnostic_spans.accounting().work;
+        assert!(span_work < diagnostic_spans.certificate().work_bound);
+        let observed_spans = regex
+            .admit_spans_observed(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: span_work,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(diagnostic_spans.as_slice(), observed_spans.as_slice());
+        assert_eq!(diagnostic_spans.certificate(), observed_spans.certificate());
+        assert_eq!(diagnostic_spans.accounting(), observed_spans.accounting());
+        expect_resource(
+            regex.admit_spans(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: span_work,
+                    ..OperationLimits::default()
+                },
+            ),
+            Resource::ExecutionWork,
+        );
+        expect_resource(
+            regex.admit_spans_observed(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: span_work - 1,
+                    ..OperationLimits::default()
+                },
+            ),
+            Resource::ExecutionWork,
+        );
+    }
+}
+
+#[test]
 fn value_reducers_enforce_observed_work_instead_of_replay_upper_bound() {
     let regex = compile(r"(?:(?:|a){1,2}?b?)*");
     let haystack = b"aab";

@@ -38,6 +38,9 @@ pub enum CaptureOperation {
 /// Production plan selected for the admitted capture operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturePlanKind {
+    /// One operation-wide span selector plus a construction-time proof of a
+    /// fixed participating-capture cardinality for every selected match.
+    LinearSelectorUniformParticipation,
     /// One operation-wide span selector plus exact-span persistent-history replay.
     LinearSelectorPersistentHistory,
 }
@@ -175,6 +178,9 @@ pub struct CaptureBuildReport {
     pub engine: EngineBuildReport,
     /// Capture-erased selector construction accounting.
     pub selector: SelectorCompileAccounting,
+    /// Exact explicit-capture participation per selected match when the HIR
+    /// proves that cardinality independent of input and branch choice.
+    pub uniform_participating_captures: Option<usize>,
     /// Complete immutable plan identity.
     pub plan_identity: CapturePlanIdentity,
 }
@@ -927,6 +933,14 @@ impl CaptureBuilder {
                 "Rust byte request produced non-Rust syntax",
             ));
         };
+        let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
+            CaptureBuildError::InternalInvariant("syntax capture count does not fit usize")
+        })?;
+        if explicit_captures != rust.hir.properties().explicit_captures_len() {
+            return Err(CaptureBuildError::InternalInvariant(
+                "syntax capture count differs from HIR properties",
+            ));
+        }
         let mut accounting = CaptureHirAccounting::default();
         let selector_profile = if unicode {
             SelectorProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
@@ -940,6 +954,8 @@ impl CaptureBuilder {
         )
         .map_err(CaptureBuildError::Selector)?;
         let selector_accounting = selector.compile_accounting();
+        let uniform_participating_captures =
+            capture_participation(&rust.hir, 1, &limits, &mut accounting)?.uniform;
         let ast = lower_hir(&rust.hir, 1, line_terminator, &limits, &mut accounting)?;
         let program =
             Arc::new(Program::compile(&ast, limits.engine).map_err(CaptureBuildError::Engine)?);
@@ -952,7 +968,11 @@ impl CaptureBuilder {
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
-            plan: CapturePlanKind::LinearSelectorPersistentHistory,
+            plan: if uniform_participating_captures.is_some() {
+                CapturePlanKind::LinearSelectorUniformParticipation
+            } else {
+                CapturePlanKind::LinearSelectorPersistentHistory
+            },
             capture_profile: CaptureProfile::RustRegexBytes1_12_4,
             selector_plan_id: selector.plan_id(),
         };
@@ -962,6 +982,7 @@ impl CaptureBuilder {
             hir: accounting,
             engine: engine_report,
             selector: selector_accounting,
+            uniform_participating_captures,
             plan_identity,
         };
         Ok(CaptureRegex {
@@ -1072,6 +1093,83 @@ impl CaptureRegex {
         selector_limits.max_peak_bytes = selector_limits
             .max_peak_bytes
             .min(limits.max_combined_peak_bytes);
+        if let Some(participating) = self.report.uniform_participating_captures {
+            let selected = self
+                .selector
+                .admit_spans_observed(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                )
+                .map_err(|source| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::Selector(source),
+                })?;
+            let selector_accounting = selected.accounting();
+            let mut matches = 0_usize;
+            for span in selected.as_slice() {
+                if span.start == span.end {
+                    return Err(Self::history_error(
+                        &identity,
+                        EngineSearchError::EmptyMatch,
+                    ));
+                }
+                matches = checked_capture_add(
+                    &identity,
+                    matches,
+                    1,
+                    EngineResource::Results,
+                    limits.aggregate.max_results,
+                )?;
+            }
+            let participating_with_overall =
+                participating
+                    .checked_add(1)
+                    .ok_or_else(|| CaptureExecutionError {
+                        identity: Box::new(identity.clone()),
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "uniform capture participation overflowed usize",
+                        ),
+                    })?;
+            let count = checked_capture_mul(
+                &identity,
+                matches,
+                participating_with_overall,
+                EngineResource::CaptureCount,
+                limits.aggregate.max_capture_count,
+            )?;
+            let all_groups = self.report.engine.captures.checked_add(1).ok_or_else(|| {
+                CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "capture schema overflowed usize",
+                    ),
+                }
+            })?;
+            let _capture_events = checked_capture_mul(
+                &identity,
+                matches,
+                all_groups,
+                EngineResource::CaptureEvents,
+                limits.aggregate.max_capture_events,
+            )?;
+            return Ok(CaptureExecutionReport {
+                identity,
+                accounting: CaptureCountOutcome {
+                    count,
+                    matches,
+                    searches: 0,
+                    total_state_visits: 0,
+                    total_history_nodes: 0,
+                    total_history_walk: 0,
+                    peak_threads: 0,
+                },
+                selector_certificate: selected.certificate().clone(),
+                selector_accounting,
+                combined_peak_bytes: selector_accounting.peak_bytes,
+            });
+        }
         let selected = self
             .selector
             .admit_spans(
@@ -1270,6 +1368,154 @@ fn checked_capture_add(
         });
     }
     Ok(required)
+}
+
+fn checked_capture_mul(
+    identity: &CaptureCacheIdentity,
+    left: usize,
+    right: usize,
+    resource: EngineResource,
+    limit: usize,
+) -> Result<usize, CaptureExecutionError> {
+    let required = left
+        .checked_mul(right)
+        .ok_or_else(|| CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+        })?;
+    if required > limit {
+        return Err(CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(EngineSearchError::Resource {
+                kind: resource,
+                required,
+                limit,
+            }),
+        });
+    }
+    Ok(required)
+}
+
+#[derive(Clone, Copy)]
+struct CaptureParticipation {
+    uniform: Option<usize>,
+    stable_set: bool,
+    can_participate: bool,
+}
+
+impl CaptureParticipation {
+    const CAPTURE_FREE: Self = Self {
+        uniform: Some(0),
+        stable_set: true,
+        can_participate: false,
+    };
+}
+
+/// Prove only the cardinality needed by the reducer while charging this
+/// auxiliary traversal to the same construction-work ledger as lowering.
+fn capture_participation(
+    hir: &Hir,
+    depth: usize,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<CaptureParticipation, CaptureBuildError> {
+    if depth > limits.max_hir_depth {
+        return Err(CaptureBuildError::HirResource {
+            resource: "depth",
+            required: depth,
+            limit: limits.max_hir_depth,
+        });
+    }
+    charge_hir(accounting, 1, limits.max_hir_work)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Look(_) => {
+            Ok(CaptureParticipation::CAPTURE_FREE)
+        }
+        HirKind::Capture(capture) => {
+            let child = capture_participation(
+                capture.sub.as_ref(),
+                next_depth(depth)?,
+                limits,
+                accounting,
+            )?;
+            let uniform = child
+                .uniform
+                .map(|count| {
+                    checked_dimension_add(count, 1, "capture participation", limits.max_hir_work)
+                })
+                .transpose()?;
+            Ok(CaptureParticipation {
+                uniform,
+                stable_set: child.stable_set,
+                can_participate: true,
+            })
+        }
+        HirKind::Repetition(repetition) => {
+            let child = capture_participation(
+                repetition.sub.as_ref(),
+                next_depth(depth)?,
+                limits,
+                accounting,
+            )?;
+            if repetition.max == Some(0) || !child.can_participate {
+                return Ok(CaptureParticipation::CAPTURE_FREE);
+            }
+            let can_repeat = match repetition.max {
+                Some(maximum) => maximum > 1,
+                None => true,
+            };
+            if repetition.min == 0 || (can_repeat && !child.stable_set) {
+                return Ok(CaptureParticipation {
+                    uniform: None,
+                    stable_set: false,
+                    can_participate: true,
+                });
+            }
+            Ok(child)
+        }
+        HirKind::Concat(children) => {
+            let mut combined = CaptureParticipation::CAPTURE_FREE;
+            for child in children {
+                let child = capture_participation(child, next_depth(depth)?, limits, accounting)?;
+                charge_hir(accounting, 1, limits.max_hir_work)?;
+                combined = CaptureParticipation {
+                    uniform: match (combined.uniform, child.uniform) {
+                        (Some(left), Some(right)) => Some(checked_dimension_add(
+                            left,
+                            right,
+                            "capture participation",
+                            limits.max_hir_work,
+                        )?),
+                        _ => None,
+                    },
+                    stable_set: combined.stable_set && child.stable_set,
+                    can_participate: combined.can_participate || child.can_participate,
+                };
+            }
+            Ok(combined)
+        }
+        HirKind::Alternation(children) => {
+            let mut uniform = None;
+            let mut can_participate = false;
+            for (index, child) in children.iter().enumerate() {
+                let child = capture_participation(child, next_depth(depth)?, limits, accounting)?;
+                charge_hir(accounting, 1, limits.max_hir_work)?;
+                uniform = if index == 0 || uniform == child.uniform {
+                    child.uniform
+                } else {
+                    None
+                };
+                can_participate |= child.can_participate;
+            }
+            Ok(CaptureParticipation {
+                uniform,
+                // Capture IDs are unique HIR nodes, so distinct alternatives
+                // have one stable set only when all of them are capture-free.
+                stable_set: !can_participate,
+                can_participate,
+            })
+        }
+    }
 }
 
 #[allow(
