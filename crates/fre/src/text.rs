@@ -974,7 +974,7 @@ pub(crate) fn next_text_boundary(haystack: &str, start: usize) -> usize {
     }
     let mut boundary = start;
     while !haystack.is_char_boundary(boundary) {
-        boundary += 1;
+        boundary = boundary.saturating_add(1);
     }
     boundary
 }
