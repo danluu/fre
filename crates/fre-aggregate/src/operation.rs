@@ -1349,85 +1349,88 @@ impl RowStore {
             try_charge_state(accounting, admitted_work_bound)?;
             let value =
                 match program.instruction(pc)? {
-                Inst::Unfilled => {
-                    return Err(Error::InternalInvariant("unfilled sparse execution state"));
-                }
-                Inst::Fail => 0,
-                Inst::Match => {
-                    if seeded {
-                        encode(position)?
-                    } else {
-                        0
+                    Inst::Unfilled => {
+                        return Err(Error::InternalInvariant("unfilled sparse execution state"));
                     }
-                }
-                Inst::Consume { bytes, next } => {
-                    try_charge_transition(accounting, admitted_work_bound)?;
-                    if next_any && input.is_some_and(|byte| bytes.contains(byte)) {
-                        next_row[*next]
-                    } else {
-                        0
-                    }
-                }
-                Inst::ConsumeScalar {
-                    scalars,
-                    next_by_width,
-                } => {
-                    try_charge_transition(accounting, admitted_work_bound)?;
-                    if !next_any {
-                        row[pc] = 0;
-                        continue;
-                    }
-                    let Some(scalar) = scalar else {
-                        row[pc] = 0;
-                        continue;
-                    };
-                    let matches = scalars.contains_with(scalar, || {
-                        try_charge_transition(accounting, admitted_work_bound)
-                    })?;
-                    if matches {
-                        let width_index = scalar.len_utf8().checked_sub(1).ok_or(
-                            Error::InternalInvariant("Unicode scalar has zero byte width"),
-                        )?;
-                        let next = *next_by_width.get(width_index).ok_or(
-                            Error::InternalInvariant("Unicode scalar width outside dispatch"),
-                        )?;
-                        *next_row.get(next).ok_or(Error::InternalInvariant(
-                            "scalar successor state outside sparse row",
-                        ))?
-                    } else {
-                        0
-                    }
-                }
-                Inst::Assert { assertion, next } => {
-                    try_charge_assertion(accounting, admitted_work_bound)?;
-                    if assertions.is_match(*assertion, position)? {
-                        row[*next]
-                    } else {
-                        0
-                    }
-                }
-                Inst::Split {
-                    preferred,
-                    fallback,
-                } => {
-                    try_charge_transition(accounting, admitted_work_bound)?;
-                    let preferred_value = row[*preferred];
-                    if preferred_value != 0 {
-                        if storage == RowStorage::SplitDecisions {
-                            let rank = program.split_rank[pc];
-                            if rank == NO_SPLIT_RANK {
-                                return Err(Error::InternalInvariant(
-                                    "sparse split state has no decision rank",
-                                ));
-                            }
-                            set_bit(record, rank)?;
+                    Inst::Fail => 0,
+                    Inst::Match => {
+                        if seeded {
+                            encode(position)?
+                        } else {
+                            0
                         }
-                        preferred_value
-                    } else {
-                        try_charge_transition(accounting, admitted_work_bound)?;
-                        row[*fallback]
                     }
-                }
+                    Inst::Consume { bytes, next } => {
+                        try_charge_transition(accounting, admitted_work_bound)?;
+                        if next_any && input.is_some_and(|byte| bytes.contains(byte)) {
+                            next_row[*next]
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::ConsumeScalar {
+                        scalars,
+                        next_by_width,
+                    } => {
+                        try_charge_transition(accounting, admitted_work_bound)?;
+                        if !next_any {
+                            row[pc] = 0;
+                            continue;
+                        }
+                        let Some(scalar) = scalar else {
+                            row[pc] = 0;
+                            continue;
+                        };
+                        let matches = scalars.contains_with(scalar, || {
+                            try_charge_transition(accounting, admitted_work_bound)
+                        })?;
+                        if matches {
+                            let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                                Error::InternalInvariant("Unicode scalar has zero byte width"),
+                            )?;
+                            let next =
+                                *next_by_width
+                                    .get(width_index)
+                                    .ok_or(Error::InternalInvariant(
+                                        "Unicode scalar width outside dispatch",
+                                    ))?;
+                            *next_row.get(next).ok_or(Error::InternalInvariant(
+                                "scalar successor state outside sparse row",
+                            ))?
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::Assert { assertion, next } => {
+                        try_charge_assertion(accounting, admitted_work_bound)?;
+                        if assertions.is_match(*assertion, position)? {
+                            row[*next]
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::Split {
+                        preferred,
+                        fallback,
+                    } => {
+                        try_charge_transition(accounting, admitted_work_bound)?;
+                        let preferred_value = row[*preferred];
+                        if preferred_value != 0 {
+                            if storage == RowStorage::SplitDecisions {
+                                let rank = program.split_rank[pc];
+                                if rank == NO_SPLIT_RANK {
+                                    return Err(Error::InternalInvariant(
+                                        "sparse split state has no decision rank",
+                                    ));
+                                }
+                                set_bit(record, rank)?;
+                            }
+                            preferred_value
+                        } else {
+                            try_charge_transition(accounting, admitted_work_bound)?;
+                            row[*fallback]
+                        }
+                    }
                 };
             row[pc] = value;
             row_any |= value != 0;
@@ -1476,7 +1479,8 @@ impl RowStore {
         let next_row = future_rows.first().map(Vec::as_slice).unwrap_or_default();
         for &pc in &program.epsilon_order {
             charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
-            let value = match program.instruction(pc)? {
+            let value =
+                match program.instruction(pc)? {
                     Inst::Unfilled => {
                         return Err(Error::InternalInvariant("unfilled execution state"));
                     }
@@ -1573,7 +1577,7 @@ impl RowStore {
                             row[*fallback]
                         }
                     }
-            };
+                };
             row[pc] = value;
         }
         match storage {
@@ -1751,12 +1755,18 @@ impl RowStore {
                             "sparse row log selected failing Unicode scalar path",
                         ));
                     }
-                    let width_index = scalar.len_utf8().checked_sub(1).ok_or(
-                        Error::InternalInvariant("Unicode scalar has zero byte width"),
-                    )?;
-                    pc = *next_by_width.get(width_index).ok_or(
-                        Error::InternalInvariant("Unicode scalar width outside dispatch"),
-                    )?;
+                    let width_index =
+                        scalar
+                            .len_utf8()
+                            .checked_sub(1)
+                            .ok_or(Error::InternalInvariant(
+                                "Unicode scalar has zero byte width",
+                            ))?;
+                    pc = *next_by_width
+                        .get(width_index)
+                        .ok_or(Error::InternalInvariant(
+                            "Unicode scalar width outside dispatch",
+                        ))?;
                     position = add(position, 1, Resource::Boundaries)?;
                 }
                 Inst::Assert { assertion, next } => {

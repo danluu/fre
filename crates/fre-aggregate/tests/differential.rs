@@ -466,7 +466,10 @@ fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
     let regex = compile_unicode(pattern);
     let compile = regex.compile_accounting();
     assert!(compile.has_scalar_transitions);
-    assert_eq!((compile.required_suffixes, compile.required_suffix_bytes), (1, 3));
+    assert_eq!(
+        (compile.required_suffixes, compile.required_suffix_bytes),
+        (1, 3)
+    );
     let expected = upstream_unicode(pattern, &haystack);
     let dense = regex
         .admit_spans(
