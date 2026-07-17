@@ -472,14 +472,14 @@ impl ByteClass {
                             computation: "fixed class byte-mask last shift",
                         })?;
                 let mask = first_mask & last_mask;
-                let word =
+                let mask_word =
                     class
                         .words
                         .get_mut(word_index)
                         .ok_or(BuildError::ArithmeticOverflow {
                             computation: "fixed class byte-mask word access",
                         })?;
-                *word |= mask;
+                *mask_word |= mask;
                 *work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
                     computation: "fixed class byte-mask work",
                 })?;
@@ -506,6 +506,26 @@ pub struct FixedClassSandwichPlan {
     middle_repetitions: u32,
     window_units: usize,
     build: BuildAccounting,
+}
+
+fn checked_window_units(middle_repetitions: u32, limits: BuildLimits) -> Result<usize, BuildError> {
+    if middle_repetitions == 0 {
+        return Err(BuildError::ZeroMiddleRepetitions);
+    }
+    if middle_repetitions > limits.max_middle_repetitions {
+        return Err(BuildError::MiddleRepetitionLimit {
+            needed: middle_repetitions,
+            limit: limits.max_middle_repetitions,
+        });
+    }
+    usize::try_from(middle_repetitions)
+        .map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "middle repetitions as usize",
+        })?
+        .checked_add(2)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "fixed class window units",
+        })
 }
 
 impl FixedClassSandwichPlan {
@@ -567,24 +587,7 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if middle_repetitions == 0 {
-            return Err(BuildError::ZeroMiddleRepetitions);
-        }
-        if middle_repetitions > limits.max_middle_repetitions {
-            return Err(BuildError::MiddleRepetitionLimit {
-                needed: middle_repetitions,
-                limit: limits.max_middle_repetitions,
-            });
-        }
-        let middle_units =
-            usize::try_from(middle_repetitions).map_err(|_| BuildError::ArithmeticOverflow {
-                computation: "middle repetitions as usize",
-            })?;
-        let window_units = middle_units
-            .checked_add(2)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed class window units",
-            })?;
+        let window_units = checked_window_units(middle_repetitions, limits)?;
         let mut work = 0_usize;
         let (prefix, prefix_capacity) =
             collect_ranges(prefix, "prefix", semantics, limits, &mut work)?;
