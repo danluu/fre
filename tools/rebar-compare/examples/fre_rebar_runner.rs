@@ -71,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-structural-quota-v4 report={REPORT_SCHEMA} aggregate-explain=14 aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-structural-quota-v4 report={REPORT_SCHEMA} aggregate-explain=15 aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -522,6 +522,9 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::FixedClassSandwich, _) => {
             "compile-aggregate-fixed-class-sandwich"
         }
+        ("compile", AggregatePlanKind::BoundedClassSequence, _) => {
+            "compile-aggregate-bounded-class-sequence"
+        }
         ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
             "compile-aggregate-finite-literal-sparse"
         }
@@ -534,6 +537,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::ExactLiteral, _) => "aggregate-exact-literal",
         (_, AggregatePlanKind::UnicodeScalarClass, _) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
+        (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",

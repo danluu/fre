@@ -213,6 +213,7 @@ fn continuation_details(
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
+        | AggregateExecutionDetails::BoundedClassSequence(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
@@ -1199,6 +1200,280 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                 .unwrap_or_else(|error| panic!("compile verify {pattern:?}: {error}"))
                 .value(),
             expected_count
+        );
+    }
+}
+
+// rebar-row:curated/10-bounded-repeat/capitals@rust/regex
+#[test]
+fn bounded_capitals_count_selects_linear_plan_at_hand_derived_work_boundary() {
+    let pattern = r"(?:[A-Z][a-z]+\s*){10,100}";
+    let haystack = b"Aa Bb Cc Dd Ee Ff Gg Hh Ii Jj!";
+    let expected = upstream(pattern, haystack, false);
+    assert_eq!(expected, vec![(0, 29)]);
+
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::BoundedClassSequence
+    );
+    let AggregateBuildAccounting::BoundedClassSequence(build) = regex.build_report().build else {
+        panic!("assigned capitals row did not retain bounded sequence accounting")
+    };
+    assert_eq!(build.allocations, 0);
+    assert_eq!(build.reserves, 0);
+    assert_eq!(build.temporary_copies, 0);
+
+    let planner_work = regex.build_report().bounded_class_sequence_planner_work;
+    let prior_fixed_work = regex.build_report().fixed_class_sandwich_planner_work;
+    let exact_planner = AggregateBuildLimits {
+        // The preceding fixed-sandwich inspection keeps its old exact quota;
+        // the new optimizer has a separately authenticated planner limit.
+        max_fixed_class_sandwich_planner_work: prior_fixed_work,
+        max_bounded_class_sequence_planner_work: planner_work,
+        ..AggregateBuildLimits::default()
+    };
+    assert_eq!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .limits(exact_planner)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::BoundedClassSequence
+    );
+    let one_below_planner = AggregateBuildLimits {
+        max_fixed_class_sandwich_planner_work: prior_fixed_work,
+        max_bounded_class_sequence_planner_work: planner_work.checked_sub(1).unwrap(),
+        ..AggregateBuildLimits::default()
+    };
+    assert!(matches!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .limits(one_below_planner)
+            .build_count(),
+        Err(AggregateBuildError::BoundedClassSequencePlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit.checked_add(1) == Some(planner_work)
+    ));
+
+    // N=30, so 28*N+8 = 848. The sole complete match is 0..29;
+    // the terminal `!` is inspected but excluded from the greedy match.
+    let exact_work = 848;
+    let exact = AggregateRunLimits {
+        bounded_class_sequence: fre::BoundedClassSequenceReduceLimits {
+            max_work: exact_work,
+            ..fre::BoundedClassSequenceReduceLimits::default()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let counted = regex.count(haystack, exact).unwrap();
+    assert_eq!(counted.value(), 1);
+    let AggregateExecutionDetails::BoundedClassSequence(accounting) = &counted.report().details
+    else {
+        panic!("assigned capitals row did not execute bounded sequence plan")
+    };
+    assert_eq!(accounting.upper_bounds.work, exact_work);
+
+    let one_below = AggregateRunLimits {
+        bounded_class_sequence: fre::BoundedClassSequenceReduceLimits {
+            max_work: 847,
+            ..fre::BoundedClassSequenceReduceLimits::default()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let error = regex.count(haystack, one_below).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::BoundedClassSequence(
+            fre::BoundedClassSequenceReduceError::WorkLimit { needed, limit }
+        ) if needed == exact_work && limit.checked_add(1) == Some(exact_work)
+    ));
+}
+
+// rebar-row:curated/10-bounded-repeat/capitals@rust/regex
+#[test]
+fn bounded_class_sequence_differentials_compare_complete_spans_across_semantic_edges() {
+    let invalid = [
+        b'A', b'a', b' ', b'B', b'b', 0xFF, b'C', b'c', b' ', b'D', b'd',
+    ];
+    let cases: [(&str, &[u8], bool, bool, bool); 9] = [
+        (
+            r"(?:(?<h>[A-Z])(?<b>[a-z]+)(?<t> *)){2,3}",
+            b"Aa Bb Cc!",
+            false,
+            false,
+            true,
+        ),
+        (
+            r"(?m:^(?:[A-Z][a-z]+ *){2,3}$)",
+            b"Aa Bb\nCc Dd\n",
+            false,
+            false,
+            false,
+        ),
+        (
+            r"(?:[A-Z][a-z]+ *){2,3}",
+            b"aa BB Cc dd",
+            false,
+            true,
+            false,
+        ),
+        (r"(?:[A][b]+ *){2,3}", b"ab AB!", false, true, true),
+        (r"(?:[A-Z][a-z]+ *){2,3}", &invalid, false, false, true),
+        (r"(?:[A-Z][a-z]+ *){2,3}", &invalid, true, false, false),
+        (
+            r"(?:[^\x00-\x40\x5B-\xFF][a-z&&[^x]]+[ \t]*){2,3}",
+            b"Aa Bb\tCx Dd ",
+            false,
+            false,
+            true,
+        ),
+        (r"(?:[a&&b][a-z]+ *){2,3}", b"Aa Bb", false, false, false),
+        (
+            r"(?:[A-Z][a-z]+ *){2,3}",
+            b"!Aa Bb Cc?Dd Ee!",
+            false,
+            false,
+            true,
+        ),
+    ];
+    for (pattern, haystack, unicode, case_insensitive, direct) in cases {
+        let windows = [0..haystack.len(), 1.min(haystack.len())..haystack.len()];
+        for window in windows {
+            let slice = &haystack[window];
+            let expected = upstream_profile(pattern, slice, case_insensitive, unicode);
+            let spans = aggregate_builder(pattern)
+                .unicode(unicode)
+                .case_insensitive(case_insensitive)
+                .plan_selection(AggregatePlanSelection::ForceContinuation)
+                .build_spans()
+                .unwrap_or_else(|error| panic!("span build {pattern:?}: {error}"))
+                .spans(slice, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("span run {pattern:?}/{slice:?}: {error}"));
+            let actual = spans
+                .iter()
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "complete spans {pattern:?}/{slice:?}");
+
+            let count = aggregate_builder(pattern)
+                .unicode(unicode)
+                .case_insensitive(case_insensitive)
+                .build_count()
+                .unwrap_or_else(|error| panic!("count build {pattern:?}: {error}"));
+            assert_eq!(
+                count.build_report().plan == AggregatePlanKind::BoundedClassSequence,
+                direct,
+                "selection {pattern:?}/{slice:?}"
+            );
+            let count = count
+                .count_value(slice, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("count run {pattern:?}/{slice:?}: {error}"));
+            assert_eq!(count, u64::try_from(expected.len()).unwrap());
+        }
+    }
+}
+
+// rebar-row:curated/10-bounded-repeat/capitals@rust/regex
+#[test]
+fn bounded_capitals_execution_work_scales_at_n_2n_and_4n() {
+    type BoundedCapitalsCase = (&'static [u8], usize, &'static [(usize, usize)]);
+    let pattern = r"(?:[A-Z][a-z]+\s*){10,100}";
+    let cases: [BoundedCapitalsCase; 3] = [
+        (b"AaBbCcDdEeFfGgHhIiJj!", 596, &[(0, 20)]),
+        (
+            b"AaBbCcDdEeFfGgHhIiJj!AaBbCcDdEeFfGgHhIiJj!",
+            1_184,
+            &[(0, 20), (21, 41)],
+        ),
+        (
+            b"AaBbCcDdEeFfGgHhIiJj!AaBbCcDdEeFfGgHhIiJj!AaBbCcDdEeFfGgHhIiJj!AaBbCcDdEeFfGgHhIiJj!",
+            2_360,
+            &[(0, 20), (21, 41), (42, 62), (63, 83)],
+        ),
+    ];
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    for (haystack, hand_work, hand_spans) in cases {
+        assert_eq!(
+            upstream(pattern, haystack, false).as_slice(),
+            hand_spans,
+            "complete hand-derived spans at N={}",
+            haystack.len()
+        );
+        let counted = regex
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(counted.value(), u64::try_from(hand_spans.len()).unwrap());
+        let AggregateExecutionDetails::BoundedClassSequence(accounting) = &counted.report().details
+        else {
+            panic!("assigned capitals row did not execute bounded sequence plan")
+        };
+        // The fixed finalization charge is 8; the remaining 28*N term is
+        // therefore exactly doubled by the 2N witness and quadrupled by 4N.
+        assert_eq!(accounting.upper_bounds.work, hand_work);
+        assert_eq!(
+            accounting.upper_bounds.work.checked_sub(8).unwrap(),
+            haystack.len().checked_mul(28).unwrap()
+        );
+    }
+}
+
+// rebar-row:curated/10-bounded-repeat/capitals@rust/regex
+#[test]
+fn bounded_class_sequence_structural_work_is_linear_in_canonical_ranges() {
+    let compact = aggregate_builder(r"(?:[A-C][a-c]+\x20*){2,3}")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let doubled = aggregate_builder(r"(?:[A-CE-G][a-ce-g]+[\x09\x20]*){2,3}")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let quadrupled =
+        aggregate_builder(r"(?:[A-CE-GI-KM-O][a-ce-gi-km-o]+[\x01\x03\x05\x07]*){2,3}")
+            .unicode(false)
+            .build_count()
+            .unwrap();
+    let AggregateBuildAccounting::BoundedClassSequence(compact_build) =
+        compact.build_report().build
+    else {
+        panic!("compact sequence did not select the bounded plan")
+    };
+    let AggregateBuildAccounting::BoundedClassSequence(doubled_build) =
+        doubled.build_report().build
+    else {
+        panic!("doubled-range sequence did not select the bounded plan")
+    };
+    let AggregateBuildAccounting::BoundedClassSequence(quadrupled_build) =
+        quadrupled.build_report().build
+    else {
+        panic!("quadrupled-range sequence did not select the bounded plan")
+    };
+    assert_eq!(compact_build.source_ranges, 3);
+    assert_eq!(doubled_build.source_ranges, 6);
+    assert_eq!(quadrupled_build.source_ranges, 12);
+    // One range visit plus the 2Q-3 three-merge comparison bound gives 3Q.
+    let fixed_work = compact
+        .build_report()
+        .bounded_class_sequence_planner_work
+        .checked_sub(compact_build.source_ranges.checked_mul(3).unwrap())
+        .unwrap();
+    for (plan, ranges) in [(&doubled, 6_usize), (&quadrupled, 12_usize)] {
+        assert_eq!(
+            plan.build_report().bounded_class_sequence_planner_work,
+            fixed_work
+                .checked_add(ranges.checked_mul(3).unwrap())
+                .unwrap()
         );
     }
 }

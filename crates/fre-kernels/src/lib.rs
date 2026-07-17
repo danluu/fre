@@ -12,6 +12,7 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+mod bounded_class_sequence;
 mod fixed_class_sandwich;
 mod forward_anchored;
 mod literal_aggregate;
@@ -22,6 +23,20 @@ mod packed_ordered_literal_aggregate;
 mod required_literal;
 mod sparse_ordered_literal_aggregate;
 mod unicode_scalar_aggregate;
+
+pub use bounded_class_sequence::{
+    BoundedClassSequencePlan, BuildAccounting as BoundedClassSequenceBuildAccounting,
+    BuildError as BoundedClassSequenceBuildError, BuildLimits as BoundedClassSequenceBuildLimits,
+    COUNT_OPERATION_ID as BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
+    CountResult as BoundedClassSequenceCountResult,
+    OperationIdentity as BoundedClassSequenceOperationIdentity,
+    PLAN_ID as BOUNDED_CLASS_SEQUENCE_PLAN_ID,
+    ReduceAccounting as BoundedClassSequenceReduceAccounting,
+    ReduceActualCounters as BoundedClassSequenceActualCounters,
+    ReduceError as BoundedClassSequenceReduceError,
+    ReduceLimits as BoundedClassSequenceReduceLimits,
+    ReduceUpperBounds as BoundedClassSequenceUpperBounds,
+};
 
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,

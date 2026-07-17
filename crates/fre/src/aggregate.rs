@@ -5,8 +5,13 @@ use fre_aggregate::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompiledRegex, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
-    FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
-    FixedClassSandwichCountResult, FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
+    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
+    BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
+    BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
+    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
+    BoundedClassSequenceReduceLimits, FixedClassSandwichBuildAccounting,
+    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
+    FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
@@ -48,7 +53,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 14;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 15;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -89,6 +94,9 @@ pub enum AggregatePlanKind {
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
     FixedClassSandwich,
+    /// Linear count reducer for a greedy bounded sequence of deterministic
+    /// `HEAD BODY+ TRAIL*` byte-class units.
+    BoundedClassSequence,
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
@@ -105,6 +113,8 @@ pub enum AggregatePlanIdentity {
     UnicodeScalar(AggregateUnicodeScalarIdentity),
     /// Fixed-width three-atom class sequence plus native reducer identity.
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
+    /// Unicode-off compound byte-class sequence plus count identity.
+    BoundedClassSequence(BoundedClassSequenceOperationIdentity),
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
@@ -249,6 +259,8 @@ pub enum AggregateBuildAccounting {
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
     /// Bounded class-sandwich construction certificate.
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
+    /// Allocation-free bounded compound byte-class construction certificate.
+    BoundedClassSequence(BoundedClassSequenceBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Sparse shared reversed automaton construction certificate. This is the
@@ -272,9 +284,13 @@ pub struct AggregateBuildLimits {
     /// One unit is charged for every HIR node and canonical scalar range
     /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
-    /// Maximum structural HIR/range inspection work for the fixed-width
-    /// class-sandwich specialization.
+    /// Maximum structural HIR/range inspection work for fixed-width class
+    /// sandwiches.
     pub max_fixed_class_sandwich_planner_work: usize,
+    /// Maximum structural HIR/range/disjointness inspection work for bounded
+    /// compound byte-class sequences. This separate quota preserves every
+    /// request previously admitted at its exact fixed-sandwich limit.
+    pub max_bounded_class_sequence_planner_work: usize,
     /// Maximum checked work for finite-language shape analysis and expansion.
     pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
@@ -283,6 +299,8 @@ pub struct AggregateBuildLimits {
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
     /// Complete bounded fixed-class construction limits.
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
+    /// Complete inline bounded class-sequence construction limits.
+    pub bounded_class_sequence: BoundedClassSequenceBuildLimits,
     /// Complete bounded reversed-DFA construction limits.
     pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
@@ -297,10 +315,12 @@ impl Default for AggregateBuildLimits {
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
+            max_bounded_class_sequence_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
+            bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
@@ -317,6 +337,8 @@ pub struct AggregateRunLimits {
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
+    /// Direct bounded class-sequence count limits.
+    pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
     /// Shared finite-language dense/sparse reducer limits. For sparse plans,
     /// `max_total_work` also bounds edge lookups, edge comparisons and failure
     /// steps individually because each is a component of that total.
@@ -355,9 +377,12 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
-    /// Fixed-class sandwich structural inspection work, including every HIR
-    /// node and canonical range examined through transparent captures.
+    /// Fixed-class structural inspection work, including every HIR node and
+    /// canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
+    /// Bounded compound-class structural inspection work, including every
+    /// HIR/range visit and admitted disjointness-comparison upper bound.
+    pub bounded_class_sequence_planner_work: usize,
     /// Checked finite-language root inspection and, for the dense route,
     /// analysis/expansion work; zero when finite inspection is skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
@@ -446,6 +471,14 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Bounded compound byte-class inspection crossed its independent
+    /// structural work cap.
+    BoundedClassSequencePlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Finite-language extraction crossed its explicit work cap.
     FinitePlannerWorkLimit {
         operation: AggregateOperation,
@@ -483,6 +516,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: FixedClassSandwichBuildError,
+    },
+    /// Bounded compound byte-class construction failed after selection.
+    BoundedClassSequenceBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: BoundedClassSequenceBuildError,
     },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
@@ -556,6 +595,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} fixed class-sandwich inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::BoundedClassSequencePlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded class-sequence inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FinitePlannerWorkLimit {
                 operation,
                 selection,
@@ -606,6 +654,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} fixed class-sandwich construction failed: {source}"
             ),
+            Self::BoundedClassSequenceBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded class-sequence construction failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -650,12 +706,14 @@ impl std::error::Error for AggregateBuildError {
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
+            Self::BoundedClassSequenceBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
+            | Self::BoundedClassSequencePlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
             | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
@@ -673,6 +731,8 @@ pub enum AggregateExecutionSource {
     UnicodeScalar(UnicodeScalarAggregateReduceError),
     /// Direct fixed class-sandwich refusal.
     FixedClassSandwich(FixedClassSandwichReduceError),
+    /// Direct bounded class-sequence refusal.
+    BoundedClassSequence(BoundedClassSequenceReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
@@ -689,6 +749,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
+            Self::BoundedClassSequence(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
@@ -705,6 +766,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
+            Self::BoundedClassSequence(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
@@ -748,6 +810,8 @@ pub enum AggregateExecutionDetails {
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
     /// Fixed class-sandwich bounds, counters, and operation identity.
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
+    /// Bounded class-sequence bounds, counters, and operation identity.
+    BoundedClassSequence(BoundedClassSequenceReduceAccounting),
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -1099,6 +1163,7 @@ impl AggregateBuilder {
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
+                bounded_class_sequence_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
@@ -1268,6 +1333,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work: work,
                     fixed_class_sandwich_planner_work: 0,
+                    bounded_class_sequence_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1384,6 +1450,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work: work,
+                    bounded_class_sequence_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1410,6 +1477,102 @@ impl AggregateBuilder {
                 });
             }
             Some(FixedClassSandwichInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let bounded_class_sequence_inspection = if !unicode
+            && selection == AggregatePlanSelection::Auto
+            && operation == AggregateOperation::Count
+        {
+            Some(
+                inspect_bounded_class_sequence(
+                    &rust.hir,
+                    limits.max_bounded_class_sequence_planner_work,
+                )
+                .map_err(|error| match error {
+                    BoundedClassSequenceInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::BoundedClassSequencePlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    BoundedClassSequenceInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded class-sequence inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let bounded_class_sequence_planner_work = match bounded_class_sequence_inspection {
+            Some(BoundedClassSequenceInspection::Eligible {
+                head,
+                body,
+                trail,
+                minimum,
+                maximum,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from bounded class-sequence inspection",
+                    });
+                }
+                let engine = BoundedClassSequencePlan::build(
+                    head.ranges(),
+                    body.ranges(),
+                    trail.ranges(),
+                    minimum,
+                    maximum,
+                    limits.bounded_class_sequence,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::BoundedClassSequenceBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::BoundedClassSequence,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_class_sequence_planner_work: work,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::BoundedClassSequence(build),
+                    plan_identity: AggregatePlanIdentity::BoundedClassSequence(
+                        engine.count_identity(),
+                    ),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::BoundedClassSequence(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(BoundedClassSequenceInspection::Ineligible { work }) => work,
             None => 0,
         };
         let inspect_finite =
@@ -1546,6 +1709,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
+                        bounded_class_sequence_planner_work,
                         finite_planner_work,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -1677,6 +1841,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
+                        bounded_class_sequence_planner_work,
                         finite_planner_work,
                         capture_erasure_work,
                         captures_erased: expected_captures,
@@ -1747,6 +1912,7 @@ impl AggregateBuilder {
             planner_work,
             unicode_scalar_planner_work,
             fixed_class_sandwich_planner_work,
+            bounded_class_sequence_planner_work,
             finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
@@ -1781,6 +1947,7 @@ enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
     FixedClassSandwich(FixedClassSandwichPlan),
+    BoundedClassSequence(BoundedClassSequencePlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
@@ -1870,6 +2037,15 @@ impl AggregatePlan {
                     self.execution_error(
                         limits,
                         AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
+            AggregateEngine::BoundedClassSequence(engine) => engine
+                .count(haystack, limits.bounded_class_sequence)
+                .map(AggregateCountExecution::BoundedClassSequence)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::BoundedClassSequence(source),
                     )
                 }),
             AggregateEngine::FiniteCount(engine) => engine
@@ -1966,6 +2142,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::FixedClassSandwich(source),
                     )
                 }),
+            AggregateEngine::BoundedClassSequence(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a bounded class-sequence count plan",
+                ),
+            )),
             AggregateEngine::FiniteSpanSum(engine) => engine
                 .span_sum(haystack, limits.finite_literal)
                 .map(|result| AggregateSpanSumExecution::FiniteLiteral {
@@ -2112,6 +2294,7 @@ enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
+    BoundedClassSequence(BoundedClassSequenceCountResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -2134,6 +2317,7 @@ impl AggregateCountExecution {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
+            Self::BoundedClassSequence(result) => result.count,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -2150,6 +2334,9 @@ impl AggregateCountExecution {
             }
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
+            }
+            Self::BoundedClassSequence(result) => {
+                AggregateExecutionDetails::BoundedClassSequence(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -2347,6 +2534,270 @@ enum FixedClassSandwichInspection<'a> {
     Ineligible {
         work: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+enum BoundedByteClassAtom<'a> {
+    Bytes(&'a ClassBytes),
+    Singleton(u8),
+}
+
+impl<'a> BoundedByteClassAtom<'a> {
+    fn range_count(self) -> usize {
+        match self {
+            Self::Bytes(class) => class.ranges().len(),
+            Self::Singleton(_) => 1,
+        }
+    }
+
+    fn ranges(self) -> BoundedByteClassRanges<'a> {
+        match self {
+            Self::Bytes(class) => BoundedByteClassRanges::Bytes(class.ranges().iter()),
+            Self::Singleton(byte) => BoundedByteClassRanges::Singleton(Some(byte)),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum BoundedByteClassRanges<'a> {
+    Bytes(core::slice::Iter<'a, ClassBytesRange>),
+    Singleton(Option<u8>),
+}
+
+impl Iterator for BoundedByteClassRanges<'_> {
+    type Item = (u8, u8);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Bytes(ranges) => ranges.next().map(|range| (range.start(), range.end())),
+            Self::Singleton(byte) => byte.take().map(|value| (value, value)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let length = self.len();
+        (length, Some(length))
+    }
+}
+
+impl ExactSizeIterator for BoundedByteClassRanges<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(ranges) => ranges.len(),
+            Self::Singleton(byte) => usize::from(byte.is_some()),
+        }
+    }
+}
+
+enum BoundedClassSequenceInspection<'a> {
+    Eligible {
+        head: BoundedByteClassAtom<'a>,
+        body: BoundedByteClassAtom<'a>,
+        trail: BoundedByteClassAtom<'a>,
+        minimum: u32,
+        maximum: u32,
+        work: usize,
+        hir_nodes: usize,
+        captures: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum BoundedClassSequenceInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one allocation-free traversal records the complete admitted compound-class HIR proof"
+)]
+fn inspect_bounded_class_sequence(
+    hir: &Hir,
+    limit: usize,
+) -> Result<BoundedClassSequenceInspection<'_>, BoundedClassSequenceInspectionError> {
+    let mut work = 0_usize;
+    let mut hir_nodes = 0_usize;
+    let mut captures = 0_usize;
+    let hir = peel_bounded_sequence_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Repetition(outer) = hir.kind() else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    let Some(maximum) = outer.max else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    if outer.min == 0 || maximum < outer.min || !outer.greedy {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    }
+    let unit = peel_bounded_sequence_captures(
+        outer.sub.as_ref(),
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let HirKind::Concat(parts) = unit.kind() else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    let [head, body, trail] = parts.as_slice() else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    let head =
+        peel_bounded_sequence_captures(head, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let Some(head) = inspect_bounded_byte_class(head) else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    let body =
+        peel_bounded_sequence_captures(body, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Repetition(body_repeat) = body.kind() else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    if body_repeat.min != 1 || body_repeat.max.is_some() || !body_repeat.greedy {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    }
+    let body = peel_bounded_sequence_captures(
+        body_repeat.sub.as_ref(),
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let Some(body) = inspect_bounded_byte_class(body) else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    let trail =
+        peel_bounded_sequence_captures(trail, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Repetition(trail_repeat) = trail.kind() else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    if trail_repeat.min != 0 || trail_repeat.max.is_some() || !trail_repeat.greedy {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    }
+    let trail = peel_bounded_sequence_captures(
+        trail_repeat.sub.as_ref(),
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let Some(trail) = inspect_bounded_byte_class(trail) else {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    };
+    for atom in [head, body, trail] {
+        for _ in 0..atom.range_count() {
+            charge_bounded_sequence_inspection_work(&mut work, limit)?;
+        }
+    }
+    // Canonical ranges are sorted and non-overlapping, so each pairwise merge
+    // needs at most left.len() + right.len() - 1 comparisons. Precharge all
+    // three bounds before reading ranges; their sum is 2Q-3, keeping selection
+    // linear in the retained source structure.
+    let head_body_comparisons = bounded_disjoint_comparison_bound(head, body)?;
+    let head_trail_comparisons = bounded_disjoint_comparison_bound(head, trail)?;
+    let body_trail_comparisons = bounded_disjoint_comparison_bound(body, trail)?;
+    let disjoint_comparisons = head_body_comparisons
+        .checked_add(head_trail_comparisons)
+        .and_then(|count| count.checked_add(body_trail_comparisons))
+        .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+    for _ in 0..disjoint_comparisons {
+        charge_bounded_sequence_inspection_work(&mut work, limit)?;
+    }
+    if bounded_byte_classes_overlap(head, body)
+        || bounded_byte_classes_overlap(head, trail)
+        || bounded_byte_classes_overlap(body, trail)
+    {
+        return Ok(BoundedClassSequenceInspection::Ineligible { work });
+    }
+    Ok(BoundedClassSequenceInspection::Eligible {
+        head,
+        body,
+        trail,
+        minimum: outer.min,
+        maximum,
+        work,
+        hir_nodes,
+        captures,
+    })
+}
+
+fn peel_bounded_sequence_captures<'a>(
+    mut hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<&'a Hir, BoundedClassSequenceInspectionError> {
+    loop {
+        charge_bounded_sequence_inspection_work(work, limit)?;
+        *hir_nodes = (*hir_nodes)
+            .checked_add(1)
+            .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+        let HirKind::Capture(capture) = hir.kind() else {
+            return Ok(hir);
+        };
+        *captures = (*captures)
+            .checked_add(1)
+            .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+        hir = capture.sub.as_ref();
+    }
+}
+
+fn inspect_bounded_byte_class(hir: &Hir) -> Option<BoundedByteClassAtom<'_>> {
+    match hir.kind() {
+        HirKind::Class(Class::Bytes(class)) if !class.ranges().is_empty() => {
+            Some(BoundedByteClassAtom::Bytes(class))
+        }
+        HirKind::Literal(literal) if literal.0.len() == 1 => {
+            Some(BoundedByteClassAtom::Singleton(literal.0[0]))
+        }
+        _ => None,
+    }
+}
+
+fn bounded_byte_classes_overlap(
+    left: BoundedByteClassAtom<'_>,
+    right: BoundedByteClassAtom<'_>,
+) -> bool {
+    let mut left = left.ranges().peekable();
+    let mut right = right.ranges().peekable();
+    while let (Some(&(left_start, left_end)), Some(&(right_start, right_end))) =
+        (left.peek(), right.peek())
+    {
+        if left_end < right_start {
+            left.next();
+        } else if right_end < left_start {
+            right.next();
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn bounded_disjoint_comparison_bound(
+    left: BoundedByteClassAtom<'_>,
+    right: BoundedByteClassAtom<'_>,
+) -> Result<usize, BoundedClassSequenceInspectionError> {
+    left.range_count()
+        .checked_add(right.range_count())
+        .and_then(|count| count.checked_sub(1))
+        .ok_or(BoundedClassSequenceInspectionError::Overflow)
+}
+
+fn charge_bounded_sequence_inspection_work(
+    work: &mut usize,
+    limit: usize,
+) -> Result<(), BoundedClassSequenceInspectionError> {
+    let needed = work
+        .checked_add(1)
+        .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+    if needed > limit {
+        return Err(BoundedClassSequenceInspectionError::WorkLimit { needed, limit });
+    }
+    *work = needed;
+    Ok(())
 }
 
 enum FixedClassSandwichInspectionError {
