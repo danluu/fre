@@ -847,6 +847,7 @@ fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
     assert_eq!(ordinary.accounting(), observed.accounting());
     assert_eq!(ordinary.certificate().work_bound, forced_work);
     assert!(ordinary.accounting().work <= forced_work);
+    assert!(ordinary.accounting().work < dense.certificate().work_bound);
 }
 
 #[test]
