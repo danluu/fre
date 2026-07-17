@@ -43,7 +43,8 @@ pub use aggregate::{
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
     AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
     AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
-    AggregateFiniteLiteralIdentity, AggregateLiteralIneligibility, AggregateOperation,
+    AggregateFiniteLiteralIdentity, AggregateFixedClassSandwichIdentity,
+    AggregateFixedClassSandwichSemantics, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits,
     AggregateSearchStep, AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
@@ -86,6 +87,12 @@ pub use fre_capture_lab::{
     SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan,
 };
 pub use fre_kernels::{
+    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_PLAN_ID,
+    FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FixedClassSandwichActualCounters,
+    FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
+    FixedClassSandwichOperation, FixedClassSandwichOperationIdentity,
+    FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
+    FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichUpperBounds,
     LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,

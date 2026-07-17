@@ -438,7 +438,7 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build(
+        Self::build_ranges(
             prefix
                 .into_iter()
                 .map(|(start, end)| (u32::from(start), u32::from(end))),
@@ -461,7 +461,7 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build(
+        Self::build_ranges(
             prefix
                 .into_iter()
                 .map(|(start, end)| (u32::from(start), u32::from(end))),
@@ -477,7 +477,11 @@ impl FixedClassSandwichPlan {
         )
     }
 
-    fn build(
+    /// Build from canonical inclusive scalar-value ranges. Byte semantics
+    /// require every endpoint to fit `u8`; Unicode semantics admit every
+    /// scalar value through `char::MAX` (surrogates can appear only inside a
+    /// spanning range and are never observed as decoded input units).
+    pub fn build_ranges(
         prefix: impl IntoIterator<Item = (u32, u32)>,
         middle: impl IntoIterator<Item = (u32, u32)>,
         suffix: impl IntoIterator<Item = (u32, u32)>,

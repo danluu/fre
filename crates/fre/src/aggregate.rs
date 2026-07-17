@@ -5,6 +5,10 @@ use fre_aggregate::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompiledRegex, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
+    FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
+    FixedClassSandwichCountResult, FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
+    FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
+    FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
     LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
     LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
@@ -25,7 +29,9 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::hir::{Class, ClassUnicode, Hir, HirKind};
+use regex_syntax::hir::{
+    Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind,
+};
 
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
@@ -36,7 +42,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 10;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 11;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -73,6 +79,9 @@ pub enum AggregatePlanKind {
     /// Direct Unicode scalar class/run stream over compact canonical ranges.
     /// This is not the continuation state engine.
     UnicodeScalarClass,
+    /// Direct bounded circular-window reducer for
+    /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences.
+    FixedClassSandwich,
     /// Ordered finite HIR lowered to one reversed shared-transition DFA and a
     /// bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
@@ -87,6 +96,8 @@ pub enum AggregatePlanIdentity {
     ExactLiteral(AggregateExactLiteralIdentity),
     /// Root Unicode scalar-class proof plus native reducer identity.
     UnicodeScalar(AggregateUnicodeScalarIdentity),
+    /// Fixed-width three-atom class sequence plus native reducer identity.
+    FixedClassSandwich(AggregateFixedClassSandwichIdentity),
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
@@ -147,6 +158,23 @@ pub struct AggregateUnicodeScalarIdentity {
     pub kernel: UnicodeScalarAggregateOperationIdentity,
 }
 
+/// Profile proof attached to the fixed class-sandwich reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateFixedClassSandwichSemantics {
+    /// Rust bytes with Unicode disabled; each admitted unit is one byte.
+    UnicodeOffByteClasses,
+    /// Rust bytes with Unicode enabled and `utf8(false)`; admitted units are
+    /// valid decoded scalars and malformed bytes break the pending window.
+    UnicodeOnScalarClassesUtf8False,
+}
+
+/// Facade identity for the construction-selected fixed class reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedClassSandwichIdentity {
+    pub semantics: AggregateFixedClassSandwichSemantics,
+    pub kernel: FixedClassSandwichOperationIdentity,
+}
+
 /// Profile proof attached to a continuation-program facade identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateContinuationSemantics {
@@ -185,6 +213,8 @@ pub enum AggregateBuildAccounting {
     ExactLiteral(LiteralAggregateBuildAccounting),
     /// Compact scalar-range plan construction certificate.
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
+    /// Bounded class-sandwich construction certificate.
+    FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Continuation compiler construction certificate.
@@ -204,12 +234,17 @@ pub struct AggregateBuildLimits {
     /// One unit is charged for every HIR node and canonical scalar range
     /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
+    /// Maximum structural HIR/range inspection work for the fixed-width
+    /// class-sandwich specialization.
+    pub max_fixed_class_sandwich_planner_work: usize,
     /// Maximum checked work for finite-language shape analysis and expansion.
     pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
     pub exact_literal: LiteralAggregateBuildLimits,
     /// Complete compact scalar-range construction limits.
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
+    /// Complete bounded fixed-class construction limits.
+    pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
     /// Complete bounded reversed-DFA construction limits.
     pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
@@ -223,9 +258,11 @@ impl Default for AggregateBuildLimits {
             syntax_safety: SafetyEnvelope::default(),
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
+            max_fixed_class_sandwich_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
+            fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
@@ -240,6 +277,8 @@ pub struct AggregateRunLimits {
     pub exact_literal: LiteralAggregateReduceLimits,
     /// Direct Unicode scalar-stream limits.
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
+    /// Direct fixed-class circular-window limits.
+    pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
     /// Shared finite-language DFA reducer limits.
     pub finite_literal: OrderedLiteralAggregateReduceLimits,
     /// Continuation whole-operation limits.
@@ -276,6 +315,9 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
+    /// Fixed-class sandwich structural inspection work, including every
+    /// examined canonical range.
+    pub fixed_class_sandwich_planner_work: usize,
     /// Checked finite-language analysis/expansion work, or zero when skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
     /// caller limit rejects the optional DFA preflight and continuation is
@@ -356,6 +398,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Fixed class-sandwich inspection crossed its structural work cap.
+    FixedClassSandwichPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Finite-language extraction crossed its explicit work cap.
     FinitePlannerWorkLimit {
         operation: AggregateOperation,
@@ -388,6 +437,12 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: UnicodeScalarAggregateBuildError,
     },
+    /// Fixed class-sandwich construction failed after selection.
+    FixedClassSandwichBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: FixedClassSandwichBuildError,
+    },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
         operation: AggregateOperation,
@@ -410,6 +465,10 @@ pub enum AggregateBuildError {
 }
 
 impl fmt::Display for AggregateBuildError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each typed construction refusal retains operation, policy and owned source context"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax {
@@ -437,6 +496,15 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} structural work units, limit is {limit}"
+            ),
+            Self::FixedClassSandwichPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed class-sandwich inspection needs {needed} structural work units, limit is {limit}"
             ),
             Self::FinitePlannerWorkLimit {
                 operation,
@@ -480,6 +548,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar construction failed: {source}"
             ),
+            Self::FixedClassSandwichBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed class-sandwich construction failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -515,10 +591,12 @@ impl std::error::Error for AggregateBuildError {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
+            Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
+            | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
             | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
@@ -534,6 +612,8 @@ pub enum AggregateExecutionSource {
     ExactLiteral(LiteralAggregateReduceError),
     /// Direct Unicode scalar-stream refusal.
     UnicodeScalar(UnicodeScalarAggregateReduceError),
+    /// Direct fixed class-sandwich refusal.
+    FixedClassSandwich(FixedClassSandwichReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Continuation whole-operation refusal.
@@ -547,6 +627,7 @@ impl fmt::Display for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
+            Self::FixedClassSandwich(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
@@ -561,6 +642,7 @@ impl std::error::Error for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
+            Self::FixedClassSandwich(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
@@ -601,6 +683,8 @@ pub enum AggregateExecutionDetails {
     ExactLiteral(LiteralAggregateReduceAccounting),
     /// Direct scalar stream's complete bounds and structural counters.
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
+    /// Fixed class-sandwich bounds, counters, and operation identity.
+    FixedClassSandwich(FixedClassSandwichReduceAccounting),
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -885,6 +969,7 @@ impl AggregateBuilder {
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
+                fixed_class_sandwich_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
@@ -1036,6 +1121,7 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work: work,
+                    fixed_class_sandwich_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1069,6 +1155,123 @@ impl AggregateBuilder {
                 });
             }
             Some(UnicodeScalarInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let fixed_class_inspection = if selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                inspect_fixed_class_sandwich(
+                    &rust.hir,
+                    unicode,
+                    limits.max_fixed_class_sandwich_planner_work,
+                )
+                .map_err(|error| match error {
+                    FixedClassSandwichInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::FixedClassSandwichPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    FixedClassSandwichInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed class-sandwich inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let fixed_class_sandwich_planner_work = match fixed_class_inspection {
+            Some(FixedClassSandwichInspection::Eligible {
+                prefix,
+                middle,
+                suffix,
+                middle_repetitions,
+                semantics,
+                work,
+                hir_nodes,
+            }) => {
+                if hir_nodes != expected_nodes || expected_captures != 0 {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from fixed class-sandwich inspection",
+                    });
+                }
+                let engine = FixedClassSandwichPlan::build_ranges(
+                    prefix.ranges(),
+                    middle.ranges(),
+                    suffix.ranges(),
+                    semantics,
+                    middle_repetitions,
+                    limits.fixed_class_sandwich,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::FixedClassSandwichBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected fixed class-sandwich reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::FixedClassSandwich,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work: work,
+                    finite_planner_work: 0,
+                    capture_erasure_work: 0,
+                    captures_erased: 0,
+                    build: AggregateBuildAccounting::FixedClassSandwich(build),
+                    plan_identity: AggregatePlanIdentity::FixedClassSandwich(
+                        AggregateFixedClassSandwichIdentity {
+                            semantics: match semantics {
+                                FixedClassSandwichSemantics::RustBytesUnicodeOff => {
+                                    AggregateFixedClassSandwichSemantics::UnicodeOffByteClasses
+                                }
+                                FixedClassSandwichSemantics::RustBytesUnicodeUtf8False => {
+                                    AggregateFixedClassSandwichSemantics::UnicodeOnScalarClassesUtf8False
+                                }
+                            },
+                            kernel,
+                        },
+                    ),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::FixedClassSandwich(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(FixedClassSandwichInspection::Ineligible { work }) => work,
             None => 0,
         };
         let finite = if !unicode
@@ -1164,6 +1367,7 @@ impl AggregateBuilder {
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                         planner_work,
                         unicode_scalar_planner_work,
+                        fixed_class_sandwich_planner_work,
                         finite_planner_work,
                         capture_erasure_work,
                         captures_erased: expected_captures,
@@ -1228,6 +1432,7 @@ impl AggregateBuilder {
             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
             planner_work,
             unicode_scalar_planner_work,
+            fixed_class_sandwich_planner_work,
             finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
@@ -1254,6 +1459,7 @@ impl AggregateBuilder {
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
+    FixedClassSandwich(FixedClassSandwichPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     Continuation(CompiledRegex),
@@ -1334,6 +1540,15 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::FixedClassSandwich(engine) => engine
+                .count(haystack, limits.fixed_class_sandwich)
+                .map(AggregateCountExecution::FixedClassSandwich)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| AggregateCountExecution::FiniteLiteral {
@@ -1400,6 +1615,15 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::FixedClassSandwich(engine) => engine
+                .span_sum(haystack, limits.fixed_class_sandwich)
+                .map(AggregateSpanSumExecution::FixedClassSandwich)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
             AggregateEngine::FiniteSpanSum(engine) => engine
                 .span_sum(haystack, limits.finite_literal)
                 .map(|result| AggregateSpanSumExecution::FiniteLiteral {
@@ -1452,6 +1676,7 @@ impl AggregatePlan {
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
+    FixedClassSandwich(FixedClassSandwichCountResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -1468,6 +1693,7 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
+            Self::FixedClassSandwich(result) => result.count,
             Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
@@ -1479,6 +1705,9 @@ impl AggregateCountExecution {
             }
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
+            }
+            Self::FixedClassSandwich(result) => {
+                AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -1499,6 +1728,7 @@ impl AggregateCountExecution {
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
+    FixedClassSandwich(FixedClassSandwichSpanSumResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -1515,6 +1745,7 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
+            Self::FixedClassSandwich(result) => result.span_sum,
             Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
         }
     }
@@ -1526,6 +1757,9 @@ impl AggregateSpanSumExecution {
             }
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
+            }
+            Self::FixedClassSandwich(result) => {
+                AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -1582,6 +1816,172 @@ enum UnicodeScalarInspection<'a> {
 enum UnicodeScalarInspectionError {
     WorkLimit { needed: usize, limit: usize },
     Overflow,
+}
+
+#[derive(Clone, Copy)]
+enum FixedClassAtom<'a> {
+    Bytes(&'a ClassBytes),
+    Unicode(&'a ClassUnicode),
+    Singleton(u32),
+}
+
+impl<'a> FixedClassAtom<'a> {
+    fn ranges(self) -> FixedClassRanges<'a> {
+        match self {
+            Self::Bytes(class) => FixedClassRanges::Bytes(class.ranges().iter()),
+            Self::Unicode(class) => FixedClassRanges::Unicode(class.ranges().iter()),
+            Self::Singleton(scalar) => FixedClassRanges::Singleton(Some(scalar)),
+        }
+    }
+
+    fn range_count(self) -> usize {
+        match self {
+            Self::Bytes(class) => class.ranges().len(),
+            Self::Unicode(class) => class.ranges().len(),
+            Self::Singleton(_) => 1,
+        }
+    }
+}
+
+enum FixedClassRanges<'a> {
+    Bytes(core::slice::Iter<'a, ClassBytesRange>),
+    Unicode(core::slice::Iter<'a, ClassUnicodeRange>),
+    Singleton(Option<u32>),
+}
+
+impl Iterator for FixedClassRanges<'_> {
+    type Item = (u32, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Bytes(ranges) => ranges
+                .next()
+                .map(|range| (u32::from(range.start()), u32::from(range.end()))),
+            Self::Unicode(ranges) => ranges
+                .next()
+                .map(|range| (u32::from(range.start()), u32::from(range.end()))),
+            Self::Singleton(scalar) => scalar.take().map(|value| (value, value)),
+        }
+    }
+}
+
+enum FixedClassSandwichInspection<'a> {
+    Eligible {
+        prefix: FixedClassAtom<'a>,
+        middle: FixedClassAtom<'a>,
+        suffix: FixedClassAtom<'a>,
+        middle_repetitions: u32,
+        semantics: FixedClassSandwichSemantics,
+        work: usize,
+        hir_nodes: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum FixedClassSandwichInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+fn inspect_fixed_class_sandwich(
+    hir: &Hir,
+    unicode: bool,
+    limit: usize,
+) -> Result<FixedClassSandwichInspection<'_>, FixedClassSandwichInspectionError> {
+    let mut work = 0_usize;
+    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+    let [prefix_hir, middle_hir, suffix_hir] = parts.as_slice() else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+
+    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let Some(prefix) = inspect_fixed_class_atom(prefix_hir, unicode) else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+
+    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let HirKind::Repetition(repeated) = middle_hir.kind() else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+    let Some(maximum) = repeated.max else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+    if repeated.min == 0 || repeated.min != maximum {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    }
+
+    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let Some(middle) = inspect_fixed_class_atom(repeated.sub.as_ref(), unicode) else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+
+    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let Some(suffix) = inspect_fixed_class_atom(suffix_hir, unicode) else {
+        return Ok(FixedClassSandwichInspection::Ineligible { work });
+    };
+
+    for atom in [prefix, middle, suffix] {
+        for _ in 0..atom.range_count() {
+            charge_fixed_class_inspection_work(&mut work, limit)?;
+        }
+    }
+    Ok(FixedClassSandwichInspection::Eligible {
+        prefix,
+        middle,
+        suffix,
+        middle_repetitions: repeated.min,
+        semantics: if unicode {
+            FixedClassSandwichSemantics::RustBytesUnicodeUtf8False
+        } else {
+            FixedClassSandwichSemantics::RustBytesUnicodeOff
+        },
+        work,
+        hir_nodes: 5,
+    })
+}
+
+fn inspect_fixed_class_atom(hir: &Hir, unicode: bool) -> Option<FixedClassAtom<'_>> {
+    match (unicode, hir.kind()) {
+        (false, HirKind::Class(Class::Bytes(class))) if !class.ranges().is_empty() => {
+            Some(FixedClassAtom::Bytes(class))
+        }
+        (true, HirKind::Class(Class::Unicode(class))) if !class.ranges().is_empty() => {
+            Some(FixedClassAtom::Unicode(class))
+        }
+        (false, HirKind::Literal(literal)) if literal.0.len() == 1 => {
+            Some(FixedClassAtom::Singleton(u32::from(literal.0[0])))
+        }
+        (true, HirKind::Literal(literal)) => {
+            let text = core::str::from_utf8(literal.0.as_ref()).ok()?;
+            let mut scalars = text.chars();
+            let scalar = scalars.next()?;
+            if scalars.next().is_none() {
+                Some(FixedClassAtom::Singleton(u32::from(scalar)))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn charge_fixed_class_inspection_work(
+    work: &mut usize,
+    limit: usize,
+) -> Result<(), FixedClassSandwichInspectionError> {
+    let needed = work
+        .checked_add(1)
+        .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+    if needed > limit {
+        return Err(FixedClassSandwichInspectionError::WorkLimit { needed, limit });
+    }
+    *work = needed;
+    Ok(())
 }
 
 fn inspect_unicode_scalar_class(
