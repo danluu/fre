@@ -1180,6 +1180,96 @@ fn fixed_class_sandwich_matches_pinned_bytes_oracle_for_both_unicode_profiles() 
 }
 
 #[test]
+fn fixed_class_sandwich_erases_nested_captures_with_exact_planner_accounting() {
+    let cases: [(&str, bool, &[u8]); 2] = [
+        (
+            r"(?P<all>(?P<p>[a-q])(?P<run>(?P<m>[^u-z]){3})(?P<s>x))",
+            false,
+            b"apppx--a\xFF\xFF\xFFx--auuux",
+        ),
+        (
+            r"(?P<all>(?P<p>[a-q])(?P<run>(?P<m>[^u-z]){3})(?P<s>[x\xE0-\xFF]))",
+            true,
+            "a雪δéx--aöööà--auuux".as_bytes(),
+        ),
+    ];
+
+    for (pattern, unicode, haystack) in cases {
+        let expected = upstream_profile(pattern, haystack, false, unicode);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
+            .sum::<u64>();
+        let count = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_count()
+            .unwrap_or_else(|error| panic!("captured count build {pattern:?}: {error}"));
+        let report = count.build_report();
+        assert_eq!(report.plan, AggregatePlanKind::FixedClassSandwich);
+        assert_eq!(report.captures_erased, 5);
+        assert_eq!(report.capture_erasure_work, 5);
+        assert_eq!(report.syntax.captures, 5);
+        assert!(report.fixed_class_sandwich_planner_work > report.capture_erasure_work);
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_count,
+            "pattern={pattern:?}"
+        );
+
+        let sum = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_span_sum()
+            .unwrap_or_else(|error| panic!("captured span-sum build {pattern:?}: {error}"));
+        assert_eq!(sum.build_report().plan, AggregatePlanKind::FixedClassSandwich);
+        assert_eq!(sum.build_report().captures_erased, 5);
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_sum,
+            "pattern={pattern:?}"
+        );
+
+        let compiled = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_compile()
+            .unwrap_or_else(|error| panic!("captured compile build {pattern:?}: {error}"));
+        assert_eq!(
+            compiled.build_report().plan,
+            AggregatePlanKind::FixedClassSandwich
+        );
+        assert_eq!(compiled.build_report().captures_erased, 5);
+        assert_eq!(
+            compiled
+                .verify_count(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            expected_count,
+            "pattern={pattern:?}"
+        );
+
+        let planner_work = report.fixed_class_sandwich_planner_work;
+        let limits = AggregateBuildLimits {
+            max_fixed_class_sandwich_planner_work: planner_work.checked_sub(1).unwrap(),
+            ..AggregateBuildLimits::default()
+        };
+        assert!(matches!(
+            aggregate_builder(pattern)
+                .unicode(unicode)
+                .limits(limits)
+                .build_count(),
+            Err(AggregateBuildError::FixedClassSandwichPlannerWorkLimit {
+                needed,
+                limit,
+                ..
+            }) if needed == planner_work && limit.checked_add(1) == Some(planner_work)
+        ));
+    }
+}
+
+#[test]
 fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
     let pattern = r"[a-q][^u-z]{13}x";
     let regex = aggregate_builder(pattern)
