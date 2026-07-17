@@ -2,7 +2,7 @@
 
 use fre::{
     CompatibilityProfile, PortableTextBuildError, PortableTextBuilder, PortableTextRegex,
-    RustProfile, SearchLimits,
+    RustProfile, SearchLimits, SearchWindow,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -62,14 +62,35 @@ fn assert_searches_equal(
             let expected = upstream
                 .find_at(haystack, start)
                 .map(|matched| (matched.start(), matched.end()));
-            let actual = fre
+            let (actual, find_at_accounting) = fre
                 .find_at(haystack, start, SearchLimits::unlimited())
                 .unwrap_or_else(|error| {
                     panic!("FRE search failed for {pattern:?}/{haystack:?}/{start}: {error}")
-                })
-                .0
-                .map(|matched| (matched.start(), matched.end()));
+                });
+            let actual = actual.map(|matched| (matched.start(), matched.end()));
             assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}");
+
+            if haystack.is_char_boundary(start) {
+                let (windowed, windowed_accounting) = fre
+                    .find_window(
+                        haystack,
+                        SearchWindow::new(start, haystack.len()),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "FRE window search failed for {pattern:?}/{haystack:?}/{start}: \
+                             {error}"
+                        )
+                    });
+                assert_eq!(
+                    windowed.map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "window/{pattern:?}/{haystack:?}/{start}"
+                );
+                assert_eq!(find_at_accounting, windowed_accounting);
+            }
+
             assert_eq!(
                 fre.is_match_at(haystack, start, SearchLimits::unlimited())
                     .unwrap_or_else(|error| {

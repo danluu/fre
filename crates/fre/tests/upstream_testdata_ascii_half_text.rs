@@ -83,13 +83,21 @@ fn ascii_half_word_text_cases_match_pinned_upstream_iteration() {
         let mut start = 0_usize;
         let mut last_match_end = None;
         loop {
-            let (matched, _) = fre
+            let (windowed, windowed_accounting) = fre
                 .find_window(
                     haystack,
                     SearchWindow::new(start, haystack.len()),
                     SearchLimits::unlimited(),
                 )
                 .unwrap_or_else(|error| panic!("{id}: FRE search: {error}"));
+            let (matched, ranged_accounting) = fre
+                .find_at(haystack, start, SearchLimits::unlimited())
+                .unwrap_or_else(|error| panic!("{id}: FRE ranged search: {error}"));
+            assert_eq!(matched, windowed, "{id}: ranged/windowed span");
+            assert_eq!(
+                ranged_accounting, windowed_accounting,
+                "{id}: ranged/windowed accounting"
+            );
             let Some(matched) = matched else {
                 break;
             };
