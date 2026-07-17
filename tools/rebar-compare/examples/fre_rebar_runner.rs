@@ -515,12 +515,16 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::UnicodeScalarClass) => {
             "compile-aggregate-unicode-scalar-class"
         }
+        ("compile", AggregatePlanKind::FixedClassSandwich) => {
+            "compile-aggregate-fixed-class-sandwich"
+        }
         ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
         ("compile", AggregatePlanKind::ContinuationProgram) => {
             "compile-aggregate-continuation-program"
         }
         (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
         (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
+        (_, AggregatePlanKind::FixedClassSandwich) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
     }

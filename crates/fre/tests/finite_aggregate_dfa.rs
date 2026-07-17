@@ -74,8 +74,8 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         compiled.build_report().plan,
         AggregatePlanKind::FiniteLiteralDfa
     );
-    assert_eq!(compiled.build_report().schema_version, 11);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 11);
+    assert_eq!(compiled.build_report().schema_version, 12);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 12);
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";

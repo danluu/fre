@@ -12,6 +12,7 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+mod fixed_class_sandwich;
 mod forward_anchored;
 mod literal_aggregate;
 mod literal_set;
@@ -21,6 +22,21 @@ mod packed_ordered_literal_aggregate;
 mod required_literal;
 mod unicode_scalar_aggregate;
 
+pub use fixed_class_sandwich::{
+    BuildAccounting as FixedClassSandwichBuildAccounting,
+    BuildError as FixedClassSandwichBuildError, BuildLimits as FixedClassSandwichBuildLimits,
+    COUNT_OPERATION_ID as FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+    CountResult as FixedClassSandwichCountResult, FixedClassSandwichPlan,
+    Operation as FixedClassSandwichOperation,
+    OperationIdentity as FixedClassSandwichOperationIdentity,
+    PLAN_ID as FIXED_CLASS_SANDWICH_PLAN_ID,
+    ReduceAccounting as FixedClassSandwichReduceAccounting,
+    ReduceActualCounters as FixedClassSandwichActualCounters,
+    ReduceError as FixedClassSandwichReduceError, ReduceLimits as FixedClassSandwichReduceLimits,
+    ReduceUpperBounds as FixedClassSandwichUpperBounds,
+    SPAN_SUM_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+    Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
+};
 pub use forward_anchored::{
     ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
     BuildAccounting as ForwardAnchoredBuildAccounting, BuildError as ForwardAnchoredBuildError,

@@ -1,9 +1,10 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregateLiteralIneligibility,
-    AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
-    AggregateResource, AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateFixedClassSandwichSemantics,
+    AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateStrategy,
+    AggregateUnicodeScalarSemantics, FixedClassSandwichOperation, FixedClassSandwichReduceError,
     LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
     LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
@@ -210,6 +211,7 @@ fn continuation_details(
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
+        | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::FiniteLiteral { .. } => {
             panic!("expected continuation execution details")
         }
@@ -1067,6 +1069,162 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                 .unwrap_or_else(|error| panic!("compile verify {pattern:?}: {error}"))
                 .value(),
             expected_count
+        );
+    }
+}
+
+#[test]
+fn fixed_class_sandwich_matches_pinned_bytes_oracle_for_both_unicode_profiles() {
+    let cases: [(&str, bool, &[u8]); 4] = [
+        (r"[a-q][^u-z]{3}x", false, b"apppx--a\xFF\xFF\xFFx--auuux"),
+        (r"[a-q][^u-z]{3}x", false, b"aqqqxapppxapx"),
+        (
+            r"[a-q][^u-z]{3}[x\xE0-\xFF]",
+            true,
+            "a雪δéx--aöööà--auuux".as_bytes(),
+        ),
+        (
+            r"[a-q][^u-z]{3}[x\xE0-\xFF]",
+            true,
+            b"a\xFFbcx--apppx--a\xE2\x98\x83\xE2\x88\x9E\xC3\xA9x",
+        ),
+    ];
+    for (pattern, unicode, haystack) in cases {
+        let expected = upstream_profile(pattern, haystack, false, unicode);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
+            .sum::<u64>();
+        let count = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_count()
+            .unwrap_or_else(|error| panic!("count build {pattern:?}: {error}"));
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::FixedClassSandwich
+        );
+        assert_eq!(count.build_report().continuation_strategy, None);
+        assert!(count.build_report().fixed_class_sandwich_planner_work > 5);
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::FixedClassSandwich(identity)
+                if identity.kernel.operation == FixedClassSandwichOperation::Count
+                    && identity.semantics
+                        == if unicode {
+                            AggregateFixedClassSandwichSemantics::UnicodeOnScalarClassesUtf8False
+                        } else {
+                            AggregateFixedClassSandwichSemantics::UnicodeOffByteClasses
+                        }
+        ));
+        let counted = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
+        assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
+        let AggregateExecutionDetails::FixedClassSandwich(accounting) = &counted.report().details
+        else {
+            panic!("fixed class count executed another family")
+        };
+        assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
+        assert!(accounting.actual.work <= accounting.upper_bounds.work);
+
+        let sum = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_span_sum()
+            .unwrap();
+        assert!(matches!(
+            sum.build_report().plan_identity,
+            AggregatePlanIdentity::FixedClassSandwich(identity)
+                if identity.kernel.operation == FixedClassSandwichOperation::SpanSum
+        ));
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_sum
+        );
+        let compiled = aggregate_builder(pattern)
+            .unicode(unicode)
+            .build_compile()
+            .unwrap();
+        assert_eq!(
+            compiled.build_report().plan,
+            AggregatePlanKind::FixedClassSandwich
+        );
+        assert_eq!(
+            compiled
+                .verify_count(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            expected_count
+        );
+    }
+}
+
+#[test]
+fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
+    let pattern = r"[a-q][^u-z]{13}x";
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::FixedClassSandwich
+    );
+    let planner_work = regex.build_report().fixed_class_sandwich_planner_work;
+    let limits = AggregateBuildLimits {
+        max_fixed_class_sandwich_planner_work: planner_work.checked_sub(1).unwrap(),
+        ..AggregateBuildLimits::default()
+    };
+    assert!(matches!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .limits(limits)
+            .build_count(),
+        Err(AggregateBuildError::FixedClassSandwichPlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit.checked_add(1) == Some(planner_work)
+    ));
+
+    let haystack = b"apppppppppppppx";
+    let audited = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::FixedClassSandwich(accounting) = &audited.report().details
+    else {
+        panic!("fixed class plan executed another family")
+    };
+    let mut run_limits = AggregateRunLimits::default();
+    run_limits.fixed_class_sandwich.max_scratch_bytes = accounting
+        .upper_bounds
+        .scratch_bytes
+        .checked_sub(1)
+        .unwrap();
+    let error = regex.count(haystack, run_limits).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::FixedClassSandwich(
+            FixedClassSandwichReduceError::ScratchLimit { .. }
+        )
+    ));
+
+    for ineligible in [
+        r"[a-q][^u-z]{2,3}x",
+        r"[a-q][^u-z]+x",
+        r"[a-q][^u-z]{3}xy",
+        r"[a-q][^u-z]{3}x!",
+    ] {
+        assert_ne!(
+            aggregate_builder(ineligible)
+                .unicode(false)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::FixedClassSandwich,
+            "pattern={ineligible:?}"
         );
     }
 }
