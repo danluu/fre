@@ -355,6 +355,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-lite",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sha2",
