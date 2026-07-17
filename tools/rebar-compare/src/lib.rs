@@ -5628,7 +5628,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_one_pattern_aggregate_models_cover_adversarial_semantics() {
+    fn current_fre_span_sum_greedy_star_uses_direct_scalar_reduction() {
         let limits = RunLimits::default();
         assert_current_fre_execution(
             current_fre(
@@ -5642,6 +5642,11 @@ mod tests {
             4,
             "aggregate-unicode-scalar-class",
         );
+    }
+
+    #[test]
+    fn current_fre_one_pattern_aggregate_models_cover_adversarial_semantics() {
+        let limits = RunLimits::default();
         let late = vec![r"(?:a+b|a)".to_string()];
         assert_current_fre_execution(
             current_fre("count", &late, b"aaaa", false, false, &limits),
