@@ -5766,142 +5766,239 @@ mod tests {
     use super::*;
     use fre::AggregateResource;
 
-    fn assert_program_state_pass_fixtures(
-        limits: &RunLimits,
-        ids: &mut std::collections::BTreeSet<&'static str>,
+    const PROGRAM_STATE_SENTINEL_MANIFEST_SHA256: &str =
+        "09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43";
+
+    #[derive(Clone, Copy)]
+    enum ProgramStateSentinelDisposition {
+        Pass { plan: &'static str },
+        ExecutionWorkUnsupported,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProgramStateSentinelExpectation {
+        id: &'static str,
+        model: &'static str,
+        expected: u64,
+        case_insensitive: bool,
+        disposition: ProgramStateSentinelDisposition,
+    }
+
+    const PROGRAM_STATE_SENTINEL_EXPECTATIONS: [ProgramStateSentinelExpectation; 9] = [
+        ProgramStateSentinelExpectation {
+            id: "curated/03-date/compile-unicode@rust/regex",
+            model: "compile",
+            expected: 5,
+            case_insensitive: true,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "compile-aggregate-continuation-program",
+            },
+        },
+        ProgramStateSentinelExpectation {
+            id: "curated/03-date/unicode@rust/regex",
+            model: "count-spans",
+            expected: 111_841,
+            case_insensitive: true,
+            disposition: ProgramStateSentinelDisposition::ExecutionWorkUnsupported,
+        },
+        ProgramStateSentinelExpectation {
+            id: "curated/08-words/long-russian@rust/regex",
+            model: "count-spans",
+            expected: 5_481,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "aggregate-continuation-program",
+            },
+        },
+        ProgramStateSentinelExpectation {
+            id: "dictionary/compile/english-10@rust/regex",
+            model: "compile",
+            expected: 1,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "compile-aggregate-finite-literal-sparse",
+            },
+        },
+        ProgramStateSentinelExpectation {
+            id: "dictionary/search/english-10@rust/regex",
+            model: "count-spans",
+            expected: 690,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "aggregate-finite-literal-sparse",
+            },
+        },
+        ProgramStateSentinelExpectation {
+            id: "hyperscan/fixed-length-words-unicode-nosom@rust/regex",
+            model: "count",
+            expected: 120,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::ExecutionWorkUnsupported,
+        },
+        ProgramStateSentinelExpectation {
+            id: "unicode/compile/huge-character-class@rust/regex",
+            model: "compile",
+            expected: 1,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "compile-aggregate-continuation-program",
+            },
+        },
+        ProgramStateSentinelExpectation {
+            id: "unicode/word/boundary-long-russian@rust/regex",
+            model: "count-spans",
+            expected: 21_332,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::ExecutionWorkUnsupported,
+        },
+        ProgramStateSentinelExpectation {
+            id: "wild/bibleref/compile@rust/regex",
+            model: "compile",
+            expected: 3,
+            case_insensitive: false,
+            disposition: ProgramStateSentinelDisposition::Pass {
+                plan: "compile-aggregate-continuation-program",
+            },
+        },
+    ];
+
+    fn program_state_sentinel_expectation(id: &str) -> Option<ProgramStateSentinelExpectation> {
+        PROGRAM_STATE_SENTINEL_EXPECTATIONS
+            .iter()
+            .copied()
+            .find(|expectation| expectation.id == id)
+    }
+
+    fn assert_program_state_sentinel_receipt(
+        receipt: &Receipt,
+        expectation: ProgramStateSentinelExpectation,
     ) {
-        // Small structural analogues exercise the production adapter and the
-        // same default limits as the nine authenticated rows. The row IDs are
-        // labels only in this test and never enter production selection.
-        let pass_fixtures = [
-            (
-                "curated/03-date/compile-unicode@rust/regex",
-                "compile",
-                r"(?i:[a-z]{3}) [0-9]{1,2}, [0-9]{4}",
-                "Jul 17, 2026".as_bytes(),
-                true,
-                1,
-            ),
-            (
-                "curated/08-words/long-russian@rust/regex",
-                "count-spans",
-                r"\b\w{3,}\b",
-                "три слова".as_bytes(),
-                true,
-                16,
-            ),
-            (
-                "dictionary/compile/english-10@rust/regex",
-                "compile",
-                "abcdefghij|klmnopqrst",
-                b"xx klmnopqrst yy".as_slice(),
-                true,
-                1,
-            ),
-            (
-                "dictionary/search/english-10@rust/regex",
-                "count-spans",
-                "abcdefghij|klmnopqrst",
-                b"abcdefghij klmnopqrst".as_slice(),
-                true,
-                20,
-            ),
-            (
-                "unicode/compile/huge-character-class@rust/regex",
-                "compile",
-                r"[\u{100}-\u{3ff}]",
-                "Ā".as_bytes(),
-                true,
-                1,
-            ),
-            (
-                "wild/bibleref/compile@rust/regex",
-                "compile",
-                r"(?:Gen|Exod) [0-9]+:[0-9]+",
-                b"Gen 1:1 Exod 2:3".as_slice(),
-                true,
-                2,
-            ),
-        ];
-        for (id, model, pattern, haystack, unicode, expected) in pass_fixtures {
-            assert!(ids.insert(id), "duplicate frozen row {id}");
-            let patterns = [pattern.to_string()];
-            match CurrentFreAdapter.execute(
-                CandidateRequest {
-                    job_id: id,
-                    model,
-                    patterns: &patterns,
-                    haystack,
-                    unicode,
-                    case_insensitive: false,
-                },
-                limits,
-            ) {
-                CandidateOutcome::Executed(actual)
-                | CandidateOutcome::ExecutedWithPlan { actual, .. } => {
-                    assert_eq!(actual, expected, "row {id}");
-                }
-                other => panic!("row {id} did not execute: {other:?}"),
+        assert_eq!(receipt.job_id, expectation.id);
+        assert_eq!(receipt.model, expectation.model);
+        assert_eq!(receipt.expected, expectation.expected);
+        assert!(receipt.input.unicode);
+        assert_eq!(receipt.input.case_insensitive, expectation.case_insensitive);
+        match expectation.disposition {
+            ProgramStateSentinelDisposition::Pass { plan } => {
+                assert_eq!(receipt.status, Status::Pass, "{}", receipt.job_id);
+                assert_eq!(
+                    receipt.actual,
+                    Some(expectation.expected),
+                    "{}",
+                    receipt.job_id
+                );
+                assert_eq!(
+                    receipt.candidate_plan.as_deref(),
+                    Some(plan),
+                    "{}",
+                    receipt.job_id
+                );
+                assert_eq!(receipt.reason, None, "{}", receipt.job_id);
+            }
+            ProgramStateSentinelDisposition::ExecutionWorkUnsupported => {
+                assert_eq!(receipt.status, Status::Unsupported, "{}", receipt.job_id);
+                assert_eq!(receipt.actual, None, "{}", receipt.job_id);
+                assert_eq!(receipt.candidate_plan, None, "{}", receipt.job_id);
+                let reason = receipt
+                    .reason
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{} has no refusal reason", receipt.job_id));
+                assert!(
+                    reason.contains("aggregate resource ExecutionWork requires")
+                        && reason.contains("limit is 536870912"),
+                    "{} returned the wrong refusal: {reason}",
+                    receipt.job_id
+                );
+                assert!(
+                    !reason.contains("ProgramStates"),
+                    "{}: {reason}",
+                    receipt.job_id
+                );
             }
         }
     }
 
-    fn assert_program_state_refusal_fixtures(
-        limits: &RunLimits,
-        ids: &mut std::collections::BTreeSet<&'static str>,
-    ) {
-        let refusal_fixtures = [
-            (
-                "curated/03-date/unicode@rust/regex",
-                "count-spans",
-                500_usize,
-            ),
-            (
-                "hyperscan/fixed-length-words-unicode-nosom@rust/regex",
-                "count",
-                550,
-            ),
-            (
-                "unicode/word/boundary-long-russian@rust/regex",
-                "count-spans",
-                600,
-            ),
-        ];
-        let haystack = vec![b'a'; 100_000];
-        for (id, model, repeats) in refusal_fixtures {
-            assert!(ids.insert(id), "duplicate frozen row {id}");
-            let patterns = [format!("(?:a+){{{repeats}}}")];
-            let outcome = CurrentFreAdapter.execute(
-                CandidateRequest {
-                    job_id: id,
-                    model,
-                    patterns: &patterns,
-                    haystack: &haystack,
-                    unicode: true,
-                    case_insensitive: false,
-                },
-                limits,
-            );
-            let CandidateOutcome::Unsupported(reason) = outcome else {
-                panic!("row {id} did not produce a typed refusal: {outcome:?}")
-            };
-            assert!(
-                reason.contains("aggregate resource ExecutionWork requires")
-                    && reason.contains("limit is 536870912"),
-                "row {id} returned the wrong refusal: {reason}"
-            );
-            assert!(!reason.contains("ProgramStates"), "row {id}: {reason}");
-        }
-    }
-
     #[test]
-    fn program_state_frontier_nine_row_default_limit_dispositions_are_frozen() {
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_program_state_frontier_nine_row_sentinel() {
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode exact expanded Rebar manifest");
         let limits = RunLimits::default();
         assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
-        let mut ids = std::collections::BTreeSet::new();
-        assert_program_state_pass_fixtures(&limits, &mut ids);
-        assert_program_state_refusal_fixtures(&limits, &mut ids);
-        assert_eq!(ids.len(), 9);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let candidate = CurrentFreAdapter;
+        let mut remaining: BTreeSet<&str> = PROGRAM_STATE_SENTINEL_EXPECTATIONS
+            .iter()
+            .map(|expectation| expectation.id)
+            .collect();
+        assert_eq!(remaining.len(), PROGRAM_STATE_SENTINEL_EXPECTATIONS.len());
+        let mut receipts = Vec::with_capacity(PROGRAM_STATE_SENTINEL_EXPECTATIONS.len());
+        for job in &manifest.jobs {
+            let Some(expectation) = program_state_sentinel_expectation(&job.id) else {
+                continue;
+            };
+            assert!(
+                remaining.remove(job.id.as_str()),
+                "duplicate sentinel job {}",
+                job.id
+            );
+            assert_eq!(job.engine, "rust/regex", "{}", job.id);
+            assert_eq!(job.model, expectation.model, "{}", job.id);
+            assert_eq!(job.expected.count, expectation.expected, "{}", job.id);
+            assert!(job.regex.unicode, "{}", job.id);
+            assert_eq!(
+                job.regex.case_insensitive, expectation.case_insensitive,
+                "{}",
+                job.id
+            );
+            let input = loader.load(job);
+            let receipt = execute_receipt(job, candidate.adapter(), &input, &limits, |loaded| {
+                candidate_reducer(&candidate, job, loaded, &limits)
+            });
+            assert_program_state_sentinel_receipt(&receipt, expectation);
+            receipts.push(receipt);
+        }
+        assert!(remaining.is_empty(), "missing sentinel jobs: {remaining:?}");
+        assert_eq!(receipts.len(), PROGRAM_STATE_SENTINEL_EXPECTATIONS.len());
+        receipts.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        let actual_ids: Vec<&str> = receipts
+            .iter()
+            .map(|receipt| receipt.job_id.as_str())
+            .collect();
+        let mut expected_ids: Vec<&str> = PROGRAM_STATE_SENTINEL_EXPECTATIONS
+            .iter()
+            .map(|expectation| expectation.id)
+            .collect();
+        expected_ids.sort_unstable();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "sentinel selected an inexact row set"
+        );
+        let receipt_bytes = serde_json::to_vec(&receipts).expect("serialize sentinel receipts");
+        println!(
+            "program-state-nine-row-sentinel manifest_sha256={manifest_hash} receipts_sha256={} rows={}",
+            sha256(&receipt_bytes),
+            receipts.len()
+        );
     }
 
     fn synthetic_job(model: &str, expected: u64) -> Job {
