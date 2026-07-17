@@ -620,8 +620,10 @@ fn capture_template_grammar_matches_pinned_bytes_on_malformed_and_invalid_inputs
         b"$$ $$$ $$$$ $",
         b"$1a/${1}a/$01/${01}",
         b"${}/${unterminated/$-/$!",
+        b"${unterminated/$1",
         b"prefix\xFF$last\xFE${missing}suffix",
         b"${\xFF}$last",
+        b"${\xFF${1}}",
         b"$999999999999999999999999999999999999999999999999999999999999",
     ];
     for replacement in replacements {
@@ -630,6 +632,69 @@ fn capture_template_grammar_matches_pinned_bytes_on_malformed_and_invalid_inputs
             1,
             "{replacement:?}"
         );
+    }
+}
+
+#[test]
+fn nested_malformed_capture_templates_have_linear_work_bounds() {
+    let fre = PortableBuilder::new(r"(a)")
+        .unicode(false)
+        .build()
+        .expect("bounded capture-template pattern");
+    let captures = [Some(b"a".as_slice()), Some(b"a".as_slice())];
+    let upstream = regex::bytes::RegexBuilder::new(r"(a)")
+        .unicode(false)
+        .build()
+        .expect("pinned capture-template pattern");
+    let upstream_captures = upstream
+        .captures(b"a")
+        .expect("pinned capture-template match");
+    let unterminated = b"${".repeat(4_096);
+    let mut invalid_utf8 = unterminated.clone();
+    invalid_utf8.extend_from_slice(&[0xFF, b'}']);
+
+    for replacement in [&unterminated, &invalid_utf8] {
+        let template_scan_work = replacement
+            .len()
+            .checked_mul(10)
+            .expect("small fixture scan work");
+        let exact_work = template_scan_work
+            .checked_add(replacement.len())
+            .expect("small fixture total work");
+        let limits = CaptureExpansionLimits {
+            max_output_bytes: replacement.len(),
+            max_work: exact_work,
+        };
+        let actual = fre
+            .expand_capture_template(&captures, replacement, limits)
+            .expect("nested malformed template stays within a linear work bound");
+        let mut expected = Vec::new();
+        upstream_captures.expand(replacement, &mut expected);
+
+        assert_eq!(actual.as_bytes(), expected);
+        assert_eq!(expected, replacement.as_slice());
+        assert_eq!(
+            actual.report().accounting.template_bytes_scanned,
+            template_scan_work
+        );
+        assert_eq!(actual.report().accounting.capture_references, 0);
+        assert_eq!(actual.report().accounting.work, exact_work);
+
+        let error = fre
+            .expand_capture_template(
+                &captures,
+                replacement,
+                CaptureExpansionLimits {
+                    max_work: exact_work - 1,
+                    ..limits
+                },
+            )
+            .expect_err("one below the certified linear work must refuse");
+        assert!(matches!(
+            error,
+            CaptureExpansionError::WorkLimit { needed, limit }
+                if needed == exact_work && limit + 1 == needed
+        ));
     }
 }
 

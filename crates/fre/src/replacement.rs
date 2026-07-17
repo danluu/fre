@@ -105,8 +105,8 @@ impl Default for CaptureExpansionLimits {
 pub struct CaptureExpansionAccounting {
     /// Conservative parser scan work charged across preflight and copy passes.
     ///
-    /// This is triangular in template length because malformed nested braced
-    /// references can make the pinned grammar revisit a suffix.
+    /// This is a linear upper bound after caching the next closing brace and
+    /// the first invalid UTF-8 byte for malformed braced references.
     pub template_bytes_scanned: usize,
     /// Capture references parsed across one semantic pass.
     pub capture_references: usize,
@@ -1018,6 +1018,9 @@ enum CaptureReference<'a> {
 struct CaptureTemplateParser<'a> {
     replacement: &'a [u8],
     cursor: usize,
+    next_closing_brace: Option<usize>,
+    invalid_utf8: Option<(usize, usize)>,
+    no_more_closing_braces: bool,
 }
 
 impl<'a> CaptureTemplateParser<'a> {
@@ -1025,7 +1028,69 @@ impl<'a> CaptureTemplateParser<'a> {
         Self {
             replacement,
             cursor: 0,
+            next_closing_brace: None,
+            invalid_utf8: None,
+            no_more_closing_braces: false,
         }
+    }
+
+    fn parse_reference(&mut self, start: usize) -> Option<(CaptureReference<'a>, usize)> {
+        let replacement = self.replacement.get(start..)?;
+        if replacement.first() != Some(&b'$') {
+            return None;
+        }
+        if replacement.get(1) == Some(&b'{') {
+            let content_start = start.checked_add(2)?;
+            let closing = match self.next_closing_brace {
+                Some(closing) if closing >= content_start => closing,
+                _ if self.no_more_closing_braces => return None,
+                _ => {
+                    let suffix = self.replacement.get(content_start..)?;
+                    let Some(relative_closing) =
+                        suffix.iter().position(|&byte| byte == b'}')
+                    else {
+                        self.next_closing_brace = None;
+                        self.invalid_utf8 = None;
+                        self.no_more_closing_braces = true;
+                        return None;
+                    };
+                    let closing = content_start.checked_add(relative_closing)?;
+                    self.next_closing_brace = Some(closing);
+                    self.invalid_utf8 = None;
+                    closing
+                }
+            };
+            if let Some((invalid_closing, invalid_byte)) = self.invalid_utf8
+                && invalid_closing == closing
+                && content_start <= invalid_byte
+            {
+                return None;
+            }
+            let content = self.replacement.get(content_start..closing)?;
+            let name = match core::str::from_utf8(content) {
+                Ok(name) => name,
+                Err(error) => {
+                    let invalid_byte = content_start.checked_add(error.valid_up_to())?;
+                    self.invalid_utf8 = Some((closing, invalid_byte));
+                    return None;
+                }
+            };
+            let consumed = closing.checked_sub(start)?.checked_add(1)?;
+            return Some((capture_reference(name), consumed));
+        }
+        let name_start = start.checked_add(1)?;
+        let suffix = self.replacement.get(name_start..)?;
+        let name_len = suffix
+            .iter()
+            .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .count();
+        if name_len == 0 {
+            return None;
+        }
+        let name_end = name_start.checked_add(name_len)?;
+        let name = core::str::from_utf8(self.replacement.get(name_start..name_end)?)
+            .expect("unbraced capture references contain only ASCII bytes");
+        Some((capture_reference(name), name_len.checked_add(1)?))
     }
 }
 
@@ -1057,7 +1122,7 @@ impl<'a> Iterator for CaptureTemplateParser<'a> {
                 &self.replacement[start..start.saturating_add(1)],
             ));
         }
-        let Some((reference, consumed)) = parse_capture_reference(remaining) else {
+        let Some((reference, consumed)) = self.parse_reference(start) else {
             self.cursor = self.cursor.saturating_add(1);
             return Some(CaptureTemplatePiece::Literal(
                 &self.replacement[start..self.cursor],
@@ -1066,28 +1131,6 @@ impl<'a> Iterator for CaptureTemplateParser<'a> {
         self.cursor = self.cursor.saturating_add(consumed);
         Some(CaptureTemplatePiece::Capture(reference))
     }
-}
-
-fn parse_capture_reference(replacement: &[u8]) -> Option<(CaptureReference<'_>, usize)> {
-    if replacement.first() != Some(&b'$') {
-        return None;
-    }
-    if replacement.get(1) == Some(&b'{') {
-        let content = &replacement[2..];
-        let closing = content.iter().position(|&byte| byte == b'}')?;
-        let name = core::str::from_utf8(&content[..closing]).ok()?;
-        return Some((capture_reference(name), closing.saturating_add(3)));
-    }
-    let name_len = replacement[1..]
-        .iter()
-        .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        .count();
-    if name_len == 0 {
-        return None;
-    }
-    let name = core::str::from_utf8(&replacement[1..=name_len])
-        .expect("unbraced capture references contain only ASCII bytes");
-    Some((capture_reference(name), name_len.saturating_add(1)))
 }
 
 fn capture_reference(name: &str) -> CaptureReference<'_> {
@@ -1239,13 +1282,18 @@ fn capture_reference_index_preflight(
 }
 
 fn capture_template_scan_work(length: usize) -> Result<usize, CaptureExpansionError> {
-    let successor = length
-        .checked_add(1)
+    // Per pass, dollar discovery examines at most 2N bytes. The monotonic
+    // caches bound closing-brace searches and UTF-8 validation to N each, and
+    // unbraced-name scans examine at most N more bytes. Retain the prior
+    // triangular bound when it is tighter for tiny templates.
+    let linear = length
+        .checked_mul(5)
         .ok_or(CaptureExpansionError::WorkOverflow)?;
-    length
-        .checked_mul(successor)
-        .map(|product| product / 2)
-        .ok_or(CaptureExpansionError::WorkOverflow)
+    let triangular = length
+        .checked_add(1)
+        .and_then(|successor| length.checked_mul(successor))
+        .map_or(usize::MAX, |product| product / 2);
+    Ok(linear.min(triangular))
 }
 
 fn enforce_capture_work(needed: usize, limit: usize) -> Result<(), CaptureExpansionError> {
