@@ -560,6 +560,22 @@ fn search_resource_dimensions_refuse_explicitly() {
 }
 
 #[test]
+fn history_admission_charges_only_save_states_per_boundary() {
+    let ast = Ast::Byte(b'a').repeat(50, Some(50), Greed::Greedy);
+    let history = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let limits = SearchLimits {
+        max_history_nodes: 4,
+        max_history_walk: 4,
+        ..SearchLimits::default()
+    };
+    let outcome = history
+        .captures(b"x", Window::all(b"x"), limits)
+        .expect("two group-zero Save states over two boundaries fit four nodes");
+    assert!(outcome.captures.is_none());
+    assert!(outcome.report.history_nodes <= 4);
+}
+
+#[test]
 fn aggregate_resource_dimensions_refuse_explicitly() {
     let ast = Ast::Byte(b'a').capture(1);
     let (inline, _) = pair(&ast);

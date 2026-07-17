@@ -1827,6 +1827,52 @@ mod tests {
     }
 
     #[test]
+    fn pinned_expensive_counted_repetitions_execute_on_text_capture_surface() {
+        let mut case = fixture_case(true, true, None);
+        case.source_file = "expensive.toml".to_owned();
+        case.unicode = true;
+        let fixtures = [
+            (
+                "expensive/regression-many-repeat-no-stack-overflow",
+                r"^.{1,2500}",
+                "a",
+                vec![(0, 1)],
+            ),
+            (
+                "expensive/backtrack-blow-visited-capacity",
+                r"\pL{50}",
+                "abcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyZZ",
+                vec![(0, 50), (50, 100), (100, 150)],
+            ),
+        ];
+        for (id, pattern, haystack, spans) in fixtures {
+            case.id = id.to_owned();
+            case.upstream_name = id.to_owned();
+            let input = ExecutableCase {
+                id: id.to_owned(),
+                patterns: vec![pattern.to_owned()],
+                haystack: haystack.as_bytes().to_vec(),
+                bounds: SearchBounds {
+                    start: 0,
+                    end: haystack.len(),
+                },
+                line_terminator: b'\n',
+                expected: spans
+                    .into_iter()
+                    .map(|(start, end)| ExpectedCaptures {
+                        pattern_id: 0,
+                        groups: vec![Some(ExpectedSpan { start, end })],
+                    })
+                    .collect(),
+            };
+            assert!(matches!(
+                execute_case(AdapterSurface::RustTextCapturesIter, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn text_set_surfaces_compile_match_and_deduplicate_pattern_ids() {
         let mut case = fixture_case(true, true, None);
         case.pattern_count = 2;

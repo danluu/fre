@@ -54,7 +54,10 @@ pub struct SearchLimits {
 impl Default for SearchLimits {
     fn default() -> Self {
         Self {
-            max_state_visits: 100_000_000,
+            // The largest pinned counted-capture program has a conservative
+            // 110,926,836-visit admission bound. This ceiling is charged but
+            // does not allocate state-visit storage.
+            max_state_visits: 200_000_000,
             max_slot_copies: 1_000_000_000,
             max_history_nodes: 100_000_000,
             max_history_walk: 100_000_000,
