@@ -616,6 +616,10 @@ impl Engine {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "structural and caller work limits stay explicit at the scan admission boundary"
+    )]
     fn scan<const OBSERVED_WORK: bool>(
         &mut self,
         program: &Program,
@@ -692,6 +696,10 @@ struct FullTable {
 }
 
 impl FullTable {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the table construction loop keeps every exact work charge beside its transition"
+    )]
     fn build<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
@@ -1028,6 +1036,10 @@ impl RowStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "structural and caller work limits stay explicit during sequential replay"
+    )]
     fn replay<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
