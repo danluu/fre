@@ -68,10 +68,12 @@ pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 pub const RE2_VERSION: &str = "2025-11-05";
 /// Stable plan label emitted by the authenticated current-FRE capture adapter.
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
+/// Stable plan label for the proved uniform captured scalar-alternation path.
+pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-unicode-scalar";
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v14-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v15-portable-word-run-v2-unicode-scalar-run-v3-capture-scalar-alternation-v1-finite-dfa-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -127,6 +129,9 @@ pub struct RunLimits {
     /// Maximum retained capture-selector program capacity. This is separate
     /// from capture-history storage and capture-free aggregate programs.
     pub fre_capture_selector_program_bytes: usize,
+    /// Maximum structural inspection work for the capture-specific uniform
+    /// scalar-alternation proof.
+    pub fre_capture_scalar_planner_work: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
     pub fre_literal_planner_work: usize,
     /// Maximum exact-literal needle bytes retained by one aggregate plan.
@@ -197,6 +202,7 @@ impl Default for RunLimits {
             fre_aggregate_repeat_bound: 1 << 10,
             fre_aggregate_program_bytes: 16 * 1_048_576,
             fre_capture_selector_program_bytes: 32 * 1_048_576,
+            fre_capture_scalar_planner_work: 8_192,
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
             fre_literal_build_work: 64 * 1_048_576,
@@ -398,10 +404,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, shared finite-language DFA, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; whole-operation capture-erased span selection plus exact-span persistent tagged-history replay for capture reducers",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, shared finite-language DFA, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, a bounded Unicode-off finite-language shared DFA, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, keeps counted and lower-bounded repetition symbolic, and supports count/span-sum without materializing matches; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using one reversed shared-transition DFA; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures use a complete reverse-row selector and replay tagged histories only over its disjoint nonempty spans, while refusing capture Unicode mode and unsupported looks; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, a bounded Unicode-off finite-language shared DFA, or a bounded continuation program; the direct scalar plan decodes valid UTF-8 once, advances one byte over invalid encoding, keeps counted and lower-bounded repetition symbolic, and supports count/span-sum without materializing matches; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using one reversed shared-transition DFA; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -2964,6 +2970,14 @@ fn fre_count_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
+        let actual =
+            execute_uniform_capture_scalar(&regex, participating, request.haystack, false, limits)?;
+        return Ok(FreReduction {
+            actual,
+            plan: CURRENT_FRE_CAPTURE_SCALAR_PLAN,
+        });
+    }
     let regex = capture_regex(request, limits)?;
     let actual = execute_count_captures(&regex, request.haystack, limits)?;
     Ok(FreReduction {
@@ -3022,12 +3036,103 @@ fn fre_grep_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
+        let actual =
+            execute_uniform_capture_scalar(&regex, participating, request.haystack, true, limits)?;
+        return Ok(FreReduction {
+            actual,
+            plan: CURRENT_FRE_CAPTURE_SCALAR_PLAN,
+        });
+    }
     let regex = capture_regex(request, limits)?;
     let actual = execute_grep_captures(&regex, request.haystack, limits)?;
     Ok(FreReduction {
         actual,
         plan: CURRENT_FRE_CAPTURE_PLAN,
     })
+}
+
+fn uniform_capture_scalar_regex(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Option<(AggregateCountRegex, usize)> {
+    if request.patterns.len() != 1 || !request.unicode || request.case_insensitive {
+        return None;
+    }
+    let mut build_limits = aggregate_build_limits(limits);
+    build_limits.max_unicode_scalar_planner_work = limits.fre_capture_scalar_planner_work;
+    let regex = AggregateBuilder::new(request.patterns[0].as_str())
+        .profile(rebar_profile())
+        .unicode(true)
+        .case_insensitive(false)
+        .limits(build_limits)
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_count()
+        .ok()?;
+    let AggregatePlanIdentity::UnicodeScalar(identity) = regex.build_report().plan_identity else {
+        return None;
+    };
+    if identity.semantics
+        != AggregateUnicodeScalarSemantics::UnicodeOnUniformCapturedAlternationRepeatedUtf8False
+        || identity.participating_captures_per_match == 0
+        || identity.participating_captures_per_match > regex.build_report().captures_erased
+    {
+        return None;
+    }
+    Some((regex, identity.participating_captures_per_match))
+}
+
+fn execute_uniform_capture_scalar(
+    regex: &AggregateCountRegex,
+    participating: usize,
+    haystack: &[u8],
+    grep: bool,
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
+    let result = regex.count(haystack, &operation_limits).map_err(|error| {
+        aggregate_execution_error(
+            &error.source,
+            format!("FRE uniform capture scalar count refused execution: {error}"),
+        )
+    })?;
+    let matches = result.value();
+    let participating_with_overall = participating
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("uniform capture participation overflow"))?;
+    let participating_with_overall = u64::try_from(participating_with_overall)
+        .map_err(|_| ExecutionError::fault("uniform capture participation does not fit u64"))?;
+    let actual = matches
+        .checked_mul(participating_with_overall)
+        .ok_or_else(|| ExecutionError::fault("uniform capture count overflow"))?;
+
+    let all_groups = regex
+        .build_report()
+        .captures_erased
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("uniform capture group count overflow"))?;
+    let all_groups = u64::try_from(all_groups)
+        .map_err(|_| ExecutionError::fault("uniform capture group count does not fit u64"))?;
+    let group_events = matches
+        .checked_mul(all_groups)
+        .ok_or_else(|| ExecutionError::fault("uniform capture event count overflow"))?;
+    let line_events = if grep {
+        u64::try_from(haystack.lines().count())
+            .map_err(|_| ExecutionError::fault("grep line count does not fit u64"))?
+    } else {
+        0
+    };
+    let reducer_events = group_events
+        .checked_add(line_events)
+        .ok_or_else(|| ExecutionError::fault("uniform capture reducer event overflow"))?;
+    if reducer_events > limits.reducer_steps || actual > limits.reducer_steps {
+        return Err(ExecutionError::unsupported(format!(
+            "FRE uniform capture reducer needs {reducer_events} events and count {actual}, limit is {}",
+            limits.reducer_steps
+        )));
+    }
+    Ok(actual)
 }
 
 fn execute_grep_captures(
@@ -3535,6 +3640,7 @@ fn require_unicode_plan_identity(
                     | AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
                     | AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
                     | AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
+                    | AggregateUnicodeScalarSemantics::UnicodeOnUniformCapturedAlternationRepeatedUtf8False
             )
                 && identity.kernel.operation
                     == match operation {
@@ -5531,7 +5637,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v14-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v15-portable-word-run-v2-unicode-scalar-run-v3-capture-scalar-alternation-v1-finite-dfa-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("positive-Unicode-word"));
@@ -6415,10 +6521,23 @@ mod tests {
                 &RunLimits::default(),
             ),
             4,
-            "capture-linear-selector-persistent-history",
+            CURRENT_FRE_CAPTURE_SCALAR_PLAN,
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "grep-captures",
+                &[overlapping.to_string()],
+                "abcdefghijklmn абвгдежзийклмн\nabcde".as_bytes(),
+                true,
+                false,
+                &RunLimits::default(),
+            ),
+            6,
+            CURRENT_FRE_CAPTURE_SCALAR_PLAN,
         );
 
         let mut selector_starved = RunLimits::default();
+        selector_starved.fre_capture_scalar_planner_work = 0;
         selector_starved.fre_capture_selector_program_bytes = 16 * 1_048_576;
         let refusal = current_fre(
             "count-captures",
