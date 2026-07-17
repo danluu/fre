@@ -1308,6 +1308,9 @@ fn finalize_program(
     hash_usize(&mut second, program.entry);
     let mut has_unicode_word_boundary = false;
     for inst in &program.insts {
+        // This one per-instruction identity unit includes both stable hashing
+        // and the immutable assertion-property classification. Classification
+        // is not a second traversal or a separate uncharged unit.
         budget.charge(1)?;
         budget.accounting.unicode_word_boundary_checks = add(
             budget.accounting.unicode_word_boundary_checks,

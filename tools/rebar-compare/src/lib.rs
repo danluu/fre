@@ -6641,6 +6641,34 @@ mod tests {
             ..RunLimits::default()
         };
         assert!(CaptureSelectorLedger::preflight_lf_scan(bytes, &sequential_one_below).is_err());
+
+        let regex = capture_regex_one("(a)", false, false, &RunLimits::default())
+            .expect("uniform capture fixture");
+        let layouts: [&[u8]; 2] = [b"aaaaaaaa", b"a\na\na\na\n"];
+        assert_eq!(layouts[0].len(), layouts[1].len());
+        assert_eq!(execute_grep_captures(&regex, layouts[0], &RunLimits::default()).unwrap(), 16);
+        assert_eq!(execute_grep_captures(&regex, layouts[1], &RunLimits::default()).unwrap(), 8);
+        for haystack in layouts {
+            let work_one_below = RunLimits {
+                fre_aggregate_operation_work: haystack.len() - 1,
+                fre_aggregate_sequential_bytes: haystack.len(),
+                ..RunLimits::default()
+            };
+            let work = execute_grep_captures(&regex, haystack, &work_one_below).unwrap_err();
+            assert!(work.message.contains("cumulative public-operation ledger"));
+            let sequential_one_below = RunLimits {
+                fre_aggregate_operation_work: haystack.len(),
+                fre_aggregate_sequential_bytes: haystack.len() - 1,
+                ..RunLimits::default()
+            };
+            let sequential =
+                execute_grep_captures(&regex, haystack, &sequential_one_below).unwrap_err();
+            assert!(
+                sequential
+                    .message
+                    .contains("cumulative public-operation ledger")
+            );
+        }
     }
 
     #[test]

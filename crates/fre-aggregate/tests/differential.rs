@@ -312,6 +312,10 @@ fn unicode_word_property_is_cached_by_the_budgeted_identity_pass() {
         accounting.unicode_word_boundary_checks,
         accounting.program_states
     );
+    for pattern in [r"\b", r"\b(?:a|ab|abc|abcd|abcde){1,3}\b"] {
+        let sized = compile_unicode_byte_stable(pattern).unwrap().compile_accounting();
+        assert_eq!(sized.unicode_word_boundary_checks, sized.program_states);
+    }
 
     let exact = CompileLimits {
         max_work: accounting.work,
@@ -338,6 +342,42 @@ fn unicode_word_property_is_cached_by_the_budgeted_identity_pass() {
         accounting.work,
         accounting.work - 1,
     );
+}
+
+#[test]
+fn unicode_word_validation_scales_with_input_not_program_size() {
+    let small = compile_unicode_byte_stable(r"\b").unwrap();
+    let large = compile_unicode_byte_stable(r"\b(?:a|ab|abc|abcd|abcde){1,3}\b").unwrap();
+    assert!(small.state_count() < large.state_count());
+    for bytes in [64, 128, 256] {
+        let haystack = vec![b'a'; bytes];
+        for regex in [&small, &large] {
+            let report = regex
+                .admit_count(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::FullTable,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(report.accounting().utf8_validation_work, bytes);
+            assert!(report.certificate().work_bound >= bytes);
+            assert!(report.certificate().sequential_bytes_bound >= bytes);
+        }
+    }
+
+    let no_boundary = compile_unicode_byte_stable(r"(?-u:\xFF)+").unwrap();
+    let invalid = [0xFF; 8];
+    let report = no_boundary
+        .admit_count(
+            &invalid,
+            0..invalid.len(),
+            Strategy::FullTable,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(report.accounting().utf8_validation_work, 0);
+    assert_eq!(report.accounting().sequential_bytes_read, 0);
 }
 
 #[test]
