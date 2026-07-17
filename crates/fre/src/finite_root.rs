@@ -69,6 +69,18 @@ impl RootLiteralAlternation<'_> {
         scratch_limit: usize,
         peak_limit: usize,
     ) -> Result<RootLiteralMaterialization<'_>, MaterializationError> {
+        let projection_work =
+            u64::try_from(self.children.len()).map_err(|_| MaterializationError::Overflow)?;
+        let final_work = self
+            .work
+            .checked_add(projection_work)
+            .ok_or(MaterializationError::Overflow)?;
+        if final_work > work_limit {
+            return Err(MaterializationError::WorkLimit {
+                needed: final_work,
+                limit: work_limit,
+            });
+        }
         let requested = self
             .children
             .len()
@@ -102,6 +114,7 @@ impl RootLiteralAlternation<'_> {
             };
             patterns.push(literal.0.as_ref());
         }
+        debug_assert_eq!(work, final_work);
         Ok(RootLiteralMaterialization { patterns, work })
     }
 }
@@ -267,7 +280,7 @@ mod tests {
         assert!(matches!(
             proof.materialize_patterns(proof.work, usize::MAX, usize::MAX),
             Err(MaterializationError::WorkLimit { needed, limit })
-                if needed == proof.work + 1 && limit == proof.work
+                if needed == 17 && limit == proof.work
         ));
         let pointer_bytes = 4 * size_of::<&[u8]>();
         assert!(matches!(

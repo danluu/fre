@@ -1343,6 +1343,7 @@ fn begin_owned_pattern_encoding(
                 computation: "initial identity allocation",
             })?;
     check_persistent_peak(initial_persistent, source_scratch_bytes, limits)?;
+    work.charge(LENGTH_PREFIX_BYTES)?;
     let mut encoded = reserve_vec::<u8>(LENGTH_PREFIX_BYTES, "cache identity")?;
     let observed_initial =
         inline_bytes
@@ -1351,7 +1352,6 @@ fn begin_owned_pattern_encoding(
                 computation: "observed initial identity allocation",
             })?;
     check_persistent_peak(observed_initial, source_scratch_bytes, limits)?;
-    work.charge(LENGTH_PREFIX_BYTES)?;
     checked_extend(
         &mut encoded,
         &[0_u8; LENGTH_PREFIX_BYTES],
@@ -2032,7 +2032,8 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, BuildWork, Output, RawEdge, RawNode, ReduceError, ReduceLimits,
-        SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, UNSET, charged_dequeue,
+        SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, SparseReverseAc, UNSET,
+        build_failure_links, charged_dequeue, pack_edge,
     };
 
     fn regex(patterns: &[Vec<u8>]) -> Regex {
@@ -2233,6 +2234,39 @@ mod tests {
         );
         assert_eq!((head, tail), (UNSET, UNSET));
         assert_eq!(admitted.used, 1);
+    }
+
+    #[test]
+    fn failure_link_builder_boundary_preserves_output_before_dequeue() {
+        let child_output = Output {
+            pattern: 7,
+            length: 1,
+        };
+        let mut automaton = SparseReverseAc {
+            offsets: vec![0, 1, 1],
+            edges: vec![pack_edge(b'a', 1)],
+            failure: vec![0, 0],
+            output: vec![
+                Output {
+                    pattern: 0,
+                    length: 0,
+                },
+                child_output,
+            ],
+        };
+        let mut nodes = vec![RawNode::EMPTY; 2];
+        let mut work = BuildWork::new(1);
+        assert!(matches!(
+            build_failure_links(&mut automaton, &mut nodes, &mut work),
+            Err(BuildError::WorkLimit {
+                needed: 2,
+                limit: 1
+            })
+        ));
+        assert_eq!(work.used, 1);
+        assert_eq!(automaton.output[1].pattern, child_output.pattern);
+        assert_eq!(automaton.output[1].length, child_output.length);
+        assert_eq!(automaton.failure, vec![0, 0]);
     }
 
     #[test]
