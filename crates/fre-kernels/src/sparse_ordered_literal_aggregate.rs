@@ -18,23 +18,28 @@
 //! one unit per source pattern and explicit byte visit, per sibling comparison,
 //! per created temporary state or edge,
 //! per CSR node or edge visit, per failure-BFS state or edge visit, per failure
-//! hop, per sparse binary-search comparison, and per final state degree scan.
-//! A charge is checked before the corresponding work.
+//! hop, per sparse binary-search comparison, and per final non-root state
+//! degree scan.
+//! The fixed root table additionally charges one unit per initialized byte
+//! entry. A charge is checked before the corresponding work.
 
 use core::{cmp::Ordering, fmt, mem::size_of};
 
 const UNSET: u32 = u32::MAX;
 const TARGET_MASK: u32 = 0x00FF_FFFF;
 const MAX_REPRESENTABLE_STATES: usize = 0x0100_0000;
-const CACHE_FORMAT_VERSION: u32 = 1;
+const ROOT_TRANSITIONS: usize = 256;
+const CACHE_FORMAT_VERSION: u32 = 2;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 
 /// Stable strategy identity shared by both operation-typed plans.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-sparse-ac-dp.v1";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-sparse-ac-root256-dp.v2";
 /// Stable identity for the count-specialized plan.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-sparse-ac-dp.v1";
+pub const COUNT_PLAN_ID: &str =
+    "ordered-literal-aggregate.count.reverse-sparse-ac-root256-dp.v2";
 /// Stable identity for the span-sum-specialized plan.
-pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.reverse-sparse-ac-dp.v1";
+pub const SPAN_SUM_PLAN_ID: &str =
+    "ordered-literal-aggregate.span-sum.reverse-sparse-ac-root256-dp.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -414,6 +419,9 @@ impl Output {
 
 #[derive(Debug)]
 struct SparseReverseAc {
+    /// Root trie targets indexed by byte. Zero denotes an absent edge, which
+    /// is unambiguous because every trie edge targets a non-root state.
+    root_transitions: [u32; ROOT_TRANSITIONS],
     offsets: Vec<u32>,
     edges: Vec<u32>,
     failure: Vec<u32>,
@@ -468,7 +476,13 @@ impl SparseReverseAc {
         Ok(None)
     }
 
-    fn edge_counted(&self, state: u32, byte: u8, counters: &mut SearchCounters) -> Option<u32> {
+    fn nonroot_edge_counted(
+        &self,
+        state: u32,
+        byte: u8,
+        counters: &mut SearchCounters,
+    ) -> Option<u32> {
+        debug_assert_ne!(state, 0);
         counters.edge_lookups = counters
             .edge_lookups
             .checked_add(1)
@@ -508,11 +522,15 @@ impl SparseReverseAc {
 
     fn next(&self, mut state: u32, byte: u8, counters: &mut SearchCounters) -> u32 {
         loop {
-            if let Some(next) = self.edge_counted(state, byte, counters) {
-                return next;
-            }
             if state == 0 {
-                return 0;
+                counters.edge_lookups = counters
+                    .edge_lookups
+                    .checked_add(1)
+                    .expect("preflight proves at most two sparse lookups per input byte");
+                return self.root_transitions[usize::from(byte)];
+            }
+            if let Some(next) = self.nonroot_edge_counted(state, byte, counters) {
+                return next;
             }
             state = self.failure[usize::try_from(state).expect("u32 state fits usize")];
             counters.failure_steps = counters
@@ -726,7 +744,8 @@ impl PlanCore {
             },
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            transition_kind: "sorted sparse-CSR byte edges plus u32 failure links",
+            transition_kind:
+                "direct 256-entry root table plus sorted sparse-CSR byte edges and u32 failure links",
             traversal_kind: "single reverse sparse-AC pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
@@ -813,6 +832,8 @@ impl PlanCore {
             })?;
         check_persistent_peak(requested_persistent, trie_scratch_bytes, limits)?;
 
+        work.charge(ROOT_TRANSITIONS)?;
+        let mut root_transitions = [0_u32; ROOT_TRANSITIONS];
         let mut offsets = reserve_vec::<u32>(offset_count, "CSR offsets")?;
         let mut edges = reserve_vec::<u32>(edge_count, "CSR edges")?;
         let mut failure = reserve_vec::<u32>(state_count, "failure links")?;
@@ -843,7 +864,7 @@ impl PlanCore {
             )?;
             checked_push(&mut failure, 0, "failure reservation")?;
         }
-        for node in &raw_nodes {
+        for (state, node) in raw_nodes.iter().enumerate() {
             work.charge(1)?;
             checked_push(
                 &mut offsets,
@@ -858,6 +879,16 @@ impl PlanCore {
                 work.charge(1)?;
                 let raw = raw_edges[usize::try_from(edge).expect("u32 edge fits usize")];
                 checked_push(&mut edges, raw.packed, "CSR edge reservation")?;
+                if state == 0 {
+                    let byte = usize::from(edge_byte(raw.packed));
+                    let target = edge_target(raw.packed);
+                    if target == 0 || root_transitions[byte] != 0 {
+                        return Err(BuildError::InternalInvariant {
+                            detail: "root table has one non-root target per byte",
+                        });
+                    }
+                    root_transitions[byte] = target;
+                }
                 edge = raw.next_sibling;
             }
         }
@@ -876,6 +907,7 @@ impl PlanCore {
         }
 
         let mut automaton = SparseReverseAc {
+            root_transitions,
             offsets,
             edges,
             failure,
@@ -1739,7 +1771,7 @@ fn max_search_checks(
     work: &mut BuildWork,
 ) -> Result<usize, BuildError> {
     let mut maximum = 0_usize;
-    for state in 0..automaton.state_count() {
+    for state in 1..automaton.state_count() {
         work.charge(1)?;
         let start = usize::try_from(automaton.offsets[state]).expect("u32 offset fits usize");
         let next_state = state
@@ -2032,8 +2064,8 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, BuildWork, Output, RawEdge, RawNode, ReduceError, ReduceLimits,
-        SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, SparseReverseAc, UNSET,
-        build_failure_links, charged_dequeue, pack_edge,
+        ROOT_TRANSITIONS, SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+        SparseReverseAc, UNSET, build_failure_links, charged_dequeue, pack_edge,
     };
 
     fn regex(patterns: &[Vec<u8>]) -> Regex {
@@ -2243,6 +2275,7 @@ mod tests {
             length: 1,
         };
         let mut automaton = SparseReverseAc {
+            root_transitions: [0; ROOT_TRANSITIONS],
             offsets: vec![0, 1, 1],
             edges: vec![pack_edge(b'a', 1)],
             failure: vec![0, 0],
@@ -2273,12 +2306,14 @@ mod tests {
     fn hand_calculated_sparse_build_and_reduce_work_are_exact_and_refuse_one_below() {
         // Owned encoding: 8-byte count prefix written twice, one pattern
         // visit, one 8-byte length prefix and one byte copy = 26. Trie/CSR:
-        // root 1, insertion 13, two output nodes 2, CSR nodes/edge 3,
-        // failure root/state 2, and two degree scans 2, for 49 total.
-        const BUILD_WORK: u64 = 49;
-        // One input byte admits 1 transition, 2 edge lookups/comparisons,
-        // 1 failure step, 2 reducer positions and 2 ring initializations.
-        const REDUCE_WORK: u64 = 10;
+        // root 1, insertion 13, root-table initialization 256, two output
+        // nodes 2, CSR nodes/edge 3, failure root/state 2, and one non-root
+        // degree scan 1, for 304 total.
+        const BUILD_WORK: u64 = 304;
+        // One input byte admits 1 transition, at most 2 edge lookups, no
+        // non-root edge comparisons, 1 failure step, 2 reducer positions and
+        // 2 ring initializations.
+        const REDUCE_WORK: u64 = 8;
 
         // Independent capacity arithmetic for one borrowed one-byte pattern:
         // source pointer vector, two raw trie nodes plus one raw edge, and the
@@ -2329,7 +2364,7 @@ mod tests {
         let exact_reduce = ReduceLimits {
             max_transitions: 1,
             max_edge_lookups: 2,
-            max_edge_search_checks: 2,
+            max_edge_search_checks: 0,
             max_failure_steps: 1,
             max_match_events: 1,
             max_count: 1,
@@ -2343,6 +2378,10 @@ mod tests {
         let result = plan.count(b"a", exact_reduce).unwrap();
         assert_eq!(result.count, 1);
         assert_eq!(result.accounting.upper_bounds.total_work, REDUCE_WORK);
+        assert_eq!(result.accounting.actual.edge_lookups, 1);
+        assert_eq!(result.accounting.actual.edge_search_checks, 0);
+        assert_eq!(result.accounting.actual.failure_steps, 0);
+        assert_eq!(result.accounting.actual.total_work, 6);
         assert!(matches!(
             plan.count(
                 b"a",
@@ -2395,26 +2434,43 @@ mod tests {
     }
 
     #[test]
-    fn root_fanout_binary_search_bound_covers_power_of_two_edges() {
-        for (fanout, expected_checks) in [(127_usize, 7), (128, 8), (255, 8), (256, 9)] {
+    fn root_table_dispatches_hits_and_misses_without_binary_search() {
+        for fanout in [127_usize, 128, 255, 256] {
             let patterns = (0..fanout)
-                .map(|byte| [b'x', u8::try_from(byte).unwrap()])
+                .map(|byte| [u8::try_from(byte).unwrap()])
                 .collect::<Vec<_>>();
-            let source = patterns.iter().map(<[u8; 2]>::as_slice).collect::<Vec<_>>();
+            let source = patterns.iter().map(<[u8; 1]>::as_slice).collect::<Vec<_>>();
             let plan =
                 SparseOrderedLiteralCountPlan::build(source, BuildLimits::unlimited()).unwrap();
             assert_eq!(
                 plan.build_accounting().max_edge_search_checks,
-                expected_checks,
+                0,
                 "fanout={fanout}"
             );
+
+            for byte in 0_u8..=u8::MAX {
+                let mut counters = super::SearchCounters::default();
+                let state = plan.core.automaton.next(0, byte, &mut counters);
+                assert_eq!(
+                    state != 0,
+                    usize::from(byte) < fanout,
+                    "fanout={fanout}, byte={byte}"
+                );
+                assert_eq!(counters.edge_lookups, 1);
+                assert_eq!(counters.edge_search_checks, 0);
+                assert_eq!(counters.failure_steps, 0);
+            }
+
+            let haystack = b"\x00\x7E\x7F\x80\xFE\xFF";
             let result = plan
-                .count(b"xxx\x00x\x7F\xFF", ReduceLimits::unlimited())
+                .count(haystack, ReduceLimits::unlimited())
                 .unwrap();
-            assert!(
-                result.accounting.actual.edge_search_checks
-                    <= result.accounting.upper_bounds.edge_search_checks
-            );
+            let expected = haystack
+                .iter()
+                .filter(|&&byte| usize::from(byte) < fanout)
+                .count();
+            assert_eq!(result.count, u64::try_from(expected).unwrap());
+            assert_eq!(result.accounting.actual.edge_search_checks, 0);
             assert!(
                 result.accounting.actual.total_work <= result.accounting.upper_bounds.total_work
             );
