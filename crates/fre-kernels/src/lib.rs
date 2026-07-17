@@ -394,8 +394,7 @@ fn copy_literal_exact(needle: &[u8]) -> Result<Vec<u8>, LiteralError> {
     if let Some(error) = exact_literal_copy_probe::take_failure() {
         return Err(map_literal_copy_error(error, needle.len()));
     }
-    fre_exact_alloc::copy_exact(needle)
-        .map_err(|error| map_literal_copy_error(error, needle.len()))
+    fre_exact_alloc::copy_exact(needle).map_err(|error| map_literal_copy_error(error, needle.len()))
 }
 
 const fn map_literal_copy_error(error: CopyError, needle_len: usize) -> LiteralError {
@@ -482,9 +481,12 @@ mod tests {
         };
         assert_eq!(plan.needle(), b"temporary needle");
         assert_eq!(
-            plan.find(b"a temporary needle survives", LiteralSearchLimits::unlimited())
-                .unwrap()
-                .0,
+            plan.find(
+                b"a temporary needle survives",
+                LiteralSearchLimits::unlimited()
+            )
+            .unwrap()
+            .0,
             Some((2, 18))
         );
     }
