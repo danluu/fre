@@ -1612,6 +1612,87 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
 }
 
 #[test]
+fn value_reducers_enforce_observed_work_instead_of_replay_upper_bound() {
+    let regex = compile(r"(?:(?:|a){1,2}?b?)*");
+    let haystack = b"aab";
+    for strategy in STRATEGIES {
+        let admitted_count = regex
+            .admit_count(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let count_work = admitted_count.accounting().work;
+        assert!(count_work < admitted_count.certificate().work_bound);
+        assert_eq!(
+            admitted_count.value(),
+            regex
+                .count_value(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits {
+                        max_work: count_work,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap()
+        );
+        expect_resource(
+            regex.count_value(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: count_work - 1,
+                    ..OperationLimits::default()
+                },
+            ),
+            Resource::ExecutionWork,
+        );
+
+        let admitted_sum = regex
+            .admit_span_sum(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let sum_work = admitted_sum.accounting().work;
+        assert!(sum_work < admitted_sum.certificate().work_bound);
+        assert_eq!(
+            admitted_sum.value(),
+            regex
+                .span_sum_value(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits {
+                        max_work: sum_work,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap()
+        );
+        expect_resource(
+            regex.span_sum_value(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: sum_work - 1,
+                    ..OperationLimits::default()
+                },
+            ),
+            Resource::ExecutionWork,
+        );
+    }
+}
+
+#[test]
 fn reverse_rows_borrow_multi_byte_decision_records_without_changing_selection() {
     let cases: [(&str, &[u8]); 3] = [
         (

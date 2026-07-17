@@ -6,6 +6,7 @@ use fre::{
     AggregateStrategy, CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
+use regex_automata::meta::Regex as MetaRegex;
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
@@ -409,6 +410,139 @@ fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
         frontier = next;
     }
     all
+}
+
+#[test]
+fn continuation_value_paths_match_diagnostic_values_and_refusals() {
+    let pattern_sets = [
+        patterns(&[r"a+", "b"]),
+        patterns(&["", r"a+"]),
+        patterns(&[r"(ab|a)", r"b?"]),
+    ];
+    let haystacks = byte_strings(3, &[b'a', b'b', 0xFF]);
+
+    for values in pattern_sets {
+        for strategy in [
+            AggregateStrategy::FullTable,
+            AggregateStrategy::ReverseSequentialRows,
+        ] {
+            let count = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_count()
+                .unwrap();
+            let span_sum = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_span_sum()
+                .unwrap();
+            assert_eq!(
+                AggregateManyPlanKind::ContinuationProgram,
+                count.build_report().plan
+            );
+            assert_eq!(
+                AggregateManyPlanKind::ContinuationProgram,
+                span_sum.build_report().plan
+            );
+
+            for haystack in &haystacks {
+                let limits = AggregateManyRunLimits::unlimited();
+                assert_eq!(
+                    count.count(haystack, limits).unwrap().value(),
+                    count.count_value(haystack, limits).unwrap(),
+                    "count parity for {values:?}/{strategy:?}/{haystack:?}"
+                );
+                assert_eq!(
+                    span_sum.span_sum(haystack, limits).unwrap().value(),
+                    span_sum.span_sum_value(haystack, limits).unwrap(),
+                    "span-sum parity for {values:?}/{strategy:?}/{haystack:?}"
+                );
+            }
+
+            let mut refused = AggregateManyRunLimits::unlimited();
+            refused.continuation.max_boundaries = 0;
+            assert_eq!(
+                count.count(b"a", refused).unwrap_err(),
+                count.count_value(b"a", refused).unwrap_err()
+            );
+            assert_eq!(
+                span_sum.span_sum(b"a", refused).unwrap_err(),
+                span_sum.span_sum_value(b"a", refused).unwrap_err()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the sealed Rebar Veryl pattern and haystack inputs"]
+fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
+    let pattern_path = std::env::var("FRE_QUALIFICATION_VERYL_PATTERNS")
+        .expect("qualification must bind the sealed Veryl pattern path");
+    let haystack_path = std::env::var("FRE_QUALIFICATION_VERYL_HAYSTACK")
+        .expect("qualification must bind the sealed Veryl haystack path");
+    let pattern_text = std::fs::read_to_string(pattern_path).unwrap();
+    let patterns = pattern_text.lines().map(str::to_owned).collect::<Vec<_>>();
+    let haystack = std::fs::read(haystack_path).unwrap();
+    assert_eq!(88, patterns.len());
+    assert_eq!(150_600, haystack.len());
+
+    let oracle = MetaRegex::builder()
+        .configure(MetaRegex::config().utf8_empty(false))
+        .syntax(
+            regex_automata::util::syntax::Config::new()
+                .utf8(false)
+                .unicode(false)
+                .case_insensitive(false),
+        )
+        .build_many(&patterns)
+        .unwrap();
+    let (oracle_count, oracle_span_sum) = oracle
+        .find_iter(&haystack)
+        .try_fold((0_u64, 0_u64), |(count, span_sum), matched| {
+            Some((
+                count.checked_add(1)?,
+                span_sum.checked_add(
+                    u64::try_from(matched.end().checked_sub(matched.start())?).ok()?,
+                )?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((62_400, 150_600), (oracle_count, oracle_span_sum));
+
+    let count = AggregateManyBuilder::new(&patterns)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_count()
+        .unwrap();
+    let span_sum = AggregateManyBuilder::new(&patterns)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        count.build_report().plan
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        span_sum.build_report().plan
+    );
+    assert_eq!(
+        oracle_count,
+        count
+            .count_value(&haystack, AggregateManyRunLimits::default())
+            .unwrap()
+    );
+    assert_eq!(
+        oracle_span_sum,
+        span_sum
+            .span_sum_value(&haystack, AggregateManyRunLimits::default())
+            .unwrap()
+    );
 }
 
 #[test]
