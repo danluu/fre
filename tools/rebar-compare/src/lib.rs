@@ -6720,13 +6720,14 @@ mod tests {
     #[test]
     fn scalar_capture_grep_lf_scan_shares_one_work_cap() {
         let defaults = RunLimits::default();
-        let patterns = [r"(\pL{2})|(\pL{1})".to_string()];
+        let patterns = [r"(\p{L}{14})|(\p{L}{13})|(\p{L}{12})|(\p{L}{11})|(\p{L}{10})|(\p{L}{9})|(\p{L}{8})|(\p{L}{7})|(\p{L}{6})|(\p{L}{5})".to_string()];
+        let fixture = b"aaaaaaaaaaaaaa";
         let selected = fre_reducer(
             CandidateRequest {
                 job_id: "test/scalar-grep-plan",
                 model: "grep-captures",
                 patterns: &patterns,
-                haystack: b"aa",
+                haystack: fixture,
                 unicode: true,
                 case_insensitive: false,
             },
@@ -6739,7 +6740,7 @@ mod tests {
                 job_id: "test/scalar-grep-line-preflight",
                 model: "grep-captures",
                 patterns: &patterns,
-                haystack: b"aa",
+                haystack: fixture,
                 unicode: true,
                 case_insensitive: false,
             },
@@ -6747,6 +6748,8 @@ mod tests {
         )
         .expect("scalar capture fixture");
         assert_eq!(participating, 1);
+        let upstream =
+            rust_compile_options(&patterns, true, false).expect("upstream scalar capture fixture");
 
         for bytes in [64, 128, 256] {
             let no_lines = vec![b'a'; bytes];
@@ -6764,7 +6767,8 @@ mod tests {
                     fre_aggregate_sequential_bytes: bytes,
                     ..RunLimits::default()
                 };
-                let expected = u64::try_from(bytes).unwrap();
+                let expected = grep_captures(&upstream, haystack, u64::MAX)
+                    .expect("upstream grep-captures result");
                 assert_eq!(
                     execute_uniform_capture_scalar(&regex, participating, haystack, true, &exact,)
                         .unwrap(),
