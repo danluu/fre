@@ -41,7 +41,7 @@ fn text_find_iter_matches_pinned_upstream_across_portable_plans() {
                 .find_iter(haystack)
                 .map(|matched| (matched.start(), matched.end()))
                 .collect::<Vec<_>>();
-            let mut matches = fre
+            let mut iterator = fre
                 .find_iter(haystack, PortableFindIterLimits::unlimited())
                 .unwrap_or_else(|error| {
                     panic!(
@@ -49,7 +49,7 @@ fn text_find_iter_matches_pinned_upstream_across_portable_plans() {
                         upstream.as_str()
                     )
                 });
-            let actual = matches
+            let actual = iterator
                 .by_ref()
                 .map(|matched| {
                     let matched = matched.unwrap_or_else(|error| {
@@ -62,8 +62,8 @@ fn text_find_iter_matches_pinned_upstream_across_portable_plans() {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "pattern={:?}", upstream.as_str());
-            assert_eq!(matches.accounting().matches, expected.len());
-            assert!(matches.next().is_none(), "text iterator must fuse");
+            assert_eq!(iterator.accounting().matches, expected.len());
+            assert!(iterator.next().is_none(), "text iterator must fuse");
         }
     }
 }
