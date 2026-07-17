@@ -5766,8 +5766,10 @@ mod tests {
     use super::*;
     use fre::AggregateResource;
 
-    #[test]
-    fn program_state_frontier_nine_row_default_limit_dispositions_are_frozen() {
+    fn assert_program_state_pass_fixtures(
+        limits: &RunLimits,
+        ids: &mut std::collections::BTreeSet<&'static str>,
+    ) {
         // Small structural analogues exercise the production adapter and the
         // same default limits as the nine authenticated rows. The row IDs are
         // labels only in this test and never enter production selection.
@@ -5821,9 +5823,6 @@ mod tests {
                 2,
             ),
         ];
-        let limits = RunLimits::default();
-        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
-        let mut ids = std::collections::BTreeSet::new();
         for (id, model, pattern, haystack, unicode, expected) in pass_fixtures {
             assert!(ids.insert(id), "duplicate frozen row {id}");
             let patterns = [pattern.to_string()];
@@ -5836,7 +5835,7 @@ mod tests {
                     unicode,
                     case_insensitive: false,
                 },
-                &limits,
+                limits,
             ) {
                 CandidateOutcome::Executed(actual)
                 | CandidateOutcome::ExecutedWithPlan { actual, .. } => {
@@ -5845,7 +5844,12 @@ mod tests {
                 other => panic!("row {id} did not execute: {other:?}"),
             }
         }
+    }
 
+    fn assert_program_state_refusal_fixtures(
+        limits: &RunLimits,
+        ids: &mut std::collections::BTreeSet<&'static str>,
+    ) {
         let refusal_fixtures = [
             (
                 "curated/03-date/unicode@rust/regex",
@@ -5876,7 +5880,7 @@ mod tests {
                     unicode: true,
                     case_insensitive: false,
                 },
-                &limits,
+                limits,
             );
             let CandidateOutcome::Unsupported(reason) = outcome else {
                 panic!("row {id} did not produce a typed refusal: {outcome:?}")
@@ -5888,6 +5892,15 @@ mod tests {
             );
             assert!(!reason.contains("ProgramStates"), "row {id}: {reason}");
         }
+    }
+
+    #[test]
+    fn program_state_frontier_nine_row_default_limit_dispositions_are_frozen() {
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        let mut ids = std::collections::BTreeSet::new();
+        assert_program_state_pass_fixtures(&limits, &mut ids);
+        assert_program_state_refusal_fixtures(&limits, &mut ids);
         assert_eq!(ids.len(), 9);
     }
 

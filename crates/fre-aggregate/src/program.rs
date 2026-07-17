@@ -158,7 +158,7 @@ fn scalar_search_comparison_bound(ranges: usize) -> (usize, usize) {
     }
     let half = ranges / 2;
     let (half_bound, preceding_bound) = scalar_search_comparison_bound(half);
-    if ranges % 2 == 0 {
+    if ranges.is_multiple_of(2) {
         (
             half_bound
                 .saturating_add(1)
@@ -210,7 +210,7 @@ mod scalar_search_tests {
         assert_eq!(
             ranges.contains_with('b', || {
                 exact_remaining = exact_remaining.checked_sub(1).ok_or(())?;
-                Ok(())
+                Ok::<(), ()>(())
             }),
             Ok(false)
         );
@@ -220,7 +220,7 @@ mod scalar_search_tests {
         assert_eq!(
             ranges.contains_with('b', || {
                 one_below_remaining = one_below_remaining.checked_sub(1).ok_or(())?;
-                Ok(())
+                Ok::<(), ()>(())
             }),
             Err(())
         );
