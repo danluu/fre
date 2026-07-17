@@ -573,14 +573,8 @@ impl PortableTextRegexSet {
         let mut searched = 0_usize;
         for (index, regex) in self.regexes.iter().enumerate() {
             let search_count = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one(
-                regex,
-                index,
-                haystack,
-                search_start,
-                limits,
-                total_work,
-            )?;
+            let (matched, work) =
+                search_one(regex, index, haystack, search_start, limits, total_work)?;
             total_work = work;
             searched = search_count;
             if matched {
@@ -651,14 +645,8 @@ impl PortableTextRegexSet {
         let mut matched_patterns = 0_usize;
         for (index, regex) in self.regexes.iter().enumerate() {
             let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one(
-                regex,
-                index,
-                haystack,
-                search_start,
-                limits,
-                total_work,
-            )?;
+            let (matched, work) =
+                search_one(regex, index, haystack, search_start, limits, total_work)?;
             total_work = work;
             if matched {
                 let needed = matched_patterns.checked_add(1).ok_or(
@@ -710,14 +698,15 @@ fn search_one(
         max_work: limits.pattern.max_work.min(remaining_total_work),
         max_scratch_bytes: limits.pattern.max_scratch_bytes,
     };
-    let (matched, accounting) = regex
-        .is_match_at(haystack, start, pattern_limits)
-        .map_err(|source| PortableRegexSetExecutionError::Pattern {
-            index,
-            total_work_before,
-            remaining_total_work,
-            source,
-        })?;
+    let (matched, accounting) =
+        regex
+            .is_match_at(haystack, start, pattern_limits)
+            .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                index,
+                total_work_before,
+                remaining_total_work,
+                source,
+            })?;
     let work = accounting.work_or_linear_terms();
     let total_work = total_work_before.checked_add(work).ok_or(
         PortableRegexSetExecutionError::ArithmeticOverflow {
