@@ -138,31 +138,17 @@ fn empty_iteration() -> Result<String, RemainingCoreRefusal> {
     let text = PortableTextBuilder::new("")
         .build()
         .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-text-build-refused"))?;
-    let mut text_ranges = Vec::new();
-    let mut start = 0_usize;
-    let mut last_match_end = None;
-    loop {
-        let (matched, _) = text
-            .find_window(
-                haystack,
-                SearchWindow::new(start, haystack.len()),
-                SearchLimits::unlimited(),
-            )
-            .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused"))?;
-        let Some(matched) = matched else {
-            break;
-        };
-        if matched.start() == matched.end() && last_match_end == Some(matched.end()) {
-            let Some(character) = haystack[start..].chars().next() else {
-                break;
-            };
-            start = start.saturating_add(character.len_utf8());
-            continue;
-        }
-        text_ranges.push(format!("{}-{}", matched.start(), matched.end()));
-        start = matched.end();
-        last_match_end = Some(matched.end());
-    }
+    let text_ranges = text
+        .find_iter(haystack, PortableFindIterLimits::unlimited())
+        .map_err(|_| RemainingCoreRefusal::Unsupported("doctest.remaining-iteration-refused"))?
+        .map(|result| {
+            result
+                .map(|matched| format!("{}-{}", matched.start(), matched.end()))
+                .map_err(|_| {
+                    RemainingCoreRefusal::Unsupported("doctest.remaining-search-refused")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let bytes = build("")?;
     let byte_ranges = bytes

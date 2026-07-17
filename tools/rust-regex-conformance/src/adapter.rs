@@ -10,12 +10,12 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
-    PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
-    PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
-    PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
-    PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, PortableTextSearchError,
-    RustProfile, SearchError, SearchLimits, SearchWindow,
+    PortableBuilder, PortableFindIterError, PortableFindIterLimits, PortableRegex,
+    PortableRegexSet, PortableRegexSetBuildError, PortableRegexSetBuilder,
+    PortableRegexSetRunLimits, PortableTextBuildError, PortableTextBuilder,
+    PortableTextCaptureBuildError, PortableTextCaptureBuilder, PortableTextCaptureRegex,
+    PortableTextRegex, PortableTextRegexSet, PortableTextRegexSetBuildError,
+    PortableTextRegexSetBuilder, RustProfile, SearchError, SearchLimits, SearchWindow,
 };
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
@@ -1046,42 +1046,22 @@ fn collect_text_matches(
     regex: &PortableTextRegex,
     haystack: &str,
     match_limit: Option<usize>,
-) -> Result<Vec<ExpectedSpan>, PortableTextSearchError> {
+) -> Result<Vec<ExpectedSpan>, PortableFindIterError> {
     let limit = match_limit.unwrap_or(usize::MAX);
-    let mut spans = Vec::new();
-    let mut start = 0_usize;
-    let mut last_match_end = None;
-    while spans.len() < limit {
-        let (matched, _) = regex.find_window(
-            haystack,
-            SearchWindow::new(start, haystack.len()),
-            SearchLimits::unlimited(),
-        )?;
-        let Some(matched) = matched else {
-            break;
-        };
-        if matched.is_empty() && last_match_end == Some(matched.end()) {
-            let Some(suffix) = haystack.get(start..) else {
-                return Err(PortableTextSearchError::InvalidUtf8Window {
-                    start,
-                    end: haystack.len(),
-                    haystack_len: haystack.len(),
-                });
-            };
-            let Some(character) = suffix.chars().next() else {
-                break;
-            };
-            start = start.saturating_add(character.len_utf8());
-            continue;
-        }
-        spans.push(ExpectedSpan {
-            start: matched.start(),
-            end: matched.end(),
-        });
-        start = matched.end();
-        last_match_end = Some(matched.end());
+    if limit == 0 {
+        return Ok(Vec::new());
     }
-    Ok(spans)
+    regex
+        .find_iter(haystack, PortableFindIterLimits::unlimited())
+        .map_err(PortableFindIterError::from)?
+        .take(limit)
+        .map(|matched| {
+            matched.map(|matched| ExpectedSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+        })
+        .collect()
 }
 
 fn collect_byte_matches(

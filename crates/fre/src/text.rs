@@ -7,8 +7,9 @@ use regex_syntax::hir::{Hir, HirKind, Look, LookSet};
 
 use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanSelection,
-    PortableBuilder, PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits,
-    SearchWindow, charge_planner, finite, reserve_planner,
+    PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
+    PortableMatches, PortableRegex, RustProfile, SearchAccounting, SearchError, SearchLimits,
+    SearchSessionSetupAccounting, SearchWindow, charge_planner, finite, reserve_planner,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -901,6 +902,29 @@ impl PortableTextRegex {
         self.inner.find(haystack.as_bytes(), limits)
     }
 
+    /// Iterate over every non-overlapping match with Rust text empty-match
+    /// progress and original-haystack assertion context.
+    ///
+    /// Repeated empty matches advance by one UTF-8 scalar value, never by one
+    /// byte. K0 prepares one reusable workspace before iteration, and iterator
+    /// items remain fallible so a resource refusal cannot be mistaken for
+    /// ordinary exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if reusable K0 workspace construction exceeds
+    /// `limits.session`. Per-search and whole-iterator failures are yielded as
+    /// [`PortableFindIterError`] items.
+    pub fn find_iter<'r, 'h>(
+        &'r self,
+        haystack: &'h str,
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableTextMatches<'r, 'h>, SearchError> {
+        Ok(PortableTextMatches {
+            inner: self.inner.find_iter_utf8(haystack, limits)?,
+        })
+    }
+
     /// Return the selected leftmost-first match at or after byte offset
     /// `start`.
     ///
@@ -967,6 +991,40 @@ impl PortableTextRegex {
         self.inner.selected_end(haystack.as_bytes(), limits)
     }
 }
+
+/// Fallible iterator over every non-overlapping Rust text match.
+///
+/// Selected spans use byte offsets into the original UTF-8 haystack. Empty
+/// matches progress by scalar value while all searches retain the complete
+/// original haystack for look-around context.
+#[derive(Debug)]
+pub struct PortableTextMatches<'r, 'h> {
+    inner: PortableMatches<'r, 'h>,
+}
+
+impl PortableTextMatches<'_, '_> {
+    /// Exact counters accumulated through the most recent iterator action.
+    #[must_use]
+    pub const fn accounting(&self) -> PortableFindIterAccounting {
+        self.inner.accounting()
+    }
+
+    /// One-time K0 workspace setup facts, or `None` for native plans.
+    #[must_use]
+    pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
+        self.inner.workspace_setup_accounting()
+    }
+}
+
+impl Iterator for PortableTextMatches<'_, '_> {
+    type Item = Result<Match, PortableFindIterError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl core::iter::FusedIterator for PortableTextMatches<'_, '_> {}
 
 pub(crate) fn next_text_boundary(haystack: &str, start: usize) -> usize {
     if start >= haystack.len() {
