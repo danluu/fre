@@ -412,6 +412,67 @@ fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn continuation_value_paths_match_diagnostic_values_and_refusals() {
+    let pattern_sets = [
+        patterns(&[r"a+", "b"]),
+        patterns(&["", r"a+"]),
+        patterns(&[r"(ab|a)", r"b?"]),
+    ];
+    let haystacks = byte_strings(3, &[b'a', b'b', 0xFF]);
+
+    for values in pattern_sets {
+        for strategy in [
+            AggregateStrategy::FullTable,
+            AggregateStrategy::ReverseSequentialRows,
+        ] {
+            let count = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_count()
+                .unwrap();
+            let span_sum = AggregateManyBuilder::new(&values)
+                .unicode(false)
+                .strategy(strategy)
+                .build_span_sum()
+                .unwrap();
+            assert_eq!(
+                AggregateManyPlanKind::ContinuationProgram,
+                count.build_report().plan
+            );
+            assert_eq!(
+                AggregateManyPlanKind::ContinuationProgram,
+                span_sum.build_report().plan
+            );
+
+            for haystack in &haystacks {
+                let limits = AggregateManyRunLimits::unlimited();
+                assert_eq!(
+                    count.count(haystack, limits).unwrap().value(),
+                    count.count_value(haystack, limits).unwrap(),
+                    "count parity for {values:?}/{strategy:?}/{haystack:?}"
+                );
+                assert_eq!(
+                    span_sum.span_sum(haystack, limits).unwrap().value(),
+                    span_sum.span_sum_value(haystack, limits).unwrap(),
+                    "span-sum parity for {values:?}/{strategy:?}/{haystack:?}"
+                );
+            }
+
+            let mut refused = AggregateManyRunLimits::unlimited();
+            refused.continuation.max_boundaries = 0;
+            assert_eq!(
+                count.count(b"a", refused).unwrap_err(),
+                count.count_value(b"a", refused).unwrap_err()
+            );
+            assert_eq!(
+                span_sum.span_sum(b"a", refused).unwrap_err(),
+                span_sum.span_sum_value(b"a", refused).unwrap_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn every_pattern_keeps_its_ordinal_source_and_profile_identity() {
     let values = patterns(&["ab", "a"]);
     let regex = AggregateManyBuilder::new(&values)
