@@ -2,8 +2,9 @@ use std::fmt::Write as _;
 
 use fre::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanKind,
-    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
+    AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits,
+    AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -27,6 +28,88 @@ fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
             .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
             .sum(),
     )
+}
+
+fn unicode_builder(pattern: impl Into<String>) -> AggregateBuilder {
+    AggregateBuilder::new(pattern)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(true)
+}
+
+fn unicode_oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
+    let spans = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .unwrap()
+        .find_iter(haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect::<Vec<_>>();
+    (
+        u64::try_from(spans.len()).unwrap(),
+        spans
+            .iter()
+            .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
+            .sum(),
+    )
+}
+
+#[test]
+fn unicode_finite_dfa_matches_upstream_on_nonempty_utf8_words_and_malformed_input() {
+    let cases = [
+        (
+            r"(?:∞|✓)",
+            b"\xFF--\xE2\x88\x9E--\xE2\x9C\x93--\x80".as_slice(),
+        ),
+        (
+            r"(?:Шерлок Холмс|Джон Уотсон)",
+            "x Шерлок Холмс / Джон Уотсон".as_bytes(),
+        ),
+        (r"(?i:δ|ω)", "δ Δ ω Ω".as_bytes()),
+        (r"(?P<word>é|雪)", "é/雪".as_bytes()),
+        (r"é|éx", "éx".as_bytes()),
+    ];
+    for (pattern, haystack) in cases {
+        let expected = unicode_oracle(pattern, haystack);
+        let count = unicode_builder(pattern).build_count().unwrap();
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::FiniteLiteralDfa
+        );
+        assert!(matches!(
+            count.build_report().plan_identity,
+            AggregatePlanIdentity::FiniteLiteral(identity)
+                if identity.semantics
+                    == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+        ));
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.0,
+            "count pattern={pattern:?} haystack={haystack:?}"
+        );
+        let sum = unicode_builder(pattern).build_span_sum().unwrap();
+        assert_eq!(sum.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.1,
+            "span sum pattern={pattern:?} haystack={haystack:?}"
+        );
+    }
+}
+
+#[test]
+fn unicode_finite_dfa_rejects_empty_and_locally_raw_byte_languages() {
+    for pattern in [r"(?:|é)", r"(?-u:\xFF)|é"] {
+        let built = unicode_builder(pattern).build_count().unwrap();
+        assert_eq!(
+            built.build_report().plan,
+            AggregatePlanKind::ContinuationProgram,
+            "pattern={pattern:?}"
+        );
+        assert!(built.build_report().finite_planner_work > 0);
+    }
 }
 
 #[test]

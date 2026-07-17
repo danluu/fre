@@ -97,8 +97,20 @@ pub enum AggregatePlanIdentity {
 /// Operation-specific identity for the shared finite-language reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateFiniteLiteralIdentity {
+    pub semantics: AggregateFiniteLiteralSemantics,
     pub algorithm: &'static str,
     pub operation: &'static str,
+}
+
+/// Profile proof attached to the shared finite-language reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateFiniteLiteralSemantics {
+    /// Rust bytes with Unicode disabled and empty matches at byte boundaries.
+    UnicodeOffByteBoundaries,
+    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to an
+    /// exactly enumerated language of nonempty valid UTF-8 words. Every word
+    /// starts with ASCII or a UTF-8 leading byte and ends on a scalar boundary.
+    UnicodeOnNonemptyUtf8Words,
 }
 
 /// Semantic proof attached to an exact-literal facade identity.
@@ -1071,8 +1083,7 @@ impl AggregateBuilder {
             Some(UnicodeScalarInspection::Ineligible { work }) => work,
             None => 0,
         };
-        let finite = if !unicode
-            && selection == AggregatePlanSelection::Auto
+        let finite = if selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
         {
             Some(
@@ -1112,7 +1123,10 @@ impl AggregateBuilder {
             None
         };
         let finite_planner_work = finite.as_ref().map_or(0, |result| result.work);
-        if let Some(words) = finite.and_then(|result| result.words) {
+        let finite_words = finite
+            .and_then(|result| result.words)
+            .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
+        if let Some(words) = finite_words {
             let capture_erasure_work =
                 expected_captures
                     .checked_mul(2)
@@ -1170,6 +1184,11 @@ impl AggregateBuilder {
                         build: AggregateBuildAccounting::FiniteLiteral(build),
                         plan_identity: AggregatePlanIdentity::FiniteLiteral(
                             AggregateFiniteLiteralIdentity {
+                                semantics: if unicode {
+                                    AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+                                } else {
+                                    AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+                                },
                                 algorithm: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
                                 operation: operation_id,
                             },
@@ -1248,6 +1267,13 @@ impl AggregateBuilder {
             report,
         })
     }
+}
+
+fn unicode_finite_words_preserve_scalar_boundaries(words: &[Vec<u8>]) -> bool {
+    !words.is_empty()
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && core::str::from_utf8(word).is_ok())
 }
 
 #[derive(Debug)]
