@@ -361,6 +361,15 @@ fn unicode_word_validation_scales_with_input_not_program_size() {
                 )
                 .unwrap();
             assert_eq!(report.accounting().utf8_validation_work, bytes);
+            assert_eq!(
+                report.accounting().work,
+                report.accounting().utf8_validation_work
+                    + report.accounting().state_evaluations
+                    + report.accounting().transition_checks
+                    + report.accounting().root_probes
+                    + report.accounting().replay_steps
+                    + report.accounting().successful_paths
+            );
             assert!(report.certificate().work_bound >= bytes);
             assert!(report.certificate().sequential_bytes_bound >= bytes);
         }
