@@ -811,6 +811,7 @@ fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
 fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
     let pattern = r"\b[a-z]+ing\b";
     let haystack = b"!wording! thing singing! wording?".repeat(64);
+    let expected = upstream_unicode_byte_stable(pattern, &haystack);
     let regex = compile_unicode_byte_stable(pattern).unwrap();
     assert_eq!(regex.compile_accounting().required_suffix_bytes, 3);
     let dense = regex
@@ -842,6 +843,8 @@ fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
             limits,
         )
         .unwrap();
+    assert_eq!(ordinary.as_slice(), expected.as_slice());
+    assert_eq!(observed.as_slice(), expected.as_slice());
     assert_eq!(ordinary.as_slice(), observed.as_slice());
     assert_eq!(ordinary.certificate(), observed.certificate());
     assert_eq!(ordinary.accounting(), observed.accounting());
