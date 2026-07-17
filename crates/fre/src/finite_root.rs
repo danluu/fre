@@ -18,6 +18,15 @@ pub(crate) enum InspectionError {
     Overflow,
 }
 
+#[derive(Debug)]
+pub(crate) enum MaterializationError {
+    WorkLimit { needed: u64, limit: u64 },
+    ScratchLimit { needed: usize, limit: usize },
+    PeakLimit { needed: usize, limit: usize },
+    AllocationFailed { additional: usize },
+    Overflow,
+}
+
 pub(crate) enum Inspection<'a> {
     Eligible(RootLiteralAlternation<'a>),
     Ineligible { work: u64 },
@@ -39,12 +48,6 @@ pub(crate) struct RootLiteralAlternation<'a> {
 }
 
 impl RootLiteralAlternation<'_> {
-    pub(crate) fn patterns(&self) -> RootLiteralPatterns<'_> {
-        RootLiteralPatterns {
-            children: self.children.iter(),
-        }
-    }
-
     pub(crate) const fn pattern_count(&self) -> usize {
         self.children.len()
     }
@@ -56,31 +59,77 @@ impl RootLiteralAlternation<'_> {
             && self.trie_states_upper_bound <= limits.max_trie_states
             && self.dense_cells_upper_bound > limits.max_dfa_cells
     }
-}
 
-#[derive(Clone)]
-pub(crate) struct RootLiteralPatterns<'a> {
-    children: core::slice::Iter<'a, Hir>,
-}
+    /// Materialize only borrowed slice pointers after exact work and capacity
+    /// preflight. The returned concrete vector is the sparse builder's entire
+    /// dynamic input; its observed capacity is checked again there.
+    pub(crate) fn materialize_patterns(
+        &self,
+        work_limit: u64,
+        scratch_limit: usize,
+        peak_limit: usize,
+    ) -> Result<RootLiteralMaterialization<'_>, MaterializationError> {
+        let requested = self
+            .children
+            .len()
+            .checked_mul(size_of::<&[u8]>())
+            .ok_or(MaterializationError::Overflow)?;
+        check_source_capacity(requested, scratch_limit, peak_limit)?;
+        let mut patterns = Vec::new();
+        patterns
+            .try_reserve_exact(self.children.len())
+            .map_err(|_| MaterializationError::AllocationFailed {
+                additional: self.children.len(),
+            })?;
+        let observed = patterns
+            .capacity()
+            .checked_mul(size_of::<&[u8]>())
+            .ok_or(MaterializationError::Overflow)?;
+        check_source_capacity(observed, scratch_limit, peak_limit)?;
 
-impl<'a> Iterator for RootLiteralPatterns<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.children.next().map(|child| {
+        let mut work = self.work;
+        for child in self.children {
+            let needed = work.checked_add(1).ok_or(MaterializationError::Overflow)?;
+            if needed > work_limit {
+                return Err(MaterializationError::WorkLimit {
+                    needed,
+                    limit: work_limit,
+                });
+            }
+            work = needed;
             let HirKind::Literal(literal) = child.kind() else {
                 unreachable!("proved root literal alternative changed during construction")
             };
-            literal.0.as_ref()
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.children.size_hint()
+            patterns.push(literal.0.as_ref());
+        }
+        Ok(RootLiteralMaterialization { patterns, work })
     }
 }
 
-impl ExactSizeIterator for RootLiteralPatterns<'_> {}
+pub(crate) struct RootLiteralMaterialization<'a> {
+    pub(crate) patterns: Vec<&'a [u8]>,
+    pub(crate) work: u64,
+}
+
+fn check_source_capacity(
+    needed: usize,
+    scratch_limit: usize,
+    peak_limit: usize,
+) -> Result<(), MaterializationError> {
+    if needed > scratch_limit {
+        return Err(MaterializationError::ScratchLimit {
+            needed,
+            limit: scratch_limit,
+        });
+    }
+    if needed > peak_limit {
+        return Err(MaterializationError::PeakLimit {
+            needed,
+            limit: peak_limit,
+        });
+    }
+    Ok(())
+}
 
 pub(crate) fn inspect(
     hir: &Hir,
@@ -98,6 +147,7 @@ pub(crate) fn inspect(
 
     let mut pattern_bytes = 0_usize;
     let mut used = [false; 256];
+    let mut used_count = 0_usize;
     for child in children {
         charge(&mut work, 1, work_limit)?;
         let HirKind::Literal(literal) = child.kind() else {
@@ -119,7 +169,11 @@ pub(crate) fn inspect(
             .checked_add(bytes.len())
             .ok_or(InspectionError::Overflow)?;
         for &byte in bytes {
-            used[usize::from(byte)] = true;
+            let slot = &mut used[usize::from(byte)];
+            if !*slot {
+                *slot = true;
+                used_count = used_count.checked_add(1).ok_or(InspectionError::Overflow)?;
+            }
         }
     }
 
@@ -135,7 +189,6 @@ pub(crate) fn inspect(
     let trie_states_upper_bound = pattern_bytes
         .checked_add(1)
         .ok_or(InspectionError::Overflow)?;
-    let used_count = used.iter().filter(|&&present| present).count();
     let alphabet_classes = if used_count == 256 {
         256
     } else {
@@ -174,7 +227,7 @@ mod tests {
         reason = "exact one-below fixtures subtract from values proved positive in the same test"
     )]
 
-    use super::{Inspection, InspectionError, inspect};
+    use super::{Inspection, InspectionError, MaterializationError, inspect, size_of};
     use fre_kernels::OrderedLiteralAggregateBuildLimits;
     use regex_syntax::ParserBuilder;
 
@@ -198,8 +251,11 @@ mod tests {
         let Inspection::Eligible(proof) = inspect(&hir, false, u64::MAX).unwrap() else {
             panic!("literal root should be eligible");
         };
+        let materialized = proof
+            .materialize_patterns(u64::MAX, usize::MAX, usize::MAX)
+            .unwrap();
         assert_eq!(
-            proof.patterns().collect::<Vec<_>>(),
+            materialized.patterns,
             vec![
                 b"ab".as_slice(),
                 b"a".as_slice(),
@@ -207,10 +263,30 @@ mod tests {
                 b"xyz".as_slice()
             ]
         );
+        assert_eq!(materialized.work, 17);
+        assert!(matches!(
+            proof.materialize_patterns(proof.work, usize::MAX, usize::MAX),
+            Err(MaterializationError::WorkLimit { needed, limit })
+                if needed == proof.work + 1 && limit == proof.work
+        ));
+        let pointer_bytes = 4 * size_of::<&[u8]>();
+        assert!(matches!(
+            proof.materialize_patterns(u64::MAX, pointer_bytes - 1, usize::MAX),
+            Err(MaterializationError::ScratchLimit { needed, limit })
+                if needed == pointer_bytes && limit == pointer_bytes - 1
+        ));
+        assert!(matches!(
+            proof.materialize_patterns(u64::MAX, usize::MAX, pointer_bytes - 1),
+            Err(MaterializationError::PeakLimit { needed, limit })
+                if needed == pointer_bytes && limit == pointer_bytes - 1
+        ));
         assert_eq!(proof.pattern_count(), 4);
         assert_eq!(proof.pattern_bytes, 8);
         assert_eq!(proof.hir_nodes, 5);
         assert_eq!(proof.work, 13);
+        // Five distinct bytes plus the catch-all alphabet class, across the
+        // independently calculated nine-state trie upper bound.
+        assert_eq!(proof.dense_cells_upper_bound, 9 * 6);
         assert!(matches!(
             inspect(&hir, false, proof.work - 1),
             Err(InspectionError::WorkLimit { needed, limit })

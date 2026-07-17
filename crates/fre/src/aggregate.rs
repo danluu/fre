@@ -1456,38 +1456,80 @@ impl AggregateBuilder {
                 });
             }
             let sparse_limits = sparse_finite_build_limits(limits.finite_literal);
-            let sparse_build = match operation {
-                AggregateOperation::Compile | AggregateOperation::Count => {
-                    SparseOrderedLiteralCountPlan::build(proof.patterns(), sparse_limits).map(
-                        |engine| {
-                            let build = engine.build_accounting();
-                            (
-                                AggregateEngine::SparseFiniteCount(engine),
-                                build,
-                                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-                            )
-                        },
-                    )
+            let materialized = match proof.materialize_patterns(
+                limits.max_finite_planner_work,
+                sparse_limits.max_scratch_bytes,
+                sparse_limits.max_peak_bytes,
+            ) {
+                Ok(materialized) => {
+                    finite_planner_work = materialized.work;
+                    Ok(materialized.patterns)
                 }
-                AggregateOperation::SpanSum => {
-                    SparseOrderedLiteralSpanSumPlan::build(proof.patterns(), sparse_limits).map(
-                        |engine| {
-                            let build = engine.build_accounting();
-                            (
-                                AggregateEngine::SparseFiniteSpanSum(engine),
-                                build,
-                                SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-                            )
-                        },
-                    )
+                Err(finite_root::MaterializationError::WorkLimit { needed, limit }) => {
+                    return Err(AggregateBuildError::FinitePlannerWorkLimit {
+                        operation,
+                        selection,
+                        needed,
+                        limit,
+                    });
                 }
-                AggregateOperation::Spans => {
+                Err(finite_root::MaterializationError::AllocationFailed { additional }) => {
+                    return Err(AggregateBuildError::FinitePlannerAllocationFailed {
+                        operation,
+                        selection,
+                        structure: "root literal pointer source",
+                        additional,
+                    });
+                }
+                Err(finite_root::MaterializationError::ScratchLimit { needed, limit }) => {
+                    Err(SparseOrderedLiteralAggregateBuildError::ScratchLimit { needed, limit })
+                }
+                Err(finite_root::MaterializationError::PeakLimit { needed, limit }) => {
+                    Err(SparseOrderedLiteralAggregateBuildError::PeakLimit { needed, limit })
+                }
+                Err(finite_root::MaterializationError::Overflow) => {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        detail: "span materialization selected sparse finite reducer",
+                        detail: "root literal source materialization accounting overflow",
                     });
                 }
+            };
+            let sparse_build = match materialized {
+                Err(source) => Err(source),
+                Ok(patterns) => match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        SparseOrderedLiteralCountPlan::build(patterns, sparse_limits).map(
+                            |engine| {
+                                let build = engine.build_accounting();
+                                (
+                                    AggregateEngine::SparseFiniteCount(engine),
+                                    build,
+                                    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                                )
+                            },
+                        )
+                    }
+                    AggregateOperation::SpanSum => {
+                        SparseOrderedLiteralSpanSumPlan::build(patterns, sparse_limits).map(
+                            |engine| {
+                                let build = engine.build_accounting();
+                                (
+                                    AggregateEngine::SparseFiniteSpanSum(engine),
+                                    build,
+                                    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                                )
+                            },
+                        )
+                    }
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span materialization selected sparse finite reducer",
+                        });
+                    }
+                },
             };
             match sparse_build {
                 Ok((engine, build, operation_id)) => {

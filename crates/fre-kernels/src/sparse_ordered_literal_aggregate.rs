@@ -7,13 +7,16 @@
 //! dense ordered-literal kernel then implements successive non-overlapping
 //! leftmost-first matches.
 //!
-//! Construction consumes its input once into the same length-prefixed owned
-//! encoding retained for cache identity. Trie insertion then reads only that
-//! authenticated encoding, so user-provided `Clone` or repeated iteration can
-//! perform no unaccounted work or change bytes between passes. Every retained
-//! and temporary vector is fallibly reserved. `build_work` is an exact charge
-//! in the documented abstract model: one unit per yielded pattern and explicit
-//! byte visit, per sibling comparison, per created temporary state or edge,
+//! Construction consumes one concrete `Vec<&[u8]>` into the same
+//! length-prefixed owned encoding retained for cache identity. The source
+//! vector capacity is included in scratch and peak accounting; the pointed-to
+//! immutable bytes remain caller-owned and are excluded by type. Restricting
+//! the source to this concrete representation prevents arbitrary iterator or
+//! `AsRef` code from running ahead of a charge. Trie insertion then reads only
+//! the authenticated encoding. Every retained and temporary vector is fallibly
+//! reserved. `build_work` is an exact charge in the documented abstract model:
+//! one unit per source pattern and explicit byte visit, per sibling comparison,
+//! per created temporary state or edge,
 //! per CSR node or edge visit, per failure-BFS state or edge visit, per failure
 //! hop, per sparse binary-search comparison, and per final state degree scan.
 //! A charge is checked before the corresponding work.
@@ -548,12 +551,8 @@ pub struct SparseOrderedLiteralSpanSumPlan {
 }
 
 impl SparseOrderedLiteralCountPlan {
-    /// Consume a pattern iterable once into a quota-checked owned encoding.
-    pub fn build<I, P>(patterns: I, limits: BuildLimits) -> Result<Self, BuildError>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<[u8]>,
-    {
+    /// Consume a concrete borrowed-pattern vector into a checked owned encoding.
+    pub fn build(patterns: Vec<&[u8]>, limits: BuildLimits) -> Result<Self, BuildError> {
         PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
     }
 
@@ -596,12 +595,8 @@ impl SparseOrderedLiteralCountPlan {
 }
 
 impl SparseOrderedLiteralSpanSumPlan {
-    /// Consume a pattern iterable once into a quota-checked owned encoding.
-    pub fn build<I, P>(patterns: I, limits: BuildLimits) -> Result<Self, BuildError>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<[u8]>,
-    {
+    /// Consume a concrete borrowed-pattern vector into a checked owned encoding.
+    pub fn build(patterns: Vec<&[u8]>, limits: BuildLimits) -> Result<Self, BuildError> {
         PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
     }
 
@@ -742,17 +737,13 @@ impl PlanCore {
         clippy::too_many_lines,
         reason = "construction keeps all exact work and capacity checks adjacent"
     )]
-    fn build<I, P>(
-        patterns: I,
+    fn build(
+        patterns: Vec<&[u8]>,
         limits: BuildLimits,
         inline_bytes: usize,
-    ) -> Result<Self, BuildError>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<[u8]>,
-    {
+    ) -> Result<Self, BuildError> {
         let mut work = BuildWork::new(limits.max_build_work);
-        let (preflight, encoded_patterns) =
+        let (preflight, encoded_patterns, source_scratch_bytes, encoding_peak_bytes) =
             encode_owned_patterns(patterns, limits, inline_bytes, &mut work)?;
 
         let logical_scratch = preflight
@@ -783,18 +774,18 @@ impl PlanCore {
         work.charge(1)?;
         checked_push(&mut raw_nodes, RawNode::EMPTY, "root node reservation")?;
 
-        let scratch_bytes = capacity_bytes(&raw_nodes)?
+        let trie_scratch_bytes = capacity_bytes(&raw_nodes)?
             .checked_add(capacity_bytes(&raw_edges)?)
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "observed build scratch",
             })?;
-        check_scratch(scratch_bytes, limits)?;
+        check_scratch(trie_scratch_bytes, limits)?;
         let persistent_floor = inline_bytes
             .checked_add(encoded_patterns.capacity())
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "observed persistent floor",
             })?;
-        check_persistent_peak(persistent_floor, scratch_bytes, limits)?;
+        check_persistent_peak(persistent_floor, trie_scratch_bytes, limits)?;
 
         insert_owned_patterns(
             preflight,
@@ -820,7 +811,7 @@ impl PlanCore {
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "requested sparse persistent bytes",
             })?;
-        check_persistent_peak(requested_persistent, scratch_bytes, limits)?;
+        check_persistent_peak(requested_persistent, trie_scratch_bytes, limits)?;
 
         let mut offsets = reserve_vec::<u32>(offset_count, "CSR offsets")?;
         let mut edges = reserve_vec::<u32>(edge_count, "CSR edges")?;
@@ -836,7 +827,9 @@ impl PlanCore {
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "observed sparse persistent bytes",
             })?;
-        let peak_bytes = check_persistent_peak(persistent_bytes, scratch_bytes, limits)?;
+        let trie_peak_bytes = check_persistent_peak(persistent_bytes, trie_scratch_bytes, limits)?;
+        let scratch_bytes = trie_scratch_bytes.max(source_scratch_bytes);
+        let peak_bytes = trie_peak_bytes.max(encoding_peak_bytes);
 
         for node in &raw_nodes {
             work.charge(1)?;
@@ -1334,6 +1327,7 @@ impl OwnedPatternStats {
 fn begin_owned_pattern_encoding(
     limits: BuildLimits,
     inline_bytes: usize,
+    source_scratch_bytes: usize,
     work: &mut BuildWork,
 ) -> Result<Vec<u8>, BuildError> {
     if LENGTH_PREFIX_BYTES > limits.max_identity_bytes {
@@ -1348,7 +1342,7 @@ fn begin_owned_pattern_encoding(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "initial identity allocation",
             })?;
-    check_persistent_peak(initial_persistent, 0, limits)?;
+    check_persistent_peak(initial_persistent, source_scratch_bytes, limits)?;
     let mut encoded = reserve_vec::<u8>(LENGTH_PREFIX_BYTES, "cache identity")?;
     let observed_initial =
         inline_bytes
@@ -1356,7 +1350,7 @@ fn begin_owned_pattern_encoding(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "observed initial identity allocation",
             })?;
-    check_persistent_peak(observed_initial, 0, limits)?;
+    check_persistent_peak(observed_initial, source_scratch_bytes, limits)?;
     work.charge(LENGTH_PREFIX_BYTES)?;
     checked_extend(
         &mut encoded,
@@ -1371,6 +1365,7 @@ fn reserve_owned_pattern_identity(
     pattern_bytes: usize,
     limits: BuildLimits,
     inline_bytes: usize,
+    source_scratch_bytes: usize,
 ) -> Result<(), BuildError> {
     let identity_bytes = encoded
         .len()
@@ -1391,7 +1386,7 @@ fn reserve_owned_pattern_identity(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "requested identity allocation",
             })?;
-    check_persistent_peak(requested_persistent, 0, limits)?;
+    check_persistent_peak(requested_persistent, source_scratch_bytes, limits)?;
     let additional =
         LENGTH_PREFIX_BYTES
             .checked_add(pattern_bytes)
@@ -1410,7 +1405,7 @@ fn reserve_owned_pattern_identity(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "observed identity allocation",
             })?;
-    check_persistent_peak(observed_persistent, 0, limits)?;
+    check_persistent_peak(observed_persistent, source_scratch_bytes, limits)?;
     Ok(())
 }
 
@@ -1430,23 +1425,33 @@ fn finish_owned_pattern_encoding(
     Ok((preflight, encoded))
 }
 
-fn encode_owned_patterns<I, P>(
-    patterns: I,
+fn encode_owned_patterns(
+    patterns: Vec<&[u8]>,
     limits: BuildLimits,
     inline_bytes: usize,
     work: &mut BuildWork,
-) -> Result<(BuildPreflight, Vec<u8>), BuildError>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<[u8]>,
-{
-    let mut encoded = begin_owned_pattern_encoding(limits, inline_bytes, work)?;
+) -> Result<(BuildPreflight, Vec<u8>, usize, usize), BuildError> {
+    let source_scratch_bytes = patterns.capacity().checked_mul(size_of::<&[u8]>()).ok_or(
+        BuildError::ArithmeticOverflow {
+            computation: "borrowed pattern source capacity",
+        },
+    )?;
+    check_scratch(source_scratch_bytes, limits)?;
+    let mut encoded =
+        begin_owned_pattern_encoding(limits, inline_bytes, source_scratch_bytes, work)?;
     let mut stats = OwnedPatternStats::default();
-    for pattern in patterns {
+    let mut index = 0_usize;
+    while index < patterns.len() {
         work.charge(1)?;
-        let bytes = pattern.as_ref();
+        let bytes = patterns[index];
         stats.observe(bytes.len(), limits)?;
-        reserve_owned_pattern_identity(&mut encoded, bytes.len(), limits, inline_bytes)?;
+        reserve_owned_pattern_identity(
+            &mut encoded,
+            bytes.len(),
+            limits,
+            inline_bytes,
+            source_scratch_bytes,
+        )?;
         work.charge(LENGTH_PREFIX_BYTES)?;
         let length = u64::try_from(bytes.len()).map_err(|_| BuildError::ArithmeticOverflow {
             computation: "identity pattern length",
@@ -1458,8 +1463,24 @@ where
         )?;
         work.charge(bytes.len())?;
         checked_extend(&mut encoded, bytes, "identity byte reservation")?;
+        index = index.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "borrowed pattern source index",
+        })?;
     }
-    finish_owned_pattern_encoding(stats, encoded, work)
+    let encoding_peak_bytes = inline_bytes
+        .checked_add(encoded.capacity())
+        .and_then(|bytes| bytes.checked_add(source_scratch_bytes))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "observed source encoding peak",
+        })?;
+    let (preflight, encoded) = finish_owned_pattern_encoding(stats, encoded, work)?;
+    drop(patterns);
+    Ok((
+        preflight,
+        encoded,
+        source_scratch_bytes,
+        encoding_peak_bytes,
+    ))
 }
 
 fn check_pattern_representation(count: usize, max_pattern_bytes: usize) -> Result<(), BuildError> {
@@ -1630,11 +1651,11 @@ fn build_failure_links(
         enqueue(raw_nodes, &mut head, &mut tail, child);
     }
     while head != UNSET {
-        work.charge(1)?;
-        let state =
-            dequeue(raw_nodes, &mut head, &mut tail)?.ok_or(BuildError::InternalInvariant {
+        let state = charged_dequeue(raw_nodes, &mut head, &mut tail, work)?.ok_or(
+            BuildError::InternalInvariant {
                 detail: "nonempty failure queue yields one state",
-            })?;
+            },
+        )?;
         let state_index = usize::try_from(state).expect("u32 state fits usize");
         let inherited = automaton.output
             [usize::try_from(automaton.failure[state_index]).expect("u32 state fits usize")];
@@ -1671,6 +1692,16 @@ fn build_failure_links(
         });
     }
     Ok(())
+}
+
+fn charged_dequeue(
+    nodes: &[RawNode],
+    head: &mut u32,
+    tail: &mut u32,
+    work: &mut BuildWork,
+) -> Result<Option<u32>, BuildError> {
+    work.charge(1)?;
+    dequeue(nodes, head, tail)
 }
 
 fn enqueue(nodes: &mut [RawNode], head: &mut u32, tail: &mut u32, state: u32) {
@@ -2000,8 +2031,8 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, ReduceError, ReduceLimits, SparseOrderedLiteralCountPlan,
-        SparseOrderedLiteralSpanSumPlan,
+        BuildError, BuildLimits, BuildWork, Output, RawEdge, RawNode, ReduceError, ReduceLimits,
+        SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, UNSET, charged_dequeue,
     };
 
     fn regex(patterns: &[Vec<u8>]) -> Regex {
@@ -2084,11 +2115,9 @@ mod tests {
                 .find_iter(haystack)
                 .map(|matched| (matched.start(), matched.end()))
                 .collect::<Vec<_>>();
-            let plan = SparseOrderedLiteralCountPlan::build(
-                patterns.iter().copied(),
-                BuildLimits::unlimited(),
-            )
-            .unwrap();
+            let plan =
+                SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                    .unwrap();
             let actual = sequence(&plan, haystack)
                 .into_iter()
                 .map(|(_, start, end)| (start, end))
@@ -2107,11 +2136,9 @@ mod tests {
                 .iter()
                 .map(|(start, end)| u64::try_from(end - start).unwrap())
                 .sum::<u64>();
-            let span = SparseOrderedLiteralSpanSumPlan::build(
-                patterns.iter().copied(),
-                BuildLimits::unlimited(),
-            )
-            .unwrap();
+            let span =
+                SparseOrderedLiteralSpanSumPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                    .unwrap();
             assert_eq!(
                 span.span_sum(haystack, ReduceLimits::unlimited())
                     .unwrap()
@@ -2124,21 +2151,21 @@ mod tests {
     #[test]
     fn source_index_priority_covers_terminal_and_failure_outputs() {
         let long_first = SparseOrderedLiteralCountPlan::build(
-            [b"ab".as_slice(), b"a".as_slice()],
+            vec![b"ab".as_slice(), b"a".as_slice()],
             BuildLimits::unlimited(),
         )
         .unwrap();
         assert_eq!(choice_at_start(&long_first, b"ab"), Some((0, 2)));
 
         let short_first = SparseOrderedLiteralCountPlan::build(
-            [b"a".as_slice(), b"ab".as_slice()],
+            vec![b"a".as_slice(), b"ab".as_slice()],
             BuildLimits::unlimited(),
         )
         .unwrap();
         assert_eq!(choice_at_start(&short_first, b"ab"), Some((0, 1)));
 
         let duplicates = SparseOrderedLiteralCountPlan::build(
-            [b"abc".as_slice(), b"abc".as_slice()],
+            vec![b"abc".as_slice(), b"abc".as_slice()],
             BuildLimits::unlimited(),
         )
         .unwrap();
@@ -2146,33 +2173,29 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_input_is_consumed_once_into_the_retained_encoding() {
-        struct OneShot<'a> {
-            inner: core::slice::Iter<'a, &'a [u8]>,
-        }
-        impl<'a> Iterator for OneShot<'a> {
-            type Item = &'a [u8];
-
-            fn next(&mut self) -> Option<Self::Item> {
-                self.inner.next().copied()
-            }
-        }
-
+    fn concrete_borrowed_source_capacity_is_bounded_and_consumed_once() {
         let patterns = [b"alpha".as_slice(), b"beta".as_slice(), b"a".as_slice()];
-        let count = SparseOrderedLiteralCountPlan::build(
-            OneShot {
-                inner: patterns.iter(),
-            },
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
-        let span = SparseOrderedLiteralSpanSumPlan::build(
-            OneShot {
-                inner: patterns.iter(),
-            },
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
+        let mut oversized_source = Vec::with_capacity(32);
+        oversized_source.extend(patterns);
+        let source_scratch = oversized_source.capacity() * size_of::<&[u8]>();
+        assert!(matches!(
+            SparseOrderedLiteralCountPlan::build(
+                oversized_source,
+                BuildLimits {
+                    max_scratch_bytes: source_scratch - 1,
+                    ..BuildLimits::unlimited()
+                }
+            ),
+            Err(BuildError::ScratchLimit { needed, limit })
+                if needed == source_scratch && limit == source_scratch - 1
+        ));
+
+        let count =
+            SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
+        let span =
+            SparseOrderedLiteralSpanSumPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
         assert_eq!(
             count
                 .count(b"alpha beta alpha", ReduceLimits::unlimited())
@@ -2189,6 +2212,30 @@ mod tests {
     }
 
     #[test]
+    fn failure_queue_refusal_precedes_dequeue_mutation() {
+        let nodes = [RawNode::EMPTY];
+        let mut head = 0;
+        let mut tail = 0;
+        let mut refused = BuildWork::new(0);
+        assert!(matches!(
+            charged_dequeue(&nodes, &mut head, &mut tail, &mut refused),
+            Err(BuildError::WorkLimit {
+                needed: 1,
+                limit: 0
+            })
+        ));
+        assert_eq!((head, tail), (0, 0));
+
+        let mut admitted = BuildWork::new(1);
+        assert_eq!(
+            charged_dequeue(&nodes, &mut head, &mut tail, &mut admitted).unwrap(),
+            Some(0)
+        );
+        assert_eq!((head, tail), (UNSET, UNSET));
+        assert_eq!(admitted.used, 1);
+    }
+
+    #[test]
     fn hand_calculated_sparse_build_and_reduce_work_are_exact_and_refuse_one_below() {
         // Owned encoding: 8-byte count prefix written twice, one pattern
         // visit, one 8-byte length prefix and one byte copy = 26. Trie/CSR:
@@ -2199,6 +2246,20 @@ mod tests {
         // 1 failure step, 2 reducer positions and 2 ring initializations.
         const REDUCE_WORK: u64 = 10;
 
+        // Independent capacity arithmetic for one borrowed one-byte pattern:
+        // source pointer vector, two raw trie nodes plus one raw edge, and the
+        // retained identity/CSR/failure/output vectors.
+        let source_scratch = size_of::<&[u8]>();
+        let trie_scratch = 2 * size_of::<RawNode>() + size_of::<RawEdge>();
+        let scratch_bytes = source_scratch.max(trie_scratch);
+        let persistent_bytes = size_of::<SparseOrderedLiteralCountPlan>()
+            + 17
+            + 3 * size_of::<u32>()
+            + size_of::<u32>()
+            + 2 * size_of::<u32>()
+            + 2 * size_of::<Output>();
+        let peak_bytes = persistent_bytes + trie_scratch;
+
         let patterns = [b"a".as_slice()];
         let exact_build = BuildLimits {
             max_patterns: 1,
@@ -2207,15 +2268,19 @@ mod tests {
             max_trie_states: 2,
             max_sparse_edges: 1,
             max_build_work: BUILD_WORK,
-            max_scratch_bytes: usize::MAX,
-            max_persistent_bytes: usize::MAX,
-            max_peak_bytes: usize::MAX,
+            max_scratch_bytes: scratch_bytes,
+            max_persistent_bytes: persistent_bytes,
+            max_peak_bytes: peak_bytes,
         };
-        let plan = SparseOrderedLiteralCountPlan::build(patterns, exact_build).unwrap();
-        assert_eq!(plan.build_accounting().build_work, BUILD_WORK);
+        let plan = SparseOrderedLiteralCountPlan::build(patterns.to_vec(), exact_build).unwrap();
+        let build = plan.build_accounting();
+        assert_eq!(build.build_work, BUILD_WORK);
+        assert_eq!(build.scratch_bytes, scratch_bytes);
+        assert_eq!(build.persistent_bytes, persistent_bytes);
+        assert_eq!(build.peak_bytes, peak_bytes);
         assert!(matches!(
             SparseOrderedLiteralCountPlan::build(
-                patterns,
+                patterns.to_vec(),
                 BuildLimits {
                     max_build_work: BUILD_WORK - 1,
                     ..exact_build
@@ -2272,12 +2337,18 @@ mod tests {
     fn sparse_storage_and_work_scale_linearly_without_dense_alphabet_rows() {
         let small_patterns = generated_patterns(1_024);
         let large_patterns = generated_patterns(2_048);
+        let small_source = small_patterns
+            .iter()
+            .map(<[u8; 8]>::as_slice)
+            .collect::<Vec<_>>();
+        let large_source = large_patterns
+            .iter()
+            .map(<[u8; 8]>::as_slice)
+            .collect::<Vec<_>>();
         let small =
-            SparseOrderedLiteralCountPlan::build(small_patterns.iter(), BuildLimits::unlimited())
-                .unwrap();
+            SparseOrderedLiteralCountPlan::build(small_source, BuildLimits::unlimited()).unwrap();
         let large =
-            SparseOrderedLiteralCountPlan::build(large_patterns.iter(), BuildLimits::unlimited())
-                .unwrap();
+            SparseOrderedLiteralCountPlan::build(large_source, BuildLimits::unlimited()).unwrap();
         let a = small.build_accounting();
         let b = large.build_accounting();
         assert_eq!(a.sparse_edges_actual + 1, a.trie_states_actual);
@@ -2295,9 +2366,9 @@ mod tests {
             let patterns = (0..fanout)
                 .map(|byte| [b'x', u8::try_from(byte).unwrap()])
                 .collect::<Vec<_>>();
+            let source = patterns.iter().map(<[u8; 2]>::as_slice).collect::<Vec<_>>();
             let plan =
-                SparseOrderedLiteralCountPlan::build(patterns.iter(), BuildLimits::unlimited())
-                    .unwrap();
+                SparseOrderedLiteralCountPlan::build(source, BuildLimits::unlimited()).unwrap();
             assert_eq!(
                 plan.build_accounting().max_edge_search_checks,
                 expected_checks,
@@ -2339,18 +2410,16 @@ mod tests {
             b"aba".as_slice(),
             b"\xFF\x00".as_slice(),
         ];
-        let baseline = SparseOrderedLiteralCountPlan::build(
-            patterns.iter().copied(),
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
+        let baseline =
+            SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
         let exact = exact_build_limits(&baseline);
-        SparseOrderedLiteralCountPlan::build(patterns.iter().copied(), exact).unwrap();
+        SparseOrderedLiteralCountPlan::build(patterns.to_vec(), exact).unwrap();
         macro_rules! assert_one_below {
             ($field:ident, $variant:ident) => {{
                 let limit = exact.$field.checked_sub(1).unwrap();
                 let error = SparseOrderedLiteralCountPlan::build(
-                    patterns.iter().copied(),
+                    patterns.to_vec(),
                     BuildLimits {
                         $field: limit,
                         ..exact
@@ -2400,16 +2469,12 @@ mod tests {
     fn every_reduce_dimension_has_exact_limit_and_one_below() {
         let patterns = [b"ababa".as_slice(), b"aba".as_slice(), b"a".as_slice()];
         let haystack = b"xxababababax";
-        let count = SparseOrderedLiteralCountPlan::build(
-            patterns.iter().copied(),
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
-        let span = SparseOrderedLiteralSpanSumPlan::build(
-            patterns.iter().copied(),
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
+        let count =
+            SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
+        let span =
+            SparseOrderedLiteralSpanSumPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
         let counted = count.count(haystack, ReduceLimits::unlimited()).unwrap();
         let summed = span.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
         let count_exact = exact_reduce_limits(counted.accounting.upper_bounds, u64::MAX);
@@ -2550,11 +2615,9 @@ mod tests {
             b"aaaaaaab".as_slice(),
             b"baaaaaaa".as_slice(),
         ];
-        let plan = SparseOrderedLiteralCountPlan::build(
-            patterns.iter().copied(),
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
+        let plan =
+            SparseOrderedLiteralCountPlan::build(patterns.to_vec(), BuildLimits::unlimited())
+                .unwrap();
         let result = plan
             .count(b"aaaaaaaaaaaaaaaaaaaa", ReduceLimits::unlimited())
             .unwrap();
