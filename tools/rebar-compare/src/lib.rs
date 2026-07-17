@@ -4014,10 +4014,11 @@ fn fre_aggregate_many_count(
     require_aggregate_many_identity(request, regex.build_report(), AggregateManyOperation::Count)?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
-    let result = regex
-        .count(request.haystack, operation_limits)
+    let actual = regex
+        .count_value(request.haystack, operation_limits)
         .map_err(|error| {
-            let message = format!("FRE ordered build-many count refused execution: {error}");
+            let message =
+                format!("FRE ordered build-many value-only count refused execution: {error}");
             aggregate_many_execution_error(&error.source, message)
         })?;
     let plan = match regex.build_report().plan {
@@ -4025,7 +4026,7 @@ fn fre_aggregate_many_count(
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction {
-        actual: result.value(),
+        actual,
         plan,
     })
 }
@@ -4084,10 +4085,12 @@ fn fre_aggregate_many_span_sum(
     )?;
     let operation_limits =
         aggregate_many_run_limits(request.haystack.len(), regex.build_report(), limits)?;
-    let result = regex
-        .span_sum(request.haystack, operation_limits)
+    let actual = regex
+        .span_sum_value(request.haystack, operation_limits)
         .map_err(|error| {
-            let message = format!("FRE ordered build-many span-sum refused execution: {error}");
+            let message = format!(
+                "FRE ordered build-many value-only span-sum refused execution: {error}"
+            );
             aggregate_many_execution_error(&error.source, message)
         })?;
     let plan = match regex.build_report().plan {
@@ -4095,7 +4098,7 @@ fn fre_aggregate_many_span_sum(
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction {
-        actual: result.value(),
+        actual,
         plan,
     })
 }
@@ -5618,6 +5621,29 @@ mod tests {
             2,
             "capture-linear-selector-persistent-history",
         );
+    }
+
+    #[test]
+    #[ignore = "requires the sealed Rebar Veryl KLV pattern and haystack payloads"]
+    fn sealed_veryl_klv_uses_value_only_build_many_rebar_routes() {
+        let pattern_path = std::env::var("FRE_QUALIFICATION_VERYL_PATTERNS")
+            .expect("qualification must bind the sealed Veryl pattern path");
+        let haystack_path = std::env::var("FRE_QUALIFICATION_VERYL_HAYSTACK")
+            .expect("qualification must bind the sealed Veryl haystack path");
+        let pattern_text = std::fs::read_to_string(pattern_path).unwrap();
+        let patterns = pattern_text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let haystack = std::fs::read(haystack_path).unwrap();
+        assert_eq!(88, patterns.len());
+        assert_eq!(150_600, haystack.len());
+
+        let limits = RunLimits::default();
+        for (model, expected) in [("count", 62_400), ("count-spans", 150_600)] {
+            assert_current_fre_execution(
+                current_fre(model, &patterns, &haystack, false, false, &limits),
+                expected,
+                "aggregate-many-continuation-program",
+            );
+        }
     }
 
     #[test]
