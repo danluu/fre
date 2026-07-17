@@ -3858,6 +3858,10 @@ fn sparse_ordered_literal_operation_limits(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive aggregate-plan dispatch keeps every plan's inactive limits explicit"
+)]
 fn aggregate_run_limits(
     haystack_len: usize,
     report: &AggregateBuildReport,
@@ -4010,6 +4014,10 @@ fn finite_plan_identity_matches(
     identity.semantics == expected_semantics && representation_matches
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive identity verifier keeps every supported plan's invariants adjacent"
+)]
 fn require_unicode_plan_identity(
     report: &AggregateBuildReport,
     unicode: bool,

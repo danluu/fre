@@ -1702,8 +1702,16 @@ impl AggregateBuilder {
                 let engine = PrefixClassAlternationPlan::build(
                     prefixes,
                     [
-                        classes[0].ranges().iter().map(class_bytes_range_tuple),
-                        classes[1].ranges().iter().map(class_bytes_range_tuple),
+                        classes[0]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(class_bytes_range_tuple),
+                        classes[1]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(class_bytes_range_tuple),
                     ],
                     limits.prefix_class_alternation,
                 )
@@ -2191,6 +2199,10 @@ impl AggregatePlan {
         0..haystack.len()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive engine dispatch keeps every typed count error mapping adjacent"
+    )]
     fn execute_count(
         &self,
         haystack: &[u8],
@@ -3285,7 +3297,7 @@ fn charge_prefix_class_work(
     Ok(())
 }
 
-fn class_bytes_range_tuple(range: &ClassBytesRange) -> (u8, u8) {
+fn class_bytes_range_tuple(range: ClassBytesRange) -> (u8, u8) {
     (range.start(), range.end())
 }
 
