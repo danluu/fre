@@ -1,12 +1,12 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregateLiteralIneligibility,
-    AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
-    AggregateResource, AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile, SearchLimits,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
+    AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateStrategy,
+    AggregateUnicodeScalarSemantics, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind, PortableBuilder, RustProfile,
+    SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -866,14 +866,24 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
             if identity.semantics == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
     ));
 
-    for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+"] {
+    for pattern in [r"a|b", r"[ab]", r"(a)"] {
+        let finite = aggregate_builder(pattern).build_count().unwrap();
+        assert!(matches!(
+            finite.build_report().plan_identity,
+            AggregatePlanIdentity::FiniteLiteral(identity)
+                if identity.semantics
+                    == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+        ));
+    }
+    for pattern in [r"\Aa", r"a+"] {
         let continuation = aggregate_builder(pattern).build_count().unwrap();
         assert!(matches!(
             continuation.build_report().plan_identity,
             AggregatePlanIdentity::Continuation(identity)
-                if identity.semantics
-                    == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
+                if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
         ));
+    }
+    for pattern in [r"a|b", r"[ab]", r"(a)", r"\Aa", r"a+"] {
         assert!(matches!(
             aggregate_builder(pattern)
                 .plan_selection(AggregatePlanSelection::ForceExactLiteral)
@@ -900,8 +910,9 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
         .unwrap();
     assert!(matches!(
         local_case_sensitive.build_report().plan_identity,
-        AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
+        AggregatePlanIdentity::FiniteLiteral(identity)
+            if identity.semantics
+                == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
     ));
     assert!(matches!(
         aggregate_builder(r"(?-i:a)")
@@ -929,15 +940,16 @@ fn unicode_exact_literal_scope_and_identity_are_explicit_and_no_fallback() {
 }
 
 #[test]
-fn unicode_singleton_case_folds_use_byte_stable_continuation() {
+fn unicode_singleton_case_folds_use_byte_stable_finite_dfa() {
     let folded_russian = aggregate_builder("рус")
         .case_insensitive(true)
         .build_count()
         .unwrap();
     assert!(matches!(
         folded_russian.build_report().plan_identity,
-        AggregatePlanIdentity::Continuation(identity)
-            if identity.semantics == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
+        AggregatePlanIdentity::FiniteLiteral(identity)
+            if identity.semantics
+                == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
     ));
     assert_eq!(
         folded_russian
@@ -948,6 +960,12 @@ fn unicode_singleton_case_folds_use_byte_stable_continuation() {
     );
 
     let folded_kelvin = aggregate_builder(r"(?i:k)").build_count().unwrap();
+    assert!(matches!(
+        folded_kelvin.build_report().plan_identity,
+        AggregatePlanIdentity::FiniteLiteral(identity)
+            if identity.semantics
+                == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+    ));
     let kelvin_haystack = [b'K', b'k', 0xE2, 0x84, 0xAA];
     assert_eq!(
         folded_kelvin
@@ -1375,7 +1393,7 @@ fn unicode_scalar_selection_admits_composition_and_preserves_existing_paths() {
                 .unwrap()
                 .build_report()
                 .plan,
-            AggregatePlanKind::ContinuationProgram,
+            AggregatePlanKind::FiniteLiteralDfa,
             "pattern={pattern:?}"
         );
     }
