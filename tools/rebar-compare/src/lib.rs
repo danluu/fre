@@ -5766,6 +5766,131 @@ mod tests {
     use super::*;
     use fre::AggregateResource;
 
+    #[test]
+    fn program_state_frontier_nine_row_default_limit_dispositions_are_frozen() {
+        // Small structural analogues exercise the production adapter and the
+        // same default limits as the nine authenticated rows. The row IDs are
+        // labels only in this test and never enter production selection.
+        let pass_fixtures = [
+            (
+                "curated/03-date/compile-unicode@rust/regex",
+                "compile",
+                r"(?i:[a-z]{3}) [0-9]{1,2}, [0-9]{4}",
+                "Jul 17, 2026".as_bytes(),
+                true,
+                1,
+            ),
+            (
+                "curated/08-words/long-russian@rust/regex",
+                "count-spans",
+                r"\b\w{3,}\b",
+                "три слова".as_bytes(),
+                true,
+                16,
+            ),
+            (
+                "dictionary/compile/english-10@rust/regex",
+                "compile",
+                "abcdefghij|klmnopqrst",
+                b"xx klmnopqrst yy".as_slice(),
+                true,
+                1,
+            ),
+            (
+                "dictionary/search/english-10@rust/regex",
+                "count-spans",
+                "abcdefghij|klmnopqrst",
+                b"abcdefghij klmnopqrst".as_slice(),
+                true,
+                20,
+            ),
+            (
+                "unicode/compile/huge-character-class@rust/regex",
+                "compile",
+                r"[\u{100}-\u{3ff}]",
+                "Ā".as_bytes(),
+                true,
+                1,
+            ),
+            (
+                "wild/bibleref/compile@rust/regex",
+                "compile",
+                r"(?:Gen|Exod) [0-9]+:[0-9]+",
+                b"Gen 1:1 Exod 2:3".as_slice(),
+                true,
+                2,
+            ),
+        ];
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        let mut ids = std::collections::BTreeSet::new();
+        for (id, model, pattern, haystack, unicode, expected) in pass_fixtures {
+            assert!(ids.insert(id), "duplicate frozen row {id}");
+            let patterns = [pattern.to_string()];
+            match CurrentFreAdapter.execute(
+                CandidateRequest {
+                    job_id: id,
+                    model,
+                    patterns: &patterns,
+                    haystack,
+                    unicode,
+                    case_insensitive: false,
+                },
+                &limits,
+            ) {
+                CandidateOutcome::Executed(actual)
+                | CandidateOutcome::ExecutedWithPlan { actual, .. } => {
+                    assert_eq!(actual, expected, "row {id}");
+                }
+                other => panic!("row {id} did not execute: {other:?}"),
+            }
+        }
+
+        let refusal_fixtures = [
+            (
+                "curated/03-date/unicode@rust/regex",
+                "count-spans",
+                500_usize,
+            ),
+            (
+                "hyperscan/fixed-length-words-unicode-nosom@rust/regex",
+                "count",
+                550,
+            ),
+            (
+                "unicode/word/boundary-long-russian@rust/regex",
+                "count-spans",
+                600,
+            ),
+        ];
+        let haystack = vec![b'a'; 100_000];
+        for (id, model, repeats) in refusal_fixtures {
+            assert!(ids.insert(id), "duplicate frozen row {id}");
+            let patterns = [format!("(?:a+){{{repeats}}}")];
+            let outcome = CurrentFreAdapter.execute(
+                CandidateRequest {
+                    job_id: id,
+                    model,
+                    patterns: &patterns,
+                    haystack: &haystack,
+                    unicode: true,
+                    case_insensitive: false,
+                },
+                &limits,
+            );
+            let CandidateOutcome::Unsupported(reason) = outcome else {
+                panic!("row {id} did not produce a typed refusal: {outcome:?}")
+            };
+            assert!(
+                reason.contains("aggregate resource ExecutionWork requires")
+                    && reason.contains("limit is 536870912"),
+                "row {id} returned the wrong refusal: {reason}"
+            );
+            assert!(!reason.contains("ProgramStates"), "row {id}: {reason}");
+        }
+        assert_eq!(ids.len(), 9);
+    }
+
     fn synthetic_job(model: &str, expected: u64) -> Job {
         serde_json::from_value(serde_json::json!({
             "id": format!("test/{model}@rust/regex"),

@@ -7,15 +7,16 @@
 //! dense ordered-literal kernel then implements successive non-overlapping
 //! leftmost-first matches.
 //!
-//! Construction accepts a cloneable iterable rather than a materialized
-//! `Vec<Vec<u8>>`. This lets a facade make the required validation, identity
-//! and insertion passes directly over a root literal HIR. Every retained and
-//! temporary vector is fallibly reserved. `build_work` is an exact charge in
-//! the documented abstract model: one unit per yielded pattern and explicit
-//! byte visit, per sibling comparison, per created temporary state or edge, per CSR
-//! node or edge visit, per failure-BFS state or edge visit, per failure hop,
-//! per sparse binary-search comparison, and per final state degree scan. A
-//! charge is checked before the corresponding work.
+//! Construction consumes its input once into the same length-prefixed owned
+//! encoding retained for cache identity. Trie insertion then reads only that
+//! authenticated encoding, so user-provided `Clone` or repeated iteration can
+//! perform no unaccounted work or change bytes between passes. Every retained
+//! and temporary vector is fallibly reserved. `build_work` is an exact charge
+//! in the documented abstract model: one unit per yielded pattern and explicit
+//! byte visit, per sibling comparison, per created temporary state or edge,
+//! per CSR node or edge visit, per failure-BFS state or edge visit, per failure
+//! hop, per sparse binary-search comparison, and per final state degree scan.
+//! A charge is checked before the corresponding work.
 
 use core::{cmp::Ordering, fmt, mem::size_of};
 
@@ -305,9 +306,6 @@ pub enum BuildError {
         structure: &'static str,
         additional: usize,
     },
-    InputChanged {
-        pass: &'static str,
-    },
     InternalInvariant {
         detail: &'static str,
     },
@@ -550,10 +548,10 @@ pub struct SparseOrderedLiteralSpanSumPlan {
 }
 
 impl SparseOrderedLiteralCountPlan {
-    /// Build directly from a stable, reusable, cloneable pattern iterable.
+    /// Consume a pattern iterable once into a quota-checked owned encoding.
     pub fn build<I, P>(patterns: I, limits: BuildLimits) -> Result<Self, BuildError>
     where
-        I: Clone + IntoIterator<Item = P>,
+        I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
         PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
@@ -598,10 +596,10 @@ impl SparseOrderedLiteralCountPlan {
 }
 
 impl SparseOrderedLiteralSpanSumPlan {
-    /// Build directly from a stable, reusable, cloneable pattern iterable.
+    /// Consume a pattern iterable once into a quota-checked owned encoding.
     pub fn build<I, P>(patterns: I, limits: BuildLimits) -> Result<Self, BuildError>
     where
-        I: Clone + IntoIterator<Item = P>,
+        I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
         PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
@@ -750,11 +748,12 @@ impl PlanCore {
         inline_bytes: usize,
     ) -> Result<Self, BuildError>
     where
-        I: Clone + IntoIterator<Item = P>,
+        I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
         let mut work = BuildWork::new(limits.max_build_work);
-        let preflight = preflight_build(patterns.clone(), limits, &mut work)?;
+        let (preflight, encoded_patterns) =
+            encode_owned_patterns(patterns, limits, inline_bytes, &mut work)?;
 
         let logical_scratch = preflight
             .trie_states_upper_bound
@@ -777,13 +776,6 @@ impl PlanCore {
         )?;
         check_persistent_peak(persistent_floor, logical_scratch, limits)?;
 
-        let mut encoded_patterns = reserve_vec::<u8>(preflight.identity_bytes, "cache identity")?;
-        encode_patterns(
-            patterns.clone(),
-            preflight,
-            &mut encoded_patterns,
-            &mut work,
-        )?;
         let mut raw_nodes =
             reserve_vec::<RawNode>(preflight.trie_states_upper_bound, "temporary trie nodes")?;
         let mut raw_edges =
@@ -804,8 +796,7 @@ impl PlanCore {
             })?;
         check_persistent_peak(persistent_floor, scratch_bytes, limits)?;
 
-        insert_patterns(
-            patterns,
+        insert_owned_patterns(
             preflight,
             &encoded_patterns,
             &mut raw_nodes,
@@ -1234,15 +1225,44 @@ impl PlanCore {
     }
 }
 
-fn preflight_build<I, P>(
+fn encode_owned_patterns<I, P>(
     patterns: I,
     limits: BuildLimits,
+    inline_bytes: usize,
     work: &mut BuildWork,
-) -> Result<BuildPreflight, BuildError>
+) -> Result<(BuildPreflight, Vec<u8>), BuildError>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<[u8]>,
 {
+    if LENGTH_PREFIX_BYTES > limits.max_identity_bytes {
+        return Err(BuildError::IdentityBytesLimit {
+            needed: LENGTH_PREFIX_BYTES,
+            limit: limits.max_identity_bytes,
+        });
+    }
+    let initial_persistent =
+        inline_bytes
+            .checked_add(LENGTH_PREFIX_BYTES)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "initial identity allocation",
+            })?;
+    check_persistent_peak(initial_persistent, 0, limits)?;
+    let mut encoded = reserve_vec::<u8>(LENGTH_PREFIX_BYTES, "cache identity")?;
+    let observed_initial =
+        inline_bytes
+            .checked_add(encoded.capacity())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "observed initial identity allocation",
+            })?;
+    check_persistent_peak(observed_initial, 0, limits)?;
+    work.charge(LENGTH_PREFIX_BYTES)?;
+    checked_extend(
+        &mut encoded,
+        &[0_u8; LENGTH_PREFIX_BYTES],
+        "identity count prefix reservation",
+    )?;
+
     let mut count = 0_usize;
     let mut pattern_bytes = 0_usize;
     let mut max_pattern_bytes = 0_usize;
@@ -1259,8 +1279,19 @@ where
                 limit: limits.max_patterns,
             });
         }
+        if count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(BuildError::RepresentationLimit {
+                structure: "pattern identifiers",
+                needed: count,
+            });
+        }
         let bytes = pattern.as_ref();
-        work.charge(bytes.len())?;
+        if bytes.len() > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(BuildError::RepresentationLimit {
+                structure: "pattern lengths",
+                needed: bytes.len(),
+            });
+        }
         pattern_bytes =
             pattern_bytes
                 .checked_add(bytes.len())
@@ -1273,6 +1304,70 @@ where
                 limit: limits.max_pattern_bytes,
             });
         }
+        let identity_bytes = encoded
+            .len()
+            .checked_add(LENGTH_PREFIX_BYTES)
+            .and_then(|length| length.checked_add(bytes.len()))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "identity bytes",
+            })?;
+        if identity_bytes > limits.max_identity_bytes {
+            return Err(BuildError::IdentityBytesLimit {
+                needed: identity_bytes,
+                limit: limits.max_identity_bytes,
+            });
+        }
+        let trie_states_upper_bound =
+            pattern_bytes
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "trie state upper bound",
+                })?;
+        if trie_states_upper_bound > limits.max_trie_states {
+            return Err(BuildError::TrieStatesLimit {
+                needed: trie_states_upper_bound,
+                limit: limits.max_trie_states,
+            });
+        }
+        if trie_states_upper_bound > MAX_REPRESENTABLE_STATES {
+            return Err(BuildError::RepresentationLimit {
+                structure: "packed sparse trie states",
+                needed: trie_states_upper_bound,
+            });
+        }
+        if pattern_bytes > limits.max_sparse_edges {
+            return Err(BuildError::SparseEdgesLimit {
+                needed: pattern_bytes,
+                limit: limits.max_sparse_edges,
+            });
+        }
+        let requested_persistent =
+            inline_bytes
+                .checked_add(identity_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "requested identity allocation",
+                })?;
+        check_persistent_peak(requested_persistent, 0, limits)?;
+        let additional =
+            LENGTH_PREFIX_BYTES
+                .checked_add(bytes.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "identity reservation increment",
+                })?;
+        encoded
+            .try_reserve_exact(additional)
+            .map_err(|_| BuildError::AllocationFailed {
+                structure: "cache identity",
+                additional,
+            })?;
+        let observed_persistent =
+            inline_bytes
+                .checked_add(encoded.capacity())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed identity allocation",
+                })?;
+        check_persistent_peak(observed_persistent, 0, limits)?;
+
         max_pattern_bytes = max_pattern_bytes.max(bytes.len());
         if bytes.is_empty() {
             has_empty_pattern = true;
@@ -1281,27 +1376,23 @@ where
                 min_nonempty_pattern_bytes.map_or(bytes.len(), |old: usize| old.min(bytes.len())),
             );
         }
+        work.charge(LENGTH_PREFIX_BYTES)?;
+        let length = u64::try_from(bytes.len()).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "identity pattern length",
+        })?;
+        checked_extend(
+            &mut encoded,
+            &length.to_le_bytes(),
+            "identity length reservation",
+        )?;
+        work.charge(bytes.len())?;
+        checked_extend(&mut encoded, bytes, "identity byte reservation")?;
     }
     if count == 0 {
         return Err(BuildError::EmptyPatternSet);
     }
     check_pattern_representation(count, max_pattern_bytes)?;
-    let identity_bytes = LENGTH_PREFIX_BYTES
-        .checked_add(count.checked_mul(LENGTH_PREFIX_BYTES).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "identity length prefixes",
-            },
-        )?)
-        .and_then(|bytes| bytes.checked_add(pattern_bytes))
-        .ok_or(BuildError::ArithmeticOverflow {
-            computation: "identity bytes",
-        })?;
-    if identity_bytes > limits.max_identity_bytes {
-        return Err(BuildError::IdentityBytesLimit {
-            needed: identity_bytes,
-            limit: limits.max_identity_bytes,
-        });
-    }
+    let identity_bytes = encoded.len();
     let trie_states_upper_bound =
         pattern_bytes
             .checked_add(1)
@@ -1327,16 +1418,26 @@ where
             limit: limits.max_sparse_edges,
         });
     }
-    Ok(BuildPreflight {
-        patterns: count,
-        pattern_bytes,
-        identity_bytes,
-        trie_states_upper_bound,
-        sparse_edges_upper_bound,
-        max_pattern_bytes,
-        min_nonempty_pattern_bytes,
-        has_empty_pattern,
-    })
+    let count_prefix = u64::try_from(count)
+        .map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "identity pattern count",
+        })?
+        .to_le_bytes();
+    work.charge(LENGTH_PREFIX_BYTES)?;
+    encoded[..LENGTH_PREFIX_BYTES].copy_from_slice(&count_prefix);
+    Ok((
+        BuildPreflight {
+            patterns: count,
+            pattern_bytes,
+            identity_bytes,
+            trie_states_upper_bound,
+            sparse_edges_upper_bound,
+            max_pattern_bytes,
+            min_nonempty_pattern_bytes,
+            has_empty_pattern,
+        },
+        encoded,
+    ))
 }
 
 fn check_pattern_representation(count: usize, max_pattern_bytes: usize) -> Result<(), BuildError> {
@@ -1355,102 +1456,37 @@ fn check_pattern_representation(count: usize, max_pattern_bytes: usize) -> Resul
     Ok(())
 }
 
-fn encode_patterns<I, P>(
-    patterns: I,
-    expected: BuildPreflight,
-    encoded: &mut Vec<u8>,
-    work: &mut BuildWork,
-) -> Result<(), BuildError>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<[u8]>,
-{
-    work.charge(LENGTH_PREFIX_BYTES)?;
-    checked_extend(
-        encoded,
-        &u64::try_from(expected.patterns)
-            .map_err(|_| BuildError::ArithmeticOverflow {
-                computation: "identity pattern count",
-            })?
-            .to_le_bytes(),
-        "identity reservation",
-    )?;
-    let mut count = 0_usize;
-    let mut bytes_seen = 0_usize;
-    let mut max_pattern_bytes = 0_usize;
-    let mut min_nonempty_pattern_bytes = None;
-    let mut has_empty_pattern = false;
-    for pattern in patterns {
-        work.charge(1)?;
-        count = count.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
-            computation: "identity pattern count",
-        })?;
-        let bytes = pattern.as_ref();
-        max_pattern_bytes = max_pattern_bytes.max(bytes.len());
-        if bytes.is_empty() {
-            has_empty_pattern = true;
-        } else {
-            min_nonempty_pattern_bytes = Some(
-                min_nonempty_pattern_bytes.map_or(bytes.len(), |old: usize| old.min(bytes.len())),
-            );
-        }
-        work.charge(bytes.len())?;
-        bytes_seen = bytes_seen
-            .checked_add(bytes.len())
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "encoded pattern bytes",
-            })?;
-        let length = u64::try_from(bytes.len()).map_err(|_| BuildError::ArithmeticOverflow {
-            computation: "identity pattern length",
-        })?;
-        work.charge(LENGTH_PREFIX_BYTES)?;
-        checked_extend(encoded, &length.to_le_bytes(), "identity reservation")?;
-        checked_extend(encoded, bytes, "identity reservation")?;
-    }
-    if count != expected.patterns
-        || bytes_seen != expected.pattern_bytes
-        || max_pattern_bytes != expected.max_pattern_bytes
-        || min_nonempty_pattern_bytes != expected.min_nonempty_pattern_bytes
-        || has_empty_pattern != expected.has_empty_pattern
-        || encoded.len() != expected.identity_bytes
-    {
-        return Err(BuildError::InputChanged { pass: "identity" });
-    }
-    Ok(())
-}
-
-fn insert_patterns<I, P>(
-    patterns: I,
+fn insert_owned_patterns(
     expected: BuildPreflight,
     encoded: &[u8],
     nodes: &mut Vec<RawNode>,
     edges: &mut Vec<RawEdge>,
     work: &mut BuildWork,
-) -> Result<(), BuildError>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<[u8]>,
-{
+) -> Result<(), BuildError> {
     let mut count = 0_usize;
     let mut identity_offset = LENGTH_PREFIX_BYTES;
-    for pattern in patterns {
+    while count < expected.patterns {
         work.charge(1)?;
-        let bytes = pattern.as_ref();
         work.charge(LENGTH_PREFIX_BYTES)?;
         let length_end = identity_offset.checked_add(LENGTH_PREFIX_BYTES).ok_or(
             BuildError::ArithmeticOverflow {
                 computation: "identity validation length",
             },
         )?;
-        let stored_length = encoded
-            .get(identity_offset..length_end)
-            .ok_or(BuildError::InputChanged { pass: "trie" })?;
-        let stored_length = usize::try_from(u64::from_le_bytes(
-            stored_length
-                .try_into()
-                .map_err(|_| BuildError::InputChanged { pass: "trie" })?,
-        ))
-        .map_err(|_| BuildError::InputChanged { pass: "trie" })?;
+        let stored_length =
+            encoded
+                .get(identity_offset..length_end)
+                .ok_or(BuildError::InternalInvariant {
+                    detail: "owned identity contains every length prefix",
+                })?;
+        let stored_length = usize::try_from(u64::from_le_bytes(stored_length.try_into().map_err(
+            |_| BuildError::InternalInvariant {
+                detail: "owned identity length prefix has fixed width",
+            },
+        )?))
+        .map_err(|_| BuildError::InternalInvariant {
+            detail: "owned identity pattern length fits usize",
+        })?;
         identity_offset = length_end;
         let bytes_end =
             identity_offset
@@ -1458,18 +1494,12 @@ where
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "identity validation bytes",
                 })?;
-        let stored = encoded
-            .get(identity_offset..bytes_end)
-            .ok_or(BuildError::InputChanged { pass: "trie" })?;
-        if stored_length != bytes.len() {
-            return Err(BuildError::InputChanged { pass: "trie" });
-        }
-        for (&left, &right) in stored.iter().zip(bytes) {
-            work.charge(1)?;
-            if left != right {
-                return Err(BuildError::InputChanged { pass: "trie" });
-            }
-        }
+        let bytes =
+            encoded
+                .get(identity_offset..bytes_end)
+                .ok_or(BuildError::InternalInvariant {
+                    detail: "owned identity contains every pattern byte",
+                })?;
         identity_offset = bytes_end;
         let pattern_id = u32::try_from(count).map_err(|_| BuildError::RepresentationLimit {
             structure: "pattern identifiers",
@@ -1494,8 +1524,10 @@ where
             computation: "inserted pattern count",
         })?;
     }
-    if count != expected.patterns || identity_offset != encoded.len() {
-        return Err(BuildError::InputChanged { pass: "trie" });
+    if identity_offset != encoded.len() {
+        return Err(BuildError::InternalInvariant {
+            detail: "owned identity has no trailing bytes",
+        });
     }
     Ok(())
 }
@@ -1575,8 +1607,12 @@ fn build_failure_links(
         let child = edge_target(automaton.edges[edge_index]);
         enqueue(raw_nodes, &mut head, &mut tail, child);
     }
-    while let Some(state) = dequeue(raw_nodes, &mut head, &mut tail)? {
+    while head != UNSET {
         work.charge(1)?;
+        let state =
+            dequeue(raw_nodes, &mut head, &mut tail)?.ok_or(BuildError::InternalInvariant {
+                detail: "nonempty failure queue yields one state",
+            })?;
         let state_index = usize::try_from(state).expect("u32 state fits usize");
         let inherited = automaton.output
             [usize::try_from(automaton.failure[state_index]).expect("u32 state fits usize")];
@@ -1606,6 +1642,11 @@ fn build_failure_links(
             automaton.failure[usize::try_from(child).expect("u32 state fits usize")] = failure;
             enqueue(raw_nodes, &mut head, &mut tail, child);
         }
+    }
+    if tail != UNSET {
+        return Err(BuildError::InternalInvariant {
+            detail: "drained failure queue has consistent empty ends",
+        });
     }
     Ok(())
 }
@@ -2083,14 +2124,33 @@ mod tests {
     }
 
     #[test]
-    fn cloneable_borrowed_iterator_needs_no_nested_owned_pattern_vector() {
+    fn one_shot_input_is_consumed_once_into_the_retained_encoding() {
+        struct OneShot<'a> {
+            inner: core::slice::Iter<'a, &'a [u8]>,
+        }
+        impl<'a> Iterator for OneShot<'a> {
+            type Item = &'a [u8];
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.inner.next().copied()
+            }
+        }
+
         let patterns = [b"alpha".as_slice(), b"beta".as_slice(), b"a".as_slice()];
-        let iterable = patterns.iter().copied();
-        let count =
-            SparseOrderedLiteralCountPlan::build(iterable.clone(), BuildLimits::unlimited())
-                .unwrap();
-        let span =
-            SparseOrderedLiteralSpanSumPlan::build(iterable, BuildLimits::unlimited()).unwrap();
+        let count = SparseOrderedLiteralCountPlan::build(
+            OneShot {
+                inner: patterns.iter(),
+            },
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let span = SparseOrderedLiteralSpanSumPlan::build(
+            OneShot {
+                inner: patterns.iter(),
+            },
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
         assert_eq!(
             count
                 .count(b"alpha beta alpha", ReduceLimits::unlimited())
@@ -2104,6 +2164,76 @@ mod tests {
                 .span_sum,
             14
         );
+    }
+
+    #[test]
+    fn hand_calculated_sparse_build_and_reduce_work_are_exact_and_refuse_one_below() {
+        let patterns = [b"a".as_slice()];
+        // Owned encoding: 8-byte count prefix written twice, one pattern
+        // visit, one 8-byte length prefix and one byte copy = 26. Trie/CSR:
+        // root 1, insertion 13, two output nodes 2, CSR nodes/edge 3,
+        // failure root/state 2, and two degree scans 2, for 49 total.
+        const BUILD_WORK: u64 = 49;
+        let exact_build = BuildLimits {
+            max_patterns: 1,
+            max_pattern_bytes: 1,
+            max_identity_bytes: 17,
+            max_trie_states: 2,
+            max_sparse_edges: 1,
+            max_build_work: BUILD_WORK,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+        let plan = SparseOrderedLiteralCountPlan::build(patterns, exact_build).unwrap();
+        assert_eq!(plan.build_accounting().build_work, BUILD_WORK);
+        assert!(matches!(
+            SparseOrderedLiteralCountPlan::build(
+                patterns,
+                BuildLimits {
+                    max_build_work: BUILD_WORK - 1,
+                    ..exact_build
+                }
+            ),
+            Err(BuildError::WorkLimit {
+                needed: BUILD_WORK,
+                limit
+            }) if limit == BUILD_WORK - 1
+        ));
+
+        // One input byte admits 1 transition, 2 edge lookups/comparisons,
+        // 1 failure step, 2 reducer positions and 2 ring initializations.
+        const REDUCE_WORK: u64 = 10;
+        let exact_reduce = ReduceLimits {
+            max_transitions: 1,
+            max_edge_lookups: 2,
+            max_edge_search_checks: 2,
+            max_failure_steps: 1,
+            max_match_events: 1,
+            max_count: 1,
+            max_span_sum: 1,
+            max_reducer_steps: 2,
+            max_ring_initializations: 2,
+            max_total_work: REDUCE_WORK,
+            max_scratch_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+        let result = plan.count(b"a", exact_reduce).unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.accounting.upper_bounds.total_work, REDUCE_WORK);
+        assert!(matches!(
+            plan.count(
+                b"a",
+                ReduceLimits {
+                    max_total_work: REDUCE_WORK - 1,
+                    ..exact_reduce
+                }
+            ),
+            Err(ReduceError::TotalWorkLimit {
+                needed: REDUCE_WORK,
+                limit
+            }) if limit == REDUCE_WORK - 1
+        ));
     }
 
     fn generated_patterns(count: usize) -> Vec<[u8; 8]> {

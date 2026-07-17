@@ -278,9 +278,10 @@ impl CompileBudget {
             self.limits.max_temporary_states,
             Resource::TemporaryStates,
         )?;
+        self.charge(1)?;
         self.current_temporary_states = current;
         self.accounting.temporary_states_peak = self.accounting.temporary_states_peak.max(current);
-        self.charge(1)
+        Ok(())
     }
 
     fn release_states(&mut self, count: usize) -> Result<(), Error> {
@@ -864,14 +865,16 @@ impl<'a> Builder<'a> {
             self.budget.charge(class.ranges().len())?;
             let mut next_by_width = [continuation; 4];
             let mut tail = continuation;
-            let mut continuation_bytes = ByteSet::empty();
-            continuation_bytes.insert_range(0x80, 0xBF);
             let maximum_width = class
                 .ranges()
                 .last()
                 .map_or(0, |range| range.end().len_utf8());
-            for slot in next_by_width.iter_mut().take(maximum_width).skip(1) {
+            let mut continuation_bytes = ByteSet::empty();
+            if maximum_width > 1 {
                 self.budget.charge(inclusive_byte_width(0x80, 0xBF)?)?;
+                continuation_bytes.insert_range(0x80, 0xBF);
+            }
+            for slot in next_by_width.iter_mut().take(maximum_width).skip(1) {
                 tail = self.push(Inst::Consume {
                     bytes: continuation_bytes,
                     next: tail,
@@ -1411,7 +1414,7 @@ fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use regex_syntax::hir::Look;
+    use regex_syntax::{ParserBuilder, hir::Look};
 
     use super::*;
 
@@ -1458,6 +1461,93 @@ mod tests {
             max_work,
             ..CompileLimits::default()
         })
+    }
+
+    fn four_range_unicode_class() -> Hir {
+        ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(r"[\u{100}\u{102}\u{104}\u{106}-\u{107}]")
+            .unwrap()
+    }
+
+    fn ascii_unicode_class() -> Hir {
+        ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse("[a-z]")
+            .unwrap()
+    }
+
+    #[test]
+    fn scalar_construction_charges_ranges_and_one_continuation_set_exactly() {
+        // Four canonical-range copies, 64 continuation-byte insertions, one
+        // two-byte continuation state and one scalar state: 4 + 64 + 1 + 1.
+        const EXACT_WORK: usize = 70;
+        let hir = four_range_unicode_class();
+        let HirKind::Class(Class::Unicode(class)) = hir.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+
+        let mut exact = CompileBudget::new(CompileLimits {
+            max_work: EXACT_WORK,
+            ..CompileLimits::default()
+        });
+        {
+            let mut builder = Builder::new(
+                CompileLimits::default().max_program_states,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CapturePolicy::Reject,
+                &mut exact,
+            );
+            builder.compile_unicode_class(class, 0).unwrap();
+            assert_eq!(builder.slots.len(), 2);
+        }
+        assert_eq!(exact.accounting.work, EXACT_WORK);
+
+        let mut one_below = CompileBudget::new(CompileLimits {
+            max_work: EXACT_WORK - 1,
+            ..CompileLimits::default()
+        });
+        let error = Builder::new(
+            CompileLimits::default().max_program_states,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CapturePolicy::Reject,
+            &mut one_below,
+        )
+        .compile_unicode_class(class, 0)
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: EXACT_WORK - 1,
+            }
+        );
+        assert_eq!(one_below.accounting.work, EXACT_WORK - 1);
+        assert_eq!(one_below.current_temporary_states, 1);
+
+        // A one-byte class never constructs the unused continuation set.
+        let ascii = ascii_unicode_class();
+        let HirKind::Class(Class::Unicode(ascii)) = ascii.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+        let mut ascii_budget = CompileBudget::new(CompileLimits {
+            max_work: 2,
+            ..CompileLimits::default()
+        });
+        Builder::new(
+            CompileLimits::default().max_program_states,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CapturePolicy::Reject,
+            &mut ascii_budget,
+        )
+        .compile_unicode_class(ascii, 0)
+        .unwrap();
+        assert_eq!(ascii_budget.accounting.work, 2);
     }
 
     #[test]

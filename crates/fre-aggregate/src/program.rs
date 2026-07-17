@@ -109,9 +109,7 @@ impl ScalarSet {
     }
 
     pub(crate) fn max_search_checks(&self) -> usize {
-        usize::try_from(self.0.len().ilog2())
-            .unwrap_or(usize::MAX)
-            .saturating_add(1)
+        scalar_search_comparison_bound(self.0.len()).0
     }
 
     pub(crate) fn contains_with<E>(
@@ -128,7 +126,10 @@ impl ScalarSet {
             let range = self.0[middle];
             if scalar < range.start {
                 upper = middle;
-            } else if scalar > range.end {
+                continue;
+            }
+            charge()?;
+            if scalar > range.end {
                 lower = middle.saturating_add(1);
             } else {
                 return Ok(true);
@@ -139,6 +140,91 @@ impl ScalarSet {
 
     pub(crate) fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.0.iter().map(|range| (range.start, range.end))
+    }
+}
+
+/// Return the exact worst-case number of scalar comparisons for a binary
+/// search over `ranges`, together with the bound for `ranges - 1`.
+///
+/// A left branch performs only `scalar < start`; a match or right branch also
+/// performs `scalar > end`. Computing both adjacent bounds lets the recurrence
+/// run in logarithmic time without allocating a table.
+fn scalar_search_comparison_bound(ranges: usize) -> (usize, usize) {
+    if ranges == 0 {
+        return (0, 0);
+    }
+    if ranges == 1 {
+        return (2, 0);
+    }
+    let half = ranges / 2;
+    let (half_bound, preceding_bound) = scalar_search_comparison_bound(half);
+    if ranges % 2 == 0 {
+        (
+            half_bound
+                .saturating_add(1)
+                .max(preceding_bound.saturating_add(2)),
+            preceding_bound.saturating_add(2),
+        )
+    } else {
+        (
+            half_bound.saturating_add(2),
+            half_bound
+                .saturating_add(1)
+                .max(preceding_bound.saturating_add(2)),
+        )
+    }
+}
+
+#[cfg(test)]
+mod scalar_search_tests {
+    use super::{ScalarRange, ScalarSet, scalar_search_comparison_bound};
+
+    fn four_singletons() -> ScalarSet {
+        ScalarSet(
+            ['a', 'c', 'e', 'g']
+                .map(|scalar| ScalarRange::new(scalar, scalar).unwrap())
+                .into(),
+        )
+    }
+
+    #[test]
+    fn comparison_bound_is_exact_for_hand_calculated_search_trees() {
+        // Each value is the longest weighted path in the lower-midpoint tree:
+        // a left edge costs one comparison and a match/right edge costs two.
+        let expected = [0, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8];
+        for (ranges, comparisons) in expected.into_iter().enumerate() {
+            assert_eq!(
+                scalar_search_comparison_bound(ranges).0,
+                comparisons,
+                "ranges={ranges}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_scalar_comparison_is_charged_before_exact_and_one_below() {
+        let ranges = four_singletons();
+        assert_eq!(ranges.max_search_checks(), 4);
+
+        let mut exact_remaining = 4_usize;
+        assert_eq!(
+            ranges.contains_with('b', || {
+                exact_remaining = exact_remaining.checked_sub(1).ok_or(())?;
+                Ok(())
+            }),
+            Ok(false)
+        );
+        assert_eq!(exact_remaining, 0);
+
+        let mut one_below_remaining = 3_usize;
+        assert_eq!(
+            ranges.contains_with('b', || {
+                one_below_remaining = one_below_remaining.checked_sub(1).ok_or(())?;
+                Ok(())
+            }),
+            Err(())
+        );
+        assert_eq!(one_below_remaining, 0);
     }
 }
 
