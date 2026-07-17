@@ -1071,8 +1071,15 @@ pub struct PortableFindIterAccounting {
     /// progress, according to the facade.
     pub suppressed_empty: usize,
     /// Sum of charged work or conservative linear terms from successful
-    /// contextual searches.
+    /// contextual searches and UTF-8 empty-match progress.
     pub work_or_linear_terms: u64,
+    /// Exact byte classifications performed while advancing a text iterator
+    /// to the next UTF-8 scalar boundary after a repeated empty match.
+    pub utf8_progress_byte_probes: u64,
+    /// Exact charged work for UTF-8 empty-match progress: one initial offset
+    /// increment, one term per byte classification, and one term per
+    /// continuation-byte increment.
+    pub utf8_progress_work: u64,
 }
 
 /// Checked terminal failure from complete portable match iteration.
@@ -3370,6 +3377,36 @@ impl PortableMatches<'_, '_> {
             .ok_or(PortableFindIterError::AccountingOverflow { counter: "work" })?;
         Ok(())
     }
+
+    fn record_utf8_progress(
+        &mut self,
+        byte_probes: u64,
+        work: u64,
+    ) -> Result<(), PortableFindIterError> {
+        let next_byte_probes = self
+            .accounting
+            .utf8_progress_byte_probes
+            .checked_add(byte_probes)
+            .ok_or(PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-byte-probe",
+            })?;
+        let next_work = self
+            .accounting
+            .work_or_linear_terms
+            .checked_add(work)
+            .ok_or(PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-work",
+            })?;
+        let next_progress_work = self.accounting.utf8_progress_work.checked_add(work).ok_or(
+            PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-work",
+            },
+        )?;
+        self.accounting.utf8_progress_byte_probes = next_byte_probes;
+        self.accounting.work_or_linear_terms = next_work;
+        self.accounting.utf8_progress_work = next_progress_work;
+        Ok(())
+    }
 }
 
 impl Iterator for PortableMatches<'_, '_> {
@@ -3413,12 +3450,50 @@ impl Iterator for PortableMatches<'_, '_> {
                     EmptyMatchProgress::Utf8Scalar => {
                         // This mode is constructed only from `&str`. Starting
                         // at a scalar boundary, skip its UTF-8 continuation
-                        // bytes to reach the next scalar boundary.
+                        // bytes to reach the next scalar boundary. Charge the
+                        // initial increment, every byte classification, and
+                        // every continuation-byte increment.
                         let mut next = self.start.saturating_add(1);
-                        while next < self.haystack.len()
-                            && (self.haystack[next] & 0b1100_0000) == 0b1000_0000
-                        {
+                        let mut byte_probes = 0_u64;
+                        let mut progress_work = 1_u64;
+                        while next < self.haystack.len() {
+                            byte_probes = match byte_probes.checked_add(1) {
+                                Some(value) => value,
+                                None => {
+                                    return Some(self.fail(
+                                        PortableFindIterError::AccountingOverflow {
+                                            counter: "utf8-progress-byte-probe",
+                                        },
+                                    ));
+                                }
+                            };
+                            progress_work = match progress_work.checked_add(1) {
+                                Some(value) => value,
+                                None => {
+                                    return Some(self.fail(
+                                        PortableFindIterError::AccountingOverflow {
+                                            counter: "utf8-progress-work",
+                                        },
+                                    ));
+                                }
+                            };
+                            if (self.haystack[next] & 0b1100_0000) != 0b1000_0000 {
+                                break;
+                            }
+                            progress_work = match progress_work.checked_add(1) {
+                                Some(value) => value,
+                                None => {
+                                    return Some(self.fail(
+                                        PortableFindIterError::AccountingOverflow {
+                                            counter: "utf8-progress-work",
+                                        },
+                                    ));
+                                }
+                            };
                             next = next.saturating_add(1);
+                        }
+                        if let Err(error) = self.record_utf8_progress(byte_probes, progress_work) {
+                            return Some(self.fail(error));
                         }
                         next
                     }
@@ -3557,10 +3632,58 @@ fn forward_anchored_limits(limits: SearchLimits) -> ForwardAnchoredSearchLimits 
 mod tests {
     use super::{
         BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
-        PortableRegex, SearchAccounting, SearchError, SearchLimits, SearchWindow,
+        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits, PortableRegex,
+        SearchAccounting, SearchError, SearchLimits, SearchWindow,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
+
+    #[test]
+    fn utf8_progress_accounting_overflow_is_atomic() {
+        let regex = PortableBuilder::new("").build().unwrap();
+        let mut iterator = regex
+            .find_iter_utf8("é", PortableFindIterLimits::unlimited())
+            .unwrap();
+
+        iterator.accounting = PortableFindIterAccounting {
+            work_or_linear_terms: u64::MAX,
+            ..PortableFindIterAccounting::default()
+        };
+        let before = iterator.accounting;
+        assert_eq!(
+            iterator.record_utf8_progress(1, 1),
+            Err(PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-work",
+            })
+        );
+        assert_eq!(iterator.accounting, before);
+
+        iterator.accounting = PortableFindIterAccounting {
+            utf8_progress_work: u64::MAX,
+            ..PortableFindIterAccounting::default()
+        };
+        let before = iterator.accounting;
+        assert_eq!(
+            iterator.record_utf8_progress(1, 1),
+            Err(PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-work",
+            })
+        );
+        assert_eq!(iterator.accounting, before);
+
+        iterator.accounting = PortableFindIterAccounting {
+            utf8_progress_byte_probes: u64::MAX,
+            ..PortableFindIterAccounting::default()
+        };
+        let before = iterator.accounting;
+        assert_eq!(
+            iterator.record_utf8_progress(1, 1),
+            Err(PortableFindIterError::AccountingOverflow {
+                counter: "utf8-progress-byte-probe",
+            })
+        );
+        assert_eq!(iterator.accounting, before);
+    }
 
     #[test]
     fn facade_exposes_only_the_certified_byte_path() {

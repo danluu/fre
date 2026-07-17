@@ -32,6 +32,7 @@ fn text_find_iter_matches_pinned_upstream_across_portable_plans() {
         "zababx",
         "xxfoobaz-alphaZ-Sherlock",
         " αβ ab 雪_42 ",
+        "é\n€\n",
     ];
 
     for (fre, upstream, expected_plan) in differential_cases() {
@@ -96,6 +97,23 @@ fn empty_text_iteration_uses_scalar_progress_and_exact_terminal_limits() {
     assert_eq!(unlimited.accounting().matches, 3);
     assert_eq!(unlimited.accounting().suppressed_empty, 3);
     assert_eq!(unlimited.accounting().search_calls, 6);
+    assert_eq!(unlimited.accounting().utf8_progress_byte_probes, 4);
+    assert_eq!(unlimited.accounting().utf8_progress_work, 9);
+    assert!(unlimited.accounting().work_or_linear_terms >= 9);
+
+    let exact_limits = PortableFindIterLimits {
+        max_search_calls: unlimited.accounting().search_calls,
+        ..PortableFindIterLimits::unlimited()
+    };
+    let exact = fre
+        .find_iter(haystack, exact_limits)
+        .expect("exact-limit text iterator")
+        .map(|matched| {
+            let matched = matched.expect("exact-limit text match");
+            (matched.start(), matched.end())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exact, expected);
 
     let limits = PortableFindIterLimits {
         max_search_calls: unlimited.accounting().search_calls - 1,
@@ -123,6 +141,30 @@ fn empty_text_iteration_uses_scalar_progress_and_exact_terminal_limits() {
     assert!(limited.next().is_none(), "terminal refusal must fuse");
 }
 
+#[test]
+fn empty_text_iteration_charges_two_and_three_byte_scalar_progress() {
+    let haystack = "é€a";
+    let fre = PortableTextBuilder::new("")
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("portable empty text regex");
+    let mut iterator = fre
+        .find_iter(haystack, PortableFindIterLimits::unlimited())
+        .expect("text iterator");
+    let actual = iterator
+        .by_ref()
+        .map(|found| {
+            let found = found.expect("text match");
+            (found.start(), found.end())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![(0, 0), (2, 2), (5, 5), (6, 6)]);
+    assert_eq!(iterator.accounting().suppressed_empty, 4);
+    assert_eq!(iterator.accounting().utf8_progress_byte_probes, 5);
+    assert_eq!(iterator.accounting().utf8_progress_work, 11);
+    assert!(iterator.accounting().work_or_linear_terms >= 11);
+}
+
 fn differential_cases() -> Vec<(PortableTextRegex, regex::Regex, PlanKind)> {
     let dfa_limits = BuildLimits {
         packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
@@ -142,9 +184,39 @@ fn differential_cases() -> Vec<(PortableTextRegex, regex::Regex, PlanKind)> {
             regex::Regex::new("foobar|foobaz|fooquux").expect("pinned literal-set DFA"),
             PlanKind::LiteralSetDfa,
         ),
+        ascii_case(
+            "[a-z]+Z",
+            PlanKind::RequiredLiteral,
+            PlanSelection::ForceRequiredLiteral,
+        ),
+        ascii_case(
+            r"\A[a-z]+Z",
+            PlanKind::ForwardAnchored,
+            PlanSelection::ForceForwardAnchored,
+        ),
         case("(?:ab)+", PlanKind::K0, PlanSelection::ForceK0),
+        case("(?m)^", PlanKind::K0, PlanSelection::ForceK0),
         case(r"\b\w{2,}\b", PlanKind::UnicodeWordRun, PlanSelection::Auto),
     ]
+}
+
+fn ascii_case(
+    pattern: &str,
+    expected_plan: PlanKind,
+    selection: PlanSelection,
+) -> (PortableTextRegex, regex::Regex, PlanKind) {
+    (
+        PortableTextBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(selection)
+            .build()
+            .unwrap_or_else(|error| panic!("portable build failed for {pattern:?}: {error}")),
+        regex::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned build failed for {pattern:?}: {error}")),
+        expected_plan,
+    )
 }
 
 fn case(
