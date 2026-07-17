@@ -4025,10 +4025,7 @@ fn fre_aggregate_many_count(
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
-    Ok(FreReduction {
-        actual,
-        plan,
-    })
+    Ok(FreReduction { actual, plan })
 }
 
 fn fre_aggregate_many_compile(
@@ -4088,19 +4085,15 @@ fn fre_aggregate_many_span_sum(
     let actual = regex
         .span_sum_value(request.haystack, operation_limits)
         .map_err(|error| {
-            let message = format!(
-                "FRE ordered build-many value-only span-sum refused execution: {error}"
-            );
+            let message =
+                format!("FRE ordered build-many value-only span-sum refused execution: {error}");
             aggregate_many_execution_error(&error.source, message)
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
-    Ok(FreReduction {
-        actual,
-        plan,
-    })
+    Ok(FreReduction { actual, plan })
 }
 
 enum TimedFreAggregate {
