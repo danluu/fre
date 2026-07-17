@@ -432,6 +432,39 @@ fn unicode_word_utf8_validation_is_prospectively_charged() {
         );
     }
 
+    let observed = regex
+        .admit_spans_observed(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let observed_work = observed.accounting().work;
+    regex
+        .admit_spans_observed(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: observed_work,
+                ..OperationLimits::default()
+            },
+        )
+        .unwrap();
+    expect_resource(
+        regex.admit_spans_observed(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: observed_work - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::ExecutionWork,
+    );
+
     let invalid = [b'a', 0xFF, b'b', b'c'];
     expect_exact_resource(
         regex.admit_count(
