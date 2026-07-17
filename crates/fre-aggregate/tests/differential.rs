@@ -511,6 +511,74 @@ fn unicode_word_utf8_validation_is_prospectively_charged() {
 }
 
 #[test]
+fn unicode_word_subranges_charge_full_haystack_with_range_precedence() {
+    let regex = compile_unicode_byte_stable(r"\b[a-z]+\b").unwrap();
+    let haystack = b"!!alpha??";
+    let report = regex
+        .admit_count(
+            haystack,
+            2..7,
+            Strategy::FullTable,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(report.accounting().utf8_validation_work, haystack.len());
+    assert!(report.accounting().sequential_bytes_read >= haystack.len());
+    expect_exact_resource(
+        regex.admit_count(
+            haystack,
+            2..7,
+            Strategy::FullTable,
+            OperationLimits {
+                max_work: haystack.len() - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::ExecutionWork,
+        haystack.len(),
+        haystack.len() - 1,
+    );
+    expect_exact_resource(
+        regex.admit_count(
+            haystack,
+            2..7,
+            Strategy::FullTable,
+            OperationLimits {
+                max_sequential_bytes: haystack.len() - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::SequentialBytes,
+        haystack.len(),
+        haystack.len() - 1,
+    );
+
+    let invalid_outside = [0xFF, b'a', b'b'];
+    assert!(matches!(
+        regex.admit_count(
+            &invalid_outside,
+            1..3,
+            Strategy::FullTable,
+            OperationLimits::default(),
+        ),
+        Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+    ));
+    assert!(matches!(
+        regex.admit_count(
+            &invalid_outside,
+            3..2,
+            Strategy::FullTable,
+            OperationLimits::default(),
+        ),
+        Err(Error::InvalidRange {
+            start: 3,
+            end: 2,
+            haystack_len: 3,
+        })
+    ));
+}
+
+#[test]
 fn directed_nested_nullable_priority_and_invalid_bytes_match_rust_1_12_4() {
     let patterns = [
         "",

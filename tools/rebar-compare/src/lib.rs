@@ -2972,9 +2972,22 @@ impl CaptureSelectorLedger {
         haystack_len: usize,
         limits: &RunLimits,
     ) -> Result<Self, ExecutionError> {
-        let mut ledger = Self::default();
-        ledger.charge(haystack_len, 0, haystack_len, limits)?;
-        Ok(ledger)
+        if haystack_len > limits.fre_aggregate_operation_work {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures LF scan requires {haystack_len} work, limit is {}",
+                limits.fre_aggregate_operation_work
+            )));
+        }
+        if haystack_len > limits.fre_aggregate_sequential_bytes {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures LF scan requires {haystack_len} sequential bytes, limit is {}",
+                limits.fre_aggregate_sequential_bytes
+            )));
+        }
+        Ok(Self {
+            work: haystack_len,
+            sequential_bytes: haystack_len,
+        })
     }
 
     fn remaining(self, limits: &RunLimits) -> Result<(usize, usize), ExecutionError> {
@@ -3007,7 +3020,7 @@ impl CaptureSelectorLedger {
         if self.work > limits.fre_aggregate_operation_work
             || self.sequential_bytes > limits.fre_aggregate_sequential_bytes
         {
-            return Err(ExecutionError::unsupported(
+            return Err(ExecutionError::fault(
                 "FRE selector exceeded its cumulative public-operation ledger",
             ));
         }
@@ -6621,7 +6634,7 @@ mod tests {
         assert_eq!(work.remaining(&limits).expect("remaining ledger"), (4, 11));
         assert_eq!(
             work.charge(5, 0, 0, &limits).unwrap_err().status,
-            Status::Unsupported
+            Status::Fault
         );
 
         let mut sequential = CaptureSelectorLedger::default();
@@ -6630,7 +6643,7 @@ mod tests {
             .expect("first sequential line");
         assert_eq!(
             sequential.charge(1, 2, 2, &limits).unwrap_err().status,
-            Status::Unsupported
+            Status::Fault
         );
     }
 
@@ -6655,13 +6668,22 @@ mod tests {
             fre_aggregate_sequential_bytes: bytes,
             ..RunLimits::default()
         };
-        assert!(CaptureSelectorLedger::preflight_lf_scan(bytes, &work_one_below).is_err());
+        let work = CaptureSelectorLedger::preflight_lf_scan(bytes, &work_one_below).unwrap_err();
+        assert_eq!(work.status, Status::Unsupported);
+        assert!(work.message.contains("requires 4096 work, limit is 4095"));
         let sequential_one_below = RunLimits {
             fre_aggregate_operation_work: bytes,
             fre_aggregate_sequential_bytes: bytes - 1,
             ..RunLimits::default()
         };
-        assert!(CaptureSelectorLedger::preflight_lf_scan(bytes, &sequential_one_below).is_err());
+        let sequential =
+            CaptureSelectorLedger::preflight_lf_scan(bytes, &sequential_one_below).unwrap_err();
+        assert_eq!(sequential.status, Status::Unsupported);
+        assert!(
+            sequential
+                .message
+                .contains("requires 4096 sequential bytes, limit is 4095")
+        );
 
         let regex = capture_regex_one("(a)", false, false, &RunLimits::default())
             .expect("uniform capture fixture");
@@ -6677,7 +6699,7 @@ mod tests {
             };
             let work = execute_grep_captures(&regex, haystack, &work_one_below).unwrap_err();
             assert_eq!(work.status, Status::Unsupported);
-            assert!(work.message.contains("cumulative public-operation ledger"));
+            assert!(work.message.contains("LF scan requires 8 work, limit is 7"));
             let sequential_one_below = RunLimits {
                 fre_aggregate_operation_work: haystack.len(),
                 fre_aggregate_sequential_bytes: haystack.len() - 1,
@@ -6689,7 +6711,7 @@ mod tests {
             assert!(
                 sequential
                     .message
-                    .contains("cumulative public-operation ledger")
+                    .contains("LF scan requires 8 sequential bytes, limit is 7")
             );
         }
 
@@ -6698,20 +6720,33 @@ mod tests {
     #[test]
     fn scalar_capture_grep_lf_scan_shares_one_work_cap() {
         let defaults = RunLimits::default();
-        let patterns = [r"(\pL)".to_string()];
+        let patterns = [r"(\pL{2})|(\pL{1})".to_string()];
+        let selected = fre_reducer(
+            CandidateRequest {
+                job_id: "test/scalar-grep-plan",
+                model: "grep-captures",
+                patterns: &patterns,
+                haystack: b"aa",
+                unicode: true,
+                case_insensitive: false,
+            },
+            &defaults,
+        )
+        .expect("scalar capture plan");
+        assert_eq!(selected.plan, CURRENT_FRE_CAPTURE_SCALAR_PLAN);
         let (regex, participating) = uniform_capture_scalar_regex(
             CandidateRequest {
                 job_id: "test/scalar-grep-line-preflight",
                 model: "grep-captures",
                 patterns: &patterns,
-                haystack: b"a",
+                haystack: b"aa",
                 unicode: true,
                 case_insensitive: false,
             },
             &defaults,
         )
         .expect("scalar capture fixture");
-        let groups = u64::try_from(participating + 1).unwrap();
+        assert_eq!(participating, 1);
 
         for bytes in [64, 128, 256] {
             let no_lines = vec![b'a'; bytes];
@@ -6729,12 +6764,7 @@ mod tests {
                     fre_aggregate_sequential_bytes: bytes,
                     ..RunLimits::default()
                 };
-                let expected = u64::try_from(
-                    haystack.iter().filter(|&&byte| byte == b'a').count(),
-                )
-                .unwrap()
-                .checked_mul(groups)
-                .unwrap();
+                let expected = u64::try_from(bytes).unwrap();
                 assert_eq!(
                     execute_uniform_capture_scalar(
                         &regex,
