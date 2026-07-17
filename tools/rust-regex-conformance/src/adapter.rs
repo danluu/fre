@@ -1130,8 +1130,10 @@ fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterD
                 "compile.unexpected-rejection",
             );
         }
-        TextCaptureBuildAttempt::Unsupported(disposition)
-        | TextCaptureBuildAttempt::Fault(disposition) => return disposition,
+        TextCaptureBuildAttempt::Unsupported(disposition) => {
+            return execute_capture_free_text_captures(case, input, &expected, disposition);
+        }
+        TextCaptureBuildAttempt::Fault(disposition) => return disposition,
     };
     let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
         return fault("adapter.text-haystack-invalid-utf8");
@@ -1149,6 +1151,49 @@ fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterD
         observed.truncate(limit);
     }
     compare(&expected, &SemanticValue::Captures(observed))
+}
+
+/// Execute the complete capture surface through the ordinary text matcher
+/// only when three independent build facts prove that group zero is the sole
+/// capture slot. This avoids constructing the persistent-history engine for
+/// capture-free patterns whose large counted repetition or Unicode class is
+/// outside that engine's intentionally smaller resource envelope.
+fn execute_capture_free_text_captures(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    expected: &SemanticValue,
+    original: AdapterDisposition,
+) -> AdapterDisposition {
+    let regex = match build_text(case, input) {
+        TextBuildAttempt::Built(regex) => regex,
+        TextBuildAttempt::Rejected
+        | TextBuildAttempt::Unsupported(_)
+        | TextBuildAttempt::Fault(_) => return original,
+    };
+    let report = regex.build_report();
+    if report.text_syntax.captures != 0
+        || report.bytes_syntax.captures != 0
+        || report.portable.captures_len != 1
+    {
+        return original;
+    }
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    let Ok(spans) = collect_text_matches(&regex, haystack, case.match_limit) else {
+        return unsupported(
+            CapabilityId::CaptureIteration,
+            "search.text-capture-free-execution-refused",
+        );
+    };
+    let observed = spans
+        .into_iter()
+        .map(|span| ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(span)],
+        })
+        .collect();
+    compare(expected, &SemanticValue::Captures(observed))
 }
 
 fn build_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> TextCaptureBuildAttempt {
@@ -1823,6 +1868,68 @@ mod tests {
         assert!(matches!(
             execute_case(AdapterSurface::RustTextCapturesIter, &case, &input),
             AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn capture_free_fallback_executes_expensive_group_zero_cases_only() {
+        let mut case = fixture_case(true, true, None);
+        case.unicode = true;
+        case.maximum_expected_capture_slots = 1;
+
+        let mut counted = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 0, end: 1 })],
+        }]);
+        counted.patterns = vec![r"^.{1,2500}".to_owned()];
+        counted.haystack = b"a".to_vec();
+        counted.bounds.end = counted.haystack.len();
+        assert!(matches!(
+            build_text_captures(&case, &counted),
+            TextCaptureBuildAttempt::Unsupported(_)
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCapturesIter, &case, &counted),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut unicode = fixture_input(
+            [0_usize, 50, 100]
+                .into_iter()
+                .map(|start| ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![Some(ExpectedSpan {
+                        start,
+                        end: start + 50,
+                    })],
+                })
+                .collect(),
+        );
+        unicode.patterns = vec![r"\pL{50}".to_owned()];
+        unicode.haystack = b"abcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyabcdefghijklmnopqrstuvwxyZZ".to_vec();
+        unicode.bounds.end = unicode.haystack.len();
+        assert!(matches!(
+            build_text_captures(&case, &unicode),
+            TextCaptureBuildAttempt::Unsupported(_)
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCapturesIter, &case, &unicode),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut explicit = counted;
+        explicit.patterns = vec![r"(.{1,2500})".to_owned()];
+        explicit.expected[0]
+            .groups
+            .push(Some(ExpectedSpan { start: 0, end: 1 }));
+        case.maximum_expected_capture_slots = 2;
+        assert!(matches!(
+            build_text_captures(&case, &explicit),
+            TextCaptureBuildAttempt::Unsupported(_)
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCapturesIter, &case, &explicit),
+            AdapterDisposition::Unsupported { .. }
         ));
     }
 
