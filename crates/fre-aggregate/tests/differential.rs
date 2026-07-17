@@ -17,6 +17,7 @@ use regex_syntax::hir::{Hir, Look};
 
 const STRATEGIES: [Strategy; 2] = [Strategy::FullTable, Strategy::ReverseSequentialRows];
 type LimitMutation = fn(&mut CompileLimits);
+type OperationLimitMutation = fn(&mut OperationLimits) -> usize;
 
 fn parse(pattern: &str) -> Hir {
     regex_syntax::ParserBuilder::new()
@@ -1713,13 +1714,17 @@ fn equal_width_reverse_rows_keep_split_decisions() {
     assert!(rows.accounting().replay_steps > 0);
 }
 
-#[test]
-fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
+fn sparse_endpoint_pattern() -> String {
     let fillers = (1..=40)
         .map(|length| format!(r"z{{{length}}}"))
         .collect::<Vec<_>>()
         .join("|");
-    let pattern = format!(r"(?:ab|a|\xFFa|\xFF||{fillers})");
+    format!(r"(?:ab|a|\xFFa|\xFF||{fillers})")
+}
+
+#[test]
+fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
+    let pattern = sparse_endpoint_pattern();
     let haystack = b"ab\xFFa\xFFx";
     let expected = upstream(&pattern, haystack);
     let full = compile(&pattern)
@@ -1773,7 +1778,21 @@ fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
             + accounting.replay_steps
             + accounting.successful_paths
     );
+}
 
+#[test]
+fn reachable_endpoint_exact_limits_succeed_and_one_below_refuses() {
+    let pattern = sparse_endpoint_pattern();
+    let haystack = b"ab\xFFa\xFFx";
+    let regex = compile(&pattern);
+    let rows = regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
     let certificate = rows.certificate();
     let exact = OperationLimits {
         max_boundaries: certificate.boundaries,
@@ -1798,59 +1817,43 @@ fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
         )
         .unwrap();
 
-    let mut below_log = exact;
-    below_log.max_log_bytes -= 1;
-    expect_exact_resource(
-        regex.admit_spans(
-            haystack,
-            0..haystack.len(),
-            Strategy::ReverseSequentialRows,
-            below_log,
+    let cases: [(Resource, usize, OperationLimitMutation); 4] = [
+        (Resource::LogBytes, exact.max_log_bytes, |limits| {
+            limits.max_log_bytes -= 1;
+            limits.max_log_bytes
+        }),
+        (
+            Resource::SequentialBytes,
+            exact.max_sequential_bytes,
+            |limits| {
+                limits.max_sequential_bytes -= 1;
+                limits.max_sequential_bytes
+            },
         ),
-        Resource::LogBytes,
-        exact.max_log_bytes,
-        below_log.max_log_bytes,
-    );
-    let mut below_sequential = exact;
-    below_sequential.max_sequential_bytes -= 1;
-    expect_exact_resource(
-        regex.admit_spans(
-            haystack,
-            0..haystack.len(),
-            Strategy::ReverseSequentialRows,
-            below_sequential,
-        ),
-        Resource::SequentialBytes,
-        exact.max_sequential_bytes,
-        below_sequential.max_sequential_bytes,
-    );
-
-    let mut below_work = exact;
-    below_work.max_work -= 1;
-    expect_exact_resource(
-        regex.admit_spans(
-            haystack,
-            0..haystack.len(),
-            Strategy::ReverseSequentialRows,
-            below_work,
-        ),
-        Resource::ExecutionWork,
-        exact.max_work,
-        below_work.max_work,
-    );
-    let mut below_peak = exact;
-    below_peak.max_peak_bytes -= 1;
-    expect_exact_resource(
-        regex.admit_spans(
-            haystack,
-            0..haystack.len(),
-            Strategy::ReverseSequentialRows,
-            below_peak,
-        ),
-        Resource::PeakBytes,
-        exact.max_peak_bytes,
-        below_peak.max_peak_bytes,
-    );
+        (Resource::ExecutionWork, exact.max_work, |limits| {
+            limits.max_work -= 1;
+            limits.max_work
+        }),
+        (Resource::PeakBytes, exact.max_peak_bytes, |limits| {
+            limits.max_peak_bytes -= 1;
+            limits.max_peak_bytes
+        }),
+    ];
+    for (resource, required, lower) in cases {
+        let mut below = exact;
+        let limit = lower(&mut below);
+        expect_exact_resource(
+            regex.admit_spans(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                below,
+            ),
+            resource,
+            required,
+            limit,
+        );
+    }
 }
 
 #[test]

@@ -501,44 +501,16 @@ impl Requirements {
                     (cells, None, 0, bytes, bytes, 0, 0, 0)
                 }
                 Strategy::ReverseSequentialRows => {
-                    let bits = add(program.split_count, 1, Resource::LogBytes)?;
-                    let decision_record = ceil_div(bits, 8)?;
-                    let endpoint_record = encoded_width(boundaries);
-                    let (storage, record, replay) = if endpoint_record < decision_record {
-                        (RowStorage::ReachableEndpoints, endpoint_record, 0)
-                    } else {
-                        let replay = mul(
-                            mul(
-                                mul(states, boundaries, Resource::ExecutionWork)?,
-                                4,
-                                Resource::ExecutionWork,
-                            )?,
-                            passes,
-                            Resource::ExecutionWork,
-                        )?;
-                        (RowStorage::SplitDecisions, decision_record, replay)
-                    };
-                    let log = mul(record, boundaries, Resource::LogBytes)?;
-                    let row_words = mul(states, 2, Resource::RandomAccessBytes)?;
-                    let row_bytes = mul(
-                        row_words,
-                        core::mem::size_of::<usize>(),
-                        Resource::RandomAccessBytes,
-                    )?;
-                    let sequential = mul(
-                        log,
-                        add(passes, 1, Resource::SequentialBytes)?,
-                        Resource::SequentialBytes,
-                    )?;
+                    let rows = ReverseRowRequirements::new(program, boundaries, passes)?;
                     (
                         0,
-                        Some(storage),
-                        record,
-                        row_bytes,
-                        row_bytes,
-                        log,
-                        sequential,
-                        replay,
+                        Some(rows.storage),
+                        rows.record_bytes,
+                        rows.row_bytes,
+                        rows.row_bytes,
+                        rows.log_bytes,
+                        rows.sequential_bound,
+                        rows.replay_bound,
                     )
                 }
             };
@@ -567,6 +539,58 @@ impl Requirements {
             requested_log_bytes: log,
             sequential_bound: sequential,
             work_bound,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReverseRowRequirements {
+    storage: RowStorage,
+    record_bytes: usize,
+    row_bytes: usize,
+    log_bytes: usize,
+    sequential_bound: usize,
+    replay_bound: usize,
+}
+
+impl ReverseRowRequirements {
+    fn new(program: &Program, boundaries: usize, passes: usize) -> Result<Self, Error> {
+        let bits = add(program.split_count, 1, Resource::LogBytes)?;
+        let decision_record = ceil_div(bits, 8)?;
+        let endpoint_record = encoded_width(boundaries);
+        let (storage, record_bytes, replay_bound) = if endpoint_record < decision_record {
+            (RowStorage::ReachableEndpoints, endpoint_record, 0)
+        } else {
+            let replay = mul(
+                mul(
+                    mul(program.insts.len(), boundaries, Resource::ExecutionWork)?,
+                    4,
+                    Resource::ExecutionWork,
+                )?,
+                passes,
+                Resource::ExecutionWork,
+            )?;
+            (RowStorage::SplitDecisions, decision_record, replay)
+        };
+        let log_bytes = mul(record_bytes, boundaries, Resource::LogBytes)?;
+        let row_words = mul(program.insts.len(), 2, Resource::RandomAccessBytes)?;
+        let row_bytes = mul(
+            row_words,
+            core::mem::size_of::<usize>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let sequential_bound = mul(
+            log_bytes,
+            add(passes, 1, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            storage,
+            record_bytes,
+            row_bytes,
+            log_bytes,
+            sequential_bound,
+            replay_bound,
         })
     }
 }
