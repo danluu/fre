@@ -2341,18 +2341,22 @@ fn validate_admitted_work(
     caller_limit: usize,
 ) -> Result<(), Error> {
     let observed = add(
+        accounting.utf8_validation_work,
         add(
             add(
-                accounting.state_evaluations,
-                accounting.transition_checks,
+                add(
+                    accounting.state_evaluations,
+                    accounting.transition_checks,
+                    Resource::ExecutionWork,
+                )?,
+                accounting.root_probes,
                 Resource::ExecutionWork,
             )?,
-            accounting.root_probes,
-            Resource::ExecutionWork,
-        )?,
-        add(
-            accounting.replay_steps,
-            accounting.successful_paths,
+            add(
+                accounting.replay_steps,
+                accounting.successful_paths,
+                Resource::ExecutionWork,
+            )?,
             Resource::ExecutionWork,
         )?,
         Resource::ExecutionWork,
