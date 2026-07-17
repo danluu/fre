@@ -23,18 +23,22 @@ use fre_kernels::{
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
     OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
-    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
-    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
-    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
-    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
-    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
-    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
-    UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
-    UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSpanSumResult,
+    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
+    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
+    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
+    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
+    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
+    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
+    SparseOrderedLiteralSpanSumPlan, UnicodeScalarAggregateBuildAccounting,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
+    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
+    UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -53,7 +57,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 15;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 16;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -97,6 +101,9 @@ pub enum AggregatePlanKind {
     /// Linear count reducer for a greedy bounded sequence of deterministic
     /// `HEAD BODY+ TRAIL*` byte-class units.
     BoundedClassSequence,
+    /// Two ordered literal-prefix/greedy-byte-class alternatives merged from
+    /// persistent monotone occurrence streams.
+    PrefixClassAlternation,
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
@@ -115,6 +122,8 @@ pub enum AggregatePlanIdentity {
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
     /// Unicode-off compound byte-class sequence plus count identity.
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
+    /// Unicode-off two-branch prefix/class proof and native count identity.
+    PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
@@ -218,6 +227,12 @@ pub struct AggregateFixedClassSandwichIdentity {
     pub kernel: FixedClassSandwichOperationIdentity,
 }
 
+/// Facade identity for the Unicode-off two-branch prefix/class reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregatePrefixClassAlternationIdentity {
+    pub kernel: PrefixClassAlternationOperationIdentity,
+}
+
 /// Profile proof attached to a continuation-program facade identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateContinuationSemantics {
@@ -261,6 +276,8 @@ pub enum AggregateBuildAccounting {
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Allocation-free bounded compound byte-class construction certificate.
     BoundedClassSequence(BoundedClassSequenceBuildAccounting),
+    /// Two-branch prefix/class construction certificate.
+    PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Sparse shared reversed automaton construction certificate. This is the
@@ -291,6 +308,9 @@ pub struct AggregateBuildLimits {
     /// compound byte-class sequences. This separate quota preserves every
     /// request previously admitted at its exact fixed-sandwich limit.
     pub max_bounded_class_sequence_planner_work: usize,
+    /// Maximum allocation-free structural inspection work for the two-branch
+    /// prefix/class specialization.
+    pub max_prefix_class_alternation_planner_work: usize,
     /// Maximum checked work for finite-language shape analysis and expansion.
     pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
@@ -301,6 +321,8 @@ pub struct AggregateBuildLimits {
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
     /// Complete inline bounded class-sequence construction limits.
     pub bounded_class_sequence: BoundedClassSequenceBuildLimits,
+    /// Complete two-branch prefix/class construction limits.
+    pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
     /// Complete bounded reversed-DFA construction limits.
     pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
@@ -316,11 +338,13 @@ impl Default for AggregateBuildLimits {
             max_unicode_scalar_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_class_sequence_planner_work: 4_096,
+            max_prefix_class_alternation_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
+            prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
@@ -339,6 +363,8 @@ pub struct AggregateRunLimits {
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
     /// Direct bounded class-sequence count limits.
     pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
+    /// Direct two-branch prefix/class count limits.
+    pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Shared finite-language dense/sparse reducer limits. For sparse plans,
     /// `max_total_work` also bounds edge lookups, edge comparisons and failure
     /// steps individually because each is a component of that total.
@@ -383,6 +409,9 @@ pub struct AggregateBuildReport {
     /// Bounded compound-class structural inspection work, including every
     /// HIR/range visit and admitted disjointness-comparison upper bound.
     pub bounded_class_sequence_planner_work: usize,
+    /// Two-branch prefix/class structural inspection work. Every HIR node,
+    /// literal byte, class range and self-overlap comparison is included.
+    pub prefix_class_alternation_planner_work: usize,
     /// Checked finite-language root inspection and, for the dense route,
     /// analysis/expansion work; zero when finite inspection is skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
@@ -479,6 +508,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Prefix/class alternation inspection crossed its structural work cap.
+    PrefixClassAlternationPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Finite-language extraction crossed its explicit work cap.
     FinitePlannerWorkLimit {
         operation: AggregateOperation,
@@ -522,6 +558,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: BoundedClassSequenceBuildError,
+    },
+    /// Prefix/class alternation construction failed after selection.
+    PrefixClassAlternationBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: PrefixClassAlternationBuildError,
     },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
@@ -604,6 +646,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded class-sequence inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::PrefixClassAlternationPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} prefix/class alternation inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FinitePlannerWorkLimit {
                 operation,
                 selection,
@@ -662,6 +713,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded class-sequence construction failed: {source}"
             ),
+            Self::PrefixClassAlternationBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} prefix/class alternation construction failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -707,6 +766,7 @@ impl std::error::Error for AggregateBuildError {
             Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
+            Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
@@ -714,6 +774,7 @@ impl std::error::Error for AggregateBuildError {
             | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
+            | Self::PrefixClassAlternationPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
             | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
@@ -733,6 +794,8 @@ pub enum AggregateExecutionSource {
     FixedClassSandwich(FixedClassSandwichReduceError),
     /// Direct bounded class-sequence refusal.
     BoundedClassSequence(BoundedClassSequenceReduceError),
+    /// Direct two-branch prefix/class refusal.
+    PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
@@ -750,6 +813,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
+            Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
@@ -767,6 +831,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::UnicodeScalar(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
+            Self::PrefixClassAlternation(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
@@ -812,6 +877,8 @@ pub enum AggregateExecutionDetails {
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
     /// Bounded class-sequence bounds, counters, and operation identity.
     BoundedClassSequence(BoundedClassSequenceReduceAccounting),
+    /// Prefix/class stream bounds, counters, and identity.
+    PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -1164,6 +1231,7 @@ impl AggregateBuilder {
                 unicode_scalar_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
+                prefix_class_alternation_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
@@ -1334,6 +1402,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work: work,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
+                    prefix_class_alternation_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1451,6 +1520,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     bounded_class_sequence_planner_work: 0,
+                    prefix_class_alternation_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1557,6 +1627,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_class_sequence_planner_work: work,
+                    prefix_class_alternation_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1573,6 +1644,110 @@ impl AggregateBuilder {
                 });
             }
             Some(BoundedClassSequenceInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+
+        let prefix_class_selection_bound = prefix_class_selection_work(&syntax);
+        let prefix_class_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && matches!(
+                operation,
+                AggregateOperation::Compile | AggregateOperation::Count
+            )
+            && prefix_class_selection_bound
+                .is_some_and(|work| work <= limits.max_prefix_class_alternation_planner_work)
+        {
+            Some(
+                inspect_prefix_class_alternation(
+                    &rust.hir,
+                    limits.max_prefix_class_alternation_planner_work,
+                )
+                .map_err(|error| match error {
+                    PrefixClassInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::PrefixClassAlternationPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    PrefixClassInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "prefix/class alternation inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let prefix_class_alternation_planner_work = match prefix_class_inspection {
+            Some(PrefixClassInspection::Eligible {
+                prefixes,
+                classes,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from prefix/class inspection",
+                    });
+                }
+                let engine = PrefixClassAlternationPlan::build(
+                    prefixes,
+                    [
+                        classes[0].ranges().iter().map(class_bytes_range_tuple),
+                        classes[1].ranges().iter().map(class_bytes_range_tuple),
+                    ],
+                    limits.prefix_class_alternation,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::PrefixClassAlternationBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::PrefixClassAlternation,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_class_sequence_planner_work,
+                    prefix_class_alternation_planner_work: work,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::PrefixClassAlternation(build),
+                    plan_identity: AggregatePlanIdentity::PrefixClassAlternation(
+                        AggregatePrefixClassAlternationIdentity {
+                            kernel: engine.count_identity(),
+                        },
+                    ),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::PrefixClassAlternation(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(PrefixClassInspection::Ineligible { work }) => work,
             None => 0,
         };
         let inspect_finite =
@@ -1710,6 +1885,7 @@ impl AggregateBuilder {
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_class_sequence_planner_work,
+                        prefix_class_alternation_planner_work,
                         finite_planner_work,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -1842,6 +2018,7 @@ impl AggregateBuilder {
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_class_sequence_planner_work,
+                        prefix_class_alternation_planner_work,
                         finite_planner_work,
                         capture_erasure_work,
                         captures_erased: expected_captures,
@@ -1913,6 +2090,7 @@ impl AggregateBuilder {
             unicode_scalar_planner_work,
             fixed_class_sandwich_planner_work,
             bounded_class_sequence_planner_work,
+            prefix_class_alternation_planner_work,
             finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
@@ -1948,6 +2126,7 @@ enum AggregateEngine {
     UnicodeScalar(UnicodeScalarAggregatePlan),
     FixedClassSandwich(FixedClassSandwichPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
+    PrefixClassAlternation(PrefixClassAlternationPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
@@ -2048,6 +2227,15 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedClassSequence(source),
                     )
                 }),
+            AggregateEngine::PrefixClassAlternation(engine) => engine
+                .count(haystack, limits.prefix_class_alternation)
+                .map(AggregateCountExecution::PrefixClassAlternation)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::PrefixClassAlternation(source),
+                    )
+                }),
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| AggregateCountExecution::FiniteLiteral {
@@ -2146,6 +2334,12 @@ impl AggregatePlan {
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a bounded class-sequence count plan",
+                ),
+            )),
+            AggregateEngine::PrefixClassAlternation(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a count-only prefix/class plan",
                 ),
             )),
             AggregateEngine::FiniteSpanSum(engine) => engine
@@ -2295,6 +2489,7 @@ enum AggregateCountExecution {
     UnicodeScalar(UnicodeScalarAggregateCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
+    PrefixClassAlternation(PrefixClassAlternationCountResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -2318,6 +2513,7 @@ impl AggregateCountExecution {
             Self::UnicodeScalar(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
+            Self::PrefixClassAlternation(result) => result.count,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -2337,6 +2533,9 @@ impl AggregateCountExecution {
             }
             Self::BoundedClassSequence(result) => {
                 AggregateExecutionDetails::BoundedClassSequence(result.accounting)
+            }
+            Self::PrefixClassAlternation(result) => {
+                AggregateExecutionDetails::PrefixClassAlternation(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -2936,6 +3135,168 @@ fn charge_fixed_class_inspection_work(
     }
     *work = needed;
     Ok(())
+}
+
+enum PrefixClassInspection<'a> {
+    Eligible {
+        prefixes: [&'a [u8]; 2],
+        classes: [&'a ClassBytes; 2],
+        work: usize,
+        hir_nodes: usize,
+        captures: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum PrefixClassInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+struct PrefixClassBranch<'a> {
+    prefix: &'a [u8],
+    class: &'a ClassBytes,
+}
+
+fn inspect_prefix_class_alternation(
+    hir: &Hir,
+    limit: usize,
+) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
+    let mut work = 0_usize;
+    let mut hir_nodes = 0_usize;
+    let mut captures = 0_usize;
+    let (_, root_kind) =
+        peel_prefix_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Alternation(branches) = root_kind else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    charge_prefix_class_work(&mut work, 2, limit)?;
+    let [first, second] = branches.as_slice() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(first) =
+        inspect_prefix_class_branch(first, &mut work, &mut hir_nodes, &mut captures, limit)?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(second) =
+        inspect_prefix_class_branch(second, &mut work, &mut hir_nodes, &mut captures, limit)?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    Ok(PrefixClassInspection::Eligible {
+        prefixes: [first.prefix, second.prefix],
+        classes: [first.class, second.class],
+        work,
+        hir_nodes,
+        captures,
+    })
+}
+
+fn inspect_prefix_class_branch<'a>(
+    hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<Option<PrefixClassBranch<'a>>, PrefixClassInspectionError> {
+    let (_, branch_kind) = peel_prefix_class_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Concat(parts) = branch_kind else {
+        return Ok(None);
+    };
+    let [prefix_hir, repeated_hir] = parts.as_slice() else {
+        return Ok(None);
+    };
+    let (_, prefix_kind) =
+        peel_prefix_class_captures(prefix_hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Literal(literal) = prefix_kind else {
+        return Ok(None);
+    };
+    let prefix = literal.0.as_ref();
+    let prefix_work = prefix
+        .len()
+        .checked_mul(2)
+        .ok_or(PrefixClassInspectionError::Overflow)?;
+    charge_prefix_class_work(work, prefix_work, limit)?;
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    if prefix[1..].contains(&prefix[0]) {
+        return Ok(None);
+    }
+
+    let (_, repeated_kind) =
+        peel_prefix_class_captures(repeated_hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Repetition(repetition) = repeated_kind else {
+        return Ok(None);
+    };
+    if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
+        return Ok(None);
+    }
+    let (_, class_kind) =
+        peel_prefix_class_captures(repetition.sub.as_ref(), work, hir_nodes, captures, limit)?;
+    let HirKind::Class(Class::Bytes(class)) = class_kind else {
+        return Ok(None);
+    };
+    charge_prefix_class_work(work, class.ranges().len(), limit)?;
+    if class.ranges().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PrefixClassBranch { prefix, class }))
+}
+
+fn peel_prefix_class_captures<'a>(
+    mut hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<(&'a Hir, &'a HirKind), PrefixClassInspectionError> {
+    loop {
+        charge_prefix_class_work(work, 1, limit)?;
+        *hir_nodes = hir_nodes
+            .checked_add(1)
+            .ok_or(PrefixClassInspectionError::Overflow)?;
+        let kind = hir.kind();
+        let HirKind::Capture(capture) = kind else {
+            return Ok((hir, kind));
+        };
+        *captures = captures
+            .checked_add(1)
+            .ok_or(PrefixClassInspectionError::Overflow)?;
+        hir = capture.sub.as_ref();
+    }
+}
+
+fn charge_prefix_class_work(
+    work: &mut usize,
+    amount: usize,
+    limit: usize,
+) -> Result<(), PrefixClassInspectionError> {
+    let needed = work
+        .checked_add(amount)
+        .ok_or(PrefixClassInspectionError::Overflow)?;
+    if needed > limit {
+        return Err(PrefixClassInspectionError::WorkLimit { needed, limit });
+    }
+    *work = needed;
+    Ok(())
+}
+
+fn class_bytes_range_tuple(range: &ClassBytesRange) -> (u8, u8) {
+    (range.start(), range.end())
+}
+
+fn prefix_class_selection_work(summary: &ParseSummary) -> Option<usize> {
+    let hir_nodes = usize::try_from(summary.hir_nodes).ok()?;
+    let literal_bytes = usize::try_from(summary.literal_bytes).ok()?;
+    let class_ranges = usize::try_from(summary.class_ranges).ok()?;
+    hir_nodes
+        .checked_add(literal_bytes.checked_mul(2)?)?
+        .checked_add(class_ranges)?
+        .checked_add(2)
 }
 
 fn inspect_unicode_scalar_class(

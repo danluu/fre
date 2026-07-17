@@ -7,8 +7,8 @@ use fre::{
     AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
     FixedClassSandwichOperation, FixedClassSandwichReduceError, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
-    PortableBuilder, RustProfile, SearchLimits, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError,
+    PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -214,6 +214,7 @@ fn continuation_details(
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
+        | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
@@ -3071,4 +3072,113 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
     let (matched, _) = portable.find(b"xxfoo", SearchLimits::default()).unwrap();
     let matched = matched.unwrap();
     assert_eq!((matched.start(), matched.end()), (2, 5));
+}
+
+#[test]
+fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() {
+    // rebar-row:imported/leipzig/huck-saw@rust/regex
+    let huck_saw = aggregate_builder(r"Huck[a-zA-Z]+|Saw[a-zA-Z]+")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        AggregatePlanKind::PrefixClassAlternation,
+        huck_saw.build_report().plan
+    );
+    assert!(matches!(
+        huck_saw.build_report().plan_identity,
+        AggregatePlanIdentity::PrefixClassAlternation(identity)
+            if identity.kernel.alternatives == 2
+                && !identity.kernel.unicode
+                && identity.kernel.non_overlapping
+    ));
+    assert_eq!(
+        2,
+        huck_saw
+            .count_value(b"Huckle Sawx Huck!", AggregateRunLimits::default())
+            .unwrap()
+    );
+
+    // Independent exact-limit witness: N=9 and
+    // Q=(2+2 prefix bytes)+(1+1 class ranges)=6, so
+    // W=16*N+8*Q+64=16*9+8*6+64=256. Complete spans: 0..4, 6..9.
+    let witness = aggregate_builder(r"ab[a-z]+|xy[0-9]+")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let mut exact = AggregateRunLimits::default();
+    exact.prefix_class_alternation.max_work = 256;
+    assert_eq!(2, witness.count_value(b"abcz--xy7", exact).unwrap());
+    exact.prefix_class_alternation.max_work = 255;
+    assert!(matches!(
+        witness.count_value(b"abcz--xy7", exact).unwrap_err().source,
+        AggregateExecutionSource::PrefixClassAlternation(
+            PrefixClassAlternationReduceError::WorkLimit {
+                needed: 256,
+                limit: 255,
+            }
+        )
+    ));
+
+    // Complete upstream span equality covers boundary windows, captures,
+    // assertions, case folding, invalid UTF-8, complement/intersection
+    // classes, and an empty-language class. Ineligible cases retain the prior
+    // route instead of changing an old success into a specialized refusal.
+    let cases: [(&str, &[u8], bool, bool); 7] = [
+        (r"ab[a-z]+|xy[0-9]+", b"abz--xy7--ab--xy00", false, true),
+        (
+            r"(?P<left>ab[a-z]+)|(?P<right>xy[0-9]+)",
+            b"_abzz_xy7_",
+            false,
+            true,
+        ),
+        (
+            r"\bab[a-z]+\b|\bxy[0-9]+\b",
+            b"abz!_abq xy7-xy8_",
+            false,
+            false,
+        ),
+        (r"ab[a-z]+|xy[0-9]+", b"ABZ--XY7--abq", true, false),
+        (r"ab[a-z]+|xy[0-9]+", b"\xFFabq\x80xy0", false, true),
+        (
+            r"ab[a-z&&[^q]]+|xy[^A-Za-z]+",
+            b"abzzq--xy12\xFF--abr",
+            false,
+            true,
+        ),
+        (r"ab[a&&[^a]]+|xy[0-9]+", b"abaaa--xy7", false, false),
+    ];
+    for (pattern, haystack, case_insensitive, specialized) in cases {
+        let expected = upstream(pattern, haystack, case_insensitive);
+        let spans = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .build_spans()
+            .unwrap()
+            .spans(haystack, AggregateRunLimits::default())
+            .unwrap();
+        let complete: Vec<_> = spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        assert_eq!(expected, complete, "complete spans for {pattern:?}");
+
+        let count = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            specialized,
+            count.build_report().plan == AggregatePlanKind::PrefixClassAlternation,
+            "selection for {pattern:?}"
+        );
+        assert_eq!(
+            u64::try_from(expected.len()).unwrap(),
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            "count for {pattern:?}"
+        );
+    }
 }

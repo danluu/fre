@@ -20,6 +20,7 @@ mod literal_set;
 mod ordered_literal_aggregate;
 mod packed_literal_set;
 mod packed_ordered_literal_aggregate;
+mod prefix_class_alternation;
 mod required_literal;
 mod sparse_ordered_literal_aggregate;
 mod unicode_scalar_aggregate;
@@ -126,6 +127,20 @@ pub use packed_ordered_literal_aggregate::{
     ReduceUpperBounds as PackedOrderedLiteralAggregateUpperBounds,
     SPAN_SUM_PLAN_ID as PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     SpanSumResult as PackedOrderedLiteralSpanSumResult,
+};
+pub use prefix_class_alternation::{
+    BuildAccounting as PrefixClassAlternationBuildAccounting,
+    BuildError as PrefixClassAlternationBuildError,
+    BuildLimits as PrefixClassAlternationBuildLimits,
+    COUNT_OPERATION_ID as PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    CountResult as PrefixClassAlternationCountResult,
+    OperationIdentity as PrefixClassAlternationOperationIdentity,
+    PLAN_ID as PREFIX_CLASS_ALTERNATION_PLAN_ID, PrefixClassAlternationPlan,
+    ReduceAccounting as PrefixClassAlternationReduceAccounting,
+    ReduceActualCounters as PrefixClassAlternationActualCounters,
+    ReduceError as PrefixClassAlternationReduceError,
+    ReduceLimits as PrefixClassAlternationReduceLimits,
+    ReduceUpperBounds as PrefixClassAlternationUpperBounds,
 };
 pub use required_literal::{
     Anchors as RequiredLiteralAnchors, BuildAccounting as RequiredLiteralBuildAccounting,

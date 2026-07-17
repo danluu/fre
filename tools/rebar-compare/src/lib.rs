@@ -40,12 +40,15 @@ use fre::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile,
-    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits, SearchSessionLimits,
-    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateReduceError,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, RustProfile, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits,
+    SearchSessionLimits, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateReduceError, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateReduceLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
@@ -81,7 +84,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -1541,6 +1544,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::BoundedClassSequence, _) => {
             "compile-aggregate-bounded-class-sequence"
         }
+        ("compile", AggregatePlanKind::PrefixClassAlternation, _) => {
+            "compile-aggregate-prefix-class-alternation"
+        }
         ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
             "compile-aggregate-finite-literal-sparse"
         }
@@ -1554,6 +1560,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::UnicodeScalarClass, _) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
+        (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -3270,6 +3277,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_unicode_scalar_planner_work: limits.fre_unicode_scalar_planner_work,
         max_fixed_class_sandwich_planner_work: limits.fre_unicode_scalar_planner_work,
         max_bounded_class_sequence_planner_work: limits.fre_unicode_scalar_planner_work,
+        max_prefix_class_alternation_planner_work: limits.fre_literal_planner_work,
         max_finite_planner_work: u64::try_from(limits.fre_aggregate_compile_work)
             .unwrap_or(u64::MAX),
         exact_literal: LiteralAggregateBuildLimits {
@@ -3300,6 +3308,13 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_build_work: limits.fre_unicode_scalar_build_work,
             max_persistent_bytes: limits.fre_unicode_scalar_build_persistent_bytes,
             max_peak_bytes: limits.fre_unicode_scalar_build_peak_bytes,
+        },
+        prefix_class_alternation: PrefixClassAlternationBuildLimits {
+            max_shape_units: limits.pattern_bytes_per_job,
+            max_build_work: limits.fre_aggregate_compile_work,
+            max_scratch_bytes: 0,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
         },
         finite_literal: OrderedLiteralAggregateBuildLimits {
             max_patterns: limits.patterns_per_job,
@@ -3702,6 +3717,36 @@ fn bounded_class_sequence_operation_limits(
 fn inactive_bounded_class_sequence_operation_limits() -> BoundedClassSequenceReduceLimits {
     BoundedClassSequenceReduceLimits::default()
 }
+fn prefix_class_alternation_operation_limits(
+    haystack_len: usize,
+    build: fre::PrefixClassAlternationBuildAccounting,
+    limits: &RunLimits,
+) -> Result<PrefixClassAlternationReduceLimits, ExecutionError> {
+    let work = checked_aggregate_add(
+        checked_aggregate_mul(haystack_len, 16, "prefix/class haystack work")?,
+        checked_aggregate_add(
+            checked_aggregate_mul(build.shape_units, 8, "prefix/class shape work")?,
+            64,
+            "prefix/class fixed work",
+        )?,
+        "prefix/class total work",
+    )?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let count = u64::try_from(haystack_len)
+        .map_err(|_| ExecutionError::fault("FRE prefix/class count bound does not fit u64"))?;
+    Ok(PrefixClassAlternationReduceLimits {
+        max_work: work.min(limits.fre_aggregate_operation_work),
+        max_match_events: haystack_len.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_scratch_bytes: 0,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
+fn inactive_prefix_class_alternation_operation_limits() -> PrefixClassAlternationReduceLimits {
+    PrefixClassAlternationReduceLimits::default()
+}
 
 fn ordered_literal_operation_limits(
     haystack_len: usize,
@@ -3824,6 +3869,7 @@ fn aggregate_run_limits(
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             // The continuation policy remains present in cache identity even
             // though no continuation engine exists and no fallback is legal.
@@ -3838,6 +3884,7 @@ fn aggregate_run_limits(
             unicode_scalar: unicode_scalar_operation_limits(haystack_len, build, limits)?,
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3854,6 +3901,7 @@ fn aggregate_run_limits(
                 limits,
             )?,
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3870,6 +3918,24 @@ fn aggregate_run_limits(
                 build,
                 limits,
             )?,
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
+        }),
+        AggregateBuildAccounting::PrefixClassAlternation(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: prefix_class_alternation_operation_limits(
+                haystack_len,
+                build,
+                limits,
+            )?,
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3882,6 +3948,7 @@ fn aggregate_run_limits(
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3894,6 +3961,7 @@ fn aggregate_run_limits(
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3908,6 +3976,7 @@ fn aggregate_run_limits(
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(haystack_len, compile.into(), limits)?,
         }),
@@ -3982,6 +4051,21 @@ fn require_unicode_plan_identity(
             }
             return Err(ExecutionError::fault(format!(
                 "fixed class aggregate semantic identity mismatch for {fixed_operation:?}: {:?}",
+                report.plan_identity
+            )));
+        }
+        if let AggregatePlanIdentity::PrefixClassAlternation(identity) = report.plan_identity {
+            if operation == LiteralAggregateOperation::Count
+                && identity.kernel.plan_id == PREFIX_CLASS_ALTERNATION_PLAN_ID
+                && identity.kernel.operation_id == PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID
+                && !identity.kernel.unicode
+                && identity.kernel.alternatives == 2
+                && identity.kernel.non_overlapping
+            {
+                return Ok(());
+            }
+            return Err(ExecutionError::fault(format!(
+                "prefix/class aggregate semantic identity mismatch for {operation:?}: {:?}",
                 report.plan_identity
             )));
         }
@@ -4077,6 +4161,38 @@ fn literal_reduce_error(source: &LiteralAggregateReduceError, message: String) -
         | LiteralAggregateReduceError::ReducerStepsLimit { .. }
         | LiteralAggregateReduceError::ScratchLimit { .. }
         | LiteralAggregateReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn prefix_class_build_error(
+    source: &PrefixClassAlternationBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        PrefixClassAlternationBuildError::ShapeLimit { .. }
+        | PrefixClassAlternationBuildError::WorkLimit { .. }
+        | PrefixClassAlternationBuildError::ScratchLimit { .. }
+        | PrefixClassAlternationBuildError::PersistentLimit { .. }
+        | PrefixClassAlternationBuildError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn prefix_class_reduce_error(
+    source: &PrefixClassAlternationReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        PrefixClassAlternationReduceError::WorkLimit { .. }
+        | PrefixClassAlternationReduceError::MatchEventsLimit { .. }
+        | PrefixClassAlternationReduceError::CountLimit { .. }
+        | PrefixClassAlternationReduceError::ScratchLimit { .. }
+        | PrefixClassAlternationReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
         _ => ExecutionError::fault(message),
     }
 }
@@ -4236,6 +4352,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::BoundedClassSequence(source) => {
             bounded_class_sequence_reduce_error(source, message)
         }
+        AggregateExecutionSource::PrefixClassAlternation(source) => {
+            prefix_class_reduce_error(source, message)
+        }
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
         }
@@ -4255,6 +4374,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::UnicodeScalarPlannerWorkLimit { .. }
         | AggregateBuildError::FixedClassSandwichPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedClassSequencePlannerWorkLimit { .. }
+        | AggregateBuildError::PrefixClassAlternationPlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerAllocationFailed { .. }
         | AggregateBuildError::ExactLiteralIneligible { .. } => {
@@ -4271,6 +4391,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         }
         AggregateBuildError::BoundedClassSequenceBuild { source, .. } => {
             bounded_class_sequence_build_error(source, message)
+        }
+        AggregateBuildError::PrefixClassAlternationBuild { source, .. } => {
+            prefix_class_build_error(source, message)
         }
         AggregateBuildError::FiniteLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
@@ -6361,7 +6484,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
