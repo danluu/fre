@@ -550,18 +550,44 @@ impl PortableTextRegexSet {
         haystack: &str,
         limits: PortableRegexSetRunLimits,
     ) -> Result<(bool, PortableRegexSetExecutionReport), PortableRegexSetExecutionError> {
+        self.is_match_at(haystack, 0, limits)
+    }
+
+    /// Whether any pattern matches at or after byte offset `start`, retaining
+    /// complete original-haystack context for assertions.
+    ///
+    /// As in pinned Rust `RegexSet::is_match_at`, an offset inside a UTF-8
+    /// scalar is valid and advances to the next possible text match boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid start, set limit, or indexed matcher refusal.
+    pub fn is_match_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<(bool, PortableRegexSetExecutionReport), PortableRegexSetExecutionError> {
+        let search_start = validate_text_start(haystack, start)?;
         let mut total_work = 0_u64;
         let mut searched = 0_usize;
         for (index, regex) in self.regexes.iter().enumerate() {
             let search_count = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one(regex, index, haystack, limits, total_work)?;
+            let (matched, work) = search_one(
+                regex,
+                index,
+                haystack,
+                search_start,
+                limits,
+                total_work,
+            )?;
             total_work = work;
             searched = search_count;
             if matched {
                 return Ok((
                     true,
                     PortableRegexSetExecutionReport {
-                        start: 0,
+                        start,
                         patterns_searched: searched,
                         matched_patterns: 1,
                         work: total_work,
@@ -573,7 +599,7 @@ impl PortableTextRegexSet {
         Ok((
             false,
             PortableRegexSetExecutionReport {
-                start: 0,
+                start,
                 patterns_searched: searched,
                 matched_patterns: 0,
                 work: total_work,
@@ -593,6 +619,23 @@ impl PortableTextRegexSet {
         haystack: &str,
         limits: PortableRegexSetRunLimits,
     ) -> Result<PortableSetMatches, PortableRegexSetExecutionError> {
+        self.matches_at(haystack, 0, limits)
+    }
+
+    /// Return every matching pattern ID at or after byte offset `start`, with
+    /// assertions evaluated against the original haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid start, set limit, allocation failure, or indexed
+    /// matcher refusal. No partial match set is published.
+    pub fn matches_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: PortableRegexSetRunLimits,
+    ) -> Result<PortableSetMatches, PortableRegexSetExecutionError> {
+        let search_start = validate_text_start(haystack, start)?;
         enforce_output_bytes(self.len(), limits.max_output_bytes)?;
         let mut flags = Vec::new();
         flags.try_reserve_exact(self.len()).map_err(|_| {
@@ -608,7 +651,14 @@ impl PortableTextRegexSet {
         let mut matched_patterns = 0_usize;
         for (index, regex) in self.regexes.iter().enumerate() {
             let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one(regex, index, haystack, limits, total_work)?;
+            let (matched, work) = search_one(
+                regex,
+                index,
+                haystack,
+                search_start,
+                limits,
+                total_work,
+            )?;
             total_work = work;
             if matched {
                 let needed = matched_patterns.checked_add(1).ok_or(
@@ -627,7 +677,7 @@ impl PortableTextRegexSet {
             }
         }
         let report = PortableRegexSetExecutionReport {
-            start: 0,
+            start,
             patterns_searched: self.len(),
             matched_patterns,
             work: total_work,
@@ -647,6 +697,7 @@ fn search_one(
     regex: &PortableTextRegex,
     index: usize,
     haystack: &str,
+    start: usize,
     limits: PortableRegexSetRunLimits,
     total_work_before: u64,
 ) -> Result<(bool, u64), PortableRegexSetExecutionError> {
@@ -659,14 +710,14 @@ fn search_one(
         max_work: limits.pattern.max_work.min(remaining_total_work),
         max_scratch_bytes: limits.pattern.max_scratch_bytes,
     };
-    let (matched, accounting) = regex.is_match(haystack, pattern_limits).map_err(|source| {
-        PortableRegexSetExecutionError::Pattern {
+    let (matched, accounting) = regex
+        .is_match_at(haystack, start, pattern_limits)
+        .map_err(|source| PortableRegexSetExecutionError::Pattern {
             index,
             total_work_before,
             remaining_total_work,
             source,
-        }
-    })?;
+        })?;
     let work = accounting.work_or_linear_terms();
     let total_work = total_work_before.checked_add(work).ok_or(
         PortableRegexSetExecutionError::ArithmeticOverflow {
@@ -679,6 +730,19 @@ fn search_one(
         });
     }
     Ok((matched, total_work))
+}
+
+fn validate_text_start(
+    haystack: &str,
+    start: usize,
+) -> Result<usize, PortableRegexSetExecutionError> {
+    if start > haystack.len() {
+        return Err(PortableRegexSetExecutionError::InvalidStart {
+            start,
+            haystack_len: haystack.len(),
+        });
+    }
+    Ok(crate::text::next_text_boundary(haystack, start))
 }
 
 fn enforce_search_count(
