@@ -133,6 +133,11 @@ pub enum AggregateUnicodeScalarSemantics {
     UnicodeOnRootClassOneOrMoreGreedyUtf8False,
     /// The same proof for lazy `CLASS+?`, which emits one scalar per match.
     UnicodeOnRootClassOneOrMoreLazyUtf8False,
+    /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to one
+    /// greedy nullable unbounded root scalar-class repetition for span-sum.
+    /// Its positive spans are exactly those of greedy `CLASS+`; the additional
+    /// empty matches contribute zero to the aggregate.
+    UnicodeOnRootClassZeroOrMoreGreedySpanSumUtf8False,
     /// Rust bytes with Unicode enabled and `utf8(false)`, restricted to a
     /// canonical scalar class under one non-nullable counted or
     /// lower-bounded repetition. Bounds remain symbolic in the direct
@@ -925,7 +930,11 @@ impl AggregateBuilder {
             && operation != AggregateOperation::Spans
         {
             Some(
-                inspect_unicode_scalar_class(&rust.hir, limits.max_unicode_scalar_planner_work)
+                inspect_unicode_scalar_class(
+                    &rust.hir,
+                    limits.max_unicode_scalar_planner_work,
+                    operation == AggregateOperation::SpanSum,
+                )
                     .map_err(|error| match error {
                         UnicodeScalarInspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::UnicodeScalarPlannerWorkLimit {
@@ -954,12 +963,23 @@ impl AggregateBuilder {
                 work,
                 hir_nodes,
                 captures,
+                nullable_greedy_span_sum,
             }) => {
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
                         detail: "syntax summary differs from Unicode scalar inspection",
+                    });
+                }
+                if nullable_greedy_span_sum
+                    && (operation != AggregateOperation::SpanSum
+                        || repetition != UnicodeScalarAggregateRepetition::OneOrMoreGreedy)
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "nullable scalar repetition escaped its span-sum proof",
                     });
                 }
                 let ranges = || {
@@ -1042,19 +1062,23 @@ impl AggregateBuilder {
                     build: AggregateBuildAccounting::UnicodeScalar(build),
                     plan_identity: AggregatePlanIdentity::UnicodeScalar(
                         AggregateUnicodeScalarIdentity {
-                            semantics: match repetition {
-                                UnicodeScalarAggregateRepetition::ExactlyOne => {
-                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
-                                }
-                                UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
-                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
-                                }
-                                UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
-                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
-                                }
-                                UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
-                                | UnicodeScalarAggregateRepetition::RepeatedLazy { .. } => {
-                                    AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
+                            semantics: if nullable_greedy_span_sum {
+                                AggregateUnicodeScalarSemantics::UnicodeOnRootClassZeroOrMoreGreedySpanSumUtf8False
+                            } else {
+                                match repetition {
+                                    UnicodeScalarAggregateRepetition::ExactlyOne => {
+                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassUtf8False
+                                    }
+                                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
+                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreGreedyUtf8False
+                                    }
+                                    UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
+                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassOneOrMoreLazyUtf8False
+                                    }
+                                    UnicodeScalarAggregateRepetition::RepeatedGreedy { .. }
+                                    | UnicodeScalarAggregateRepetition::RepeatedLazy { .. } => {
+                                        AggregateUnicodeScalarSemantics::UnicodeOnRootClassRepeatedUtf8False
+                                    }
                                 }
                             },
                             kernel,
@@ -1573,6 +1597,7 @@ enum UnicodeScalarInspection<'a> {
         work: usize,
         hir_nodes: usize,
         captures: usize,
+        nullable_greedy_span_sum: bool,
     },
     Ineligible {
         work: usize,
@@ -1587,12 +1612,14 @@ enum UnicodeScalarInspectionError {
 fn inspect_unicode_scalar_class(
     mut hir: &Hir,
     limit: usize,
+    allow_nullable_greedy_span_sum: bool,
 ) -> Result<UnicodeScalarInspection<'_>, UnicodeScalarInspectionError> {
     let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
     let mut repetition = UnicodeScalarAggregateRepetition::ExactlyOne;
     let mut saw_repetition = false;
+    let mut nullable_greedy_span_sum = false;
     loop {
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
@@ -1619,6 +1646,23 @@ fn inspect_unicode_scalar_class(
                 saw_repetition = true;
                 hir = repeated.sub.as_ref();
             }
+            HirKind::Repetition(repeated)
+                if !saw_repetition
+                    && allow_nullable_greedy_span_sum
+                    && repeated.min == 0
+                    && repeated.max.is_none()
+                    && repeated.greedy =>
+            {
+                // Greedy `CLASS*` and `CLASS+` have identical positive
+                // leftmost-first spans. Only `CLASS*` emits additional empty
+                // matches, and those add zero to span-sum. Keep the kernel
+                // identity truthful by using its one-or-more reducer while the
+                // facade identity records this operation-specific proof.
+                repetition = UnicodeScalarAggregateRepetition::OneOrMoreGreedy;
+                saw_repetition = true;
+                nullable_greedy_span_sum = true;
+                hir = repeated.sub.as_ref();
+            }
             HirKind::Class(Class::Unicode(class)) => {
                 if repetition.is_run() {
                     if class.ranges().is_empty() {
@@ -1631,6 +1675,7 @@ fn inspect_unicode_scalar_class(
                         work,
                         hir_nodes,
                         captures,
+                        nullable_greedy_span_sum,
                     });
                 }
                 for range in class.ranges() {
@@ -1642,6 +1687,7 @@ fn inspect_unicode_scalar_class(
                             work,
                             hir_nodes,
                             captures,
+                            nullable_greedy_span_sum,
                         });
                     }
                 }

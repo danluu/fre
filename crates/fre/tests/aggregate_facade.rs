@@ -1145,6 +1145,99 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
 }
 
 #[test]
+fn unicode_scalar_greedy_star_erases_only_zero_length_matches_for_span_sum() {
+    let cases: [(&str, &[u8], bool); 7] = [
+        (".*", b"", false),
+        (".*", b"abc\n\xFF\xE9\x9B\xAA\x80z", false),
+        ("(?s:.)*", b"a\n\xFF\xE9\x9B\xAA\x80z", false),
+        (r"\pL*", "ab--αβ--雪1".as_bytes(), false),
+        (r"(?P<run>\pL*)", "ab--αβ--雪1".as_bytes(), false),
+        (r"(?P<atom>\pL)*", "ab--αβ--雪1".as_bytes(), false),
+        (r"[k]*", b"kK--kk", true),
+    ];
+    for (pattern, haystack, case_insensitive) in cases {
+        let expected = upstream_profile(pattern, haystack, case_insensitive, true);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+
+        let sum = aggregate_builder(pattern)
+            .case_insensitive(case_insensitive)
+            .build_span_sum()
+            .unwrap_or_else(|error| panic!("sum build {pattern:?}: {error}"));
+        assert_eq!(
+            sum.build_report().plan,
+            AggregatePlanKind::UnicodeScalarClass,
+            "pattern={pattern:?}"
+        );
+        assert!(matches!(
+            sum.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.semantics
+                    == AggregateUnicodeScalarSemantics::UnicodeOnRootClassZeroOrMoreGreedySpanSumUtf8False
+                    && identity.kernel.repetition
+                        == fre::UnicodeScalarAggregateRepetition::OneOrMoreGreedy
+                    && identity.kernel.operation == UnicodeScalarAggregateOperation::SpanSum
+        ));
+        assert_eq!(
+            sum.span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("sum run {pattern:?}: {error}")),
+            expected_sum,
+            "pattern={pattern:?}"
+        );
+
+        let count = aggregate_builder(pattern)
+            .case_insensitive(case_insensitive)
+            .build_count()
+            .unwrap_or_else(|error| panic!("count build {pattern:?}: {error}"));
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::ContinuationProgram,
+            "count must retain nullable semantics for {pattern:?}"
+        );
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}")),
+            expected_count,
+            "pattern={pattern:?}"
+        );
+
+        assert_eq!(
+            aggregate_builder(pattern)
+                .case_insensitive(case_insensitive)
+                .build_compile()
+                .unwrap_or_else(|error| panic!("compile build {pattern:?}: {error}"))
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram,
+            "compile must retain nullable semantics for {pattern:?}"
+        );
+    }
+
+    for non_equivalent in [r"\pL*?", r"\pL{0,4}"] {
+        assert_eq!(
+            aggregate_builder(non_equivalent)
+                .build_span_sum()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+    }
+    assert_eq!(
+        aggregate_builder(r"\pL{0,}")
+            .build_span_sum()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+}
+
+#[test]
 fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions() {
     let cases: [(&str, &[u8]); 11] = [
         (r"\pL{2,4}", b"ab--cdef--g"),
