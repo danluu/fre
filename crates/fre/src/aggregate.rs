@@ -2585,35 +2585,44 @@ impl AggregatePlan {
                 ),
             )),
             AggregateEngine::Continuation(engine) => {
-                let strategy = self.report.continuation_strategy.ok_or_else(|| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation span-sum plan lacks storage strategy",
-                        ),
-                    )
-                })?;
-                let admitted = engine
-                    .admit_span_sum(
-                        haystack,
-                        Self::full_range(haystack),
-                        strategy,
-                        limits.continuation,
-                    )
-                    .map_err(|source| {
-                        self.execution_error(limits, AggregateExecutionSource::Continuation(source))
-                    })?;
-                let value = u64::try_from(admitted.value()).map_err(|_| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation span sum does not fit u64",
-                        ),
-                    )
-                })?;
-                Ok(AggregateSpanSumExecution::Continuation { admitted, value })
+                self.execute_continuation_span_sum(engine, haystack, limits)
             }
         }
+    }
+
+    fn execute_continuation_span_sum(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let admitted = engine
+            .admit_span_sum(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|source| {
+                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
+            })?;
+        let value = u64::try_from(admitted.value()).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })?;
+        Ok(AggregateSpanSumExecution::Continuation { admitted, value })
     }
 
     fn execute_count_value(
