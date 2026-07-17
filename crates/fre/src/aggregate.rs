@@ -9,8 +9,11 @@ use fre_kernels::{
     BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
     BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
     BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, FixedClassSandwichBuildAccounting,
-    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
+    BoundedClassSequenceReduceLimits, BoundedContextBuildAccounting, BoundedContextBuildError,
+    BoundedContextBuildLimits, BoundedContextCountResult, BoundedContextOperationIdentity,
+    BoundedContextPlan, BoundedContextReduceAccounting, BoundedContextReduceError,
+    BoundedContextReduceLimits, FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError,
+    FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
     FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
@@ -57,7 +60,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 16;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 17;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -104,6 +107,8 @@ pub enum AggregatePlanKind {
     /// Two ordered literal-prefix/greedy-byte-class alternatives merged from
     /// persistent monotone occurrence streams.
     PrefixClassAlternation,
+    /// Linear literal-interval stream for a fixed-class/bounded-gap context.
+    BoundedContext,
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
@@ -124,6 +129,8 @@ pub enum AggregatePlanIdentity {
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
     /// Unicode-off two-branch prefix/class proof and native count identity.
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
+    /// Bounded byte-context proof plus native count identity.
+    BoundedContext(AggregateBoundedContextIdentity),
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
@@ -233,6 +240,12 @@ pub struct AggregatePrefixClassAlternationIdentity {
     pub kernel: PrefixClassAlternationOperationIdentity,
 }
 
+/// Facade identity for the Unicode-off bounded-context count reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateBoundedContextIdentity {
+    pub kernel: BoundedContextOperationIdentity,
+}
+
 /// Profile proof attached to a continuation-program facade identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateContinuationSemantics {
@@ -278,6 +291,8 @@ pub enum AggregateBuildAccounting {
     BoundedClassSequence(BoundedClassSequenceBuildAccounting),
     /// Two-branch prefix/class construction certificate.
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
+    /// Bounded-context construction certificate.
+    BoundedContext(BoundedContextBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Sparse shared reversed automaton construction certificate. This is the
@@ -311,6 +326,8 @@ pub struct AggregateBuildLimits {
     /// Maximum allocation-free structural inspection work for the two-branch
     /// prefix/class specialization.
     pub max_prefix_class_alternation_planner_work: usize,
+    /// Maximum allocation-free HIR/range inspection work for bounded context.
+    pub max_bounded_context_planner_work: usize,
     /// Maximum checked work for finite-language shape analysis and expansion.
     pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
@@ -323,6 +340,8 @@ pub struct AggregateBuildLimits {
     pub bounded_class_sequence: BoundedClassSequenceBuildLimits,
     /// Complete two-branch prefix/class construction limits.
     pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
+    /// Complete bounded-context construction limits.
+    pub bounded_context: BoundedContextBuildLimits,
     /// Complete bounded reversed-DFA construction limits.
     pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
@@ -339,12 +358,14 @@ impl Default for AggregateBuildLimits {
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_class_sequence_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
+            max_bounded_context_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
+            bounded_context: BoundedContextBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
         }
@@ -365,6 +386,8 @@ pub struct AggregateRunLimits {
     pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
     /// Direct two-branch prefix/class count limits.
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
+    /// Direct bounded-context literal interval-stream limits.
+    pub bounded_context: BoundedContextReduceLimits,
     /// Shared finite-language dense/sparse reducer limits. For sparse plans,
     /// `max_total_work` also bounds edge lookups, edge comparisons and failure
     /// steps individually because each is a component of that total.
@@ -412,6 +435,8 @@ pub struct AggregateBuildReport {
     /// Two-branch prefix/class structural inspection work. Every HIR node,
     /// literal byte, class range and self-overlap comparison is included.
     pub prefix_class_alternation_planner_work: usize,
+    /// Bounded-context structural inspection work.
+    pub bounded_context_planner_work: usize,
     /// Checked finite-language root inspection and, for the dense route,
     /// analysis/expansion work; zero when finite inspection is skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
@@ -515,6 +540,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Bounded-context inspection crossed its structural work cap.
+    BoundedContextPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Finite-language extraction crossed its explicit work cap.
     FinitePlannerWorkLimit {
         operation: AggregateOperation,
@@ -564,6 +596,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: PrefixClassAlternationBuildError,
+    },
+    /// Bounded-context construction failed after selection.
+    BoundedContextBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: BoundedContextBuildError,
     },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
@@ -655,6 +693,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} prefix/class alternation inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::BoundedContextPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded-context inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FinitePlannerWorkLimit {
                 operation,
                 selection,
@@ -721,6 +768,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} prefix/class alternation construction failed: {source}"
             ),
+            Self::BoundedContextBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded-context construction failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -767,6 +822,7 @@ impl std::error::Error for AggregateBuildError {
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
+            Self::BoundedContextBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
@@ -775,6 +831,7 @@ impl std::error::Error for AggregateBuildError {
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
+            | Self::BoundedContextPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
             | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
@@ -796,6 +853,8 @@ pub enum AggregateExecutionSource {
     BoundedClassSequence(BoundedClassSequenceReduceError),
     /// Direct two-branch prefix/class refusal.
     PrefixClassAlternation(PrefixClassAlternationReduceError),
+    /// Direct bounded-context refusal.
+    BoundedContext(BoundedContextReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
@@ -814,6 +873,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
+            Self::BoundedContext(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
@@ -832,6 +892,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::FixedClassSandwich(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
+            Self::BoundedContext(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
@@ -879,6 +940,8 @@ pub enum AggregateExecutionDetails {
     BoundedClassSequence(BoundedClassSequenceReduceAccounting),
     /// Prefix/class stream bounds, counters, and identity.
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
+    /// Bounded-context bounds, counters, and operation identity.
+    BoundedContext(BoundedContextReduceAccounting),
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -1232,6 +1295,7 @@ impl AggregateBuilder {
                 fixed_class_sandwich_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
+                bounded_context_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
@@ -1403,6 +1467,7 @@ impl AggregateBuilder {
                     fixed_class_sandwich_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
+                    bounded_context_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1521,6 +1586,7 @@ impl AggregateBuilder {
                     fixed_class_sandwich_planner_work: work,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
+                    bounded_context_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1628,6 +1694,7 @@ impl AggregateBuilder {
                     fixed_class_sandwich_planner_work,
                     bounded_class_sequence_planner_work: work,
                     prefix_class_alternation_planner_work: 0,
+                    bounded_context_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1646,7 +1713,6 @@ impl AggregateBuilder {
             Some(BoundedClassSequenceInspection::Ineligible { work }) => work,
             None => 0,
         };
-
         let prefix_class_selection_bound = prefix_class_selection_work(&syntax);
         let prefix_class_inspection = if !unicode
             && !case_insensitive
@@ -1738,6 +1804,7 @@ impl AggregateBuilder {
                     fixed_class_sandwich_planner_work,
                     bounded_class_sequence_planner_work,
                     prefix_class_alternation_planner_work: work,
+                    bounded_context_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1756,6 +1823,118 @@ impl AggregateBuilder {
                 });
             }
             Some(PrefixClassInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let bounded_context_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && matches!(
+                operation,
+                AggregateOperation::Compile | AggregateOperation::Count
+            ) {
+            Some(
+                inspect_bounded_context(&rust.hir, limits.max_bounded_context_planner_work)
+                    .map_err(|error| match error {
+                        BoundedContextInspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::BoundedContextPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        BoundedContextInspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded-context inspection accounting overflow",
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let bounded_context_planner_work = match bounded_context_inspection {
+            Some(BoundedContextInspection::Eligible {
+                prefix,
+                separator,
+                tail,
+                literal,
+                prefix_width,
+                left_gap_max,
+                right_gap_max,
+                tail_width,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from bounded-context inspection",
+                    });
+                }
+                let engine = BoundedContextPlan::build(
+                    prefix
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    separator
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    tail.ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    literal,
+                    prefix_width,
+                    left_gap_max,
+                    right_gap_max,
+                    tail_width,
+                    limits.bounded_context,
+                )
+                .map_err(|source| AggregateBuildError::BoundedContextBuild {
+                    operation,
+                    selection,
+                    source,
+                })?;
+                let build = engine.build_accounting();
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::BoundedContext,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_class_sequence_planner_work,
+                    prefix_class_alternation_planner_work,
+                    bounded_context_planner_work: work,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::BoundedContext(build),
+                    plan_identity: AggregatePlanIdentity::BoundedContext(
+                        AggregateBoundedContextIdentity {
+                            kernel: engine.count_identity(),
+                        },
+                    ),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::BoundedContext(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(BoundedContextInspection::Ineligible { work }) => work,
             None => 0,
         };
         let inspect_finite =
@@ -1894,6 +2073,7 @@ impl AggregateBuilder {
                         fixed_class_sandwich_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
+                        bounded_context_planner_work,
                         finite_planner_work,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -2027,6 +2207,7 @@ impl AggregateBuilder {
                         fixed_class_sandwich_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
+                        bounded_context_planner_work,
                         finite_planner_work,
                         capture_erasure_work,
                         captures_erased: expected_captures,
@@ -2099,6 +2280,7 @@ impl AggregateBuilder {
             fixed_class_sandwich_planner_work,
             bounded_class_sequence_planner_work,
             prefix_class_alternation_planner_work,
+            bounded_context_planner_work,
             finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
@@ -2135,6 +2317,7 @@ enum AggregateEngine {
     FixedClassSandwich(FixedClassSandwichPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
+    BoundedContext(BoundedContextPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
@@ -2248,6 +2431,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::PrefixClassAlternation(source),
                     )
                 }),
+            AggregateEngine::BoundedContext(engine) => engine
+                .count(haystack, limits.bounded_context)
+                .map(AggregateCountExecution::BoundedContext)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::BoundedContext(source))
+                }),
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| AggregateCountExecution::FiniteLiteral {
@@ -2352,6 +2541,12 @@ impl AggregatePlan {
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a count-only prefix/class plan",
+                ),
+            )),
+            AggregateEngine::BoundedContext(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a bounded-context count plan",
                 ),
             )),
             AggregateEngine::FiniteSpanSum(engine) => engine
@@ -2502,6 +2697,7 @@ enum AggregateCountExecution {
     FixedClassSandwich(FixedClassSandwichCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
+    BoundedContext(BoundedContextCountResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -2526,6 +2722,7 @@ impl AggregateCountExecution {
             Self::FixedClassSandwich(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
+            Self::BoundedContext(result) => result.count,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -2548,6 +2745,9 @@ impl AggregateCountExecution {
             }
             Self::PrefixClassAlternation(result) => {
                 AggregateExecutionDetails::PrefixClassAlternation(result.accounting)
+            }
+            Self::BoundedContext(result) => {
+                AggregateExecutionDetails::BoundedContext(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -2682,6 +2882,268 @@ enum UnicodeScalarInspection<'a> {
 enum UnicodeScalarInspectionError {
     WorkLimit { needed: usize, limit: usize },
     Overflow,
+}
+
+enum BoundedContextInspection<'a> {
+    Eligible {
+        prefix: &'a ClassBytes,
+        separator: &'a ClassBytes,
+        tail: &'a ClassBytes,
+        literal: &'a [u8],
+        prefix_width: u32,
+        left_gap_max: u32,
+        right_gap_max: u32,
+        tail_width: u32,
+        work: usize,
+        hir_nodes: usize,
+        captures: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum BoundedContextInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the eligibility proof walks the fixed seven-part HIR in semantic order and keeps all charged early refusals together"
+)]
+fn inspect_bounded_context(
+    hir: &Hir,
+    limit: usize,
+) -> Result<BoundedContextInspection<'_>, BoundedContextInspectionError> {
+    let mut work = 0_usize;
+    let mut hir_nodes = 0_usize;
+    let mut captures = 0_usize;
+    let hir = peel_bounded_context_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let [
+        prefix,
+        left_separator,
+        left_gap,
+        literal,
+        right_gap,
+        right_separator,
+        tail,
+    ] = parts.as_slice()
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+
+    let Some((prefix, prefix_width)) = inspect_bounded_context_exact_class(
+        prefix,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let Some(left_separator) = inspect_bounded_context_separator(
+        left_separator,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let Some(left_gap_max) =
+        inspect_bounded_context_gap(left_gap, &mut work, &mut hir_nodes, &mut captures, limit)?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let literal =
+        peel_bounded_context_captures(literal, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Literal(literal) = literal.kind() else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    if literal.0.is_empty() {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    }
+    for _ in &literal.0 {
+        charge_bounded_context_work(&mut work, limit)?;
+    }
+    let Some(right_gap_max) =
+        inspect_bounded_context_gap(right_gap, &mut work, &mut hir_nodes, &mut captures, limit)?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let Some(right_separator) = inspect_bounded_context_separator(
+        right_separator,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let Some((tail, tail_width)) =
+        inspect_bounded_context_exact_class(tail, &mut work, &mut hir_nodes, &mut captures, limit)?
+    else {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    };
+    let separator_dedup_comparisons = left_separator
+        .ranges()
+        .len()
+        .checked_add(right_separator.ranges().len())
+        .ok_or(BoundedContextInspectionError::Overflow)?;
+    for _ in 0..separator_dedup_comparisons {
+        charge_bounded_context_work(&mut work, limit)?;
+    }
+    if left_separator != right_separator {
+        return Ok(BoundedContextInspection::Ineligible { work });
+    }
+    for class in [prefix, left_separator, tail] {
+        for _ in class.ranges() {
+            charge_bounded_context_work(&mut work, limit)?;
+        }
+    }
+    Ok(BoundedContextInspection::Eligible {
+        prefix,
+        separator: left_separator,
+        tail,
+        literal: literal.0.as_ref(),
+        prefix_width,
+        left_gap_max,
+        right_gap_max,
+        tail_width,
+        work,
+        hir_nodes,
+        captures,
+    })
+}
+
+fn inspect_bounded_context_exact_class<'a>(
+    hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<Option<(&'a ClassBytes, u32)>, BoundedContextInspectionError> {
+    let hir = peel_bounded_context_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    let Some(maximum) = repetition.max else {
+        return Ok(None);
+    };
+    if repetition.min != maximum || repetition.min < 2 || !repetition.greedy {
+        return Ok(None);
+    }
+    let sub =
+        peel_bounded_context_captures(repetition.sub.as_ref(), work, hir_nodes, captures, limit)?;
+    let HirKind::Class(Class::Bytes(class)) = sub.kind() else {
+        return Ok(None);
+    };
+    if class.ranges().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((class, repetition.min)))
+}
+
+fn inspect_bounded_context_separator<'a>(
+    hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<Option<&'a ClassBytes>, BoundedContextInspectionError> {
+    let hir = peel_bounded_context_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
+        return Ok(None);
+    }
+    let sub =
+        peel_bounded_context_captures(repetition.sub.as_ref(), work, hir_nodes, captures, limit)?;
+    let HirKind::Class(Class::Bytes(class)) = sub.kind() else {
+        return Ok(None);
+    };
+    if class.ranges().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(class))
+}
+
+fn inspect_bounded_context_gap(
+    hir: &Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<Option<u32>, BoundedContextInspectionError> {
+    let hir = peel_bounded_context_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    let Some(maximum) = repetition.max else {
+        return Ok(None);
+    };
+    if repetition.min != 0 || !repetition.greedy {
+        return Ok(None);
+    }
+    let sub =
+        peel_bounded_context_captures(repetition.sub.as_ref(), work, hir_nodes, captures, limit)?;
+    let HirKind::Class(Class::Bytes(class)) = sub.kind() else {
+        return Ok(None);
+    };
+    for _ in class.ranges() {
+        charge_bounded_context_work(work, limit)?;
+    }
+    let [range] = class.ranges() else {
+        return Ok(None);
+    };
+    if range.start() != u8::MIN || range.end() != u8::MAX {
+        return Ok(None);
+    }
+    Ok(Some(maximum))
+}
+
+fn peel_bounded_context_captures<'a>(
+    mut hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<&'a Hir, BoundedContextInspectionError> {
+    loop {
+        charge_bounded_context_work(work, limit)?;
+        *hir_nodes = (*hir_nodes)
+            .checked_add(1)
+            .ok_or(BoundedContextInspectionError::Overflow)?;
+        let HirKind::Capture(capture) = hir.kind() else {
+            return Ok(hir);
+        };
+        *captures = (*captures)
+            .checked_add(1)
+            .ok_or(BoundedContextInspectionError::Overflow)?;
+        hir = capture.sub.as_ref();
+    }
+}
+
+fn charge_bounded_context_work(
+    work: &mut usize,
+    limit: usize,
+) -> Result<(), BoundedContextInspectionError> {
+    let needed = work
+        .checked_add(1)
+        .ok_or(BoundedContextInspectionError::Overflow)?;
+    if needed > limit {
+        return Err(BoundedContextInspectionError::WorkLimit { needed, limit });
+    }
+    *work = needed;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

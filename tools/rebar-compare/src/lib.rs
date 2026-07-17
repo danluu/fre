@@ -84,7 +84,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -415,10 +415,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1547,6 +1547,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::PrefixClassAlternation, _) => {
             "compile-aggregate-prefix-class-alternation"
         }
+        ("compile", AggregatePlanKind::BoundedContext, _) => "compile-aggregate-bounded-context",
         ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
             "compile-aggregate-finite-literal-sparse"
         }
@@ -1561,6 +1562,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
+        (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -3278,6 +3280,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_fixed_class_sandwich_planner_work: limits.fre_unicode_scalar_planner_work,
         max_bounded_class_sequence_planner_work: limits.fre_unicode_scalar_planner_work,
         max_prefix_class_alternation_planner_work: limits.fre_literal_planner_work,
+        max_bounded_context_planner_work: limits.fre_unicode_scalar_planner_work,
         max_finite_planner_work: u64::try_from(limits.fre_aggregate_compile_work)
             .unwrap_or(u64::MAX),
         exact_literal: LiteralAggregateBuildLimits {
@@ -3315,6 +3318,16 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_scratch_bytes: 0,
             max_persistent_bytes: limits.fre_aggregate_program_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
+        bounded_context: fre::BoundedContextBuildLimits {
+            max_source_ranges: limits.fre_unicode_scalar_build_source_ranges,
+            max_literal_bytes: limits.fre_literal_build_needle_bytes,
+            max_repeat_bound: limits.fre_aggregate_repeat_bound,
+            max_gap_bound: limits.fre_aggregate_repeat_bound,
+            max_build_work: limits.fre_unicode_scalar_build_work,
+            max_scratch_bytes: limits.fre_literal_build_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         finite_literal: OrderedLiteralAggregateBuildLimits {
             max_patterns: limits.patterns_per_job,
@@ -3748,6 +3761,64 @@ fn inactive_prefix_class_alternation_operation_limits() -> PrefixClassAlternatio
     PrefixClassAlternationReduceLimits::default()
 }
 
+fn bounded_context_operation_limits(
+    haystack_len: usize,
+    build: fre::BoundedContextBuildAccounting,
+    limits: &RunLimits,
+) -> Result<fre::BoundedContextReduceLimits, ExecutionError> {
+    let tail = usize::try_from(build.tail_width)
+        .map_err(|_| ExecutionError::fault("FRE bounded-context tail width does not fit usize"))?;
+    let interval_records = haystack_len
+        .checked_div(
+            tail.checked_add(1)
+                .ok_or_else(|| ExecutionError::fault("FRE bounded-context tail overflow"))?,
+        )
+        .ok_or_else(|| ExecutionError::fault("FRE bounded-context interval denominator is zero"))?;
+    let interval_bytes =
+        checked_aggregate_mul(interval_records, 12, "bounded-context interval bytes")?;
+    let work = checked_aggregate_add(
+        checked_aggregate_add(
+            checked_aggregate_mul(haystack_len, 21, "bounded-context input work")?,
+            checked_aggregate_mul(build.literal_bytes, 11, "bounded-context literal work")?,
+            "bounded-context input plus literal work",
+        )?,
+        checked_aggregate_add(
+            checked_aggregate_mul(interval_bytes, 3, "bounded-context interval work")?,
+            40,
+            "bounded-context interval plus fixed work",
+        )?,
+        "bounded-context total work",
+    )?;
+    let minimum_match = usize::try_from(build.prefix_width)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(build.literal_bytes))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| {
+            usize::try_from(build.tail_width)
+                .ok()
+                .and_then(|tail| value.checked_add(tail))
+        })
+        .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match overflow"))?;
+    let match_events = haystack_len
+        .checked_div(minimum_match)
+        .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match is zero"))?;
+    Ok(fre::BoundedContextReduceLimits {
+        max_input_bytes: haystack_len,
+        max_work: work.min(limits.fre_aggregate_operation_work),
+        max_match_events: match_events,
+        max_count: u64::try_from(match_events)
+            .map_err(|_| ExecutionError::fault("FRE bounded-context count does not fit u64"))?
+            .min(limits.reducer_steps),
+        max_scratch_bytes: interval_bytes.min(limits.fre_aggregate_scratch_bytes),
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
+fn inactive_bounded_context_operation_limits() -> fre::BoundedContextReduceLimits {
+    fre::BoundedContextReduceLimits::default()
+}
+
 fn ordered_literal_operation_limits(
     haystack_len: usize,
     build: Option<fre::OrderedLiteralAggregateBuildAccounting>,
@@ -3874,6 +3945,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             // The continuation policy remains present in cache identity even
             // though no continuation engine exists and no fallback is legal.
@@ -3889,6 +3961,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3906,6 +3979,7 @@ fn aggregate_run_limits(
             )?,
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3923,6 +3997,7 @@ fn aggregate_run_limits(
                 limits,
             )?,
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3940,6 +4015,21 @@ fn aggregate_run_limits(
                 build,
                 limits,
             )?,
+            bounded_context: inactive_bounded_context_operation_limits(),
+            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
+        }),
+        AggregateBuildAccounting::BoundedContext(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: bounded_context_operation_limits(haystack_len, build, limits)?,
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3953,6 +4043,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3966,6 +4057,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -3981,6 +4073,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(haystack_len, compile.into(), limits)?,
         }),
@@ -4074,6 +4167,18 @@ fn require_unicode_plan_identity(
             }
             return Err(ExecutionError::fault(format!(
                 "prefix/class aggregate semantic identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        }
+        if let AggregatePlanIdentity::BoundedContext(identity) = report.plan_identity {
+            if operation == LiteralAggregateOperation::Count
+                && identity.kernel.plan_id == fre::BOUNDED_CONTEXT_PLAN_ID
+                && identity.kernel.operation_id == fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID
+            {
+                return Ok(());
+            }
+            return Err(ExecutionError::fault(format!(
+                "bounded-context aggregate semantic identity mismatch for {operation:?}: {:?}",
                 report.plan_identity
             )));
         }
@@ -4292,6 +4397,23 @@ fn bounded_class_sequence_build_error(
     }
 }
 
+fn bounded_context_build_error(
+    source: &fre::BoundedContextBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        fre::BoundedContextBuildError::RepeatLimit { .. }
+        | fre::BoundedContextBuildError::GapLimit { .. }
+        | fre::BoundedContextBuildError::RangeLimit { .. }
+        | fre::BoundedContextBuildError::LiteralLimit { .. }
+        | fre::BoundedContextBuildError::WorkLimit { .. }
+        | fre::BoundedContextBuildError::ScratchLimit { .. }
+        | fre::BoundedContextBuildError::PersistentLimit { .. }
+        | fre::BoundedContextBuildError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn bounded_class_sequence_reduce_error(
     source: &BoundedClassSequenceReduceError,
     message: String,
@@ -4301,6 +4423,21 @@ fn bounded_class_sequence_reduce_error(
         | BoundedClassSequenceReduceError::CountLimit { .. }
         | BoundedClassSequenceReduceError::WorkLimit { .. }
         | BoundedClassSequenceReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn bounded_context_reduce_error(
+    source: &fre::BoundedContextReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        fre::BoundedContextReduceError::InputLimit { .. }
+        | fre::BoundedContextReduceError::WorkLimit { .. }
+        | fre::BoundedContextReduceError::MatchEventsLimit { .. }
+        | fre::BoundedContextReduceError::CountLimit { .. }
+        | fre::BoundedContextReduceError::ScratchLimit { .. }
+        | fre::BoundedContextReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
 }
@@ -4363,6 +4500,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::PrefixClassAlternation(source) => {
             prefix_class_reduce_error(source, message)
         }
+        AggregateExecutionSource::BoundedContext(source) => {
+            bounded_context_reduce_error(source, message)
+        }
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
         }
@@ -4383,6 +4523,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::FixedClassSandwichPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedClassSequencePlannerWorkLimit { .. }
         | AggregateBuildError::PrefixClassAlternationPlannerWorkLimit { .. }
+        | AggregateBuildError::BoundedContextPlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerAllocationFailed { .. }
         | AggregateBuildError::ExactLiteralIneligible { .. } => {
@@ -4402,6 +4543,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         }
         AggregateBuildError::PrefixClassAlternationBuild { source, .. } => {
             prefix_class_build_error(source, message)
+        }
+        AggregateBuildError::BoundedContextBuild { source, .. } => {
+            bounded_context_build_error(source, message)
         }
         AggregateBuildError::FiniteLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
@@ -6492,7 +6636,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

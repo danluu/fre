@@ -13,6 +13,7 @@ use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
 mod bounded_class_sequence;
+mod bounded_context;
 mod fixed_class_sandwich;
 mod forward_anchored;
 mod literal_aggregate;
@@ -39,6 +40,15 @@ pub use bounded_class_sequence::{
     ReduceUpperBounds as BoundedClassSequenceUpperBounds,
 };
 
+pub use bounded_context::{
+    BoundedContextPlan, BuildAccounting as BoundedContextBuildAccounting,
+    BuildError as BoundedContextBuildError, BuildLimits as BoundedContextBuildLimits,
+    COUNT_OPERATION_ID as BOUNDED_CONTEXT_COUNT_OPERATION_ID,
+    CountResult as BoundedContextCountResult, OperationIdentity as BoundedContextOperationIdentity,
+    PLAN_ID as BOUNDED_CONTEXT_PLAN_ID, ReduceAccounting as BoundedContextReduceAccounting,
+    ReduceActualCounters as BoundedContextActualCounters, ReduceError as BoundedContextReduceError,
+    ReduceLimits as BoundedContextReduceLimits, ReduceUpperBounds as BoundedContextUpperBounds,
+};
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,
     BuildError as FixedClassSandwichBuildError, BuildLimits as FixedClassSandwichBuildLimits,

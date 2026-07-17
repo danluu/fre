@@ -5,10 +5,10 @@ use fre::{
     AggregateFixedClassSandwichSemantics, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
     AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
-    PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
+    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -215,6 +215,7 @@ fn continuation_details(
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
+        | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
@@ -1726,6 +1727,137 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
             "pattern={ineligible:?}"
         );
     }
+}
+
+#[test]
+fn rebar_row_curated_10_bounded_repeat_context_selects_linear_count() {
+    // rebar-row:curated/10-bounded-repeat/context@rust/regex
+    let pattern = r"[A-Za-z]{10}\s+[\s\S]{0,100}Result[\s\S]{0,100}\s+[A-Za-z]{10}";
+    let haystack = b"prefix ABCDEFGHIJ 12Result34 KLMNOPQRST suffix\nUVWXYZabcd Result efghijklMN";
+    let expected = upstream_profile(pattern, haystack, false, false);
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(regex.build_report().plan, AggregatePlanKind::BoundedContext);
+    assert!(regex.build_report().bounded_context_planner_work > 0);
+    assert!(matches!(
+        regex.build_report().plan_identity,
+        AggregatePlanIdentity::BoundedContext(identity)
+            if identity.kernel.plan_id == fre::BOUNDED_CONTEXT_PLAN_ID
+    ));
+    let counted = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
+    assert!(matches!(
+        &counted.report().details,
+        AggregateExecutionDetails::BoundedContext(_)
+    ));
+}
+
+#[test]
+fn rebar_row_curated_10_bounded_repeat_context_exact_limit_and_one_below() {
+    // rebar-row:curated/10-bounded-repeat/context@rust/regex
+    // Hand calculation, not SUT output: `[a-z]{2}\s+.{0,2}R.{0,2}\s+[a-z]{2}`
+    // on `aa R bb` has N=7, L=1, T=2 and S=12*floor(7/3)=24.
+    // Thus W=21*7+11*1+3*24+40=270. Limit 270 admits complete span
+    // 0..7/count 1; limit 269 refuses before allocation/traversal with no fallback.
+    let regex = aggregate_builder(r"[a-z]{2}\s+[\s\S]{0,2}R[\s\S]{0,2}\s+[a-z]{2}")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(regex.build_report().plan, AggregatePlanKind::BoundedContext);
+    let mut exact = AggregateRunLimits::default();
+    exact.bounded_context.max_work = 270;
+    assert_eq!(regex.count_value(b"aa R bb", exact).unwrap(), 1);
+    exact.bounded_context.max_work = 269;
+    let error = regex.count_value(b"aa R bb", exact).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::BoundedContext(BoundedContextReduceError::WorkLimit {
+            needed: 270,
+            limit: 269,
+        })
+    ));
+}
+
+#[test]
+fn rebar_row_curated_10_bounded_repeat_context_complete_span_matrix() {
+    // rebar-row:curated/10-bounded-repeat/context@rust/regex
+    // Complete spans, rather than counts, cover captures, assertions, folding,
+    // malformed UTF-8, complement/intersection classes, empty language, and
+    // sliced boundary windows. Ineligible shapes remain on their old identity.
+    let cases: [(&str, &[u8], bool); 7] = [
+        (
+            r"(?P<all>[A-Za-z]{2} +[\s\S]{0,2}(?P<lit>R)[\s\S]{0,2} +[A-Za-z]{2})",
+            b"aa R bb--cc 1R2 dd",
+            false,
+        ),
+        (
+            r"\A[a-z]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[a-z]{2}\z",
+            b"aa R bb",
+            false,
+        ),
+        (
+            r"[a-z]{2} +[\s\S]{0,2}r[\s\S]{0,2} +[a-z]{2}",
+            b"AA R bb",
+            true,
+        ),
+        (
+            r"[a-z]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[a-z]{2}",
+            b"aa \xFFR\xFE bb",
+            false,
+        ),
+        (
+            r"[a-z&&[^q]]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[^0-9 ]{2}",
+            b"aa 1R2 bb",
+            false,
+        ),
+        (
+            r"[a&&b]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[a-z]{2}",
+            b"aa R bb",
+            false,
+        ),
+        (
+            r"[a-z]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[a-z]{2}",
+            b"xxaa R bbyy",
+            false,
+        ),
+    ];
+    for (pattern, haystack, case_insensitive) in cases {
+        let expected = upstream_profile(pattern, haystack, case_insensitive, false);
+        let spans = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .build_spans()
+            .unwrap()
+            .spans(haystack, AggregateRunLimits::default())
+            .unwrap();
+        let actual = spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "pattern={pattern:?}");
+    }
+
+    let whole = b"xxaa R bbyy";
+    let window = &whole[2..9];
+    let pattern = r"[a-z]{2} +[\s\S]{0,2}R[\s\S]{0,2} +[a-z]{2}";
+    let expected = upstream_profile(pattern, window, false, false);
+    let spans = aggregate_builder(pattern)
+        .unicode(false)
+        .build_spans()
+        .unwrap()
+        .spans(window, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(
+        spans
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]

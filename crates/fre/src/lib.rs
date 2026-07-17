@@ -38,13 +38,13 @@ mod text_set;
 mod unicode_word_run;
 
 pub use aggregate::{
-    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
-    AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
-    AggregateCaptureSemantics, AggregateCompileRegex, AggregateContinuationIdentity,
-    AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
-    AggregateExactLiteralIdentity, AggregateExactLiteralSemantics, AggregateExecutionDetails,
-    AggregateExecutionError, AggregateExecutionReport, AggregateExecutionSource,
-    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
+    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBoundedContextIdentity, AggregateBuildAccounting,
+    AggregateBuildError, AggregateBuildLimits, AggregateBuildReport, AggregateBuilder,
+    AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateCountResult, AggregateExactLiteralIdentity, AggregateExactLiteralSemantics,
+    AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionReport,
+    AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichIdentity, AggregateFixedClassSandwichSemantics,
     AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregatePrefixClassAlternationIdentity, AggregateRunLimits,
@@ -91,11 +91,15 @@ pub use fre_capture_lab::{
 };
 pub use fre_kernels::{
     BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CLASS_SEQUENCE_PLAN_ID,
+    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
     BoundedClassSequenceActualCounters, BoundedClassSequenceBuildAccounting,
     BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
     BoundedClassSequenceOperationIdentity, BoundedClassSequenceReduceAccounting,
     BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
-    BoundedClassSequenceUpperBounds, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+    BoundedClassSequenceUpperBounds, BoundedContextActualCounters, BoundedContextBuildAccounting,
+    BoundedContextBuildError, BoundedContextBuildLimits, BoundedContextOperationIdentity,
+    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedContextUpperBounds, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
     FIXED_CLASS_SANDWICH_PLAN_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
     FixedClassSandwichActualCounters, FixedClassSandwichBuildAccounting,
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
