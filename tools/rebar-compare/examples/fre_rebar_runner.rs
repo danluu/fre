@@ -15,9 +15,9 @@ use std::{
 
 use bstr::ByteSlice;
 use fre::{
-    AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport, AggregateManyBuilder,
-    AggregateManyPlanKind, AggregatePlanKind, PlanKind, PortableSearchSession, SearchLimits,
-    SearchSessionLimits,
+    AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
+    AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanKind, PlanKind,
+    PortableSearchSession, SearchLimits, SearchSessionLimits,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
@@ -71,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-fixed-class-sandwich-v1-structural-quota-v4 report={REPORT_SCHEMA} aggregate-explain=13 aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-structural-quota-v4 report={REPORT_SCHEMA} aggregate-explain=14 aggregate-many=compile+count+count-spans performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -510,23 +510,33 @@ fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
 }
 
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
-    match (model, report.plan) {
-        ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
-        ("compile", AggregatePlanKind::UnicodeScalarClass) => {
+    let sparse = matches!(
+        report.build,
+        AggregateBuildAccounting::SparseFiniteLiteral(_)
+    );
+    match (model, report.plan, sparse) {
+        ("compile", AggregatePlanKind::ExactLiteral, _) => "compile-aggregate-exact-literal",
+        ("compile", AggregatePlanKind::UnicodeScalarClass, _) => {
             "compile-aggregate-unicode-scalar-class"
         }
-        ("compile", AggregatePlanKind::FixedClassSandwich) => {
+        ("compile", AggregatePlanKind::FixedClassSandwich, _) => {
             "compile-aggregate-fixed-class-sandwich"
         }
-        ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
-        ("compile", AggregatePlanKind::ContinuationProgram) => {
+        ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
+            "compile-aggregate-finite-literal-sparse"
+        }
+        ("compile", AggregatePlanKind::FiniteLiteralDfa, false) => {
+            "compile-aggregate-finite-literal-dfa"
+        }
+        ("compile", AggregatePlanKind::ContinuationProgram, _) => {
             "compile-aggregate-continuation-program"
         }
-        (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
-        (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
-        (_, AggregatePlanKind::FixedClassSandwich) => "aggregate-fixed-class-sandwich",
-        (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
+        (_, AggregatePlanKind::ExactLiteral, _) => "aggregate-exact-literal",
+        (_, AggregatePlanKind::UnicodeScalarClass, _) => "aggregate-unicode-scalar-class",
+        (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
+        (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
+        (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
     }
 }
 

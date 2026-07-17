@@ -5,7 +5,7 @@ use regex_syntax::utf8::Utf8Sequences;
 
 use crate::accounting::CompileAccounting;
 use crate::error::{add, enforce, mul};
-use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program};
+use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet};
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
 /// Explicit semantic profile asserted by direct HIR callers.
@@ -14,7 +14,7 @@ use crate::{CompileLimits, Error, Resource, Unsupported};
 /// empty HIR cannot reveal whether Unicode mode was enabled. Passing this
 /// token asserts both the pinned parser configuration and the empty-match
 /// boundary policy. Unicode-on callers receive literals, byte classes, Unicode
-/// scalar classes lowered to canonical UTF-8 paths, every pinned look
+/// scalar classes retained as bounded scalar-consuming transitions, every pinned look
 /// assertion, and their regular composition.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RustByteProfile {
@@ -27,7 +27,7 @@ impl RustByteProfile {
     pub const PINNED_1_12_4: Self = Self { unicode: false };
 
     /// Pinned Unicode-on Rust-bytes profile with `utf8(false)` and
-    /// `utf8_empty(false)`, with scalar classes lowered to canonical UTF-8.
+    /// `utf8_empty(false)`, with scalar classes matched at canonical UTF-8 boundaries.
     /// Positive Unicode word boundaries additionally require valid UTF-8 at
     /// operation admission.
     pub const PINNED_1_12_4_UNICODE_ON_BYTE_STABLE: Self = Self { unicode: true };
@@ -163,12 +163,16 @@ impl CompiledRegex {
             limits.max_program_states,
             Resource::ProgramStates,
         )?;
-        let (epsilon_order, split_rank, split_count) = certify_program(&insts, &mut budget)?;
+        let certificate = certify_program(&insts, &mut budget)?;
+        // `program_bytes` visits every instruction to include each deeply
+        // owned scalar-range box in the exact retained-byte total.
+        budget.charge(insts.len())?;
         let program_bytes = add(
             program_bytes(
+                &insts,
                 insts.capacity(),
-                epsilon_order.capacity(),
-                split_rank.capacity(),
+                certificate.epsilon_order.capacity(),
+                certificate.split_rank.capacity(),
             )?,
             required_suffixes.retained_bytes()?,
             Resource::ProgramBytes,
@@ -180,12 +184,18 @@ impl CompiledRegex {
         )?;
         budget.accounting.program_states = insts.len();
         budget.accounting.program_bytes = program_bytes;
+        budget.accounting.execution_state_work = certificate.execution_state_work;
+        budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
+        budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
         let program = Program {
             insts,
             entry,
-            epsilon_order,
-            split_rank,
-            split_count,
+            epsilon_order: certificate.epsilon_order,
+            split_rank: certificate.split_rank,
+            split_count: certificate.split_count,
+            execution_state_work: certificate.execution_state_work,
+            has_scalar_transition: certificate.has_scalar_transition,
+            max_scalar_search_checks: certificate.max_scalar_search_checks,
         };
         let plan_id = plan_identity(&program, profile, &mut budget)?;
         let accounting = budget.finish();
@@ -245,6 +255,9 @@ impl CompileBudget {
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
+                execution_state_work: 0,
+                has_scalar_transitions: false,
+                max_scalar_search_checks: 0,
                 work: 0,
             },
             current_temporary_states: 0,
@@ -636,6 +649,7 @@ fn validate_repetition(repetition: &Repetition, budget: &mut CompileBudget) -> R
 
 struct Builder<'a> {
     slots: Vec<Inst>,
+    scalar_range_bytes: usize,
     state_limit: usize,
     profile: RustByteProfile,
     capture_policy: CapturePolicy,
@@ -651,6 +665,7 @@ impl<'a> Builder<'a> {
     ) -> Self {
         Self {
             slots: Vec::new(),
+            scalar_range_bytes: 0,
             state_limit,
             profile,
             capture_policy,
@@ -658,9 +673,37 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn enforce_program_shape(&self, states: usize, scalar_range_bytes: usize) -> Result<(), Error> {
+        enforce(states, self.state_limit, Resource::ProgramStates)?;
+        let state_metadata_bytes = mul(2, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
+        let state_bytes = mul(
+            states,
+            add(
+                core::mem::size_of::<Inst>(),
+                state_metadata_bytes,
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
+            self.budget.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )
+    }
+
     fn push(&mut self, inst: Inst) -> Result<usize, Error> {
         let required = add(self.slots.len(), 1, Resource::ProgramStates)?;
-        enforce(required, self.state_limit, Resource::ProgramStates)?;
+        let added_scalar_bytes = match &inst {
+            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        let scalar_range_bytes = add(
+            self.scalar_range_bytes,
+            added_scalar_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape(required, scalar_range_bytes)?;
         self.budget.acquire_state()?;
         self.slots
             .try_reserve(1)
@@ -670,7 +713,63 @@ impl<'a> Builder<'a> {
             })?;
         let index = self.slots.len();
         self.slots.push(inst);
+        self.scalar_range_bytes = scalar_range_bytes;
         Ok(index)
+    }
+
+    fn fill_unfilled(&mut self, index: usize, inst: Inst) -> Result<(), Error> {
+        if !matches!(self.slots.get(index), Some(Inst::Unfilled)) {
+            return Err(Error::InternalInvariant(
+                "compiler attempted to replace a filled state",
+            ));
+        }
+        let added_scalar_bytes = match &inst {
+            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        let scalar_range_bytes = add(
+            self.scalar_range_bytes,
+            added_scalar_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
+        self.slots[index] = inst;
+        self.scalar_range_bytes = scalar_range_bytes;
+        Ok(())
+    }
+
+    /// Check both persistent space and construction work before cloning a
+    /// scalar range allocation into a progress-product state.
+    fn preflight_progress_fill(&mut self, index: usize, source: &Inst) -> Result<(), Error> {
+        if !matches!(self.slots.get(index), Some(Inst::Unfilled)) {
+            return Err(Error::InternalInvariant(
+                "compiler attempted to replace a filled state",
+            ));
+        }
+        let added_scalar_bytes = match source {
+            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        let scalar_range_bytes = add(
+            self.scalar_range_bytes,
+            added_scalar_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
+        if let Inst::ConsumeScalar { scalars, .. } = source {
+            self.budget.charge(scalars.len())?;
+        }
+        Ok(())
+    }
+
+    fn preflight_scalar_set(&self, range_count: usize) -> Result<(), Error> {
+        let states = add(self.slots.len(), 1, Resource::ProgramStates)?;
+        let scalar_range_bytes = add(
+            self.scalar_range_bytes,
+            ScalarSet::required_bytes(range_count)?,
+            Resource::ProgramBytes,
+        )?;
+        self.enforce_program_shape(states, scalar_range_bytes)
     }
 
     fn finish(self) -> Result<Vec<Inst>, Error> {
@@ -762,29 +861,29 @@ impl<'a> Builder<'a> {
         continuation: usize,
     ) -> Result<usize, Error> {
         if self.profile.unicode {
-            let mut fallback = None;
-            for range in class.ranges() {
-                // These paths are disjoint. Stable source order affects only
-                // plan identity, not leftmost-first selection.
-                for sequence in Utf8Sequences::new(range.start(), range.end()) {
-                    let mut next = continuation;
-                    for byte_range in sequence.as_slice().iter().rev() {
-                        self.budget
-                            .charge(inclusive_byte_width(byte_range.start, byte_range.end)?)?;
-                        let mut bytes = ByteSet::empty();
-                        bytes.insert_range(byte_range.start, byte_range.end);
-                        next = self.push(Inst::Consume { bytes, next })?;
-                    }
-                    fallback = Some(match fallback {
-                        None => next,
-                        Some(previous) => self.push(Inst::Split {
-                            preferred: next,
-                            fallback: previous,
-                        })?,
-                    });
-                }
+            self.budget.charge(class.ranges().len())?;
+            let mut next_by_width = [continuation; 4];
+            let mut tail = continuation;
+            let mut continuation_bytes = ByteSet::empty();
+            continuation_bytes.insert_range(0x80, 0xBF);
+            let maximum_width = class
+                .ranges()
+                .last()
+                .map_or(0, |range| range.end().len_utf8());
+            for slot in next_by_width.iter_mut().take(maximum_width).skip(1) {
+                self.budget.charge(inclusive_byte_width(0x80, 0xBF)?)?;
+                tail = self.push(Inst::Consume {
+                    bytes: continuation_bytes,
+                    next: tail,
+                })?;
+                *slot = tail;
             }
-            return fallback.ok_or(Error::InternalInvariant("empty Unicode scalar class"));
+            self.preflight_scalar_set(class.ranges().len())?;
+            let scalars = ScalarSet::from_unicode_class(class)?;
+            return self.push(Inst::ConsumeScalar {
+                scalars,
+                next_by_width,
+            });
         }
 
         let mut entry = None;
@@ -949,9 +1048,12 @@ impl<'a> Builder<'a> {
             if matches!(inst, Inst::Match) {
                 continue;
             }
-            self.slots[zero_map[pc]] = translate_progress(inst, &zero_map, &consumed_map, false)?;
-            self.slots[consumed_map[pc]] =
-                translate_progress(inst, &zero_map, &consumed_map, true)?;
+            self.preflight_progress_fill(zero_map[pc], inst)?;
+            let zero = translate_progress(inst, &zero_map, &consumed_map, false)?;
+            self.fill_unfilled(zero_map[pc], zero)?;
+            self.preflight_progress_fill(consumed_map[pc], inst)?;
+            let consumed = translate_progress(inst, &zero_map, &consumed_map, true)?;
+            self.fill_unfilled(consumed_map[pc], consumed)?;
         }
         zero_map
             .get(fragment_entry)
@@ -980,6 +1082,19 @@ fn translate_progress(
             bytes: *bytes,
             next: mapped(consumed, *next)?,
         }),
+        Inst::ConsumeScalar {
+            scalars,
+            next_by_width,
+        } => {
+            let mut translated = [0_usize; 4];
+            for (destination, source) in translated.iter_mut().zip(next_by_width) {
+                *destination = mapped(consumed, *source)?;
+            }
+            Ok(Inst::ConsumeScalar {
+                scalars: scalars.try_clone()?,
+                next_by_width: translated,
+            })
+        }
         Inst::Assert { assertion, next } => Ok(Inst::Assert {
             assertion: *assertion,
             next: mapped(same, *next)?,
@@ -994,7 +1109,14 @@ fn translate_progress(
     }
 }
 
-type ProgramCertificate = (Vec<usize>, Vec<usize>, usize);
+struct ProgramCertificate {
+    epsilon_order: Vec<usize>,
+    split_rank: Vec<usize>,
+    split_count: usize,
+    execution_state_work: usize,
+    has_scalar_transition: bool,
+    max_scalar_search_checks: usize,
+}
 
 fn certify_program(
     insts: &[Inst],
@@ -1073,6 +1195,9 @@ fn certify_program(
     // the exact state-width allocation as the persistent split-rank table.
     let mut split_rank = outgoing;
     let mut split_count = 0_usize;
+    let mut execution_state_work = 0_usize;
+    let mut has_scalar_transition = false;
+    let mut max_scalar_search_checks = 0_usize;
     for (rank, inst) in split_rank.iter_mut().zip(insts) {
         budget.charge(1)?;
         if matches!(inst, Inst::Split { .. }) {
@@ -1081,8 +1206,44 @@ fn certify_program(
         } else {
             *rank = NO_SPLIT_RANK;
         }
+        let transitions = execution_transitions(
+            inst,
+            &mut has_scalar_transition,
+            &mut max_scalar_search_checks,
+        )?;
+        execution_state_work = add(
+            add(execution_state_work, 1, Resource::ExecutionWork)?,
+            transitions,
+            Resource::ExecutionWork,
+        )?;
     }
-    Ok((order, split_rank, split_count))
+    Ok(ProgramCertificate {
+        epsilon_order: order,
+        split_rank,
+        split_count,
+        execution_state_work,
+        has_scalar_transition,
+        max_scalar_search_checks,
+    })
+}
+
+fn execution_transitions(
+    inst: &Inst,
+    has_scalar_transition: &mut bool,
+    max_scalar_search_checks: &mut usize,
+) -> Result<usize, Error> {
+    match inst {
+        Inst::Unfilled => Err(Error::InternalInvariant("unfilled execution state")),
+        Inst::Fail | Inst::Match => Ok(0),
+        Inst::Consume { .. } | Inst::Assert { .. } => Ok(1),
+        Inst::ConsumeScalar { scalars, .. } => {
+            *has_scalar_transition = true;
+            let checks = scalars.max_search_checks();
+            *max_scalar_search_checks = (*max_scalar_search_checks).max(checks);
+            add(1, checks, Resource::ExecutionWork)
+        }
+        Inst::Split { .. } => Ok(2),
+    }
 }
 
 fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
@@ -1092,13 +1253,34 @@ fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
             preferred,
             fallback,
         } => [Some(*preferred), Some(*fallback)],
-        Inst::Unfilled | Inst::Fail | Inst::Match | Inst::Consume { .. } => [None, None],
+        Inst::Unfilled
+        | Inst::Fail
+        | Inst::Match
+        | Inst::Consume { .. }
+        | Inst::ConsumeScalar { .. } => [None, None],
     };
     targets.into_iter().flatten()
 }
 
-fn program_bytes(states: usize, order: usize, ranks: usize) -> Result<usize, Error> {
-    let insts = mul(states, core::mem::size_of::<Inst>(), Resource::ProgramBytes)?;
+fn program_bytes(
+    insts: &[Inst],
+    inst_capacity: usize,
+    order: usize,
+    ranks: usize,
+) -> Result<usize, Error> {
+    let state_bytes = mul(
+        inst_capacity,
+        core::mem::size_of::<Inst>(),
+        Resource::ProgramBytes,
+    )?;
+    let scalar_bytes = insts.iter().try_fold(0_usize, |total, inst| {
+        let bytes = match inst {
+            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        add(total, bytes, Resource::ProgramBytes)
+    })?;
+    let insts = add(state_bytes, scalar_bytes, Resource::ProgramBytes)?;
     let order = mul(order, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
     let ranks = mul(ranks, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
     add(
@@ -1121,6 +1303,9 @@ fn plan_identity(
     hash_usize(&mut second, program.entry);
     for inst in &program.insts {
         budget.charge(1)?;
+        if let Inst::ConsumeScalar { scalars, .. } = inst {
+            budget.charge(scalars.len())?;
+        }
         hash_inst(&mut first, inst);
         hash_inst(&mut second, inst);
     }
@@ -1141,6 +1326,20 @@ fn hash_inst(hash: &mut StableHash, inst: &Inst) {
                 hash.bytes(&word.to_le_bytes());
             }
             hash_usize(hash, *next);
+        }
+        Inst::ConsumeScalar {
+            scalars,
+            next_by_width,
+        } => {
+            hash.byte(6);
+            hash_usize(hash, scalars.len());
+            for (start, end) in scalars.ranges() {
+                hash.bytes(&start.to_le_bytes());
+                hash.bytes(&end.to_le_bytes());
+            }
+            for next in next_by_width {
+                hash_usize(hash, *next);
+            }
         }
         Inst::Assert { assertion, next } => {
             hash.byte(4);

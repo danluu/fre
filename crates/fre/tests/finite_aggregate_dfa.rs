@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
 
 use fre::{
-    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
-    AggregateOperation, AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits,
-    AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
+    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
+    AggregateBuildLimits, AggregateBuilder, AggregateExecutionDetails, AggregateExecutionSource,
+    AggregateFiniteLiteralSemantics, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
+    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SparseOrderedLiteralAggregateReduceError,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -157,8 +158,8 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         compiled.build_report().plan,
         AggregatePlanKind::FiniteLiteralDfa
     );
-    assert_eq!(compiled.build_report().schema_version, 13);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 13);
+    assert_eq!(compiled.build_report().schema_version, 14);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 14);
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";
@@ -260,6 +261,126 @@ fn alternation(count: usize) -> String {
     }
     pattern.push(')');
     pattern
+}
+
+fn unicode_alternation(count: usize) -> (String, usize, Vec<String>) {
+    let leaders = ('a'..='z').chain('A'..='Z').collect::<Vec<_>>();
+    let maximum_count = leaders.len().checked_add(2).unwrap();
+    assert!((3..=maximum_count).contains(&count));
+    let root_words = count.checked_sub(2).unwrap();
+    let mut words = (0..root_words)
+        .map(|index| format!("{}{index:03}雪", leaders[index]))
+        .collect::<Vec<_>>();
+    let first = words[0].clone();
+    words.push(first.strip_suffix('雪').unwrap().to_owned());
+    words.push(first);
+    let pattern_bytes = words.iter().map(String::len).sum();
+    (format!("(?:{})", words.join("|")), pattern_bytes, words)
+}
+
+#[test]
+fn sparse_finite_facade_preserves_unicode_priority_and_frozen_cell_quota() {
+    let (pattern, pattern_bytes, words) = unicode_alternation(32);
+    let mut haystack = b"\xFF--".to_vec();
+    haystack.extend_from_slice(words[7].as_bytes());
+    haystack.extend_from_slice(b"--\x80--");
+    haystack.extend_from_slice(words[31].as_bytes());
+    let expected = unicode_oracle(&pattern, &haystack);
+    let mut build_limits = AggregateBuildLimits::default();
+    // The sparse preflight uses at most one packed edge per literal byte.
+    // The same frozen cell ceiling is too small for a dense row per state.
+    build_limits.finite_literal.max_dfa_cells = pattern_bytes;
+
+    let count = unicode_builder(&pattern)
+        .limits(build_limits)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::SparseFiniteLiteral(build) = count.build_report().build else {
+        panic!("cell-bound root alternative did not select the sparse representation")
+    };
+    assert_eq!(build.sparse_edges_upper_bound, pattern_bytes);
+    assert!(build.trie_states_actual > 1);
+    assert!(matches!(
+        count.build_report().plan_identity,
+        AggregatePlanIdentity::FiniteLiteral(identity)
+            if identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.semantics
+                    == AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+    ));
+    assert_eq!(
+        count
+            .count_value(&haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected.0
+    );
+
+    let span = unicode_builder(&pattern)
+        .limits(build_limits)
+        .build_span_sum()
+        .unwrap();
+    let audited = span
+        .span_sum(&haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(audited.value(), expected.1);
+    let AggregateExecutionDetails::SparseFiniteLiteral {
+        upper_bounds,
+        actual,
+    } = &audited.report().details
+    else {
+        panic!("sparse span-sum executed another representation")
+    };
+    assert!(actual.edge_search_checks <= upper_bounds.edge_search_checks);
+    assert!(actual.failure_steps <= upper_bounds.failure_steps);
+    assert!(actual.total_work <= upper_bounds.total_work);
+
+    let exact_work = usize::try_from(upper_bounds.total_work).unwrap();
+    let mut exact_run = AggregateRunLimits::default();
+    exact_run.finite_literal.max_total_work = exact_work;
+    span.span_sum_value(&haystack, exact_run).unwrap();
+    exact_run.finite_literal.max_total_work = exact_work - 1;
+    let error = span.span_sum_value(&haystack, exact_run).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::SparseFiniteLiteral(
+            SparseOrderedLiteralAggregateReduceError::TotalWorkLimit { .. }
+        )
+    ));
+
+    build_limits.finite_literal.max_dfa_cells = pattern_bytes - 1;
+    let one_below = unicode_builder(pattern)
+        .limits(build_limits)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        one_below.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+}
+
+#[test]
+fn sparse_finite_construction_scales_beyond_old_hir_stack_and_state_ceilings() {
+    let count = 65_537;
+    let mut pattern = String::from("(?:");
+    for index in 0..count {
+        if index != 0 {
+            pattern.push('|');
+        }
+        write!(&mut pattern, "x{index:08x}").unwrap();
+    }
+    pattern.push(')');
+    let pattern_bytes = count * 9;
+    let mut limits = AggregateBuildLimits::default();
+    limits.finite_literal.max_patterns = count;
+    limits.finite_literal.max_pattern_bytes = pattern_bytes;
+    limits.finite_literal.max_dfa_cells = pattern_bytes;
+    let compiled = builder(pattern).limits(limits).build_compile().unwrap();
+    let AggregateBuildAccounting::SparseFiniteLiteral(build) = compiled.build_report().build else {
+        panic!("large flat literal language did not select sparse construction")
+    };
+    assert!(compiled.build_report().syntax.hir_nodes > 65_536);
+    assert!(build.trie_states_actual > 65_536);
+    assert_eq!(build.sparse_edges_actual + 1, build.trie_states_actual);
+    assert!(build.sparse_edges_actual <= build.sparse_edges_upper_bound);
 }
 
 fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {

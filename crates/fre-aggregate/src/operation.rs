@@ -4,7 +4,7 @@ use core::ops::Range;
 use crate::accounting::ExecutionAccounting;
 use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes};
 use crate::error::{add, enforce, mul};
-use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program};
+use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program, decode_first_scalar};
 use crate::{Error, OperationLimits, Resource};
 
 /// Half-open absolute byte span in the original haystack.
@@ -524,6 +524,10 @@ struct Requirements {
 }
 
 impl Requirements {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each storage strategy keeps its exact work and byte bounds beside admission"
+    )]
     fn new<const OBSERVED_WORK: bool>(
         program: &Program,
         boundaries: usize,
@@ -532,21 +536,11 @@ impl Requirements {
         limits: OperationLimits,
     ) -> Result<Self, Error> {
         let states = program.insts.len();
-        let per_boundary = program.insts.iter().try_fold(0_usize, |total, inst| {
-            let transitions = match inst {
-                Inst::Unfilled => {
-                    return Err(Error::InternalInvariant("unfilled execution state"));
-                }
-                Inst::Fail | Inst::Match => 0,
-                Inst::Consume { .. } | Inst::Assert { .. } => 1,
-                Inst::Split { .. } => 2,
-            };
-            add(
-                add(total, 1, Resource::ExecutionWork)?,
-                transitions,
-                Resource::ExecutionWork,
-            )
-        })?;
+        let per_boundary = add(
+            program.execution_state_work(),
+            usize::from(program.contains_scalar_transition()),
+            Resource::ExecutionWork,
+        )?;
         let build_work = mul(per_boundary, boundaries, Resource::ExecutionWork)?;
         let scan_base = mul(
             mul(boundaries, 4, Resource::ExecutionWork)?,
@@ -672,10 +666,15 @@ impl ReverseRowRequirements {
         let (storage, record_bytes, replay_bound) = if endpoint_record < decision_record {
             (RowStorage::ReachableEndpoints, endpoint_record, 0)
         } else {
+            let replay_factor = add(
+                4,
+                program.max_scalar_search_checks(),
+                Resource::ExecutionWork,
+            )?;
             let replay = mul(
                 mul(
                     mul(program.insts.len(), boundaries, Resource::ExecutionWork)?,
-                    4,
+                    replay_factor,
                     Resource::ExecutionWork,
                 )?,
                 passes,
@@ -918,6 +917,16 @@ impl FullTable {
             // no input byte and therefore cannot follow a Consume edge.
             let next_row = later_rows.get(..states).unwrap_or(&[]);
             let input = haystack.get(position).copied();
+            let scalar = if program.contains_scalar_transition() {
+                charge_transition::<OBSERVED_WORK>(
+                    accounting,
+                    requirements.work_bound,
+                    limits.max_work,
+                )?;
+                haystack.get(position..).and_then(decode_first_scalar)
+            } else {
+                None
+            };
             for &pc in &program.epsilon_order {
                 charge_state::<OBSERVED_WORK>(
                     accounting,
@@ -938,6 +947,43 @@ impl FullTable {
                         )?;
                         if input.is_some_and(|byte| bytes.contains(byte)) {
                             next_row[*next]
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::ConsumeScalar {
+                        scalars,
+                        next_by_width,
+                    } => {
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
+                        let Some(scalar) = scalar else {
+                            row[pc] = 0;
+                            continue;
+                        };
+                        let matches = scalars.contains_with(scalar, || {
+                            charge_transition::<OBSERVED_WORK>(
+                                accounting,
+                                requirements.work_bound,
+                                limits.max_work,
+                            )
+                        })?;
+                        if matches {
+                            let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                                Error::InternalInvariant("Unicode scalar has zero byte width"),
+                            )?;
+                            let next =
+                                *next_by_width
+                                    .get(width_index)
+                                    .ok_or(Error::InternalInvariant(
+                                        "Unicode scalar width outside dispatch",
+                                    ))?;
+                            *next_row.get(next).ok_or(Error::InternalInvariant(
+                                "scalar successor state outside table row",
+                            ))?
                         } else {
                             0
                         }
@@ -1029,14 +1075,18 @@ impl RowStore {
         let allocated_store = store.capacity();
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
         let states = program.insts.len();
-        let row_words = add(states, states, Resource::RandomAccessBytes)?;
-        let mut rows = zeroed_usizes(row_words, Resource::RandomAccessBytes)?;
+        let row_count = 2;
+        let mut rows = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut row_words = 0_usize;
+        for row in &mut rows[..row_count] {
+            *row = zeroed_usizes(states, Resource::RandomAccessBytes)?;
+            row_words = add(row_words, row.capacity(), Resource::RandomAccessBytes)?;
+        }
         let row_bytes = mul(
-            rows.capacity(),
+            row_words,
             core::mem::size_of::<usize>(),
             Resource::RandomAccessBytes,
         )?;
-        let (mut row, mut next_row) = rows.split_at_mut(states);
         let build_scratch = row_bytes;
         enforce(
             build_scratch,
@@ -1061,13 +1111,17 @@ impl RowStore {
             let terminal_record = store
                 .get_mut(..write_offset)
                 .ok_or(Error::InternalInvariant("terminal row outside row log"))?;
+            let (row, future_rows) = rows[..row_count]
+                .split_first_mut()
+                .ok_or(Error::InternalInvariant("row ring is empty"))?;
             Self::build_row::<false, OBSERVED_WORK>(
                 program,
+                haystack,
                 assertions,
                 haystack.len(),
                 0,
                 row,
-                next_row,
+                future_rows,
                 terminal_record,
                 storage,
                 accounting,
@@ -1080,20 +1134,24 @@ impl RowStore {
             requirements.record_bytes,
             Resource::SequentialBytes,
         )?;
-        core::mem::swap(&mut row, &mut next_row);
+        rows[..row_count].rotate_right(1);
 
         for (position, input) in haystack.iter().copied().enumerate().rev() {
             let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
             let record = store
                 .get_mut(write_offset..end)
                 .ok_or(Error::InternalInvariant("row-log write outside store"))?;
+            let (row, future_rows) = rows[..row_count]
+                .split_first_mut()
+                .ok_or(Error::InternalInvariant("row ring is empty"))?;
             Self::build_row::<true, OBSERVED_WORK>(
                 program,
+                haystack,
                 assertions,
                 position,
                 input,
                 row,
-                next_row,
+                future_rows,
                 record,
                 storage,
                 accounting,
@@ -1106,7 +1164,7 @@ impl RowStore {
                 Resource::SequentialBytes,
             )?;
             write_offset = end;
-            core::mem::swap(&mut row, &mut next_row);
+            rows[..row_count].rotate_right(1);
         }
         if write_offset != store.len() {
             return Err(Error::InternalInvariant("row-log store length mismatch"));
@@ -1280,10 +1338,17 @@ impl RowStore {
         if !seeded && !next_any {
             return Ok(false);
         }
+        let scalar = if next_any && program.contains_scalar_transition() {
+            try_charge_transition(accounting, admitted_work_bound)?;
+            haystack.get(position..).and_then(decode_first_scalar)
+        } else {
+            None
+        };
         let mut row_any = false;
         for &pc in &program.epsilon_order {
             try_charge_state(accounting, admitted_work_bound)?;
-            let value = match program.instruction(pc)? {
+            let value =
+                match program.instruction(pc)? {
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant("unfilled sparse execution state"));
                 }
@@ -1299,6 +1364,36 @@ impl RowStore {
                     try_charge_transition(accounting, admitted_work_bound)?;
                     if next_any && input.is_some_and(|byte| bytes.contains(byte)) {
                         next_row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::ConsumeScalar {
+                    scalars,
+                    next_by_width,
+                } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    if !next_any {
+                        row[pc] = 0;
+                        continue;
+                    }
+                    let Some(scalar) = scalar else {
+                        row[pc] = 0;
+                        continue;
+                    };
+                    let matches = scalars.contains_with(scalar, || {
+                        try_charge_transition(accounting, admitted_work_bound)
+                    })?;
+                    if matches {
+                        let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                            Error::InternalInvariant("Unicode scalar has zero byte width"),
+                        )?;
+                        let next = *next_by_width.get(width_index).ok_or(
+                            Error::InternalInvariant("Unicode scalar width outside dispatch"),
+                        )?;
+                        *next_row.get(next).ok_or(Error::InternalInvariant(
+                            "scalar successor state outside sparse row",
+                        ))?
                     } else {
                         0
                     }
@@ -1333,7 +1428,7 @@ impl RowStore {
                         row[*fallback]
                     }
                 }
-            };
+                };
             row[pc] = value;
             row_any |= value != 0;
         }
@@ -1351,81 +1446,133 @@ impl RowStore {
     #[inline]
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "the specialized row loop keeps borrowed buffers and exact accounting explicit"
     )]
     fn build_row<const HAS_INPUT: bool, const OBSERVED_WORK: bool>(
         program: &Program,
+        haystack: &[u8],
         assertions: AssertionContext<'_>,
         position: usize,
         input: u8,
         row: &mut [usize],
-        next_row: &[usize],
+        future_rows: &[Vec<usize>],
         record: &mut [u8],
         storage: RowStorage,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
         caller_work_limit: usize,
     ) -> Result<(), Error> {
+        let scalar = if program.contains_scalar_transition() {
+            charge_transition::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
+            if HAS_INPUT {
+                haystack.get(position..).and_then(decode_first_scalar)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let next_row = future_rows.first().map(Vec::as_slice).unwrap_or_default();
         for &pc in &program.epsilon_order {
             charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             let value = match program.instruction(pc)? {
-                Inst::Unfilled => {
-                    return Err(Error::InternalInvariant("unfilled execution state"));
-                }
-                Inst::Fail => 0,
-                Inst::Consume { bytes, next } => {
-                    charge_transition::<OBSERVED_WORK>(
-                        accounting,
-                        admitted_work_bound,
-                        caller_work_limit,
-                    )?;
-                    if HAS_INPUT && bytes.contains(input) {
-                        next_row[*next]
-                    } else {
-                        0
+                    Inst::Unfilled => {
+                        return Err(Error::InternalInvariant("unfilled execution state"));
                     }
-                }
-                Inst::Match => encode(position)?,
-                Inst::Assert { assertion, next } => {
-                    charge_assertion::<OBSERVED_WORK>(
-                        accounting,
-                        admitted_work_bound,
-                        caller_work_limit,
-                    )?;
-                    if assertions.is_match(*assertion, position)? {
-                        row[*next]
-                    } else {
-                        0
-                    }
-                }
-                Inst::Split {
-                    preferred,
-                    fallback,
-                } => {
-                    charge_transition::<OBSERVED_WORK>(
-                        accounting,
-                        admitted_work_bound,
-                        caller_work_limit,
-                    )?;
-                    let preferred_value = row[*preferred];
-                    let rank = program.split_rank[pc];
-                    if rank == NO_SPLIT_RANK {
-                        return Err(Error::InternalInvariant("split state has no decision rank"));
-                    }
-                    if preferred_value != 0 {
-                        if storage == RowStorage::SplitDecisions {
-                            set_bit(record, rank)?;
-                        }
-                        preferred_value
-                    } else {
+                    Inst::Fail => 0,
+                    Inst::Consume { bytes, next } => {
                         charge_transition::<OBSERVED_WORK>(
                             accounting,
                             admitted_work_bound,
                             caller_work_limit,
                         )?;
-                        row[*fallback]
+                        if HAS_INPUT && bytes.contains(input) {
+                            next_row[*next]
+                        } else {
+                            0
+                        }
                     }
-                }
+                    Inst::ConsumeScalar {
+                        scalars,
+                        next_by_width,
+                    } => {
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                        let Some(scalar) = scalar else {
+                            row[pc] = 0;
+                            continue;
+                        };
+                        let matches = scalars.contains_with(scalar, || {
+                            charge_transition::<OBSERVED_WORK>(
+                                accounting,
+                                admitted_work_bound,
+                                caller_work_limit,
+                            )
+                        })?;
+                        if matches {
+                            let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                                Error::InternalInvariant("Unicode scalar has zero byte width"),
+                            )?;
+                            let next =
+                                *next_by_width
+                                    .get(width_index)
+                                    .ok_or(Error::InternalInvariant(
+                                        "Unicode scalar width outside dispatch",
+                                    ))?;
+                            *next_row.get(next).ok_or(Error::InternalInvariant(
+                                "scalar successor state outside row ring",
+                            ))?
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::Match => encode(position)?,
+                    Inst::Assert { assertion, next } => {
+                        charge_assertion::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                        if assertions.is_match(*assertion, position)? {
+                            row[*next]
+                        } else {
+                            0
+                        }
+                    }
+                    Inst::Split {
+                        preferred,
+                        fallback,
+                    } => {
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                        let preferred_value = row[*preferred];
+                        let rank = program.split_rank[pc];
+                        if rank == NO_SPLIT_RANK {
+                            return Err(Error::InternalInvariant(
+                                "split state has no decision rank",
+                            ));
+                        }
+                        if preferred_value != 0 {
+                            if storage == RowStorage::SplitDecisions {
+                                set_bit(record, rank)?;
+                            }
+                            preferred_value
+                        } else {
+                            charge_transition::<OBSERVED_WORK>(
+                                accounting,
+                                admitted_work_bound,
+                                caller_work_limit,
+                            )?;
+                            row[*fallback]
+                        }
+                    }
             };
             row[pc] = value;
         }
@@ -1486,6 +1633,42 @@ impl RowStore {
                     }
                     position = add(position, 1, Resource::Boundaries)?;
                     pc = *next;
+                }
+                Inst::ConsumeScalar {
+                    scalars,
+                    next_by_width,
+                } => {
+                    let scalar = haystack
+                        .get(position..)
+                        .and_then(decode_first_scalar)
+                        .ok_or(Error::InternalInvariant(
+                            "row log selected invalid Unicode scalar path",
+                        ))?;
+                    let matches = scalars.contains_with(scalar, || {
+                        charge_replay::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )
+                    })?;
+                    if !matches {
+                        return Err(Error::InternalInvariant(
+                            "row log selected failing Unicode scalar path",
+                        ));
+                    }
+                    let width_index =
+                        scalar
+                            .len_utf8()
+                            .checked_sub(1)
+                            .ok_or(Error::InternalInvariant(
+                                "Unicode scalar has zero byte width",
+                            ))?;
+                    pc = *next_by_width
+                        .get(width_index)
+                        .ok_or(Error::InternalInvariant(
+                            "Unicode scalar width outside dispatch",
+                        ))?;
+                    position = add(position, 1, Resource::Boundaries)?;
                 }
                 Inst::Assert { assertion, next } => {
                     charge_assertion::<OBSERVED_WORK>(
@@ -1549,6 +1732,32 @@ impl RowStore {
                     }
                     position = add(position, 1, Resource::Boundaries)?;
                     pc = *next;
+                }
+                Inst::ConsumeScalar {
+                    scalars,
+                    next_by_width,
+                } => {
+                    let scalar = haystack
+                        .get(position..)
+                        .and_then(decode_first_scalar)
+                        .ok_or(Error::InternalInvariant(
+                            "sparse row log selected invalid Unicode scalar path",
+                        ))?;
+                    let matches = scalars.contains_with(scalar, || {
+                        try_charge_replay(accounting, admitted_work_bound)
+                    })?;
+                    if !matches {
+                        return Err(Error::InternalInvariant(
+                            "sparse row log selected failing Unicode scalar path",
+                        ));
+                    }
+                    let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                        Error::InternalInvariant("Unicode scalar has zero byte width"),
+                    )?;
+                    pc = *next_by_width.get(width_index).ok_or(
+                        Error::InternalInvariant("Unicode scalar width outside dispatch"),
+                    )?;
+                    position = add(position, 1, Resource::Boundaries)?;
                 }
                 Inst::Assert { assertion, next } => {
                     try_charge_assertion(accounting, admitted_work_bound)?;

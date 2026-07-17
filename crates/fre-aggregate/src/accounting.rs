@@ -12,9 +12,9 @@ pub struct CompileAccounting {
     pub capture_erasure_work: usize,
     pub literal_bytes: usize,
     pub class_ranges: usize,
-    /// Canonical variable-width UTF-8 paths produced from scalar ranges.
+    /// Canonical variable-width UTF-8 paths censused while validating scalar ranges.
     pub utf8_sequences: usize,
-    /// Byte ranges across the canonical UTF-8 paths.
+    /// Byte ranges across the canonical UTF-8 validation census.
     pub utf8_byte_ranges: usize,
     /// Supported zero-width look nodes observed exactly once during bounded
     /// validation. Repetition expansion is accounted separately by states.
@@ -27,6 +27,13 @@ pub struct CompileAccounting {
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
+    /// Exact work to evaluate every state once at one input boundary,
+    /// including each state's worst-case transition checks.
+    pub execution_state_work: usize,
+    /// Whether row construction decodes one candidate scalar per boundary.
+    pub has_scalar_transitions: bool,
+    /// Worst-case binary-search comparisons for one scalar transition.
+    pub max_scalar_search_checks: usize,
     pub work: usize,
 }
 

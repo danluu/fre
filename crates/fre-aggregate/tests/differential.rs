@@ -59,6 +59,41 @@ fn upstream_unicode(pattern: &str, haystack: &[u8]) -> Vec<Span> {
         .collect()
 }
 
+fn assert_scalar_program_compile_limits(hir: &Hir, program_states: usize, program_bytes: usize) {
+    let exact = CompileLimits {
+        max_program_states: program_states,
+        max_program_bytes: program_bytes,
+        ..CompileLimits::default()
+    };
+    CompiledRegex::from_hir(
+        hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        exact,
+    )
+    .unwrap();
+
+    let mut lower_states = exact;
+    lower_states.max_program_states -= 1;
+    expect_resource(
+        CompiledRegex::from_hir(
+            hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            lower_states,
+        ),
+        Resource::ProgramStates,
+    );
+    let mut lower_bytes = exact;
+    lower_bytes.max_program_bytes -= 1;
+    expect_resource(
+        CompiledRegex::from_hir(
+            hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            lower_bytes,
+        ),
+        Resource::ProgramBytes,
+    );
+}
+
 fn upstream_unicode_range(
     pattern: &str,
     haystack: &[u8],
@@ -420,6 +455,76 @@ fn required_suffix_sparse_rows_preserve_priority_and_exact_work_admission() {
 }
 
 #[test]
+fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
+    let pattern = r"[é雪]+ing";
+    let mut chunk = "!é雪ing!雪雪ing!éing!".as_bytes().to_vec();
+    chunk.extend_from_slice(&[0xFF, b'!', 0xE9, 0x9B, b'i', b'n', b'g', b'!']);
+    let mut haystack = Vec::new();
+    for _ in 0..128 {
+        haystack.extend_from_slice(&chunk);
+    }
+    let regex = compile_unicode(pattern);
+    let compile = regex.compile_accounting();
+    assert!(compile.has_scalar_transitions);
+    assert_eq!((compile.required_suffixes, compile.required_suffix_bytes), (1, 3));
+    let expected = upstream_unicode(pattern, &haystack);
+    let dense = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let mut limits = OperationLimits {
+        max_work: dense.certificate().work_bound - 1,
+        ..OperationLimits::default()
+    };
+    let sparse = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(expected, sparse.as_slice());
+    assert_eq!(
+        Some(RowStorage::SplitDecisions),
+        sparse.certificate().row_storage
+    );
+    assert!(sparse.accounting().replay_steps > 0);
+    assert!(sparse.accounting().transition_checks > 0);
+    assert!(sparse.accounting().work < dense.certificate().work_bound);
+
+    let exact_work = sparse.accounting().work;
+    limits.max_work = exact_work;
+    let exact = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(expected, exact.as_slice());
+    limits.max_work = exact_work - 1;
+    assert!(matches!(
+        regex.admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        ),
+        Err(Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required,
+            limit,
+        }) if required == limit + 1
+    ));
+}
+
+#[test]
 fn required_suffix_sparse_rows_choose_the_narrower_endpoint_log() {
     let pattern = (1..=40)
         .map(|length| format!(r"a{{{length}}}x"))
@@ -650,6 +755,260 @@ fn unicode_profile_and_utf8_expansion_are_identity_and_resource_dimensions() {
         ),
         Resource::Utf8ByteRanges,
     );
+}
+
+#[test]
+fn scalar_native_unicode_classes_bound_states_rows_and_search_work() {
+    let pattern = r"^\w{5}\s\w{6}\s\w{7}$";
+    let hir = parse_unicode(pattern);
+    let regex = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let compile = regex.compile_accounting();
+    assert!(compile.class_ranges > 100);
+    assert!(regex.state_count() < 128, "states={}", regex.state_count());
+    assert!(compile.has_scalar_transitions);
+    assert!(compile.execution_state_work > compile.program_states);
+    assert!(compile.max_scalar_search_checks > 1);
+
+    assert_scalar_program_compile_limits(&hir, compile.program_states, compile.program_bytes);
+
+    let cases: [&[u8]; 4] = [
+        b"alpha beta12 seven77",
+        "αβγδε привет русский".as_bytes(),
+        b"alpha beta12 seven7!",
+        b"alpha beta12 seve\xFF77",
+    ];
+    for haystack in cases {
+        let expected = upstream_unicode(pattern, haystack);
+        for strategy in STRATEGIES {
+            let actual = regex
+                .admit_spans(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(actual.iter().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    let haystack = "αβγδε привет русский".as_bytes();
+    let rows = regex
+        .admit_count(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(rows.value(), 1);
+    let certificate = rows.certificate();
+    let expected_work_bound = certificate.boundaries
+        * (compile.execution_state_work + usize::from(compile.has_scalar_transitions))
+        + certificate.boundaries * 4
+        + certificate.states * certificate.boundaries * (4 + compile.max_scalar_search_checks);
+    assert_eq!(certificate.work_bound, expected_work_bound);
+    assert_eq!(
+        certificate.random_access_bytes,
+        regex.state_count() * 2 * core::mem::size_of::<usize>()
+    );
+    assert!(rows.accounting().work <= certificate.work_bound);
+    regex
+        .admit_count(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: certificate.work_bound,
+                ..OperationLimits::default()
+            },
+        )
+        .unwrap();
+    expect_resource(
+        regex.admit_count(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: certificate.work_bound - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::ExecutionWork,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the adversarial fixture keeps compile and execution quota boundaries together"
+)]
+fn huge_scalar_class_nested_stars_preflight_clone_work_and_persistent_bytes() {
+    const RANGE_COUNT: u32 = 1 << 16;
+    let ranges = (0..RANGE_COUNT).map(|index| {
+        let scalar = char::from_u32(0x1_0000 + index * 2).expect("valid non-BMP scalar");
+        regex_syntax::hir::ClassUnicodeRange::new(scalar, scalar)
+    });
+    let mut hir = Hir::class(regex_syntax::hir::Class::Unicode(
+        regex_syntax::hir::ClassUnicode::new(ranges),
+    ));
+    let generous = CompileLimits {
+        max_program_bytes: 128 << 20,
+        max_work: 64 << 20,
+        ..CompileLimits::default()
+    };
+    let plain = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        generous,
+    )
+    .unwrap()
+    .compile_accounting();
+    for _ in 0..2 {
+        hir = Hir::repetition(regex_syntax::hir::Repetition {
+            min: 0,
+            max: None,
+            greedy: true,
+            sub: Box::new(hir),
+        });
+    }
+
+    let regex = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        generous,
+    )
+    .unwrap();
+    let compile = regex.compile_accounting();
+    assert_eq!(
+        compile.class_ranges,
+        usize::try_from(RANGE_COUNT).expect("range count fits usize")
+    );
+    assert!(compile.program_bytes > plain.program_bytes + (4 << 20));
+    assert!(
+        compile.work
+            > plain.work + usize::try_from(RANGE_COUNT).expect("range count fits usize") * 4
+    );
+
+    let exact = CompileLimits {
+        max_program_bytes: compile.program_bytes,
+        max_work: compile.work,
+        ..generous
+    };
+    CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        exact,
+    )
+    .unwrap();
+    expect_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits {
+                max_program_bytes: compile.program_bytes - 1,
+                ..generous
+            },
+        ),
+        Resource::ProgramBytes,
+    );
+    expect_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits {
+                max_work: compile.work - 1,
+                ..generous
+            },
+        ),
+        Resource::CompileWork,
+    );
+    expect_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits {
+                max_program_bytes: 1,
+                ..generous
+            },
+        ),
+        Resource::ProgramBytes,
+    );
+
+    let haystack = "𐀀x𐀂".as_bytes();
+    for strategy in STRATEGIES {
+        let admitted = regex
+            .admit_count(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let work = admitted.accounting().work;
+        assert!(work > 0);
+        assert_eq!(
+            admitted.value(),
+            regex
+                .count_value(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits {
+                        max_work: work,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap()
+        );
+        expect_resource(
+            regex.count_value(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: work - 1,
+                    ..OperationLimits::default()
+                },
+            ),
+            Resource::ExecutionWork,
+        );
+    }
+}
+
+#[test]
+fn scalar_transitions_reject_malformed_sequences_without_crossing_byte_boundaries() {
+    let pattern = r"[é雪🦀]+";
+    let regex = compile_unicode(pattern);
+    let cases: [&[u8]; 8] = [
+        "é雪🦀".as_bytes(),
+        b"\xC3",
+        b"\xC3x",
+        b"\xE9\x9B",
+        b"\xF0\x9F\xA6",
+        b"\xC0\xAF",
+        b"\xED\xA0\x80",
+        b"\xF4\x90\x80\x80",
+    ];
+    for haystack in cases {
+        let expected = upstream_unicode(pattern, haystack);
+        for strategy in STRATEGIES {
+            let actual = regex
+                .admit_spans(
+                    haystack,
+                    0..haystack.len(),
+                    strategy,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(actual.as_slice(), expected, "{strategy:?} {haystack:?}");
+        }
+    }
 }
 
 #[test]

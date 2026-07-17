@@ -18,6 +18,12 @@ use fre_kernels::{
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
     OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
+    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
+    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
     UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
     UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
@@ -36,13 +42,13 @@ use regex_syntax::hir::{
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
     AggregateExecutionAccounting, AggregateOperationCertificate, AggregateOperationLimits,
-    AggregatePlanId, BuildError, Match, finite,
+    AggregatePlanId, BuildError, Match, finite, finite_root,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 13;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 14;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -83,8 +89,8 @@ pub enum AggregatePlanKind {
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
     FixedClassSandwich,
-    /// Ordered finite HIR lowered to one reversed shared-transition DFA and a
-    /// bounded initial/progressed reducer ring.
+    /// Ordered finite HIR lowered to one reversed shared dense or sparse
+    /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
@@ -209,9 +215,10 @@ pub enum AggregateContinuationSemantics {
     /// boundary.
     UnicodeOffByteBoundaries,
     /// Rust bytes with Unicode enabled, `utf8(false)` and `utf8_empty(false)`.
-    /// Scalar classes use canonical UTF-8 paths; raw byte HIR stays byte
-    /// oriented. Positive Unicode word-boundary plans additionally make a
-    /// typed admission refusal on malformed UTF-8.
+    /// Scalar classes use compact canonical-scalar transitions with bounded
+    /// UTF-8 decoding; raw byte HIR stays byte oriented. Positive Unicode
+    /// word-boundary plans additionally make a typed admission refusal on
+    /// malformed UTF-8.
     UnicodeOnUtf8ScalarHir,
 }
 
@@ -244,6 +251,10 @@ pub enum AggregateBuildAccounting {
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
+    /// Sparse shared reversed automaton construction certificate. This is the
+    /// same finite-language semantic family with a different transition
+    /// representation selected only after the dense cell cap is exceeded.
+    SparseFiniteLiteral(SparseOrderedLiteralAggregateBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
 }
@@ -306,7 +317,9 @@ pub struct AggregateRunLimits {
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
-    /// Shared finite-language DFA reducer limits.
+    /// Shared finite-language dense/sparse reducer limits. For sparse plans,
+    /// `max_total_work` also bounds edge lookups, edge comparisons and failure
+    /// steps individually because each is a component of that total.
     pub finite_literal: OrderedLiteralAggregateReduceLimits,
     /// Continuation whole-operation limits.
     pub continuation: AggregateOperationLimits,
@@ -345,12 +358,13 @@ pub struct AggregateBuildReport {
     /// Fixed-class sandwich structural inspection work, including every HIR
     /// node and canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
-    /// Checked finite-language analysis/expansion work, or zero when skipped.
+    /// Checked finite-language root inspection and, for the dense route,
+    /// analysis/expansion work; zero when finite inspection is skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
-    /// caller limit rejects the optional DFA preflight and continuation is
-    /// selected. A rejected DFA publishes neither build accounting nor plan
-    /// identity; its caller-bounded preflight is not double-counted as work of
-    /// the selected continuation artifact.
+    /// caller limit rejects the optional dense/sparse automaton preflight and
+    /// continuation is selected. A rejected automaton publishes neither build
+    /// accounting nor plan identity; its caller-bounded preflight is not
+    /// double-counted as work of the selected continuation artifact.
     pub finite_planner_work: u64,
     /// Transparent capture-node visits charged by the selected plan builder.
     pub capture_erasure_work: usize,
@@ -476,6 +490,15 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: OrderedLiteralAggregateBuildError,
     },
+    /// Sparse reversed finite-language automaton construction failed after
+    /// selection. Caller-selected resource refusals remain optional in
+    /// `Auto`; allocator, arithmetic, representation and proof failures do
+    /// not get disguised by a continuation retry.
+    SparseFiniteLiteralBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: SparseOrderedLiteralAggregateBuildError,
+    },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
         operation: AggregateOperation,
@@ -591,6 +614,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} finite-language DFA construction failed: {source}"
             ),
+            Self::SparseFiniteLiteralBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} sparse finite-language construction failed: {source}"
+            ),
             Self::ContinuationCompile {
                 operation,
                 selection,
@@ -620,6 +651,7 @@ impl std::error::Error for AggregateBuildError {
             Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
+            Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
@@ -643,6 +675,8 @@ pub enum AggregateExecutionSource {
     FixedClassSandwich(FixedClassSandwichReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
+    /// Sparse shared finite-language automaton whole-operation refusal.
+    SparseFiniteLiteral(SparseOrderedLiteralAggregateReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -656,6 +690,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
+            Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -671,6 +706,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::UnicodeScalar(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
+            Self::SparseFiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
             Self::InternalInvariant(_) => None,
         }
@@ -718,6 +754,11 @@ pub enum AggregateExecutionDetails {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
+    /// Sparse finite-language structural bounds and exact counters.
+    SparseFiniteLiteral {
+        upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
+        actual: SparseOrderedLiteralAggregateActualCounters,
+    },
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -760,6 +801,67 @@ fn finite_build_limit_allows_continuation(source: &OrderedLiteralAggregateBuildE
             | OrderedLiteralAggregateBuildError::PersistentLimit { .. }
             | OrderedLiteralAggregateBuildError::PeakLimit { .. }
     )
+}
+
+/// Sparse construction reuses the existing finite-language quota envelope.
+/// A sparse edge is one packed `u32` cell, so the frozen dense-cell ceiling is
+/// also a conservative sparse-edge ceiling; no quota is introduced or raised.
+const fn sparse_finite_build_limits(
+    limits: OrderedLiteralAggregateBuildLimits,
+) -> SparseOrderedLiteralAggregateBuildLimits {
+    SparseOrderedLiteralAggregateBuildLimits {
+        max_patterns: limits.max_patterns,
+        max_pattern_bytes: limits.max_pattern_bytes,
+        max_identity_bytes: limits.max_identity_bytes,
+        max_trie_states: limits.max_trie_states,
+        max_sparse_edges: limits.max_dfa_cells,
+        max_build_work: limits.max_build_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_persistent_bytes: limits.max_persistent_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+fn sparse_finite_build_limit_allows_continuation(
+    source: &SparseOrderedLiteralAggregateBuildError,
+) -> bool {
+    matches!(
+        source,
+        SparseOrderedLiteralAggregateBuildError::PatternLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::IdentityBytesLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::TrieStatesLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::SparseEdgesLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::WorkLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::ScratchLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::PersistentLimit { .. }
+            | SparseOrderedLiteralAggregateBuildError::PeakLimit { .. }
+    )
+}
+
+/// Execution also stays inside the existing finite-language quota envelope.
+/// Every sparse structural counter is a component of total work, so the
+/// ordered reducer's total-work ceiling is a safe ceiling for components that
+/// have no dense analogue. The adapter publishes an exact sparse total-work
+/// bound when this representation is selected.
+fn sparse_finite_reduce_limits(
+    limits: OrderedLiteralAggregateReduceLimits,
+) -> SparseOrderedLiteralAggregateReduceLimits {
+    let total_work = u64::try_from(limits.max_total_work).unwrap_or(u64::MAX);
+    SparseOrderedLiteralAggregateReduceLimits {
+        max_transitions: limits.max_transitions,
+        max_edge_lookups: limits.max_total_work,
+        max_edge_search_checks: total_work,
+        max_failure_steps: limits.max_total_work,
+        max_match_events: limits.max_match_events,
+        max_count: limits.max_count,
+        max_span_sum: limits.max_span_sum,
+        max_reducer_steps: limits.max_reducer_steps,
+        max_ring_initializations: limits.max_ring_initializations,
+        max_total_work: total_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
 }
 
 impl AggregateBuilder {
@@ -1310,15 +1412,140 @@ impl AggregateBuilder {
             Some(FixedClassSandwichInspection::Ineligible { work }) => work,
             None => 0,
         };
-        let finite = if selection == AggregatePlanSelection::Auto
-            && operation != AggregateOperation::Spans
+        let inspect_finite =
+            selection == AggregatePlanSelection::Auto && operation != AggregateOperation::Spans;
+        let root_finite = if inspect_finite {
+            Some(
+                finite_root::inspect(&rust.hir, unicode, limits.max_finite_planner_work).map_err(
+                    |error| match error {
+                        finite_root::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::FinitePlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        finite_root::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "root finite-language inspection accounting overflow",
+                            }
+                        }
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let mut finite_planner_work = match &root_finite {
+            Some(finite_root::Inspection::Eligible(proof)) => proof.work,
+            Some(finite_root::Inspection::Ineligible { work }) => *work,
+            None => 0,
+        };
+        let mut sparse_refused = false;
+        if let Some(finite_root::Inspection::Eligible(proof)) = &root_finite
+            && proof.should_use_sparse(limits.finite_literal)
         {
+            if proof.hir_nodes != expected_nodes || expected_captures != 0 {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "syntax summary differs from root finite-language inspection",
+                });
+            }
+            let sparse_limits = sparse_finite_build_limits(limits.finite_literal);
+            let sparse_build = match operation {
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    SparseOrderedLiteralCountPlan::build(proof.patterns(), sparse_limits).map(
+                        |engine| {
+                            let build = engine.build_accounting();
+                            (
+                                AggregateEngine::SparseFiniteCount(engine),
+                                build,
+                                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                            )
+                        },
+                    )
+                }
+                AggregateOperation::SpanSum => {
+                    SparseOrderedLiteralSpanSumPlan::build(proof.patterns(), sparse_limits).map(
+                        |engine| {
+                            let build = engine.build_accounting();
+                            (
+                                AggregateEngine::SparseFiniteSpanSum(engine),
+                                build,
+                                SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                            )
+                        },
+                    )
+                }
+                AggregateOperation::Spans => {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "span materialization selected sparse finite reducer",
+                    });
+                }
+            };
+            match sparse_build {
+                Ok((engine, build, operation_id)) => {
+                    let report = AggregateBuildReport {
+                        schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        syntax_key,
+                        admission,
+                        syntax,
+                        operation,
+                        selection,
+                        plan: AggregatePlanKind::FiniteLiteralDfa,
+                        continuation_strategy: None,
+                        capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                        planner_work,
+                        unicode_scalar_planner_work,
+                        fixed_class_sandwich_planner_work,
+                        finite_planner_work,
+                        capture_erasure_work: 0,
+                        captures_erased: 0,
+                        build: AggregateBuildAccounting::SparseFiniteLiteral(build),
+                        plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                            AggregateFiniteLiteralIdentity {
+                                semantics: if unicode {
+                                    AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+                                } else {
+                                    AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+                                },
+                                algorithm: SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                                operation: operation_id,
+                            },
+                        ),
+                        retained_capacity_bytes: build.persistent_bytes,
+                    };
+                    return Ok(AggregatePlan {
+                        engine,
+                        limits,
+                        report,
+                    });
+                }
+                Err(source) if sparse_finite_build_limit_allows_continuation(&source) => {
+                    sparse_refused = true;
+                }
+                Err(source) => {
+                    return Err(AggregateBuildError::SparseFiniteLiteralBuild {
+                        operation,
+                        selection,
+                        source,
+                    });
+                }
+            }
+        }
+        let finite = if inspect_finite && !sparse_refused {
             Some(
                 finite::extract(
                     &rust.hir,
                     limits.finite_literal.max_patterns,
                     limits.finite_literal.max_pattern_bytes,
-                    0,
+                    finite_planner_work,
                     limits.max_finite_planner_work,
                 )
                 .map_err(|error| match error {
@@ -1349,7 +1576,9 @@ impl AggregateBuilder {
         } else {
             None
         };
-        let finite_planner_work = finite.as_ref().map_or(0, |result| result.work);
+        if let Some(result) = &finite {
+            finite_planner_work = result.work;
+        }
         let finite_words = finite
             .and_then(|result| result.words)
             .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
@@ -1512,6 +1741,8 @@ enum AggregateEngine {
     FixedClassSandwich(FixedClassSandwichPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
+    SparseFiniteCount(SparseOrderedLiteralCountPlan),
+    SparseFiniteSpanSum(SparseOrderedLiteralSpanSumPlan),
     Continuation(CompiledRegex),
 }
 
@@ -1615,6 +1846,25 @@ impl AggregatePlan {
                     "count operation retained a finite span-sum plan",
                 ),
             )),
+            AggregateEngine::SparseFiniteCount(engine) => engine
+                .count(haystack, sparse_finite_reduce_limits(limits.finite_literal))
+                .map(|result| AggregateCountExecution::SparseFiniteLiteral {
+                    value: result.count,
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::SparseFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::SparseFiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a sparse finite span-sum plan",
+                ),
+            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1690,6 +1940,25 @@ impl AggregatePlan {
                     "span-sum operation retained a finite count plan",
                 ),
             )),
+            AggregateEngine::SparseFiniteSpanSum(engine) => engine
+                .span_sum(haystack, sparse_finite_reduce_limits(limits.finite_literal))
+                .map(|result| AggregateSpanSumExecution::SparseFiniteLiteral {
+                    value: result.span_sum,
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::SparseFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::SparseFiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a sparse finite count plan",
+                ),
+            )),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -1732,6 +2001,11 @@ enum AggregateCountExecution {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
+    SparseFiniteLiteral {
+        value: u64,
+        upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
+        actual: SparseOrderedLiteralAggregateActualCounters,
+    },
     Continuation {
         admitted: AdmittedCount,
         value: u64,
@@ -1744,7 +2018,9 @@ impl AggregateCountExecution {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
-            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. }
+            | Self::SparseFiniteLiteral { value, .. }
+            | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1764,6 +2040,14 @@ impl AggregateCountExecution {
                 actual,
                 ..
             } => AggregateExecutionDetails::FiniteLiteral {
+                upper_bounds,
+                actual,
+            },
+            Self::SparseFiniteLiteral {
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::SparseFiniteLiteral {
                 upper_bounds,
                 actual,
             },
@@ -1784,6 +2068,11 @@ enum AggregateSpanSumExecution {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
     },
+    SparseFiniteLiteral {
+        value: u64,
+        upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
+        actual: SparseOrderedLiteralAggregateActualCounters,
+    },
     Continuation {
         admitted: AdmittedSpanSum,
         value: u64,
@@ -1796,7 +2085,9 @@ impl AggregateSpanSumExecution {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
-            Self::FiniteLiteral { value, .. } | Self::Continuation { value, .. } => *value,
+            Self::FiniteLiteral { value, .. }
+            | Self::SparseFiniteLiteral { value, .. }
+            | Self::Continuation { value, .. } => *value,
         }
     }
 
@@ -1816,6 +2107,14 @@ impl AggregateSpanSumExecution {
                 actual,
                 ..
             } => AggregateExecutionDetails::FiniteLiteral {
+                upper_bounds,
+                actual,
+            },
+            Self::SparseFiniteLiteral {
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::SparseFiniteLiteral {
                 upper_bounds,
                 actual,
             },

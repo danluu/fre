@@ -213,7 +213,8 @@ fn continuation_details(
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
-        | AggregateExecutionDetails::FiniteLiteral { .. } => {
+        | AggregateExecutionDetails::FiniteLiteral { .. }
+        | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
         }
     }

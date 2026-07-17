@@ -31,6 +31,117 @@ impl ByteSet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScalarRange {
+    start: u32,
+    end: u32,
+}
+
+impl ScalarRange {
+    pub(crate) fn new(start: char, end: char) -> Result<Self, Error> {
+        if start > end {
+            return Err(Error::InternalInvariant(
+                "non-canonical Unicode scalar range",
+            ));
+        }
+        Ok(Self {
+            start: u32::from(start),
+            end: u32::from(end),
+        })
+    }
+}
+
+/// Canonical, sorted scalar ranges owned by one consuming instruction.
+///
+/// Keeping the ranges on the consuming state avoids expanding one logical
+/// Unicode class into hundreds of one- through four-byte UTF-8 paths. The
+/// fallible callback lets execution charge every binary-search comparison
+/// before it is performed.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ScalarSet(Box<[ScalarRange]>);
+
+impl ScalarSet {
+    pub(crate) fn required_bytes(range_count: usize) -> Result<usize, Error> {
+        range_count
+            .checked_mul(core::mem::size_of::<ScalarRange>())
+            .ok_or(Error::ArithmeticOverflow {
+                resource: crate::Resource::ProgramBytes,
+            })
+    }
+
+    pub(crate) fn from_unicode_class(
+        class: &regex_syntax::hir::ClassUnicode,
+    ) -> Result<Self, Error> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(class.ranges().len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: crate::Resource::ProgramBytes,
+                items: class.ranges().len(),
+            })?;
+        for range in class.ranges() {
+            ranges.push(ScalarRange::new(range.start(), range.end())?);
+        }
+        if ranges.is_empty() {
+            return Err(Error::InternalInvariant("empty Unicode scalar class"));
+        }
+        Ok(Self(ranges.into_boxed_slice()))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> Result<usize, Error> {
+        Self::required_bytes(self.0.len())
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(self.0.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: crate::Resource::ProgramBytes,
+                items: self.0.len(),
+            })?;
+        ranges.extend_from_slice(&self.0);
+        Ok(Self(ranges.into_boxed_slice()))
+    }
+
+    pub(crate) fn max_search_checks(&self) -> usize {
+        usize::try_from(self.0.len().ilog2())
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+    }
+
+    pub(crate) fn contains_with<E>(
+        &self,
+        scalar: char,
+        mut charge: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let scalar = u32::from(scalar);
+        let mut lower = 0_usize;
+        let mut upper = self.0.len();
+        while lower < upper {
+            charge()?;
+            let middle = lower.saturating_add(upper.saturating_sub(lower) / 2);
+            let range = self.0[middle];
+            if scalar < range.start {
+                upper = middle;
+            } else if scalar > range.end {
+                lower = middle.saturating_add(1);
+            } else {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.0.iter().map(|range| (range.start, range.end))
+    }
+}
+
 /// A constant-time zero-width predicate admitted by the continuation engine.
 ///
 /// This is deliberately distinct from `regex_syntax::hir::Look`: every
@@ -298,7 +409,7 @@ fn unicode_assertion_matches(
     })
 }
 
-fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
+pub(crate) fn decode_first_scalar(bytes: &[u8]) -> Option<char> {
     let first = *bytes.first()?;
     let width = match first {
         0x00..=0x7F => 1,
@@ -323,14 +434,27 @@ fn decode_last_scalar(bytes: &[u8]) -> Option<char> {
     (scalar.len_utf8() == encoded.len()).then_some(scalar)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Inst {
     Unfilled,
     Fail,
     Match,
-    Consume { bytes: ByteSet, next: usize },
-    Assert { assertion: Assertion, next: usize },
-    Split { preferred: usize, fallback: usize },
+    Consume {
+        bytes: ByteSet,
+        next: usize,
+    },
+    ConsumeScalar {
+        scalars: ScalarSet,
+        next_by_width: [usize; 4],
+    },
+    Assert {
+        assertion: Assertion,
+        next: usize,
+    },
+    Split {
+        preferred: usize,
+        fallback: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -340,6 +464,9 @@ pub(crate) struct Program {
     pub(crate) epsilon_order: Vec<usize>,
     pub(crate) split_rank: Vec<usize>,
     pub(crate) split_count: usize,
+    pub(crate) execution_state_work: usize,
+    pub(crate) has_scalar_transition: bool,
+    pub(crate) max_scalar_search_checks: usize,
 }
 
 impl Program {
@@ -356,5 +483,17 @@ impl Program {
         self.insts
             .get(pc)
             .ok_or(Error::InternalInvariant("program counter outside program"))
+    }
+
+    pub(crate) const fn execution_state_work(&self) -> usize {
+        self.execution_state_work
+    }
+
+    pub(crate) const fn contains_scalar_transition(&self) -> bool {
+        self.has_scalar_transition
+    }
+
+    pub(crate) const fn max_scalar_search_checks(&self) -> usize {
+        self.max_scalar_search_checks
     }
 }

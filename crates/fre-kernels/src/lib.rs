@@ -20,6 +20,7 @@ mod ordered_literal_aggregate;
 mod packed_literal_set;
 mod packed_ordered_literal_aggregate;
 mod required_literal;
+mod sparse_ordered_literal_aggregate;
 mod unicode_scalar_aggregate;
 
 pub use fixed_class_sandwich::{
@@ -117,6 +118,28 @@ pub use required_literal::{
     ByteClass as RequiredLiteralByteClass, PLAN_ID as REQUIRED_LITERAL_PLAN_ID,
     RequiredLiteralPlan, SearchAccounting as RequiredLiteralSearchAccounting,
     SearchError as RequiredLiteralSearchError, SearchLimits as RequiredLiteralSearchLimits,
+};
+pub use sparse_ordered_literal_aggregate::{
+    ALGORITHM_ID as SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    BoundarySemantics as SparseOrderedLiteralAggregateBoundarySemantics,
+    BuildAccounting as SparseOrderedLiteralAggregateBuildAccounting,
+    BuildError as SparseOrderedLiteralAggregateBuildError,
+    BuildLimits as SparseOrderedLiteralAggregateBuildLimits,
+    COUNT_PLAN_ID as SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+    CacheIdentity as SparseOrderedLiteralAggregateCacheIdentity,
+    CountResult as SparseOrderedLiteralCountResult,
+    IterationSemantics as SparseOrderedLiteralAggregateIterationSemantics,
+    MatchSemantics as SparseOrderedLiteralAggregateMatchSemantics,
+    Operation as SparseOrderedLiteralAggregateOperation,
+    ReduceAccounting as SparseOrderedLiteralAggregateReduceAccounting,
+    ReduceActualCounters as SparseOrderedLiteralAggregateActualCounters,
+    ReduceError as SparseOrderedLiteralAggregateReduceError,
+    ReduceLimits as SparseOrderedLiteralAggregateReduceLimits,
+    ReduceUpperBounds as SparseOrderedLiteralAggregateUpperBounds,
+    SPAN_SUM_PLAN_ID as SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    Semantics as SparseOrderedLiteralAggregateSemantics,
+    SpanSumResult as SparseOrderedLiteralSpanSumResult, SparseOrderedLiteralCountPlan,
+    SparseOrderedLiteralSpanSumPlan,
 };
 pub use unicode_scalar_aggregate::{
     BuildAccounting as UnicodeScalarAggregateBuildAccounting,

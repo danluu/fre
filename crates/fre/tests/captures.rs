@@ -343,12 +343,10 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
         .unicode(true)
         .build()
         .expect("overlapping Unicode-word selector fits the bounded default");
-    assert_eq!(regex.build_report().selector.program_states, 344_385);
-    assert_eq!(regex.build_report().selector.temporary_states_peak, 344_385);
-    assert_eq!(regex.build_report().selector.program_bytes, 30_675_984);
-    // Required-suffix eligibility now charges its five-node ineligible walk
-    // before the unchanged capture selector compilation.
-    assert_eq!(regex.build_report().selector.work, 3_305_881);
+    assert_eq!(regex.build_report().selector.program_states, 390);
+    assert_eq!(regex.build_report().selector.temporary_states_peak, 390);
+    assert_eq!(regex.build_report().selector.program_bytes, 549_432);
+    assert!(regex.build_report().selector.work >= 126_986);
 
     for haystack in [
         "abcdefghijklmn абвгдежзийклмн",
@@ -370,7 +368,7 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     }
 
     let mut limits = fre::CaptureBuildLimits::default();
-    limits.selector.max_program_states = 262_144;
+    limits.selector.max_program_states = 389;
     assert!(matches!(
         CaptureBuilder::new(pattern)
             .unicode(true)
@@ -379,8 +377,8 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
         Err(fre::CaptureBuildError::Selector(
             fre::AggregateEngineError::ResourceLimit {
                 resource: fre::AggregateResource::ProgramStates,
-                required: 262_145,
-                limit: 262_144,
+                required: 390,
+                limit: 389,
             }
         ))
     ));

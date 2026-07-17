@@ -38,8 +38,11 @@ use fre::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile, SearchLimits,
-    SearchSessionLimits, UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
+    OrderedLiteralAggregateReduceLimits, PortableBuilder, RustProfile,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits, SearchSessionLimits,
+    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateReduceError,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
 };
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
@@ -75,7 +78,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-fixed-class-sandwich-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -406,10 +409,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, shared finite-language DFA, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, shared finite-language dense/sparse automaton, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, a bounded finite-language shared DFA (including nonempty valid-UTF8 Unicode words), or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using one reversed shared-transition DFA; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1215,19 +1218,7 @@ impl CurrentFreAggregateCompileArtifact {
                     lifecycle.unicode,
                     "compile",
                 )?;
-                Ok(match regex.build_report().plan {
-                    AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
-                    AggregatePlanKind::UnicodeScalarClass => {
-                        "compile-aggregate-unicode-scalar-class"
-                    }
-                    AggregatePlanKind::FixedClassSandwich => {
-                        "compile-aggregate-fixed-class-sandwich"
-                    }
-                    AggregatePlanKind::FiniteLiteralDfa => "compile-aggregate-finite-literal-dfa",
-                    AggregatePlanKind::ContinuationProgram => {
-                        "compile-aggregate-continuation-program"
-                    }
-                })
+                Ok(aggregate_single_plan_label("compile", regex.build_report()))
             }
             (CurrentFreAggregateCompileArtifactInner::Many(regex), patterns)
                 if patterns.len() > 1 =>
@@ -1446,7 +1437,7 @@ fn build_current_fre_count_lifecycle(
             .build_count()
             .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
-        let plan = aggregate_single_plan_label("count", regex.build_report().plan);
+        let plan = aggregate_single_plan_label("count", regex.build_report());
         let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
         (
             plan,
@@ -1496,7 +1487,7 @@ fn build_current_fre_span_sum_lifecycle(
             unicode,
             "count-spans",
         )?;
-        let plan = aggregate_single_plan_label("count-spans", regex.build_report().plan);
+        let plan = aggregate_single_plan_label("count-spans", regex.build_report());
         let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
         (
             plan,
@@ -1531,24 +1522,34 @@ fn build_current_fre_span_sum_lifecycle(
     })
 }
 
-fn aggregate_single_plan_label(model: &str, plan: AggregatePlanKind) -> &'static str {
-    match (model, plan) {
-        ("compile", AggregatePlanKind::ExactLiteral) => "compile-aggregate-exact-literal",
-        ("compile", AggregatePlanKind::UnicodeScalarClass) => {
+fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'static str {
+    let sparse = matches!(
+        report.build,
+        AggregateBuildAccounting::SparseFiniteLiteral(_)
+    );
+    match (model, report.plan, sparse) {
+        ("compile", AggregatePlanKind::ExactLiteral, _) => "compile-aggregate-exact-literal",
+        ("compile", AggregatePlanKind::UnicodeScalarClass, _) => {
             "compile-aggregate-unicode-scalar-class"
         }
-        ("compile", AggregatePlanKind::FixedClassSandwich) => {
+        ("compile", AggregatePlanKind::FixedClassSandwich, _) => {
             "compile-aggregate-fixed-class-sandwich"
         }
-        ("compile", AggregatePlanKind::FiniteLiteralDfa) => "compile-aggregate-finite-literal-dfa",
-        ("compile", AggregatePlanKind::ContinuationProgram) => {
+        ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
+            "compile-aggregate-finite-literal-sparse"
+        }
+        ("compile", AggregatePlanKind::FiniteLiteralDfa, false) => {
+            "compile-aggregate-finite-literal-dfa"
+        }
+        ("compile", AggregatePlanKind::ContinuationProgram, _) => {
             "compile-aggregate-continuation-program"
         }
-        (_, AggregatePlanKind::ExactLiteral) => "aggregate-exact-literal",
-        (_, AggregatePlanKind::UnicodeScalarClass) => "aggregate-unicode-scalar-class",
-        (_, AggregatePlanKind::FixedClassSandwich) => "aggregate-fixed-class-sandwich",
-        (_, AggregatePlanKind::FiniteLiteralDfa) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::ContinuationProgram) => "aggregate-continuation-program",
+        (_, AggregatePlanKind::ExactLiteral, _) => "aggregate-exact-literal",
+        (_, AggregatePlanKind::UnicodeScalarClass, _) => "aggregate-unicode-scalar-class",
+        (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
+        (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
+        (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
     }
 }
 
@@ -2780,13 +2781,7 @@ fn fre_compile_verify(
             let message = format!("FRE compiled artifact failed untimed verification: {error}");
             aggregate_execution_error(&error.source, message)
         })?;
-    let plan = match regex.build_report().plan {
-        AggregatePlanKind::ExactLiteral => "compile-aggregate-exact-literal",
-        AggregatePlanKind::UnicodeScalarClass => "compile-aggregate-unicode-scalar-class",
-        AggregatePlanKind::FixedClassSandwich => "compile-aggregate-fixed-class-sandwich",
-        AggregatePlanKind::FiniteLiteralDfa => "compile-aggregate-finite-literal-dfa",
-        AggregatePlanKind::ContinuationProgram => "compile-aggregate-continuation-program",
-    };
+    let plan = aggregate_single_plan_label("compile", regex.build_report());
     Ok(FreReduction {
         actual: result.value(),
         plan,
@@ -2891,7 +2886,11 @@ fn capture_run_limits(
     let searches = checked_aggregate_add(haystack_len, 1, "capture searches")?;
     let search_work = usize::try_from(limits.fre_search_work)
         .map_err(|_| ExecutionError::fault("FRE capture search work does not fit usize"))?;
-    let mut selector = continuation_operation_limits(haystack_len, selector_states, limits)?;
+    let mut selector = continuation_operation_limits(
+        haystack_len,
+        conservative_continuation_shape(selector_states)?,
+        limits,
+    )?;
     let boundaries = checked_aggregate_add(haystack_len, 1, "capture selector boundaries")?;
     selector.max_output_bytes = checked_aggregate_mul(
         boundaries,
@@ -3337,14 +3336,60 @@ fn checked_aggregate_u64_mul(
         .ok_or_else(|| ExecutionError::fault(format!("FRE aggregate {dimension} overflow")))
 }
 
+#[derive(Clone, Copy)]
+struct ContinuationProgramShape {
+    states: usize,
+    execution_state_work: usize,
+    has_scalar_transitions: bool,
+    max_scalar_search_checks: usize,
+}
+
+impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
+    fn from(accounting: fre::AggregateCompileAccounting) -> Self {
+        Self {
+            states: accounting.program_states,
+            execution_state_work: accounting.execution_state_work,
+            has_scalar_transitions: accounting.has_scalar_transitions,
+            max_scalar_search_checks: accounting.max_scalar_search_checks,
+        }
+    }
+}
+
+fn inactive_continuation_shape() -> ContinuationProgramShape {
+    ContinuationProgramShape {
+        states: 1,
+        // One Match state is evaluated once and has no outgoing transition.
+        execution_state_work: 1,
+        has_scalar_transitions: false,
+        max_scalar_search_checks: 0,
+    }
+}
+
+fn conservative_continuation_shape(
+    states: usize,
+) -> Result<ContinuationProgramShape, ExecutionError> {
+    // Callers that publish their own exact work limit use this helper only for
+    // row/log storage. Three units per state is the non-scalar Thompson
+    // maximum: one evaluation and two Split transition checks.
+    let execution_state_work = checked_aggregate_mul(states, 3, "state work")?;
+    Ok(ContinuationProgramShape {
+        states,
+        execution_state_work,
+        has_scalar_transitions: false,
+        max_scalar_search_checks: 0,
+    })
+}
+
 /// Build every operation limit explicitly from authenticated input size,
-/// exact compiled state count and the report's named policy quotas. The fixed
-/// reverse-row strategy never receives a full-table allowance.
+/// exact compiled state/search dimensions and the report's named policy
+/// quotas. The fixed reverse-row strategy never receives a full-table
+/// allowance.
 fn continuation_operation_limits(
     haystack_len: usize,
-    program_states: usize,
+    shape: ContinuationProgramShape,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
+    let program_states = shape.states;
     if program_states == 0 {
         return Err(ExecutionError::fault(
             "FRE aggregate compiler reported a zero-state program",
@@ -3360,14 +3405,28 @@ fn continuation_operation_limits(
     let sequential_upper = checked_aggregate_mul(log_upper, 2, "sequential bytes")?;
     let peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
 
-    // A state contributes at most one evaluation plus two transition checks
-    // per boundary. Reverse-row replay adds at most four state steps per
-    // boundary, and the scan contributes four boundary steps.
+    // These are the same structural terms enforced by
+    // fre-aggregate's Requirements::new. Scalar decoding is shared once per
+    // boundary; membership comparisons are already included in the exact
+    // state-work census. Sequential replay can revisit every state and adds
+    // the largest retained scalar search to its four fixed replay steps.
+    let per_boundary_build = checked_aggregate_add(
+        shape.execution_state_work,
+        usize::from(shape.has_scalar_transitions),
+        "per-boundary build work",
+    )?;
+    let build_work = checked_aggregate_mul(per_boundary_build, boundaries, "row-build work")?;
+    let scan_work = checked_aggregate_mul(boundaries, 4, "scan work")?;
+    let replay_factor =
+        checked_aggregate_add(4, shape.max_scalar_search_checks, "replay work factor")?;
     let state_boundaries =
         checked_aggregate_mul(program_states, boundaries, "state-boundary cells")?;
-    let state_work = checked_aggregate_mul(state_boundaries, 7, "state work")?;
-    let scan_work = checked_aggregate_mul(boundaries, 4, "scan work")?;
-    let work_upper = checked_aggregate_add(state_work, scan_work, "operation work")?;
+    let replay_work = checked_aggregate_mul(state_boundaries, replay_factor, "row-replay work")?;
+    let work_upper = checked_aggregate_add(
+        checked_aggregate_add(build_work, scan_work, "build plus scan work")?,
+        replay_work,
+        "operation work",
+    )?;
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
@@ -3642,6 +3701,72 @@ fn ordered_literal_operation_limits(
     })
 }
 
+fn sparse_ordered_literal_operation_limits(
+    haystack_len: usize,
+    build: fre::SparseOrderedLiteralAggregateBuildAccounting,
+    limits: &RunLimits,
+) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
+    let boundaries = checked_aggregate_add(haystack_len, 1, "sparse finite boundaries")?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let match_events = if build.has_empty_pattern {
+        boundaries
+    } else {
+        let minimum = build.min_nonempty_pattern_bytes.ok_or_else(|| {
+            ExecutionError::fault("FRE sparse finite plan lacks a nonempty minimum")
+        })?;
+        haystack_len
+            .checked_div(minimum)
+            .ok_or_else(|| ExecutionError::fault("FRE sparse finite minimum is zero"))?
+    };
+    let ring_initializations = build
+        .max_pattern_bytes
+        .min(haystack_len)
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE sparse finite ring overflow"))?;
+    let edge_lookups = checked_aggregate_mul(haystack_len, 2, "sparse edge lookups")?;
+    let edge_search_checks = checked_aggregate_mul(
+        edge_lookups,
+        build.max_edge_search_checks,
+        "sparse edge search checks",
+    )?;
+    let total_work = checked_aggregate_add(
+        checked_aggregate_add(
+            checked_aggregate_add(
+                checked_aggregate_add(
+                    haystack_len,
+                    edge_lookups,
+                    "sparse transitions plus edge lookups",
+                )?,
+                edge_search_checks,
+                "sparse edge comparison work",
+            )?,
+            haystack_len,
+            "sparse failure work",
+        )?,
+        checked_aggregate_add(
+            boundaries,
+            ring_initializations,
+            "sparse reducer plus ring work",
+        )?,
+        "sparse finite total work",
+    )?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("FRE sparse finite count does not fit u64"))?;
+    Ok(OrderedLiteralAggregateReduceLimits {
+        max_transitions: haystack_len,
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE sparse finite span does not fit u64"))?,
+        max_reducer_steps: boundaries.min(reducer_limit),
+        max_ring_initializations: ring_initializations,
+        max_total_work: total_work.min(limits.fre_aggregate_operation_work),
+        max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 fn aggregate_run_limits(
     haystack_len: usize,
     report: &AggregateBuildReport,
@@ -3655,14 +3780,22 @@ fn aggregate_run_limits(
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             // The continuation policy remains present in cache identity even
             // though no continuation engine exists and no fallback is legal.
-            continuation: continuation_operation_limits(haystack_len, 1, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
         }),
         AggregateBuildAccounting::UnicodeScalar(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: unicode_scalar_operation_limits(haystack_len, build, limits)?,
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(haystack_len, 1, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
         }),
         AggregateBuildAccounting::FixedClassSandwich(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
@@ -3673,14 +3806,33 @@ fn aggregate_run_limits(
                 limits,
             )?,
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(haystack_len, 1, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
         }),
         AggregateBuildAccounting::FiniteLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
-            continuation: continuation_operation_limits(haystack_len, 1, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
+        }),
+        AggregateBuildAccounting::SparseFiniteLiteral(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+            finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
         }),
         AggregateBuildAccounting::Continuation(compile) => Ok(AggregateRunLimits {
             // Literal policy remains present in cache identity even when HIR
@@ -3689,13 +3841,36 @@ fn aggregate_run_limits(
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                compile.program_states,
-                limits,
-            )?,
+            continuation: continuation_operation_limits(haystack_len, compile.into(), limits)?,
         }),
     }
+}
+
+fn finite_plan_identity_matches(
+    identity: AggregateFiniteLiteralIdentity,
+    unicode: bool,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    let (dense_finite_operation, sparse_finite_operation) = match operation {
+        LiteralAggregateOperation::Count => (
+            ORDERED_LITERAL_COUNT_PLAN_ID,
+            SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+        ),
+        LiteralAggregateOperation::SpanSum => (
+            ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+            SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+        ),
+    };
+    let expected_semantics = if unicode {
+        AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+    } else {
+        AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+    };
+    let representation_matches = (identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+        && identity.operation == dense_finite_operation)
+        || (identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+            && identity.operation == sparse_finite_operation);
+    identity.semantics == expected_semantics && representation_matches
 }
 
 fn require_unicode_plan_identity(
@@ -3703,29 +3878,12 @@ fn require_unicode_plan_identity(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> Result<(), ExecutionError> {
-    let finite_operation = match operation {
-        LiteralAggregateOperation::Count => ORDERED_LITERAL_COUNT_PLAN_ID,
-        LiteralAggregateOperation::SpanSum => ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    };
-    if let AggregatePlanIdentity::FiniteLiteral(AggregateFiniteLiteralIdentity {
-        semantics,
-        algorithm,
-        operation,
-    }) = report.plan_identity
-    {
-        let expected_semantics = if unicode {
-            AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
-        } else {
-            AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
-        };
-        if semantics == expected_semantics
-            && algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-            && operation == finite_operation
-        {
+    if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
+        if finite_plan_identity_matches(identity, unicode, operation) {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
-            "finite aggregate semantic identity mismatch for {finite_operation}: {:?}",
+            "finite aggregate semantic identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )));
     }
@@ -3914,6 +4072,49 @@ fn fixed_class_sandwich_reduce_error(
     }
 }
 
+fn sparse_ordered_literal_build_error(
+    source: &SparseOrderedLiteralAggregateBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        SparseOrderedLiteralAggregateBuildError::PatternLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::IdentityBytesLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::TrieStatesLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::SparseEdgesLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::WorkLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::ScratchLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::PersistentLimit { .. }
+        | SparseOrderedLiteralAggregateBuildError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn sparse_ordered_literal_reduce_error(
+    source: &SparseOrderedLiteralAggregateReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        SparseOrderedLiteralAggregateReduceError::TransitionLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::EdgeLookupLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::EdgeSearchChecksLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::FailureStepsLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::MatchEventsLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::CountLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::SpanSumLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::ReducerStepsLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::RingInitializationLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::TotalWorkLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::ScratchLimit { .. }
+        | SparseOrderedLiteralAggregateReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn aggregate_execution_error(source: &AggregateExecutionSource, message: String) -> ExecutionError {
     match source {
         AggregateExecutionSource::ExactLiteral(source) => literal_reduce_error(source, message),
@@ -3925,6 +4126,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         }
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
+        }
+        AggregateExecutionSource::SparseFiniteLiteral(source) => {
+            sparse_ordered_literal_reduce_error(source, message)
         }
         AggregateExecutionSource::Continuation(source) => aggregate_engine_error(source, message),
         AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
@@ -3954,6 +4158,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         }
         AggregateBuildError::FiniteLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
+        }
+        AggregateBuildError::SparseFiniteLiteralBuild { source, .. } => {
+            sparse_ordered_literal_build_error(source, message)
         }
         AggregateBuildError::ContinuationCompile { source, .. } => {
             aggregate_engine_error(source, message)
@@ -3994,13 +4201,7 @@ fn fre_aggregate_count(
             let message = format!("FRE aggregate count refused execution: {error}");
             aggregate_execution_error(&error.source, message)
         })?;
-    let plan = match regex.build_report().plan {
-        AggregatePlanKind::ExactLiteral => "aggregate-exact-literal",
-        AggregatePlanKind::UnicodeScalarClass => "aggregate-unicode-scalar-class",
-        AggregatePlanKind::FixedClassSandwich => "aggregate-fixed-class-sandwich",
-        AggregatePlanKind::FiniteLiteralDfa => "aggregate-finite-literal-dfa",
-        AggregatePlanKind::ContinuationProgram => "aggregate-continuation-program",
-    };
+    let plan = aggregate_single_plan_label("count", regex.build_report());
     Ok(FreReduction {
         actual: result.value(),
         plan,
@@ -4038,13 +4239,7 @@ fn fre_aggregate_span_sum(
             let message = format!("FRE aggregate span-sum refused execution: {error}");
             aggregate_execution_error(&error.source, message)
         })?;
-    let plan = match regex.build_report().plan {
-        AggregatePlanKind::ExactLiteral => "aggregate-exact-literal",
-        AggregatePlanKind::UnicodeScalarClass => "aggregate-unicode-scalar-class",
-        AggregatePlanKind::FixedClassSandwich => "aggregate-fixed-class-sandwich",
-        AggregatePlanKind::FiniteLiteralDfa => "aggregate-finite-literal-dfa",
-        AggregatePlanKind::ContinuationProgram => "aggregate-continuation-program",
-    };
+    let plan = aggregate_single_plan_label("count-spans", regex.build_report());
     Ok(FreReduction {
         actual: result.value(),
         plan,
@@ -4210,13 +4405,13 @@ fn aggregate_many_run_limits(
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
         },
     };
-    let program_states = match report.build {
-        AggregateManyBuildAccounting::Continuation(compile) => compile.program_states,
-        AggregateManyBuildAccounting::OrderedLiteral(_) => 1,
+    let continuation_shape = match report.build {
+        AggregateManyBuildAccounting::Continuation(compile) => compile.into(),
+        AggregateManyBuildAccounting::OrderedLiteral(_) => inactive_continuation_shape(),
     };
     Ok(AggregateManyRunLimits {
         ordered_literal,
-        continuation: continuation_operation_limits(haystack_len, program_states, limits)?,
+        continuation: continuation_operation_limits(haystack_len, continuation_shape, limits)?,
     })
 }
 
@@ -5818,7 +6013,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-fixed-class-sandwich-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -5962,6 +6157,39 @@ mod tests {
             ),
             9,
             "aggregate-finite-literal-dfa",
+        );
+    }
+
+    #[test]
+    fn compile_lifecycle_labels_sparse_finite_representation_exactly() {
+        let words = (0..32)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>();
+        let pattern = format!("(?:{})", words.join("|"));
+        let mut limits = AggregateBuildLimits::default();
+        limits.finite_literal.max_dfa_cells = 32 * 4;
+        let regex = AggregateBuilder::new(&pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(limits)
+            .build_compile()
+            .unwrap();
+        assert!(matches!(
+            regex.build_report().build,
+            AggregateBuildAccounting::SparseFiniteLiteral(_)
+        ));
+        let artifact = CurrentFreAggregateCompileArtifact {
+            inner: CurrentFreAggregateCompileArtifactInner::Single(regex),
+        };
+        let lifecycle = CurrentFreAggregateCompileLifecycle {
+            patterns: vec![pattern],
+            unicode: false,
+            case_insensitive: false,
+            haystack_len: 0,
+        };
+        assert_eq!(
+            artifact.plan(&lifecycle).unwrap(),
+            "compile-aggregate-finite-literal-sparse"
         );
     }
 
@@ -6864,7 +7092,7 @@ mod tests {
 
         let selector_starved = RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 16 * 1_048_576,
+            fre_capture_selector_program_bytes: 549_431,
             ..RunLimits::default()
         };
         let refusal = current_fre(
@@ -6877,7 +7105,7 @@ mod tests {
         );
         assert!(
             matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 30675984, limit is 16777216")),
+                if reason.contains("ProgramBytes requires 549432, limit is 549431")),
             "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }
@@ -7091,7 +7319,9 @@ mod tests {
     #[test]
     fn aggregate_operation_limits_are_fully_derived_and_quota_capped() {
         let mut run = RunLimits::default();
-        let derived = continuation_operation_limits(10, 5, &run).unwrap();
+        let derived =
+            continuation_operation_limits(10, conservative_continuation_shape(5).unwrap(), &run)
+                .unwrap();
         let row_words = 5usize.checked_mul(2).unwrap();
         let row_bytes = row_words
             .checked_mul(core::mem::size_of::<usize>())
@@ -7116,13 +7346,139 @@ mod tests {
         run.fre_aggregate_sequential_bytes = 4;
         run.fre_aggregate_peak_bytes = 3;
         run.fre_aggregate_operation_work = 2;
-        let capped = continuation_operation_limits(10, 5, &run).unwrap();
+        let capped =
+            continuation_operation_limits(10, conservative_continuation_shape(5).unwrap(), &run)
+                .unwrap();
         assert_eq!(capped.max_random_access_bytes, 7);
         assert_eq!(capped.max_scratch_bytes, 6);
         assert_eq!(capped.max_log_bytes, 5);
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn aggregate_operation_limits_include_scalar_search_and_shared_decode() {
+        let shape = ContinuationProgramShape {
+            states: 5,
+            execution_state_work: 11,
+            has_scalar_transitions: true,
+            max_scalar_search_checks: 10,
+        };
+        let derived = continuation_operation_limits(10, shape, &RunLimits::default()).unwrap();
+        // 11 boundaries: (11 state work + one shared decode) * 11 to build
+        // rows, 4 * 11 to scan, and 5 * 11 * (4 + 10) to replay.
+        assert_eq!(derived.max_work, 946);
+
+        let capped = continuation_operation_limits(
+            10,
+            shape,
+            &RunLimits {
+                fre_aggregate_operation_work: 945,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.max_work, 945);
+    }
+
+    #[test]
+    fn sparse_finite_operation_limits_include_every_search_and_reducer_term() {
+        let build = fre::SparseOrderedLiteralAggregateBuildAccounting {
+            patterns: 3,
+            pattern_bytes: 30,
+            identity_bytes: 62,
+            identity_capacity_bytes: 62,
+            trie_states_upper_bound: 31,
+            trie_states_actual: 20,
+            sparse_edges_upper_bound: 30,
+            sparse_edges_actual: 19,
+            build_work: 200,
+            max_pattern_bytes: 24,
+            min_nonempty_pattern_bytes: Some(1),
+            has_empty_pattern: false,
+            max_edge_search_checks: 6,
+            scratch_bytes: 400,
+            persistent_bytes: 500,
+            peak_bytes: 900,
+        };
+        let derived =
+            sparse_ordered_literal_operation_limits(10, build, &RunLimits::default()).unwrap();
+        assert_eq!(derived.max_transitions, 10);
+        assert_eq!(derived.max_match_events, 10);
+        assert_eq!(derived.max_reducer_steps, 11);
+        assert_eq!(derived.max_ring_initializations, 11);
+        // 10 transitions + 20 lookups + 120 comparisons + 10 failures
+        // + 11 reducer positions + 11 ring initializations.
+        assert_eq!(derived.max_total_work, 182);
+
+        let capped = sparse_ordered_literal_operation_limits(
+            10,
+            build,
+            &RunLimits {
+                fre_aggregate_operation_work: 181,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.max_total_work, 181);
+    }
+
+    #[test]
+    fn finite_identity_requires_matching_dense_or_sparse_algorithm_operation_pair() {
+        let identity = |algorithm, operation| AggregateFiniteLiteralIdentity {
+            semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
+            algorithm,
+            operation,
+        };
+        assert!(finite_plan_identity_matches(
+            identity(
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(finite_plan_identity_matches(
+            identity(
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            false,
+            LiteralAggregateOperation::Count,
+        ));
     }
 
     #[test]
@@ -7164,5 +7520,34 @@ mod tests {
             "literal arithmetic".to_string(),
         );
         assert_eq!(literal_arithmetic.status, Status::Fault);
+
+        let sparse_build_resource = sparse_ordered_literal_build_error(
+            &SparseOrderedLiteralAggregateBuildError::SparseEdgesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            "sparse build resource".to_string(),
+        );
+        assert_eq!(sparse_build_resource.status, Status::Unsupported);
+        let sparse_build_fault = sparse_ordered_literal_build_error(
+            &SparseOrderedLiteralAggregateBuildError::ArithmeticOverflow {
+                computation: "fixture",
+            },
+            "sparse build arithmetic".to_string(),
+        );
+        assert_eq!(sparse_build_fault.status, Status::Fault);
+        let sparse_reduce_resource = sparse_ordered_literal_reduce_error(
+            &SparseOrderedLiteralAggregateReduceError::EdgeSearchChecksLimit {
+                needed: 2,
+                limit: 1,
+            },
+            "sparse reduce resource".to_string(),
+        );
+        assert_eq!(sparse_reduce_resource.status, Status::Unsupported);
+        let sparse_reduce_fault = sparse_ordered_literal_reduce_error(
+            &SparseOrderedLiteralAggregateReduceError::InternalInvariant { detail: "fixture" },
+            "sparse reduce invariant".to_string(),
+        );
+        assert_eq!(sparse_reduce_fault.status, Status::Fault);
     }
 }

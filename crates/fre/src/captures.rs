@@ -868,7 +868,8 @@ pub struct CaptureBuilder {
 
 impl CaptureBuilder {
     /// Start from the pinned Rust byte profile. Unicode defaults to enabled;
-    /// scalar classes lower to checked canonical UTF-8 byte sequences.
+    /// scalar classes lower to compact canonical-scalar transitions with
+    /// checked bounded UTF-8 decoding.
     #[must_use]
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {

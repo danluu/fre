@@ -27,6 +27,7 @@ mod aggregate;
 mod aggregate_many;
 mod captures;
 mod finite;
+mod finite_root;
 mod forward_anchored;
 mod replacement;
 mod required_literal;
@@ -103,7 +104,12 @@ pub use fre_kernels::{
     OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, UnicodeScalarAggregateBuildAccounting,
+    OrderedLiteralAggregateUpperBounds, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
+    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
+    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
+    SparseOrderedLiteralAggregateUpperBounds, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
