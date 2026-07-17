@@ -71,7 +71,7 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v3";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -2814,25 +2814,11 @@ fn capture_regex_one(
     case_insensitive: bool,
     limits: &RunLimits,
 ) -> Result<CaptureRegex, ExecutionError> {
-    let engine_limits = fre::CaptureEngineBuildLimits {
-        max_compile_work: limits.fre_aggregate_compile_work,
-        max_program_bytes: limits.fre_aggregate_program_bytes,
-        ..fre::CaptureEngineBuildLimits::default()
-    };
     let regex = CaptureBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(unicode)
         .case_insensitive(case_insensitive)
-        .limits(CaptureBuildLimits {
-            max_hir_work: limits.fre_aggregate_compile_work,
-            engine: engine_limits,
-            selector: fre::AggregateCompileLimits {
-                max_work: limits.fre_aggregate_compile_work,
-                max_program_bytes: limits.fre_aggregate_program_bytes,
-                ..fre::AggregateCompileLimits::default()
-            },
-            ..CaptureBuildLimits::default()
-        })
+        .limits(capture_build_limits(limits))
         .build()
         .map_err(|error| capture_build_error(&error))?;
     let identity = &regex.build_report().plan_identity;
@@ -2844,6 +2830,26 @@ fn capture_regex_one(
         ));
     }
     Ok(regex)
+}
+
+fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
+    let defaults = CaptureBuildLimits::default();
+    let engine = fre::CaptureEngineBuildLimits {
+        max_compile_work: limits.fre_aggregate_compile_work,
+        max_program_bytes: limits.fre_aggregate_program_bytes,
+        ..defaults.engine
+    };
+    let selector = fre::AggregateCompileLimits {
+        max_work: limits.fre_aggregate_compile_work,
+        max_program_bytes: limits.fre_aggregate_program_bytes,
+        ..defaults.selector
+    };
+    CaptureBuildLimits {
+        max_hir_work: limits.fre_aggregate_compile_work,
+        engine,
+        selector,
+        ..defaults
+    }
 }
 
 #[allow(
@@ -5521,7 +5527,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v12-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v2"
+            "fre-current-aggregate-capture-v13-portable-word-run-v2-unicode-scalar-run-v3-finite-dfa-v1-structural-quota-v3"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("positive-Unicode-word"));
@@ -6351,6 +6357,47 @@ mod tests {
         assert_eq!(many_continuation.max_hir_stack_items, 13);
         assert_eq!(many_continuation.max_repeat_bound, 14);
         assert_eq!(many_continuation.max_program_bytes, 15);
+    }
+
+    #[test]
+    fn capture_limits_preserve_facade_cardinality_and_selector_ceilings() {
+        let run = RunLimits {
+            fre_aggregate_compile_work: 17,
+            fre_aggregate_program_bytes: 19,
+            ..RunLimits::default()
+        };
+        let defaults = CaptureBuildLimits::default();
+        let mapped = capture_build_limits(&run);
+        assert_eq!(mapped.max_hir_work, 17);
+        assert_eq!(mapped.engine.max_compile_work, 17);
+        assert_eq!(mapped.engine.max_program_bytes, 19);
+        assert_eq!(mapped.engine.max_captures, 1_024);
+        assert_eq!(
+            mapped.selector.max_program_states,
+            defaults.selector.max_program_states
+        );
+        assert_eq!(
+            mapped.selector.max_temporary_states,
+            defaults.selector.max_temporary_states
+        );
+        assert_eq!(mapped.selector.max_work, 17);
+        assert_eq!(mapped.selector.max_program_bytes, 19);
+
+        let pattern = "(a)".repeat(65);
+        let patterns = [pattern];
+        let haystack = [b'a'; 65];
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &patterns,
+                &haystack,
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            66,
+            "capture-linear-selector-persistent-history",
+        );
     }
 
     #[test]

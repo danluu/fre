@@ -297,6 +297,42 @@ fn cross_family_capture_reducers_match_pinned_rust_bytes() {
     }
 }
 
+#[test]
+fn sixty_five_user_captures_match_pinned_rust_and_remain_bounded() {
+    // This cardinality is shared by the authenticated Veryl lexer rows:
+    // curated/05-lexer-veryl/single and wild/parol-veryl/{ascii,unicode}.
+    let pattern = "(a)".repeat(65);
+    let haystack = vec![b'a'; 65];
+    let regex = CaptureBuilder::new(&pattern)
+        .unicode(false)
+        .build()
+        .expect("65 user captures fit the facade's bounded default");
+    assert_eq!(regex.build_report().engine.captures, 65);
+    let result = regex
+        .count_captures(&haystack, CaptureRunLimits::default())
+        .expect("65-capture reduction");
+    assert_eq!(
+        result.accounting.count,
+        reference_count(&pattern, &haystack)
+    );
+
+    let mut limits = fre::CaptureBuildLimits::default();
+    limits.engine.max_captures = 64;
+    assert!(matches!(
+        CaptureBuilder::new(&pattern)
+            .unicode(false)
+            .limits(limits)
+            .build(),
+        Err(fre::CaptureBuildError::Engine(
+            fre::CaptureEngineBuildError::Resource {
+                kind: CaptureResource::Captures,
+                required: 65,
+                limit: 64,
+            }
+        ))
+    ));
+}
+
 fn adversarial_operation_work(size: usize) -> (usize, usize) {
     let regex = CaptureBuilder::new(r"(?:a.*z|a)")
         .unicode(false)

@@ -93,6 +93,11 @@ impl Default for CaptureBuildLimits {
         // maximum state or patch capacities.
         let engine = EngineBuildLimits {
             max_ast_nodes: 65_536,
+            // The authenticated Rebar lexer surface contains 65 user
+            // captures. This remains a checked construction ceiling, not a
+            // preallocation: the compiler charges every capture and all
+            // resulting states before publishing a program.
+            max_captures: 1_024,
             max_repeat_expansion: 2_500,
             max_states: 262_144,
             max_patch_entries: 262_144,
