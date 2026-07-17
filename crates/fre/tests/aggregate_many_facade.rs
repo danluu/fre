@@ -473,6 +473,55 @@ fn continuation_value_paths_match_diagnostic_values_and_refusals() {
 }
 
 #[test]
+#[ignore = "requires the sealed Rebar Veryl pattern and haystack inputs"]
+fn sealed_veryl_count_and_span_sum_fit_default_execution_work() {
+    let pattern_path = std::env::var("FRE_QUALIFICATION_VERYL_PATTERNS")
+        .expect("qualification must bind the sealed Veryl pattern path");
+    let haystack_path = std::env::var("FRE_QUALIFICATION_VERYL_HAYSTACK")
+        .expect("qualification must bind the sealed Veryl haystack path");
+    let pattern_text = std::fs::read_to_string(pattern_path).unwrap();
+    let patterns = pattern_text.lines().map(str::to_owned).collect::<Vec<_>>();
+    let haystack = std::fs::read(haystack_path).unwrap();
+    assert_eq!(88, patterns.len());
+    assert_eq!(150_600, haystack.len());
+
+    let count = AggregateManyBuilder::new(&patterns)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_count()
+        .unwrap();
+    let span_sum = AggregateManyBuilder::new(&patterns)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        count.build_report().plan
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        span_sum.build_report().plan
+    );
+    assert_eq!(
+        124_800,
+        count
+            .count_value(&haystack, AggregateManyRunLimits::default())
+            .unwrap()
+    );
+    assert_eq!(
+        150_600,
+        span_sum
+            .span_sum_value(&haystack, AggregateManyRunLimits::default())
+            .unwrap()
+    );
+}
+
+#[test]
 fn every_pattern_keeps_its_ordinal_source_and_profile_identity() {
     let values = patterns(&["ab", "a"]);
     let regex = AggregateManyBuilder::new(&values)
