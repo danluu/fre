@@ -9,7 +9,8 @@
 
 use core::fmt;
 
-use memchr::memmem::Finder;
+use fre_exact_alloc::CopyError;
+use memchr::memmem::{Finder, FinderBuilder};
 
 mod forward_anchored;
 mod literal_aggregate;
@@ -228,6 +229,11 @@ pub enum LiteralError {
     ArithmeticOverflow {
         computation: &'static str,
     },
+    /// The exact owned-needle allocation failed.
+    AllocationFailed {
+        structure: &'static str,
+        additional: usize,
+    },
 }
 
 impl fmt::Display for LiteralError {
@@ -251,6 +257,10 @@ impl fmt::Display for LiteralError {
             Self::ArithmeticOverflow { computation } => {
                 write!(f, "arithmetic overflow while computing {computation}")
             }
+            Self::AllocationFailed {
+                structure,
+                additional,
+            } => write!(f, "failed to allocate {additional} bytes for {structure}"),
         }
     }
 }
@@ -258,7 +268,7 @@ impl fmt::Display for LiteralError {
 impl std::error::Error for LiteralError {}
 
 /// Immutable exact-literal plan with an owned preprocessed finder.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LiteralPlan {
     finder: Finder<'static>,
     needle_bytes: usize,
@@ -270,7 +280,9 @@ impl LiteralPlan {
     /// # Errors
     ///
     /// Returns [`LiteralError::NeedleLimit`] before construction if the
-    /// declared persistent-byte cap is too small.
+    /// declared payload cap is too small. Allocation failure is returned as a
+    /// typed error; this plan deliberately does not implement `Clone` because
+    /// cloning its owned finder would introduce an unmetered allocation.
     pub fn new(needle: &[u8], limits: LiteralBuildLimits) -> Result<Self, LiteralError> {
         if needle.len() > limits.max_needle_bytes {
             return Err(LiteralError::NeedleLimit {
@@ -278,8 +290,9 @@ impl LiteralPlan {
                 limit: limits.max_needle_bytes,
             });
         }
+        let owned = copy_literal_exact(needle)?;
         Ok(Self {
-            finder: Finder::new(needle).into_owned(),
+            finder: FinderBuilder::new().build_forward_owned(owned),
             needle_bytes: needle.len(),
         })
     }
@@ -374,9 +387,71 @@ impl LiteralPlan {
     }
 }
 
+fn copy_literal_exact(needle: &[u8]) -> Result<Vec<u8>, LiteralError> {
+    #[cfg(test)]
+    exact_literal_copy_probe::record();
+    #[cfg(test)]
+    if let Some(error) = exact_literal_copy_probe::take_failure() {
+        return Err(map_literal_copy_error(error, needle.len()));
+    }
+    fre_exact_alloc::copy_exact(needle).map_err(|error| map_literal_copy_error(error, needle.len()))
+}
+
+const fn map_literal_copy_error(error: CopyError, needle_len: usize) -> LiteralError {
+    match error {
+        CopyError::LayoutOverflow => LiteralError::ArithmeticOverflow {
+            computation: "exact literal allocation layout",
+        },
+        CopyError::AllocationFailed => LiteralError::AllocationFailed {
+            structure: "exact literal needle",
+            additional: needle_len,
+        },
+    }
+}
+
+#[cfg(test)]
+mod exact_literal_copy_probe {
+    use std::cell::Cell;
+
+    use fre_exact_alloc::CopyError;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static FAILURE: Cell<Option<CopyError>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().checked_add(1).expect("test probe overflow"));
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+        FAILURE.set(None);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn fail_next(error: CopyError) {
+        FAILURE.set(Some(error));
+    }
+
+    pub(super) fn take_failure() -> Option<CopyError> {
+        let failure = FAILURE.get();
+        FAILURE.set(None);
+        failure
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits, Window};
+    use fre_exact_alloc::CopyError;
+
+    use super::{
+        LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits, Window,
+        copy_literal_exact, exact_literal_copy_probe,
+    };
 
     #[test]
     fn literals_and_empty_needles_keep_exact_offsets() {
@@ -399,6 +474,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_literal_plan_owns_the_fallibly_copied_needle() {
+        let plan = {
+            let source = b"temporary needle".to_vec();
+            LiteralPlan::new(&source, LiteralBuildLimits::default()).unwrap()
+        };
+        assert_eq!(plan.needle(), b"temporary needle");
+        assert_eq!(
+            plan.find(
+                b"a temporary needle survives",
+                LiteralSearchLimits::unlimited()
+            )
+            .unwrap()
+            .0,
+            Some((2, 18))
+        );
+    }
+
+    #[test]
     fn ranges_do_not_match_across_their_end() {
         let plan = LiteralPlan::new(b"bc", LiteralBuildLimits::default()).unwrap();
         assert_eq!(
@@ -411,6 +504,7 @@ mod tests {
 
     #[test]
     fn every_declared_limit_fails_before_search() {
+        exact_literal_copy_probe::reset();
         assert!(matches!(
             LiteralPlan::new(
                 b"ab",
@@ -420,6 +514,7 @@ mod tests {
             ),
             Err(LiteralError::NeedleLimit { .. })
         ));
+        assert_eq!(exact_literal_copy_probe::calls(), 0);
         let plan = LiteralPlan::new(b"ab", LiteralBuildLimits::default()).unwrap();
         assert!(matches!(
             plan.find(
@@ -430,5 +525,44 @@ mod tests {
             ),
             Err(LiteralError::LinearTermLimit { .. })
         ));
+    }
+
+    #[test]
+    fn exact_literal_copy_has_exact_capacity() {
+        for len in [0_usize, 1, 2, 3, 7, 8, 15, 16, 31, 32, 255, 256, 4096] {
+            let source: Vec<u8> = (0_u8..=u8::MAX).cycle().take(len).collect();
+            exact_literal_copy_probe::reset();
+            let owned = copy_literal_exact(&source).unwrap();
+            assert_eq!(exact_literal_copy_probe::calls(), 1);
+            assert_eq!(owned, source);
+            assert_eq!(owned.capacity(), len);
+        }
+    }
+
+    #[test]
+    fn exact_literal_copy_failures_are_typed_without_retry() {
+        for (injected, expected) in [
+            (
+                CopyError::LayoutOverflow,
+                LiteralError::ArithmeticOverflow {
+                    computation: "exact literal allocation layout",
+                },
+            ),
+            (
+                CopyError::AllocationFailed,
+                LiteralError::AllocationFailed {
+                    structure: "exact literal needle",
+                    additional: 6,
+                },
+            ),
+        ] {
+            exact_literal_copy_probe::reset();
+            exact_literal_copy_probe::fail_next(injected);
+            assert_eq!(
+                LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap_err(),
+                expected
+            );
+            assert_eq!(exact_literal_copy_probe::calls(), 1);
+        }
     }
 }
