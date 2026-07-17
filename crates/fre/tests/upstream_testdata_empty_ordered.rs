@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use fre::{
-    PlanKind, PortableFindIterLimits, PortableTextRegex, RustProfile, SearchLimits, SearchWindow,
+    PlanKind, PortableFindIterLimits, PortableTextRegex, RustProfile,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -61,30 +61,12 @@ fn empty_first_corpus_iterators_match_pinned_upstream() {
 }
 
 fn text_spans(regex: &PortableTextRegex, haystack: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut start = 0_usize;
-    let mut last_match_end = None;
-    loop {
-        let (matched, _) = regex
-            .find_window(
-                haystack,
-                SearchWindow::new(start, haystack.len()),
-                SearchLimits::unlimited(),
-            )
-            .expect("qualified text search executes");
-        let Some(matched) = matched else {
-            break;
-        };
-        if matched.is_empty() && last_match_end == Some(matched.end()) {
-            let Some(character) = haystack[start..].chars().next() else {
-                break;
-            };
-            start = start.saturating_add(character.len_utf8());
-            continue;
-        }
-        spans.push((matched.start(), matched.end()));
-        start = matched.end();
-        last_match_end = Some(matched.end());
-    }
-    spans
+    regex
+        .find_iter(haystack, PortableFindIterLimits::unlimited())
+        .expect("qualified text iterator construction")
+        .map(|matched| {
+            let matched = matched.expect("qualified text iteration");
+            (matched.start(), matched.end())
+        })
+        .collect()
 }

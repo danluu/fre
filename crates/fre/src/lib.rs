@@ -134,7 +134,7 @@ pub use set::{
 pub use split::{AggregateSplit, PortableSplit};
 pub use text::{
     PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextProof,
-    PortableTextRegex, PortableTextSearchError,
+    PortableTextMatches, PortableTextRegex, PortableTextSearchError,
 };
 pub use text_set::{
     PORTABLE_TEXT_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableTextRegexSet,
@@ -1020,11 +1020,11 @@ impl From<UnicodeWordRunError> for SearchError {
     }
 }
 
-/// Hard limits for complete non-overlapping byte match iteration.
+/// Hard limits for complete non-overlapping match iteration.
 ///
 /// `max_search_calls` bounds the whole iterator, including searches that
-/// suppress a repeated empty match while making byte-wise progress. The
-/// session and per-search limits retain their existing operation-specific
+/// suppress a repeated empty match while making byte- or scalar-wise progress.
+/// The session and per-search limits retain their existing operation-specific
 /// meanings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableFindIterLimits {
@@ -1058,8 +1058,8 @@ impl Default for PortableFindIterLimits {
     }
 }
 
-/// Exact no-clock accounting accumulated by [`PortableMatches`] or
-/// [`PortableByteMatches`].
+/// Exact no-clock accounting accumulated by the portable byte or text match
+/// iterators.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PortableFindIterAccounting {
     /// Contextual search invocations, including the final miss and suppressed
@@ -1067,14 +1067,15 @@ pub struct PortableFindIterAccounting {
     pub search_calls: usize,
     /// Non-overlapping matches returned to the caller.
     pub matches: usize,
-    /// Repeated empty matches suppressed to guarantee byte-wise progress.
+    /// Repeated empty matches suppressed to guarantee byte- or scalar-wise
+    /// progress, according to the facade.
     pub suppressed_empty: usize,
     /// Sum of charged work or conservative linear terms from successful
     /// contextual searches.
     pub work_or_linear_terms: u64,
 }
 
-/// Checked terminal failure from complete byte match iteration.
+/// Checked terminal failure from complete portable match iteration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PortableFindIterError {
@@ -2705,11 +2706,33 @@ impl PortableRegex {
         haystack: &'h [u8],
         limits: PortableFindIterLimits,
     ) -> Result<PortableMatches<'r, 'h>, SearchError> {
+        self.find_iter_with_progress(haystack, limits, EmptyMatchProgress::Byte)
+    }
+
+    pub(crate) fn find_iter_utf8<'r, 'h>(
+        &'r self,
+        haystack: &'h str,
+        limits: PortableFindIterLimits,
+    ) -> Result<PortableMatches<'r, 'h>, SearchError> {
+        self.find_iter_with_progress(
+            haystack.as_bytes(),
+            limits,
+            EmptyMatchProgress::Utf8Scalar,
+        )
+    }
+
+    fn find_iter_with_progress<'r, 'h>(
+        &'r self,
+        haystack: &'h [u8],
+        limits: PortableFindIterLimits,
+        empty_match_progress: EmptyMatchProgress,
+    ) -> Result<PortableMatches<'r, 'h>, SearchError> {
         let session = self.search_session(limits.session)?;
         Ok(PortableMatches {
             session,
             haystack,
             limits,
+            empty_match_progress,
             start: 0,
             last_match_end: None,
             accounting: PortableFindIterAccounting::default(),
@@ -3293,10 +3316,17 @@ pub struct PortableMatches<'r, 'h> {
     session: PortableSearchSession<'r>,
     haystack: &'h [u8],
     limits: PortableFindIterLimits,
+    empty_match_progress: EmptyMatchProgress,
     start: usize,
     last_match_end: Option<usize>,
     accounting: PortableFindIterAccounting,
     finished: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyMatchProgress {
+    Byte,
+    Utf8Scalar,
 }
 
 impl PortableMatches<'_, '_> {
@@ -3382,7 +3412,21 @@ impl Iterator for PortableMatches<'_, '_> {
                     self.finished = true;
                     return None;
                 }
-                self.start = self.start.saturating_add(1);
+                self.start = match self.empty_match_progress {
+                    EmptyMatchProgress::Byte => self.start.saturating_add(1),
+                    EmptyMatchProgress::Utf8Scalar => {
+                        // This mode is constructed only from `&str`. Starting
+                        // at a scalar boundary, skip its UTF-8 continuation
+                        // bytes to reach the next scalar boundary.
+                        let mut next = self.start.saturating_add(1);
+                        while next < self.haystack.len()
+                            && (self.haystack[next] & 0b1100_0000) == 0b1000_0000
+                        {
+                            next = next.saturating_add(1);
+                        }
+                        next
+                    }
+                };
                 continue;
             }
 
