@@ -123,12 +123,12 @@ fn ranged_cases() -> Vec<(PortableTextRegex, regex::Regex, PlanKind)> {
             regex::Regex::new("foobar|foobaz|fooquux").expect("pinned literal-set DFA"),
             PlanKind::LiteralSetDfa,
         ),
-        case(
+        ascii_case(
             "[a-z]+Z",
             PlanKind::RequiredLiteral,
             PlanSelection::ForceRequiredLiteral,
         ),
-        case(
+        ascii_case(
             r"\A[a-z]+Z",
             PlanKind::ForwardAnchored,
             PlanSelection::ForceForwardAnchored,
@@ -149,6 +149,25 @@ fn case(
             .build()
             .unwrap_or_else(|error| panic!("portable build failed for {pattern:?}: {error}")),
         regex::Regex::new(pattern)
+            .unwrap_or_else(|error| panic!("pinned build failed for {pattern:?}: {error}")),
+        expected_plan,
+    )
+}
+
+fn ascii_case(
+    pattern: &str,
+    expected_plan: PlanKind,
+    selection: PlanSelection,
+) -> (PortableTextRegex, regex::Regex, PlanKind) {
+    (
+        PortableTextBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(selection)
+            .build()
+            .unwrap_or_else(|error| panic!("portable build failed for {pattern:?}: {error}")),
+        regex::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
             .unwrap_or_else(|error| panic!("pinned build failed for {pattern:?}: {error}")),
         expected_plan,
     )
