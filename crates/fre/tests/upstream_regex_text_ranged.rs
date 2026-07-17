@@ -124,22 +124,14 @@ fn ranged_cases() -> Vec<(PortableTextRegex, regex::Regex, PlanKind)> {
             PlanKind::LiteralSetDfa,
         ),
         case("[a-z]+Z", PlanKind::RequiredLiteral, PlanSelection::Auto),
-        case(
-            r"\A[a-z]+Z",
-            PlanKind::ForwardAnchored,
-            PlanSelection::Auto,
-        ),
+        case(r"\A[a-z]+Z", PlanKind::ForwardAnchored, PlanSelection::Auto),
         case(
             r"\A[a-z]+Z\z",
             PlanKind::ForwardAnchored,
             PlanSelection::ForceForwardAnchored,
         ),
         case("(?:ab)+", PlanKind::K0, PlanSelection::ForceK0),
-        case(
-            r"\b\w{2,}\b",
-            PlanKind::UnicodeWordRun,
-            PlanSelection::Auto,
-        ),
+        case(r"\b\w{2,}\b", PlanKind::UnicodeWordRun, PlanSelection::Auto),
     ]
 }
 
