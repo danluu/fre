@@ -49,6 +49,56 @@ fn text_set_matches_pinned_rust_across_unicode_nullable_and_duplicate_patterns()
 }
 
 #[test]
+fn text_set_offset_search_matches_pinned_rust_at_every_byte() {
+    let patterns = ["", r"\bbar\b", r"(?m)^bar$", "é", "東京"];
+    let fre = PortableTextRegexSet::new(patterns).expect("FRE text offset set");
+    let upstream = regex::RegexSet::new(patterns).expect("pinned text offset set");
+
+    for haystack in ["", "é", "foobar", "foo\nbar\n東京"] {
+        for start in 0..=haystack.len() {
+            let expected = upstream
+                .matches_at(haystack, start)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let actual = fre
+                .matches_at(haystack, start, PortableRegexSetRunLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("FRE text set failed for {haystack:?}/{start}: {error}")
+                });
+            assert_eq!(actual.iter().collect::<Vec<_>>(), expected);
+            assert_eq!(actual.report().start, start);
+
+            let (matched, report) = fre
+                .is_match_at(haystack, start, PortableRegexSetRunLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("FRE text set existence failed for {haystack:?}/{start}: {error}")
+                });
+            assert_eq!(matched, upstream.is_match_at(haystack, start));
+            assert_eq!(report.start, start);
+        }
+    }
+}
+
+#[test]
+fn text_set_offset_validation_precedes_output_allocation() {
+    let set = PortableTextRegexSet::new(["a", "b"]).expect("text set");
+    let limits = PortableRegexSetRunLimits {
+        max_output_bytes: 0,
+        ..PortableRegexSetRunLimits::unlimited()
+    };
+    let error = set
+        .matches_at("é", 3, limits)
+        .expect_err("out-of-bounds start must be reported first");
+    assert!(matches!(
+        error,
+        PortableRegexSetExecutionError::InvalidStart {
+            start: 3,
+            haystack_len: 2
+        }
+    ));
+}
+
+#[test]
 fn text_set_preserves_proofs_profile_identity_and_traits() {
     let patterns = sources(&["雪", "a+"]);
     let set = PortableTextRegexSetBuilder::new(&patterns)

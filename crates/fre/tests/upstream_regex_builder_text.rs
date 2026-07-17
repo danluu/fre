@@ -2,7 +2,7 @@
 
 use fre::{
     CompatibilityProfile, PortableTextBuildError, PortableTextBuilder, PortableTextRegex,
-    RustProfile, SearchLimits, SearchWindow,
+    RustProfile, SearchLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -58,29 +58,49 @@ fn assert_searches_equal(
     haystacks: &[&str],
 ) {
     for haystack in haystacks {
-        let mut starts = haystack
-            .char_indices()
-            .map(|(offset, _)| offset)
-            .collect::<Vec<_>>();
-        starts.push(haystack.len());
-        for start in starts {
+        for start in 0..=haystack.len() {
             let expected = upstream
                 .find_at(haystack, start)
                 .map(|matched| (matched.start(), matched.end()));
             let actual = fre
-                .find_window(
-                    haystack,
-                    SearchWindow::new(start, haystack.len()),
-                    SearchLimits::unlimited(),
-                )
+                .find_at(haystack, start, SearchLimits::unlimited())
                 .unwrap_or_else(|error| {
                     panic!("FRE search failed for {pattern:?}/{haystack:?}/{start}: {error}")
                 })
                 .0
                 .map(|matched| (matched.start(), matched.end()));
             assert_eq!(actual, expected, "{pattern:?}/{haystack:?}/{start}");
+            assert_eq!(
+                fre.is_match_at(haystack, start, SearchLimits::unlimited())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "FRE existence search failed for {pattern:?}/{haystack:?}/{start}: \
+                             {error}"
+                        )
+                    })
+                    .0,
+                upstream.is_match_at(haystack, start),
+                "existence {pattern:?}/{haystack:?}/{start}"
+            );
         }
     }
+}
+
+#[test]
+fn text_offset_search_refuses_only_out_of_bounds_starts() {
+    let regex = PortableTextRegex::new("").expect("nullable text regex");
+    let haystack = "é";
+    let matched = regex
+        .find_at(haystack, 1, SearchLimits::unlimited())
+        .expect("interior UTF-8 start is valid")
+        .0
+        .expect("empty match at the next scalar boundary");
+    assert_eq!((matched.start(), matched.end()), (2, 2));
+    assert!(
+        regex
+            .find_at(haystack, haystack.len() + 1, SearchLimits::unlimited())
+            .is_err()
+    );
 }
 
 #[test]

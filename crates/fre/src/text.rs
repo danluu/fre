@@ -866,6 +866,28 @@ impl PortableTextRegex {
         self.inner.is_match(haystack.as_bytes(), limits)
     }
 
+    /// Whether a selected match exists at or after the byte offset `start`.
+    ///
+    /// Like pinned Rust `Regex::is_match_at`, `start` need not be a UTF-8
+    /// scalar boundary. An interior offset advances to the next scalar
+    /// boundary because every match published by the proved text facade starts
+    /// on a scalar boundary. Assertions still inspect the complete original
+    /// haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an out-of-bounds start or when checked
+    /// search limits refuse execution.
+    pub fn is_match_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner.is_match_at(haystack.as_bytes(), start, limits)
+    }
+
     /// Return the selected leftmost-first match in byte offsets.
     ///
     /// # Errors
@@ -877,6 +899,26 @@ impl PortableTextRegex {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         self.inner.find(haystack.as_bytes(), limits)
+    }
+
+    /// Return the selected leftmost-first match at or after byte offset
+    /// `start`.
+    ///
+    /// Interior UTF-8 offsets advance to the next scalar boundary without
+    /// slicing the haystack, so look assertions retain their original context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an out-of-bounds start or when checked
+    /// search limits refuse execution.
+    pub fn find_at(
+        &self,
+        haystack: &str,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        let start = next_text_boundary(haystack, start);
+        self.inner.find_at(haystack.as_bytes(), start, limits)
     }
 
     /// Search a byte range whose endpoints are scalar boundaries while
@@ -924,6 +966,17 @@ impl PortableTextRegex {
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         self.inner.selected_end(haystack.as_bytes(), limits)
     }
+}
+
+pub(crate) fn next_text_boundary(haystack: &str, start: usize) -> usize {
+    if start >= haystack.len() {
+        return start;
+    }
+    let mut boundary = start;
+    while !haystack.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
 }
 
 #[cfg(test)]
