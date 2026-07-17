@@ -346,10 +346,25 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
-        if self.program.contains_unicode_word_boundary() && core::str::from_utf8(haystack).is_err()
-        {
-            return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
-        }
+        let mut accounting = ExecutionAccounting::default();
+        let utf8_validation = preflight_unicode_word_utf8(
+            &self.program,
+            haystack,
+            limits,
+            &mut accounting,
+        )?;
+        let mut engine_limits = limits;
+        engine_limits.max_work = engine_limits.max_work.checked_sub(utf8_validation).ok_or(
+            Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork,
+            },
+        )?;
+        engine_limits.max_sequential_bytes = engine_limits
+            .max_sequential_bytes
+            .checked_sub(utf8_validation)
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::SequentialBytes,
+            })?;
         let local = &haystack[range.clone()];
         let assertion_context = AssertionContext::new(haystack, range.start, local.len())?;
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
@@ -360,16 +375,22 @@ impl CompiledRegex {
             boundaries,
             strategy,
             passes,
-            limits,
+            engine_limits,
         ) {
             Ok(requirements)
                 if OBSERVED_WORK
-                    && requirements.work_bound > limits.max_work
+                    && requirements.work_bound > engine_limits.max_work
                     && strategy == Strategy::ReverseSequentialRows
                     && !self.required_suffixes.is_empty() =>
             {
                 (
-                    Requirements::new_sparse(&self.program, boundaries, strategy, passes, limits)?,
+                    Requirements::new_sparse(
+                        &self.program,
+                        boundaries,
+                        strategy,
+                        passes,
+                        engine_limits,
+                    )?,
                     Some(&self.required_suffixes),
                 )
             }
@@ -381,13 +402,19 @@ impl CompiledRegex {
                 && !self.required_suffixes.is_empty() =>
             {
                 (
-                    Requirements::new_sparse(&self.program, boundaries, strategy, passes, limits)?,
+                    Requirements::new_sparse(
+                        &self.program,
+                        boundaries,
+                        strategy,
+                        passes,
+                        engine_limits,
+                    )?,
                     Some(&self.required_suffixes),
                 )
             }
             Err(error) => return Err(error),
         };
-        let mut accounting = ExecutionAccounting::default();
+        let requirements = requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, limits)?;
         let mut engine = Engine::build::<OBSERVED_WORK>(
             &self.program,
             local,
@@ -510,6 +537,31 @@ impl CompiledRegex {
     }
 }
 
+fn preflight_unicode_word_utf8(
+    program: &Program,
+    haystack: &[u8],
+    limits: OperationLimits,
+    accounting: &mut ExecutionAccounting,
+) -> Result<usize, Error> {
+    if !program.contains_unicode_word_boundary() {
+        return Ok(0);
+    }
+    let bytes = haystack.len();
+    enforce(bytes, limits.max_work, Resource::ExecutionWork)?;
+    enforce(
+        bytes,
+        limits.max_sequential_bytes,
+        Resource::SequentialBytes,
+    )?;
+    accounting.utf8_validation_work = bytes;
+    accounting.work = bytes;
+    accounting.sequential_bytes_read = bytes;
+    if core::str::from_utf8(haystack).is_err() {
+        return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScanSummary {
     matches: usize,
@@ -547,6 +599,32 @@ struct Requirements {
 }
 
 impl Requirements {
+    fn with_prefix<const OBSERVED_WORK: bool>(
+        mut self,
+        work: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        self.work_bound = add(self.work_bound, work, Resource::ExecutionWork)?;
+        if !OBSERVED_WORK {
+            enforce(
+                self.work_bound,
+                limits.max_work,
+                Resource::ExecutionWork,
+            )?;
+        }
+        self.sequential_bound = add(
+            self.sequential_bound,
+            work,
+            Resource::SequentialBytes,
+        )?;
+        enforce(
+            self.sequential_bound,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        Ok(self)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "each storage strategy keeps its exact work and byte bounds beside admission"

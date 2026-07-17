@@ -299,6 +299,136 @@ fn unicode_word_boundary_refuses_malformed_utf8_before_publication() {
 }
 
 #[test]
+fn unicode_word_property_is_cached_by_the_budgeted_identity_pass() {
+    let hir = parse_unicode_byte_stable(r"\b[a-z]+\b");
+    let observed = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    let accounting = observed.compile_accounting();
+    assert_eq!(
+        accounting.unicode_word_boundary_checks,
+        accounting.program_states
+    );
+
+    let exact = CompileLimits {
+        max_work: accounting.work,
+        ..CompileLimits::default()
+    };
+    let exact_accounting = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        exact,
+    )
+    .unwrap()
+    .compile_accounting();
+    assert_eq!(exact_accounting, accounting);
+    expect_exact_resource(
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits {
+                max_work: accounting.work - 1,
+                ..CompileLimits::default()
+            },
+        ),
+        Resource::CompileWork,
+        accounting.work,
+        accounting.work - 1,
+    );
+}
+
+#[test]
+fn unicode_word_utf8_validation_is_prospectively_charged() {
+    let regex = compile_unicode_byte_stable(r"\b[a-z]+\b").unwrap();
+    let haystack = b"alpha beta gamma delta";
+    for strategy in STRATEGIES {
+        let baseline = regex
+            .admit_count(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(baseline.accounting().utf8_validation_work, haystack.len());
+        assert!(baseline.accounting().sequential_bytes_read >= haystack.len());
+
+        let exact = OperationLimits {
+            max_work: baseline.certificate().work_bound,
+            max_sequential_bytes: baseline.certificate().sequential_bytes_bound,
+            ..OperationLimits::default()
+        };
+        regex
+            .admit_count(haystack, 0..haystack.len(), strategy, exact)
+            .unwrap();
+        let mut one_below_work = exact;
+        one_below_work.max_work -= 1;
+        expect_resource(
+            regex.admit_count(haystack, 0..haystack.len(), strategy, one_below_work),
+            Resource::ExecutionWork,
+        );
+        let mut one_below_sequential = exact;
+        one_below_sequential.max_sequential_bytes -= 1;
+        expect_resource(
+            regex.admit_count(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                one_below_sequential,
+            ),
+            Resource::SequentialBytes,
+        );
+    }
+
+    let invalid = [b'a', 0xFF, b'b', b'c'];
+    expect_exact_resource(
+        regex.admit_count(
+            &invalid,
+            0..invalid.len(),
+            Strategy::FullTable,
+            OperationLimits {
+                max_work: invalid.len() - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::ExecutionWork,
+        invalid.len(),
+        invalid.len() - 1,
+    );
+    assert!(matches!(
+        regex.admit_count(
+            &invalid,
+            0..invalid.len(),
+            Strategy::FullTable,
+            OperationLimits {
+                max_work: invalid.len(),
+                max_sequential_bytes: invalid.len(),
+                ..OperationLimits::default()
+            },
+        ),
+        Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+    ));
+    expect_exact_resource(
+        regex.admit_count(
+            &invalid,
+            0..invalid.len(),
+            Strategy::FullTable,
+            OperationLimits {
+                max_work: invalid.len(),
+                max_sequential_bytes: invalid.len() - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Resource::SequentialBytes,
+        invalid.len(),
+        invalid.len() - 1,
+    );
+}
+
+#[test]
 fn directed_nested_nullable_priority_and_invalid_bytes_match_rust_1_12_4() {
     let patterns = [
         "",

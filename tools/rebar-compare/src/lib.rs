@@ -2968,6 +2968,15 @@ struct CaptureSelectorLedger {
 }
 
 impl CaptureSelectorLedger {
+    fn preflight_lf_scan(
+        haystack_len: usize,
+        limits: &RunLimits,
+    ) -> Result<Self, ExecutionError> {
+        let mut ledger = Self::default();
+        ledger.charge(haystack_len, 0, haystack_len, limits)?;
+        Ok(ledger)
+    }
+
     fn remaining(self, limits: &RunLimits) -> Result<(usize, usize), ExecutionError> {
         let work = limits
             .fre_aggregate_operation_work
@@ -3188,7 +3197,10 @@ fn execute_grep_captures(
         .ok_or_else(|| ExecutionError::fault("FRE capture group count overflow"))?;
     let mut reducer_events = 0_usize;
     let mut count = 0_usize;
-    let mut selector = CaptureSelectorLedger::default();
+    // `ByteSlice::lines` scans the complete haystack for LF delimiters. Bind
+    // that work and sequential read before constructing the iterator so a
+    // one-below caller cannot trigger an uncharged partial traversal.
+    let mut selector = CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?;
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
@@ -6599,6 +6611,36 @@ mod tests {
             .charge(1, 8, 9, &limits)
             .expect("first sequential line");
         assert!(sequential.charge(1, 2, 2, &limits).is_err());
+    }
+
+    #[test]
+    fn grep_capture_lf_scan_is_preflighted_and_scales() {
+        for bytes in [0, 1, 4_096] {
+            let limits = RunLimits {
+                fre_aggregate_operation_work: bytes,
+                fre_aggregate_sequential_bytes: bytes,
+                ..RunLimits::default()
+            };
+            let ledger = CaptureSelectorLedger::preflight_lf_scan(bytes, &limits)
+                .expect("exact LF scan budget");
+            assert_eq!(ledger.work, bytes);
+            assert_eq!(ledger.sequential_bytes, bytes);
+            assert_eq!(ledger.remaining(&limits).unwrap(), (0, 0));
+        }
+
+        let bytes = 4_096;
+        let work_one_below = RunLimits {
+            fre_aggregate_operation_work: bytes - 1,
+            fre_aggregate_sequential_bytes: bytes,
+            ..RunLimits::default()
+        };
+        assert!(CaptureSelectorLedger::preflight_lf_scan(bytes, &work_one_below).is_err());
+        let sequential_one_below = RunLimits {
+            fre_aggregate_operation_work: bytes,
+            fre_aggregate_sequential_bytes: bytes - 1,
+            ..RunLimits::default()
+        };
+        assert!(CaptureSelectorLedger::preflight_lf_scan(bytes, &sequential_one_below).is_err());
     }
 
     #[test]

@@ -553,16 +553,12 @@ pub(crate) struct Program {
     pub(crate) execution_state_work: usize,
     pub(crate) has_scalar_transition: bool,
     pub(crate) max_scalar_search_checks: usize,
+    pub(crate) has_unicode_word_boundary: bool,
 }
 
 impl Program {
-    pub(crate) fn contains_unicode_word_boundary(&self) -> bool {
-        self.insts.iter().any(|inst| {
-            matches!(
-                inst,
-                Inst::Assert { assertion, .. } if assertion.is_unicode_word()
-            )
-        })
+    pub(crate) const fn contains_unicode_word_boundary(&self) -> bool {
+        self.has_unicode_word_boundary
     }
 
     pub(crate) fn instruction(&self, pc: usize) -> Result<&Inst, Error> {

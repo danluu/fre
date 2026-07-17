@@ -187,7 +187,7 @@ impl CompiledRegex {
         budget.accounting.execution_state_work = certificate.execution_state_work;
         budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
         budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
-        let program = Program {
+        let mut program = Program {
             insts,
             entry,
             epsilon_order: certificate.epsilon_order,
@@ -196,8 +196,9 @@ impl CompiledRegex {
             execution_state_work: certificate.execution_state_work,
             has_scalar_transition: certificate.has_scalar_transition,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
+            has_unicode_word_boundary: false,
         };
-        let plan_id = plan_identity(&program, profile, &mut budget)?;
+        let plan_id = finalize_program(&mut program, profile, &mut budget)?;
         let accounting = budget.finish();
         Ok(Self {
             program,
@@ -258,6 +259,7 @@ impl CompileBudget {
                 execution_state_work: 0,
                 has_scalar_transitions: false,
                 max_scalar_search_checks: 0,
+                unicode_word_boundary_checks: 0,
                 work: 0,
             },
             current_temporary_states: 0,
@@ -1293,8 +1295,8 @@ fn program_bytes(
     )
 }
 
-fn plan_identity(
-    program: &Program,
+fn finalize_program(
+    program: &mut Program,
     profile: RustByteProfile,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
@@ -1304,14 +1306,25 @@ fn plan_identity(
     second.bytes(profile.identity_domain());
     hash_usize(&mut first, program.entry);
     hash_usize(&mut second, program.entry);
+    let mut has_unicode_word_boundary = false;
     for inst in &program.insts {
         budget.charge(1)?;
+        budget.accounting.unicode_word_boundary_checks = add(
+            budget.accounting.unicode_word_boundary_checks,
+            1,
+            Resource::CompileWork,
+        )?;
+        has_unicode_word_boundary |= matches!(
+            inst,
+            Inst::Assert { assertion, .. } if assertion.is_unicode_word()
+        );
         if let Inst::ConsumeScalar { scalars, .. } = inst {
             budget.charge(scalars.len())?;
         }
         hash_inst(&mut first, inst);
         hash_inst(&mut second, inst);
     }
+    program.has_unicode_word_boundary = has_unicode_word_boundary;
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
     bytes[8..].copy_from_slice(&second.finish().to_le_bytes());

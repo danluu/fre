@@ -34,6 +34,9 @@ pub struct CompileAccounting {
     pub has_scalar_transitions: bool,
     /// Worst-case binary-search comparisons for one scalar transition.
     pub max_scalar_search_checks: usize,
+    /// Instruction-property checks performed during the already-budgeted
+    /// plan-identity traversal to cache Unicode-word admission requirements.
+    pub unicode_word_boundary_checks: usize,
     pub work: usize,
 }
 
@@ -51,6 +54,8 @@ pub struct ExecutionAccounting {
     pub successful_paths: usize,
     pub suppressed_empty: usize,
     pub emitted_matches: usize,
+    /// Bytes prospectively charged before whole-haystack UTF-8 validation.
+    pub utf8_validation_work: usize,
     pub sequential_bytes_written: usize,
     pub sequential_bytes_read: usize,
     pub random_access_peak_bytes: usize,
