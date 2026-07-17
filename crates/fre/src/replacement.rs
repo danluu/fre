@@ -1046,8 +1046,7 @@ impl<'a> CaptureTemplateParser<'a> {
                 _ if self.no_more_closing_braces => return None,
                 _ => {
                     let suffix = self.replacement.get(content_start..)?;
-                    let Some(relative_closing) =
-                        suffix.iter().position(|&byte| byte == b'}')
+                    let Some(relative_closing) = suffix.iter().position(|&byte| byte == b'}')
                     else {
                         self.next_closing_brace = None;
                         self.invalid_utf8 = None;

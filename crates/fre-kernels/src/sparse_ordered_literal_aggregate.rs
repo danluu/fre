@@ -35,8 +35,7 @@ const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 /// Stable strategy identity shared by both operation-typed plans.
 pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-sparse-ac-root256-dp.v2";
 /// Stable identity for the count-specialized plan.
-pub const COUNT_PLAN_ID: &str =
-    "ordered-literal-aggregate.count.reverse-sparse-ac-root256-dp.v2";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-sparse-ac-root256-dp.v2";
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str =
     "ordered-literal-aggregate.span-sum.reverse-sparse-ac-root256-dp.v2";
@@ -744,8 +743,7 @@ impl PlanCore {
             },
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            transition_kind:
-                "direct 256-entry root table plus sorted sparse-CSR byte edges and u32 failure links",
+            transition_kind: "direct 256-entry root table plus sorted sparse-CSR byte edges and u32 failure links",
             traversal_kind: "single reverse sparse-AC pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
@@ -2063,8 +2061,8 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, BuildWork, Output, RawEdge, RawNode, ReduceError, ReduceLimits,
-        ROOT_TRANSITIONS, SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+        BuildError, BuildLimits, BuildWork, Output, ROOT_TRANSITIONS, RawEdge, RawNode,
+        ReduceError, ReduceLimits, SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
         SparseReverseAc, UNSET, build_failure_links, charged_dequeue, pack_edge,
     };
 
@@ -2462,9 +2460,7 @@ mod tests {
             }
 
             let haystack = b"\x00\x7E\x7F\x80\xFE\xFF";
-            let result = plan
-                .count(haystack, ReduceLimits::unlimited())
-                .unwrap();
+            let result = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
             let expected = haystack
                 .iter()
                 .filter(|&&byte| usize::from(byte) < fanout)
