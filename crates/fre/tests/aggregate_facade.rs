@@ -289,6 +289,116 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "count and span-sum exact/one-below matrices share one mechanism fixture"
+)]
+fn continuation_value_reducers_use_exact_work_for_byte_progress_and_unicode_offsets() {
+    let unicode_haystack = ["Aé雪🦀".as_bytes(), &[0xFF, 0x80], "雪éA".as_bytes()].concat();
+    let cases: [(&str, &[u8], bool); 2] = [
+        (r"(?:|a|z{64}[q-r])", &[b'a', 0xFF, b'a'], false),
+        (r"(?:[Aé雪🦀]+|z{64}[q-r])", &unicode_haystack, true),
+    ];
+
+    for (pattern, haystack, unicode) in cases {
+        let expected = upstream_profile(pattern, haystack, false, unicode);
+        let expected_count = u64::try_from(expected.len()).unwrap();
+        let expected_sum = u64::try_from(
+            expected
+                .iter()
+                .map(|(start, end)| end - start)
+                .sum::<usize>(),
+        )
+        .unwrap();
+
+        for strategy in STRATEGIES {
+            let builder = || {
+                aggregate_builder(pattern)
+                    .unicode(unicode)
+                    .plan_selection(AggregatePlanSelection::ForceContinuation)
+                    .strategy(strategy)
+            };
+
+            let count = builder().build_count().unwrap();
+            let audited = count
+                .count(haystack, AggregateRunLimits::default())
+                .unwrap();
+            assert_eq!(audited.value(), expected_count);
+            let (certificate, accounting) = continuation_details(&audited.report().details);
+            assert!(accounting.work < certificate.work_bound);
+
+            let mut exact = AggregateRunLimits::default();
+            exact.continuation.max_work = accounting.work;
+            assert_eq!(count.count_value(haystack, exact).unwrap(), expected_count);
+            let audited_error = count.count(haystack, exact).unwrap_err();
+            assert!(matches!(
+                audited_error.source,
+                AggregateExecutionSource::Continuation(
+                    AggregateEngineError::ResourceLimit {
+                        resource: AggregateResource::ExecutionWork,
+                        required,
+                        limit,
+                    }
+                ) if required == certificate.work_bound && limit == accounting.work
+            ));
+
+            let mut below = exact;
+            below.continuation.max_work -= 1;
+            let value_error = count.count_value(haystack, below).unwrap_err();
+            assert!(matches!(
+                value_error.source,
+                AggregateExecutionSource::Continuation(
+                    AggregateEngineError::ResourceLimit {
+                        resource: AggregateResource::ExecutionWork,
+                        required,
+                        limit,
+                    }
+                ) if required == limit + 1 && limit + 1 == accounting.work
+            ));
+
+            let span_sum = builder().build_span_sum().unwrap();
+            let audited = span_sum
+                .span_sum(haystack, AggregateRunLimits::default())
+                .unwrap();
+            assert_eq!(audited.value(), expected_sum);
+            let (certificate, accounting) = continuation_details(&audited.report().details);
+            assert!(accounting.work < certificate.work_bound);
+
+            exact.continuation.max_work = accounting.work;
+            assert_eq!(
+                span_sum.span_sum_value(haystack, exact).unwrap(),
+                expected_sum
+            );
+            let audited_error = span_sum.span_sum(haystack, exact).unwrap_err();
+            assert!(matches!(
+                audited_error.source,
+                AggregateExecutionSource::Continuation(
+                    AggregateEngineError::ResourceLimit {
+                        resource: AggregateResource::ExecutionWork,
+                        required,
+                        limit,
+                    }
+                ) if required == certificate.work_bound && limit == accounting.work
+            ));
+
+            below = exact;
+            below.continuation.max_work -= 1;
+            let value_error = span_sum.span_sum_value(haystack, below).unwrap_err();
+            assert!(matches!(
+                value_error.source,
+                AggregateExecutionSource::Continuation(
+                    AggregateEngineError::ResourceLimit {
+                        resource: AggregateResource::ExecutionWork,
+                        required,
+                        limit,
+                    }
+                ) if required == limit + 1 && limit + 1 == accounting.work
+            ));
+        }
+    }
+}
+
+#[test]
 fn unicode_word_boundary_routes_through_continuation_exactly() {
     let haystack = "ascii snow雪_ Ж".as_bytes();
     let expected = regex::bytes::RegexBuilder::new(r"\b")

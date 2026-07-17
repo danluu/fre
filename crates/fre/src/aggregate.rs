@@ -2032,6 +2032,80 @@ impl AggregatePlan {
             }
         }
     }
+
+    fn execute_count_value(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return self
+                .execute_count(haystack, limits)
+                .map(|execution| execution.value());
+        };
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation count plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let value = engine
+            .count_value(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|source| {
+                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
+            })?;
+        u64::try_from(value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
+            )
+        })
+    }
+
+    fn execute_span_sum_value(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return self
+                .execute_span_sum(haystack, limits)
+                .map(|execution| execution.value());
+        };
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let value = engine
+            .span_sum_value(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|source| {
+                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
+            })?;
+        u64::try_from(value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })
+    }
 }
 
 enum AggregateCountExecution {
@@ -3023,19 +3097,20 @@ impl AggregateCountRegex {
         Ok(AggregateCountResult { value, report })
     }
 
-    /// Count through the same selected plan and complete preflight as
-    /// [`Self::count`], but return only the reducer value. A successful call
-    /// does not construct an [`AggregateExecutionReport`], cache identity, or
-    /// clone the source-key `Arc`. Failures retain the complete typed identity.
+    /// Count through the same selected plan as [`Self::count`], but return only
+    /// the reducer value. Continuation programs enforce execution work against
+    /// the exact work observed by the complete reduction instead of requiring
+    /// the diagnostic result's conservative replay bound. All other resource
+    /// preflights are unchanged. A successful call does not construct an
+    /// [`AggregateExecutionReport`], cache identity, or clone the source-key
+    /// `Arc`. Failures retain the complete typed identity.
     pub fn count_value(
         &self,
         haystack: &[u8],
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
-        self.0
-            .execute_count(haystack, limits)
-            .map(|execution| execution.value())
+        self.0.execute_count_value(haystack, limits)
     }
 }
 
@@ -3090,19 +3165,20 @@ impl AggregateSpanSumRegex {
         Ok(AggregateSpanSumResult { value, report })
     }
 
-    /// Sum spans through the same selected plan and complete preflight as
-    /// [`Self::span_sum`], but return only the reducer value. A successful call
-    /// does not construct an [`AggregateExecutionReport`], cache identity, or
-    /// clone the source-key `Arc`. Failures retain the complete typed identity.
+    /// Sum spans through the same selected plan as [`Self::span_sum`], but
+    /// return only the reducer value. Continuation programs enforce execution
+    /// work against the exact work observed by the complete reduction instead
+    /// of requiring the diagnostic result's conservative replay bound. All
+    /// other resource preflights are unchanged. A successful call does not
+    /// construct an [`AggregateExecutionReport`], cache identity, or clone the
+    /// source-key `Arc`. Failures retain the complete typed identity.
     pub fn span_sum_value(
         &self,
         haystack: &[u8],
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
-        self.0
-            .execute_span_sum(haystack, limits)
-            .map(|execution| execution.value())
+        self.0.execute_span_sum_value(haystack, limits)
     }
 }
 

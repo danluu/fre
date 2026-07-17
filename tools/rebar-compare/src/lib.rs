@@ -4195,17 +4195,14 @@ fn fre_aggregate_count(
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
     let operation_limits = &operation_limits;
-    let result = regex
-        .count(request.haystack, operation_limits)
+    let actual = regex
+        .count_value(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate count refused execution: {error}");
             aggregate_execution_error(&error.source, message)
         })?;
     let plan = aggregate_single_plan_label("count", regex.build_report());
-    Ok(FreReduction {
-        actual: result.value(),
-        plan,
-    })
+    Ok(FreReduction { actual, plan })
 }
 
 fn fre_aggregate_span_sum(
@@ -4233,17 +4230,14 @@ fn fre_aggregate_span_sum(
     let operation_limits =
         aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
     let operation_limits = &operation_limits;
-    let result = regex
-        .span_sum(request.haystack, operation_limits)
+    let actual = regex
+        .span_sum_value(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate span-sum refused execution: {error}");
             aggregate_execution_error(&error.source, message)
         })?;
     let plan = aggregate_single_plan_label("count-spans", regex.build_report());
-    Ok(FreReduction {
-        actual: result.value(),
-        plan,
-    })
+    Ok(FreReduction { actual, plan })
 }
 
 fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
@@ -7101,6 +7095,95 @@ mod tests {
         assert!(
             matches!(outcome, CandidateOutcome::Unsupported(ref reason) if reason.contains("ExecutionWork")),
             "continuation resource admission must remain unsupported: {outcome:?}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both Rebar value reducers share one exact observed-work admission fixture"
+    )]
+    fn current_fre_single_value_reducers_use_exact_continuation_work() {
+        let pattern = r"(?:|a+|z{64}[q-r])";
+        let patterns = [pattern.to_string()];
+        let haystack = [b'a', 0xFF, b'a'];
+        let baseline_limits = RunLimits::default();
+
+        let count = AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&baseline_limits))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+        let run_limits =
+            aggregate_run_limits(haystack.len(), count.build_report(), &baseline_limits).unwrap();
+        let audited = count.count(&haystack, run_limits).unwrap();
+        let fre::AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = &audited.report().details
+        else {
+            panic!("expected continuation count details");
+        };
+        assert!(accounting.work < certificate.work_bound);
+
+        let mut exact = baseline_limits.clone();
+        exact.fre_aggregate_operation_work = accounting.work;
+        assert_current_fre_execution(
+            current_fre("count", &patterns, &haystack, false, false, &exact),
+            4,
+            "aggregate-continuation-program",
+        );
+        exact.fre_aggregate_operation_work -= 1;
+        let refused = current_fre("count", &patterns, &haystack, false, false, &exact);
+        assert!(
+            matches!(refused, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("ExecutionWork")
+                    && reason.contains(&format!("requires {}", accounting.work))
+                    && reason.contains(&format!("limit is {}", accounting.work - 1))),
+            "one-below observed count work must remain typed unsupported: {refused:?}"
+        );
+
+        let span_sum = AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&baseline_limits))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_span_sum()
+            .unwrap();
+        let run_limits =
+            aggregate_run_limits(haystack.len(), span_sum.build_report(), &baseline_limits)
+                .unwrap();
+        let audited = span_sum.span_sum(&haystack, run_limits).unwrap();
+        let fre::AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = &audited.report().details
+        else {
+            panic!("expected continuation span-sum details");
+        };
+        assert!(accounting.work < certificate.work_bound);
+
+        exact = baseline_limits;
+        exact.fre_aggregate_operation_work = accounting.work;
+        assert_current_fre_execution(
+            current_fre("count-spans", &patterns, &haystack, false, false, &exact),
+            0,
+            "aggregate-continuation-program",
+        );
+        exact.fre_aggregate_operation_work -= 1;
+        let refused = current_fre("count-spans", &patterns, &haystack, false, false, &exact);
+        assert!(
+            matches!(refused, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("ExecutionWork")
+                    && reason.contains(&format!("requires {}", accounting.work))
+                    && reason.contains(&format!("limit is {}", accounting.work - 1))),
+            "one-below observed span-sum work must remain typed unsupported: {refused:?}"
         );
     }
 
