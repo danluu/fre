@@ -121,12 +121,12 @@ pub use fre_kernels::{
     SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
     SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
     SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
-    UnicodeScalarAggregateBuildAccounting,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
-    UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
-    UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregateReduceAccounting,
+    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
+    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSemantics,
+    UnicodeScalarAggregateUpperBounds,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
