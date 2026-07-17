@@ -19,6 +19,11 @@ pub struct CompileAccounting {
     /// Supported zero-width look nodes observed exactly once during bounded
     /// validation. Repetition expansion is accounted separately by states.
     pub look_assertions: usize,
+    /// Nonempty suffix alternatives proved to terminate every match and
+    /// retained as an optional sparse-execution seed.
+    pub required_suffixes: usize,
+    /// Total bytes across `required_suffixes`.
+    pub required_suffix_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,

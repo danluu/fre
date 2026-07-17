@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 use core::ops::Range;
 
 use crate::accounting::ExecutionAccounting;
-use crate::compile::{CompiledRegex, PlanId};
+use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes};
 use crate::error::{add, enforce, mul};
 use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program};
 use crate::{Error, OperationLimits, Resource};
@@ -332,13 +332,38 @@ impl CompiledRegex {
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
         enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
         let passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let requirements = Requirements::new::<OBSERVED_WORK>(
+        let (requirements, sparse_seed) = match Requirements::new::<OBSERVED_WORK>(
             &self.program,
             boundaries,
             strategy,
             passes,
             limits,
-        )?;
+        ) {
+            Ok(requirements)
+                if OBSERVED_WORK
+                    && requirements.work_bound > limits.max_work
+                    && strategy == Strategy::ReverseSequentialRows
+                    && !self.required_suffixes.is_empty() =>
+            {
+                (
+                    Requirements::new_sparse(&self.program, boundaries, strategy, passes, limits)?,
+                    Some(&self.required_suffixes),
+                )
+            }
+            Ok(requirements) => (requirements, None),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }) if strategy == Strategy::ReverseSequentialRows
+                && !self.required_suffixes.is_empty() =>
+            {
+                (
+                    Requirements::new_sparse(&self.program, boundaries, strategy, passes, limits)?,
+                    Some(&self.required_suffixes),
+                )
+            }
+            Err(error) => return Err(error),
+        };
         let mut accounting = ExecutionAccounting::default();
         let mut engine = Engine::build::<OBSERVED_WORK>(
             &self.program,
@@ -346,6 +371,7 @@ impl CompiledRegex {
             assertion_context,
             strategy,
             requirements,
+            sparse_seed,
             limits,
             &mut accounting,
         )?;
@@ -582,6 +608,47 @@ impl Requirements {
             work_bound,
         })
     }
+
+    fn new_sparse(
+        program: &Program,
+        boundaries: usize,
+        strategy: Strategy,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        if strategy != Strategy::ReverseSequentialRows {
+            return Err(Error::InternalInvariant(
+                "sparse continuation requires reverse sequential rows",
+            ));
+        }
+        let rows = ReverseRowRequirements::new(program, boundaries, passes)?;
+        enforce(
+            rows.row_bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            rows.row_bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(rows.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            rows.sequential_bound,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            table_cells: 0,
+            row_storage: Some(rows.storage),
+            record_bytes: rows.record_bytes,
+            requested_log_bytes: rows.log_bytes,
+            sequential_bound: rows.sequential_bound,
+            // Sparse construction charges every observed unit before it is
+            // performed, so the caller's limit is its explicit admission cap.
+            work_bound: limits.max_work,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -642,15 +709,21 @@ impl ReverseRowRequirements {
 enum Engine {
     Full(FullTable),
     Rows(RowStore),
+    SparseRows(RowStore),
 }
 
 impl Engine {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "engine construction binds the exact program, range, selected route, limits, and accounting"
+    )]
     fn build<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
         strategy: Strategy,
         requirements: Requirements,
+        sparse_seed: Option<&RequiredSuffixes>,
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
     ) -> Result<Self, Error> {
@@ -664,15 +737,27 @@ impl Engine {
                 accounting,
             )
             .map(Self::Full),
-            Strategy::ReverseSequentialRows => RowStore::build::<OBSERVED_WORK>(
-                program,
-                haystack,
-                assertions,
-                requirements,
-                limits,
-                accounting,
-            )
-            .map(Self::Rows),
+            Strategy::ReverseSequentialRows => match sparse_seed {
+                Some(seed) => RowStore::build_sparse(
+                    program,
+                    haystack,
+                    assertions,
+                    requirements,
+                    seed,
+                    limits,
+                    accounting,
+                )
+                .map(Self::SparseRows),
+                None => RowStore::build::<OBSERVED_WORK>(
+                    program,
+                    haystack,
+                    assertions,
+                    requirements,
+                    limits,
+                    accounting,
+                )
+                .map(Self::Rows),
+            },
         }
     }
 
@@ -730,13 +815,41 @@ impl Engine {
                     &mut emit,
                 )
             }
+            Self::SparseRows(store) => {
+                let mut reader = store.reader();
+                scan_sequence_sparse(
+                    haystack.len(),
+                    assertions.base(),
+                    accounting,
+                    admitted_work_bound,
+                    |start, accounting| {
+                        if reader.storage == RowStorage::ReachableEndpoints {
+                            return reader.endpoint(start, accounting);
+                        }
+                        if !reader.root(start, accounting)? {
+                            return Ok(None);
+                        }
+                        RowStore::replay_sparse(
+                            program,
+                            haystack,
+                            assertions,
+                            start,
+                            &mut reader,
+                            accounting,
+                            admitted_work_bound,
+                        )
+                        .map(Some)
+                    },
+                    &mut emit,
+                )
+            }
         }
     }
 
     fn peak_with_output(&self, output_bytes: usize) -> Result<usize, Error> {
         match self {
             Self::Full(table) => add(table.allocated_bytes, output_bytes, Resource::PeakBytes),
-            Self::Rows(store) => {
+            Self::Rows(store) | Self::SparseRows(store) => {
                 let build = add(
                     store.allocated_store_bytes,
                     store.build_scratch_bytes,
@@ -1011,6 +1124,230 @@ impl RowStore {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sparse reverse construction keeps its complete storage and work certificate local"
+    )]
+    fn build_sparse(
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        requirements: Requirements,
+        seed: &RequiredSuffixes,
+        limits: OperationLimits,
+        accounting: &mut ExecutionAccounting,
+    ) -> Result<Self, Error> {
+        if seed.is_empty() {
+            return Err(Error::InternalInvariant("sparse continuation has no seed"));
+        }
+        let storage = requirements.row_storage.ok_or(Error::InternalInvariant(
+            "sparse continuation has no row storage",
+        ))?;
+        let mut store = zeroed_bytes(requirements.requested_log_bytes, Resource::LogBytes)?;
+        let allocated_store = store.capacity();
+        enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
+        let states = program.insts.len();
+        let row_words = add(states, states, Resource::RandomAccessBytes)?;
+        let mut rows = zeroed_usizes(row_words, Resource::RandomAccessBytes)?;
+        let row_bytes = mul(
+            rows.capacity(),
+            core::mem::size_of::<usize>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let (mut row, mut next_row) = rows.split_at_mut(states);
+        let build_scratch = row_bytes;
+        enforce(
+            build_scratch,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            build_scratch,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(
+            add(allocated_store, build_scratch, Resource::PeakBytes)?,
+            limits.max_peak_bytes,
+            Resource::PeakBytes,
+        )?;
+
+        let mut write_offset = requirements.record_bytes;
+        let mut next_any = {
+            let terminal_record = store
+                .get_mut(..write_offset)
+                .ok_or(Error::InternalInvariant(
+                    "terminal row outside sparse row log",
+                ))?;
+            Self::build_sparse_row(
+                program,
+                haystack,
+                assertions,
+                haystack.len(),
+                None,
+                seed,
+                row,
+                next_row,
+                false,
+                terminal_record,
+                storage,
+                accounting,
+                requirements.work_bound,
+            )?
+        };
+        accounting.sequential_bytes_written = add(
+            accounting.sequential_bytes_written,
+            requirements.record_bytes,
+            Resource::SequentialBytes,
+        )?;
+        core::mem::swap(&mut row, &mut next_row);
+
+        for (position, input) in haystack.iter().copied().enumerate().rev() {
+            let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
+            let record = store
+                .get_mut(write_offset..end)
+                .ok_or(Error::InternalInvariant(
+                    "sparse row-log write outside store",
+                ))?;
+            let row_any = Self::build_sparse_row(
+                program,
+                haystack,
+                assertions,
+                position,
+                Some(input),
+                seed,
+                row,
+                next_row,
+                next_any,
+                record,
+                storage,
+                accounting,
+                requirements.work_bound,
+            )?;
+            accounting.sequential_bytes_written = add(
+                accounting.sequential_bytes_written,
+                requirements.record_bytes,
+                Resource::SequentialBytes,
+            )?;
+            write_offset = end;
+            core::mem::swap(&mut row, &mut next_row);
+            next_any = row_any;
+        }
+        if write_offset != store.len() {
+            return Err(Error::InternalInvariant(
+                "sparse row-log store length mismatch",
+            ));
+        }
+        accounting.random_access_peak_bytes = build_scratch;
+        accounting.scratch_peak_bytes = build_scratch;
+        accounting.log_bytes = allocated_store;
+        Ok(Self {
+            bytes: store,
+            storage,
+            record_bytes: requirements.record_bytes,
+            allocated_store_bytes: allocated_store,
+            build_scratch_bytes: build_scratch,
+            root_rank: program.split_count,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one sparse-row boundary exposes every proof input and owned buffer"
+    )]
+    fn build_sparse_row(
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        position: usize,
+        input: Option<u8>,
+        seed: &RequiredSuffixes,
+        row: &mut [usize],
+        next_row: &[usize],
+        next_any: bool,
+        record: &mut [u8],
+        storage: RowStorage,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<bool, Error> {
+        let seeded =
+            sparse_seed_matches(seed, haystack, position, accounting, admitted_work_bound)?;
+        // A required suffix can only make Match live at a suffix-ending
+        // boundary. If neither that seed nor the successor row is live, this
+        // entire row is provably zero. The row buffer may retain old values,
+        // but every state is overwritten before a later nonempty row reads it.
+        if !seeded && !next_any {
+            return Ok(false);
+        }
+        let mut row_any = false;
+        for &pc in &program.epsilon_order {
+            try_charge_state(accounting, admitted_work_bound)?;
+            let value = match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant("unfilled sparse execution state"));
+                }
+                Inst::Fail => 0,
+                Inst::Match => {
+                    if seeded {
+                        encode(position)?
+                    } else {
+                        0
+                    }
+                }
+                Inst::Consume { bytes, next } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    if next_any && input.is_some_and(|byte| bytes.contains(byte)) {
+                        next_row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::Assert { assertion, next } => {
+                    try_charge_assertion(accounting, admitted_work_bound)?;
+                    if assertions.is_match(*assertion, position)? {
+                        row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    let preferred_value = row[*preferred];
+                    if preferred_value != 0 {
+                        if storage == RowStorage::SplitDecisions {
+                            let rank = program.split_rank[pc];
+                            if rank == NO_SPLIT_RANK {
+                                return Err(Error::InternalInvariant(
+                                    "sparse split state has no decision rank",
+                                ));
+                            }
+                            set_bit(record, rank)?;
+                        }
+                        preferred_value
+                    } else {
+                        try_charge_transition(accounting, admitted_work_bound)?;
+                        row[*fallback]
+                    }
+                }
+            };
+            row[pc] = value;
+            row_any |= value != 0;
+        }
+        match storage {
+            RowStorage::SplitDecisions => {
+                if row[program.entry] != 0 {
+                    set_bit(record, program.split_count)?;
+                }
+            }
+            RowStorage::ReachableEndpoints => write_encoded(record, row[program.entry])?,
+        }
+        Ok(row_any)
+    }
+
     #[inline]
     #[allow(
         clippy::too_many_arguments,
@@ -1170,6 +1507,67 @@ impl RowStore {
                     let rank = program.split_rank[pc];
                     if rank == NO_SPLIT_RANK {
                         return Err(Error::InternalInvariant("split state has no decision rank"));
+                    }
+                    pc = if reader.decision(position, rank, accounting)? {
+                        *preferred
+                    } else {
+                        *fallback
+                    };
+                }
+            }
+        }
+    }
+
+    fn replay_sparse(
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        start: usize,
+        reader: &mut RowReader<'_>,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<usize, Error> {
+        let mut pc = program.entry;
+        let mut position = start;
+        loop {
+            try_charge_replay(accounting, admitted_work_bound)?;
+            match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant("unfilled sparse replay state"));
+                }
+                Inst::Fail => {
+                    return Err(Error::InternalInvariant(
+                        "sparse row log replayed a failing state",
+                    ));
+                }
+                Inst::Match => return Ok(position),
+                Inst::Consume { bytes, next } => {
+                    if position >= haystack.len() || !bytes.contains(haystack[position]) {
+                        return Err(Error::InternalInvariant(
+                            "sparse row log selected failing byte path",
+                        ));
+                    }
+                    position = add(position, 1, Resource::Boundaries)?;
+                    pc = *next;
+                }
+                Inst::Assert { assertion, next } => {
+                    try_charge_assertion(accounting, admitted_work_bound)?;
+                    if !assertions.is_match(*assertion, position)? {
+                        return Err(Error::InternalInvariant(
+                            "sparse row log selected failing assertion",
+                        ));
+                    }
+                    pc = *next;
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                } => {
+                    let rank = program.split_rank[pc];
+                    if rank == NO_SPLIT_RANK {
+                        return Err(Error::InternalInvariant(
+                            "sparse split state has no decision rank",
+                        ));
                     }
                     pc = if reader.decision(position, rank, accounting)? {
                         *preferred
@@ -1341,6 +1739,92 @@ fn scan_sequence<const OBSERVED_WORK: bool>(
     Ok(summary)
 }
 
+fn scan_sequence_sparse(
+    haystack_len: usize,
+    base: usize,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    mut selected: impl FnMut(usize, &mut ExecutionAccounting) -> Result<Option<usize>, Error>,
+    emit: &mut impl FnMut(Span) -> Result<(), Error>,
+) -> Result<ScanSummary, Error> {
+    let mut summary = ScanSummary::empty();
+    let mut cursor = 0_usize;
+    let mut previous_end = None;
+    while cursor <= haystack_len {
+        let mut start = cursor;
+        let found = loop {
+            if start > haystack_len {
+                break None;
+            }
+            try_charge_root(accounting, admitted_work_bound)?;
+            if let Some(end) = selected(start, accounting)? {
+                if end < start || end > haystack_len {
+                    return Err(Error::InternalInvariant(
+                        "sparse selected endpoint outside input",
+                    ));
+                }
+                break Some((start, end));
+            }
+            start = start.saturating_add(1);
+        };
+        let Some((start, end)) = found else {
+            break;
+        };
+        try_charge_event(accounting, admitted_work_bound)?;
+        summary.events = add(summary.events, 1, Resource::MatchEvents)?;
+        if start == end && previous_end == Some(start) {
+            summary.suppressed = add(summary.suppressed, 1, Resource::MatchEvents)?;
+            accounting.suppressed_empty =
+                add(accounting.suppressed_empty, 1, Resource::MatchEvents)?;
+            let Some(next) = start.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+            continue;
+        }
+        let absolute_start = add(base, start, Resource::Boundaries)?;
+        let absolute_end = add(base, end, Resource::Boundaries)?;
+        emit(Span {
+            start: absolute_start,
+            end: absolute_end,
+        })?;
+        summary.matches = add(summary.matches, 1, Resource::OutputMatches)?;
+        summary.span_sum = add(
+            summary.span_sum,
+            end.checked_sub(start)
+                .ok_or(Error::InternalInvariant("sparse endpoint precedes start"))?,
+            Resource::SpanSum,
+        )?;
+        previous_end = Some(end);
+        cursor = end;
+    }
+    Ok(summary)
+}
+
+fn sparse_seed_matches(
+    seed: &RequiredSuffixes,
+    haystack: &[u8],
+    end: usize,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<bool, Error> {
+    for suffix in seed.iter() {
+        try_charge_transition_amount(
+            accounting,
+            admitted_work_bound,
+            add(suffix.len(), 1, Resource::ExecutionWork)?,
+        )?;
+        let start = end.checked_sub(suffix.len());
+        if start
+            .and_then(|start| haystack.get(start..end))
+            .is_some_and(|got| got == suffix)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // `Requirements::new` checked the sum of every possible construction, scan
 // and replay charge before allocation. Consequently each actual counter and
 // their sum fit in `usize` and cannot reach the structural bound's successor.
@@ -1458,6 +1942,77 @@ fn charge_event<const OBSERVED_WORK: bool>(
     charge::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
     accounting.successful_paths += 1;
     Ok(())
+}
+
+fn try_charge_amount(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    amount: usize,
+) -> Result<(), Error> {
+    let required = add(accounting.work, amount, Resource::ExecutionWork)?;
+    enforce(required, admitted_work_bound, Resource::ExecutionWork)?;
+    accounting.work = required;
+    Ok(())
+}
+
+fn try_charge_state(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    accounting.state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
+    try_charge_amount(accounting, admitted_work_bound, 1)
+}
+
+fn try_charge_transition(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    try_charge_transition_amount(accounting, admitted_work_bound, 1)
+}
+
+fn try_charge_transition_amount(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    amount: usize,
+) -> Result<(), Error> {
+    accounting.transition_checks = add(
+        accounting.transition_checks,
+        amount,
+        Resource::ExecutionWork,
+    )?;
+    try_charge_amount(accounting, admitted_work_bound, amount)
+}
+
+fn try_charge_assertion(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    accounting.assertion_checks = add(accounting.assertion_checks, 1, Resource::ExecutionWork)?;
+    try_charge_transition(accounting, admitted_work_bound)
+}
+
+fn try_charge_root(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    accounting.root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
+    try_charge_amount(accounting, admitted_work_bound, 1)
+}
+
+fn try_charge_replay(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    accounting.replay_steps = add(accounting.replay_steps, 1, Resource::ExecutionWork)?;
+    try_charge_amount(accounting, admitted_work_bound, 1)
+}
+
+fn try_charge_event(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    accounting.successful_paths = add(accounting.successful_paths, 1, Resource::ExecutionWork)?;
+    try_charge_amount(accounting, admitted_work_bound, 1)
 }
 
 fn validate_admitted_work(

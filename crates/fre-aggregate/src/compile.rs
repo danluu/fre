@@ -66,8 +66,45 @@ impl core::fmt::Display for PlanId {
 #[derive(Debug)]
 pub struct CompiledRegex {
     pub(crate) program: Program,
+    pub(crate) required_suffixes: RequiredSuffixes,
     plan_id: PlanId,
     accounting: CompileAccounting,
+}
+
+/// A small construction-proved set: every match ends with one of these
+/// nonempty byte strings. It is only an execution hint; an ineligible HIR
+/// retains the dense continuation route.
+#[derive(Debug, Default)]
+pub(crate) struct RequiredSuffixes {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl RequiredSuffixes {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        let mut start = 0_usize;
+        self.ends.iter().map(move |&end| {
+            let suffix = &self.bytes[start..end];
+            start = end;
+            suffix
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    fn retained_bytes(&self) -> Result<usize, Error> {
+        add(
+            self.bytes.capacity(),
+            mul(
+                self.ends.capacity(),
+                core::mem::size_of::<usize>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )
+    }
 }
 
 impl CompiledRegex {
@@ -109,6 +146,9 @@ impl CompiledRegex {
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
         validate_hir(hir, profile, capture_policy, &mut budget)?;
+        let required_suffixes = required_suffixes(hir, &mut budget)?;
+        budget.accounting.required_suffixes = required_suffixes.ends.len();
+        budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
@@ -124,10 +164,14 @@ impl CompiledRegex {
             Resource::ProgramStates,
         )?;
         let (epsilon_order, split_rank, split_count) = certify_program(&insts, &mut budget)?;
-        let program_bytes = program_bytes(
-            insts.capacity(),
-            epsilon_order.capacity(),
-            split_rank.capacity(),
+        let program_bytes = add(
+            program_bytes(
+                insts.capacity(),
+                epsilon_order.capacity(),
+                split_rank.capacity(),
+            )?,
+            required_suffixes.retained_bytes()?,
+            Resource::ProgramBytes,
         )?;
         enforce(
             program_bytes,
@@ -147,6 +191,7 @@ impl CompiledRegex {
         let accounting = budget.finish();
         Ok(Self {
             program,
+            required_suffixes,
             plan_id,
             accounting,
         })
@@ -195,6 +240,8 @@ impl CompileBudget {
                 utf8_sequences: 0,
                 utf8_byte_ranges: 0,
                 look_assertions: 0,
+                required_suffixes: 0,
+                required_suffix_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -258,6 +305,152 @@ impl CompileBudget {
 
     fn finish(self) -> CompileAccounting {
         self.accounting
+    }
+}
+
+const MAX_REQUIRED_SUFFIXES: usize = 8;
+const MAX_REQUIRED_SUFFIX_BYTES: usize = 4_096;
+
+#[derive(Clone, Copy)]
+struct SuffixSet<'a> {
+    literals: [Option<&'a [u8]>; MAX_REQUIRED_SUFFIXES],
+    len: usize,
+    bytes: usize,
+}
+
+impl<'a> SuffixSet<'a> {
+    const fn empty() -> Self {
+        Self {
+            literals: [None; MAX_REQUIRED_SUFFIXES],
+            len: 0,
+            bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, literal: &'a [u8], budget: &mut CompileBudget) -> Result<bool, Error> {
+        if literal.is_empty() || literal.len() > MAX_REQUIRED_SUFFIX_BYTES {
+            return Ok(false);
+        }
+        for existing in self.literals[..self.len].iter().flatten().copied() {
+            // Preflight the length check and worst-case shared byte prefix
+            // before slice equality can perform either.
+            let comparison_work = add(existing.len().min(literal.len()), 1, Resource::CompileWork)?;
+            budget.charge(comparison_work)?;
+            if existing == literal {
+                return Ok(true);
+            }
+        }
+        if self.len == MAX_REQUIRED_SUFFIXES {
+            return Ok(false);
+        }
+        let Some(bytes) = self.bytes.checked_add(literal.len()) else {
+            return Ok(false);
+        };
+        if bytes > MAX_REQUIRED_SUFFIX_BYTES {
+            return Ok(false);
+        }
+        self.literals[self.len] = Some(literal);
+        self.len = self.len.saturating_add(1);
+        self.bytes = bytes;
+        Ok(true)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.literals[..self.len].iter().flatten().copied()
+    }
+}
+
+enum SuffixAnalysis<'a> {
+    /// This HIR consumes no bytes, so a containing concatenation must continue
+    /// looking to its left.
+    ZeroWidth,
+    /// No bounded nonempty suffix theorem was proved.
+    None,
+    Literals(SuffixSet<'a>),
+}
+
+fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSuffixes, Error> {
+    let SuffixAnalysis::Literals(literals) = analyze_required_suffixes(hir, budget)? else {
+        return Ok(RequiredSuffixes::default());
+    };
+    if literals.len == 0 {
+        return Ok(RequiredSuffixes::default());
+    }
+    // Preflight every retained endpoint and byte before allocation or copy.
+    budget.charge(add(literals.len, literals.bytes, Resource::CompileWork)?)?;
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(literals.bytes).is_err() {
+        return Ok(RequiredSuffixes::default());
+    }
+    let mut ends = Vec::new();
+    if ends.try_reserve_exact(literals.len).is_err() {
+        return Ok(RequiredSuffixes::default());
+    }
+    for literal in literals.iter() {
+        bytes.extend_from_slice(literal);
+        ends.push(bytes.len());
+    }
+    Ok(RequiredSuffixes { bytes, ends })
+}
+
+fn analyze_required_suffixes<'a>(
+    hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<SuffixAnalysis<'a>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => Ok(SuffixAnalysis::ZeroWidth),
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            if bytes.is_empty() {
+                Ok(SuffixAnalysis::ZeroWidth)
+            } else {
+                let mut suffixes = SuffixSet::empty();
+                if suffixes.insert(bytes, budget)? {
+                    Ok(SuffixAnalysis::Literals(suffixes))
+                } else {
+                    Ok(SuffixAnalysis::None)
+                }
+            }
+        }
+        HirKind::Class(_) => Ok(SuffixAnalysis::None),
+        HirKind::Capture(capture) => analyze_required_suffixes(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                Ok(SuffixAnalysis::None)
+            } else {
+                analyze_required_suffixes(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            for part in parts.iter().rev() {
+                match analyze_required_suffixes(part, budget)? {
+                    SuffixAnalysis::ZeroWidth => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(SuffixAnalysis::ZeroWidth)
+        }
+        HirKind::Alternation(branches) => {
+            let mut combined = SuffixSet::empty();
+            for branch in branches {
+                // Branch selection is separate from the recursive node visit.
+                budget.charge(1)?;
+                let SuffixAnalysis::Literals(suffixes) = analyze_required_suffixes(branch, budget)?
+                else {
+                    return Ok(SuffixAnalysis::None);
+                };
+                for suffix in suffixes.iter() {
+                    if !combined.insert(suffix, budget)? {
+                        return Ok(SuffixAnalysis::None);
+                    }
+                }
+            }
+            if combined.len == 0 {
+                Ok(SuffixAnalysis::None)
+            } else {
+                Ok(SuffixAnalysis::Literals(combined))
+            }
+        }
     }
 }
 
@@ -1015,4 +1208,100 @@ fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
     let mut values = reserved_vec(length, resource)?;
     values.resize(length, 0);
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use regex_syntax::hir::Look;
+
+    use super::*;
+
+    const ADVERSARIAL_ANALYSIS_WORK: usize = 2_368;
+    const ADVERSARIAL_ANALYSIS_ONE_BELOW: usize = 2_367;
+    const ADVERSARIAL_RETAINED_WORK: usize = 2_888;
+    const ADVERSARIAL_RETAINED_ONE_BELOW: usize = 2_887;
+
+    fn suffix_adversary(ninth_is_duplicate: bool) -> Hir {
+        let looks = [
+            Look::Start,
+            Look::End,
+            Look::StartLF,
+            Look::EndLF,
+            Look::StartCRLF,
+            Look::EndCRLF,
+            Look::WordAscii,
+            Look::WordAsciiNegate,
+            Look::WordStartAscii,
+        ];
+        let branches = looks
+            .into_iter()
+            .enumerate()
+            .map(|(index, look)| {
+                let mut suffix = vec![b'x'; 64];
+                suffix[63] = if ninth_is_duplicate && index == 8 {
+                    7
+                } else {
+                    u8::try_from(index).expect("nine branches fit in u8")
+                };
+                Hir::concat(vec![Hir::look(look), Hir::literal(suffix)])
+            })
+            .collect();
+        let hir = Hir::alternation(branches);
+        assert!(matches!(
+            hir.kind(),
+            HirKind::Alternation(branches) if branches.len() == 9
+        ));
+        hir
+    }
+
+    fn suffix_budget(max_work: usize) -> CompileBudget {
+        CompileBudget::new(CompileLimits {
+            max_work,
+            ..CompileLimits::default()
+        })
+    }
+
+    #[test]
+    fn required_suffix_ineligible_analysis_exact_limit_and_one_below() {
+        // 19 visited nodes + 9 alternation branches + 36 worst-case
+        // 64-byte dedup comparisons, each charged as min(lengths) + 1.
+        let hir = suffix_adversary(false);
+        let mut exact = suffix_budget(ADVERSARIAL_ANALYSIS_WORK);
+        let suffixes = required_suffixes(&hir, &mut exact).unwrap();
+        assert!(suffixes.is_empty());
+        assert_eq!(ADVERSARIAL_ANALYSIS_WORK, exact.accounting.work);
+
+        let mut one_below = suffix_budget(ADVERSARIAL_ANALYSIS_ONE_BELOW);
+        assert_eq!(
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: ADVERSARIAL_ANALYSIS_WORK,
+                limit: ADVERSARIAL_ANALYSIS_ONE_BELOW,
+            },
+            required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn required_suffix_retained_copy_exact_limit_and_one_below() {
+        // The same adversarial analysis retains eight 64-byte suffixes when
+        // the ninth branch duplicates the eighth, adding 8 endpoint writes
+        // and 512 byte copies to the preflighted work.
+        let hir = suffix_adversary(true);
+        let mut exact = suffix_budget(ADVERSARIAL_RETAINED_WORK);
+        let suffixes = required_suffixes(&hir, &mut exact).unwrap();
+        assert_eq!(8, suffixes.ends.len());
+        assert_eq!(512, suffixes.bytes.len());
+        assert_eq!(ADVERSARIAL_RETAINED_WORK, exact.accounting.work);
+
+        let mut one_below = suffix_budget(ADVERSARIAL_RETAINED_ONE_BELOW);
+        assert_eq!(
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: ADVERSARIAL_RETAINED_WORK,
+                limit: ADVERSARIAL_RETAINED_ONE_BELOW,
+            },
+            required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+    }
 }

@@ -346,7 +346,9 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     assert_eq!(regex.build_report().selector.program_states, 344_385);
     assert_eq!(regex.build_report().selector.temporary_states_peak, 344_385);
     assert_eq!(regex.build_report().selector.program_bytes, 30_675_984);
-    assert_eq!(regex.build_report().selector.work, 3_305_876);
+    // Required-suffix eligibility now charges its five-node ineligible walk
+    // before the unchanged capture selector compilation.
+    assert_eq!(regex.build_report().selector.work, 3_305_881);
 
     for haystack in [
         "abcdefghijklmn абвгдежзийклмн",

@@ -344,6 +344,210 @@ fn directed_nested_nullable_priority_and_invalid_bytes_match_rust_1_12_4() {
 }
 
 #[test]
+fn required_suffix_sparse_rows_preserve_priority_and_exact_work_admission() {
+    let cases: [(&str, &[u8]); 4] = [
+        (r"[a-z]+ing", b"!!!!zzing!!!!aing!!!!"),
+        (r"(?:zabb|b)", b"!zabb!b!zabb!"),
+        (r"(?:a+?x|aa+x)", b"!aaaax!aax!"),
+        (r"(?-u:[a-z\xFF]+)ing", b"!a\xFFing!zzing!"),
+    ];
+    for (pattern, haystack) in cases {
+        let mut expanded = Vec::new();
+        for _ in 0..128 {
+            expanded.extend_from_slice(haystack);
+        }
+        let regex = compile(pattern);
+        let expected = upstream(pattern, &expanded);
+        let dense = regex
+            .admit_spans(
+                &expanded,
+                0..expanded.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let mut sparse_limits = OperationLimits {
+            max_work: dense.certificate().work_bound - 1,
+            ..OperationLimits::default()
+        };
+        let sparse = regex
+            .admit_spans(
+                &expanded,
+                0..expanded.len(),
+                Strategy::ReverseSequentialRows,
+                sparse_limits,
+            )
+            .unwrap_or_else(|error| panic!("sparse {pattern:?} failed: {error}"));
+        assert_eq!(expected, sparse.as_slice(), "{pattern:?}");
+        assert!(sparse.accounting().work < dense.certificate().work_bound);
+        assert_eq!(
+            Some(RowStorage::SplitDecisions),
+            sparse.certificate().row_storage
+        );
+        assert!(sparse.accounting().replay_steps > 0);
+        assert_eq!(
+            sparse_limits.max_work,
+            sparse.certificate().work_bound,
+            "the sparse certificate records its dynamic admission cap"
+        );
+
+        let exact_work = sparse.accounting().work;
+        sparse_limits.max_work = exact_work;
+        let exact = regex
+            .admit_spans(
+                &expanded,
+                0..expanded.len(),
+                Strategy::ReverseSequentialRows,
+                sparse_limits,
+            )
+            .unwrap();
+        assert_eq!(expected, exact.as_slice());
+        sparse_limits.max_work = exact_work - 1;
+        assert!(matches!(
+            regex.admit_spans(
+                &expanded,
+                0..expanded.len(),
+                Strategy::ReverseSequentialRows,
+                sparse_limits,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            }) if required == limit + 1
+        ));
+    }
+}
+
+#[test]
+fn required_suffix_sparse_rows_choose_the_narrower_endpoint_log() {
+    let pattern = (1..=40)
+        .map(|length| format!(r"a{{{length}}}x"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let haystack = b"!aaaaax!aaaaaaaaaax!".repeat(64);
+    let regex = compile(&format!(r"(?:{pattern})"));
+    let expected = upstream(&format!(r"(?:{pattern})"), &haystack);
+    let dense = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let sparse = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: dense.certificate().work_bound - 1,
+                ..OperationLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(expected, sparse.as_slice());
+    assert_eq!(
+        Some(RowStorage::ReachableEndpoints),
+        sparse.certificate().row_storage
+    );
+    assert_eq!(0, sparse.accounting().replay_steps);
+    assert!(sparse.accounting().work < dense.certificate().work_bound);
+}
+
+#[test]
+fn sparse_suffix_selection_is_bounded_and_ineligible_inputs_stay_dense() {
+    let one = compile(r"[a-z]+ing").compile_accounting();
+    assert_eq!((one.required_suffixes, one.required_suffix_bytes), (1, 3));
+    let alternatives = compile(r"(?:foo|bar)").compile_accounting();
+    assert_eq!(
+        (
+            alternatives.required_suffixes,
+            alternatives.required_suffix_bytes
+        ),
+        (2, 6)
+    );
+    let nullable = compile(r"(?:foo|)");
+    let accounting = nullable.compile_accounting();
+    assert_eq!(
+        (
+            accounting.required_suffixes,
+            accounting.required_suffix_bytes
+        ),
+        (0, 0)
+    );
+    let dense = nullable
+        .admit_count(
+            b"foofoo",
+            0..6,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let limits = OperationLimits {
+        max_work: dense.certificate().work_bound - 1,
+        ..OperationLimits::default()
+    };
+    assert!(matches!(
+        nullable.admit_count(b"foofoo", 0..6, Strategy::ReverseSequentialRows, limits,),
+        Err(Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            ..
+        })
+    ));
+
+    let unicode_word = compile_unicode_byte_stable(r"\b[a-z]+ing\b").unwrap();
+    assert_eq!(unicode_word.compile_accounting().required_suffix_bytes, 3);
+    assert!(matches!(
+        unicode_word.admit_count(
+            &[b'a', 0xFF, b'i', b'n', b'g'],
+            0..5,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        ),
+        Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+    ));
+}
+
+#[test]
+#[ignore = "16 MiB Rebar-scale semantic canary; run explicitly"]
+fn required_suffix_sparse_rows_cross_the_rebar_work_refusal_boundary() {
+    const HAYSTACK_LEN: usize = 16 * 1_048_576;
+    const MATCHES: usize = 4_096;
+    let mut haystack = vec![b'!'; HAYSTACK_LEN];
+    for ordinal in 0..MATCHES {
+        let start = ordinal * 4_096;
+        haystack[start..start + 7].copy_from_slice(b"wording");
+    }
+    let regex = compile(r"[a-zA-Z]+ing");
+    let limits = OperationLimits {
+        max_boundaries: HAYSTACK_LEN + 1,
+        max_match_events: MATCHES,
+        max_output_matches: MATCHES,
+        max_span_sum: HAYSTACK_LEN,
+        ..OperationLimits::default()
+    };
+    let count = regex
+        .admit_count(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(count.value(), MATCHES);
+    assert_eq!(count.certificate().work_bound, limits.max_work);
+    assert_eq!(
+        Some(RowStorage::SplitDecisions),
+        count.certificate().row_storage
+    );
+    assert_eq!(1, count.certificate().row_record_bytes);
+    assert!(count.accounting().work < limits.max_work);
+    assert!(count.accounting().state_evaluations < HAYSTACK_LEN);
+}
+
+#[test]
 fn unicode_scalar_paths_cover_all_widths_invalid_bytes_and_nullable_priority() {
     let patterns = [
         r"[Aé雪🦀]",
