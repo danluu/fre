@@ -80,7 +80,8 @@ pub enum AggregatePlanKind {
     /// This is not the continuation state engine.
     UnicodeScalarClass,
     /// Direct bounded circular-window reducer for
-    /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences.
+    /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
+    /// whole-match capture erasure.
     FixedClassSandwich,
     /// Ordered finite HIR lowered to one reversed shared-transition DFA and a
     /// bounded initial/progressed reducer ring.
@@ -341,8 +342,8 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
-    /// Fixed-class sandwich structural inspection work, including every
-    /// examined canonical range.
+    /// Fixed-class sandwich structural inspection work, including every HIR
+    /// node and canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
     /// Checked finite-language analysis/expansion work, or zero when skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
@@ -1230,8 +1231,9 @@ impl AggregateBuilder {
                 semantics,
                 work,
                 hir_nodes,
+                captures,
             }) => {
-                if hir_nodes != expected_nodes || expected_captures != 0 {
+                if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
@@ -1281,8 +1283,8 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     finite_planner_work: 0,
-                    capture_erasure_work: 0,
-                    captures_erased: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
                     build: AggregateBuildAccounting::FixedClassSandwich(build),
                     plan_identity: AggregatePlanIdentity::FixedClassSandwich(
                         AggregateFixedClassSandwichIdentity {
@@ -1925,6 +1927,7 @@ enum FixedClassSandwichInspection<'a> {
         semantics: FixedClassSandwichSemantics,
         work: usize,
         hir_nodes: usize,
+        captures: usize,
     },
     Ineligible {
         work: usize,
@@ -1942,7 +1945,15 @@ fn inspect_fixed_class_sandwich(
     limit: usize,
 ) -> Result<FixedClassSandwichInspection<'_>, FixedClassSandwichInspectionError> {
     let mut work = 0_usize;
-    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let mut hir_nodes = 0_usize;
+    let mut captures = 0_usize;
+    let hir = peel_fixed_class_captures(
+        hir,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
     let HirKind::Concat(parts) = hir.kind() else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
@@ -1950,12 +1961,24 @@ fn inspect_fixed_class_sandwich(
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let prefix_hir = peel_fixed_class_captures(
+        prefix_hir,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
     let Some(prefix) = inspect_fixed_class_atom(prefix_hir, unicode) else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let middle_hir = peel_fixed_class_captures(
+        middle_hir,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
     let HirKind::Repetition(repeated) = middle_hir.kind() else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
@@ -1966,12 +1989,24 @@ fn inspect_fixed_class_sandwich(
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     }
 
-    charge_fixed_class_inspection_work(&mut work, limit)?;
-    let Some(middle) = inspect_fixed_class_atom(repeated.sub.as_ref(), unicode) else {
+    let repeated_hir = peel_fixed_class_captures(
+        repeated.sub.as_ref(),
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let Some(middle) = inspect_fixed_class_atom(repeated_hir, unicode) else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
 
-    charge_fixed_class_inspection_work(&mut work, limit)?;
+    let suffix_hir = peel_fixed_class_captures(
+        suffix_hir,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
     let Some(suffix) = inspect_fixed_class_atom(suffix_hir, unicode) else {
         return Ok(FixedClassSandwichInspection::Ineligible { work });
     };
@@ -1992,8 +2027,31 @@ fn inspect_fixed_class_sandwich(
             FixedClassSandwichSemantics::RustBytesUnicodeOff
         },
         work,
-        hir_nodes: 5,
+        hir_nodes,
+        captures,
     })
+}
+
+fn peel_fixed_class_captures<'a>(
+    mut hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<&'a Hir, FixedClassSandwichInspectionError> {
+    loop {
+        charge_fixed_class_inspection_work(work, limit)?;
+        *hir_nodes = (*hir_nodes)
+            .checked_add(1)
+            .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+        let HirKind::Capture(capture) = hir.kind() else {
+            return Ok(hir);
+        };
+        *captures = (*captures)
+            .checked_add(1)
+            .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+        hir = capture.sub.as_ref();
+    }
 }
 
 fn inspect_fixed_class_atom(hir: &Hir, unicode: bool) -> Option<FixedClassAtom<'_>> {
