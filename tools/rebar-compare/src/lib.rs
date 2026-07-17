@@ -21,12 +21,12 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
-    AggregateFiniteLiteralIdentity, AggregateFixedClassSandwichSemantics,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCompileRegex,
-    AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
+    AggregateFixedClassSandwichSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
     AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
     AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
@@ -75,7 +75,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v1-fixed-class-sandwich-v1-structural-quota-v4";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-fixed-class-sandwich-v1-structural-quota-v4";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -409,7 +409,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, shared finite-language DFA, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses either a proved uniform captured Unicode-scalar alternation or whole-operation capture-erased span selection plus exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, a bounded Unicode-off finite-language shared DFA, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using one reversed shared-transition DFA; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, a bounded finite-language shared DFA (including nonempty valid-UTF8 Unicode words), or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; the finite-language plan preserves leftmost-first HIR order and empty-match progress while using one reversed shared-transition DFA; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits canonical scalar classes as bounded UTF-8 paths plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, otherwise use a complete reverse-row selector and exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded canonical UTF-8 scalar-class paths plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -3703,25 +3703,33 @@ fn require_unicode_plan_identity(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> Result<(), ExecutionError> {
-    if !unicode {
-        let finite_operation = match operation {
-            LiteralAggregateOperation::Count => ORDERED_LITERAL_COUNT_PLAN_ID,
-            LiteralAggregateOperation::SpanSum => ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    let finite_operation = match operation {
+        LiteralAggregateOperation::Count => ORDERED_LITERAL_COUNT_PLAN_ID,
+        LiteralAggregateOperation::SpanSum => ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    };
+    if let AggregatePlanIdentity::FiniteLiteral(AggregateFiniteLiteralIdentity {
+        semantics,
+        algorithm,
+        operation,
+    }) = report.plan_identity
+    {
+        let expected_semantics = if unicode {
+            AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+        } else {
+            AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
         };
-        if let AggregatePlanIdentity::FiniteLiteral(AggregateFiniteLiteralIdentity {
-            algorithm,
-            operation,
-        }) = report.plan_identity
+        if semantics == expected_semantics
+            && algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+            && operation == finite_operation
         {
-            if algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID && operation == finite_operation
-            {
-                return Ok(());
-            }
-            return Err(ExecutionError::fault(format!(
-                "finite aggregate semantic identity mismatch for {finite_operation}: {:?}",
-                report.plan_identity
-            )));
+            return Ok(());
         }
+        return Err(ExecutionError::fault(format!(
+            "finite aggregate semantic identity mismatch for {finite_operation}: {:?}",
+            report.plan_identity
+        )));
+    }
+    if !unicode {
         if let AggregatePlanIdentity::FixedClassSandwich(identity) = report.plan_identity {
             let fixed_operation = match operation {
                 LiteralAggregateOperation::Count => FixedClassSandwichOperation::Count,
@@ -5810,7 +5818,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v1-fixed-class-sandwich-v1-structural-quota-v4"
+            "fre-current-aggregate-capture-v16-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-fixed-class-sandwich-v1-structural-quota-v4"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -5924,6 +5932,36 @@ mod tests {
             ),
             4,
             "aggregate-unicode-scalar-class",
+        );
+    }
+
+    #[test]
+    fn current_fre_unicode_finite_literals_use_the_shared_dfa() {
+        let limits = RunLimits::default();
+        let haystack = "--∞--✓--∞--".as_bytes();
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &["∞|✓".to_string()],
+                haystack,
+                true,
+                false,
+                &limits,
+            ),
+            3,
+            "aggregate-finite-literal-dfa",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &["∞|✓".to_string()],
+                haystack,
+                true,
+                false,
+                &limits,
+            ),
+            9,
+            "aggregate-finite-literal-dfa",
         );
     }
 
@@ -6511,7 +6549,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count", &["a|b".to_string()], b"baab", true, false, &limits),
             4,
-            "aggregate-continuation-program",
+            "aggregate-finite-literal-dfa",
         );
         assert_current_fre_execution(
             current_fre("count", &["a".to_string()], b"baab", true, false, &limits),
@@ -6526,7 +6564,7 @@ mod tests {
             true,
             &limits,
         );
-        assert_current_fre_execution(folded, 1, "aggregate-continuation-program");
+        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-dfa");
         assert_current_fre_execution(
             current_fre(
                 "count",
