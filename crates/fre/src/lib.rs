@@ -75,7 +75,8 @@ pub use fre_aggregate::{
     Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
     OperationLimits as AggregateOperationLimits, PlanId as AggregatePlanId,
-    Resource as AggregateResource, Span as AggregateSpan, Unsupported as AggregateUnsupported,
+    Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
+    Unsupported as AggregateUnsupported,
 };
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,

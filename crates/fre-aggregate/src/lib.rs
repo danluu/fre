@@ -27,8 +27,10 @@
 //! global iteration by repeatedly searching overlapping suffixes.
 //!
 //! Two independently selectable storage strategies are provided:
-//! [`Strategy::FullTable`] and [`Strategy::ReverseSequentialRows`]. Both have
-//! checked whole-operation work and storage certificates. A public pull
+//! [`Strategy::FullTable`] and [`Strategy::ReverseSequentialRows`]. Reverse
+//! rows construction-selects the narrower of split/root decisions and a
+//! minimally encoded reachable endpoint per input boundary. Both strategies
+//! have checked whole-operation work and storage certificates. A public pull
 //! iterator is only created after the entire match sequence has been admitted
 //! and evaluated, so repeated calls cannot evade a resource limit.
 
@@ -47,5 +49,5 @@ pub use error::{Error, Resource, Unsupported};
 pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, MatchCount, OperationCertificate, OperationId,
-    Span, SpanIter, SpanIteration, SpanSum, Strategy,
+    RowStorage, Span, SpanIter, SpanIteration, SpanSum, Strategy,
 };

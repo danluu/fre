@@ -4,8 +4,8 @@
 )]
 
 use fre_aggregate::{
-    CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Span,
-    Strategy, Unsupported,
+    CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RowStorage, RustByteProfile,
+    Span, Strategy, Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{
@@ -1363,6 +1363,13 @@ fn plan_and_operation_identities_are_deterministic_and_typed() {
     let count = first
         .admit_count(b"ab", 0..2, Strategy::FullTable, OperationLimits::default())
         .unwrap();
+    assert_eq!(None, spans.certificate().row_storage);
+    assert_eq!(0, spans.certificate().row_record_bytes);
+    assert!(rows.certificate().row_storage.is_some());
+    assert_eq!(
+        rows.certificate().log_bytes,
+        rows.certificate().row_record_bytes * rows.certificate().boundaries
+    );
     assert_eq!(
         spans.certificate().operation_id,
         spans_again.certificate().operation_id
@@ -1385,6 +1392,29 @@ fn expect_resource<T>(result: Result<T, Error>, resource: Resource) {
     assert!(
         matches!(result, Err(Error::ResourceLimit { resource: actual, .. }) if actual == resource),
         "expected resource refusal {resource:?}"
+    );
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consuming opaque success values keeps exact refusal assertions generic"
+)]
+fn expect_exact_resource<T>(
+    result: Result<T, Error>,
+    resource: Resource,
+    required: usize,
+    limit: usize,
+) {
+    assert!(
+        matches!(
+            result,
+            Err(Error::ResourceLimit {
+                resource: actual,
+                required: actual_required,
+                limit: actual_limit,
+            }) if actual == resource && actual_required == required && actual_limit == limit
+        ),
+        "expected exact {resource:?} refusal requiring {required} with limit {limit}"
     );
 }
 
@@ -1612,7 +1642,7 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
 }
 
 #[test]
-fn reverse_rows_borrow_multi_byte_decision_records_without_changing_selection() {
+fn reverse_rows_choose_narrow_reachable_endpoints_without_changing_selection() {
     let cases: [(&str, &[u8]); 3] = [
         (
             r"(?:a|bb|ccc|dddd|eeeee|ffffff|ggggggg|hhhhhhhh|iiiiiiiii|jjjjjjjjjj)+?",
@@ -1627,7 +1657,6 @@ fn reverse_rows_borrow_multi_byte_decision_records_without_changing_selection() 
             b"alpha\nnope\njuliett\ncharlie",
         ),
     ];
-    let mut observed_multi_byte_record = false;
     for (pattern, haystack) in cases {
         let regex = compile(pattern);
         let expected = upstream(pattern, haystack);
@@ -1651,14 +1680,206 @@ fn reverse_rows_borrow_multi_byte_decision_records_without_changing_selection() 
         assert_eq!(expected, rows.as_slice(), "borrowed rows: {pattern:?}");
         assert_eq!(full.as_slice(), rows.as_slice(), "strategy: {pattern:?}");
         let certificate = rows.certificate();
-        observed_multi_byte_record |= certificate.log_bytes >= certificate.boundaries * 2;
+        assert_eq!(
+            Some(RowStorage::ReachableEndpoints),
+            certificate.row_storage
+        );
+        assert_eq!(1, certificate.row_record_bytes);
+        assert_eq!(certificate.boundaries, certificate.log_bytes);
+        assert_eq!(0, rows.accounting().replay_steps);
         assert!(
             rows.accounting().sequential_bytes_written + rows.accounting().sequential_bytes_read
                 <= certificate.sequential_bytes_bound
         );
     }
-    assert!(
-        observed_multi_byte_record,
-        "fixture must exercise a decision record wider than one byte"
+}
+
+#[test]
+fn equal_width_reverse_rows_keep_split_decisions() {
+    let regex = compile(r"(?:a|bb)");
+    let rows = regex
+        .admit_spans(
+            b"a",
+            0..1,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        Some(RowStorage::SplitDecisions),
+        rows.certificate().row_storage
     );
+    assert_eq!(1, rows.certificate().row_record_bytes);
+    assert!(rows.accounting().replay_steps > 0);
+}
+
+#[test]
+fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
+    let fillers = (1..=40)
+        .map(|length| format!(r"z{{{length}}}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"(?:ab|a|\xFFa|\xFF||{fillers})");
+    let haystack = b"ab\xFFa\xFFx";
+    let expected = upstream(&pattern, haystack);
+    let full = compile(&pattern)
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::FullTable,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let regex = compile(&pattern);
+    let rows = regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(expected, full.as_slice());
+    assert_eq!(expected, rows.as_slice());
+    assert_eq!(
+        Some(RowStorage::ReachableEndpoints),
+        rows.certificate().row_storage
+    );
+    assert_eq!(1, rows.certificate().row_record_bytes);
+    assert_eq!(rows.certificate().boundaries, rows.certificate().log_bytes);
+    let accounting = rows.accounting();
+    assert_eq!(0, accounting.replay_steps);
+    assert_eq!(
+        rows.certificate().states * rows.certificate().boundaries,
+        accounting.state_evaluations
+    );
+    assert_eq!(
+        rows.certificate().log_bytes,
+        accounting.sequential_bytes_written
+    );
+    assert_eq!(
+        rows.certificate().log_bytes * 2,
+        accounting.sequential_bytes_read
+    );
+    assert_eq!(
+        rows.certificate().log_bytes * 3,
+        rows.certificate().sequential_bytes_bound
+    );
+    assert_eq!(
+        accounting.work,
+        accounting.state_evaluations
+            + accounting.transition_checks
+            + accounting.root_probes
+            + accounting.replay_steps
+            + accounting.successful_paths
+    );
+
+    let certificate = rows.certificate();
+    let exact = OperationLimits {
+        max_boundaries: certificate.boundaries,
+        max_table_cells: certificate.table_cells,
+        max_random_access_bytes: certificate.random_access_bytes,
+        max_scratch_bytes: certificate.scratch_bytes,
+        max_log_bytes: certificate.log_bytes,
+        max_sequential_bytes: certificate.sequential_bytes_bound,
+        max_match_events: certificate.match_events,
+        max_output_matches: certificate.output_matches,
+        max_output_bytes: certificate.output_bytes,
+        max_span_sum: certificate.span_sum,
+        max_peak_bytes: certificate.peak_bytes,
+        max_work: certificate.work_bound,
+    };
+    regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            exact,
+        )
+        .unwrap();
+
+    let mut below_log = exact;
+    below_log.max_log_bytes -= 1;
+    expect_exact_resource(
+        regex.admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            below_log,
+        ),
+        Resource::LogBytes,
+        exact.max_log_bytes,
+        below_log.max_log_bytes,
+    );
+    let mut below_sequential = exact;
+    below_sequential.max_sequential_bytes -= 1;
+    expect_exact_resource(
+        regex.admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            below_sequential,
+        ),
+        Resource::SequentialBytes,
+        exact.max_sequential_bytes,
+        below_sequential.max_sequential_bytes,
+    );
+
+    let mut below_work = exact;
+    below_work.max_work -= 1;
+    expect_exact_resource(
+        regex.admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            below_work,
+        ),
+        Resource::ExecutionWork,
+        exact.max_work,
+        below_work.max_work,
+    );
+    let mut below_peak = exact;
+    below_peak.max_peak_bytes -= 1;
+    expect_exact_resource(
+        regex.admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            below_peak,
+        ),
+        Resource::PeakBytes,
+        exact.max_peak_bytes,
+        below_peak.max_peak_bytes,
+    );
+}
+
+#[test]
+fn reachable_endpoints_preserve_unicode_paths_and_invalid_bytes() {
+    let fillers = (1..=24)
+        .map(|length| format!(r"z{{{length}}}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"(?:🦀|雪|é|a|(?-u:\xFF)||{fillers})");
+    let haystack = [
+        &[0xFF][..],
+        "aé雪🦀".as_bytes(),
+        &[0x80, b'a', 0xC3, 0xA9, 0xFF],
+    ]
+    .concat();
+    let expected = upstream_unicode(&pattern, &haystack);
+    let regex = compile_unicode(&pattern);
+    let rows = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(expected, rows.as_slice());
+    assert_eq!(
+        Some(RowStorage::ReachableEndpoints),
+        rows.certificate().row_storage
+    );
+    assert_eq!(0, rows.accounting().replay_steps);
 }

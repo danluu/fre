@@ -44,8 +44,9 @@ compiler work are checked.
 Both strategies compute one global recurrence over the operation range:
 
 - `FullTable`: one endpoint word for every `(boundary, state)`;
-- `ReverseSequentialRows`: two random-access rows plus fixed-size split/root
-  records written right-to-left and read monotonically left-to-right.
+- `ReverseSequentialRows`: two random-access rows plus the narrower of
+  fixed-size split/root records and minimally encoded reachable endpoints,
+  written right-to-left and read monotonically left-to-right.
 
 Neither strategy performs repeated suffix searches or runtime fallback.
 Admission checks boundaries, table cells, semantic work, random-access and
