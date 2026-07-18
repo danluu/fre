@@ -37,6 +37,11 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
+#[allow(
+    dead_code,
+    reason = "the finite-anchor certifier is landed independently before its reviewed executor"
+)]
+mod anchored_island;
 mod candidate;
 mod compile;
 mod error;
