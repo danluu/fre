@@ -6,6 +6,7 @@ use regex_syntax::utf8::Utf8Sequences;
 use crate::accounting::CompileAccounting;
 use crate::error::{add, enforce, mul};
 use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet};
+use crate::required_internal_anchor;
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
 /// Explicit semantic profile asserted by direct HIR callers.
@@ -67,6 +68,7 @@ impl core::fmt::Display for PlanId {
 pub struct CompiledRegex {
     pub(crate) program: Program,
     pub(crate) required_suffixes: RequiredSuffixes,
+    pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     plan_id: PlanId,
     accounting: CompileAccounting,
 }
@@ -148,8 +150,48 @@ impl CompiledRegex {
         validate_hir(hir, profile, capture_policy, &mut budget)?;
         let required_suffixes = required_suffixes(hir, &mut budget)?;
         budget.acquire_construction_bytes(required_suffixes.retained_bytes()?)?;
+        enforce(
+            budget.current_construction_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
         budget.accounting.required_suffixes = required_suffixes.ends.len();
         budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
+        let required_internal_anchor = if profile.unicode {
+            None
+        } else {
+            let remaining_work = limits.max_work.checked_sub(budget.accounting.work).ok_or(
+                Error::ArithmeticOverflow {
+                    resource: Resource::CompileWork,
+                },
+            )?;
+            let remaining_program_bytes = limits
+                .max_program_bytes
+                .checked_sub(budget.current_construction_bytes)
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::ProgramBytes,
+                })?;
+            let inspection = required_internal_anchor::inspect(
+                hir,
+                remaining_work,
+                limits.max_literal_bytes,
+                remaining_program_bytes,
+            )?;
+            if let Some(inspection) = inspection {
+                budget.charge(inspection.inspection_work)?;
+                let build = inspection.plan.build_accounting();
+                budget.acquire_construction_bytes(build.persistent_bytes)?;
+                budget.accounting.required_internal_anchors = 1;
+                budget.accounting.required_internal_anchor_bytes = build.anchor_bytes;
+                budget.accounting.required_internal_anchor_optional_stages = build.optional_stages;
+                budget.accounting.required_internal_anchor_build_work = build.structural_work;
+                budget.accounting.required_internal_anchor_persistent_bytes =
+                    build.persistent_bytes;
+                Some(inspection.plan)
+            } else {
+                None
+            }
+        };
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
@@ -168,7 +210,7 @@ impl CompiledRegex {
         // `program_bytes` visits every instruction to include each deeply
         // owned scalar-range box in the exact retained-byte total.
         budget.charge(insts.len())?;
-        let program_bytes = add(
+        let mut program_bytes = add(
             program_bytes(
                 &insts,
                 insts.capacity(),
@@ -178,6 +220,13 @@ impl CompiledRegex {
             required_suffixes.retained_bytes()?,
             Resource::ProgramBytes,
         )?;
+        if let Some(plan) = &required_internal_anchor {
+            program_bytes = add(
+                program_bytes,
+                plan.build_accounting().persistent_bytes,
+                Resource::ProgramBytes,
+            )?;
+        }
         enforce(
             program_bytes,
             limits.max_program_bytes,
@@ -199,7 +248,10 @@ impl CompiledRegex {
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
         };
-        let plan_id = finalize_program(&mut program, profile, &mut budget)?;
+        let mut plan_id = finalize_program(&mut program, profile, &mut budget)?;
+        if let Some(plan) = &required_internal_anchor {
+            plan_id = bind_required_internal_anchor_identity(plan_id, plan, &mut budget)?;
+        }
         if budget.current_construction_bytes != program_bytes {
             return Err(Error::InternalInvariant(
                 "compiler retained bytes differ from construction accounting",
@@ -209,6 +261,7 @@ impl CompiledRegex {
         Ok(Self {
             program,
             required_suffixes,
+            required_internal_anchor,
             plan_id,
             accounting,
         })
@@ -260,6 +313,11 @@ impl CompileBudget {
                 look_assertions: 0,
                 required_suffixes: 0,
                 required_suffix_bytes: 0,
+                required_internal_anchors: 0,
+                required_internal_anchor_bytes: 0,
+                required_internal_anchor_optional_stages: 0,
+                required_internal_anchor_build_work: 0,
+                required_internal_anchor_persistent_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -1567,6 +1625,32 @@ fn finalize_program(
     }
     program.has_unicode_word_boundary = has_unicode_word_boundary;
     budget.accounting.requires_utf8_validation = has_unicode_word_boundary;
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
+fn bind_required_internal_anchor_identity(
+    program: PlanId,
+    plan: &fre_kernels::RequiredInternalAnchorPlan,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = fre_kernels::REQUIRED_INTERNAL_ANCHOR_PLAN_ID.as_bytes();
+    let operation = fre_kernels::REQUIRED_INTERNAL_ANCHOR_COUNT_OPERATION_ID.as_bytes();
+    budget.charge(add(
+        add(program.0.len(), domain.len(), Resource::CompileWork)?,
+        add(operation.len(), plan.anchor().len(), Resource::CompileWork)?,
+        Resource::CompileWork,
+    )?)?;
+    let mut first = StableHash::new(0xa87c_19e2_d4b5_6301);
+    let mut second = StableHash::new(0x6301_d4b5_19e2_a87c);
+    for hash in [&mut first, &mut second] {
+        hash.bytes(&program.0);
+        hash.bytes(domain);
+        hash.bytes(operation);
+        hash.bytes(plan.anchor());
+    }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
     bytes[8..].copy_from_slice(&second.finish().to_le_bytes());

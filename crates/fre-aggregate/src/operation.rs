@@ -1,6 +1,11 @@
 use core::marker::PhantomData;
 use core::ops::Range;
 
+use fre_kernels::{
+    RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
+    RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan,
+};
+
 use crate::accounting::ExecutionAccounting;
 use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes};
 use crate::error::{add, enforce, mul};
@@ -346,6 +351,13 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
+        let local = &haystack[range.clone()];
+        if kind == OperationKind::Count
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.required_internal_anchor
+        {
+            return self.execute_required_internal_anchor(plan, local, range, strategy, limits);
+        }
         let mut accounting = ExecutionAccounting::default();
         let utf8_validation =
             preflight_unicode_word_utf8(&self.program, haystack, limits, &mut accounting)?;
@@ -361,7 +373,6 @@ impl CompiledRegex {
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::SequentialBytes,
             })?;
-        let local = &haystack[range.clone()];
         let assertion_context = AssertionContext::new(haystack, range.start, local.len())?;
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
         enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
@@ -530,6 +541,140 @@ impl CompiledRegex {
             summary,
             spans,
         })
+    }
+
+    fn execute_required_internal_anchor(
+        &self,
+        plan: &RequiredInternalAnchorPlan,
+        local: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<ExecutionResult, Error> {
+        let (boundaries, upper) = preflight_required_internal_anchor(plan, local.len(), limits)?;
+        let result = plan
+            .count(local, exact_required_anchor_limits(upper))
+            .map_err(|error| map_required_anchor_error(&error))?;
+        let matches = usize::try_from(result.count).map_err(|_| Error::ArithmeticOverflow {
+            resource: Resource::OutputMatches,
+        })?;
+        let actual = result.accounting.actual;
+        let accounting = ExecutionAccounting {
+            transition_checks: actual.continuation_steps,
+            root_probes: actual.candidate_visits,
+            successful_paths: matches,
+            emitted_matches: matches,
+            sequential_bytes_read: upper.source_accesses,
+            peak_bytes: upper.peak_bytes,
+            work: upper.work,
+            required_anchor_candidates: actual.candidate_visits,
+            required_anchor_prefix_steps: actual.prefix_steps,
+            required_anchor_continuation_steps: actual.continuation_steps,
+            required_anchor_source_accesses: upper.source_accesses,
+            required_anchor_queue_peak: upper.queue_entries,
+            required_anchor_frontier_peak: upper.frontier_entries,
+            ..ExecutionAccounting::default()
+        };
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_id: operation_identity(self.plan_id(), strategy, OperationKind::Count),
+            strategy,
+            range,
+            states: self.program.insts.len(),
+            boundaries,
+            table_cells: 0,
+            row_storage: None,
+            row_record_bytes: 0,
+            work_bound: upper.work,
+            random_access_bytes: 0,
+            scratch_bytes: 0,
+            log_bytes: 0,
+            sequential_bytes_bound: upper.source_accesses,
+            match_events: matches,
+            output_matches: matches,
+            output_bytes: 0,
+            span_sum: 0,
+            peak_bytes: upper.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting,
+            summary: ScanSummary {
+                matches,
+                events: matches,
+                suppressed: 0,
+                span_sum: 0,
+            },
+            spans: Vec::new(),
+        })
+    }
+}
+
+fn preflight_required_internal_anchor(
+    plan: &RequiredInternalAnchorPlan,
+    input_bytes: usize,
+    limits: OperationLimits,
+) -> Result<(usize, RequiredInternalAnchorCountUpperBounds), Error> {
+    let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+    enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+    let upper = plan
+        .count_upper_bounds(input_bytes)
+        .map_err(|error| map_required_anchor_error(&error))?;
+    enforce(
+        upper.candidate_visits,
+        limits.max_match_events,
+        Resource::MatchEvents,
+    )?;
+    let count = usize::try_from(upper.count).map_err(|_| Error::ArithmeticOverflow {
+        resource: Resource::OutputMatches,
+    })?;
+    enforce(count, limits.max_output_matches, Resource::OutputMatches)?;
+    enforce(
+        upper.source_accesses,
+        limits.max_sequential_bytes,
+        Resource::SequentialBytes,
+    )?;
+    enforce(upper.work, limits.max_work, Resource::ExecutionWork)?;
+    enforce(
+        upper.scratch_bytes,
+        limits.max_scratch_bytes,
+        Resource::ScratchBytes,
+    )?;
+    enforce(upper.peak_bytes, limits.max_peak_bytes, Resource::PeakBytes)?;
+    Ok((boundaries, upper))
+}
+
+const fn exact_required_anchor_limits(
+    upper: RequiredInternalAnchorCountUpperBounds,
+) -> RequiredInternalAnchorCountLimits {
+    RequiredInternalAnchorCountLimits {
+        max_input_bytes: upper.input_bytes,
+        max_candidate_visits: upper.candidate_visits,
+        max_continuation_steps: upper.continuation_steps,
+        max_source_accesses: upper.source_accesses,
+        max_random_access_bytes: upper.random_access_bytes,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_work: upper.work,
+        max_count: upper.count,
+        max_queue_entries: upper.queue_entries,
+        max_frontier_entries: upper.frontier_entries,
+        max_allocations: upper.allocations,
+        max_scratch_bytes: upper.scratch_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    }
+}
+
+fn map_required_anchor_error(error: &RequiredInternalAnchorCountError) -> Error {
+    match error {
+        RequiredInternalAnchorCountError::Overflow(_) => Error::ArithmeticOverflow {
+            resource: Resource::ExecutionWork,
+        },
+        RequiredInternalAnchorCountError::Resource { .. }
+        | RequiredInternalAnchorCountError::CountResource { .. }
+        | RequiredInternalAnchorCountError::AccountingInvariant { .. } => {
+            Error::InternalInvariant("required internal-anchor admission diverged from preflight")
+        }
+        _ => Error::InternalInvariant("unclassified required internal-anchor execution refusal"),
     }
 }
 

@@ -42,6 +42,7 @@ mod error;
 mod limits;
 mod operation;
 mod program;
+mod required_internal_anchor;
 
 pub use accounting::{CompileAccounting, ExecutionAccounting};
 pub use compile::{CompiledRegex, PlanId, RustByteProfile};

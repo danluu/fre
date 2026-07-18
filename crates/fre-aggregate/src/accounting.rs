@@ -24,6 +24,13 @@ pub struct CompileAccounting {
     pub required_suffixes: usize,
     /// Total bytes across `required_suffixes`.
     pub required_suffix_bytes: usize,
+    /// Structurally derived internal-anchor candidate stream retained for a
+    /// bounded count verifier. Zero means the dense continuation route.
+    pub required_internal_anchors: usize,
+    pub required_internal_anchor_bytes: usize,
+    pub required_internal_anchor_optional_stages: usize,
+    pub required_internal_anchor_build_work: usize,
+    pub required_internal_anchor_persistent_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
@@ -58,6 +65,12 @@ pub struct ExecutionAccounting {
     /// table/row construction and sequential-row replay.
     pub assertion_checks: usize,
     pub root_probes: usize,
+    pub required_anchor_candidates: usize,
+    pub required_anchor_prefix_steps: usize,
+    pub required_anchor_continuation_steps: usize,
+    pub required_anchor_source_accesses: usize,
+    pub required_anchor_queue_peak: usize,
+    pub required_anchor_frontier_peak: usize,
     pub replay_steps: usize,
     pub successful_paths: usize,
     pub suppressed_empty: usize,

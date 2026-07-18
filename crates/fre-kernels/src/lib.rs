@@ -208,6 +208,7 @@ pub use required_internal_anchor::{
     OptionalStageSource as RequiredInternalAnchorOptionalStageSource,
     PLAN_ID as REQUIRED_INTERNAL_ANCHOR_PLAN_ID, RequiredInternalAnchorPlan,
 };
+pub use required_literal::ByteClass as RequiredInternalAnchorByteClass;
 pub use required_literal::{
     Anchors as RequiredLiteralAnchors, BuildAccounting as RequiredLiteralBuildAccounting,
     BuildError as RequiredLiteralBuildError, BuildLimits as RequiredLiteralBuildLimits,

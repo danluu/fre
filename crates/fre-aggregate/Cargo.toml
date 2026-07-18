@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fre-kernels = { path = "../fre-kernels" }
 regex-syntax = "=0.8.11"
 
 [dev-dependencies]

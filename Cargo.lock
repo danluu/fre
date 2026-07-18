@@ -114,6 +114,7 @@ name = "fre-aggregate"
 version = "0.1.0"
 dependencies = [
  "fre-iterator-lab",
+ "fre-kernels",
  "fre-reference",
  "regex",
  "regex-automata",

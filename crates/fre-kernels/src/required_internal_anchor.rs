@@ -51,6 +51,10 @@ pub struct BuildLimits {
     pub max_build_work: usize,
     pub max_persistent_bytes: usize,
     pub max_peak_bytes: usize,
+    pub max_allocations: usize,
+    pub max_reserves: usize,
+    pub max_source_copies: usize,
+    pub max_scratch_bytes: usize,
 }
 
 impl Default for BuildLimits {
@@ -60,6 +64,10 @@ impl Default for BuildLimits {
             max_build_work: 1 << 24,
             max_persistent_bytes: 1 << 24,
             max_peak_bytes: 1 << 24,
+            max_allocations: 1,
+            max_reserves: 1,
+            max_source_copies: 1,
+            max_scratch_bytes: 0,
         }
     }
 }
@@ -84,10 +92,13 @@ pub struct CountLimits {
     pub max_candidate_visits: usize,
     pub max_continuation_steps: usize,
     pub max_source_accesses: usize,
+    pub max_random_access_bytes: usize,
+    pub max_sequential_bytes: usize,
     pub max_work: usize,
     pub max_count: u64,
     pub max_queue_entries: usize,
     pub max_frontier_entries: usize,
+    pub max_allocations: usize,
     pub max_scratch_bytes: usize,
     pub max_peak_bytes: usize,
 }
@@ -99,10 +110,13 @@ impl Default for CountLimits {
             max_candidate_visits: 128 << 20,
             max_continuation_steps: 1 << 29,
             max_source_accesses: 1 << 29,
+            max_random_access_bytes: 1 << 29,
+            max_sequential_bytes: 1 << 29,
             max_work: 1 << 29,
             max_count: 128 << 20,
             max_queue_entries: 1,
             max_frontier_entries: 1,
+            max_allocations: 0,
             max_scratch_bytes: 0,
             max_peak_bytes: 1 << 24,
         }
@@ -118,6 +132,8 @@ pub struct CountUpperBounds {
     pub prefix_steps: usize,
     pub continuation_steps: usize,
     pub source_accesses: usize,
+    pub random_access_bytes: usize,
+    pub sequential_bytes: usize,
     pub work: usize,
     pub count: u64,
     pub queue_entries: usize,
@@ -170,6 +186,10 @@ pub enum BuildError {
     WorkLimit { needed: usize, limit: usize },
     PersistentLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
+    AllocationLimit { needed: usize, limit: usize },
+    ReserveLimit { needed: usize, limit: usize },
+    SourceCopyLimit { needed: usize, limit: usize },
+    ScratchLimit { needed: usize, limit: usize },
     AllocationFailed { additional: usize },
     Overflow(&'static str),
 }
@@ -188,10 +208,13 @@ pub enum CountResource {
     CandidateVisits,
     ContinuationSteps,
     SourceAccesses,
+    RandomAccessBytes,
+    SequentialBytes,
     Work,
     Count,
     QueueEntries,
     FrontierEntries,
+    Allocations,
     ScratchBytes,
     PeakBytes,
 }
@@ -273,31 +296,15 @@ impl RequiredInternalAnchorPlan {
         validate_optional(&continuation, optional_count)?;
 
         let structural_work = build_work(anchor.len(), optional_count)?;
-        if structural_work > limits.max_build_work {
-            return Err(BuildError::WorkLimit {
-                needed: structural_work,
-                limit: limits.max_build_work,
-            });
-        }
+        preflight_build_resources(structural_work, 0, 0, limits)?;
         if let Some(border) = longest_border(anchor)? {
             return Err(BuildError::OverlappingAnchor { border });
         }
         let persistent_bytes = size_of::<Self>()
             .checked_add(anchor.len())
             .ok_or(BuildError::Overflow("persistent bytes"))?;
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
         let peak_bytes = persistent_bytes;
-        if peak_bytes > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
+        preflight_build_resources(structural_work, persistent_bytes, peak_bytes, limits)?;
 
         let mut owned_anchor = Vec::new();
         owned_anchor
@@ -350,10 +357,11 @@ impl RequiredInternalAnchorPlan {
 
     /// Count leftmost-first non-overlapping matches after complete preflight.
     pub fn count(&self, haystack: &[u8], limits: CountLimits) -> Result<CountResult, CountError> {
-        let upper = self.preflight(haystack.len())?;
+        let upper = self.count_upper_bounds(haystack.len())?;
         enforce(&upper, limits)?;
         let mut actual = CountActual::default();
         let mut search = 0_usize;
+        let mut match_floor = 0_usize;
         while search <= haystack.len() {
             actual.finder_calls = add(actual.finder_calls, 1, "finder calls")?;
             let Some(relative) = self.finder.find(&haystack[search..]) else {
@@ -362,7 +370,8 @@ impl RequiredInternalAnchorPlan {
             actual.candidate_visits = add(actual.candidate_visits, 1, "candidate visits")?;
             let candidate = add(search, relative, "candidate position")?;
             let after_anchor = add(candidate, self.anchor().len(), "after anchor")?;
-            let Some(start) = self.prefix_start(haystack, candidate, &mut actual)? else {
+            let Some(start) = self.prefix_start(haystack, candidate, match_floor, &mut actual)?
+            else {
                 search = after_anchor;
                 continue;
             };
@@ -376,6 +385,7 @@ impl RequiredInternalAnchorPlan {
                 .checked_add(1)
                 .ok_or(CountError::Overflow("matches"))?;
             search = end;
+            match_floor = end;
         }
         check_actual(&actual, &upper)?;
         Ok(CountResult {
@@ -388,7 +398,8 @@ impl RequiredInternalAnchorPlan {
         })
     }
 
-    fn preflight(&self, input_bytes: usize) -> Result<CountUpperBounds, CountError> {
+    /// Derive every execution resource bound without reading the input.
+    pub fn count_upper_bounds(&self, input_bytes: usize) -> Result<CountUpperBounds, CountError> {
         let anchor_bytes = self.anchor().len();
         let candidate_visits = input_bytes
             .checked_div(anchor_bytes)
@@ -415,6 +426,12 @@ impl RequiredInternalAnchorPlan {
             continuation_steps,
             "source bound",
         )?;
+        let random_access_bytes = prefix_steps;
+        let sequential_bytes = add(
+            finder_source_accesses,
+            continuation_steps,
+            "sequential byte bound",
+        )?;
         let work = add(
             add(
                 source_accesses,
@@ -434,6 +451,8 @@ impl RequiredInternalAnchorPlan {
             prefix_steps,
             continuation_steps,
             source_accesses,
+            random_access_bytes,
+            sequential_bytes,
             work,
             count,
             queue_entries: 1,
@@ -449,13 +468,14 @@ impl RequiredInternalAnchorPlan {
         &self,
         haystack: &[u8],
         candidate: usize,
+        match_floor: usize,
         actual: &mut CountActual,
     ) -> Result<Option<usize>, CountError> {
-        if candidate == 0 {
+        if candidate == match_floor {
             return Ok(None);
         }
         let mut start = candidate;
-        while start > 0 {
+        while start > match_floor {
             let previous = start
                 .checked_sub(1)
                 .ok_or(CountError::Overflow("prefix predecessor"))?;
@@ -578,6 +598,71 @@ fn build_work(anchor_bytes: usize, optional_count: usize) -> Result<usize, Build
         .ok_or(BuildError::Overflow("build work"))
 }
 
+fn preflight_build_resources(
+    structural_work: usize,
+    persistent_bytes: usize,
+    peak_bytes: usize,
+    limits: BuildLimits,
+) -> Result<(), BuildError> {
+    if structural_work > limits.max_build_work {
+        return Err(BuildError::WorkLimit {
+            needed: structural_work,
+            limit: limits.max_build_work,
+        });
+    }
+    if persistent_bytes > limits.max_persistent_bytes {
+        return Err(BuildError::PersistentLimit {
+            needed: persistent_bytes,
+            limit: limits.max_persistent_bytes,
+        });
+    }
+    if peak_bytes > limits.max_peak_bytes {
+        return Err(BuildError::PeakLimit {
+            needed: peak_bytes,
+            limit: limits.max_peak_bytes,
+        });
+    }
+    for (needed, limit, error) in [
+        (
+            1,
+            limits.max_allocations,
+            BuildError::AllocationLimit {
+                needed: 1,
+                limit: limits.max_allocations,
+            },
+        ),
+        (
+            1,
+            limits.max_reserves,
+            BuildError::ReserveLimit {
+                needed: 1,
+                limit: limits.max_reserves,
+            },
+        ),
+        (
+            1,
+            limits.max_source_copies,
+            BuildError::SourceCopyLimit {
+                needed: 1,
+                limit: limits.max_source_copies,
+            },
+        ),
+        (
+            0,
+            limits.max_scratch_bytes,
+            BuildError::ScratchLimit {
+                needed: 0,
+                limit: limits.max_scratch_bytes,
+            },
+        ),
+    ] {
+        if needed > limit {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn longest_border(anchor: &[u8]) -> Result<Option<usize>, BuildError> {
     for border in (1..anchor.len()).rev() {
         let suffix_start = anchor
@@ -613,6 +698,16 @@ fn enforce(upper: &CountUpperBounds, limits: CountLimits) -> Result<(), CountErr
             upper.source_accesses,
             limits.max_source_accesses,
         ),
+        (
+            CountResource::RandomAccessBytes,
+            upper.random_access_bytes,
+            limits.max_random_access_bytes,
+        ),
+        (
+            CountResource::SequentialBytes,
+            upper.sequential_bytes,
+            limits.max_sequential_bytes,
+        ),
         (CountResource::Work, upper.work, limits.max_work),
         (
             CountResource::QueueEntries,
@@ -623,6 +718,11 @@ fn enforce(upper: &CountUpperBounds, limits: CountLimits) -> Result<(), CountErr
             CountResource::FrontierEntries,
             upper.frontier_entries,
             limits.max_frontier_entries,
+        ),
+        (
+            CountResource::Allocations,
+            upper.allocations,
+            limits.max_allocations,
         ),
         (
             CountResource::ScratchBytes,
@@ -769,26 +869,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_candidate_bounds_refuse_before_search_at_exact_one_below() {
-        let plan = uri_plan();
-        let haystack = b"x://a/b y://c/d";
-        let baseline = plan.count(haystack, CountLimits::default()).unwrap();
-        let upper = baseline.accounting.upper_bounds;
-        let exact = CountLimits {
+    fn exact_count_limits(upper: CountUpperBounds) -> CountLimits {
+        CountLimits {
             max_input_bytes: upper.input_bytes,
             max_candidate_visits: upper.candidate_visits,
             max_continuation_steps: upper.continuation_steps,
             max_source_accesses: upper.source_accesses,
+            max_random_access_bytes: upper.random_access_bytes,
+            max_sequential_bytes: upper.sequential_bytes,
             max_work: upper.work,
             max_count: upper.count,
             max_queue_entries: upper.queue_entries,
             max_frontier_entries: upper.frontier_entries,
+            max_allocations: upper.allocations,
             max_scratch_bytes: upper.scratch_bytes,
             max_peak_bytes: upper.peak_bytes,
-        };
+        }
+    }
+
+    fn assert_resource_refusal(
+        plan: &RequiredInternalAnchorPlan,
+        haystack: &[u8],
+        limits: CountLimits,
+        resource: CountResource,
+    ) {
+        assert!(matches!(
+            plan.count(haystack, limits),
+            Err(CountError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+
+    #[test]
+    fn source_dimensions_refuse_before_search_at_exact_one_below() {
+        let plan = uri_plan();
+        let haystack = b"x://a/b y://c/d";
+        let baseline = plan.count(haystack, CountLimits::default()).unwrap();
+        let upper = baseline.accounting.upper_bounds;
+        let exact = exact_count_limits(upper);
         assert_eq!(plan.count(haystack, exact).unwrap(), baseline);
         for (resource, limits) in [
+            (
+                CountResource::InputBytes,
+                CountLimits {
+                    max_input_bytes: upper.input_bytes - 1,
+                    ..exact
+                },
+            ),
             (
                 CountResource::CandidateVisits,
                 CountLimits {
@@ -807,6 +933,32 @@ mod tests {
                 CountResource::SourceAccesses,
                 CountLimits {
                     max_source_accesses: upper.source_accesses - 1,
+                    ..exact
+                },
+            ),
+            (
+                CountResource::RandomAccessBytes,
+                CountLimits {
+                    max_random_access_bytes: upper.random_access_bytes - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            assert_resource_refusal(&plan, haystack, limits, resource);
+        }
+    }
+
+    #[test]
+    fn state_dimensions_refuse_before_search_at_exact_one_below() {
+        let plan = uri_plan();
+        let haystack = b"x://a/b y://c/d";
+        let upper = plan.count_upper_bounds(haystack.len()).unwrap();
+        let exact = exact_count_limits(upper);
+        for (resource, limits) in [
+            (
+                CountResource::SequentialBytes,
+                CountLimits {
+                    max_sequential_bytes: upper.sequential_bytes - 1,
                     ..exact
                 },
             ),
@@ -839,10 +991,7 @@ mod tests {
                 },
             ),
         ] {
-            assert!(matches!(
-                plan.count(haystack, limits),
-                Err(CountError::Resource { resource: got, .. }) if got == resource
-            ));
+            assert_resource_refusal(&plan, haystack, limits, resource);
         }
         assert!(matches!(
             plan.count(
@@ -854,6 +1003,62 @@ mod tests {
             ),
             Err(CountError::CountResource { .. })
         ));
+        assert_eq!(upper.allocations, 0);
+        assert_eq!(upper.scratch_bytes, 0);
+    }
+
+    #[test]
+    fn dense_all_candidate_input_refuses_before_verification() {
+        let plan = uri_plan();
+        let dense = b"://://://";
+        let dense_upper = plan.count_upper_bounds(dense.len()).unwrap();
+        let dense_result = plan.count(dense, CountLimits::default()).unwrap();
+        assert_eq!(dense_upper.candidate_visits, 3);
+        assert_eq!(dense_result.accounting.actual.candidate_visits, 3);
+        assert_eq!(dense_result.count, 0);
+        assert!(matches!(
+            plan.count(
+                dense,
+                CountLimits {
+                    max_candidate_visits: 2,
+                    ..CountLimits::default()
+                }
+            ),
+            Err(CountError::Resource {
+                resource: CountResource::CandidateVisits,
+                needed: 3,
+                limit: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn candidate_failures_resume_but_successes_raise_the_nonoverlap_floor() {
+        let prefix = ByteClass::from_bytes(b"a");
+        let head = ByteClass::from_bytes(b"b");
+        let tail = ByteClass::from_bytes(b"ab");
+        let plan = RequiredInternalAnchorPlan::build(
+            prefix,
+            b"X",
+            ContinuationSource::new(head, tail),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.count(b"aXbaaaXba", CountLimits::default())
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            uri_plan()
+                .count(b"://://://", CountLimits::default())
+                .unwrap()
+                .accounting
+                .actual
+                .candidate_visits,
+            3
+        );
     }
 
     #[test]
@@ -871,6 +1076,10 @@ mod tests {
             max_build_work: build.structural_work,
             max_persistent_bytes: build.persistent_bytes,
             max_peak_bytes: build.peak_bytes,
+            max_allocations: build.allocations,
+            max_reserves: build.reserves,
+            max_source_copies: build.source_copies,
+            max_scratch_bytes: build.scratch_bytes,
         };
         let source = uri_source();
         assert!(RequiredInternalAnchorPlan::build(ascii_word(), b"://", source, exact).is_ok());
@@ -886,6 +1095,36 @@ mod tests {
             ),
             Err(BuildError::WorkLimit { .. })
         ));
+        for limits in [
+            BuildLimits {
+                max_anchor_bytes: build.anchor_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_persistent_bytes: build.persistent_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_peak_bytes: build.peak_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_allocations: build.allocations - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_reserves: build.reserves - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_source_copies: build.source_copies - 1,
+                ..exact
+            },
+        ] {
+            assert!(
+                RequiredInternalAnchorPlan::build(ascii_word(), b"://", source, limits).is_err()
+            );
+        }
         assert!(matches!(
             RequiredInternalAnchorPlan::build(
                 ByteClass::from_bytes(b":ab"),
