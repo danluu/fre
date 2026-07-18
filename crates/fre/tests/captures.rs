@@ -1,12 +1,14 @@
 use core::mem::size_of;
+use std::sync::Arc;
 
 use fre::{
-    CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
-    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, LineCaptureBuildError,
-    LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration,
-    LineCapturePlanKind, LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits,
-    PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
-    SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
+    CaptureExecutionSource, CaptureRequiredLiteralBuildError, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralRunLimits, CaptureResource, CaptureRunLimits, CaptureSearchError,
+    CaptureSearchLimits, LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource,
+    LineCaptureBuilder, LineCaptureConfiguration, LineCapturePlanKind, LineCaptureResource,
+    LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN,
+    SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
     SPACE_AROUND_OPERATOR_INSPECTION_WORK, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
     STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
     WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
@@ -1572,4 +1574,127 @@ fn source_and_execution_limits_remain_in_capture_identity() {
         ..CaptureRunLimits::default()
     };
     assert_ne!(default_identity, python_name.cache_identity(constrained));
+}
+
+#[test]
+fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
+    fn build(
+        pattern: &str,
+        required: CaptureRequiredLiteralBuildLimits,
+        max_hir_work: usize,
+    ) -> Result<fre::CaptureRegex, CaptureBuildError> {
+        let mut limits = CaptureBuildLimits::default();
+        limits.max_hir_work = max_hir_work;
+        limits.required_literal = Some(required);
+        CaptureBuilder::new(pattern)
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .limits(limits)
+            .build()
+    }
+
+    let baseline = build(
+        "(?:AB|CD)",
+        CaptureRequiredLiteralBuildLimits::default(),
+        usize::MAX,
+    )
+    .expect("central required-literal capture build");
+    let plan = baseline
+        .required_literal_plan()
+        .expect("required-literal plan");
+    let accounting = plan.build_report().accounting;
+    assert!(Arc::ptr_eq(
+        &plan.build_report().identity.syntax,
+        &baseline.build_report().plan_identity.syntax,
+    ));
+    assert_eq!(accounting.needles, 2);
+    assert_eq!(accounting.needle_bytes, 4);
+    assert_eq!(accounting.literal_set.patterns, 2);
+    assert_eq!(accounting.literal_set.pattern_bytes, 4);
+    assert_eq!(accounting.literal_set.trie_states_upper_bound, 5);
+    assert_eq!(accounting.literal_set.dfa_cells_upper_bound, 1_280);
+    assert_eq!(accounting.literal_set.build_work_upper_bound, 1_286);
+    assert_eq!(accounting.planner_work, 25);
+    assert!(
+        plan.is_candidate(
+            b"zzAB",
+            CaptureRequiredLiteralRunLimits { max_transitions: 5 },
+        )
+        .expect("exact transition limit")
+        .candidate
+    );
+    assert!(
+        plan.is_candidate(
+            b"zzAB",
+            CaptureRequiredLiteralRunLimits { max_transitions: 4 },
+        )
+        .is_err()
+    );
+
+    let disabled = CaptureBuilder::new("(?:AB|CD)")
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build()
+        .expect("capture without optional proof");
+    assert!(disabled.required_literal_plan().is_none());
+    assert_ne!(
+        disabled.build_report().plan_identity,
+        baseline.build_report().plan_identity
+    );
+    for nullable in ["(?:AB|)", "(?:AB)?"] {
+        assert!(
+            build(
+                nullable,
+                CaptureRequiredLiteralBuildLimits::default(),
+                usize::MAX,
+            )
+            .expect("nullable capture remains supported")
+            .required_literal_plan()
+            .is_none()
+        );
+    }
+
+    for (resource, one_below) in [
+        ("planner work", accounting.planner_work - 1),
+        ("HIR depth", accounting.hir_depth - 1),
+        ("needle count", accounting.needles - 1),
+        ("needle bytes", accounting.needle_bytes - 1),
+        ("source bytes", accounting.source_bytes - 1),
+        ("scratch bytes", accounting.scratch_bytes - 1),
+        ("peak bytes", accounting.peak_bytes_upper_bound - 1),
+    ] {
+        let mut required = CaptureRequiredLiteralBuildLimits::default();
+        match resource {
+            "planner work" => required.max_planner_work = one_below,
+            "HIR depth" => required.max_hir_depth = one_below,
+            "needle count" => required.max_needles = one_below,
+            "needle bytes" => required.max_needle_bytes = one_below,
+            "source bytes" => required.max_source_bytes = one_below,
+            "scratch bytes" => required.max_scratch_bytes = one_below,
+            "peak bytes" => required.max_peak_bytes = one_below,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            build("(?:AB|CD)", required, usize::MAX),
+            Err(CaptureBuildError::RequiredLiteral(
+                CaptureRequiredLiteralBuildError::Resource { .. }
+                    | CaptureRequiredLiteralBuildError::LiteralSet(_)
+            ))
+        ));
+    }
+
+    build(
+        "(?:AB|CD)",
+        CaptureRequiredLiteralBuildLimits::default(),
+        baseline.build_report().hir.work,
+    )
+    .expect("exact cumulative HIR-work limit");
+    assert!(
+        build(
+            "(?:AB|CD)",
+            CaptureRequiredLiteralBuildLimits::default(),
+            baseline.build_report().hir.work - 1,
+        )
+        .is_err()
+    );
 }

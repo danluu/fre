@@ -28,6 +28,11 @@ use regex_syntax::{
     utf8::Utf8Sequences,
 };
 
+use crate::capture_required_literal::{
+    self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
+    CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralIdentity, CaptureRequiredLiteralPlan,
+};
+
 /// Capture-aware operation included in construction and execution identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureOperation {
@@ -87,6 +92,9 @@ pub struct CaptureBuildLimits {
     pub engine: EngineBuildLimits,
     /// Capture-erased operation-wide span-selector compiler limits.
     pub selector: SelectorCompileLimits,
+    /// Optional required-literal proof and DFA limits. `None` performs no
+    /// additional HIR traversal and preserves the legacy capture artifact.
+    pub required_literal: Option<CaptureRequiredLiteralBuildLimits>,
 }
 
 impl Default for CaptureBuildLimits {
@@ -124,6 +132,7 @@ impl Default for CaptureBuildLimits {
             max_hir_depth: 250,
             engine,
             selector,
+            required_literal: None,
         }
     }
 }
@@ -163,6 +172,8 @@ pub struct CapturePlanIdentity {
     pub capture_profile: CaptureProfile,
     /// Exact capture-erased selector program identity.
     pub selector_plan_id: SelectorPlanId,
+    /// Optional generic required-any-literal proof sharing this exact syntax.
+    pub required_literal: Option<CaptureRequiredLiteralIdentity>,
 }
 
 /// Construction report for one immutable capture plan.
@@ -181,6 +192,8 @@ pub struct CaptureBuildReport {
     /// Exact explicit-capture participation per selected match when the HIR
     /// proves that cardinality independent of input and branch choice.
     pub uniform_participating_captures: Option<usize>,
+    /// Optional bounded required-literal construction receipt.
+    pub required_literal: Option<CaptureRequiredLiteralBuildAccounting>,
     /// Complete immutable plan identity.
     pub plan_identity: CapturePlanIdentity,
 }
@@ -224,6 +237,8 @@ pub enum CaptureBuildError {
     Engine(EngineBuildError),
     /// Operation-wide capture-erased span selector refused or faulted.
     Selector(SelectorError),
+    /// Optional required-literal proof or DFA construction refused.
+    RequiredLiteral(CaptureRequiredLiteralBuildError),
     /// Facade invariant failure.
     InternalInvariant(&'static str),
 }
@@ -251,6 +266,9 @@ impl fmt::Display for CaptureBuildError {
             }
             Self::Engine(error) => write!(formatter, "capture engine build failed: {error}"),
             Self::Selector(error) => write!(formatter, "capture selector build failed: {error}"),
+            Self::RequiredLiteral(error) => {
+                write!(formatter, "capture required-literal build failed: {error}")
+            }
             Self::InternalInvariant(detail) => {
                 write!(formatter, "capture facade invariant failed: {detail}")
             }
@@ -264,6 +282,7 @@ impl std::error::Error for CaptureBuildError {
             Self::Syntax(error) => Some(error),
             Self::Engine(error) => Some(error),
             Self::Selector(error) => Some(error),
+            Self::RequiredLiteral(error) => Some(error),
             _ => None,
         }
     }
@@ -691,6 +710,17 @@ impl PortableTextCaptureBuilder {
         self
     }
 
+    /// Enable one bounded generic required-any-literal certificate from the
+    /// same parsed HIR and syntax identity used by the capture executors.
+    #[must_use]
+    pub const fn required_literal_prefilter(
+        mut self,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Self {
+        self.limits.required_literal = Some(limits);
+        self
+    }
+
     /// Prove exact capture-preserving HIR equivalence and build the tagged
     /// byte-stable executor.
     pub fn build(self) -> Result<PortableTextCaptureRegex, PortableTextCaptureBuildError> {
@@ -942,6 +972,33 @@ impl CaptureBuilder {
             ));
         }
         let mut accounting = CaptureHirAccounting::default();
+        let required_literal = if let Some(mut required_limits) = limits.required_literal {
+            let remaining_hir_work = limits.max_hir_work.checked_sub(accounting.work).ok_or(
+                CaptureBuildError::HirResource {
+                    resource: "work",
+                    required: accounting.work,
+                    limit: limits.max_hir_work,
+                },
+            )?;
+            required_limits.max_planner_work =
+                required_limits.max_planner_work.min(remaining_hir_work);
+            let plan = capture_required_literal::build_from_hir(
+                &rust.hir,
+                Arc::clone(&syntax_key),
+                required_limits,
+            )
+            .map_err(CaptureBuildError::RequiredLiteral)?;
+            if let Some(plan) = &plan {
+                charge_hir(
+                    &mut accounting,
+                    plan.build_report().accounting.planner_work,
+                    limits.max_hir_work,
+                )?;
+            }
+            plan
+        } else {
+            None
+        };
         let selector_profile = if unicode {
             SelectorProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
         } else {
@@ -975,6 +1032,9 @@ impl CaptureBuilder {
             },
             capture_profile: CaptureProfile::RustRegexBytes1_12_4,
             selector_plan_id: selector.plan_id(),
+            required_literal: required_literal
+                .as_ref()
+                .map(|plan| plan.build_report().identity.clone()),
         };
         let report = CaptureBuildReport {
             admission,
@@ -983,11 +1043,15 @@ impl CaptureBuilder {
             engine: engine_report,
             selector: selector_accounting,
             uniform_participating_captures,
+            required_literal: required_literal
+                .as_ref()
+                .map(|plan| plan.build_report().accounting),
             plan_identity,
         };
         Ok(CaptureRegex {
             engine: HistoryRegex::from_program(program),
             selector: Arc::new(selector),
+            required_literal,
             build_limits: limits,
             report,
         })
@@ -999,6 +1063,7 @@ impl CaptureBuilder {
 pub struct CaptureRegex {
     engine: HistoryRegex,
     selector: Arc<SelectorRegex>,
+    required_literal: Option<CaptureRequiredLiteralPlan>,
     build_limits: CaptureBuildLimits,
     report: CaptureBuildReport,
 }
@@ -1008,6 +1073,12 @@ impl CaptureRegex {
     #[must_use]
     pub const fn build_report(&self) -> &CaptureBuildReport {
         &self.report
+    }
+
+    /// Optional generic line-candidate proof built from this exact capture HIR.
+    #[must_use]
+    pub const fn required_literal_plan(&self) -> Option<&CaptureRequiredLiteralPlan> {
+        self.required_literal.as_ref()
     }
 
     /// Exact cache identity for these execution limits.

@@ -1,20 +1,14 @@
 //! Bounded required-literal prefilter for capture-preserving operations.
 
 use core::{fmt, mem::size_of};
-use std::sync::Arc;
+use std::{alloc::Layout, sync::Arc};
 
 use fre_kernels::{
     LiteralSetAccounting, LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError,
     LiteralSetPlan, LiteralSetSearchLimits,
 };
-use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
-    ParseSummary, RustProfile, SafetyEnvelope,
-};
+use fre_syntax::CacheKey;
 use regex_syntax::hir::{Hir, HirKind};
-
-const SYNTAX_ALLOCATION_BYTES_PER_WORK: usize = 4_096;
-const SYNTAX_ALLOCATION_FIXED_BYTES: usize = 64 * 1_024;
 
 /// Versioned algorithm identity for the required-any-literal proof.
 pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v1";
@@ -22,8 +16,6 @@ pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-lit
 /// Fixed construction limits included in plan identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureRequiredLiteralBuildLimits {
-    pub admission: AdmissionPolicy,
-    pub syntax_safety: SafetyEnvelope,
     pub max_planner_work: usize,
     pub max_hir_depth: usize,
     pub max_needles: usize,
@@ -36,16 +28,7 @@ pub struct CaptureRequiredLiteralBuildLimits {
 
 impl Default for CaptureRequiredLiteralBuildLimits {
     fn default() -> Self {
-        let syntax_safety = SafetyEnvelope {
-            max_pattern_bytes: 16 * 1_024,
-            max_nesting: 250,
-            max_hir_nodes: 8_192,
-            max_parse_work: 8_192,
-            max_traversal_stack: 8_192,
-        };
         Self {
-            admission: AdmissionPolicy::default(),
-            syntax_safety,
             max_planner_work: 1_000_000,
             max_hir_depth: 250,
             max_needles: 64,
@@ -67,13 +50,12 @@ impl Default for CaptureRequiredLiteralBuildLimits {
 /// Exact planner and bounded DFA construction receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureRequiredLiteralBuildAccounting {
-    pub syntax_temporary_bytes_upper_bound: usize,
-    pub identity_source_capacity_bytes: usize,
     pub planner_work: usize,
     pub hir_nodes: usize,
     pub hir_depth: usize,
     pub needles: usize,
     pub needle_bytes: usize,
+    pub minimum_needle_bytes: usize,
     pub source_bytes: usize,
     pub scratch_bytes: usize,
     pub peak_bytes_upper_bound: usize,
@@ -91,8 +73,6 @@ pub struct CaptureRequiredLiteralIdentity {
 /// Published construction report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureRequiredLiteralBuildReport {
-    pub admission: AdmissionStatus,
-    pub syntax: ParseSummary,
     pub identity: CaptureRequiredLiteralIdentity,
     pub accounting: CaptureRequiredLiteralBuildAccounting,
 }
@@ -101,8 +81,6 @@ pub struct CaptureRequiredLiteralBuildReport {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CaptureRequiredLiteralBuildError {
-    Syntax(fre_syntax::ParseError),
-    Unsupported,
     Resource {
         resource: &'static str,
         required: usize,
@@ -120,8 +98,6 @@ pub enum CaptureRequiredLiteralBuildError {
 impl fmt::Display for CaptureRequiredLiteralBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Syntax(error) => write!(f, "required-literal syntax failed: {error}"),
-            Self::Unsupported => f.write_str("HIR has no bounded required literal set"),
             Self::Resource {
                 resource,
                 required,
@@ -149,7 +125,6 @@ impl fmt::Display for CaptureRequiredLiteralBuildError {
 impl std::error::Error for CaptureRequiredLiteralBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Syntax(error) => Some(error),
             Self::LiteralSet(error) => Some(error),
             _ => None,
         }
@@ -205,267 +180,171 @@ impl std::error::Error for CaptureRequiredLiteralSearchError {
     }
 }
 
-/// Builder for a generic required-any-literal proof over Rust byte HIR.
-#[derive(Clone, Debug)]
-pub struct CaptureRequiredLiteralBuilder {
-    pattern: String,
-    profile: RustProfile,
+pub(crate) fn build_from_hir(
+    hir: &Hir,
+    syntax: Arc<CacheKey>,
     limits: CaptureRequiredLiteralBuildLimits,
-}
+) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
+    let mut meter = Meter::new(limits);
+    let Some(metrics) = measure(hir, 1, &mut meter)? else {
+        return Ok(None);
+    };
+    check_metric_limits(metrics, limits)?;
 
-impl CaptureRequiredLiteralBuilder {
-    #[must_use]
-    pub fn new(pattern: impl Into<String>) -> Self {
-        Self {
-            pattern: pattern.into(),
-            profile: RustProfile::default(),
-            limits: CaptureRequiredLiteralBuildLimits::default(),
+    let prospective_needle_bytes = metrics
+        .needles
+        .checked_mul(size_of::<Vec<u8>>())
+        .and_then(|bytes| bytes.checked_add(metrics.bytes))
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "prospective needle bytes",
+        ))?;
+    let needle_arc_block = arc_block_bytes::<Vec<Vec<u8>>>()?;
+    let prospective_source = prospective_needle_bytes
+        .checked_add(needle_arc_block)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "prospective source bytes",
+        ))?;
+    check_limit("source bytes", prospective_source, limits.max_source_bytes)?;
+
+    let prospective_scratch = metrics.needles.checked_mul(size_of::<&[u8]>()).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("reference scratch"),
+    )?;
+    check_limit(
+        "scratch bytes",
+        prospective_scratch,
+        limits.max_scratch_bytes,
+    )?;
+
+    let mut needles = Vec::new();
+    needles.try_reserve_exact(metrics.needles).map_err(|_| {
+        CaptureRequiredLiteralBuildError::Allocation {
+            structure: "needle",
+            items: metrics.needles,
         }
+    })?;
+    collect(hir, 1, &mut meter, &mut needles)?;
+    if needles.len() != metrics.needles {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "collected needle count differs from proof",
+        ));
     }
 
-    #[must_use]
-    pub fn profile(mut self, profile: RustProfile) -> Self {
-        self.profile = profile;
-        self
-    }
-
-    #[must_use]
-    pub fn unicode(mut self, enabled: bool) -> Self {
-        self.profile.options.unicode = enabled;
-        self
-    }
-
-    #[must_use]
-    pub fn case_insensitive(mut self, enabled: bool) -> Self {
-        self.profile.options.case_insensitive = enabled;
-        self
-    }
-
-    #[must_use]
-    pub const fn limits(mut self, limits: CaptureRequiredLiteralBuildLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    pub fn build(self) -> Result<CaptureRequiredLiteralPlan, CaptureRequiredLiteralBuildError> {
-        let identity_source_capacity_bytes = self.pattern.capacity();
-        let syntax_temporary_bytes_upper_bound =
-            usize::try_from(self.limits.syntax_safety.max_parse_work)
-                .map_err(|_| CaptureRequiredLiteralBuildError::Overflow("syntax work as usize"))?
-                .checked_mul(SYNTAX_ALLOCATION_BYTES_PER_WORK)
-                .and_then(|bytes| bytes.checked_add(SYNTAX_ALLOCATION_FIXED_BYTES))
-                .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                    "syntax temporary bytes",
-                ))?;
-        let identity_bytes_before_parse = identity_source_capacity_bytes
-            .checked_add(cache_key_arc_bytes()?)
+    meter.charge(metrics.needles)?;
+    let actual_bytes = needles.iter().try_fold(0_usize, |total, needle| {
+        total
+            .checked_add(needle.len())
             .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "identity bytes before parse",
-            ))?;
-        check_limit(
-            "source bytes",
-            identity_bytes_before_parse,
-            self.limits.max_source_bytes,
-        )?;
-        let preparse_peak = syntax_temporary_bytes_upper_bound
-            .checked_add(identity_bytes_before_parse)
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "preparse peak bytes",
-            ))?;
-        check_limit("peak bytes", preparse_peak, self.limits.max_peak_bytes)?;
+                "collected needle bytes",
+            ))
+    })?;
+    if actual_bytes != metrics.bytes {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "collected needle bytes differ from proof",
+        ));
+    }
 
-        let profile = CompatibilityProfile::RustBytes(self.profile);
-        let parsed = fre_syntax::parse(
-            fre_syntax::ParseRequest::rust(self.pattern, profile)
-                .with_admission(self.limits.admission)
-                .with_safety_envelope(self.limits.syntax_safety),
-        )
-        .map_err(CaptureRequiredLiteralBuildError::Syntax)?;
-        if parsed.key.pattern.capacity_bytes() != identity_source_capacity_bytes {
-            return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
-                "retained source capacity changed during parsing",
-            ));
+    meter.charge(metrics.needles)?;
+    let needle_capacity_bytes = needle_capacity_bytes(&needles)?;
+    let source_before_matcher = needle_capacity_bytes.checked_add(needle_arc_block).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("observed source before matcher"),
+    )?;
+    check_limit(
+        "source bytes",
+        source_before_matcher,
+        limits.max_source_bytes,
+    )?;
+
+    let mut refs = Vec::new();
+    refs.try_reserve_exact(metrics.needles).map_err(|_| {
+        CaptureRequiredLiteralBuildError::Allocation {
+            structure: "needle reference",
+            items: metrics.needles,
         }
-        let CanonicalPattern::Rust(rust) = parsed.pattern else {
-            return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
-                "Rust byte request produced non-Rust syntax",
-            ));
-        };
-        let mut meter = Meter::new(self.limits);
-        let Some(metrics) = measure(&rust.hir, 1, &mut meter)? else {
-            return Err(CaptureRequiredLiteralBuildError::Unsupported);
-        };
-        check_metric_limits(metrics, self.limits)?;
-        let prospective_needle_bytes = metrics
-            .needles
-            .checked_mul(size_of::<Vec<u8>>())
-            .and_then(|bytes| bytes.checked_add(metrics.bytes))
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "prospective needle bytes",
-            ))?;
-        let needle_arc_block = arc_block_bytes::<Vec<Vec<u8>>>()?;
-        let prospective_source = identity_bytes_before_parse
-            .checked_add(prospective_needle_bytes)
-            .and_then(|bytes| bytes.checked_add(needle_arc_block))
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "prospective source bytes",
-            ))?;
-        check_limit(
-            "source bytes",
-            prospective_source,
-            self.limits.max_source_bytes,
-        )?;
-        let prospective_scratch = metrics.needles.checked_mul(size_of::<&[u8]>()).ok_or(
-            CaptureRequiredLiteralBuildError::Overflow("reference scratch"),
-        )?;
-        check_limit(
-            "scratch bytes",
-            prospective_scratch,
-            self.limits.max_scratch_bytes,
-        )?;
+    })?;
+    let scratch_bytes = refs.capacity().checked_mul(size_of::<&[u8]>()).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("observed reference scratch"),
+    )?;
+    check_limit("scratch bytes", scratch_bytes, limits.max_scratch_bytes)?;
+    meter.charge(metrics.needles)?;
+    refs.extend(needles.iter().map(Vec::as_slice));
 
-        let mut needles = Vec::new();
-        needles.try_reserve_exact(metrics.needles).map_err(|_| {
-            CaptureRequiredLiteralBuildError::Allocation {
-                structure: "needle",
-                items: metrics.needles,
-            }
+    let mut dfa_limits = limits.literal_set;
+    let matcher_arc_block = arc_block_bytes::<LiteralSetPlan>()?;
+    let plan_value_bytes = size_of::<CaptureRequiredLiteralPlan>();
+    let fixed_persistent = source_before_matcher
+        .checked_add(matcher_arc_block)
+        .and_then(|bytes| bytes.checked_add(plan_value_bytes))
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "fixed persistent bytes",
+        ))?;
+    let source_headroom = limits
+        .max_source_bytes
+        .checked_sub(fixed_persistent)
+        .ok_or(CaptureRequiredLiteralBuildError::Resource {
+            resource: "source bytes",
+            required: fixed_persistent,
+            limit: limits.max_source_bytes,
         })?;
-        collect(&rust.hir, 1, &mut meter, &mut needles)?;
-        if needles.len() != metrics.needles {
-            return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
-                "collected needle count differs from proof",
-            ));
-        }
-        meter.charge(metrics.needles)?;
-        let actual_bytes = needles.iter().try_fold(0_usize, |total, needle| {
-            total
-                .checked_add(needle.len())
-                .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                    "collected needle bytes",
-                ))
-        })?;
-        if actual_bytes != metrics.bytes {
-            return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
-                "collected needle bytes differ from proof",
-            ));
-        }
-        let needle_capacity_bytes = needle_capacity_bytes(&needles)?;
-        let source_before_matcher = identity_bytes_before_parse
-            .checked_add(needle_capacity_bytes)
-            .and_then(|bytes| bytes.checked_add(needle_arc_block))
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "observed source before matcher",
-            ))?;
-        check_limit(
-            "source bytes",
-            source_before_matcher,
-            self.limits.max_source_bytes,
-        )?;
+    dfa_limits.max_persistent_bytes = dfa_limits.max_persistent_bytes.min(source_headroom);
 
-        let mut refs = Vec::new();
-        refs.try_reserve_exact(metrics.needles).map_err(|_| {
-            CaptureRequiredLiteralBuildError::Allocation {
-                structure: "needle reference",
-                items: metrics.needles,
-            }
-        })?;
-        let scratch_bytes = refs.capacity().checked_mul(size_of::<&[u8]>()).ok_or(
-            CaptureRequiredLiteralBuildError::Overflow("observed reference scratch"),
-        )?;
-        check_limit(
-            "scratch bytes",
-            scratch_bytes,
-            self.limits.max_scratch_bytes,
-        )?;
-        meter.charge(metrics.needles)?;
-        refs.extend(needles.iter().map(Vec::as_slice));
-
-        let mut dfa_limits = self.limits.literal_set;
-        let matcher_arc_block = arc_block_bytes::<LiteralSetPlan>()?;
-        let plan_value_bytes = size_of::<CaptureRequiredLiteralPlan>();
-        let source_headroom = self
-            .limits
-            .max_source_bytes
-            .checked_sub(source_before_matcher)
-            .and_then(|bytes| bytes.checked_sub(matcher_arc_block))
-            .and_then(|bytes| bytes.checked_sub(plan_value_bytes))
-            .ok_or(CaptureRequiredLiteralBuildError::Resource {
-                resource: "source bytes",
-                required: source_before_matcher,
-                limit: self.limits.max_source_bytes,
-            })?;
-        dfa_limits.max_persistent_bytes = dfa_limits.max_persistent_bytes.min(source_headroom);
-        let live_before_dfa = syntax_temporary_bytes_upper_bound
-            .checked_add(source_before_matcher)
-            .and_then(|bytes| bytes.checked_add(scratch_bytes))
-            .and_then(|bytes| bytes.checked_add(matcher_arc_block))
-            .and_then(|bytes| bytes.checked_add(plan_value_bytes))
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "live bytes before DFA",
-            ))?;
-        dfa_limits.max_build_bytes = dfa_limits.max_build_bytes.min(
-            self.limits
-                .max_peak_bytes
-                .checked_sub(live_before_dfa)
-                .ok_or(CaptureRequiredLiteralBuildError::Resource {
+    let live_before_dfa = fixed_persistent.checked_add(scratch_bytes).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("live bytes before DFA"),
+    )?;
+    dfa_limits.max_build_bytes =
+        dfa_limits
+            .max_build_bytes
+            .min(limits.max_peak_bytes.checked_sub(live_before_dfa).ok_or(
+                CaptureRequiredLiteralBuildError::Resource {
                     resource: "peak bytes",
                     required: live_before_dfa,
-                    limit: self.limits.max_peak_bytes,
-                })?,
-        );
-        let matcher = LiteralSetPlan::new(&refs, dfa_limits)
-            .map_err(CaptureRequiredLiteralBuildError::LiteralSet)?;
-        let literal_set = matcher.build_accounting();
-        let source_bytes = source_before_matcher
-            .checked_add(matcher_arc_block)
-            .and_then(|bytes| bytes.checked_add(literal_set.persistent_bytes))
-            .and_then(|bytes| bytes.checked_add(plan_value_bytes))
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "published source bytes",
-            ))?;
-        check_limit("source bytes", source_bytes, self.limits.max_source_bytes)?;
-        let peak_bytes_upper_bound = live_before_dfa
-            .checked_add(literal_set.build_bytes_upper_bound)
-            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                "peak build bytes",
-            ))?;
-        check_limit(
-            "peak bytes",
+                    limit: limits.max_peak_bytes,
+                },
+            )?);
+    // Charge publication before DFA construction so no later planner refusal
+    // can strand already-admitted construction work.
+    meter.charge(3)?;
+    let matcher = LiteralSetPlan::new(&refs, dfa_limits)
+        .map_err(CaptureRequiredLiteralBuildError::LiteralSet)?;
+    let literal_set = matcher.build_accounting();
+
+    let source_bytes = fixed_persistent
+        .checked_add(literal_set.persistent_bytes)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "published source bytes",
+        ))?;
+    check_limit("source bytes", source_bytes, limits.max_source_bytes)?;
+    let peak_bytes_upper_bound = live_before_dfa
+        .checked_add(literal_set.build_bytes_upper_bound)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "peak build bytes",
+        ))?;
+    check_limit("peak bytes", peak_bytes_upper_bound, limits.max_peak_bytes)?;
+
+    let identity = CaptureRequiredLiteralIdentity {
+        syntax,
+        plan_id: CAPTURE_REQUIRED_LITERAL_PLAN_ID,
+        needles: Arc::new(needles),
+    };
+    let report = CaptureRequiredLiteralBuildReport {
+        identity,
+        accounting: CaptureRequiredLiteralBuildAccounting {
+            planner_work: meter.work,
+            hir_nodes: meter.nodes,
+            hir_depth: meter.depth,
+            needles: metrics.needles,
+            needle_bytes: metrics.bytes,
+            minimum_needle_bytes: metrics.minimum_bytes,
+            source_bytes,
+            scratch_bytes,
             peak_bytes_upper_bound,
-            self.limits.max_peak_bytes,
-        )?;
-        meter.charge(3)?;
-        let needles = Arc::new(needles);
-        let identity = CaptureRequiredLiteralIdentity {
-            syntax: Arc::new(parsed.key),
-            plan_id: CAPTURE_REQUIRED_LITERAL_PLAN_ID,
-            needles,
-        };
-        let report = CaptureRequiredLiteralBuildReport {
-            admission: parsed.admission_status,
-            syntax: parsed.summary,
-            identity,
-            accounting: CaptureRequiredLiteralBuildAccounting {
-                syntax_temporary_bytes_upper_bound,
-                identity_source_capacity_bytes,
-                planner_work: meter.work,
-                hir_nodes: meter.nodes,
-                hir_depth: meter.depth,
-                needles: metrics.needles,
-                needle_bytes: metrics.bytes,
-                source_bytes,
-                scratch_bytes,
-                peak_bytes_upper_bound,
-                literal_set,
-            },
-        };
-        Ok(CaptureRequiredLiteralPlan {
-            matcher: Arc::new(matcher),
-            build_limits: self.limits,
-            report,
-        })
-    }
+            literal_set,
+        },
+    };
+    Ok(Some(CaptureRequiredLiteralPlan {
+        matcher: Arc::new(matcher),
+        build_limits: limits,
+        report,
+    }))
 }
 
 /// Immutable, cheaply cloneable candidate prefilter.
@@ -516,6 +395,7 @@ impl CaptureRequiredLiteralPlan {
 struct Metrics {
     needles: usize,
     bytes: usize,
+    minimum_bytes: usize,
 }
 
 struct Meter {
@@ -568,6 +448,7 @@ fn measure(
             Ok(Some(Metrics {
                 needles: 1,
                 bytes: literal.0.len(),
+                minimum_bytes: literal.0.len(),
             }))
         }
         HirKind::Capture(capture) => measure(&capture.sub, next_depth(depth)?, meter),
@@ -585,6 +466,7 @@ fn measure(
         HirKind::Alternation(children) if !children.is_empty() => {
             let mut needles = 0_usize;
             let mut bytes = 0_usize;
+            let mut minimum_bytes = usize::MAX;
             for child in children {
                 let Some(metrics) = measure(child, next_depth(depth)?, meter)? else {
                     return Ok(None);
@@ -595,8 +477,13 @@ fn measure(
                 bytes = bytes
                     .checked_add(metrics.bytes)
                     .ok_or(CaptureRequiredLiteralBuildError::Overflow("needle bytes"))?;
+                minimum_bytes = minimum_bytes.min(metrics.minimum_bytes);
             }
-            Ok(Some(Metrics { needles, bytes }))
+            Ok(Some(Metrics {
+                needles,
+                bytes,
+                minimum_bytes,
+            }))
         }
         _ => Ok(None),
     }
@@ -664,17 +551,11 @@ fn check_metric_limits(
     check_limit("needle bytes", metrics.bytes, limits.max_needle_bytes)
 }
 
-fn cache_key_arc_bytes() -> Result<usize, CaptureRequiredLiteralBuildError> {
-    arc_block_bytes::<CacheKey>()
-}
-
 fn arc_block_bytes<T>() -> Result<usize, CaptureRequiredLiteralBuildError> {
-    size_of::<usize>()
-        .checked_mul(2)
-        .and_then(|header| size_of::<T>().checked_add(header))
-        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-            "Arc block bytes",
-        ))
+    Layout::new::<[usize; 2]>()
+        .extend(Layout::new::<T>())
+        .map(|(layout, _)| layout.pad_to_align().size())
+        .map_err(|_| CaptureRequiredLiteralBuildError::Overflow("Arc block bytes"))
 }
 
 fn needle_capacity_bytes(
@@ -716,36 +597,56 @@ fn next_depth(depth: usize) -> Result<usize, CaptureRequiredLiteralBuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
 
     const AWS: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
 
+    fn build(
+        pattern: &str,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = false;
+        let parsed = fre_syntax::parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustBytes(profile),
+        ))
+        .unwrap();
+        let key = Arc::new(parsed.key);
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            panic!("Rust parser returned a non-Rust pattern")
+        };
+        build_from_hir(&rust.hir, key, limits)
+    }
+
     #[test]
     fn generic_lattice_selects_required_literals_and_preserves_order() {
-        let plan = CaptureRequiredLiteralBuilder::new("(?:(AB|CD)x|y(AB|CD))+")
-            .unicode(false)
-            .build()
-            .unwrap();
+        let plan = build(
+            "(?:(AB|CD)x|y(AB|CD))+",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             plan.build_report().identity.needles.as_ref(),
             &vec![b"AB".to_vec(), b"CD".to_vec(), b"y".to_vec()]
         );
         assert!(
-            CaptureRequiredLiteralBuilder::new("(?:AB|)")
-                .build()
-                .is_err()
+            build("(?:AB|)", CaptureRequiredLiteralBuildLimits::default())
+                .unwrap()
+                .is_none()
         );
         assert!(
-            CaptureRequiredLiteralBuilder::new("(?:AB)?")
-                .build()
-                .is_err()
+            build("(?:AB)?", CaptureRequiredLiteralBuildLimits::default())
+                .unwrap()
+                .is_none()
         );
     }
 
     #[test]
     fn aws_hir_proves_the_access_prefix_set_and_byte_search_is_malformed_safe() {
-        let plan = CaptureRequiredLiteralBuilder::new(AWS)
-            .unicode(false)
-            .build()
+        let plan = build(AWS, CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
             .unwrap();
         assert_eq!(plan.build_report().accounting.needles, 8);
         assert_eq!(plan.build_report().accounting.needle_bytes, 32);
@@ -762,25 +663,26 @@ mod tests {
                 b"AIDA".to_vec(),
             ]
         );
-        let miss = plan
+        let hit = plan
             .is_candidate(
                 b"\xFF EASTASIAN",
                 CaptureRequiredLiteralRunLimits::default(),
             )
             .unwrap();
-        assert!(miss.candidate);
-        assert_eq!(miss.accounting.transitions_upper_bound, 12);
-        let clean_miss = plan
-            .is_candidate(b"\xFF no key", CaptureRequiredLiteralRunLimits::default())
-            .unwrap();
-        assert!(!clean_miss.candidate);
+        assert!(hit.candidate);
+        assert_eq!(hit.accounting.transitions_upper_bound, 12);
+        assert!(
+            !plan
+                .is_candidate(b"\xFF no key", CaptureRequiredLiteralRunLimits::default(),)
+                .unwrap()
+                .candidate
+        );
     }
 
     #[test]
     fn planner_and_search_exact_limits_refuse_one_below() {
-        let baseline = CaptureRequiredLiteralBuilder::new("(?:AB|CD)")
-            .unicode(false)
-            .build()
+        let baseline = build("(?:AB|CD)", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
             .unwrap();
         let accounting = baseline.build_report().accounting;
         for (resource, limit) in [
@@ -800,53 +702,37 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(matches!(
-                CaptureRequiredLiteralBuilder::new("(?:AB|CD)")
-                    .unicode(false)
-                    .limits(limits)
-                    .build(),
+                build("(?:AB|CD)", limits),
                 Err(CaptureRequiredLiteralBuildError::Resource {
                     resource: actual,
                     ..
                 }) if actual == resource
             ));
         }
-        let mut source_one_below = CaptureRequiredLiteralBuildLimits::default();
-        source_one_below.max_source_bytes = accounting.source_bytes - 1;
+
+        for dimension in ["source", "peak", "persistent"] {
+            let mut limits = CaptureRequiredLiteralBuildLimits::default();
+            match dimension {
+                "source" => limits.max_source_bytes = accounting.source_bytes - 1,
+                "peak" => limits.max_peak_bytes = accounting.peak_bytes_upper_bound - 1,
+                "persistent" => {
+                    limits.literal_set.max_persistent_bytes =
+                        accounting.literal_set.persistent_bytes - 1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(build("(?:AB|CD)", limits).is_err());
+        }
+
         assert!(
-            CaptureRequiredLiteralBuilder::new("(?:AB|CD)")
-                .unicode(false)
-                .limits(source_one_below)
-                .build()
-                .is_err()
+            baseline
+                .is_candidate(
+                    b"zzAB",
+                    CaptureRequiredLiteralRunLimits { max_transitions: 5 },
+                )
+                .unwrap()
+                .candidate
         );
-        let mut peak_one_below = CaptureRequiredLiteralBuildLimits::default();
-        peak_one_below.max_peak_bytes = accounting.peak_bytes_upper_bound - 1;
-        assert!(
-            CaptureRequiredLiteralBuilder::new("(?:AB|CD)")
-                .unicode(false)
-                .limits(peak_one_below)
-                .build()
-                .is_err()
-        );
-        let mut persistent_one_below = CaptureRequiredLiteralBuildLimits::default();
-        persistent_one_below.literal_set.max_persistent_bytes =
-            accounting.literal_set.persistent_bytes - 1;
-        assert!(matches!(
-            CaptureRequiredLiteralBuilder::new("(?:AB|CD)")
-                .unicode(false)
-                .limits(persistent_one_below)
-                .build(),
-            Err(CaptureRequiredLiteralBuildError::LiteralSet(
-                LiteralSetError::PersistentBytesLimit { .. }
-            ))
-        ));
-        let exact = baseline
-            .is_candidate(
-                b"zzAB",
-                CaptureRequiredLiteralRunLimits { max_transitions: 5 },
-            )
-            .unwrap();
-        assert!(exact.candidate);
         assert!(matches!(
             baseline.is_candidate(
                 b"zzAB",
