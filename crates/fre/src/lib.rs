@@ -196,10 +196,15 @@ use fre_syntax::{
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
 pub use line_capture::{
     LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildReport,
-    LineCaptureBuildResource, LineCaptureBuilder, LineCapturePlan, LineCapturePlanIdentity,
-    LineCapturePlanKind, LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits,
-    LineCaptureRunReport, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-    SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+    LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration,
+    LineCaptureOperationIdentity, LineCapturePlan, LineCapturePlanIdentity, LineCapturePlanKind,
+    LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits, LineCaptureRunReport,
+    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID,
+    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+    SPACE_AROUND_OPERATOR_OPERATION_ID, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+    STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
+    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
+    WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
 };
 
 pub use fre_automata::{

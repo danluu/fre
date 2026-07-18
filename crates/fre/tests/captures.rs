@@ -3,9 +3,14 @@ use core::mem::size_of;
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
     CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, LineCaptureBuildError,
-    LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder, LineCapturePlanKind,
-    LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder,
-    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+    LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration,
+    LineCapturePlanKind, LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits,
+    PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK,
+    SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    SPACE_AROUND_OPERATOR_INSPECTION_WORK, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+    STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
+    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
+    WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
 };
 use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
@@ -40,10 +45,14 @@ fn assert_count(pattern: &str, haystack: &[u8]) {
 }
 
 fn space_operator_plan() -> fre::LineCapturePlan {
-    LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+    line_capture_plan(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+}
+
+fn line_capture_plan(pattern: &str) -> fre::LineCapturePlan {
+    LineCaptureBuilder::new(pattern)
         .profile(fre::RustProfile::rebar_1_12_4())
         .build()
-        .expect("space-around-operator direct plan")
+        .expect("exact direct line-capture plan")
 }
 
 fn reference_grep_capture_count(pattern: &str, haystack: &[u8]) -> usize {
@@ -448,6 +457,351 @@ fn space_around_operator_direct_plan_has_exact_prospective_limits() {
         assert_eq!(report.work, 12 * bytes + 1);
         assert_eq!(report.sequential_bytes, bytes);
         assert_eq!(report.actual_input_loads, bytes);
+    }
+}
+
+#[test]
+fn remaining_ruff_line_plans_authenticate_exact_hir_and_one_below() {
+    let cases = [
+        (
+            SHEBANG_CAPTURE_PATTERN,
+            LineCapturePlanKind::Shebang,
+            LineCaptureConfiguration::AnchoredWhitespaceLiteralTail,
+            SHEBANG_OPERATION_ID,
+            (9, 12, 2, SHEBANG_INSPECTION_WORK, 2, 3, 12),
+        ),
+        (
+            STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+            LineCapturePlanKind::StringQuotePrefix,
+            LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail,
+            STRING_QUOTE_PREFIX_OPERATION_ID,
+            (10, 12, 0, STRING_QUOTE_PREFIX_INSPECTION_WORK, 1, 2, 8),
+        ),
+        (
+            WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+            LineCapturePlanKind::WhitespaceAroundKeywords,
+            LineCaptureConfiguration::UnicodeWordKeywordSet,
+            WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+            (
+                45,
+                20,
+                155,
+                WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
+                2,
+                3,
+                16,
+            ),
+        ),
+    ];
+    for (
+        pattern,
+        kind,
+        configuration,
+        operation_id,
+        (nodes, ranges, literals, inspection, explicit, groups, rate),
+    ) in cases
+    {
+        let plan = line_capture_plan(pattern);
+        let report = plan.build_report();
+        assert_eq!(report.identity.source, pattern);
+        assert_eq!(report.identity.profile, fre::RustProfile::rebar_1_12_4());
+        assert_eq!(report.identity.plan, kind);
+        assert_eq!(report.identity.operation.operation_id, operation_id);
+        assert_eq!(report.identity.operation.configuration, configuration);
+        assert_eq!(report.identity.operation.work_per_input_byte, rate);
+        assert_eq!(report.hir_nodes, nodes);
+        assert_eq!(report.class_ranges, ranges);
+        assert_eq!(report.literal_bytes, literals);
+        assert_eq!(report.inspection_work, inspection);
+        assert_eq!(report.minimum_match_bytes, 2);
+        assert_eq!(report.explicit_captures, explicit);
+        assert_eq!(report.participating_groups_per_match, groups);
+        assert_eq!(report.allocations, 0);
+        assert_eq!(report.scratch_bytes, 0);
+        assert_eq!(report.persistent_bytes, size_of::<fre::LineCapturePlan>());
+        assert_eq!(report.peak_bytes, size_of::<fre::LineCapturePlan>());
+
+        assert_remaining_ruff_build_limits(pattern, inspection);
+    }
+}
+
+fn assert_remaining_ruff_build_limits(pattern: &str, inspection: usize) {
+    let inspection_below = inspection
+        .checked_sub(1)
+        .expect("registered inspection work is nonzero");
+    let plan_bytes_below = size_of::<fre::LineCapturePlan>()
+        .checked_sub(1)
+        .expect("line-capture plan is nonempty");
+    assert!(matches!(
+        LineCaptureBuilder::new(pattern)
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .limits(LineCaptureBuildLimits {
+                max_inspection_work: inspection_below,
+                ..LineCaptureBuildLimits::default()
+            })
+            .build(),
+        Err(LineCaptureBuildError::InspectionWork { required, limit })
+            if required == inspection && limit == inspection_below
+    ));
+    for (resource, limits) in [
+        (
+            LineCaptureBuildResource::PersistentBytes,
+            LineCaptureBuildLimits {
+                max_persistent_bytes: plan_bytes_below,
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+        (
+            LineCaptureBuildResource::PeakBytes,
+            LineCaptureBuildLimits {
+                max_peak_bytes: plan_bytes_below,
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+    ] {
+        assert!(matches!(
+            LineCaptureBuilder::new(pattern)
+                .profile(fre::RustProfile::rebar_1_12_4())
+                .limits(limits)
+                .build(),
+            Err(LineCaptureBuildError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+    let mutated = format!("{pattern} ");
+    assert!(matches!(
+        LineCaptureBuilder::new(&mutated)
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .build(),
+        Err(LineCaptureBuildError::Unsupported("source identity"))
+    ));
+}
+
+#[test]
+fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
+    let cases = [
+        (SHEBANG_CAPTURE_PATTERN, b"#!".as_slice(), 12, 3, 23),
+        (
+            STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+            b"''".as_slice(),
+            8,
+            2,
+            15,
+        ),
+        (
+            WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+            b"if".as_slice(),
+            16,
+            3,
+            28,
+        ),
+    ];
+    for (pattern, haystack, rate, count, actual_work) in cases {
+        let plan = line_capture_plan(pattern);
+        let prospective_work = rate * haystack.len() + 1;
+        let prospective_matches = haystack.len() / 2;
+        let prospective_captures = prospective_matches * count;
+        let prospective_events = haystack.len() + prospective_captures;
+        let exact = LineCaptureRunLimits {
+            max_work: prospective_work,
+            max_sequential_bytes: haystack.len(),
+            max_capture_count: prospective_captures,
+            max_reducer_events: prospective_events,
+        };
+        let report = plan
+            .grep_capture_count(haystack, exact)
+            .expect("exact direct execution bounds");
+        assert_eq!(report.work, prospective_work);
+        assert_eq!(report.actual_work, actual_work);
+        assert!(report.actual_work <= report.work);
+        assert_eq!(report.sequential_bytes, haystack.len());
+        assert_eq!(report.actual_input_loads, haystack.len());
+        assert_eq!(report.prospective_matches, prospective_matches);
+        assert_eq!(report.prospective_capture_count, prospective_captures);
+        assert_eq!(report.prospective_line_events, haystack.len());
+        assert_eq!(report.prospective_reducer_events, prospective_events);
+        assert_eq!(report.matches, 1);
+        assert_eq!(report.capture_count, count);
+        assert_eq!(report.lines, 1);
+        assert_eq!(report.reducer_events, count + 1);
+        assert_eq!(report.scratch_bytes, 0);
+        assert_eq!(report.output_bytes, 0);
+
+        for (resource, limits) in [
+            (
+                LineCaptureResource::ExecutionWork,
+                LineCaptureRunLimits {
+                    max_work: prospective_work - 1,
+                    ..exact
+                },
+            ),
+            (
+                LineCaptureResource::SequentialBytes,
+                LineCaptureRunLimits {
+                    max_sequential_bytes: haystack.len() - 1,
+                    ..exact
+                },
+            ),
+            (
+                LineCaptureResource::CaptureCount,
+                LineCaptureRunLimits {
+                    max_capture_count: prospective_captures - 1,
+                    ..exact
+                },
+            ),
+            (
+                LineCaptureResource::ReducerEvents,
+                LineCaptureRunLimits {
+                    max_reducer_events: prospective_events - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            assert!(matches!(
+                plan.grep_capture_count(haystack, limits),
+                Err(LineCaptureRunError::Resource { resource: got, .. }) if got == resource
+            ));
+        }
+
+        for bytes in [1_usize, 64, 4_096] {
+            let input = vec![b'a'; bytes];
+            let report = plan
+                .grep_capture_count(&input, LineCaptureRunLimits::default())
+                .expect("scaled direct reduction");
+            assert_eq!(report.work, rate * bytes + 1);
+            assert_eq!(report.sequential_bytes, bytes);
+            assert_eq!(report.actual_input_loads, bytes);
+            assert!(report.actual_work <= report.work);
+        }
+    }
+}
+
+fn assert_line_capture_oracle(pattern: &str, haystack: &[u8]) {
+    let plan = line_capture_plan(pattern);
+    let expected = reference_grep_capture_count(pattern, haystack);
+    let report = plan
+        .grep_capture_count(haystack, LineCaptureRunLimits::default())
+        .unwrap_or_else(|error| panic!("pattern={pattern:?} haystack={haystack:?}: {error}"));
+    assert_eq!(report.capture_count, expected, "haystack={haystack:?}");
+    assert_eq!(report.actual_input_loads, haystack.len());
+    assert!(report.actual_work <= report.work);
+    assert_eq!(report.scratch_bytes, 0);
+    assert_eq!(report.output_bytes, 0);
+}
+
+#[test]
+fn shebang_direct_plan_matches_anchor_unicode_invalid_and_crlf_oracles() {
+    let cases: &[&[u8]] = &[
+        b"",
+        b"#!",
+        b" \t#!",
+        b"#!directive",
+        b"#!\xFFtail",
+        b"#!a\xFFb",
+        b"\xFF#!",
+        b" \xFF#!",
+        b"x#!",
+        b" #x#!",
+        b"#!\r\n",
+        b"#!\r",
+        b"\r#!",
+        "\u{0085}\u{2003}#!\u{2028}".as_bytes(),
+        b"#!\n \t#!x\r\n\xFF#!\n",
+    ];
+    for haystack in cases {
+        assert_line_capture_oracle(SHEBANG_CAPTURE_PATTERN, haystack);
+    }
+}
+
+#[test]
+fn string_quote_direct_plan_matches_casefold_raw_invalid_and_crlf_oracles() {
+    let cases: &[&[u8]] = &[
+        b"",
+        b"'",
+        b"''",
+        b"\"\"",
+        b"'\"",
+        b"\"'",
+        b"r''",
+        b"URB\"\"",
+        b"RuB'a'",
+        b"rub",
+        b"rurx''",
+        b"'a'b'",
+        b"''x",
+        b"''\xFF",
+        b"'\xFF'",
+        b"\xFF''",
+        b"''\r\n",
+        b"''\r",
+        b"'\r'\r\n",
+        "'\u{2028}'".as_bytes(),
+        "'\u{00E9}'".as_bytes(),
+        "U\"\u{03B2}\"".as_bytes(),
+    ];
+    for haystack in cases {
+        assert_line_capture_oracle(STRING_QUOTE_PREFIX_CAPTURE_PATTERN, haystack);
+    }
+}
+
+#[test]
+fn keyword_direct_plan_matches_unicode_boundaries_invalid_and_multiple_oracles() {
+    let all_keywords = b"False,None,True,and,as,assert,async,await,break,class,continue,def,del,elif,else,except,finally,for,from,global,if,import,in,is,lambda,nonlocal,not,or,pass,raise,return,try,while,with,yield\n";
+    assert_eq!(
+        reference_grep_capture_count(WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, all_keywords),
+        105
+    );
+    let cases: &[&[u8]] = &[
+        b"",
+        b"if",
+        b"if else",
+        b"False None True",
+        b"gift",
+        b"if_",
+        b"_if",
+        b"if-else",
+        b"if\xFFelse",
+        b"\xFFif\xFF",
+        b"if_\xFF",
+        "\u{00E9}if".as_bytes(),
+        "\u{00E9} if".as_bytes(),
+        "if\u{2003}else".as_bytes(),
+        "if\u{2028}else".as_bytes(),
+        "if\u{200C}or".as_bytes(),
+        "if\u{200D}or".as_bytes(),
+        b"if\r\nelse\nwhile try\r",
+        b"as assert async in is import",
+        b"continue nonlocal finally assert async await",
+        all_keywords,
+    ];
+    for haystack in cases {
+        assert_line_capture_oracle(WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, haystack);
+    }
+}
+
+#[test]
+fn remaining_ruff_line_plans_load_every_valid_malformed_and_cr_byte_once() {
+    let inputs: &[&[u8]] = &[
+        b"\ra",
+        b"\r\n",
+        b"\xC2",
+        b"\xE2",
+        b"\xE2\x82",
+        b"\xF0",
+        b"\xF0\x9F",
+        b"\xF0\x9F\x92",
+        b"\xE0\x80\x80",
+        b"\xED\xA0\x80",
+        b"\xF4\x90\x80\x80",
+        b"#!\xFF\r\n'\xFF'\n\xFFif\xFF",
+    ];
+    for pattern in [
+        SHEBANG_CAPTURE_PATTERN,
+        STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+        WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+    ] {
+        for haystack in inputs {
+            assert_line_capture_oracle(pattern, haystack);
+        }
     }
 }
 

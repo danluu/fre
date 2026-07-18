@@ -11,9 +11,21 @@ use fre_syntax::RustProfile;
 
 /// Exact source spelling for the first admitted line-capture plan.
 pub const SPACE_AROUND_OPERATOR_CAPTURE_PATTERN: &str = r"[^,\s](\s*)(?:[-+*/|!<=>%&^]+|:=)(\s*)";
+/// Exact source spelling for Ruff's start-anchored shebang capture row.
+pub const SHEBANG_CAPTURE_PATTERN: &str = r"^(?P<spaces>\s*)#!(?P<directive>.*)";
+/// Exact source spelling for Ruff's whole-line string quote-prefix capture row.
+pub const STRING_QUOTE_PREFIX_CAPTURE_PATTERN: &str = r#"^(?i)[urb]*['\"](?P<raw>.*)['\"]$"#;
+/// Exact source spelling for Ruff's whitespace-delimited Python-keyword row.
+pub const WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN: &str = r"(\s*)\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b(\s*)";
 
 /// Exact structural-inspection charge for the pinned canonical HIR.
 pub const SPACE_AROUND_OPERATOR_INSPECTION_WORK: usize = 54;
+/// Exact structural-inspection charge for the shebang plan.
+pub const SHEBANG_INSPECTION_WORK: usize = 23;
+/// Exact structural-inspection charge for the quote-prefix plan.
+pub const STRING_QUOTE_PREFIX_INSPECTION_WORK: usize = 22;
+/// Exact structural-inspection charge for the Python-keyword plan.
+pub const WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK: usize = 220;
 
 const SPACE_AROUND_OPERATOR_HIR_NODES: usize = 12;
 const SPACE_AROUND_OPERATOR_CLASS_RANGES: usize = 40;
@@ -21,6 +33,34 @@ const SPACE_AROUND_OPERATOR_LITERAL_BYTES: usize = 2;
 const SPACE_AROUND_OPERATOR_MINIMUM_BYTES: usize = 2;
 const SPACE_AROUND_OPERATOR_PARTICIPATING_GROUPS: usize = 3;
 const SPACE_AROUND_OPERATOR_WORK_PER_INPUT_BYTE: usize = 12;
+
+const SHEBANG_HIR_NODES: usize = 9;
+const SHEBANG_CLASS_RANGES: usize = 12;
+const SHEBANG_LITERAL_BYTES: usize = 2;
+const SHEBANG_WORK_PER_INPUT_BYTE: usize = 12;
+const SHEBANG_UNIT_WORK: usize = 10;
+
+const STRING_QUOTE_PREFIX_HIR_NODES: usize = 10;
+const STRING_QUOTE_PREFIX_CLASS_RANGES: usize = 12;
+const STRING_QUOTE_PREFIX_LITERAL_BYTES: usize = 0;
+const STRING_QUOTE_PREFIX_WORK_PER_INPUT_BYTE: usize = 8;
+const STRING_QUOTE_PREFIX_UNIT_WORK: usize = 6;
+
+const WHITESPACE_AROUND_KEYWORDS_HIR_NODES: usize = 45;
+const WHITESPACE_AROUND_KEYWORDS_CLASS_RANGES: usize = 20;
+const WHITESPACE_AROUND_KEYWORDS_LITERAL_BYTES: usize = 155;
+const WHITESPACE_AROUND_KEYWORDS_WORK_PER_INPUT_BYTE: usize = 16;
+const WHITESPACE_AROUND_KEYWORDS_UNIT_WORK: usize = 10;
+
+/// Stable operation identity for the retained space-operator configuration.
+pub const SPACE_AROUND_OPERATOR_OPERATION_ID: &str = "capture-line-space-around-operator-stream-v2";
+/// Stable operation identity for the configured shebang stream.
+pub const SHEBANG_OPERATION_ID: &str = "capture-line-ruff-shebang-stream-v1";
+/// Stable operation identity for the configured quote-prefix stream.
+pub const STRING_QUOTE_PREFIX_OPERATION_ID: &str = "capture-line-ruff-string-quote-stream-v1";
+/// Stable operation identity for the configured Python-keyword stream.
+pub const WHITESPACE_AROUND_KEYWORDS_OPERATION_ID: &str =
+    "capture-line-ruff-python-keywords-stream-v1";
 
 /// Construction limits for an exact line-capture plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +108,42 @@ pub enum LineCapturePlanKind {
     /// `[^,\s](\s*)(?:[-+*/|!<=>%&^]+|:=)(\s*)` under the pinned
     /// Unicode-on Rebar Rust-byte profile.
     SpaceAroundOperator,
+    /// `^(?P<spaces>\s*)#!(?P<directive>.*)`.
+    Shebang,
+    /// `^(?i)[urb]*['\"](?P<raw>.*)['\"]$`.
+    StringQuotePrefix,
+    /// The exact finite Python-keyword set between Unicode word boundaries.
+    WhitespaceAroundKeywords,
+}
+
+/// Bounded scanner configuration selected by exact source identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LineCaptureConfiguration {
+    /// Unanchored operator tokens with surrounding Unicode whitespace captures.
+    SpaceAroundOperator,
+    /// Start-anchored Unicode whitespace, a fixed `#!`, and a line tail.
+    AnchoredWhitespaceLiteralTail,
+    /// Start/end-anchored ASCII prefix class, quote class, and greedy line tail.
+    AnchoredAsciiPrefixQuotedTail,
+    /// A finite ASCII keyword set delimited by Unicode word boundaries.
+    UnicodeWordKeywordSet,
+}
+
+/// Immutable execution identity derived from one registered configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LineCaptureOperationIdentity {
+    /// Stable operation label consumed by the adapter and runner.
+    pub operation_id: &'static str,
+    /// Generic bounded scanner configuration.
+    pub configuration: LineCaptureConfiguration,
+    /// Conservative prospective work charged for each input byte.
+    pub work_per_input_byte: usize,
+    /// Per-decoded-unit work charged by the actual execution ledger.
+    pub unit_work: usize,
+    /// Proved positive minimum match width.
+    pub minimum_match_bytes: usize,
+    /// Participating capture groups per match, including group zero.
+    pub participating_groups_per_match: usize,
 }
 
 /// Immutable plan identity.
@@ -79,6 +155,8 @@ pub struct LineCapturePlanIdentity {
     pub profile: RustProfile,
     /// Exact direct mechanism.
     pub plan: LineCapturePlanKind,
+    /// Complete configured execution identity.
+    pub operation: LineCaptureOperationIdentity,
 }
 
 /// Exact structural facts established before publishing a plan.
@@ -94,6 +172,8 @@ pub struct LineCaptureBuildReport {
     pub inspection_work: usize,
     /// Proved positive whole-match minimum in bytes.
     pub minimum_match_bytes: usize,
+    /// Exact explicit capture count in the authenticated HIR.
+    pub explicit_captures: usize,
     /// Participating groups per selected match, including group zero.
     pub participating_groups_per_match: usize,
     /// Construction allocations performed after prospective admission.
@@ -247,6 +327,8 @@ pub struct LineCaptureRunReport {
     pub reducer_events: usize,
     /// Exact prospective work certificate.
     pub work: usize,
+    /// Actual charged scanner/decoder work.
+    pub actual_work: usize,
     /// Exact prospective single-pass input-load certificate.
     pub sequential_bytes: usize,
     /// Prospective non-overlapping match ceiling admitted before scanning.
@@ -263,6 +345,106 @@ pub struct LineCaptureRunReport {
     pub scratch_bytes: usize,
     /// Dynamic output bytes (always zero for this plan).
     pub output_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LineCaptureRegistration {
+    source: &'static str,
+    plan: LineCapturePlanKind,
+    operation: LineCaptureOperationIdentity,
+    hir_nodes: usize,
+    class_ranges: usize,
+    literal_bytes: usize,
+    inspection_work: usize,
+    explicit_captures: usize,
+}
+
+impl LineCaptureRegistration {
+    const fn for_plan(plan: LineCapturePlanKind) -> Self {
+        match plan {
+            LineCapturePlanKind::SpaceAroundOperator => Self {
+                source: SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+                plan,
+                operation: LineCaptureOperationIdentity {
+                    operation_id: SPACE_AROUND_OPERATOR_OPERATION_ID,
+                    configuration: LineCaptureConfiguration::SpaceAroundOperator,
+                    work_per_input_byte: SPACE_AROUND_OPERATOR_WORK_PER_INPUT_BYTE,
+                    unit_work: 10,
+                    minimum_match_bytes: SPACE_AROUND_OPERATOR_MINIMUM_BYTES,
+                    participating_groups_per_match: SPACE_AROUND_OPERATOR_PARTICIPATING_GROUPS,
+                },
+                hir_nodes: SPACE_AROUND_OPERATOR_HIR_NODES,
+                class_ranges: SPACE_AROUND_OPERATOR_CLASS_RANGES,
+                literal_bytes: SPACE_AROUND_OPERATOR_LITERAL_BYTES,
+                inspection_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+                explicit_captures: 2,
+            },
+            LineCapturePlanKind::Shebang => Self {
+                source: SHEBANG_CAPTURE_PATTERN,
+                plan,
+                operation: LineCaptureOperationIdentity {
+                    operation_id: SHEBANG_OPERATION_ID,
+                    configuration: LineCaptureConfiguration::AnchoredWhitespaceLiteralTail,
+                    work_per_input_byte: SHEBANG_WORK_PER_INPUT_BYTE,
+                    unit_work: SHEBANG_UNIT_WORK,
+                    minimum_match_bytes: 2,
+                    participating_groups_per_match: 3,
+                },
+                hir_nodes: SHEBANG_HIR_NODES,
+                class_ranges: SHEBANG_CLASS_RANGES,
+                literal_bytes: SHEBANG_LITERAL_BYTES,
+                inspection_work: SHEBANG_INSPECTION_WORK,
+                explicit_captures: 2,
+            },
+            LineCapturePlanKind::StringQuotePrefix => Self {
+                source: STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+                plan,
+                operation: LineCaptureOperationIdentity {
+                    operation_id: STRING_QUOTE_PREFIX_OPERATION_ID,
+                    configuration: LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail,
+                    work_per_input_byte: STRING_QUOTE_PREFIX_WORK_PER_INPUT_BYTE,
+                    unit_work: STRING_QUOTE_PREFIX_UNIT_WORK,
+                    minimum_match_bytes: 2,
+                    participating_groups_per_match: 2,
+                },
+                hir_nodes: STRING_QUOTE_PREFIX_HIR_NODES,
+                class_ranges: STRING_QUOTE_PREFIX_CLASS_RANGES,
+                literal_bytes: STRING_QUOTE_PREFIX_LITERAL_BYTES,
+                inspection_work: STRING_QUOTE_PREFIX_INSPECTION_WORK,
+                explicit_captures: 1,
+            },
+            LineCapturePlanKind::WhitespaceAroundKeywords => Self {
+                source: WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+                plan,
+                operation: LineCaptureOperationIdentity {
+                    operation_id: WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+                    configuration: LineCaptureConfiguration::UnicodeWordKeywordSet,
+                    work_per_input_byte: WHITESPACE_AROUND_KEYWORDS_WORK_PER_INPUT_BYTE,
+                    unit_work: WHITESPACE_AROUND_KEYWORDS_UNIT_WORK,
+                    minimum_match_bytes: 2,
+                    participating_groups_per_match: 3,
+                },
+                hir_nodes: WHITESPACE_AROUND_KEYWORDS_HIR_NODES,
+                class_ranges: WHITESPACE_AROUND_KEYWORDS_CLASS_RANGES,
+                literal_bytes: WHITESPACE_AROUND_KEYWORDS_LITERAL_BYTES,
+                inspection_work: WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
+                explicit_captures: 2,
+            },
+        }
+    }
+
+    fn for_source(source: &str) -> Option<Self> {
+        let plan = match source {
+            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN => LineCapturePlanKind::SpaceAroundOperator,
+            SHEBANG_CAPTURE_PATTERN => LineCapturePlanKind::Shebang,
+            STRING_QUOTE_PREFIX_CAPTURE_PATTERN => LineCapturePlanKind::StringQuotePrefix,
+            WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN => {
+                LineCapturePlanKind::WhitespaceAroundKeywords
+            }
+            _ => return None,
+        };
+        Some(Self::for_plan(plan))
+    }
 }
 
 /// Builder for exact, allocation-free line-capture reducers.
@@ -300,9 +482,11 @@ impl<'a> LineCaptureBuilder<'a> {
 
     /// Authenticate and construct one exact line-capture plan.
     pub fn build(self) -> Result<LineCapturePlan, LineCaptureBuildError> {
-        if SPACE_AROUND_OPERATOR_INSPECTION_WORK > self.limits.max_inspection_work {
+        let registration = LineCaptureRegistration::for_source(self.pattern)
+            .ok_or(LineCaptureBuildError::Unsupported("source identity"))?;
+        if registration.inspection_work > self.limits.max_inspection_work {
             return Err(LineCaptureBuildError::InspectionWork {
-                required: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+                required: registration.inspection_work,
                 limit: self.limits.max_inspection_work,
             });
         }
@@ -328,9 +512,6 @@ impl<'a> LineCaptureBuilder<'a> {
             peak_bytes,
             self.limits.max_peak_bytes,
         )?;
-        if self.pattern != SPACE_AROUND_OPERATOR_CAPTURE_PATTERN {
-            return Err(LineCaptureBuildError::Unsupported("source identity"));
-        }
         if self.profile != RustProfile::rebar_1_12_4() {
             return Err(LineCaptureBuildError::Unsupported("Rust profile identity"));
         }
@@ -340,20 +521,22 @@ impl<'a> LineCaptureBuilder<'a> {
         // storage. The zero resource facts are prospectively bounded by the
         // caller's limits (whose minimum representable value is also zero).
         let report = LineCaptureBuildReport {
-            hir_nodes: SPACE_AROUND_OPERATOR_HIR_NODES,
-            class_ranges: SPACE_AROUND_OPERATOR_CLASS_RANGES,
-            literal_bytes: SPACE_AROUND_OPERATOR_LITERAL_BYTES,
-            inspection_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
-            minimum_match_bytes: SPACE_AROUND_OPERATOR_MINIMUM_BYTES,
-            participating_groups_per_match: SPACE_AROUND_OPERATOR_PARTICIPATING_GROUPS,
+            hir_nodes: registration.hir_nodes,
+            class_ranges: registration.class_ranges,
+            literal_bytes: registration.literal_bytes,
+            inspection_work: registration.inspection_work,
+            minimum_match_bytes: registration.operation.minimum_match_bytes,
+            explicit_captures: registration.explicit_captures,
+            participating_groups_per_match: registration.operation.participating_groups_per_match,
             allocations: 0,
             scratch_bytes: 0,
             persistent_bytes,
             peak_bytes,
             identity: LineCapturePlanIdentity {
-                source: SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+                source: registration.source,
                 profile: self.profile,
-                plan: LineCapturePlanKind::SpaceAroundOperator,
+                plan: registration.plan,
+                operation: registration.operation,
             },
         };
         Ok(LineCapturePlan { report })
@@ -379,9 +562,10 @@ impl LineCapturePlan {
         haystack: &[u8],
         limits: LineCaptureRunLimits,
     ) -> Result<LineCaptureRunReport, LineCaptureRunError> {
+        let operation = self.report.identity.operation;
         let work = haystack
             .len()
-            .checked_mul(SPACE_AROUND_OPERATOR_WORK_PER_INPUT_BYTE)
+            .checked_mul(operation.work_per_input_byte)
             .and_then(|work| work.checked_add(1))
             .ok_or(LineCaptureRunError::ArithmeticOverflow(
                 LineCaptureResource::ExecutionWork,
@@ -422,7 +606,7 @@ impl LineCapturePlan {
             limits.max_reducer_events,
         )?;
 
-        let scan = scan_space_around_operator(haystack)?;
+        let scan = scan_line_capture(operation, haystack)?;
         let lines = scan.lines;
         let matches = scan.matches;
         let capture_count = matches
@@ -451,6 +635,7 @@ impl LineCapturePlan {
             scan.input_loads,
             sequential_bytes,
         )?;
+        enforce_invariant(LineCaptureResource::ExecutionWork, scan.work, work)?;
         Ok(LineCaptureRunReport {
             identity: self.report.identity.clone(),
             lines,
@@ -464,6 +649,7 @@ impl LineCapturePlan {
             prospective_line_events,
             prospective_reducer_events,
             actual_input_loads: scan.input_loads,
+            actual_work: scan.work,
             scratch_bytes: 0,
             output_bytes: 0,
         })
@@ -594,6 +780,280 @@ impl SpaceOperatorState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ShebangPhase {
+    #[default]
+    LeadingWhitespace,
+    Hash,
+    Matched,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShebangState {
+    phase: ShebangPhase,
+}
+
+impl ShebangState {
+    fn push_scalar(&mut self, scalar: char) {
+        self.phase = match self.phase {
+            ShebangPhase::LeadingWhitespace if is_unicode_whitespace(scalar) => {
+                ShebangPhase::LeadingWhitespace
+            }
+            ShebangPhase::LeadingWhitespace if scalar == '#' => ShebangPhase::Hash,
+            ShebangPhase::Hash if scalar == '!' => ShebangPhase::Matched,
+            ShebangPhase::Matched => ShebangPhase::Matched,
+            _ => ShebangPhase::Failed,
+        };
+    }
+
+    fn push_invalid(&mut self) {
+        if self.phase != ShebangPhase::Matched {
+            self.phase = ShebangPhase::Failed;
+        }
+    }
+
+    const fn matched(self) -> bool {
+        matches!(self.phase, ShebangPhase::Matched)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StringQuotePhase {
+    #[default]
+    Prefix,
+    Body {
+        has_unit_after_open: bool,
+        last_unit_is_quote: bool,
+    },
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StringQuoteState {
+    phase: StringQuotePhase,
+}
+
+impl StringQuoteState {
+    fn push_scalar(&mut self, scalar: char) {
+        self.phase = match self.phase {
+            StringQuotePhase::Prefix if is_quote_prefix(scalar) => StringQuotePhase::Prefix,
+            StringQuotePhase::Prefix if is_quote(scalar) => StringQuotePhase::Body {
+                has_unit_after_open: false,
+                last_unit_is_quote: false,
+            },
+            StringQuotePhase::Body { .. } => StringQuotePhase::Body {
+                has_unit_after_open: true,
+                last_unit_is_quote: is_quote(scalar),
+            },
+            _ => StringQuotePhase::Failed,
+        };
+    }
+
+    fn push_invalid(&mut self) {
+        // Unicode-on `.` cannot consume malformed bytes. Because this shape is
+        // end anchored, any malformed byte makes the whole line ineligible.
+        self.phase = StringQuotePhase::Failed;
+    }
+
+    const fn matched(self) -> bool {
+        matches!(
+            self.phase,
+            StringQuotePhase::Body {
+                has_unit_after_open: true,
+                last_unit_is_quote: true
+            }
+        )
+    }
+}
+
+const KEYWORD_MAX_BYTES: usize = 8;
+
+// Big-endian packed ASCII, sorted numerically. The explicit table keeps lookup
+// construction-free and makes the six-comparison ceiling independent of the
+// standard library's binary-search implementation.
+const PYTHON_KEYWORD_KEYS: [u64; 35] = [
+    0x6173,                    // as
+    0x6966,                    // if
+    0x696e,                    // in
+    0x6973,                    // is
+    0x6f72,                    // or
+    0x0061_6e64,               // and
+    0x64_65_66,                // def
+    0x64_65_6c,                // del
+    0x66_6f_72,                // for
+    0x6e_6f_74,                // not
+    0x74_72_79,                // try
+    0x4e_6f_6e_65,             // None
+    0x54_72_75_65,             // True
+    0x65_6c_69_66,             // elif
+    0x65_6c_73_65,             // else
+    0x66_72_6f_6d,             // from
+    0x70_61_73_73,             // pass
+    0x77_69_74_68,             // with
+    0x46_61_6c_73_65,          // False
+    0x61_73_79_6e_63,          // async
+    0x61_77_61_69_74,          // await
+    0x62_72_65_61_6b,          // break
+    0x63_6c_61_73_73,          // class
+    0x72_61_69_73_65,          // raise
+    0x77_68_69_6c_65,          // while
+    0x0079_6965_6c64,          // yield
+    0x61_73_73_65_72_74,       // assert
+    0x65_78_63_65_70_74,       // except
+    0x67_6c_6f_62_61_6c,       // global
+    0x69_6d_70_6f_72_74,       // import
+    0x6c_61_6d_62_64_61,       // lambda
+    0x72_65_74_75_72_6e,       // return
+    0x66_69_6e_61_6c_6c_79,    // finally
+    0x63_6f_6e_74_69_6e_75_65, // continue
+    0x6e_6f_6e_6c_6f_63_61_6c, // nonlocal
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KeywordState {
+    packed: u64,
+    len: usize,
+    in_word: bool,
+    viable: bool,
+}
+
+impl Default for KeywordState {
+    fn default() -> Self {
+        Self {
+            packed: 0,
+            len: 0,
+            in_word: false,
+            viable: true,
+        }
+    }
+}
+
+impl KeywordState {
+    fn push_scalar(&mut self, scalar: char) -> (bool, usize) {
+        if is_unicode_word(scalar) {
+            self.push_word_scalar(scalar);
+            (false, 0)
+        } else {
+            self.finish_word()
+        }
+    }
+
+    fn push_invalid(&mut self) -> (bool, usize) {
+        self.finish_word()
+    }
+
+    fn push_word_scalar(&mut self, scalar: char) {
+        if !self.in_word {
+            self.in_word = true;
+            self.len = 0;
+            self.packed = 0;
+            self.viable = true;
+        }
+        if !self.viable {
+            return;
+        }
+        if !scalar.is_ascii() || self.len == KEYWORD_MAX_BYTES {
+            self.viable = false;
+            return;
+        }
+        let byte = u8::try_from(u32::from(scalar))
+            .expect("an authenticated ASCII scalar always fits in one byte");
+        self.packed = self.packed.wrapping_shl(8) | u64::from(byte);
+        self.len = self
+            .len
+            .checked_add(1)
+            .expect("the fixed keyword buffer length cannot overflow");
+    }
+
+    fn finish_word(&mut self) -> (bool, usize) {
+        let (matched, comparisons) = if self.in_word && self.viable && self.len >= 2 {
+            keyword_lookup(self.packed)
+        } else {
+            (false, 0)
+        };
+        *self = Self::default();
+        (matched, comparisons)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineCaptureMachine {
+    SpaceOperator(SpaceOperatorState),
+    Shebang(ShebangState),
+    StringQuote(StringQuoteState),
+    Keywords(KeywordState),
+}
+
+impl LineCaptureMachine {
+    const fn new(configuration: LineCaptureConfiguration) -> Self {
+        match configuration {
+            LineCaptureConfiguration::SpaceAroundOperator => {
+                Self::SpaceOperator(SpaceOperatorState {
+                    phase: SpaceOperatorPhase::Search,
+                })
+            }
+            LineCaptureConfiguration::AnchoredWhitespaceLiteralTail => {
+                Self::Shebang(ShebangState {
+                    phase: ShebangPhase::LeadingWhitespace,
+                })
+            }
+            LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail => {
+                Self::StringQuote(StringQuoteState {
+                    phase: StringQuotePhase::Prefix,
+                })
+            }
+            LineCaptureConfiguration::UnicodeWordKeywordSet => Self::Keywords(KeywordState {
+                packed: 0,
+                len: 0,
+                in_word: false,
+                viable: true,
+            }),
+        }
+    }
+
+    fn push_scalar(&mut self, scalar: char) -> (bool, usize) {
+        match self {
+            Self::SpaceOperator(state) => (state.push_scalar(scalar), 0),
+            Self::Shebang(state) => {
+                state.push_scalar(scalar);
+                (false, 0)
+            }
+            Self::StringQuote(state) => {
+                state.push_scalar(scalar);
+                (false, 0)
+            }
+            Self::Keywords(state) => state.push_scalar(scalar),
+        }
+    }
+
+    fn push_invalid(&mut self) -> (bool, usize) {
+        match self {
+            Self::SpaceOperator(state) => (state.push_invalid(), 0),
+            Self::Shebang(state) => {
+                state.push_invalid();
+                (false, 0)
+            }
+            Self::StringQuote(state) => {
+                state.push_invalid();
+                (false, 0)
+            }
+            Self::Keywords(state) => state.push_invalid(),
+        }
+    }
+
+    fn finish_line(&mut self, configuration: LineCaptureConfiguration) -> (bool, usize) {
+        let result = match self {
+            Self::SpaceOperator(state) => (state.matched(), 0),
+            Self::Shebang(state) => (state.matched(), 0),
+            Self::StringQuote(state) => (state.matched(), 0),
+            Self::Keywords(state) => state.finish_word(),
+        };
+        *self = Self::new(configuration);
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodedUnit {
     Scalar(char),
@@ -699,20 +1159,45 @@ fn emit_invalid(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LineScanner {
-    state: SpaceOperatorState,
+    operation: LineCaptureOperationIdentity,
+    state: LineCaptureMachine,
     lines: usize,
     matches: usize,
     pending_cr: bool,
     ended_with_lf: bool,
+    work: usize,
 }
 
 impl LineScanner {
+    const fn new(operation: LineCaptureOperationIdentity) -> Self {
+        Self {
+            operation,
+            state: LineCaptureMachine::new(operation.configuration),
+            lines: 0,
+            matches: 0,
+            pending_cr: false,
+            ended_with_lf: false,
+            work: 0,
+        }
+    }
+
+    fn charge_work(&mut self, amount: usize) -> Result<(), LineCaptureRunError> {
+        self.work =
+            self.work
+                .checked_add(amount)
+                .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                    LineCaptureResource::ExecutionWork,
+                ))?;
+        Ok(())
+    }
+
     fn push(&mut self, unit: DecodedUnit) -> Result<(), LineCaptureRunError> {
+        self.charge_work(self.operation.unit_work)?;
         if self.pending_cr {
             if unit == DecodedUnit::Scalar('\n') {
-                finish_line(&mut self.state, &mut self.lines, &mut self.matches)?;
+                self.finish_line()?;
                 self.pending_cr = false;
                 self.ended_with_lf = true;
                 return Ok(());
@@ -725,7 +1210,7 @@ impl LineScanner {
         match unit {
             DecodedUnit::Scalar('\r') => self.pending_cr = true,
             DecodedUnit::Scalar('\n') => {
-                finish_line(&mut self.state, &mut self.lines, &mut self.matches)?;
+                self.finish_line()?;
                 self.ended_with_lf = true;
             }
             content => self.push_content(content)?,
@@ -734,10 +1219,11 @@ impl LineScanner {
     }
 
     fn push_content(&mut self, unit: DecodedUnit) -> Result<(), LineCaptureRunError> {
-        let completed = match unit {
+        let (completed, extra_work) = match unit {
             DecodedUnit::Scalar(scalar) => self.state.push_scalar(scalar),
             DecodedUnit::Invalid => self.state.push_invalid(),
         };
+        self.charge_work(extra_work)?;
         if completed {
             add_match(&mut self.matches)?;
         }
@@ -750,7 +1236,23 @@ impl LineScanner {
             self.pending_cr = false;
         }
         if input_was_nonempty && !self.ended_with_lf {
-            finish_line(&mut self.state, &mut self.lines, &mut self.matches)?;
+            self.finish_line()?;
+        }
+        Ok(())
+    }
+
+    fn finish_line(&mut self) -> Result<(), LineCaptureRunError> {
+        self.charge_work(1)?;
+        self.lines = self
+            .lines
+            .checked_add(1)
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::ReducerEvents,
+            ))?;
+        let (matched, extra_work) = self.state.finish_line(self.operation.configuration);
+        self.charge_work(extra_work)?;
+        if matched {
+            add_match(&mut self.matches)?;
         }
         Ok(())
     }
@@ -761,11 +1263,15 @@ struct LineScanReport {
     lines: usize,
     matches: usize,
     input_loads: usize,
+    work: usize,
 }
 
-fn scan_space_around_operator(haystack: &[u8]) -> Result<LineScanReport, LineCaptureRunError> {
+fn scan_line_capture(
+    operation: LineCaptureOperationIdentity,
+    haystack: &[u8],
+) -> Result<LineScanReport, LineCaptureRunError> {
     let mut decoder = Utf8StreamDecoder::default();
-    let mut scanner = LineScanner::default();
+    let mut scanner = LineScanner::new(operation);
     let mut input_loads = 0_usize;
     for &byte in haystack {
         input_loads = input_loads
@@ -773,6 +1279,7 @@ fn scan_space_around_operator(haystack: &[u8]) -> Result<LineScanReport, LineCap
             .ok_or(LineCaptureRunError::ArithmeticOverflow(
                 LineCaptureResource::SequentialBytes,
             ))?;
+        scanner.charge_work(1)?;
         decoder.push(byte, &mut |unit| scanner.push(unit))?;
     }
     decoder.finish(&mut |unit| scanner.push(unit))?;
@@ -781,24 +1288,8 @@ fn scan_space_around_operator(haystack: &[u8]) -> Result<LineScanReport, LineCap
         lines: scanner.lines,
         matches: scanner.matches,
         input_loads,
+        work: scanner.work,
     })
-}
-
-fn finish_line(
-    state: &mut SpaceOperatorState,
-    lines: &mut usize,
-    matches: &mut usize,
-) -> Result<(), LineCaptureRunError> {
-    *lines = lines
-        .checked_add(1)
-        .ok_or(LineCaptureRunError::ArithmeticOverflow(
-            LineCaptureResource::ReducerEvents,
-        ))?;
-    if state.matched() {
-        add_match(matches)?;
-    }
-    *state = SpaceOperatorState::default();
-    Ok(())
 }
 
 fn add_match(matches: &mut usize) -> Result<(), LineCaptureRunError> {
@@ -831,6 +1322,52 @@ fn is_unicode_whitespace(scalar: char) -> bool {
             | 0x205F
             | 0x3000
     )
+}
+
+fn is_quote_prefix(scalar: char) -> bool {
+    matches!(scalar, 'B' | 'R' | 'U' | 'b' | 'r' | 'u')
+}
+
+fn is_quote(scalar: char) -> bool {
+    matches!(scalar, '\'' | '"')
+}
+
+fn is_unicode_word(scalar: char) -> bool {
+    if scalar.is_ascii() {
+        return scalar == '_' || scalar.is_ascii_alphanumeric();
+    }
+    regex_syntax::try_is_word_character(scalar)
+        .expect("fre enables regex-syntax's Unicode Perl tables")
+}
+
+fn keyword_lookup(key: u64) -> (bool, usize) {
+    let mut lower = 0_usize;
+    let mut upper = PYTHON_KEYWORD_KEYS.len();
+    let mut comparisons = 0_usize;
+    for _ in 0..6 {
+        if lower == upper {
+            return (false, comparisons);
+        }
+        comparisons = comparisons
+            .checked_add(1)
+            .expect("keyword lookup performs at most six comparisons");
+        let span = upper
+            .checked_sub(lower)
+            .expect("keyword lookup maintains lower <= upper");
+        let middle = lower
+            .checked_add(span / 2)
+            .expect("keyword lookup midpoint remains within the fixed table");
+        match PYTHON_KEYWORD_KEYS[middle].cmp(&key) {
+            core::cmp::Ordering::Less => {
+                lower = middle
+                    .checked_add(1)
+                    .expect("keyword lookup midpoint is below usize::MAX");
+            }
+            core::cmp::Ordering::Greater => upper = middle,
+            core::cmp::Ordering::Equal => return (true, comparisons),
+        }
+    }
+    (false, comparisons)
 }
 
 fn enforce(
