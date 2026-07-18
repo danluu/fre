@@ -566,22 +566,7 @@ impl UrlAggregatePlan {
                 if let Some(tld_end) = self.longest_tld(haystack, position + 1, end, meter)? {
                     meter.accounting.tld_candidates =
                         reduce_add(meter.accounting.tld_candidates, 1, "TLD candidates")?;
-                    if let Some(prefix_start) =
-                        domain_prefix_start(haystack, start, position, meter)?
-                    {
-                        let record = &mut records[prefix_start - start];
-                        meter.work(2)?; // record lookup and max publication
-                        record.domain_end = if record.domain_end == NONE {
-                            tld_end
-                        } else {
-                            record.domain_end.max(tld_end)
-                        };
-                        meter.accounting.candidate_insertions = reduce_add(
-                            meter.accounting.candidate_insertions,
-                            1,
-                            "candidate insertions",
-                        )?;
-                    }
+                    domain_candidates(haystack, start, position, tld_end, records, meter)?;
                 }
             }
             if matches!(byte.to_ascii_lowercase(), b'f' | b'h') {
@@ -677,32 +662,127 @@ impl UrlAggregatePlan {
     }
 }
 
-fn domain_prefix_start(
+fn domain_candidates(
     source: &[u8],
     segment: usize,
     dot: usize,
+    tld_end: usize,
+    records: &mut [CandidateRecord],
     meter: &mut Meter,
-) -> Result<Option<usize>, ReduceError> {
-    let regular = regular_suffix(source, segment, dot, false, meter)?;
-    let xn = xn_suffix(source, segment, dot, meter)?;
-    let Some(mut start) = min_option(regular, xn) else {
-        return Ok(None);
-    };
-    while start > segment {
+) -> Result<(), ReduceError> {
+    let (base_starts, base_count) = regular_suffixes(source, segment, dot, false, meter)?;
+    let mut extension_start = None;
+    for &start in &base_starts[..base_count] {
+        publish_domain_candidate(source, segment, start, tld_end, records, meter)?;
+    }
+    if base_count > 0 {
+        let earliest = base_starts[base_count - 1];
+        if earliest > segment && source[earliest - 1] == b'.' {
+            extension_start = Some(earliest);
+        }
+    }
+
+    let mut lower = dot;
+    while lower > segment {
         meter.random(1)?;
         meter.accounting.prefix_steps =
             reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-        if source[start - 1] != b'.' {
+        if !is_xn_body(source[lower - 1]) {
             break;
         }
-        let Some(previous) = regular_suffix(source, segment, start - 1, true, meter)? else {
-            break;
-        };
-        start = previous;
+        lower -= 1;
+    }
+    let mut candidate = lower;
+    while candidate + 5 <= dot {
+        meter.work(1)?;
+        if folded_equal(source, candidate, b"xn--", meter)? {
+            publish_domain_candidate(source, segment, candidate, tld_end, records, meter)?;
+            if candidate > segment && source[candidate - 1] == b'.' {
+                extension_start = Some(candidate);
+            }
+        }
+        candidate += 1;
     }
 
+    // Once a complete base label begins immediately after a dot, every valid
+    // suffix of the preceding subdomain label is a distinct restart candidate.
+    // Only a candidate covering that complete preceding label can extend again.
+    let mut current = extension_start;
+    while let Some(start) = current {
+        let previous_end = start - 1;
+        let (sub_starts, sub_count) = regular_suffixes(source, segment, previous_end, true, meter)?;
+        for &sub_start in &sub_starts[..sub_count] {
+            publish_domain_candidate(source, segment, sub_start, tld_end, records, meter)?;
+        }
+        current = if sub_count > 0 {
+            let earliest = sub_starts[sub_count - 1];
+            (earliest > segment && source[earliest - 1] == b'.').then_some(earliest)
+        } else {
+            None
+        };
+    }
+    Ok(())
+}
+
+fn regular_suffixes(
+    source: &[u8],
+    segment: usize,
+    end: usize,
+    subdomain: bool,
+    meter: &mut Meter,
+) -> Result<([usize; LABEL_REPETITIONS + 1], usize), ReduceError> {
+    let mut starts = [NONE; LABEL_REPETITIONS + 1];
+    if end <= segment {
+        return Ok((starts, 0));
+    }
+    meter.random(1)?;
+    if !is_alnum(source[end - 1]) {
+        return Ok((starts, 0));
+    }
+    let mut position = end - 1;
+    let mut count = 1_usize;
+    starts[0] = position;
+    for _ in 0..LABEL_REPETITIONS {
+        if position >= segment + 2 {
+            meter.random(2)?;
+            meter.accounting.prefix_steps =
+                reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
+            if source[position - 1] == b'-' && is_label_atom(source[position - 2], subdomain) {
+                position -= 2;
+                starts[count] = position;
+                count += 1;
+                continue;
+            }
+        }
+        if position > segment {
+            meter.random(1)?;
+            meter.accounting.prefix_steps =
+                reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
+            if is_label_atom(source[position - 1], subdomain) {
+                position -= 1;
+                starts[count] = position;
+                count += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    Ok((starts, count))
+}
+
+fn publish_domain_candidate(
+    source: &[u8],
+    segment: usize,
+    start: usize,
+    tld_end: usize,
+    records: &mut [CandidateRecord],
+    meter: &mut Meter,
+) -> Result<(), ReduceError> {
+    publish_domain_record(segment, start, tld_end, records, meter)?;
+
     // Optional auth has an unambiguous reverse parse because ':' and '@' are
-    // excluded from both nonempty auth fields.
+    // excluded from both nonempty auth fields. The unextended start remains a
+    // candidate because matching is unanchored.
     if start > segment {
         meter.random(1)?;
         if source[start - 1] == b'@' {
@@ -728,14 +808,24 @@ fn domain_prefix_start(
                         break;
                     }
                     user -= 1;
-                }
-                if user < colon {
-                    start = user;
+                    publish_domain_record(segment, user, tld_end, records, meter)?;
+                    publish_scheme_extension(source, segment, user, tld_end, records, meter)?;
                 }
             }
         }
     }
+    publish_scheme_extension(source, segment, start, tld_end, records, meter)?;
+    Ok(())
+}
 
+fn publish_scheme_extension(
+    source: &[u8],
+    segment: usize,
+    start: usize,
+    tld_end: usize,
+    records: &mut [CandidateRecord],
+    meter: &mut Meter,
+) -> Result<(), ReduceError> {
     for scheme in [
         b"https://".as_slice(),
         b"http://".as_slice(),
@@ -745,77 +835,42 @@ fn domain_prefix_start(
         if start - segment >= scheme.len()
             && folded_equal(source, start - scheme.len(), scheme, meter)?
         {
-            start -= scheme.len();
+            publish_domain_record(segment, start - scheme.len(), tld_end, records, meter)?;
             break;
         }
     }
-    Ok(Some(start))
+    Ok(())
 }
 
-fn regular_suffix(
-    source: &[u8],
+fn publish_domain_record(
     segment: usize,
-    end: usize,
-    subdomain: bool,
+    start: usize,
+    tld_end: usize,
+    records: &mut [CandidateRecord],
     meter: &mut Meter,
-) -> Result<Option<usize>, ReduceError> {
-    if end <= segment {
-        return Ok(None);
-    }
-    meter.random(1)?;
-    if !is_alnum(source[end - 1]) {
-        return Ok(None);
-    }
-    let mut position = end - 1;
-    for _ in 0..LABEL_REPETITIONS {
-        if position >= segment + 2 {
-            meter.random(2)?;
-            meter.accounting.prefix_steps =
-                reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-            if source[position - 1] == b'-' && is_label_atom(source[position - 2], subdomain) {
-                position -= 2;
-                continue;
-            }
-        }
-        if position > segment {
-            meter.random(1)?;
-            meter.accounting.prefix_steps =
-                reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-            if is_label_atom(source[position - 1], subdomain) {
-                position -= 1;
-                continue;
-            }
-        }
-        break;
-    }
-    Ok(Some(position))
-}
-
-fn xn_suffix(
-    source: &[u8],
-    segment: usize,
-    end: usize,
-    meter: &mut Meter,
-) -> Result<Option<usize>, ReduceError> {
-    let mut lower = end;
-    while lower > segment {
-        meter.random(1)?;
-        meter.accounting.prefix_steps =
-            reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-        if !is_xn_body(source[lower - 1]) {
-            break;
-        }
-        lower -= 1;
-    }
-    let mut candidate = lower;
-    while candidate + 5 <= end {
-        meter.work(1)?;
-        if folded_equal(source, candidate, b"xn--", meter)? {
-            return Ok(Some(candidate));
-        }
-        candidate += 1;
-    }
-    Ok(None)
+) -> Result<(), ReduceError> {
+    let relative = start
+        .checked_sub(segment)
+        .ok_or(ReduceError::Invariant("domain candidate precedes segment"))?;
+    let record = records.get_mut(relative).ok_or(ReduceError::Invariant(
+        "domain candidate exceeds segment workspace",
+    ))?;
+    meter.work(2)?;
+    record.domain_end = if record.domain_end == NONE {
+        tld_end
+    } else {
+        record.domain_end.max(tld_end)
+    };
+    meter.accounting.candidate_insertions = reduce_add(
+        meter.accounting.candidate_insertions,
+        1,
+        "candidate insertions",
+    )?;
+    reduce_enforce(
+        "candidates",
+        meter.accounting.candidate_insertions,
+        meter.limits.max_candidates,
+    )
 }
 
 fn ipv4_end(
@@ -1023,14 +1078,6 @@ const fn is_path(byte: u8) -> bool {
         )
 }
 
-const fn min_option(left: Option<usize>, right: Option<usize>) -> Option<usize> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left < right { left } else { right }),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
 #[derive(Debug)]
 struct BuildMeter {
     limit: usize,
@@ -1168,6 +1215,9 @@ mod tests {
             b"xhttps://a.com",
             b"http://999.999.999.999/a.com",
             b"http://1.2.3.4.com",
+            b"http://1.2.3.4x.com",
+            b"https://1.2.3.4x.com",
+            b"ftp://1.2.3.4x.com",
             b"a.com,b.org",
             b"a.com/b.org?x",
             b"a.comx.com",
@@ -1178,6 +1228,10 @@ mod tests {
             b"_a.b.com",
             b"a-.b.com",
             b"xxn--a.com xn--a.com",
+            b"xn--a.coma.com",
+            b"u:p@a.comu:p@a.com",
+            b"x.comdef.a.com",
+            b"a.com!def.a.com",
             b"A.CoM\tb.ORG\nc.com\x0bd.com\x0ce.com\rf.com",
         ] {
             check(&tlds, haystack);
@@ -1194,7 +1248,10 @@ mod tests {
         let limits = ReduceLimits {
             max_input_bytes: haystack.len(),
             max_boundaries: haystack.len() + 1,
-            max_candidates: exact.accounting.candidate_visits,
+            max_candidates: exact
+                .accounting
+                .candidate_insertions
+                .max(exact.accounting.candidate_visits),
             max_matches: exact.matches,
             max_span_sum: exact.value,
             max_sequential_bytes: exact.accounting.sequential_bytes,
