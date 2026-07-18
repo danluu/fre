@@ -148,72 +148,44 @@ impl CompiledRegex {
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
         validate_hir(hir, profile, capture_policy, &mut budget)?;
-        let required_suffixes = required_suffixes(hir, &mut budget)?;
-        budget.acquire_construction_bytes(required_suffixes.retained_bytes()?)?;
-        enforce(
-            budget.current_construction_bytes,
-            limits.max_program_bytes,
-            Resource::ProgramBytes,
-        )?;
-        budget.accounting.required_suffixes = required_suffixes.ends.len();
-        budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
-        let required_internal_anchor = if profile.unicode {
-            None
-        } else {
-            let remaining_work = limits.max_work.checked_sub(budget.accounting.work).ok_or(
-                Error::ArithmeticOverflow {
-                    resource: Resource::CompileWork,
-                },
-            )?;
-            let remaining_program_bytes = limits
-                .max_program_bytes
-                .checked_sub(budget.current_construction_bytes)
-                .ok_or(Error::ArithmeticOverflow {
-                    resource: Resource::ProgramBytes,
-                })?;
-            let inspection = required_internal_anchor::inspect(
-                hir,
-                remaining_work,
-                limits.max_literal_bytes,
-                remaining_program_bytes,
-            )?;
-            retain_required_internal_anchor(inspection, &mut budget)?
-        };
+        let (required_suffixes, required_internal_anchor, retained_program_bytes) =
+            build_retained_components(hir, profile, limits, &mut budget)?;
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
             capture_policy,
+            retained_program_bytes,
             &mut budget,
         );
         let accept = builder.push(Inst::Match)?;
         let entry = builder.compile_node(hir, accept, 1)?;
+        let scalar_range_bytes = builder.scalar_range_bytes;
         let insts = builder.finish()?;
         enforce(
             insts.len(),
             limits.max_program_states,
             Resource::ProgramStates,
         )?;
-        let certificate = certify_program(&insts, &mut budget)?;
+        let certificate = certify_program(
+            &insts,
+            insts.capacity(),
+            scalar_range_bytes,
+            retained_program_bytes,
+            &mut budget,
+        )?;
         // `program_bytes` visits every instruction to include each deeply
         // owned scalar-range box in the exact retained-byte total.
         budget.charge(insts.len())?;
-        let mut program_bytes = add(
+        let program_bytes = add(
             program_bytes(
                 &insts,
                 insts.capacity(),
                 certificate.epsilon_order.capacity(),
                 certificate.split_rank.capacity(),
             )?,
-            required_suffixes.retained_bytes()?,
+            retained_program_bytes,
             Resource::ProgramBytes,
         )?;
-        if let Some(plan) = &required_internal_anchor {
-            program_bytes = add(
-                program_bytes,
-                plan.build_accounting().persistent_bytes,
-                Resource::ProgramBytes,
-            )?;
-        }
         enforce(
             program_bytes,
             limits.max_program_bytes,
@@ -268,6 +240,71 @@ impl CompiledRegex {
     pub fn state_count(&self) -> usize {
         self.program.insts.len()
     }
+}
+
+fn build_retained_components(
+    hir: &Hir,
+    profile: RustByteProfile,
+    limits: CompileLimits,
+    budget: &mut CompileBudget,
+) -> Result<
+    (
+        RequiredSuffixes,
+        Option<fre_kernels::RequiredInternalAnchorPlan>,
+        usize,
+    ),
+    Error,
+> {
+    let required_suffixes = required_suffixes(hir, budget)?;
+    budget.accounting.required_suffixes = required_suffixes.ends.len();
+    budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
+    let required_suffix_program_bytes = required_suffixes.retained_bytes()?;
+    budget.acquire_construction_bytes(required_suffix_program_bytes)?;
+    enforce(
+        budget.current_construction_bytes,
+        limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    let required_internal_anchor = if profile.unicode {
+        None
+    } else {
+        let remaining_work = limits.max_work.checked_sub(budget.accounting.work).ok_or(
+            Error::ArithmeticOverflow {
+                resource: Resource::CompileWork,
+            },
+        )?;
+        let remaining_program_bytes = limits
+            .max_program_bytes
+            .checked_sub(budget.current_construction_bytes)
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::ProgramBytes,
+            })?;
+        let inspection = required_internal_anchor::inspect(
+            hir,
+            remaining_work,
+            limits.max_literal_bytes,
+            remaining_program_bytes,
+        )?;
+        retain_required_internal_anchor(inspection, budget)?
+    };
+    let required_internal_anchor_program_bytes = required_internal_anchor
+        .as_ref()
+        .map_or(0, |plan| plan.build_accounting().persistent_bytes);
+    let retained_program_bytes = add(
+        required_suffix_program_bytes,
+        required_internal_anchor_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        retained_program_bytes,
+        limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    Ok((
+        required_suffixes,
+        required_internal_anchor,
+        retained_program_bytes,
+    ))
 }
 
 fn retain_required_internal_anchor(
@@ -528,6 +565,20 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
     if suffix_count == 0 {
         return Ok(RequiredSuffixes::default());
     }
+    let requested_program_bytes = add(
+        suffix_bytes,
+        mul(
+            suffix_count,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?,
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        requested_program_bytes,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
     // Preflight every retained endpoint and byte before allocation or copy.
     budget.charge(add(suffix_count, suffix_bytes, Resource::CompileWork)?)?;
     let mut bytes = Vec::new();
@@ -538,6 +589,20 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
     if ends.try_reserve_exact(suffix_count).is_err() {
         return Ok(RequiredSuffixes::default());
     }
+    let retained_program_bytes = add(
+        bytes.capacity(),
+        mul(
+            ends.capacity(),
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?,
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        retained_program_bytes,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
     match analysis {
         SuffixAnalysis::Literals(literals) => {
             for literal in literals.iter() {
@@ -849,6 +914,7 @@ fn validate_repetition(repetition: &Repetition, budget: &mut CompileBudget) -> R
 struct Builder<'a> {
     slots: Vec<Inst>,
     scalar_range_bytes: usize,
+    retained_program_bytes: usize,
     state_limit: usize,
     profile: RustByteProfile,
     capture_policy: CapturePolicy,
@@ -860,11 +926,13 @@ impl<'a> Builder<'a> {
         state_limit: usize,
         profile: RustByteProfile,
         capture_policy: CapturePolicy,
+        retained_program_bytes: usize,
         budget: &'a mut CompileBudget,
     ) -> Self {
         Self {
             slots: Vec::new(),
             scalar_range_bytes: 0,
+            retained_program_bytes,
             state_limit,
             profile,
             capture_policy,
@@ -885,7 +953,11 @@ impl<'a> Builder<'a> {
             Resource::ProgramBytes,
         )?;
         enforce(
-            add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
+            add(
+                add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
+                self.retained_program_bytes,
+                Resource::ProgramBytes,
+            )?,
             self.budget.limits.max_program_bytes,
             Resource::ProgramBytes,
         )
@@ -1188,6 +1260,7 @@ impl<'a> Builder<'a> {
                 self.state_limit,
                 self.profile,
                 self.capture_policy,
+                self.retained_program_bytes,
                 self.budget,
             );
             let accept = fragment_builder.push(Inst::Match)?;
@@ -1232,6 +1305,7 @@ impl<'a> Builder<'a> {
                 self.state_limit,
                 self.profile,
                 self.capture_policy,
+                self.retained_program_bytes,
                 self.budget,
             );
             let accept = fragment_builder.push(Inst::Match)?;
@@ -1369,6 +1443,24 @@ struct EpsilonParentIndex {
     scratch_bytes: usize,
 }
 
+fn certify_program(
+    insts: &[Inst],
+    state_capacity: usize,
+    scalar_range_bytes: usize,
+    retained_program_bytes: usize,
+    budget: &mut CompileBudget,
+) -> Result<ProgramCertificate, Error> {
+    let states = insts.len();
+    preflight_certification_program_bytes(
+        state_capacity,
+        states,
+        scalar_range_bytes,
+        retained_program_bytes,
+        budget.limits.max_program_bytes,
+    )?;
+    certify_program_admitted(insts, budget)
+}
+
 fn build_epsilon_parent_index(
     insts: &[Inst],
     budget: &mut CompileBudget,
@@ -1434,7 +1526,7 @@ fn build_epsilon_parent_index(
     })
 }
 
-fn certify_program(
+fn certify_program_admitted(
     insts: &[Inst],
     budget: &mut CompileBudget,
 ) -> Result<ProgramCertificate, Error> {
@@ -1520,6 +1612,37 @@ fn certify_program(
         has_scalar_transition,
         max_scalar_search_checks,
     })
+}
+
+fn preflight_certification_program_bytes(
+    state_capacity: usize,
+    states: usize,
+    scalar_range_bytes: usize,
+    retained_program_bytes: usize,
+    limit: usize,
+) -> Result<usize, Error> {
+    let state_bytes = mul(
+        state_capacity,
+        core::mem::size_of::<Inst>(),
+        Resource::ProgramBytes,
+    )?;
+    let certificate_items = mul(2, states, Resource::ProgramBytes)?;
+    let certificate_bytes = mul(
+        certificate_items,
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
+    let required = add(
+        add(state_bytes, scalar_range_bytes, Resource::ProgramBytes)?,
+        add(
+            certificate_bytes,
+            retained_program_bytes,
+            Resource::ProgramBytes,
+        )?,
+        Resource::ProgramBytes,
+    )?;
+    enforce(required, limit, Resource::ProgramBytes)?;
+    Ok(required)
 }
 
 fn execution_transitions(
@@ -1899,6 +2022,7 @@ mod tests {
                 CompileLimits::default().max_program_states,
                 RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
                 CapturePolicy::Reject,
+                0,
                 &mut exact,
             );
             builder.compile_unicode_class(class, 0).unwrap();
@@ -1914,6 +2038,7 @@ mod tests {
             CompileLimits::default().max_program_states,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CapturePolicy::Reject,
+            0,
             &mut one_below,
         )
         .compile_unicode_class(class, 0)
@@ -1942,6 +2067,7 @@ mod tests {
             CompileLimits::default().max_program_states,
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CapturePolicy::Reject,
+            0,
             &mut ascii_budget,
         )
         .compile_unicode_class(ascii, 0)
@@ -1982,6 +2108,35 @@ mod tests {
         assert_eq!(512, suffixes.bytes.len());
         assert_eq!(ADVERSARIAL_RETAINED_WORK, exact.accounting.work);
 
+        let retained_bytes = suffixes.retained_bytes().unwrap();
+        assert_eq!(retained_bytes, 512 + 8 * core::mem::size_of::<usize>());
+        let mut exact_bytes = CompileBudget::new(CompileLimits {
+            max_work: ADVERSARIAL_RETAINED_WORK,
+            max_program_bytes: retained_bytes,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            required_suffixes(&hir, &mut exact_bytes)
+                .unwrap()
+                .retained_bytes()
+                .unwrap(),
+            retained_bytes
+        );
+        let mut one_below_bytes = CompileBudget::new(CompileLimits {
+            max_work: ADVERSARIAL_RETAINED_WORK,
+            max_program_bytes: retained_bytes - 1,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            required_suffixes(&hir, &mut one_below_bytes).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: retained_bytes,
+                limit: retained_bytes - 1,
+            }
+        );
+        assert_eq!(one_below_bytes.accounting.work, ADVERSARIAL_ANALYSIS_WORK);
+
         let mut one_below = suffix_budget(ADVERSARIAL_RETAINED_ONE_BELOW);
         assert_eq!(
             Error::ResourceLimit {
@@ -1990,6 +2145,128 @@ mod tests {
                 limit: ADVERSARIAL_RETAINED_ONE_BELOW,
             },
             required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn retained_components_preflight_general_and_certificate_bytes_before_work() {
+        const SUFFIX_BYTES: usize = 17;
+        const ANCHOR_BYTES: usize = 23;
+        let retained_bytes = SUFFIX_BYTES + ANCHOR_BYTES;
+        let state_bytes = core::mem::size_of::<Inst>() + 2 * core::mem::size_of::<usize>();
+        let exact_limit = retained_bytes + state_bytes;
+
+        let mut exact = CompileBudget::new(CompileLimits {
+            max_program_bytes: exact_limit,
+            ..CompileLimits::default()
+        });
+        {
+            let mut builder = Builder::new(
+                CompileLimits::default().max_program_states,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::Reject,
+                retained_bytes,
+                &mut exact,
+            );
+            assert_eq!(builder.slots.capacity(), 0);
+            builder.push(Inst::Match).unwrap();
+        }
+        assert_eq!(exact.accounting.work, 1);
+        assert_eq!(exact.current_temporary_states, 1);
+
+        let mut one_below = CompileBudget::new(CompileLimits {
+            max_program_bytes: exact_limit - 1,
+            ..CompileLimits::default()
+        });
+        {
+            let mut builder = Builder::new(
+                CompileLimits::default().max_program_states,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::Reject,
+                retained_bytes,
+                &mut one_below,
+            );
+            assert_eq!(
+                builder.push(Inst::Match).unwrap_err(),
+                Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    required: exact_limit,
+                    limit: exact_limit - 1,
+                }
+            );
+            assert!(builder.slots.is_empty());
+            assert_eq!(builder.slots.capacity(), 0);
+        }
+        assert_eq!(one_below.accounting.work, 0);
+        assert_eq!(one_below.current_temporary_states, 0);
+
+        let insts = vec![Inst::Match];
+        let certificate_limit = preflight_certification_program_bytes(
+            insts.capacity(),
+            insts.len(),
+            0,
+            retained_bytes,
+            usize::MAX,
+        )
+        .unwrap();
+        let mut certificate_one_below = CompileBudget::new(CompileLimits {
+            max_program_bytes: certificate_limit - 1,
+            ..CompileLimits::default()
+        });
+        let Err(certificate_error) = certify_program(
+            &insts,
+            insts.capacity(),
+            0,
+            retained_bytes,
+            &mut certificate_one_below,
+        ) else {
+            panic!("one-below certificate admission must refuse");
+        };
+        assert_eq!(
+            certificate_error,
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: certificate_limit,
+                limit: certificate_limit - 1,
+            }
+        );
+        assert_eq!(certificate_one_below.accounting.work, 0);
+        assert_eq!(certificate_one_below.current_temporary_states, 0);
+    }
+
+    #[test]
+    fn required_anchor_combined_program_bytes_are_exact_and_one_below() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"[\w]+://[^/\s?#]+[^\s?#]+(?:\?[^\s#]*)?(?:#[^\s]*)?")
+            .unwrap();
+        let baseline = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = baseline.compile_accounting();
+        assert_eq!(accounting.required_internal_anchors, 1);
+        assert!(accounting.required_internal_anchor_persistent_bytes > 0);
+        let exact = CompileLimits {
+            max_program_bytes: accounting.program_bytes,
+            ..CompileLimits::default()
+        };
+        CompiledRegex::from_hir(&hir, RustByteProfile::PINNED_1_12_4, exact).unwrap();
+        let one_below = CompileLimits {
+            max_program_bytes: accounting.program_bytes - 1,
+            ..CompileLimits::default()
+        };
+        assert_eq!(
+            CompiledRegex::from_hir(&hir, RustByteProfile::PINNED_1_12_4, one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: accounting.program_bytes,
+                limit: accounting.program_bytes - 1,
+            }
         );
     }
 
