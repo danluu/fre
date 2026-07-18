@@ -5857,6 +5857,155 @@ fn required_internal_anchor_operation_limits(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContinuationStorageLimits {
+    random: usize,
+    scratch: usize,
+    log: usize,
+    sequential: usize,
+    peak: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CachedFrontierTransitionLayout {
+    symbol: u64,
+    next_state: u16,
+    result_state: u16,
+    occupied: bool,
+}
+
+const CACHED_FRONTIERS: usize = 4_096;
+const CACHED_TRANSITIONS: usize = 65_536;
+const CACHED_TRANSITION_SLOTS: usize = CACHED_TRANSITIONS * 2;
+
+fn cached_frontier_words(program_states: usize) -> Result<usize, ExecutionError> {
+    checked_aggregate_add(program_states, 63, "cached-frontier word numerator")?
+        .checked_div(64)
+        .ok_or_else(|| ExecutionError::fault("FRE cached-frontier word width is zero"))
+}
+
+fn cached_frontier_initialization_work(
+    program_states: usize,
+    boundaries: usize,
+) -> Result<usize, ExecutionError> {
+    let words = cached_frontier_words(program_states)?;
+    let state_words = checked_aggregate_mul(words, CACHED_FRONTIERS, "cached state words")?;
+    let candidate_words = checked_aggregate_mul(words, 2, "cached candidate words")?;
+    let state_and_hashes = checked_aggregate_add(
+        state_words,
+        CACHED_FRONTIERS,
+        "cached state and hash initialization",
+    )?;
+    let transitions_and_candidates = checked_aggregate_add(
+        CACHED_TRANSITION_SLOTS,
+        candidate_words,
+        "cached transition and candidate initialization",
+    )?;
+    checked_aggregate_add(
+        checked_aggregate_add(
+            boundaries,
+            state_and_hashes,
+            "cached boundary and state initialization",
+        )?,
+        checked_aggregate_add(transitions_and_candidates, 6, "cached fixed initialization")?,
+        "cached-frontier initialization work",
+    )
+}
+
+/// Mirror the continuation engine's prospective exact-layout theorem for the
+/// bounded Boolean-frontier executor. The capacities are fixed before source
+/// inspection: 4,096 frontier images, 65,536 installed transitions in a
+/// half-full open-addressed table, and one `u16` image ID or uncached sentinel
+/// per boundary. Full caches stop inserting and recompute from checkpoints.
+fn cached_frontier_limits(
+    program_states: usize,
+    boundaries: usize,
+    passes: usize,
+) -> Result<ContinuationStorageLimits, ExecutionError> {
+    let words = cached_frontier_words(program_states)?;
+    let state_words =
+        checked_aggregate_mul(words, CACHED_FRONTIERS, "cached-frontier state words")?;
+    let state_bytes = checked_aggregate_mul(
+        state_words,
+        core::mem::size_of::<u64>(),
+        "cached-frontier state bytes",
+    )?;
+    let hash_bytes = checked_aggregate_mul(
+        CACHED_FRONTIERS,
+        core::mem::size_of::<u64>(),
+        "cached-frontier hash bytes",
+    )?;
+    let transition_bytes = checked_aggregate_mul(
+        CACHED_TRANSITION_SLOTS,
+        core::mem::size_of::<CachedFrontierTransitionLayout>(),
+        "cached-frontier transition bytes",
+    )?;
+    let candidate_words = checked_aggregate_mul(words, 2, "cached-frontier replay row words")?;
+    let candidate_bytes = checked_aggregate_mul(
+        candidate_words,
+        core::mem::size_of::<u64>(),
+        "cached-frontier candidate/replay bytes",
+    )?;
+    let random_bytes = checked_aggregate_add(
+        checked_aggregate_add(state_bytes, hash_bytes, "cached-frontier state/hash bytes")?,
+        checked_aggregate_add(
+            transition_bytes,
+            candidate_bytes,
+            "cached-frontier transition/candidate bytes",
+        )?,
+        "cached-frontier random bytes",
+    )?;
+    let log_bytes = checked_aggregate_mul(
+        boundaries,
+        core::mem::size_of::<u16>(),
+        "cached-frontier log bytes",
+    )?;
+    let read_passes = checked_aggregate_mul(passes, 3, "cached-frontier read passes")?;
+    let sequential_bytes = checked_aggregate_mul(
+        log_bytes,
+        checked_aggregate_add(read_passes, 1, "cached-frontier total passes")?,
+        "cached-frontier sequential bytes",
+    )?;
+    let peak_bytes = checked_aggregate_add(log_bytes, random_bytes, "cached-frontier peak bytes")?;
+    Ok(ContinuationStorageLimits {
+        random: random_bytes,
+        scratch: random_bytes,
+        log: log_bytes,
+        sequential: sequential_bytes,
+        peak: peak_bytes,
+    })
+}
+
+fn composed_continuation_storage_limits(
+    program_states: usize,
+    boundaries: usize,
+    prevalidation: usize,
+    available_work: usize,
+    has_terminal_frontier: bool,
+    row: ContinuationStorageLimits,
+) -> Result<ContinuationStorageLimits, ExecutionError> {
+    if has_terminal_frontier {
+        return Ok(row);
+    }
+    if cached_frontier_initialization_work(program_states, boundaries)? > available_work {
+        return Ok(row);
+    }
+    let cached = cached_frontier_limits(program_states, boundaries, 1)?;
+    let cached_sequential = checked_aggregate_add(
+        cached.sequential,
+        prevalidation,
+        "cached-frontier sequential bytes including UTF-8 prevalidation",
+    )?;
+    Ok(ContinuationStorageLimits {
+        random: row.random.max(cached.random),
+        scratch: row.scratch.max(cached.scratch),
+        log: row.log.max(cached.log),
+        sequential: row.sequential.max(cached_sequential),
+        peak: row.peak.max(cached.peak),
+    })
+}
+
 fn continuation_operation_limits(
     haystack_len: usize,
     shape: ContinuationProgramShape,
@@ -5883,9 +6032,9 @@ fn continuation_operation_limits(
     let row_random_access = checked_aggregate_add(row_bytes, record_bytes, "random-access bytes")?;
     let log_upper = checked_aggregate_mul(record_bytes, boundaries, "row-log bytes")?;
     let row_sequential_upper = checked_aggregate_mul(log_upper, 2, "row sequential bytes")?;
-    let (random_access_upper, route_source) =
-        terminal_frontier_resource_upper(haystack_len, shape, row_random_access)?
-            .unwrap_or((row_random_access, 0));
+    let terminal_frontier =
+        terminal_frontier_resource_upper(haystack_len, shape, row_random_access)?;
+    let (random_access_upper, route_source) = terminal_frontier.unwrap_or((row_random_access, 0));
     let prevalidation = if shape.requires_utf8_validation {
         haystack_len
     } else {
@@ -5900,7 +6049,14 @@ fn continuation_operation_limits(
         prevalidation,
         "sequential bytes including UTF-8 prevalidation",
     )?;
-    let peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
+    let row_peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
+    let row_storage = ContinuationStorageLimits {
+        random: random_access_upper,
+        scratch: random_access_upper,
+        log: log_upper,
+        sequential: sequential_upper,
+        peak: row_peak_upper,
+    };
 
     // These are the same structural terms enforced by
     // fre-aggregate's Requirements::new. Scalar decoding is shared once per
@@ -5929,6 +6085,15 @@ fn continuation_operation_limits(
         prevalidation,
         "operation work including UTF-8 prevalidation",
     )?;
+    let available_work = work_upper.min(limits.fre_aggregate_operation_work);
+    let storage = composed_continuation_storage_limits(
+        program_states,
+        boundaries,
+        prevalidation,
+        available_work,
+        terminal_frontier.is_some(),
+        row_storage,
+    )?;
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
@@ -5939,16 +6104,18 @@ fn continuation_operation_limits(
     Ok(AggregateOperationLimits {
         max_boundaries: boundaries,
         max_table_cells: 0,
-        max_random_access_bytes: random_access_upper.min(limits.fre_aggregate_random_access_bytes),
-        max_scratch_bytes: random_access_upper.min(limits.fre_aggregate_scratch_bytes),
-        max_log_bytes: log_upper.min(limits.fre_aggregate_log_bytes),
-        max_sequential_bytes: sequential_upper.min(limits.fre_aggregate_sequential_bytes),
+        max_random_access_bytes: storage.random.min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: storage.scratch.min(limits.fre_aggregate_scratch_bytes),
+        max_log_bytes: storage.log.min(limits.fre_aggregate_log_bytes),
+        max_sequential_bytes: storage
+            .sequential
+            .min(limits.fre_aggregate_sequential_bytes),
         max_match_events: event_upper.min(reducer_event_limit),
         max_output_matches: boundaries.min(reducer_matches),
         max_output_bytes: 0,
         max_span_sum: haystack_len,
-        max_peak_bytes: peak_upper.min(limits.fre_aggregate_peak_bytes),
-        max_work: work_upper.min(limits.fre_aggregate_operation_work),
+        max_peak_bytes: storage.peak.min(limits.fre_aggregate_peak_bytes),
+        max_work: available_work,
     })
 }
 
@@ -14508,23 +14675,36 @@ mod tests {
         let derived =
             continuation_operation_limits(10, conservative_continuation_shape(5).unwrap(), &run)
                 .unwrap();
-        let row_words = 5usize.checked_mul(2).unwrap();
-        let row_bytes = row_words
-            .checked_mul(core::mem::size_of::<usize>())
-            .unwrap();
-        let random = row_bytes.checked_add(1).unwrap();
+        let cached_frontier = cached_frontier_limits(5, 11, 1).unwrap();
+        assert_eq!(cached_frontier.random, 2_162_704);
+        assert_eq!(cached_frontier.scratch, 2_162_704);
+        assert_eq!(cached_frontier.log, 22);
+        assert_eq!(cached_frontier.sequential, 88);
+        assert_eq!(cached_frontier.peak, 2_162_726);
+        assert!(cached_frontier_initialization_work(5, 11).unwrap() > derived.max_work);
         assert_eq!(derived.max_boundaries, 11);
         assert_eq!(derived.max_table_cells, 0);
-        assert_eq!(derived.max_random_access_bytes, random);
-        assert_eq!(derived.max_scratch_bytes, random);
+        assert_eq!(derived.max_random_access_bytes, 81);
+        assert_eq!(derived.max_scratch_bytes, 81);
         assert_eq!(derived.max_log_bytes, 11);
         assert_eq!(derived.max_sequential_bytes, 22);
         assert_eq!(derived.max_match_events, 22);
         assert_eq!(derived.max_output_matches, 11);
         assert_eq!(derived.max_output_bytes, 0);
         assert_eq!(derived.max_span_sum, 10);
-        assert_eq!(derived.max_peak_bytes, random.checked_add(11).unwrap());
+        assert_eq!(derived.max_peak_bytes, 92);
         assert_eq!(derived.max_work, 429);
+
+        let unicode = continuation_operation_limits(
+            10,
+            ContinuationProgramShape {
+                requires_utf8_validation: true,
+                ..conservative_continuation_shape(5).unwrap()
+            },
+            &run,
+        )
+        .unwrap();
+        assert_eq!(unicode.max_sequential_bytes, 32);
 
         let one_below = continuation_operation_limits(
             10,
@@ -14542,6 +14722,27 @@ mod tests {
         );
         assert_eq!(one_below.max_work, derived.max_work - 1);
 
+        let row_one_below = continuation_operation_limits(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            &RunLimits {
+                fre_aggregate_random_access_bytes: derived.max_random_access_bytes - 1,
+                fre_aggregate_scratch_bytes: derived.max_scratch_bytes - 1,
+                fre_aggregate_peak_bytes: derived.max_peak_bytes - 1,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            row_one_below.max_random_access_bytes,
+            derived.max_random_access_bytes - 1
+        );
+        assert_eq!(
+            row_one_below.max_scratch_bytes,
+            derived.max_scratch_bytes - 1
+        );
+        assert_eq!(row_one_below.max_peak_bytes, derived.max_peak_bytes - 1);
+
         run.fre_aggregate_random_access_bytes = 7;
         run.fre_aggregate_scratch_bytes = 6;
         run.fre_aggregate_log_bytes = 5;
@@ -14557,6 +14758,36 @@ mod tests {
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn cached_storage_is_derived_only_when_fixed_initialization_fits_work() {
+        let cache_shape = conservative_continuation_shape(65).unwrap();
+        let cache_derived =
+            continuation_operation_limits(1_000, cache_shape, &RunLimits::default()).unwrap();
+        let cache_storage = cached_frontier_limits(65, 1_001, 1).unwrap();
+        let cache_initialization = cached_frontier_initialization_work(65, 1_001).unwrap();
+        assert!(cache_initialization <= cache_derived.max_work);
+        assert_eq!(cache_derived.max_random_access_bytes, cache_storage.random);
+        assert_eq!(cache_derived.max_scratch_bytes, cache_storage.scratch);
+        assert_eq!(cache_derived.max_log_bytes, 9_009);
+        assert_eq!(cache_derived.max_sequential_bytes, 18_018);
+        assert_eq!(cache_derived.max_peak_bytes, cache_storage.peak);
+
+        let cache_ineligible = continuation_operation_limits(
+            1_000,
+            cache_shape,
+            &RunLimits {
+                fre_aggregate_operation_work: cache_initialization - 1,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cache_ineligible.max_random_access_bytes, 1_049);
+        assert_eq!(cache_ineligible.max_scratch_bytes, 1_049);
+        assert_eq!(cache_ineligible.max_log_bytes, 9_009);
+        assert_eq!(cache_ineligible.max_sequential_bytes, 18_018);
+        assert_eq!(cache_ineligible.max_peak_bytes, 10_058);
     }
 
     #[test]
@@ -14717,13 +14948,22 @@ mod tests {
         assert_eq!(shape.terminal_frontier_bytes, 2);
         let limits = RunLimits::default();
         let exact = continuation_operation_limits(1_024, shape, &limits).unwrap();
-        let legacy = continuation_operation_limits(
-            1_024,
-            conservative_continuation_shape(shape.states).unwrap(),
-            &limits,
-        )
-        .unwrap();
-        assert!(exact.max_random_access_bytes > legacy.max_random_access_bytes);
+        let record_bytes = (shape.states + 1).div_ceil(8);
+        let row_random_access = shape.states * 2 * core::mem::size_of::<usize>() + record_bytes;
+        let (terminal_random_access, _) =
+            terminal_frontier_resource_upper(1_024, shape, row_random_access)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            exact.max_random_access_bytes,
+            terminal_random_access.min(limits.fre_aggregate_random_access_bytes)
+        );
+        assert!(
+            exact.max_random_access_bytes
+                < cached_frontier_limits(shape.states, 1_025, 1)
+                    .unwrap()
+                    .random
+        );
         let capture = capture_count_run_limits(&regex, 1_024, &limits).unwrap();
         assert_eq!(
             capture.selector.max_random_access_bytes,

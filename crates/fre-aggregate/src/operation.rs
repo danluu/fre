@@ -1,6 +1,7 @@
 use core::marker::PhantomData;
 use core::ops::Range;
 
+use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::{
     RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
     RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan,
@@ -9,7 +10,9 @@ use fre_kernels::{
 use crate::accounting::ExecutionAccounting;
 use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes, TerminalFrontierSeed};
 use crate::error::{add, enforce, mul};
-use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program, decode_first_scalar};
+use crate::program::{
+    Assertion, AssertionContext, Inst, NO_SPLIT_RANK, Program, ScalarSet, decode_first_scalar,
+};
 use crate::{Error, OperationLimits, Resource};
 
 mod terminal_frontier;
@@ -421,42 +424,64 @@ impl CompiledRegex {
                 Ok(requirements)
                     if OBSERVED_WORK
                         && requirements.work_bound > engine_limits.max_work
-                        && fallback_seed.is_some() =>
+                        && strategy == Strategy::ReverseSequentialRows =>
                 {
-                    let seed = fallback_seed.ok_or(Error::InternalInvariant(
-                        "missing continuation fallback seed",
-                    ))?;
-                    (
-                        Requirements::new_for_seed(
-                            &self.program,
-                            boundaries,
-                            strategy,
-                            passes,
-                            engine_limits,
-                            seed,
-                        )?,
-                        Some(seed),
-                    )
+                    if let Some(seed) = fallback_seed {
+                        (
+                            Requirements::new_for_seed(
+                                &self.program,
+                                boundaries,
+                                strategy,
+                                passes,
+                                engine_limits,
+                                seed,
+                            )?,
+                            Some(seed),
+                        )
+                    } else {
+                        (
+                            Requirements::new_cached::<OBSERVED_WORK>(
+                                &self.program,
+                                boundaries,
+                                strategy,
+                                passes,
+                                engine_limits,
+                            )?,
+                            None,
+                        )
+                    }
                 }
                 Ok(requirements) => (requirements, None),
-                Err(Error::ResourceLimit {
-                    resource: Resource::ExecutionWork,
-                    ..
-                }) if fallback_seed.is_some() => {
-                    let seed = fallback_seed.ok_or(Error::InternalInvariant(
-                        "missing continuation fallback seed",
-                    ))?;
-                    (
-                        Requirements::new_for_seed(
-                            &self.program,
-                            boundaries,
-                            strategy,
-                            passes,
-                            engine_limits,
-                            seed,
-                        )?,
-                        Some(seed),
-                    )
+                Err(
+                    error @ Error::ResourceLimit {
+                        resource: Resource::ExecutionWork,
+                        ..
+                    },
+                ) if strategy == Strategy::ReverseSequentialRows => {
+                    if let Some(seed) = fallback_seed {
+                        (
+                            Requirements::new_for_seed(
+                                &self.program,
+                                boundaries,
+                                strategy,
+                                passes,
+                                engine_limits,
+                                seed,
+                            )?,
+                            Some(seed),
+                        )
+                    } else {
+                        (
+                            Requirements::new_cached_after_refusal(
+                                error,
+                                &self.program,
+                                boundaries,
+                                passes,
+                                engine_limits,
+                            )?,
+                            None,
+                        )
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -552,7 +577,7 @@ impl CompiledRegex {
         } else {
             accounting.peak_bytes = engine.peak_with_output(0)?;
         }
-        validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
+        validate_admitted_work(&accounting, requirements.work_bound, limits.max_work)?;
         accounting.emitted_matches = summary.matches;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
@@ -804,6 +829,8 @@ struct Requirements {
     work_bound: usize,
     terminal_frontier: bool,
     frontier: Option<terminal_frontier::FrontierRequirements>,
+    cached_frontier: Option<CachedFrontierRequirements>,
+    cache_attempt_work: usize,
 }
 
 impl Requirements {
@@ -924,7 +951,61 @@ impl Requirements {
             work_bound,
             terminal_frontier: false,
             frontier: None,
+            cached_frontier: None,
+            cache_attempt_work: 0,
         })
+    }
+
+    fn cached(
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Option<Self>, Error> {
+        let cache = CachedFrontierRequirements::new(program.insts.len(), boundaries, passes)?;
+        // A caller using observed-work admission can legitimately set its
+        // limit below the cache's fixed initialization cost while the dense
+        // executor still fits at its exact observed charge. In that case the
+        // cache is not an admissible alternative: selecting it would replace
+        // a successful exact-limit replay with a larger resource refusal.
+        if cache.initialization_work()? > limits.max_work {
+            return Ok(None);
+        }
+        Ok(cache.fits(limits)?.then_some(Self {
+            table_cells: 0,
+            row_storage: None,
+            record_bytes: cache.record_bytes,
+            requested_log_bytes: cache.log_bytes,
+            sequential_bound: cache.sequential_bound,
+            work_bound: limits.max_work,
+            terminal_frontier: false,
+            frontier: None,
+            cached_frontier: Some(cache),
+            cache_attempt_work: 1,
+        }))
+    }
+
+    fn new_cached<const OBSERVED_WORK: bool>(
+        program: &Program,
+        boundaries: usize,
+        strategy: Strategy,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        if let Some(requirements) = Self::cached(program, boundaries, passes, limits)? {
+            return Ok(requirements);
+        }
+        Self::new::<OBSERVED_WORK>(program, boundaries, strategy, passes, limits)
+    }
+
+    fn new_cached_after_refusal(
+        refusal: Error,
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        Self::cached(program, boundaries, passes, limits)?.ok_or(refusal)
     }
 
     fn new_sparse(
@@ -967,6 +1048,8 @@ impl Requirements {
             work_bound: limits.max_work,
             terminal_frontier: false,
             frontier: None,
+            cached_frontier: None,
+            cache_attempt_work: 0,
         })
     }
 
@@ -1030,7 +1113,156 @@ impl Requirements {
             work_bound: limits.max_work,
             terminal_frontier: true,
             frontier: Some(frontier),
+            cached_frontier: None,
+            cache_attempt_work: 0,
         })
+    }
+}
+
+const MAX_CACHED_FRONTIERS: usize = 4_096;
+const MAX_CACHED_TRANSITIONS: usize = 65_536;
+const CACHED_TRANSITION_SLOTS: usize = MAX_CACHED_TRANSITIONS * 2;
+const UNCACHED_FRONTIER: u16 = u16::MAX;
+
+fn cached_frontier_words(states: usize) -> Result<usize, Error> {
+    add(states, 63, Resource::ScratchBytes)?
+        .checked_div(64)
+        .ok_or(Error::InternalInvariant("zero cached-frontier word width"))
+}
+
+/// Prospective fixed-capacity theorem for the interned Boolean-frontier
+/// executor. Every retained cache image owns exactly `ceil(Q / 64)` Boolean
+/// words, the transition table has twice the maximum installed entries, and
+/// every boundary owns one `u16` image ID or an uncached sentinel. A sentinel
+/// is recomputed from the next retained checkpoint during replay, making both
+/// caches best-effort accelerators: filling either one cannot change semantics
+/// or cause a cache-capacity refusal. No allocation depends on cache hits,
+/// collisions, or input contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedFrontierRequirements {
+    words: usize,
+    record_bytes: usize,
+    state_word_capacity: usize,
+    boundary_count: usize,
+    log_bytes: usize,
+    random_bytes: usize,
+    scratch_bytes: usize,
+    peak_bytes: usize,
+    sequential_bound: usize,
+}
+
+impl CachedFrontierRequirements {
+    fn new(states: usize, boundaries: usize, passes: usize) -> Result<Self, Error> {
+        let words = cached_frontier_words(states)?;
+        let record_bytes = core::mem::size_of::<u16>();
+        let state_word_capacity = mul(words, MAX_CACHED_FRONTIERS, Resource::ScratchBytes)?;
+        let state_bytes = mul(
+            state_word_capacity,
+            core::mem::size_of::<u64>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let hash_bytes = mul(
+            MAX_CACHED_FRONTIERS,
+            core::mem::size_of::<u64>(),
+            Resource::ScratchBytes,
+        )?;
+        let transition_bytes = mul(
+            CACHED_TRANSITION_SLOTS,
+            core::mem::size_of::<CachedTransitionSlot>(),
+            Resource::ScratchBytes,
+        )?;
+        let candidate_bytes = mul(
+            mul(words, 2, Resource::ScratchBytes)?,
+            core::mem::size_of::<u64>(),
+            Resource::ScratchBytes,
+        )?;
+        let phase_scratch_bytes = add(
+            add(hash_bytes, transition_bytes, Resource::ScratchBytes)?,
+            candidate_bytes,
+            Resource::ScratchBytes,
+        )?;
+        let random_bytes = add(
+            state_bytes,
+            phase_scratch_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        let scratch_bytes = random_bytes;
+        let log_bytes = mul(boundaries, record_bytes, Resource::LogBytes)?;
+        let peak_bytes = add(log_bytes, random_bytes, Resource::PeakBytes)?;
+        let read_passes = mul(passes, 3, Resource::SequentialBytes)?;
+        let sequential_bound = mul(
+            log_bytes,
+            add(read_passes, 1, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            words,
+            record_bytes,
+            state_word_capacity,
+            boundary_count: boundaries,
+            log_bytes,
+            random_bytes,
+            scratch_bytes,
+            peak_bytes,
+            sequential_bound,
+        })
+    }
+
+    fn enforce(self, limits: OperationLimits) -> Result<(), Error> {
+        enforce(
+            self.random_bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            self.scratch_bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(self.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            self.sequential_bound,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        enforce(self.peak_bytes, limits.max_peak_bytes, Resource::PeakBytes)
+    }
+
+    fn fits(self, limits: OperationLimits) -> Result<bool, Error> {
+        match self.enforce(limits) {
+            Ok(()) => Ok(true),
+            Err(Error::ResourceLimit {
+                resource:
+                    Resource::RandomAccessBytes
+                    | Resource::ScratchBytes
+                    | Resource::LogBytes
+                    | Resource::SequentialBytes
+                    | Resource::PeakBytes,
+                ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn initialization_work(self) -> Result<usize, Error> {
+        let initialized = add(
+            add(
+                add(
+                    self.boundary_count,
+                    self.state_word_capacity,
+                    Resource::ExecutionWork,
+                )?,
+                MAX_CACHED_FRONTIERS,
+                Resource::ExecutionWork,
+            )?,
+            add(
+                CACHED_TRANSITION_SLOTS,
+                mul(self.words, 2, Resource::ExecutionWork)?,
+                Resource::ExecutionWork,
+            )?,
+            Resource::ExecutionWork,
+        )?;
+        add(initialized, 6, Resource::ExecutionWork)
     }
 }
 
@@ -1131,6 +1363,7 @@ enum Engine {
     Rows(RowStore),
     SparseRows(RowStore),
     TerminalFrontier(RowStore),
+    CachedFrontiers(CachedFrontierStore),
 }
 
 impl Engine {
@@ -1148,6 +1381,25 @@ impl Engine {
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
     ) -> Result<Self, Error> {
+        if requirements.cache_attempt_work != 0 {
+            try_charge_frontier_amount(
+                accounting,
+                requirements.work_bound,
+                requirements.cache_attempt_work,
+            )?;
+        }
+        if let Some(cache) = requirements.cached_frontier {
+            return CachedFrontierStore::build(
+                program,
+                haystack,
+                assertions,
+                requirements,
+                cache,
+                limits,
+                accounting,
+            )
+            .map(Self::CachedFrontiers);
+        }
         match strategy {
             Strategy::FullTable => FullTable::build::<OBSERVED_WORK>(
                 program,
@@ -1274,6 +1526,14 @@ impl Engine {
                     &mut emit,
                 )
             }
+            Self::CachedFrontiers(cache) => cache.scan(
+                program,
+                haystack,
+                assertions,
+                accounting,
+                admitted_work_bound,
+                &mut emit,
+            ),
         }
     }
 
@@ -1292,6 +1552,10 @@ impl Engine {
                     Resource::PeakBytes,
                 )?;
                 Ok(build.max(replay))
+            }
+            Self::CachedFrontiers(cache) => {
+                let replay = add(cache.replay_bytes, output_bytes, Resource::PeakBytes)?;
+                Ok(cache.build_peak_bytes.max(replay))
             }
         }
     }
@@ -1485,6 +1749,795 @@ struct RowStore {
     allocated_store_bytes: usize,
     build_scratch_bytes: usize,
     root_rank: usize,
+}
+
+fn exact_allocation_error(error: CopyError, resource: Resource, items: usize) -> Error {
+    match error {
+        CopyError::LayoutOverflow => Error::ArithmeticOverflow { resource },
+        CopyError::AllocationFailed => Error::AllocationFailed { resource, items },
+    }
+}
+
+fn exact_filled<T: Copy>(
+    length: usize,
+    value: T,
+    resource: Resource,
+) -> Result<ExactVec<T>, Error> {
+    let mut values = ExactVec::try_with_capacity(length)
+        .map_err(|error| exact_allocation_error(error, resource, length))?;
+    for _ in 0..length {
+        values
+            .try_push(value)
+            .map_err(|_| Error::InternalInvariant("exact allocation changed capacity"))?;
+    }
+    Ok(values)
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct CachedTransitionSlot {
+    symbol: u64,
+    next_state: u16,
+    result_state: u16,
+    occupied: bool,
+}
+
+impl CachedTransitionSlot {
+    const EMPTY: Self = Self {
+        symbol: 0,
+        next_state: 0,
+        result_state: 0,
+        occupied: false,
+    };
+}
+
+fn cached_compute_row(
+    program: &Program,
+    symbol: u64,
+    next_frontier: &[u64],
+    row: &mut [u64],
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    try_charge_frontier_amount(accounting, admitted_work_bound, row.len())?;
+    row.fill(0);
+    for &pc in &program.epsilon_order {
+        try_charge_state(accounting, admitted_work_bound)?;
+        let present =
+            match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "cached frontier reached an unfilled state",
+                    ));
+                }
+                Inst::Fail => false,
+                Inst::Match => cached_symbol_seeded(symbol),
+                Inst::Consume { bytes, next } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    cached_symbol_byte(symbol).is_some_and(|byte| bytes.contains(byte))
+                        && cached_candidate_bit(next_frontier, *next)?
+                }
+                Inst::ConsumeScalar {
+                    scalars,
+                    next_by_width,
+                } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    if let Some(scalar) = cached_symbol_scalar(symbol) {
+                        let matches = scalars.contains_with(scalar, || {
+                            try_charge_transition(accounting, admitted_work_bound)
+                        })?;
+                        if matches {
+                            let width_index = scalar.len_utf8().checked_sub(1).ok_or(
+                                Error::InternalInvariant("Unicode scalar has zero byte width"),
+                            )?;
+                            let next =
+                                *next_by_width
+                                    .get(width_index)
+                                    .ok_or(Error::InternalInvariant(
+                                        "Unicode scalar width outside cached dispatch",
+                                    ))?;
+                            cached_candidate_bit(next_frontier, next)?
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                Inst::Assert { assertion, next } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    cached_symbol_assertion(symbol, *assertion) && cached_candidate_bit(row, *next)?
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                } => {
+                    try_charge_transition(accounting, admitted_work_bound)?;
+                    if cached_candidate_bit(row, *preferred)? {
+                        true
+                    } else {
+                        try_charge_transition(accounting, admitted_work_bound)?;
+                        cached_candidate_bit(row, *fallback)?
+                    }
+                }
+            };
+        if present {
+            cached_set_candidate_bit(row, pc)?;
+        }
+    }
+    Ok(())
+}
+
+fn cached_replay_scalar(
+    scalars: &ScalarSet,
+    next_by_width: &[usize; 4],
+    haystack: &[u8],
+    position: usize,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<usize, Error> {
+    let scalar = haystack
+        .get(position..)
+        .and_then(decode_first_scalar)
+        .ok_or(Error::InternalInvariant(
+            "cached frontier replay selected invalid Unicode scalar",
+        ))?;
+    if !scalars.contains_with(scalar, || {
+        try_charge_replay(accounting, admitted_work_bound)
+    })? {
+        return Err(Error::InternalInvariant(
+            "cached frontier replay selected failing Unicode scalar",
+        ));
+    }
+    let width_index = scalar
+        .len_utf8()
+        .checked_sub(1)
+        .ok_or(Error::InternalInvariant(
+            "Unicode scalar has zero byte width",
+        ))?;
+    next_by_width
+        .get(width_index)
+        .copied()
+        .ok_or(Error::InternalInvariant(
+            "Unicode scalar width outside cached replay dispatch",
+        ))
+}
+
+/// Stable Boolean row images plus a bounded transition cache. Liveness is
+/// sufficient during the reverse sweep: replay consults the retained row at
+/// each boundary and therefore applies preferred/fallback priority exactly at
+/// the original decision point.
+struct CachedFrontierStore {
+    boundary_states: ExactVec<u16>,
+    state_bits: ExactVec<u64>,
+    replay_current: ExactVec<u64>,
+    replay_next: ExactVec<u64>,
+    words: usize,
+    used_assertions: u32,
+    checkpoint_log_bytes_read: usize,
+    build_peak_bytes: usize,
+    replay_bytes: usize,
+}
+
+impl CachedFrontierStore {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cached-frontier construction keeps its fixed capacity, semantic key, and exact charges together"
+    )]
+    fn build(
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        requirements: Requirements,
+        cache: CachedFrontierRequirements,
+        limits: OperationLimits,
+        accounting: &mut ExecutionAccounting,
+    ) -> Result<Self, Error> {
+        cache.enforce(limits)?;
+        try_charge_frontier_amount(
+            accounting,
+            requirements.work_bound,
+            cache.initialization_work()?,
+        )?;
+        let mut boundary_states = exact_filled(cache.boundary_count, 0_u16, Resource::LogBytes)?;
+        let mut state_bits = exact_filled(
+            cache.state_word_capacity,
+            0_u64,
+            Resource::RandomAccessBytes,
+        )?;
+        let mut state_hashes = exact_filled(MAX_CACHED_FRONTIERS, 0_u64, Resource::ScratchBytes)?;
+        let mut transitions = exact_filled(
+            CACHED_TRANSITION_SLOTS,
+            CachedTransitionSlot::EMPTY,
+            Resource::ScratchBytes,
+        )?;
+        let mut candidate = exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?;
+        let mut next_frontier = exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?;
+
+        // State zero is the all-failing successor beyond the terminal row.
+        let mut state_count = 1_usize;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        state_hashes[0] = cached_row_hash(&candidate, accounting, requirements.work_bound)?;
+        let mut transition_count = 0_usize;
+        let mut next_state = Some(0_u16);
+        let used_assertions =
+            cached_program_assertion_mask(program, accounting, requirements.work_bound)?;
+        for position in (0..cache.boundary_count).rev() {
+            let symbol = cached_boundary_symbol(
+                program,
+                assertions,
+                haystack,
+                position,
+                used_assertions,
+                accounting,
+                requirements.work_bound,
+            )?;
+            let (cached, slot) = if let Some(state) = next_state {
+                let (cached, slot) = cached_transition_lookup(
+                    &transitions,
+                    state,
+                    symbol,
+                    accounting,
+                    requirements.work_bound,
+                )?;
+                (cached, Some(slot))
+            } else {
+                (None, None)
+            };
+            let current = if let Some(state) = cached {
+                let start = mul(usize::from(state), cache.words, Resource::ScratchBytes)?;
+                let end = add(start, cache.words, Resource::ScratchBytes)?;
+                try_charge_frontier_amount(accounting, requirements.work_bound, cache.words)?;
+                candidate.copy_from_slice(state_bits.get(start..end).ok_or(
+                    Error::InternalInvariant("cached frontier hit outside retained store"),
+                )?);
+                Some(state)
+            } else {
+                cached_compute_row(
+                    program,
+                    symbol,
+                    &next_frontier,
+                    &mut candidate,
+                    accounting,
+                    requirements.work_bound,
+                )?;
+                let hash = cached_row_hash(&candidate, accounting, requirements.work_bound)?;
+                let mut interned = None;
+                for state in 0..state_count {
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    if state_hashes[state] != hash {
+                        continue;
+                    }
+                    let start = mul(state, cache.words, Resource::ScratchBytes)?;
+                    let end = add(start, cache.words, Resource::ScratchBytes)?;
+                    let retained = state_bits.get(start..end).ok_or(Error::InternalInvariant(
+                        "cached frontier row outside store",
+                    ))?;
+                    let mut equal = true;
+                    for (&left, &right) in retained.iter().zip(candidate.iter()) {
+                        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                        if left != right {
+                            equal = false;
+                            break;
+                        }
+                    }
+                    if equal {
+                        interned = Some(u16::try_from(state).map_err(|_| {
+                            Error::InternalInvariant("cached frontier ID does not fit u16")
+                        })?);
+                        break;
+                    }
+                }
+                let result = if let Some(state) = interned {
+                    Some(state)
+                } else if state_count < MAX_CACHED_FRONTIERS {
+                    let required = add(state_count, 1, Resource::TableCells)?;
+                    let start = mul(state_count, cache.words, Resource::ScratchBytes)?;
+                    let end = add(start, cache.words, Resource::ScratchBytes)?;
+                    try_charge_frontier_amount(accounting, requirements.work_bound, cache.words)?;
+                    state_bits
+                        .get_mut(start..end)
+                        .ok_or(Error::InternalInvariant(
+                            "cached frontier insertion outside store",
+                        ))?
+                        .copy_from_slice(&candidate);
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    state_hashes[state_count] = hash;
+                    let state = u16::try_from(state_count).map_err(|_| {
+                        Error::InternalInvariant("cached frontier ID does not fit u16")
+                    })?;
+                    state_count = required;
+                    Some(state)
+                } else {
+                    None
+                };
+                if let (Some(slot), Some(next_state), Some(result_state)) =
+                    (slot, next_state, result)
+                    && transition_count < MAX_CACHED_TRANSITIONS
+                {
+                    let required = add(transition_count, 1, Resource::TableCells)?;
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    transitions[slot] = CachedTransitionSlot {
+                        symbol,
+                        next_state,
+                        result_state,
+                        occupied: true,
+                    };
+                    transition_count = required;
+                }
+                result
+            };
+            try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+            boundary_states[position] = current.unwrap_or(UNCACHED_FRONTIER);
+            accounting.sequential_bytes_written = add(
+                accounting.sequential_bytes_written,
+                core::mem::size_of::<u16>(),
+                Resource::SequentialBytes,
+            )?;
+            core::mem::swap(&mut candidate, &mut next_frontier);
+            next_state = current;
+        }
+
+        accounting.random_access_peak_bytes = cache.random_bytes;
+        accounting.scratch_peak_bytes = cache.scratch_bytes;
+        accounting.log_bytes = cache.log_bytes;
+        let replay_bytes = add(
+            add(
+                cache.log_bytes,
+                mul(
+                    cache.state_word_capacity,
+                    core::mem::size_of::<u64>(),
+                    Resource::PeakBytes,
+                )?,
+                Resource::PeakBytes,
+            )?,
+            mul(
+                mul(cache.words, 2, Resource::PeakBytes)?,
+                core::mem::size_of::<u64>(),
+                Resource::PeakBytes,
+            )?,
+            Resource::PeakBytes,
+        )?;
+        drop(transitions);
+        drop(state_hashes);
+        Ok(Self {
+            boundary_states,
+            state_bits,
+            replay_current: candidate,
+            replay_next: next_frontier,
+            words: cache.words,
+            used_assertions,
+            checkpoint_log_bytes_read: 0,
+            build_peak_bytes: cache.peak_bytes,
+            replay_bytes,
+        })
+    }
+
+    fn scan(
+        &mut self,
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+        mut emit: impl FnMut(Span) -> Result<(), Error>,
+    ) -> Result<ScanSummary, Error> {
+        scan_sequence_sparse(
+            haystack.len(),
+            assertions.base(),
+            accounting,
+            admitted_work_bound,
+            |start, accounting| {
+                self.selected(
+                    program,
+                    haystack,
+                    assertions,
+                    start,
+                    accounting,
+                    admitted_work_bound,
+                )
+            },
+            &mut emit,
+        )
+    }
+
+    fn selected(
+        &mut self,
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        start: usize,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<Option<usize>, Error> {
+        self.load_boundary(
+            program,
+            haystack,
+            assertions,
+            start,
+            accounting,
+            admitted_work_bound,
+        )?;
+        if !cached_candidate_bit(&self.replay_current, program.entry)? {
+            return Ok(None);
+        }
+        let mut pc = program.entry;
+        let mut position = start;
+        loop {
+            try_charge_replay(accounting, admitted_work_bound)?;
+            match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "cached frontier replay reached an unfilled state",
+                    ));
+                }
+                Inst::Fail => {
+                    return Err(Error::InternalInvariant(
+                        "cached frontier replay selected failure",
+                    ));
+                }
+                Inst::Match => return Ok(Some(position)),
+                Inst::Consume { bytes, next } => {
+                    if position >= haystack.len() || !bytes.contains(haystack[position]) {
+                        return Err(Error::InternalInvariant(
+                            "cached frontier replay selected failing byte",
+                        ));
+                    }
+                    position = add(position, 1, Resource::Boundaries)?;
+                    self.load_boundary(
+                        program,
+                        haystack,
+                        assertions,
+                        position,
+                        accounting,
+                        admitted_work_bound,
+                    )?;
+                    pc = *next;
+                }
+                Inst::ConsumeScalar {
+                    scalars,
+                    next_by_width,
+                } => {
+                    pc = cached_replay_scalar(
+                        scalars,
+                        next_by_width,
+                        haystack,
+                        position,
+                        accounting,
+                        admitted_work_bound,
+                    )?;
+                    position = add(position, 1, Resource::Boundaries)?;
+                    self.load_boundary(
+                        program,
+                        haystack,
+                        assertions,
+                        position,
+                        accounting,
+                        admitted_work_bound,
+                    )?;
+                }
+                Inst::Assert { assertion, next } => {
+                    try_charge_assertion(accounting, admitted_work_bound)?;
+                    if !assertions.is_match(*assertion, position)? {
+                        return Err(Error::InternalInvariant(
+                            "cached frontier replay selected failing assertion",
+                        ));
+                    }
+                    pc = *next;
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                } => {
+                    pc = if cached_candidate_bit(&self.replay_current, *preferred)? {
+                        *preferred
+                    } else {
+                        *fallback
+                    };
+                }
+            }
+        }
+    }
+
+    fn load_boundary(
+        &mut self,
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        position: usize,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<(), Error> {
+        accounting.sequential_bytes_read = add(
+            accounting.sequential_bytes_read,
+            core::mem::size_of::<u16>(),
+            Resource::SequentialBytes,
+        )?;
+        let first = self
+            .boundary_states
+            .get(position)
+            .copied()
+            .ok_or(Error::InternalInvariant(
+                "cached frontier boundary outside state stream",
+            ))?;
+        if first != UNCACHED_FRONTIER {
+            return cached_copy_retained_row(
+                &self.state_bits,
+                self.words,
+                first,
+                &mut self.replay_current,
+                accounting,
+                admitted_work_bound,
+            );
+        }
+
+        let mut checkpoint = add(position, 1, Resource::Boundaries)?;
+        loop {
+            if checkpoint == self.boundary_states.len() {
+                try_charge_frontier_amount(
+                    accounting,
+                    admitted_work_bound,
+                    self.replay_current.len(),
+                )?;
+                self.replay_current.fill(0);
+                break;
+            }
+            try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+            self.checkpoint_log_bytes_read = add(
+                self.checkpoint_log_bytes_read,
+                core::mem::size_of::<u16>(),
+                Resource::LogBytes,
+            )?;
+            let state = *self
+                .boundary_states
+                .get(checkpoint)
+                .ok_or(Error::InternalInvariant(
+                    "cached frontier checkpoint outside state stream",
+                ))?;
+            if state != UNCACHED_FRONTIER {
+                cached_copy_retained_row(
+                    &self.state_bits,
+                    self.words,
+                    state,
+                    &mut self.replay_current,
+                    accounting,
+                    admitted_work_bound,
+                )?;
+                break;
+            }
+            checkpoint = add(checkpoint, 1, Resource::Boundaries)?;
+        }
+
+        for replay_position in (position..checkpoint).rev() {
+            core::mem::swap(&mut self.replay_current, &mut self.replay_next);
+            let symbol = cached_boundary_symbol(
+                program,
+                assertions,
+                haystack,
+                replay_position,
+                self.used_assertions,
+                accounting,
+                admitted_work_bound,
+            )?;
+            cached_compute_row(
+                program,
+                symbol,
+                &self.replay_next,
+                &mut self.replay_current,
+                accounting,
+                admitted_work_bound,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn cached_transition_lookup(
+    slots: &[CachedTransitionSlot],
+    next_state: u16,
+    symbol: u64,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(Option<u16>, usize), Error> {
+    try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+    let mask = slots
+        .len()
+        .checked_sub(1)
+        .ok_or(Error::InternalInvariant("empty cached transition table"))?;
+    let mut index = cached_transition_hash(next_state, symbol) & mask;
+    for _ in 0..slots.len() {
+        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+        let slot = slots[index];
+        if !slot.occupied {
+            return Ok((None, index));
+        }
+        if slot.next_state == next_state && slot.symbol == symbol {
+            return Ok((Some(slot.result_state), index));
+        }
+        index = index.wrapping_add(1) & mask;
+    }
+    Err(Error::InternalInvariant(
+        "cached transition table has no empty slot",
+    ))
+}
+
+fn cached_transition_hash(next_state: u16, symbol: u64) -> usize {
+    let key = symbol ^ (u64::from(next_state) << 48);
+    let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    usize::try_from(mixed ^ (mixed >> 32)).unwrap_or(0)
+}
+
+fn cached_row_hash(
+    words: &[u64],
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<u64, Error> {
+    let mut hash = 0xCBF2_9CE4_8422_2325_u64;
+    for &word in words {
+        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+        hash ^= word;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    Ok(hash)
+}
+
+const CACHED_ASSERTIONS: [Assertion; 18] = [
+    Assertion::StartText,
+    Assertion::EndText,
+    Assertion::StartLf,
+    Assertion::EndLf,
+    Assertion::StartCrlf,
+    Assertion::EndCrlf,
+    Assertion::WordAscii,
+    Assertion::WordAsciiNegate,
+    Assertion::WordStartAscii,
+    Assertion::WordEndAscii,
+    Assertion::WordStartHalfAscii,
+    Assertion::WordEndHalfAscii,
+    Assertion::WordUnicode,
+    Assertion::WordUnicodeNegate,
+    Assertion::WordStartUnicode,
+    Assertion::WordEndUnicode,
+    Assertion::WordStartHalfUnicode,
+    Assertion::WordEndHalfUnicode,
+];
+
+const CACHED_ASSERTION_SHIFT: u32 = 9;
+const CACHED_SEED_SHIFT: u32 = CACHED_ASSERTION_SHIFT + 18;
+const CACHED_SCALAR_SHIFT: u32 = CACHED_SEED_SHIFT + 1;
+const CACHED_SCALAR_NONE: u32 = 0x11_0000;
+
+fn cached_boundary_symbol(
+    program: &Program,
+    assertions: AssertionContext<'_>,
+    haystack: &[u8],
+    position: usize,
+    used_assertions: u32,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<u64, Error> {
+    try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+    let mut assertion_mask = 0_u64;
+    for assertion in CACHED_ASSERTIONS {
+        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+        let bit = 1_u32 << assertion.identity_tag();
+        if used_assertions & bit == 0 {
+            continue;
+        }
+        try_charge_assertion(accounting, admitted_work_bound)?;
+        if assertions.is_match(assertion, position)? {
+            assertion_mask |= 1_u64 << assertion.identity_tag();
+        }
+    }
+    let seeded = true;
+    let byte = if let Some(byte) = haystack.get(position) {
+        accounting.random_access_bytes_read = add(
+            accounting.random_access_bytes_read,
+            1,
+            Resource::RandomAccessBytes,
+        )?;
+        u64::from(*byte)
+    } else {
+        256_u64
+    };
+    let scalar = if program.contains_scalar_transition() {
+        try_charge_transition(accounting, admitted_work_bound)?;
+        let source = haystack.get(position..).unwrap_or_default();
+        accounting.random_access_bytes_read = add(
+            accounting.random_access_bytes_read,
+            cached_scalar_source_accesses(source),
+            Resource::RandomAccessBytes,
+        )?;
+        decode_first_scalar(source).map_or(CACHED_SCALAR_NONE, u32::from)
+    } else {
+        CACHED_SCALAR_NONE
+    };
+    Ok(byte
+        | (assertion_mask << CACHED_ASSERTION_SHIFT)
+        | (u64::from(seeded) << CACHED_SEED_SHIFT)
+        | (u64::from(scalar) << CACHED_SCALAR_SHIFT))
+}
+
+fn cached_scalar_source_accesses(bytes: &[u8]) -> usize {
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return 1,
+    };
+    if bytes.len() < width { 1 } else { width }
+}
+
+fn cached_program_assertion_mask(
+    program: &Program,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<u32, Error> {
+    let mut mask = 0_u32;
+    for inst in &program.insts {
+        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+        if let Inst::Assert { assertion, .. } = inst {
+            mask |= 1_u32 << assertion.identity_tag();
+        }
+    }
+    Ok(mask)
+}
+
+fn cached_symbol_byte(symbol: u64) -> Option<u8> {
+    u8::try_from(symbol & 0x1ff).ok()
+}
+
+fn cached_symbol_assertion(symbol: u64, assertion: Assertion) -> bool {
+    symbol & (1_u64 << (CACHED_ASSERTION_SHIFT + u32::from(assertion.identity_tag()))) != 0
+}
+
+fn cached_symbol_seeded(symbol: u64) -> bool {
+    symbol & (1_u64 << CACHED_SEED_SHIFT) != 0
+}
+
+fn cached_symbol_scalar(symbol: u64) -> Option<char> {
+    let encoded = u32::try_from((symbol >> CACHED_SCALAR_SHIFT) & 0x1f_ffff).ok()?;
+    if encoded == CACHED_SCALAR_NONE {
+        return None;
+    }
+    char::from_u32(encoded)
+}
+
+fn cached_copy_retained_row(
+    rows: &[u64],
+    words: usize,
+    state: u16,
+    target: &mut [u64],
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    let start = mul(usize::from(state), words, Resource::ScratchBytes)?;
+    let end = add(start, words, Resource::ScratchBytes)?;
+    try_charge_frontier_amount(accounting, admitted_work_bound, words)?;
+    target.copy_from_slice(rows.get(start..end).ok_or(Error::InternalInvariant(
+        "cached frontier state outside store",
+    ))?);
+    Ok(())
+}
+
+fn cached_candidate_bit(row: &[u64], pc: usize) -> Result<bool, Error> {
+    row.get(pc / 64)
+        .map(|bits| bits & (1_u64 << (pc % 64)) != 0)
+        .ok_or(Error::InternalInvariant(
+            "cached frontier bit outside candidate row",
+        ))
+}
+
+fn cached_set_candidate_bit(row: &mut [u64], pc: usize) -> Result<(), Error> {
+    let word = row.get_mut(pc / 64).ok_or(Error::InternalInvariant(
+        "cached frontier bit outside candidate row",
+    ))?;
+    *word |= 1_u64 << (pc % 64);
+    Ok(())
 }
 
 impl RowStore {
@@ -2606,6 +3659,19 @@ fn try_charge_amount(
     Ok(())
 }
 
+fn try_charge_frontier_amount(
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    amount: usize,
+) -> Result<(), Error> {
+    accounting.frontier_bookkeeping = add(
+        accounting.frontier_bookkeeping,
+        amount,
+        Resource::ExecutionWork,
+    )?;
+    try_charge_amount(accounting, admitted_work_bound, amount)
+}
+
 fn try_charge_state(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
@@ -2667,7 +3733,7 @@ fn try_charge_event(
 }
 
 fn validate_admitted_work(
-    accounting: ExecutionAccounting,
+    accounting: &ExecutionAccounting,
     admitted_work_bound: usize,
     caller_limit: usize,
 ) -> Result<(), Error> {
@@ -2840,8 +3906,216 @@ fn operation_identity(
 #[cfg(test)]
 mod tests {
     use crate::accounting::ExecutionAccounting;
+    use crate::program::AssertionContext;
+    use crate::{CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile};
 
-    use super::{RowReader, RowStorage, decode, encoded_width, read_encoded, write_encoded};
+    use super::{
+        CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot, RowReader,
+        RowStorage, UNCACHED_FRONTIER, cached_boundary_symbol, cached_compute_row,
+        cached_frontier_words, cached_program_assertion_mask, decode, encoded_width, exact_filled,
+        read_encoded, write_encoded,
+    };
+
+    #[test]
+    fn uncached_checkpoint_recomputes_and_preserves_preferred_alternation() {
+        let hir = regex_syntax::ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("a|ab")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let program = &compiled.program;
+        let haystack = b"ab";
+        let assertions = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let words = cached_frontier_words(program.insts.len()).unwrap();
+        let admitted = usize::MAX;
+        let mut accounting = ExecutionAccounting::default();
+        let used_assertions =
+            cached_program_assertion_mask(program, &mut accounting, admitted).unwrap();
+
+        let zero = vec![0_u64; words];
+        let mut terminal = vec![0_u64; words];
+        let terminal_symbol = cached_boundary_symbol(
+            program,
+            assertions,
+            haystack,
+            haystack.len(),
+            used_assertions,
+            &mut accounting,
+            admitted,
+        )
+        .unwrap();
+        cached_compute_row(
+            program,
+            terminal_symbol,
+            &zero,
+            &mut terminal,
+            &mut accounting,
+            admitted,
+        )
+        .unwrap();
+        let mut row_one = vec![0_u64; words];
+        let row_one_symbol = cached_boundary_symbol(
+            program,
+            assertions,
+            haystack,
+            1,
+            used_assertions,
+            &mut accounting,
+            admitted,
+        )
+        .unwrap();
+        cached_compute_row(
+            program,
+            row_one_symbol,
+            &terminal,
+            &mut row_one,
+            &mut accounting,
+            admitted,
+        )
+        .unwrap();
+
+        let mut state_bits = exact_filled(words * 3, 0_u64, Resource::ScratchBytes).unwrap();
+        state_bits[words..words * 2].copy_from_slice(&terminal);
+        state_bits[words * 2..words * 3].copy_from_slice(&row_one);
+        let mut boundary_states = exact_filled(3, UNCACHED_FRONTIER, Resource::LogBytes).unwrap();
+        boundary_states[1] = 2;
+        boundary_states[2] = 1;
+        let mut store = CachedFrontierStore {
+            boundary_states,
+            state_bits,
+            replay_current: exact_filled(words, 0_u64, Resource::ScratchBytes).unwrap(),
+            replay_next: exact_filled(words, 0_u64, Resource::ScratchBytes).unwrap(),
+            words,
+            used_assertions,
+            checkpoint_log_bytes_read: 0,
+            build_peak_bytes: 0,
+            replay_bytes: 0,
+        };
+        let before_random = accounting.random_access_bytes_read;
+        assert_eq!(
+            store
+                .selected(program, haystack, assertions, 0, &mut accounting, admitted,)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(accounting.random_access_bytes_read - before_random, 1);
+        assert_eq!(store.checkpoint_log_bytes_read, core::mem::size_of::<u16>());
+    }
+
+    #[test]
+    fn cached_frontier_exact_capacity_and_every_one_below_limit() {
+        let requirements = CachedFrontierRequirements::new(65, 11, 1).unwrap();
+        assert_eq!(core::mem::size_of::<CachedTransitionSlot>(), 16);
+        assert_eq!(requirements.words, 2);
+        assert_eq!(requirements.record_bytes, 2);
+        assert_eq!(requirements.state_word_capacity, 8_192);
+        assert_eq!(requirements.boundary_count, 11);
+        assert_eq!(requirements.log_bytes, 22);
+        assert_eq!(requirements.random_bytes, 2_195_488);
+        assert_eq!(requirements.scratch_bytes, 2_195_488);
+        assert_eq!(requirements.peak_bytes, 2_195_510);
+        assert_eq!(requirements.sequential_bound, 88);
+        assert_eq!(requirements.initialization_work().unwrap(), 143_381);
+
+        let exact = OperationLimits {
+            max_random_access_bytes: requirements.random_bytes,
+            max_scratch_bytes: requirements.scratch_bytes,
+            max_log_bytes: requirements.log_bytes,
+            max_sequential_bytes: requirements.sequential_bound,
+            max_peak_bytes: requirements.peak_bytes,
+            ..OperationLimits::default()
+        };
+        requirements.enforce(exact).unwrap();
+        for (resource, required, one_below) in [
+            (
+                Resource::RandomAccessBytes,
+                requirements.random_bytes,
+                OperationLimits {
+                    max_random_access_bytes: requirements.random_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::ScratchBytes,
+                requirements.scratch_bytes,
+                OperationLimits {
+                    max_scratch_bytes: requirements.scratch_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::LogBytes,
+                requirements.log_bytes,
+                OperationLimits {
+                    max_log_bytes: requirements.log_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::SequentialBytes,
+                requirements.sequential_bound,
+                OperationLimits {
+                    max_sequential_bytes: requirements.sequential_bound - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::PeakBytes,
+                requirements.peak_bytes,
+                OperationLimits {
+                    max_peak_bytes: requirements.peak_bytes - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            assert_eq!(
+                requirements.enforce(one_below),
+                Err(Error::ResourceLimit {
+                    resource,
+                    required,
+                    limit: required - 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn cached_frontier_capacity_is_input_independent_and_overflow_checked() {
+        let short = CachedFrontierRequirements::new(257, 19, 1).unwrap();
+        let long = CachedFrontierRequirements::new(257, 19_000, 1).unwrap();
+        assert_eq!(short.words, long.words);
+        assert_eq!(short.state_word_capacity, long.state_word_capacity);
+        assert_eq!(short.random_bytes, long.random_bytes);
+        assert_eq!(short.scratch_bytes, long.scratch_bytes);
+        assert!(short.log_bytes < long.log_bytes);
+        assert!(short.peak_bytes < long.peak_bytes);
+
+        assert_eq!(
+            CachedFrontierRequirements::new(usize::MAX, 0, 1),
+            Err(Error::ArithmeticOverflow {
+                resource: Resource::ScratchBytes,
+            })
+        );
+        assert_eq!(
+            CachedFrontierRequirements::new(1, usize::MAX, 1),
+            Err(Error::ArithmeticOverflow {
+                resource: Resource::LogBytes,
+            })
+        );
+        assert_eq!(
+            CachedFrontierRequirements::new(1, 1, usize::MAX),
+            Err(Error::ArithmeticOverflow {
+                resource: Resource::SequentialBytes,
+            })
+        );
+    }
 
     #[test]
     fn reachable_endpoint_encoding_covers_arbitrary_word_widths() {
