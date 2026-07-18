@@ -11,11 +11,11 @@ use core::{fmt, mem::size_of};
 use fre_exact_alloc::{CopyError, ExactVec};
 
 /// Stable identity for the exact ordered grapheme scalar machine.
-pub const PLAN_ID: &str = "grapheme-scalar-dfa.utf8-role-segments.v1";
+pub const PLAN_ID: &str = "grapheme-scalar-dfa.utf8-role-transitions.v2";
 /// Stable identity for match counting.
-pub const COUNT_OPERATION_ID: &str = "grapheme-scalar-dfa.count.non-overlapping.v1";
+pub const COUNT_OPERATION_ID: &str = "grapheme-scalar-dfa.count.non-overlapping.v2";
 /// Stable identity for matched-byte summation.
-pub const SPAN_SUM_OPERATION_ID: &str = "grapheme-scalar-dfa.span-sum.non-overlapping.v1";
+pub const SPAN_SUM_OPERATION_ID: &str = "grapheme-scalar-dfa.span-sum.non-overlapping.v2";
 
 const MAX_SCALAR: u32 = 0x10_FFFF;
 const AFTER_MAX_SCALAR: u32 = MAX_SCALAR + 1;
@@ -37,14 +37,14 @@ const SWEEP_EVENT_WORK: usize = 32;
 const SEGMENT_WRITE_WORK: usize = 8;
 const SEMANTIC_SEGMENT_WORK: usize = 64;
 const ALLOCATION_WORK: usize = 16;
-// A role probe charges the lookahead access, option test, mask read and bit
-// comparison. Branch and repetition counters separately charge their control
-// decisions; all three are bounded from input bytes before traversal.
-const ROLE_PROBES_PER_INPUT_BYTE: usize = 16;
-const BRANCH_CHECKS_PER_INPUT_BYTE: usize = 24;
-const REPETITION_TESTS_PER_INPUT_BYTE: usize = 8;
-const ROLE_PROBE_WORK: usize = 4;
-const EXECUTION_TERMINAL_CHECKS: usize = 1;
+// Execution consumes each decoded token exactly once. One role probe is one
+// classified transition, including the mask-to-class decision, state lookup,
+// action dispatch, checked state/output updates and state write. The fixed
+// charge intentionally dominates those operations and is also charged once
+// for the terminal transition. Decode, classification, range-search and token
+// traversal work remain separate published counters.
+const TRANSITION_WORK: usize = 48;
+const EXECUTION_TERMINAL_TRANSITIONS: usize = 1;
 const EXECUTION_SCRATCH_BYTES: usize = 512;
 
 /// One exact class role in the accepted HIR skeleton.
@@ -1126,45 +1126,48 @@ impl GraphemeScalarDfaPlan {
             plan: self,
             haystack,
             offset: 0,
-            lookahead: None,
             actual: ReduceActualCounters {
                 scratch_bytes: EXECUTION_SCRATCH_BYTES,
                 ..ReduceActualCounters::default()
             },
         };
-        loop {
-            cursor.repetition_test()?;
-            let token = cursor.peek()?;
-            cursor.branch_check()?;
-            let Some(token) = token else {
-                break;
-            };
-            cursor.branch_check()?;
-            if token.scalar.is_none() {
-                cursor.take()?.ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "invalid-byte lookahead",
-                })?;
+        let mut state = ClusterState::Empty;
+        while let Some(token) = cursor.next()? {
+            cursor.transition()?;
+            let Some(_) = token.scalar else {
+                // Rust bytes-regex Unicode semantics advance one malformed
+                // byte without matching it or carrying grapheme state across
+                // it.
+                state = ClusterState::Empty;
                 continue;
+            };
+            let class = ScalarClass::from_roles(token.roles);
+            if let Some(next) = state.accept(class) {
+                state = next;
+            } else {
+                cursor.actual.match_events =
+                    checked_reduce_add(cursor.actual.match_events, 1, "match events")?;
+                cursor.actual.count =
+                    cursor
+                        .actual
+                        .count
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "match count",
+                        })?;
+                state = ClusterState::start(class);
             }
-            let matched_bytes = match_one(&mut cursor)?;
-            cursor.actual.match_events =
-                checked_reduce_add(cursor.actual.match_events, 1, "match events")?;
-            cursor.actual.count =
-                cursor
-                    .actual
-                    .count
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "match count",
-                    })?;
-            cursor.actual.matched_bytes = cursor
-                .actual
-                .matched_bytes
-                .checked_add(matched_bytes)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "matched bytes",
+            let width =
+                u64::try_from(token.width).map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "token byte width",
                 })?;
+            cursor.actual.matched_bytes = cursor.actual.matched_bytes.checked_add(width).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "matched bytes",
+                },
+            )?;
         }
+        cursor.transition()?;
         cursor.actual.scanner_steps =
             checked_reduce_add(cursor.actual.scanner_steps, 1, "terminal scanner step")?;
         cursor.actual.work = cursor
@@ -1177,7 +1180,7 @@ impl GraphemeScalarDfaPlan {
                 cursor
                     .actual
                     .role_probes
-                    .checked_mul(ROLE_PROBE_WORK)
+                    .checked_mul(TRANSITION_WORK)
                     .and_then(|term| value.checked_add(term))
             })
             .and_then(|value| value.checked_add(cursor.actual.branch_checks))
@@ -1249,24 +1252,14 @@ fn reduce_upper_bounds(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "scanner step upper bound",
         })?;
-    let role_probes = input_bytes.checked_mul(ROLE_PROBES_PER_INPUT_BYTE).ok_or(
-        ReduceError::ArithmeticOverflow {
-            computation: "role probe upper bound",
-        },
-    )?;
-    let branch_checks = input_bytes
-        .checked_mul(BRANCH_CHECKS_PER_INPUT_BYTE)
-        .and_then(|value| value.checked_add(EXECUTION_TERMINAL_CHECKS))
+    let role_probes = input_bytes
+        .checked_add(EXECUTION_TERMINAL_TRANSITIONS)
         .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "branch check upper bound",
+            computation: "transition upper bound",
         })?;
-    let repetition_tests = input_bytes
-        .checked_mul(REPETITION_TESTS_PER_INPUT_BYTE)
-        .and_then(|value| value.checked_add(EXECUTION_TERMINAL_CHECKS))
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "repetition test upper bound",
-        })?;
-    let role_probe_work = checked_reduce_mul(role_probes, ROLE_PROBE_WORK, "role probe work")?;
+    let branch_checks = 0;
+    let repetition_tests = 0;
+    let role_probe_work = checked_reduce_mul(role_probes, TRANSITION_WORK, "transition work")?;
     let count = u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
         computation: "count upper bound",
     })?;
@@ -1428,222 +1421,195 @@ struct ScalarCursor<'a> {
     plan: &'a GraphemeScalarDfaPlan,
     haystack: &'a [u8],
     offset: usize,
-    lookahead: Option<Token>,
     actual: ReduceActualCounters,
 }
 
 impl ScalarCursor<'_> {
-    fn peek(&mut self) -> Result<Option<Token>, ReduceError> {
-        if self.lookahead.is_none() && self.offset < self.haystack.len() {
-            let decoded = decode_scalar(&self.haystack[self.offset..]);
-            self.offset = checked_reduce_add(self.offset, decoded.width, "input cursor")?;
-            self.actual.input_bytes_advanced = checked_reduce_add(
-                self.actual.input_bytes_advanced,
-                decoded.width,
-                "input bytes advanced",
-            )?;
-            self.actual.decode_byte_checks = checked_reduce_add(
-                self.actual.decode_byte_checks,
-                decoded.byte_checks,
-                "decode byte checks",
-            )?;
-            let roles = if let Some(scalar) = decoded.scalar {
-                let (roles, comparisons) = self.plan.classify(scalar)?;
-                self.actual.valid_scalars =
-                    checked_reduce_add(self.actual.valid_scalars, 1, "valid scalars")?;
-                self.actual.classifications =
-                    checked_reduce_add(self.actual.classifications, 1, "classifications")?;
-                self.actual.range_comparisons = checked_reduce_add(
-                    self.actual.range_comparisons,
-                    comparisons,
-                    "range comparisons",
-                )?;
-                roles
-            } else {
-                self.actual.invalid_bytes =
-                    checked_reduce_add(self.actual.invalid_bytes, 1, "invalid bytes")?;
-                0
-            };
-            self.lookahead = Some(Token {
-                scalar: decoded.scalar,
-                width: decoded.width,
-                roles,
-            });
+    fn next(&mut self) -> Result<Option<Token>, ReduceError> {
+        if self.offset == self.haystack.len() {
+            return Ok(None);
         }
-        Ok(self.lookahead)
+        let decoded = decode_scalar(&self.haystack[self.offset..]);
+        self.offset = checked_reduce_add(self.offset, decoded.width, "input cursor")?;
+        self.actual.input_bytes_advanced = checked_reduce_add(
+            self.actual.input_bytes_advanced,
+            decoded.width,
+            "input bytes advanced",
+        )?;
+        self.actual.decode_byte_checks = checked_reduce_add(
+            self.actual.decode_byte_checks,
+            decoded.byte_checks,
+            "decode byte checks",
+        )?;
+        let roles = if let Some(scalar) = decoded.scalar {
+            let (roles, comparisons) = self.plan.classify(scalar)?;
+            self.actual.valid_scalars =
+                checked_reduce_add(self.actual.valid_scalars, 1, "valid scalars")?;
+            self.actual.classifications =
+                checked_reduce_add(self.actual.classifications, 1, "classifications")?;
+            self.actual.range_comparisons = checked_reduce_add(
+                self.actual.range_comparisons,
+                comparisons,
+                "range comparisons",
+            )?;
+            roles
+        } else {
+            self.actual.invalid_bytes =
+                checked_reduce_add(self.actual.invalid_bytes, 1, "invalid bytes")?;
+            0
+        };
+        self.actual.scanner_steps =
+            checked_reduce_add(self.actual.scanner_steps, 1, "scanner steps")?;
+        Ok(Some(Token {
+            scalar: decoded.scalar,
+            width: decoded.width,
+            roles,
+        }))
     }
 
-    fn take(&mut self) -> Result<Option<Token>, ReduceError> {
-        let token = self.peek()?;
-        if token.is_some() {
-            self.lookahead = None;
-            self.actual.scanner_steps =
-                checked_reduce_add(self.actual.scanner_steps, 1, "scanner steps")?;
-        }
-        Ok(token)
-    }
-
-    fn has(&mut self, role: GraphemeScalarClassRole) -> Result<bool, ReduceError> {
-        self.actual.role_probes = checked_reduce_add(self.actual.role_probes, 1, "role probes")?;
-        self.branch_check()?;
-        Ok(self
-            .peek()?
-            .is_some_and(|token| token.roles & role.bit() != 0))
-    }
-
-    fn branch_check(&mut self) -> Result<(), ReduceError> {
-        self.actual.branch_checks =
-            checked_reduce_add(self.actual.branch_checks, 1, "branch checks")?;
+    fn transition(&mut self) -> Result<(), ReduceError> {
+        self.actual.role_probes =
+            checked_reduce_add(self.actual.role_probes, 1, "classified transitions")?;
         Ok(())
     }
+}
 
-    fn repetition_test(&mut self) -> Result<(), ReduceError> {
-        self.actual.repetition_tests =
-            checked_reduce_add(self.actual.repetition_tests, 1, "repetition tests")?;
-        Ok(())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarClass {
+    Cr,
+    Lf,
+    Control,
+    Prepend,
+    L,
+    V,
+    Lv,
+    Lvt,
+    T,
+    Ri,
+    Extend,
+    Zwj,
+    SpacingMark,
+    ExtendedPictographic,
+    Other,
+}
+
+impl ScalarClass {
+    fn from_roles(roles: u32) -> Self {
+        for (role, class) in [
+            (GraphemeScalarClassRole::Cr, Self::Cr),
+            (GraphemeScalarClassRole::Lf, Self::Lf),
+            (GraphemeScalarClassRole::Control, Self::Control),
+            (GraphemeScalarClassRole::Prepend, Self::Prepend),
+            (GraphemeScalarClassRole::L, Self::L),
+            (GraphemeScalarClassRole::V, Self::V),
+            (GraphemeScalarClassRole::Lv, Self::Lv),
+            (GraphemeScalarClassRole::Lvt, Self::Lvt),
+            (GraphemeScalarClassRole::T, Self::T),
+            (GraphemeScalarClassRole::Ri, Self::Ri),
+            (GraphemeScalarClassRole::Extend, Self::Extend),
+            (GraphemeScalarClassRole::Zwj, Self::Zwj),
+            (GraphemeScalarClassRole::SpacingMark, Self::SpacingMark),
+            (
+                GraphemeScalarClassRole::ExtendedPictographic,
+                Self::ExtendedPictographic,
+            ),
+        ] {
+            if roles & role.bit() != 0 {
+                return class;
+            }
+        }
+        Self::Other
     }
 
-    fn consume(&mut self) -> Result<u64, ReduceError> {
-        let token = self.take()?.ok_or(ReduceError::ArithmeticOverflow {
-            computation: "required token",
-        })?;
-        u64::try_from(token.width).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "token byte width",
-        })
+    const fn is_tail(self) -> bool {
+        matches!(self, Self::Extend | Self::Zwj | Self::SpacingMark)
+    }
+
+    const fn is_generic_core(self) -> bool {
+        !matches!(self, Self::Cr | Self::Lf | Self::Control)
     }
 }
 
-fn match_one(cursor: &mut ScalarCursor<'_>) -> Result<u64, ReduceError> {
-    if cursor.has(GraphemeScalarClassRole::Cr)? {
-        let mut bytes = cursor.consume()?;
-        if cursor.has(GraphemeScalarClassRole::Lf)? {
-            bytes = checked_u64_add(bytes, cursor.consume()?, "CRLF match bytes")?;
-        }
-        return Ok(bytes);
-    }
-    if cursor.has(GraphemeScalarClassRole::Control)? {
-        return cursor.consume();
-    }
-
-    let mut bytes = consume_while(cursor, GraphemeScalarClassRole::Prepend)?;
-    if cursor.has(GraphemeScalarClassRole::GenericCore)? {
-        bytes = checked_u64_add(bytes, consume_core(cursor)?, "core bytes")?;
-        bytes = checked_u64_add(
-            bytes,
-            consume_while(cursor, GraphemeScalarClassRole::Tail)?,
-            "tail bytes",
-        )?;
-        return Ok(bytes);
-    }
-    cursor.branch_check()?;
-    if bytes != 0 {
-        // Greedy `Prepend*` backs off once so its last scalar is the generic
-        // core. The byte extent remains the whole already-consumed run.
-        return Ok(bytes);
-    }
-    cursor.consume()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterState {
+    Empty,
+    Cr,
+    Closed,
+    Prepend,
+    HangulL,
+    HangulV,
+    HangulT,
+    RiOne,
+    RiPair,
+    ExtendedPictographic,
+    ExtendedPictographicExtend,
+    ExtendedPictographicZwj,
+    Tail,
 }
 
-fn consume_core(cursor: &mut ScalarCursor<'_>) -> Result<u64, ReduceError> {
-    if cursor.has(GraphemeScalarClassRole::L)? {
-        let mut bytes = consume_while(cursor, GraphemeScalarClassRole::L)?;
-        if cursor.has(GraphemeScalarClassRole::V)? {
-            bytes = checked_u64_add(
-                bytes,
-                consume_while(cursor, GraphemeScalarClassRole::V)?,
-                "Hangul V bytes",
-            )?;
-            return consume_hangul_tail(cursor, bytes);
+impl ClusterState {
+    const fn start(class: ScalarClass) -> Self {
+        match class {
+            ScalarClass::Cr => Self::Cr,
+            ScalarClass::Lf | ScalarClass::Control => Self::Closed,
+            ScalarClass::Prepend => Self::Prepend,
+            ScalarClass::L => Self::HangulL,
+            ScalarClass::V | ScalarClass::Lv => Self::HangulV,
+            ScalarClass::Lvt | ScalarClass::T => Self::HangulT,
+            ScalarClass::Ri => Self::RiOne,
+            ScalarClass::ExtendedPictographic => Self::ExtendedPictographic,
+            ScalarClass::Extend
+            | ScalarClass::Zwj
+            | ScalarClass::SpacingMark
+            | ScalarClass::Other => Self::Tail,
         }
-        if cursor.has(GraphemeScalarClassRole::Lv)? {
-            bytes = checked_u64_add(bytes, cursor.consume()?, "Hangul LV bytes")?;
-            bytes = checked_u64_add(
-                bytes,
-                consume_while(cursor, GraphemeScalarClassRole::V)?,
-                "Hangul V bytes",
-            )?;
-            return consume_hangul_tail(cursor, bytes);
-        }
-        if cursor.has(GraphemeScalarClassRole::Lvt)? {
-            bytes = checked_u64_add(bytes, cursor.consume()?, "Hangul LVT bytes")?;
-            return consume_hangul_tail(cursor, bytes);
-        }
-        return Ok(bytes);
     }
-    if cursor.has(GraphemeScalarClassRole::V)? {
-        let bytes = consume_while(cursor, GraphemeScalarClassRole::V)?;
-        return consume_hangul_tail(cursor, bytes);
-    }
-    if cursor.has(GraphemeScalarClassRole::Lv)? {
-        let mut bytes = cursor.consume()?;
-        bytes = checked_u64_add(
-            bytes,
-            consume_while(cursor, GraphemeScalarClassRole::V)?,
-            "Hangul V bytes",
-        )?;
-        return consume_hangul_tail(cursor, bytes);
-    }
-    if cursor.has(GraphemeScalarClassRole::Lvt)? {
-        let bytes = cursor.consume()?;
-        return consume_hangul_tail(cursor, bytes);
-    }
-    if cursor.has(GraphemeScalarClassRole::T)? {
-        return consume_while(cursor, GraphemeScalarClassRole::T);
-    }
-    if cursor.has(GraphemeScalarClassRole::Ri)? {
-        let mut bytes = cursor.consume()?;
-        if cursor.has(GraphemeScalarClassRole::Ri)? {
-            bytes = checked_u64_add(bytes, cursor.consume()?, "regional-indicator pair bytes")?;
-        }
-        return Ok(bytes);
-    }
-    if cursor.has(GraphemeScalarClassRole::ExtendedPictographic)? {
-        return consume_extended_pictographic(cursor);
-    }
-    cursor.consume()
-}
 
-fn consume_hangul_tail(cursor: &mut ScalarCursor<'_>, bytes: u64) -> Result<u64, ReduceError> {
-    checked_u64_add(
-        bytes,
-        consume_while(cursor, GraphemeScalarClassRole::T)?,
-        "Hangul T bytes",
-    )
-}
-
-fn consume_extended_pictographic(cursor: &mut ScalarCursor<'_>) -> Result<u64, ReduceError> {
-    let mut bytes = cursor.consume()?;
-    loop {
-        cursor.repetition_test()?;
-        bytes = checked_u64_add(
-            bytes,
-            consume_while(cursor, GraphemeScalarClassRole::Extend)?,
-            "pictographic Extend bytes",
-        )?;
-        if !cursor.has(GraphemeScalarClassRole::Zwj)? {
-            return Ok(bytes);
+    const fn accept(self, class: ScalarClass) -> Option<Self> {
+        match self {
+            Self::Empty => None,
+            Self::Cr if matches!(class, ScalarClass::Lf) => Some(Self::Closed),
+            Self::Prepend if matches!(class, ScalarClass::Prepend) => Some(Self::Prepend),
+            Self::Prepend if class.is_generic_core() => Some(Self::start(class)),
+            Self::HangulL if matches!(class, ScalarClass::L) => Some(Self::HangulL),
+            Self::HangulL if matches!(class, ScalarClass::V | ScalarClass::Lv) => {
+                Some(Self::HangulV)
+            }
+            Self::HangulL if matches!(class, ScalarClass::Lvt) => Some(Self::HangulT),
+            Self::HangulV if matches!(class, ScalarClass::V) => Some(Self::HangulV),
+            Self::HangulV if matches!(class, ScalarClass::T) => Some(Self::HangulT),
+            Self::HangulT if matches!(class, ScalarClass::T) => Some(Self::HangulT),
+            Self::RiOne if matches!(class, ScalarClass::Ri) => Some(Self::RiPair),
+            Self::ExtendedPictographic if matches!(class, ScalarClass::Extend) => {
+                Some(Self::ExtendedPictographicExtend)
+            }
+            Self::ExtendedPictographicExtend if matches!(class, ScalarClass::Extend) => {
+                Some(Self::ExtendedPictographicExtend)
+            }
+            Self::ExtendedPictographic | Self::ExtendedPictographicExtend
+                if matches!(class, ScalarClass::Zwj) =>
+            {
+                Some(Self::ExtendedPictographicZwj)
+            }
+            Self::ExtendedPictographicZwj if matches!(class, ScalarClass::ExtendedPictographic) => {
+                Some(Self::ExtendedPictographic)
+            }
+            Self::ExtendedPictographicZwj if class.is_tail() => Some(Self::Tail),
+            Self::HangulL
+            | Self::HangulV
+            | Self::HangulT
+            | Self::RiOne
+            | Self::RiPair
+            | Self::ExtendedPictographic
+            | Self::ExtendedPictographicExtend
+            | Self::Tail
+                if class.is_tail() =>
+            {
+                Some(Self::Tail)
+            }
+            _ => None,
         }
-        bytes = checked_u64_add(bytes, cursor.consume()?, "pictographic ZWJ bytes")?;
-        if !cursor.has(GraphemeScalarClassRole::ExtendedPictographic)? {
-            return Ok(bytes);
-        }
-        bytes = checked_u64_add(bytes, cursor.consume()?, "pictographic bridge bytes")?;
     }
-}
-
-fn consume_while(
-    cursor: &mut ScalarCursor<'_>,
-    role: GraphemeScalarClassRole,
-) -> Result<u64, ReduceError> {
-    let mut bytes = 0_u64;
-    loop {
-        cursor.repetition_test()?;
-        if !cursor.has(role)? {
-            break;
-        }
-        bytes = checked_u64_add(bytes, cursor.consume()?, "repetition bytes")?;
-    }
-    Ok(bytes)
 }
 
 fn validate_semantics(segments: &[RoleSegment]) -> Result<(), BuildError> {
@@ -1873,11 +1839,6 @@ fn checked_reduce_mul(
         .ok_or(ReduceError::ArithmeticOverflow { computation })
 }
 
-fn checked_u64_add(left: u64, right: u64, computation: &'static str) -> Result<u64, ReduceError> {
-    left.checked_add(right)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })
-}
-
 const fn binary_search_comparison_bound(mut segments: usize) -> usize {
     let mut comparisons = 0_usize;
     while segments != 0 {
@@ -2031,8 +1992,6 @@ mod tests {
         RangeComparisons,
         ScannerSteps,
         RoleProbes,
-        BranchChecks,
-        RepetitionTests,
         MatchEvents,
         Count,
         SpanSum,
@@ -2117,13 +2076,13 @@ mod tests {
             range_comparisons: 30,
             binary_search_comparisons_per_scalar: 5,
             scanner_steps: 7,
-            role_probes: 96,
-            branch_checks: 145,
-            repetition_tests: 49,
+            role_probes: 7,
+            branch_checks: 0,
+            repetition_tests: 0,
             match_events: 6,
             count: 6,
             span_sum: 6,
-            work: 645,
+            work: 403,
             scratch_bytes: 512,
             persistent_bytes: 664,
             peak_bytes: 1_176,
@@ -2174,12 +2133,6 @@ mod tests {
                 limited.max_scanner_steps = one_below(upper.scanner_steps);
             }
             ReduceGate::RoleProbes => limited.max_role_probes = one_below(upper.role_probes),
-            ReduceGate::BranchChecks => {
-                limited.max_branch_checks = one_below(upper.branch_checks);
-            }
-            ReduceGate::RepetitionTests => {
-                limited.max_repetition_tests = one_below(upper.repetition_tests);
-            }
             ReduceGate::MatchEvents => limited.max_match_events = one_below(upper.match_events),
             ReduceGate::Count => limited.max_count = one_below_u64(upper.count),
             ReduceGate::SpanSum => limited.max_span_sum = one_below_u64(upper.span_sum),
@@ -2258,14 +2211,6 @@ mod tests {
                     ReduceError::ScannerStepsLimit { .. }
                 )
                 | (ReduceGate::RoleProbes, ReduceError::RoleProbesLimit { .. })
-                | (
-                    ReduceGate::BranchChecks,
-                    ReduceError::BranchChecksLimit { .. }
-                )
-                | (
-                    ReduceGate::RepetitionTests,
-                    ReduceError::RepetitionTestsLimit { .. }
-                )
                 | (
                     ReduceGate::MatchEvents,
                     ReduceError::MatchEventsLimit { .. }
@@ -2379,8 +2324,6 @@ mod tests {
             ReduceGate::RangeComparisons,
             ReduceGate::ScannerSteps,
             ReduceGate::RoleProbes,
-            ReduceGate::BranchChecks,
-            ReduceGate::RepetitionTests,
             ReduceGate::MatchEvents,
             ReduceGate::Count,
             ReduceGate::SpanSum,
@@ -2414,8 +2357,6 @@ mod tests {
             ReduceGate::RangeComparisons,
             ReduceGate::ScannerSteps,
             ReduceGate::RoleProbes,
-            ReduceGate::BranchChecks,
-            ReduceGate::RepetitionTests,
             ReduceGate::MatchEvents,
             ReduceGate::Count,
             ReduceGate::Work,
@@ -2456,7 +2397,7 @@ mod tests {
     }
 
     #[test]
-    fn max_event_preflight_and_role_probe_adversaries_stay_bounded() {
+    fn max_event_preflight_and_transitions_stay_bounded() {
         let preflight = BuildPreflight::for_range_count(4_096).unwrap();
         assert_eq!(preflight.events, 8_192);
         assert!(preflight.sort_comparisons > preflight.events);
@@ -2468,7 +2409,7 @@ mod tests {
         ));
 
         let plan = plan();
-        let mut observed_role_probes = 0_usize;
+        let mut observed_transitions = 0_usize;
         for haystack in [
             &b"q"[..],
             &b"x"[..],
@@ -2480,13 +2421,14 @@ mod tests {
             let result = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
             let actual = result.accounting.actual;
             let upper = result.accounting.upper_bounds;
-            observed_role_probes = observed_role_probes.max(actual.role_probes);
+            observed_transitions = observed_transitions.max(actual.role_probes);
+            assert_eq!(actual.role_probes, haystack.len() + 1);
             assert!(actual.role_probes <= upper.role_probes);
             assert!(actual.branch_checks <= upper.branch_checks);
             assert!(actual.repetition_tests <= upper.repetition_tests);
             assert!(actual.work <= upper.work);
         }
-        assert!(observed_role_probes > 16);
+        assert!(observed_transitions > 8);
     }
 
     #[test]
@@ -2565,13 +2507,13 @@ mod tests {
                     range_comparisons: 40,
                     binary_search_comparisons_per_scalar: 5,
                     scanner_steps: 9,
-                    role_probes: 128,
-                    branch_checks: 193,
-                    repetition_tests: 65,
+                    role_probes: 9,
+                    branch_checks: 0,
+                    repetition_tests: 0,
                     match_events: 8,
                     count: 8,
                     span_sum: 8,
-                    work: 859,
+                    work: 521,
                     scratch_bytes: 512,
                     persistent_bytes: 664,
                     peak_bytes: 1_176,
@@ -2588,13 +2530,13 @@ mod tests {
                     range_comparisons: 80,
                     binary_search_comparisons_per_scalar: 5,
                     scanner_steps: 17,
-                    role_probes: 256,
-                    branch_checks: 385,
-                    repetition_tests: 129,
+                    role_probes: 17,
+                    branch_checks: 0,
+                    repetition_tests: 0,
                     match_events: 16,
                     count: 16,
                     span_sum: 16,
-                    work: 1_715,
+                    work: 993,
                     scratch_bytes: 512,
                     persistent_bytes: 664,
                     peak_bytes: 1_176,
@@ -2611,13 +2553,13 @@ mod tests {
                     range_comparisons: 160,
                     binary_search_comparisons_per_scalar: 5,
                     scanner_steps: 33,
-                    role_probes: 512,
-                    branch_checks: 769,
-                    repetition_tests: 257,
+                    role_probes: 33,
+                    branch_checks: 0,
+                    repetition_tests: 0,
                     match_events: 32,
                     count: 32,
                     span_sum: 32,
-                    work: 3_427,
+                    work: 1_937,
                     scratch_bytes: 512,
                     persistent_bytes: 664,
                     peak_bytes: 1_176,
@@ -2707,7 +2649,7 @@ mod tests {
 
         let build = plan().build_accounting();
         assert!(matches!(
-            reduce_upper_bounds(usize::MAX / 107 + 1, build),
+            reduce_upper_bounds(usize::MAX / 59 + 1, build),
             Err(ReduceError::ArithmeticOverflow {
                 computation: "execution work upper bound"
             })

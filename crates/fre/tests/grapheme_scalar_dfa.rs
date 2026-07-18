@@ -114,6 +114,42 @@ fn malformed_bytes_resynchronize_exactly_like_regex_bytes() {
 }
 
 #[test]
+fn malformed_bytes_break_every_cluster_join_like_regex_bytes() {
+    let candidate = candidate();
+    let boundaries: &[(&[u8], &[u8])] = &[
+        (b"\r", b"\n"),
+        ("\u{1F1E6}".as_bytes(), "\u{1F1E7}".as_bytes()),
+        ("\u{1100}".as_bytes(), "\u{1161}\u{11A8}".as_bytes()),
+        (
+            "\u{1F600}\u{0300}".as_bytes(),
+            "\u{200D}\u{1F600}".as_bytes(),
+        ),
+        ("\u{0600}".as_bytes(), "a\u{0300}".as_bytes()),
+    ];
+    let malformed: &[&[u8]] = &[
+        b"\xFF",
+        b"\x80",
+        b"\xC0\x80",
+        b"\xE0\x80\x80",
+        b"\xED\xA0\x80",
+        b"\xF4\x90\x80\x80",
+        b"\xC2",
+    ];
+    for &(left, right) in boundaries {
+        for &invalid in malformed {
+            let haystack = [left, invalid, right].concat();
+            assert_eq!(
+                candidate
+                    .count_value(&haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                oracle_count(&haystack),
+                "left={left:?} invalid={invalid:?} right={right:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn non_count_operations_remain_on_the_existing_plan() {
     let compiled = AggregateBuilder::new(GRAPHEME)
         .profile(RustProfile::rebar_1_12_4())
@@ -417,8 +453,6 @@ enum ReduceGate {
     RangeComparisons,
     ScannerSteps,
     RoleProbes,
-    BranchChecks,
-    RepetitionTests,
     MatchEvents,
     Count,
     Work,
@@ -474,8 +508,6 @@ fn facade_propagates_exact_and_one_below_count_limits() {
         ReduceGate::RangeComparisons,
         ReduceGate::ScannerSteps,
         ReduceGate::RoleProbes,
-        ReduceGate::BranchChecks,
-        ReduceGate::RepetitionTests,
         ReduceGate::MatchEvents,
         ReduceGate::Count,
         ReduceGate::Work,
@@ -503,13 +535,6 @@ fn facade_propagates_exact_and_one_below_count_limits() {
             }
             ReduceGate::RoleProbes => {
                 limited.grapheme_scalar_dfa.max_role_probes = one_below(upper.role_probes);
-            }
-            ReduceGate::BranchChecks => {
-                limited.grapheme_scalar_dfa.max_branch_checks = one_below(upper.branch_checks);
-            }
-            ReduceGate::RepetitionTests => {
-                limited.grapheme_scalar_dfa.max_repetition_tests =
-                    one_below(upper.repetition_tests);
             }
             ReduceGate::MatchEvents => {
                 limited.grapheme_scalar_dfa.max_match_events = one_below(upper.match_events);
@@ -552,12 +577,6 @@ fn facade_propagates_exact_and_one_below_count_limits() {
             ) | (
                 ReduceGate::RoleProbes,
                 GraphemeScalarDfaReduceError::RoleProbesLimit { .. }
-            ) | (
-                ReduceGate::BranchChecks,
-                GraphemeScalarDfaReduceError::BranchChecksLimit { .. }
-            ) | (
-                ReduceGate::RepetitionTests,
-                GraphemeScalarDfaReduceError::RepetitionTestsLimit { .. }
             ) | (
                 ReduceGate::MatchEvents,
                 GraphemeScalarDfaReduceError::MatchEventsLimit { .. }
