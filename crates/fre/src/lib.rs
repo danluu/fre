@@ -27,6 +27,11 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_many;
+#[allow(
+    dead_code,
+    reason = "private proof kernel is checkpointed before facade integration"
+)]
+mod capture_noqa;
 mod captures;
 mod finite;
 mod finite_root;
