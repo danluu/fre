@@ -1734,7 +1734,7 @@ mod tests {
         );
         let steady_expectations = performance_expectations(
             "steady-public-operation",
-            "capture-linear-selector-persistent-history",
+            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN,
             12,
         );
         let steady = model_capture_performance_raw_with_measurement(
@@ -2064,7 +2064,9 @@ mod tests {
             r"([a-z][a-z])([a-z])([\r\n])?",
             b"foo foo\r\nZ\r\nfoo\r\nfoo",
         );
-        let grep_expectations = capture_expectations("steady-public-operation", 12);
+        let mut grep_expectations = capture_expectations("steady-public-operation", 12);
+        grep_expectations.plan =
+            Some(rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN.to_string());
         let grep = model_captures_with_measurement(
             &grep_benchmark,
             &grep_expectations,
