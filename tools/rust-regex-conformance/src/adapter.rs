@@ -2550,7 +2550,7 @@ mod tests {
         ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesIsMatch, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            Err(NotApplicableReason::InvalidUtf8Haystack)
         );
 
         let rejected_case = fixture_case(false, true, None);
@@ -2656,10 +2656,16 @@ mod tests {
             execute_case(AdapterSurface::RustBytesCompile, &case, &input),
             AdapterDisposition::Pass { .. }
         ));
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustBytesIsMatch, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
-        );
+        for surface in [
+            AdapterSurface::RustBytesIsMatch,
+            AdapterSurface::RustBytesFindIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
 
         let mut bytes_case = fixture_case(true, false, None);
         bytes_case.bounded_search = true;
