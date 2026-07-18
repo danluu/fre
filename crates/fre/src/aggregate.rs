@@ -60,7 +60,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 17;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 18;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -319,6 +319,11 @@ pub struct AggregateBuildLimits {
     /// Maximum structural HIR/range inspection work for fixed-width class
     /// sandwiches.
     pub max_fixed_class_sandwich_planner_work: usize,
+    /// Maximum allocation-free HIR/range/membership inspection work for the
+    /// direct bounded-affix specialization. This is independent of the legacy
+    /// bounded-context selector so adding the specialization cannot consume a
+    /// caller's previously sufficient bounded-context budget.
+    pub max_bounded_affix_planner_work: usize,
     /// Maximum structural HIR/range/disjointness inspection work for bounded
     /// compound byte-class sequences. This separate quota preserves every
     /// request previously admitted at its exact fixed-sandwich limit.
@@ -356,6 +361,7 @@ impl Default for AggregateBuildLimits {
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
+            max_bounded_affix_planner_work: 4_096,
             max_bounded_class_sequence_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
             max_bounded_context_planner_work: 4_096,
@@ -429,6 +435,9 @@ pub struct AggregateBuildReport {
     /// Fixed-class structural inspection work, including every HIR node and
     /// canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
+    /// Charged direct bounded-affix inspection work, including an ineligible
+    /// inspection followed by another plan.
+    pub bounded_affix_planner_work: usize,
     /// Bounded compound-class structural inspection work, including every
     /// HIR/range visit and admitted disjointness-comparison upper bound.
     pub bounded_class_sequence_planner_work: usize,
@@ -520,6 +529,14 @@ pub enum AggregateBuildError {
     },
     /// Fixed class-sandwich inspection crossed its structural work cap.
     FixedClassSandwichPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
+    /// Direct bounded-affix inspection crossed its independent structural
+    /// work cap.
+    BoundedAffixPlannerWorkLimit {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         needed: usize,
@@ -675,6 +692,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} fixed class-sandwich inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::BoundedAffixPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded-affix inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::BoundedClassSequencePlannerWorkLimit {
                 operation,
                 selection,
@@ -829,6 +855,7 @@ impl std::error::Error for AggregateBuildError {
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
+            | Self::BoundedAffixPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
             | Self::BoundedContextPlannerWorkLimit { .. }
@@ -1293,6 +1320,7 @@ impl AggregateBuilder {
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
+                bounded_affix_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
@@ -1465,6 +1493,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work: work,
                     fixed_class_sandwich_planner_work: 0,
+                    bounded_affix_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1584,6 +1613,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work: work,
+                    bounded_affix_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1692,6 +1722,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
                     bounded_class_sequence_planner_work: work,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1802,6 +1833,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
                     bounded_class_sequence_planner_work,
                     prefix_class_alternation_planner_work: work,
                     bounded_context_planner_work: 0,
@@ -1831,22 +1863,24 @@ impl AggregateBuilder {
             && selection == AggregatePlanSelection::Auto
             && operation == AggregateOperation::Count
         {
-            let affix = inspect_bounded_affix(&rust.hir, limits.max_bounded_context_planner_work)
+            let affix = inspect_bounded_affix(&rust.hir, limits.max_bounded_affix_planner_work)
                 .map_err(|error| match error {
-                BoundedContextInspectionError::WorkLimit { needed, limit } => {
-                    AggregateBuildError::BoundedContextPlannerWorkLimit {
-                        operation,
-                        selection,
-                        needed,
-                        limit,
+                    BoundedContextInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::BoundedAffixPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
                     }
-                }
-                BoundedContextInspectionError::Overflow => AggregateBuildError::InternalInvariant {
-                    operation,
-                    selection,
-                    detail: "bounded-affix inspection accounting overflow",
-                },
-            })?;
+                    BoundedContextInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded-affix inspection accounting overflow",
+                        }
+                    }
+                })?;
             match affix {
                 BoundedAffixInspection::Eligible {
                     left,
@@ -1901,9 +1935,10 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
+                        bounded_affix_planner_work: work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
-                        bounded_context_planner_work: work,
+                        bounded_context_planner_work: 0,
                         finite_planner_work: 0,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -1936,28 +1971,24 @@ impl AggregateBuilder {
                 AggregateOperation::Compile | AggregateOperation::Count
             ) {
             Some(
-                inspect_bounded_context(
-                    &rust.hir,
-                    bounded_affix_planner_work,
-                    limits.max_bounded_context_planner_work,
-                )
-                .map_err(|error| match error {
-                    BoundedContextInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::BoundedContextPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                inspect_bounded_context(&rust.hir, limits.max_bounded_context_planner_work)
+                    .map_err(|error| match error {
+                        BoundedContextInspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::BoundedContextPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    BoundedContextInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "bounded-context inspection accounting overflow",
+                        BoundedContextInspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded-context inspection accounting overflow",
+                            }
                         }
-                    }
-                })?,
+                    })?,
             )
         } else {
             None
@@ -2021,6 +2052,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work,
                     bounded_class_sequence_planner_work,
                     prefix_class_alternation_planner_work,
                     bounded_context_planner_work: work,
@@ -2178,6 +2210,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
+                        bounded_affix_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
@@ -2312,6 +2345,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
+                        bounded_affix_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
@@ -2385,6 +2419,7 @@ impl AggregateBuilder {
             planner_work,
             unicode_scalar_planner_work,
             fixed_class_sandwich_planner_work,
+            bounded_affix_planner_work,
             bounded_class_sequence_planner_work,
             prefix_class_alternation_planner_work,
             bounded_context_planner_work,
@@ -3162,10 +3197,9 @@ fn bounded_affix_class_contains(
 )]
 fn inspect_bounded_context(
     hir: &Hir,
-    initial_work: usize,
     limit: usize,
 ) -> Result<BoundedContextInspection<'_>, BoundedContextInspectionError> {
-    let mut work = initial_work;
+    let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
     let hir = peel_bounded_context_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;

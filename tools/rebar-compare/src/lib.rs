@@ -87,7 +87,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v6";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v7";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -146,6 +146,8 @@ pub struct RunLimits {
     /// Maximum structural inspection work for the capture-specific uniform
     /// scalar-alternation proof.
     pub fre_capture_scalar_planner_work: usize,
+    /// Maximum independent bounded-affix structural inspection work.
+    pub fre_bounded_affix_planner_work: usize,
     /// Maximum allocation-free canonical-HIR literal inspection work.
     pub fre_literal_planner_work: usize,
     /// Maximum exact-literal needle bytes retained by one aggregate plan.
@@ -217,6 +219,7 @@ impl Default for RunLimits {
             fre_aggregate_program_bytes: 16 * 1_048_576,
             fre_capture_selector_program_bytes: 32 * 1_048_576,
             fre_capture_scalar_planner_work: 8_192,
+            fre_bounded_affix_planner_work: 4_096,
             fre_literal_planner_work: 4_096,
             fre_literal_build_needle_bytes: 32 * 1_048_576,
             fre_literal_build_work: 64 * 1_048_576,
@@ -3339,6 +3342,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_unicode_scalar_planner_work: limits.fre_unicode_scalar_planner_work,
         max_fixed_class_sandwich_planner_work: limits.fre_unicode_scalar_planner_work,
         max_bounded_class_sequence_planner_work: limits.fre_unicode_scalar_planner_work,
+        max_bounded_affix_planner_work: limits.fre_bounded_affix_planner_work,
         max_prefix_class_alternation_planner_work: limits.fre_literal_planner_work,
         max_bounded_context_planner_work: limits.fre_unicode_scalar_planner_work,
         max_finite_planner_work: u64::try_from(limits.fre_aggregate_compile_work)
@@ -4629,6 +4633,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::LiteralPlannerWorkLimit { .. }
         | AggregateBuildError::UnicodeScalarPlannerWorkLimit { .. }
         | AggregateBuildError::FixedClassSandwichPlannerWorkLimit { .. }
+        | AggregateBuildError::BoundedAffixPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedClassSequencePlannerWorkLimit { .. }
         | AggregateBuildError::PrefixClassAlternationPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedContextPlannerWorkLimit { .. }
@@ -6997,7 +7002,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v6"
+            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v7"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
