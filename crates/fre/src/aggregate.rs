@@ -576,6 +576,7 @@ impl AggregateBuildReport {
                         <= compile.required_internal_anchor_build_work_upper_bound
                     && compile.required_internal_anchor_persistent_bytes > 0
                     && compile == sealed.compile
+                    && self.retained_capacity_bytes == compile.program_bytes
             }
             None => absent,
         }

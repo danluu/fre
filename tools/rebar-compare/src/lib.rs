@@ -10465,6 +10465,22 @@ mod tests {
         assert_eq!(input.haystack.len(), 6_839_410);
         assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
 
+        let qualified = AggregateBuilder::new(&input.patterns[0])
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&limits))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .expect("build authenticated URI required-anchor plan");
+        let report = qualified.build_report();
+        assert!(report.authenticates_required_internal_anchor_identity());
+        let AggregateBuildAccounting::Continuation(compile) = report.build else {
+            panic!("authenticated URI must use continuation accounting");
+        };
+        assert_eq!(compile.required_internal_anchors, 1);
+        assert_eq!(compile.required_internal_anchor_bytes, 3);
+        assert_eq!(compile.required_internal_anchor_optional_stages, 2);
+
         let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
         assert_eq!(rust, job.expected.count);
         let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
@@ -14467,6 +14483,12 @@ mod tests {
         assert_eq!(capped.max_output_bytes, 0);
     }
 
+    fn assert_required_anchor_report_rejected(report: &AggregateBuildReport) {
+        assert!(!report.has_closed_required_internal_anchor_identity());
+        assert!(require_closed_required_internal_anchor_identity(report).is_err());
+        assert!(aggregate_run_limits(128, report, &RunLimits::default()).is_err());
+    }
+
     #[test]
     fn required_anchor_public_private_identity_is_fail_closed() {
         let regex = AggregateBuilder::new(r"[\w]+://[^/\s?#]+[^\s?#]+(?:\?[^\s#]*)?(?:#[^\s]*)?")
@@ -14481,17 +14503,41 @@ mod tests {
         require_closed_required_internal_anchor_identity(report).unwrap();
         aggregate_run_limits(128, report, &RunLimits::default()).unwrap();
 
-        let mut forged = report.clone();
-        let AggregateBuildAccounting::Continuation(ref mut compile) = forged.build else {
-            panic!("URI must retain continuation accounting");
-        };
-        compile.required_internal_anchor_bytes = compile
-            .required_internal_anchor_bytes
-            .checked_sub(1)
+        for field in 0..6 {
+            let mut forged = report.clone();
+            let AggregateBuildAccounting::Continuation(ref mut compile) = forged.build else {
+                panic!("URI must retain continuation accounting");
+            };
+            match field {
+                0 => compile.required_internal_anchors += 1,
+                1 => compile.required_internal_anchor_bytes += 1,
+                2 => compile.required_internal_anchor_optional_stages += 1,
+                3 => compile.required_internal_anchor_build_work += 1,
+                4 => compile.required_internal_anchor_build_work_upper_bound += 1,
+                5 => compile.required_internal_anchor_persistent_bytes += 1,
+                _ => unreachable!(),
+            }
+            assert_required_anchor_report_rejected(&forged);
+        }
+        let mut retained = report.clone();
+        retained.retained_capacity_bytes += 1;
+        assert_required_anchor_report_rejected(&retained);
+
+        let other = AggregateBuilder::new(r"a+Xb+[ab]+")
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
             .unwrap();
-        assert!(!forged.has_closed_required_internal_anchor_identity());
-        assert!(require_closed_required_internal_anchor_identity(&forged).is_err());
-        assert!(aggregate_run_limits(128, &forged, &RunLimits::default()).is_err());
+        let mut program = report.clone();
+        program.plan_identity = other.build_report().plan_identity;
+        assert_required_anchor_report_rejected(&program);
+        let mut transplanted = report.clone();
+        transplanted.build = other.build_report().build;
+        transplanted.plan_identity = other.build_report().plan_identity;
+        transplanted.retained_capacity_bytes = other.build_report().retained_capacity_bytes;
+        assert_required_anchor_report_rejected(&transplanted);
     }
 
     #[test]
