@@ -9,13 +9,28 @@ use fre_kernels::{
     LiteralSetPlan, LiteralSetSearchLimits,
 };
 use fre_syntax::CacheKey;
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Versioned algorithm identity for the required-any-literal proof.
-pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v2";
+pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v3";
 
 const MAX_INLINE_NEEDLES: usize = 64;
 const NEEDLE_OFFSET_SLOTS: usize = MAX_INLINE_NEEDLES + 1;
+
+#[derive(Clone, Copy)]
+enum RawNeedle<'hir> {
+    Literal(&'hir [u8]),
+    Byte([u8; 1]),
+}
+
+impl RawNeedle<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Literal(bytes) => bytes,
+            Self::Byte(byte) => byte,
+        }
+    }
+}
 
 #[cfg(test)]
 mod exact_allocation_probe {
@@ -321,14 +336,14 @@ fn build_from_hir_metered(
         });
     }
 
-    let canonical_scratch = size_of::<[&[u8]; MAX_INLINE_NEEDLES]>()
+    let canonical_scratch = size_of::<[RawNeedle<'static>; MAX_INLINE_NEEDLES]>()
         .checked_add(size_of::<[bool; MAX_INLINE_NEEDLES]>())
         .ok_or(CaptureRequiredLiteralBuildError::Overflow(
             "canonical antichain scratch",
         ))?;
     check_limit("scratch bytes", canonical_scratch, limits.max_scratch_bytes)?;
 
-    let mut raw_needles = [&[][..]; MAX_INLINE_NEEDLES];
+    let mut raw_needles = [RawNeedle::Literal(&[]); MAX_INLINE_NEEDLES];
     let mut raw_count = 0_usize;
     collect_refs(hir, 1, meter, &mut raw_needles, &mut raw_count)?;
     if raw_count != raw_metrics.needles {
@@ -338,14 +353,16 @@ fn build_from_hir_metered(
     }
     let (retained, effective) = effective_antichain(&raw_needles[..raw_count], meter)?;
     check_metric_limits(effective, limits)?;
-    if effective.needles < 2 || effective.minimum_bytes < 2 {
+    if effective.needles < 2 {
         return Ok(None);
     }
 
     let reference_scratch = effective.needles.checked_mul(size_of::<&[u8]>()).ok_or(
         CaptureRequiredLiteralBuildError::Overflow("exact reference scratch"),
     )?;
-    let scratch_bytes = canonical_scratch.max(reference_scratch);
+    let scratch_bytes = canonical_scratch.checked_add(reference_scratch).ok_or(
+        CaptureRequiredLiteralBuildError::Overflow("combined canonical and reference scratch"),
+    )?;
     check_limit("scratch bytes", scratch_bytes, limits.max_scratch_bytes)?;
 
     let needle_arc_block = arc_block_bytes::<CaptureRequiredLiteralNeedles>()?;
@@ -408,7 +425,7 @@ fn build_from_hir_metered(
             continue;
         }
         offsets[effective_index] = arena.len();
-        for &byte in *needle {
+        for &byte in needle.bytes() {
             arena.try_push(byte).map_err(|_| {
                 CaptureRequiredLiteralBuildError::InternalInvariant(
                     "admitted exact needle arena rejected a byte",
@@ -612,17 +629,22 @@ fn measure(
                 minimum_bytes: literal.0.len(),
             }))
         }
+        HirKind::Class(class) => measure_ascii_class(class, meter),
         HirKind::Capture(capture) => measure(&capture.sub, next_depth(depth)?, meter),
         HirKind::Repetition(repetition) if repetition.min > 0 => {
             measure(&repetition.sub, next_depth(depth)?, meter)
         }
         HirKind::Concat(children) => {
+            let mut fallback = None;
             for child in children {
                 if let Some(metrics) = measure(child, next_depth(depth)?, meter)? {
-                    return Ok(Some(metrics));
+                    if metrics.minimum_bytes >= 2 {
+                        return Ok(Some(metrics));
+                    }
+                    fallback.get_or_insert(metrics);
                 }
             }
-            Ok(None)
+            Ok(fallback)
         }
         HirKind::Alternation(children) if !children.is_empty() => {
             let mut needles = 0_usize;
@@ -650,11 +672,137 @@ fn measure(
     }
 }
 
+fn measure_ascii_class(
+    class: &Class,
+    meter: &mut Meter,
+) -> Result<Option<Metrics>, CaptureRequiredLiteralBuildError> {
+    let mut bytes = 0_usize;
+    match class {
+        Class::Unicode(class) => {
+            for range in class.ranges() {
+                meter.charge(1)?;
+                let start = u32::from(range.start());
+                let end = u32::from(range.end());
+                if end > 0x7F {
+                    return Ok(None);
+                }
+                let width = inclusive_class_width(u64::from(start), u64::from(end))?;
+                meter.charge(width)?;
+                bytes =
+                    bytes
+                        .checked_add(width)
+                        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                            "ASCII class bytes",
+                        ))?;
+            }
+        }
+        Class::Bytes(class) => {
+            for range in class.ranges() {
+                meter.charge(1)?;
+                let width =
+                    inclusive_class_width(u64::from(range.start()), u64::from(range.end()))?;
+                meter.charge(width)?;
+                bytes =
+                    bytes
+                        .checked_add(width)
+                        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                            "byte class bytes",
+                        ))?;
+            }
+        }
+    }
+    if bytes > MAX_INLINE_NEEDLES {
+        return Ok(None);
+    }
+    Ok((bytes != 0).then_some(Metrics {
+        needles: bytes,
+        bytes,
+        minimum_bytes: 1,
+    }))
+}
+
+fn collect_ascii_class(
+    class: &Class,
+    meter: &mut Meter,
+    output: &mut [RawNeedle<'_>; MAX_INLINE_NEEDLES],
+    count: &mut usize,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    match class {
+        Class::Unicode(class) => {
+            for range in class.ranges() {
+                meter.charge(1)?;
+                let start = u32::from(range.start());
+                let end = u32::from(range.end());
+                if end > 0x7F {
+                    return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+                        "proved ASCII class contains a non-ASCII scalar",
+                    ));
+                }
+                let width = inclusive_class_width(u64::from(start), u64::from(end))?;
+                meter.charge(width)?;
+                for value in start..=end {
+                    push_raw_byte(
+                        output,
+                        count,
+                        u8::try_from(value).map_err(|_| {
+                            CaptureRequiredLiteralBuildError::InternalInvariant(
+                                "proved ASCII scalar does not fit one byte",
+                            )
+                        })?,
+                    )?;
+                }
+            }
+        }
+        Class::Bytes(class) => {
+            for range in class.ranges() {
+                meter.charge(1)?;
+                let width =
+                    inclusive_class_width(u64::from(range.start()), u64::from(range.end()))?;
+                meter.charge(width)?;
+                for byte in range.start()..=range.end() {
+                    push_raw_byte(output, count, byte)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inclusive_class_width(start: u64, end: u64) -> Result<usize, CaptureRequiredLiteralBuildError> {
+    let width = end
+        .checked_sub(start)
+        .and_then(|width| width.checked_add(1))
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "inclusive class width",
+        ))?;
+    usize::try_from(width)
+        .map_err(|_| CaptureRequiredLiteralBuildError::Overflow("inclusive class width"))
+}
+
+fn push_raw_byte(
+    output: &mut [RawNeedle<'_>; MAX_INLINE_NEEDLES],
+    count: &mut usize,
+    byte: u8,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    if *count >= MAX_INLINE_NEEDLES {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "measured raw needles exceed inline storage",
+        ));
+    }
+    output[*count] = RawNeedle::Byte([byte]);
+    *count = count
+        .checked_add(1)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "raw needle reference count",
+        ))?;
+    Ok(())
+}
+
 fn collect_refs<'hir>(
     hir: &'hir Hir,
     depth: usize,
     meter: &mut Meter,
-    output: &mut [&'hir [u8]; MAX_INLINE_NEEDLES],
+    output: &mut [RawNeedle<'hir>; MAX_INLINE_NEEDLES],
     count: &mut usize,
 ) -> Result<(), CaptureRequiredLiteralBuildError> {
     meter.enter(depth)?;
@@ -668,7 +816,7 @@ fn collect_refs<'hir>(
                     "measured raw needles exceed inline reference storage",
                 ));
             }
-            output[*count] = literal.0.as_ref();
+            output[*count] = RawNeedle::Literal(literal.0.as_ref());
             *count = count
                 .checked_add(1)
                 .ok_or(CaptureRequiredLiteralBuildError::Overflow(
@@ -676,6 +824,7 @@ fn collect_refs<'hir>(
                 ))?;
             Ok(())
         }
+        HirKind::Class(class) => collect_ascii_class(class, meter, output, count),
         HirKind::Capture(capture) => {
             collect_refs(&capture.sub, next_depth(depth)?, meter, output, count)
         }
@@ -683,14 +832,24 @@ fn collect_refs<'hir>(
             collect_refs(&repetition.sub, next_depth(depth)?, meter, output, count)
         }
         HirKind::Concat(children) => {
+            let mut fallback = None;
             for child in children {
-                if measure(child, next_depth(depth)?, meter)?.is_some() {
-                    return collect_refs(child, next_depth(depth)?, meter, output, count);
+                if let Some(metrics) = measure(child, next_depth(depth)?, meter)? {
+                    if metrics.minimum_bytes >= 2 {
+                        return collect_refs(child, next_depth(depth)?, meter, output, count);
+                    }
+                    fallback.get_or_insert(child);
                 }
             }
-            Err(CaptureRequiredLiteralBuildError::InternalInvariant(
-                "proved concat lost its required literal",
-            ))
+            collect_refs(
+                fallback.ok_or(CaptureRequiredLiteralBuildError::InternalInvariant(
+                    "proved concat lost its required literal",
+                ))?,
+                next_depth(depth)?,
+                meter,
+                output,
+                count,
+            )
         }
         HirKind::Alternation(children) => {
             for child in children {
@@ -705,7 +864,7 @@ fn collect_refs<'hir>(
 }
 
 fn effective_antichain(
-    raw: &[&[u8]],
+    raw: &[RawNeedle<'_>],
     meter: &mut Meter,
 ) -> Result<([bool; MAX_INLINE_NEEDLES], Metrics), CaptureRequiredLiteralBuildError> {
     let mut retained = [true; MAX_INLINE_NEEDLES];
@@ -719,19 +878,21 @@ fn effective_antichain(
             // One pair visit and both length inspections are admitted before
             // choosing the only comparison that can remove a redundant item.
             meter.charge(3)?;
-            match raw[left].len().cmp(&raw[right].len()) {
+            let left_bytes = raw[left].bytes();
+            let right_bytes = raw[right].bytes();
+            match left_bytes.len().cmp(&right_bytes.len()) {
                 core::cmp::Ordering::Equal => {
-                    if equal_metered(raw[left], raw[right], meter)? {
+                    if equal_metered(left_bytes, right_bytes, meter)? {
                         remove_metered(&mut retained, right, meter)?;
                     }
                 }
                 core::cmp::Ordering::Less => {
-                    if contains_metered(raw[right], raw[left], meter)? {
+                    if contains_metered(right_bytes, left_bytes, meter)? {
                         remove_metered(&mut retained, right, meter)?;
                     }
                 }
                 core::cmp::Ordering::Greater => {
-                    if contains_metered(raw[left], raw[right], meter)? {
+                    if contains_metered(left_bytes, right_bytes, meter)? {
                         remove_metered(&mut retained, left, meter)?;
                     }
                 }
@@ -753,13 +914,10 @@ fn effective_antichain(
             .ok_or(CaptureRequiredLiteralBuildError::Overflow(
                 "effective needle count",
             ))?;
-        bytes =
-            bytes
-                .checked_add(needle.len())
-                .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-                    "effective needle bytes",
-                ))?;
-        minimum_bytes = minimum_bytes.min(needle.len());
+        bytes = bytes.checked_add(needle.bytes().len()).ok_or(
+            CaptureRequiredLiteralBuildError::Overflow("effective needle bytes"),
+        )?;
+        minimum_bytes = minimum_bytes.min(needle.bytes().len());
     }
     if needles == 0 {
         return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
@@ -910,8 +1068,16 @@ mod tests {
         pattern: &str,
         limits: CaptureRequiredLiteralBuildLimits,
     ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
+        build_detailed_with_unicode(pattern, false, limits)
+    }
+
+    fn build_detailed_with_unicode(
+        pattern: &str,
+        unicode: bool,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
         let mut profile = RustProfile::rebar_1_12_4();
-        profile.options.unicode = false;
+        profile.options.unicode = unicode;
         let parsed = fre_syntax::parse(ParseRequest::rust(
             pattern,
             CompatibilityProfile::RustBytes(profile),
@@ -969,6 +1135,192 @@ mod tests {
                 .unwrap()
                 .plan
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn small_mandatory_ascii_classes_form_exact_one_byte_alternatives() {
+        let plan = build(
+            r"(?:[0-9]x|[A-F]y)+",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("mandatory small ASCII classes");
+        let expected = (b'0'..=b'9')
+            .chain(b'A'..=b'F')
+            .map(|byte| vec![byte])
+            .collect::<Vec<_>>();
+        assert_eq!(owned_needles(&plan), expected);
+        assert_eq!(plan.build_report().accounting.minimum_needle_bytes, 1);
+
+        for (haystack, candidate) in [
+            (b"none".as_slice(), false),
+            (b"value=5".as_slice(), true),
+            (b"value=B".as_slice(), true),
+        ] {
+            assert_eq!(
+                plan.is_candidate(haystack, CaptureRequiredLiteralRunLimits::default())
+                    .unwrap()
+                    .candidate,
+                candidate
+            );
+        }
+
+        let baseline = plan
+            .is_candidate(b"none", CaptureRequiredLiteralRunLimits::default())
+            .unwrap();
+        let exact = baseline.accounting.transitions_upper_bound;
+        assert_eq!(
+            plan.is_candidate(
+                b"none",
+                CaptureRequiredLiteralRunLimits {
+                    max_transitions: exact,
+                },
+            )
+            .unwrap()
+            .accounting,
+            baseline.accounting
+        );
+        assert!(matches!(
+            plan.is_candidate(
+                b"none",
+                CaptureRequiredLiteralRunLimits {
+                    max_transitions: exact - 1,
+                },
+            ),
+            Err(CaptureRequiredLiteralSearchError {
+                source: LiteralSetError::TransitionLimit { needed, limit },
+                ..
+            }) if needed == exact && limit == exact - 1
+        ));
+    }
+
+    #[test]
+    fn concat_prefers_multi_byte_proofs_and_skips_ineligible_classes() {
+        let fallback = build(
+            r"[\x00-\xFF](?:AB|CD)",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("oversized class must not hide a later bounded proof");
+        assert_eq!(
+            owned_needles(&fallback),
+            vec![b"AB".to_vec(), b"CD".to_vec()]
+        );
+
+        let preferred = build(
+            r"[0-9](?:AB|CD)",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("a later multi-byte proof must outrank a small class");
+        assert_eq!(
+            owned_needles(&preferred),
+            vec![b"AB".to_vec(), b"CD".to_vec()]
+        );
+
+        let unicode_fallback = build_detailed_with_unicode(
+            r"[0-9\u{80}](?:AB|CD)",
+            true,
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap_or_else(|failure| panic!("Unicode fallback build failed: {}", failure.source))
+        .plan
+        .expect("multi-byte Unicode class must not become a raw-byte proof");
+        assert_eq!(
+            owned_needles(&unicode_fallback),
+            vec![b"AB".to_vec(), b"CD".to_vec()]
+        );
+    }
+
+    #[test]
+    fn unicode_ascii_and_raw_byte_classes_are_malformed_safe() {
+        let unicode_ascii = build_detailed_with_unicode(
+            r"[A-B]",
+            true,
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap_or_else(|failure| panic!("Unicode ASCII class build failed: {}", failure.source))
+        .plan
+        .expect("two-scalar Unicode ASCII class");
+        assert!(
+            !unicode_ascii
+                .is_candidate(b"\xFF", CaptureRequiredLiteralRunLimits::default())
+                .unwrap()
+                .candidate
+        );
+        assert!(
+            unicode_ascii
+                .is_candidate(b"\xFFA", CaptureRequiredLiteralRunLimits::default())
+                .unwrap()
+                .candidate
+        );
+
+        let byte_class = build(r"[\x80-\x81]", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("two-byte raw class");
+        assert_eq!(owned_needles(&byte_class), vec![vec![0x80], vec![0x81]]);
+        assert!(
+            byte_class
+                .is_candidate(b"\xFF\x80", CaptureRequiredLiteralRunLimits::default())
+                .unwrap()
+                .candidate
+        );
+    }
+
+    #[test]
+    fn ascii_class_capacity_and_planner_work_are_exactly_bounded() {
+        let at_capacity = build(r"[\x00-\x3F]", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("64-byte class is within inline capacity");
+        let accounting = at_capacity.build_report().accounting;
+        assert_eq!(accounting.raw_needles, MAX_INLINE_NEEDLES);
+        assert_eq!(accounting.needles, MAX_INLINE_NEEDLES);
+        assert_eq!(accounting.raw_needle_bytes, MAX_INLINE_NEEDLES);
+        assert_eq!(accounting.needle_bytes, MAX_INLINE_NEEDLES);
+
+        let exact = CaptureRequiredLiteralBuildLimits {
+            max_planner_work: accounting.planner_work,
+            ..CaptureRequiredLiteralBuildLimits::default()
+        };
+        assert_eq!(
+            build(r"[\x00-\x3F]", exact)
+                .expect("exact class planner-work limit")
+                .plan
+                .expect("exact limit retains class plan")
+                .build_report()
+                .accounting
+                .planner_work,
+            accounting.planner_work
+        );
+
+        let mut one_below = exact;
+        one_below.max_planner_work -= 1;
+        exact_allocation_probe::reset();
+        let refusal = build_detailed(r"[\x00-\x3F]", one_below)
+            .err()
+            .expect("one-below class planner work must refuse");
+        assert!(matches!(
+            refusal.source,
+            CaptureRequiredLiteralBuildError::Resource {
+                resource: "planner work",
+                required,
+                limit,
+            } if required == accounting.planner_work && limit == accounting.planner_work - 1
+        ));
+        assert_eq!(exact_allocation_probe::calls(), 0);
+
+        assert!(
+            build(r"[\x00-\x40]", CaptureRequiredLiteralBuildLimits::default())
+                .unwrap()
+                .plan
+                .is_none(),
+            "65-byte class exceeds inline capacity without partially enabling a plan"
         );
     }
 

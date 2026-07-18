@@ -33,6 +33,53 @@ fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
         .sum()
 }
 
+#[test]
+fn required_ascii_class_prefilter_does_not_bypass_aggregate_result_limits() {
+    let regex = CaptureBuilder::new(r"([0-9])|x(?:[0-9])")
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .limits(CaptureBuildLimits {
+            required_literal: Some(CaptureRequiredLiteralBuildLimits::default()),
+            ..CaptureBuildLimits::default()
+        })
+        .build()
+        .expect("nonuniform mandatory-class capture plan");
+    assert_eq!(
+        regex.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorPersistentHistory
+    );
+    let prefilter = regex
+        .required_literal_plan()
+        .expect("mandatory ASCII class prefilter");
+    assert!(
+        prefilter
+            .is_candidate(b"7", CaptureRequiredLiteralRunLimits { max_transitions: 2 })
+            .expect("exact prefilter transition limit")
+            .candidate
+    );
+
+    let error = regex
+        .count_captures(
+            b"7",
+            CaptureRunLimits {
+                aggregate: CaptureAggregateLimits {
+                    max_results: 0,
+                    ..CaptureAggregateLimits::default()
+                },
+                ..CaptureRunLimits::default()
+            },
+        )
+        .expect_err("one result must not pass a zero aggregate-result limit");
+    assert!(matches!(
+        error.source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::Results,
+            required: 1,
+            limit: 0,
+        })
+    ));
+}
+
 fn assert_count(pattern: &str, haystack: &[u8]) {
     let regex = CaptureBuilder::new(pattern)
         .unicode(false)
