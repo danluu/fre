@@ -7652,6 +7652,43 @@ mod tests {
         }
     }
 
+    fn fn_predicate_direct_receipt(
+        haystack: &[u8],
+        limits: &RunLimits,
+    ) -> fre::LineCaptureRunReport {
+        let plan = LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
+            .profile(rebar_profile())
+            .unicode(false)
+            .build()
+            .expect("exact allocation-free separated-fields plan");
+        let reducer_limit = usize::try_from(limits.reducer_steps).expect("reducer limit usize");
+        let report = plan
+            .grep_capture_count(
+                haystack,
+                LineCaptureRunLimits {
+                    max_work: limits.fre_aggregate_operation_work,
+                    max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
+                    max_capture_count: reducer_limit,
+                    max_reducer_events: reducer_limit,
+                },
+            )
+            .expect("direct fn-predicate resource receipt");
+        assert_eq!(haystack.len(), 7_384_531);
+        assert_eq!(report.work, 88_614_373);
+        assert_eq!(report.actual_work, 81_447_534);
+        assert_eq!(report.actual_input_loads, haystack.len());
+        assert_eq!(report.prospective_matches, 369_226);
+        assert_eq!(report.prospective_capture_count, 1_476_904);
+        assert_eq!(report.prospective_reducer_events, 8_861_435);
+        assert_eq!((report.lines, report.matches), (239_963, 229));
+        assert_eq!(
+            (report.capture_count, report.reducer_events),
+            (916, 240_879)
+        );
+        assert_eq!((report.scratch_bytes, report.output_bytes), (0, 0));
+        report
+    }
+
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_program_state_frontier_nine_row_sentinel() {
@@ -8088,6 +8125,157 @@ mod tests {
             },
         );
         print_ruff_hard_canary_receipt(&manifest_hash, JOB_ID, rust, &candidate, build, &direct);
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_fn_predicate_real_row_canary() {
+        const JOB_ID: &str = "opt/onepass/fn-predicate@rust/regex";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact fn-predicate row");
+        assert!(matching.next().is_none(), "duplicate fn-predicate row");
+        assert_eq!(job.model, "grep-captures");
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 916);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader
+            .load(job)
+            .expect("load authenticated fn-predicate row");
+        assert_eq!(
+            input.patterns,
+            [ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN.to_string()]
+        );
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let direct = fn_predicate_direct_receipt(&input.haystack, &limits);
+
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE fn-predicate facade result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN)
+        );
+        let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+            false,
+            false,
+            input.haystack.len(),
+            RunLimits {
+                fre_capture_scalar_planner_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK,
+                fre_aggregate_operation_work: direct.work,
+                fre_aggregate_sequential_bytes: direct.sequential_bytes,
+                reducer_steps: u64::try_from(direct.prospective_reducer_events)
+                    .expect("reducer events u64"),
+                ..RunLimits::default()
+            },
+        )
+        .expect("retained fn-predicate lifecycle");
+        assert_eq!(
+            lifecycle.plan(),
+            CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
+        );
+        assert_eq!(lifecycle.execute(&input.haystack).expect("first"), rust);
+        assert_eq!(lifecycle.execute(&input.haystack).expect("steady"), rust);
+        println!(
+            "fn-predicate-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={} work={} actual_work={} bytes={} loads={} matches={} captures={} lines={} events={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan"),
+            direct.work,
+            direct.actual_work,
+            direct.sequential_bytes,
+            direct.actual_input_loads,
+            direct.matches,
+            direct.capture_count,
+            direct.lines,
+            direct.reducer_events,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_fn_predicate_nearest_controls_screen() {
+        const ROWS: [(&str, u64); 5] = [
+            ("opt/onepass/fn-predicate@rust/regex", 916),
+            ("opt/onepass/first-three-words-english@rust/regex", 35_128),
+            ("opt/onepass/first-three-words-russian@rust/regex", 19_224),
+            ("opt/onepass/word-boundary-english@rust/regex", 579),
+            ("opt/onepass/word-boundary-russian@rust/regex", 873),
+        ];
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let mut seen = BTreeSet::new();
+        for job in manifest
+            .jobs
+            .iter()
+            .filter(|job| ROWS.iter().any(|(expected_id, _)| job.id == *expected_id))
+        {
+            let expected = ROWS
+                .iter()
+                .find_map(|(id, count)| (job.id == *id).then_some(*count))
+                .expect("selected exact row");
+            assert!(seen.insert(job.id.as_str()), "duplicate row {}", job.id);
+            assert_eq!(job.expected.count, expected, "{}", job.id);
+            let input = loader.load(job).expect("load exact onepass control");
+            let rust = rust_reducer(job, &input, &limits).expect("pinned Rust control result");
+            let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+                .expect("FRE onepass control result");
+            assert_eq!(rust, expected, "{}", job.id);
+            assert_eq!(candidate.actual, expected, "{}", job.id);
+            let plan = candidate.plan.as_deref().expect("executed plan");
+            if job.id == ROWS[0].0 {
+                assert_eq!(plan, CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN);
+            } else {
+                assert_ne!(plan, CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN);
+            }
+            println!(
+                "fn-predicate-control-screen manifest_sha256={manifest_hash} job={} unicode={} expected={expected} rust={rust} fre={} plan={plan}",
+                job.id, job.regex.unicode, candidate.actual,
+            );
+        }
+        assert_eq!(seen.len(), ROWS.len());
     }
 
     #[derive(Clone, Copy)]
