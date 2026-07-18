@@ -1408,6 +1408,7 @@ impl AggregateBuilder {
                 detail: "Rust bytes request produced a non-Rust canonical pattern",
             });
         };
+        let minimum_match_bytes = rust.hir.properties().minimum_len();
         let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
             AggregateBuildError::InternalInvariant {
                 operation,
@@ -1535,6 +1536,7 @@ impl AggregateBuilder {
             };
             return Ok(AggregatePlan {
                 engine: AggregateEngine::ExactLiteral(engine),
+                minimum_match_bytes,
                 limits,
                 report,
             });
@@ -1721,6 +1723,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::UnicodeScalar(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -1846,6 +1849,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::FixedClassSandwich(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -2024,6 +2028,7 @@ impl AggregateBuilder {
             };
             return Ok(AggregatePlan {
                 engine: AggregateEngine::GraphemeScalarDfa(engine),
+                minimum_match_bytes,
                 limits,
                 report,
             });
@@ -2139,6 +2144,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedClassSequence(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -2246,6 +2252,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedSeparatedFields(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -2362,6 +2369,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::PrefixClassAlternation(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -2467,6 +2475,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine: AggregateEngine::BoundedContext(engine),
+                        minimum_match_bytes,
                         limits,
                         report,
                     });
@@ -2587,6 +2596,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedContext(engine),
+                    minimum_match_bytes,
                     limits,
                     report,
                 });
@@ -2754,6 +2764,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine,
+                        minimum_match_bytes,
                         limits,
                         report,
                     });
@@ -2892,6 +2903,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine,
+                        minimum_match_bytes,
                         limits,
                         report,
                     });
@@ -2966,6 +2978,7 @@ impl AggregateBuilder {
         };
         Ok(AggregatePlan {
             engine: AggregateEngine::Continuation(engine),
+            minimum_match_bytes,
             limits,
             report,
         })
@@ -3009,6 +3022,7 @@ enum AggregateEngine {
 #[derive(Debug)]
 struct AggregatePlan {
     engine: AggregateEngine,
+    minimum_match_bytes: Option<usize>,
     limits: AggregateBuildLimits,
     report: AggregateBuildReport,
 }
@@ -3020,6 +3034,10 @@ impl AggregatePlan {
 
     const fn build_report(&self) -> &AggregateBuildReport {
         &self.report
+    }
+
+    const fn minimum_match_bytes(&self) -> Option<usize> {
+        self.minimum_match_bytes
     }
 
     fn cache_identity(&self, execution_limits: &AggregateRunLimits) -> AggregateCacheIdentity {
@@ -5348,6 +5366,12 @@ impl AggregateSpansRegex {
         self.0.build_report()
     }
 
+    /// Minimum whole-match width derived from the authenticated construction HIR.
+    #[must_use]
+    pub const fn minimum_match_bytes(&self) -> Option<usize> {
+        self.0.minimum_match_bytes()
+    }
+
     #[must_use]
     pub fn cache_identity(
         &self,
@@ -5597,6 +5621,12 @@ impl AggregateCountRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateBuildReport {
         self.0.build_report()
+    }
+
+    /// Minimum whole-match width derived from the authenticated construction HIR.
+    #[must_use]
+    pub const fn minimum_match_bytes(&self) -> Option<usize> {
+        self.0.minimum_match_bytes()
     }
 
     #[must_use]

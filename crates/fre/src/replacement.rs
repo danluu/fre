@@ -221,14 +221,17 @@ impl std::error::Error for CaptureExpansionError {}
 
 /// Per-call policy for literal/no-expansion replacement.
 ///
-/// The aggregate limits bound complete match selection. `max_output_bytes`
-/// separately bounds the one output allocation before any bytes are copied.
+/// The aggregate limits bound complete match selection. Logical output length
+/// and observed retained capacity have separate ceilings so allocator
+/// rounding cannot hide behind an exact-size preflight.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiteralReplacementLimits {
     /// Complete selected-span execution policy.
     pub aggregate: AggregateRunLimits,
     /// Maximum length of the replaced haystack.
     pub max_output_bytes: usize,
+    /// Maximum observed retained capacity of the replaced haystack.
+    pub max_output_capacity_bytes: usize,
 }
 
 impl Default for LiteralReplacementLimits {
@@ -236,6 +239,7 @@ impl Default for LiteralReplacementLimits {
         Self {
             aggregate: AggregateRunLimits::default(),
             max_output_bytes: 67_108_864,
+            max_output_capacity_bytes: 67_108_864,
         }
     }
 }
@@ -255,6 +259,8 @@ pub struct LiteralReplacementIdentity {
     pub replacement_bytes: usize,
     /// Output-allocation ceiling applied after exact size preflight.
     pub max_output_bytes: usize,
+    /// Observed output-capacity ceiling applied before copying.
+    pub max_output_capacity_bytes: usize,
 }
 
 /// Exact work and byte counts for a completed replacement.
@@ -272,6 +278,8 @@ pub struct LiteralReplacementAccounting {
     pub replacement_bytes_copied: usize,
     /// Exact final output length.
     pub output_bytes: usize,
+    /// Observed retained capacity of the owned output allocation.
+    pub output_capacity_bytes: usize,
 }
 
 /// Successful replacement evidence.
@@ -297,6 +305,12 @@ impl LiteralReplacementResult {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Observed retained capacity of the owned replacement output.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.bytes.capacity()
     }
 
     /// Consume the result and return the replaced bytes.
@@ -337,6 +351,7 @@ impl std::error::Error for LiteralReplacementError {
             LiteralReplacementErrorSource::Selector(source) => Some(source),
             LiteralReplacementErrorSource::OutputSizeOverflow
             | LiteralReplacementErrorSource::OutputBytesLimit { .. }
+            | LiteralReplacementErrorSource::OutputCapacityBytesLimit { .. }
             | LiteralReplacementErrorSource::AllocationFailed { .. }
             | LiteralReplacementErrorSource::InternalInvariant(_) => None,
         }
@@ -352,6 +367,8 @@ pub enum LiteralReplacementErrorSource {
     OutputSizeOverflow,
     /// Exact output length exceeded the caller's ceiling.
     OutputBytesLimit { needed: usize, limit: usize },
+    /// Observed retained output capacity exceeded the caller's ceiling.
+    OutputCapacityBytesLimit { needed: usize, limit: usize },
     /// The single preflighted output allocation failed.
     AllocationFailed { requested: usize },
     /// A fully admitted selector span violated the facade contract.
@@ -366,6 +383,10 @@ impl fmt::Display for LiteralReplacementErrorSource {
             Self::OutputBytesLimit { needed, limit } => write!(
                 formatter,
                 "output needs {needed} bytes, exceeding the {limit}-byte limit"
+            ),
+            Self::OutputCapacityBytesLimit { needed, limit } => write!(
+                formatter,
+                "output capacity is {needed} bytes, exceeding the {limit}-byte capacity limit"
             ),
             Self::AllocationFailed { requested } => {
                 write!(formatter, "failed to allocate {requested} output bytes")
@@ -383,6 +404,7 @@ impl std::error::Error for LiteralReplacementErrorSource {
             Self::Selector(source) => Some(source),
             Self::OutputSizeOverflow
             | Self::OutputBytesLimit { .. }
+            | Self::OutputCapacityBytesLimit { .. }
             | Self::AllocationFailed { .. }
             | Self::InternalInvariant(_) => None,
         }
@@ -808,6 +830,7 @@ impl AggregateSpansRegex {
                         limit,
                         replacement_bytes: replacement.len(),
                         max_output_bytes: limits.max_output_bytes,
+                        max_output_capacity_bytes: limits.max_output_capacity_bytes,
                     }),
                     source: LiteralReplacementErrorSource::Selector(error.source),
                 })?;
@@ -817,9 +840,11 @@ impl AggregateSpansRegex {
             limit,
             replacement_bytes: replacement.len(),
             max_output_bytes: limits.max_output_bytes,
+            max_output_capacity_bytes: limits.max_output_capacity_bytes,
         };
-        let accounting = replacement_preflight(&spans, haystack.len(), replacement.len(), limit)
-            .map_err(|source| replacement_error(&identity, source))?;
+        let mut accounting =
+            replacement_preflight(&spans, haystack.len(), replacement.len(), limit)
+                .map_err(|source| replacement_error(&identity, source))?;
         if accounting.output_bytes > limits.max_output_bytes {
             return Err(replacement_error(
                 &identity,
@@ -841,6 +866,16 @@ impl AggregateSpansRegex {
                     },
                 )
             })?;
+        accounting.output_capacity_bytes = output.capacity();
+        if accounting.output_capacity_bytes > limits.max_output_capacity_bytes {
+            return Err(replacement_error(
+                &identity,
+                LiteralReplacementErrorSource::OutputCapacityBytesLimit {
+                    needed: accounting.output_capacity_bytes,
+                    limit: limits.max_output_capacity_bytes,
+                },
+            ));
+        }
         let mut cursor = 0_usize;
         for matched in spans.iter().take(accounting.replacements) {
             let gap = haystack.get(cursor..matched.start).ok_or_else(|| {
@@ -989,6 +1024,7 @@ fn replacement_preflight(
         haystack_bytes_copied,
         replacement_bytes_copied,
         output_bytes,
+        output_capacity_bytes: 0,
     })
 }
 

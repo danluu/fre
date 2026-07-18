@@ -958,6 +958,11 @@ fn output_limit_is_exact_and_accounting_retains_complete_selection() {
     assert_eq!(exact.report().accounting.span_visits, 2);
     assert_eq!(exact.report().accounting.haystack_bytes_copied, 6);
     assert_eq!(exact.report().accounting.replacement_bytes_copied, 3);
+    assert_eq!(
+        exact.report().accounting.output_capacity_bytes,
+        exact.capacity_bytes()
+    );
+    assert!(exact.capacity_bytes() >= exact.report().accounting.output_bytes);
 
     let below = LiteralReplacementLimits {
         max_output_bytes: 8,
@@ -976,6 +981,30 @@ fn output_limit_is_exact_and_accounting_retains_complete_selection() {
     assert_eq!(error.identity.limit, 1);
     assert_eq!(error.identity.replacement_bytes, 3);
     assert_eq!(error.identity.selector.operation, AggregateOperation::Spans);
+
+    let observed_capacity = exact.capacity_bytes();
+    let capacity_below = LiteralReplacementLimits {
+        max_output_bytes: 9,
+        max_output_capacity_bytes: observed_capacity
+            .checked_sub(1)
+            .expect("nonempty output capacity"),
+        ..LiteralReplacementLimits::default()
+    };
+    let error = regex
+        .replace_literal(b"age: 26", b"XYZ", capacity_below)
+        .expect_err("one below observed output capacity must fail before copying");
+    assert!(matches!(
+        error.source,
+        LiteralReplacementErrorSource::OutputCapacityBytesLimit {
+            needed,
+            limit
+        } if needed == observed_capacity && limit + 1 == needed
+    ));
+    assert_eq!(error.identity.max_output_bytes, 9);
+    assert_eq!(
+        error.identity.max_output_capacity_bytes,
+        observed_capacity - 1
+    );
 
     let zero = regex
         .replacen_literal(b"age: 26", 0, b"XYZ", LiteralReplacementLimits::default())
