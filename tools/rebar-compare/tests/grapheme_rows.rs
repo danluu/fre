@@ -6,7 +6,7 @@ use rebar_compare::{
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_validate_aggregate_identity,
 };
 
-const ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v7";
+const ADAPTER: &str = "fre-current-aggregate-capture-v19-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 
 const GRAPHEME: &str = r"(?x)
 \p{gcb=CR} \p{gcb=LF}
