@@ -434,6 +434,7 @@ fn continuation_details(
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
+        | AggregateExecutionDetails::BoundedSeparatedFields(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
@@ -1516,6 +1517,135 @@ fn bounded_capitals_count_selects_linear_plan_at_hand_derived_work_boundary() {
         AggregateExecutionSource::BoundedClassSequence(
             fre::BoundedClassSequenceReduceError::WorkLimit { needed, limit }
         ) if needed == exact_work && limit.checked_add(1) == Some(exact_work)
+    ));
+}
+
+fn assert_bounded_separated_ip_planner_boundary(pattern: &str, regex: &fre::AggregateCountRegex) {
+    let planner_work = regex.build_report().bounded_separated_fields_planner_work;
+    assert!(planner_work > 0);
+    let prior_work = regex.build_report().bounded_class_sequence_planner_work;
+    let exact_planner = AggregateBuildLimits {
+        max_bounded_class_sequence_planner_work: prior_work,
+        max_bounded_separated_fields_planner_work: planner_work,
+        ..AggregateBuildLimits::default()
+    };
+    assert!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .limits(exact_planner)
+            .build_count()
+            .is_ok()
+    );
+    assert!(matches!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .limits(AggregateBuildLimits {
+                max_bounded_separated_fields_planner_work: planner_work
+                    .checked_sub(1)
+                    .unwrap(),
+                ..exact_planner
+            })
+            .build_count(),
+        Err(AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit.checked_add(1) == Some(planner_work)
+    ));
+}
+
+// rebar-row:imported/mariomka/ip@rust/regex
+#[test]
+fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
+    let pattern =
+        r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
+    let haystack = b"0.0.0.0 255.255.255.255 256.1.1.1 10.20.30.40";
+    let expected = upstream(pattern, haystack, false);
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        regex.build_report().plan,
+        AggregatePlanKind::BoundedSeparatedFields
+    );
+    assert!(matches!(
+        regex.build_report().plan_identity,
+        AggregatePlanIdentity::BoundedSeparatedFields(identity)
+            if identity.kernel.plan_id == fre::BOUNDED_SEPARATED_FIELDS_PLAN_ID
+    ));
+    assert!(matches!(
+        regex.build_report().build,
+        AggregateBuildAccounting::BoundedSeparatedFields(build)
+            if build.allocations == 0 && build.reserves == 0
+    ));
+
+    assert_bounded_separated_ip_planner_boundary(pattern, &regex);
+
+    let exact_work = haystack.len() * 78 + 8;
+    let exact_sequential = haystack.len() * 50;
+    let exact_run = AggregateRunLimits {
+        bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
+            max_work: exact_work,
+            max_sequential_bytes: exact_sequential,
+            ..fre::BoundedSeparatedFieldsReduceLimits::default()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let counted = regex.count(haystack, exact_run).unwrap();
+    assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
+    let AggregateExecutionDetails::BoundedSeparatedFields(accounting) = &counted.report().details
+    else {
+        panic!("assigned IP row did not execute bounded separated-field plan")
+    };
+    assert_eq!(accounting.upper_bounds.work, exact_work);
+    assert_eq!(accounting.upper_bounds.sequential_bytes, exact_sequential);
+    assert_eq!(accounting.upper_bounds.random_access_bytes, 0);
+    assert_eq!(
+        accounting.actual.sequential_bytes,
+        accounting
+            .actual
+            .separator_inspections
+            .checked_add(accounting.actual.class_comparisons)
+            .unwrap()
+    );
+    assert!(accounting.actual.sequential_bytes <= exact_sequential);
+    assert_eq!(accounting.actual.random_access_bytes, 0);
+    let error = regex
+        .count(
+            haystack,
+            AggregateRunLimits {
+                bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
+                    max_work: exact_work - 1,
+                    ..fre::BoundedSeparatedFieldsReduceLimits::default()
+                },
+                ..AggregateRunLimits::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::BoundedSeparatedFields(
+            fre::BoundedSeparatedFieldsReduceError::WorkLimit { needed, limit }
+        ) if needed == exact_work && limit + 1 == exact_work
+    ));
+    let error = regex
+        .count(
+            haystack,
+            AggregateRunLimits {
+                bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
+                    max_sequential_bytes: exact_sequential - 1,
+                    ..fre::BoundedSeparatedFieldsReduceLimits::default()
+                },
+                ..AggregateRunLimits::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::BoundedSeparatedFields(
+            fre::BoundedSeparatedFieldsReduceError::SequentialLimit { needed, limit }
+        ) if needed == exact_sequential && limit + 1 == exact_sequential
     ));
 }
 

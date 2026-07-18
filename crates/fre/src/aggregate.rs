@@ -5,16 +5,23 @@ use fre_aggregate::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompiledRegex, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
-    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
-    BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
-    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedContextBuildAccounting, BoundedContextBuildError,
-    BoundedContextBuildLimits, BoundedContextCountResult, BoundedContextOperationIdentity,
-    BoundedContextPlan, BoundedContextReduceAccounting, BoundedContextReduceError,
-    BoundedContextReduceLimits, FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError,
-    FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
-    FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
+    BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
+    BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BoundedClassSequenceBuildAccounting,
+    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceCountResult, BoundedClassSequenceOperationIdentity,
+    BoundedClassSequencePlan, BoundedClassSequenceReduceAccounting,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedContextBuildAccounting, BoundedContextBuildError, BoundedContextBuildLimits,
+    BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
+    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
+    BoundedSeparatedFieldsBuildAccounting, BoundedSeparatedFieldsBuildError,
+    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsCountResult,
+    BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
+    BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
+    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
+    FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
+    FixedClassSandwichCountResult, FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
@@ -64,7 +71,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 19;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 20;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -110,6 +117,9 @@ pub enum AggregatePlanKind {
     /// Linear count reducer for a greedy bounded sequence of deterministic
     /// `HEAD BODY+ TRAIL*` byte-class units.
     BoundedClassSequence,
+    /// Constant-frontier count reducer for a fixed number of identical,
+    /// one-byte-separator-delimited bounded byte-class fields.
+    BoundedSeparatedFields,
     /// Two ordered literal-prefix/greedy-byte-class alternatives merged from
     /// persistent monotone occurrence streams.
     PrefixClassAlternation,
@@ -135,6 +145,8 @@ pub enum AggregatePlanIdentity {
     GraphemeScalarDfa(AggregateGraphemeScalarDfaIdentity),
     /// Unicode-off compound byte-class sequence plus count identity.
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
+    /// Unicode-off bounded separated-field proof plus count identity.
+    BoundedSeparatedFields(AggregateBoundedSeparatedFieldsIdentity),
     /// Unicode-off two-branch prefix/class proof and native count identity.
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Bounded byte-context proof plus native count identity.
@@ -264,6 +276,12 @@ pub struct AggregatePrefixClassAlternationIdentity {
     pub kernel: PrefixClassAlternationOperationIdentity,
 }
 
+/// Facade identity for the Unicode-off bounded separated-field reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateBoundedSeparatedFieldsIdentity {
+    pub kernel: BoundedSeparatedFieldsOperationIdentity,
+}
+
 /// Facade identity for the Unicode-off bounded-context count reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateBoundedContextIdentity {
@@ -315,6 +333,8 @@ pub enum AggregateBuildAccounting {
     GraphemeScalarDfa(GraphemeScalarDfaBuildAccounting),
     /// Allocation-free bounded compound byte-class construction certificate.
     BoundedClassSequence(BoundedClassSequenceBuildAccounting),
+    /// Allocation-free bounded separated-field construction certificate.
+    BoundedSeparatedFields(BoundedSeparatedFieldsBuildAccounting),
     /// Two-branch prefix/class construction certificate.
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
     /// Bounded-context construction certificate.
@@ -357,6 +377,10 @@ pub struct AggregateBuildLimits {
     /// compound byte-class sequences. This separate quota preserves every
     /// request previously admitted at its exact fixed-sandwich limit.
     pub max_bounded_class_sequence_planner_work: usize,
+    /// Maximum structural HIR/range/equality inspection work for bounded
+    /// separator-delimited fields. This independent quota preserves requests
+    /// admitted at every pre-existing selector's exact limit.
+    pub max_bounded_separated_fields_planner_work: usize,
     /// Maximum allocation-free structural inspection work for the two-branch
     /// prefix/class specialization.
     pub max_prefix_class_alternation_planner_work: usize,
@@ -374,6 +398,8 @@ pub struct AggregateBuildLimits {
     pub grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits,
     /// Complete inline bounded class-sequence construction limits.
     pub bounded_class_sequence: BoundedClassSequenceBuildLimits,
+    /// Complete inline bounded separated-field construction limits.
+    pub bounded_separated_fields: BoundedSeparatedFieldsBuildLimits,
     /// Complete two-branch prefix/class construction limits.
     pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
     /// Complete bounded-context construction limits.
@@ -395,6 +421,7 @@ impl Default for AggregateBuildLimits {
             max_bounded_affix_planner_work: 4_096,
             max_grapheme_scalar_dfa_planner_work: 1 << 20,
             max_bounded_class_sequence_planner_work: 4_096,
+            max_bounded_separated_fields_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
             max_bounded_context_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
@@ -403,6 +430,7 @@ impl Default for AggregateBuildLimits {
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
+            bounded_separated_fields: BoundedSeparatedFieldsBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             bounded_context: BoundedContextBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
@@ -425,6 +453,8 @@ pub struct AggregateRunLimits {
     pub grapheme_scalar_dfa: GraphemeScalarDfaReduceLimits,
     /// Direct bounded class-sequence count limits.
     pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
+    /// Direct bounded separated-field count limits.
+    pub bounded_separated_fields: BoundedSeparatedFieldsReduceLimits,
     /// Direct two-branch prefix/class count limits.
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Direct bounded-context literal interval-stream limits.
@@ -478,6 +508,9 @@ pub struct AggregateBuildReport {
     /// Bounded compound-class structural inspection work, including every
     /// HIR/range visit and admitted disjointness-comparison upper bound.
     pub bounded_class_sequence_planner_work: usize,
+    /// Bounded separated-field structural inspection work, including every
+    /// HIR/range visit and repeated/final field equality-comparison bound.
+    pub bounded_separated_fields_planner_work: usize,
     /// Two-branch prefix/class structural inspection work. Every HIR node,
     /// literal byte, class range and self-overlap comparison is included.
     pub prefix_class_alternation_planner_work: usize,
@@ -499,8 +532,59 @@ pub struct AggregateBuildReport {
     pub build: AggregateBuildAccounting,
     /// Stable operation-specific selected-plan identity.
     pub plan_identity: AggregatePlanIdentity,
+    /// Construction-owned copy that prevents a caller from transplanting a
+    /// different bounded separated-field resource certificate into this
+    /// report while retaining the original compiled artifact.
+    sealed_bounded_separated_fields_identity: Option<AggregateBoundedSeparatedFieldsIdentity>,
     /// Selected plan's retained capacity/persistent bytes.
     pub retained_capacity_bytes: usize,
+}
+
+impl AggregateBuildReport {
+    /// Check that the public bounded-separated discriminators and private
+    /// construction seal form one closed identity state. A report is valid
+    /// either when every bounded discriminator and the seal are absent, or
+    /// when all four are present and the public resource certificate exactly
+    /// matches the immutable construction certificate.
+    #[must_use]
+    pub fn has_closed_bounded_separated_fields_identity(&self) -> bool {
+        match (
+            self.plan,
+            self.build,
+            self.plan_identity,
+            self.sealed_bounded_separated_fields_identity,
+        ) {
+            (
+                AggregatePlanKind::BoundedSeparatedFields,
+                AggregateBuildAccounting::BoundedSeparatedFields(build),
+                AggregatePlanIdentity::BoundedSeparatedFields(identity),
+                Some(sealed),
+            ) => {
+                identity == sealed
+                    && build == sealed.kernel.build_accounting()
+                    && self.retained_capacity_bytes == build.persistent_bytes
+            }
+            (plan, build, identity, None) => {
+                plan != AggregatePlanKind::BoundedSeparatedFields
+                    && !matches!(build, AggregateBuildAccounting::BoundedSeparatedFields(_))
+                    && !matches!(identity, AggregatePlanIdentity::BoundedSeparatedFields(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// Check that a bounded separated-field identity is the exact immutable
+    /// certificate published with this construction report.
+    #[must_use]
+    pub fn authenticates_bounded_separated_fields_identity(
+        &self,
+        identity: AggregateBoundedSeparatedFieldsIdentity,
+    ) -> bool {
+        matches!(
+            self.sealed_bounded_separated_fields_identity,
+            Some(sealed) if sealed == identity
+        )
+    }
 }
 
 /// Complete equality key for a compiled aggregate operation invocation.
@@ -594,6 +678,14 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Bounded separated-field inspection crossed its independent structural
+    /// work cap.
+    BoundedSeparatedFieldsPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Prefix/class alternation inspection crossed its structural work cap.
     PrefixClassAlternationPlannerWorkLimit {
         operation: AggregateOperation,
@@ -657,6 +749,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: BoundedClassSequenceBuildError,
+    },
+    /// Bounded separated-field construction failed after selection.
+    BoundedSeparatedFieldsBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: BoundedSeparatedFieldsBuildError,
     },
     /// Prefix/class alternation construction failed after selection.
     PrefixClassAlternationBuild {
@@ -769,6 +867,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded class-sequence inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::BoundedSeparatedFieldsPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded separated-field inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::PrefixClassAlternationPlannerWorkLimit {
                 operation,
                 selection,
@@ -853,6 +960,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded class-sequence construction failed: {source}"
             ),
+            Self::BoundedSeparatedFieldsBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded separated-field construction failed: {source}"
+            ),
             Self::PrefixClassAlternationBuild {
                 operation,
                 selection,
@@ -915,6 +1030,7 @@ impl std::error::Error for AggregateBuildError {
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
+            Self::BoundedSeparatedFieldsBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::BoundedContextBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
@@ -926,6 +1042,7 @@ impl std::error::Error for AggregateBuildError {
             | Self::BoundedAffixPlannerWorkLimit { .. }
             | Self::GraphemeScalarDfaPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
+            | Self::BoundedSeparatedFieldsPlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
             | Self::BoundedContextPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
@@ -949,6 +1066,8 @@ pub enum AggregateExecutionSource {
     GraphemeScalarDfa(GraphemeScalarDfaReduceError),
     /// Direct bounded class-sequence refusal.
     BoundedClassSequence(BoundedClassSequenceReduceError),
+    /// Direct bounded separated-field refusal.
+    BoundedSeparatedFields(BoundedSeparatedFieldsReduceError),
     /// Direct two-branch prefix/class refusal.
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Direct bounded-context refusal.
@@ -971,6 +1090,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
+            Self::BoundedSeparatedFields(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::BoundedContext(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
@@ -991,6 +1111,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::FixedClassSandwich(source) => Some(source),
             Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
+            Self::BoundedSeparatedFields(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
             Self::BoundedContext(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
@@ -1040,6 +1161,8 @@ pub enum AggregateExecutionDetails {
     GraphemeScalarDfa(GraphemeScalarDfaReduceAccounting),
     /// Bounded class-sequence bounds, counters, and operation identity.
     BoundedClassSequence(BoundedClassSequenceReduceAccounting),
+    /// Bounded separated-field bounds, counters, and operation identity.
+    BoundedSeparatedFields(BoundedSeparatedFieldsReduceAccounting),
     /// Prefix/class stream bounds, counters, and identity.
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Bounded-context bounds, counters, and operation identity.
@@ -1399,6 +1522,7 @@ impl AggregateBuilder {
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
+                bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
                 finite_planner_work: 0,
@@ -1406,6 +1530,7 @@ impl AggregateBuilder {
                 captures_erased: captures,
                 build: AggregateBuildAccounting::ExactLiteral(build),
                 plan_identity,
+                sealed_bounded_separated_fields_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -1573,6 +1698,7 @@ impl AggregateBuilder {
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
+                    bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
                     finite_planner_work: 0,
@@ -1590,6 +1716,7 @@ impl AggregateBuilder {
                             kernel,
                         },
                     ),
+                    sealed_bounded_separated_fields_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -1694,6 +1821,7 @@ impl AggregateBuilder {
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
+                    bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
                     finite_planner_work: 0,
@@ -1713,6 +1841,7 @@ impl AggregateBuilder {
                             kernel,
                         },
                     ),
+                    sealed_bounded_separated_fields_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -1877,6 +2006,7 @@ impl AggregateBuilder {
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: inspection.work,
                 bounded_class_sequence_planner_work: 0,
+                bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
                 finite_planner_work: 0,
@@ -1889,6 +2019,7 @@ impl AggregateBuilder {
                         kernel: engine.count_identity(),
                     },
                 ),
+                sealed_bounded_separated_fields_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -1993,6 +2124,7 @@ impl AggregateBuilder {
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work: work,
+                    bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
                     finite_planner_work: 0,
@@ -2002,6 +2134,7 @@ impl AggregateBuilder {
                     plan_identity: AggregatePlanIdentity::BoundedClassSequence(
                         engine.count_identity(),
                     ),
+                    sealed_bounded_separated_fields_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2011,6 +2144,113 @@ impl AggregateBuilder {
                 });
             }
             Some(BoundedClassSequenceInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let bounded_separated_fields_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation == AggregateOperation::Count
+        {
+            Some(
+                inspect_bounded_separated_fields(
+                    &rust.hir,
+                    limits.max_bounded_separated_fields_planner_work,
+                )
+                .map_err(|error| match error {
+                    BoundedSeparatedFieldsInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    BoundedSeparatedFieldsInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded separated-field inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let bounded_separated_fields_planner_work = match bounded_separated_fields_inspection {
+            Some(BoundedSeparatedFieldsInspection::Eligible {
+                field,
+                separator,
+                fields,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from bounded separated-field inspection",
+                    });
+                }
+                let Some(field_source) = field.kernel_source() else {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "eligible bounded separated-field source was not representable",
+                    });
+                };
+                let engine = BoundedSeparatedFieldsPlan::build(
+                    field_source,
+                    separator,
+                    fields,
+                    limits.bounded_separated_fields,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::BoundedSeparatedFieldsBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let plan_identity = AggregateBoundedSeparatedFieldsIdentity {
+                    kernel: engine.count_identity(),
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::BoundedSeparatedFields,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work: work,
+                    prefix_class_alternation_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::BoundedSeparatedFields(build),
+                    plan_identity: AggregatePlanIdentity::BoundedSeparatedFields(plan_identity),
+                    sealed_bounded_separated_fields_identity: Some(plan_identity),
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::BoundedSeparatedFields(engine),
+                    limits,
+                    report,
+                });
+            }
+            Some(BoundedSeparatedFieldsInspection::Ineligible { work }) => work,
             None => 0,
         };
         let prefix_class_selection_bound = prefix_class_selection_work(&syntax);
@@ -2105,6 +2345,7 @@ impl AggregateBuilder {
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work: work,
                     bounded_context_planner_work: 0,
                     finite_planner_work: 0,
@@ -2116,6 +2357,7 @@ impl AggregateBuilder {
                             kernel: engine.count_identity(),
                         },
                     ),
+                    sealed_bounded_separated_fields_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2208,6 +2450,7 @@ impl AggregateBuilder {
                         bounded_affix_planner_work: work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
+                        bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work: 0,
                         finite_planner_work: 0,
@@ -2219,6 +2462,7 @@ impl AggregateBuilder {
                                 kernel: engine.count_identity(),
                             },
                         ),
+                        sealed_bounded_separated_fields_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2326,6 +2570,7 @@ impl AggregateBuilder {
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
                     bounded_context_planner_work: work,
                     finite_planner_work: 0,
@@ -2337,6 +2582,7 @@ impl AggregateBuilder {
                             kernel: engine.count_identity(),
                         },
                     ),
+                    sealed_bounded_separated_fields_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2485,6 +2731,7 @@ impl AggregateBuilder {
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
+                        bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
                         finite_planner_work,
@@ -2502,6 +2749,7 @@ impl AggregateBuilder {
                                 operation: operation_id,
                             },
                         ),
+                        sealed_bounded_separated_fields_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2621,6 +2869,7 @@ impl AggregateBuilder {
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
+                        bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
                         finite_planner_work,
@@ -2638,6 +2887,7 @@ impl AggregateBuilder {
                                 operation: operation_id,
                             },
                         ),
+                        sealed_bounded_separated_fields_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2696,6 +2946,7 @@ impl AggregateBuilder {
             bounded_affix_planner_work,
             grapheme_scalar_dfa_planner_work,
             bounded_class_sequence_planner_work,
+            bounded_separated_fields_planner_work,
             prefix_class_alternation_planner_work,
             bounded_context_planner_work,
             finite_planner_work,
@@ -2710,6 +2961,7 @@ impl AggregateBuilder {
                 },
                 program: engine.plan_id(),
             }),
+            sealed_bounded_separated_fields_identity: None,
             retained_capacity_bytes: compile.program_bytes,
         };
         Ok(AggregatePlan {
@@ -2744,6 +2996,7 @@ enum AggregateEngine {
     FixedClassSandwich(FixedClassSandwichPlan),
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
+    BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
     BoundedContext(BoundedContextPlan),
     FiniteCount(OrderedLiteralCountPlan),
@@ -2857,6 +3110,15 @@ impl AggregatePlan {
                     self.execution_error(
                         limits,
                         AggregateExecutionSource::BoundedClassSequence(source),
+                    )
+                }),
+            AggregateEngine::BoundedSeparatedFields(engine) => engine
+                .count(haystack, limits.bounded_separated_fields)
+                .map(AggregateCountExecution::BoundedSeparatedFields)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::BoundedSeparatedFields(source),
                     )
                 }),
             AggregateEngine::PrefixClassAlternation(engine) => engine
@@ -2978,6 +3240,12 @@ impl AggregatePlan {
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a bounded class-sequence count plan",
+                ),
+            )),
+            AggregateEngine::BoundedSeparatedFields(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a bounded separated-field count plan",
                 ),
             )),
             AggregateEngine::PrefixClassAlternation(_) => Err(self.execution_error(
@@ -3149,6 +3417,7 @@ enum AggregateCountExecution {
     FixedClassSandwich(FixedClassSandwichCountResult),
     GraphemeScalarDfa(GraphemeScalarDfaCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
+    BoundedSeparatedFields(BoundedSeparatedFieldsCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
     BoundedContext(BoundedContextCountResult),
     FiniteLiteral {
@@ -3175,6 +3444,7 @@ impl AggregateCountExecution {
             Self::FixedClassSandwich(result) => result.count,
             Self::GraphemeScalarDfa(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
+            Self::BoundedSeparatedFields(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
             Self::BoundedContext(result) => result.count,
             Self::FiniteLiteral { value, .. }
@@ -3199,6 +3469,9 @@ impl AggregateCountExecution {
             }
             Self::BoundedClassSequence(result) => {
                 AggregateExecutionDetails::BoundedClassSequence(result.accounting)
+            }
+            Self::BoundedSeparatedFields(result) => {
+                AggregateExecutionDetails::BoundedSeparatedFields(result.accounting)
             }
             Self::PrefixClassAlternation(result) => {
                 AggregateExecutionDetails::PrefixClassAlternation(result.accounting)
@@ -3849,6 +4122,382 @@ impl ExactSizeIterator for BoundedByteClassRanges<'_> {
             Self::Singleton(byte) => usize::from(byte.is_some()),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct BoundedSeparatedAlternativeInspection<'a> {
+    atoms: [Option<BoundedByteClassAtom<'a>>; BOUNDED_SEPARATED_FIELDS_MAX_ATOMS],
+    atom_count: u8,
+    optional_index: Option<u8>,
+}
+
+impl BoundedSeparatedAlternativeInspection<'_> {
+    const EMPTY: Self = Self {
+        atoms: [None; BOUNDED_SEPARATED_FIELDS_MAX_ATOMS],
+        atom_count: 0,
+        optional_index: None,
+    };
+
+    fn kernel_source(self) -> Option<BoundedSeparatedFieldsAlternativeSource<'static>> {
+        let mut source = BoundedSeparatedFieldsAlternativeSource::empty();
+        for index in 0..usize::from(self.atom_count) {
+            source.atoms[index] = Some(match self.atoms[index]? {
+                BoundedByteClassAtom::Singleton(byte) => {
+                    BoundedSeparatedFieldsAtomSource::Singleton(byte)
+                }
+                BoundedByteClassAtom::Bytes(class) => {
+                    let [range] = class.ranges() else {
+                        return None;
+                    };
+                    BoundedSeparatedFieldsAtomSource::Range(range.start(), range.end())
+                }
+            });
+        }
+        source.atom_count = self.atom_count;
+        source.optional_index = self.optional_index;
+        Some(source)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoundedSeparatedFieldInspection<'a> {
+    alternatives: [Option<BoundedSeparatedAlternativeInspection<'a>>;
+        BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES],
+    alternative_count: u8,
+}
+
+impl BoundedSeparatedFieldInspection<'_> {
+    const EMPTY: Self = Self {
+        alternatives: [None; BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES],
+        alternative_count: 0,
+    };
+
+    fn kernel_source(self) -> Option<BoundedSeparatedFieldsFieldSource<'static>> {
+        let mut source = BoundedSeparatedFieldsFieldSource::empty();
+        for index in 0..usize::from(self.alternative_count) {
+            source.alternatives[index] = Some(self.alternatives[index]?.kernel_source()?);
+        }
+        source.alternative_count = self.alternative_count;
+        Some(source)
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the fixed-array eligible receipt keeps HIR inspection allocation-free"
+)]
+enum BoundedSeparatedFieldsInspection<'a> {
+    Eligible {
+        field: BoundedSeparatedFieldInspection<'a>,
+        separator: u8,
+        fields: u32,
+        work: usize,
+        hir_nodes: usize,
+        captures: usize,
+    },
+    Ineligible {
+        work: usize,
+    },
+}
+
+enum BoundedSeparatedFieldsInspectionError {
+    WorkLimit { needed: usize, limit: usize },
+    Overflow,
+}
+
+struct BoundedSeparatedFieldsInspector {
+    limit: usize,
+    work: usize,
+    hir_nodes: usize,
+    captures: usize,
+}
+
+impl BoundedSeparatedFieldsInspector {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            work: 0,
+            hir_nodes: 0,
+            captures: 0,
+        }
+    }
+
+    fn inspect(
+        mut self,
+        hir: &Hir,
+    ) -> Result<BoundedSeparatedFieldsInspection<'_>, BoundedSeparatedFieldsInspectionError> {
+        let Some(root) = self.peel(hir)? else {
+            return Ok(self.ineligible());
+        };
+        let HirKind::Concat(root_parts) = root.kind() else {
+            return Ok(self.ineligible());
+        };
+        let [repeated_hir, final_field_hir] = root_parts.as_slice() else {
+            return Ok(self.ineligible());
+        };
+        let Some(repeated_hir) = self.peel(repeated_hir)? else {
+            return Ok(self.ineligible());
+        };
+        let HirKind::Repetition(repeated) = repeated_hir.kind() else {
+            return Ok(self.ineligible());
+        };
+        let Some(maximum) = repeated.max else {
+            return Ok(self.ineligible());
+        };
+        if repeated.min == 0 || repeated.min != maximum || !repeated.greedy {
+            return Ok(self.ineligible());
+        }
+        let fields = repeated
+            .min
+            .checked_add(1)
+            .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+        if fields > BOUNDED_SEPARATED_FIELDS_MAX_FIELDS {
+            return Ok(self.ineligible());
+        }
+        let Some(repeated_unit) = self.peel(repeated.sub.as_ref())? else {
+            return Ok(self.ineligible());
+        };
+        let HirKind::Concat(unit_parts) = repeated_unit.kind() else {
+            return Ok(self.ineligible());
+        };
+        let [repeated_field_hir, separator_hir] = unit_parts.as_slice() else {
+            return Ok(self.ineligible());
+        };
+        let Some(repeated_field) = self.field(repeated_field_hir)? else {
+            return Ok(self.ineligible());
+        };
+        let Some(separator_hir) = self.peel(separator_hir)? else {
+            return Ok(self.ineligible());
+        };
+        let HirKind::Literal(separator_literal) = separator_hir.kind() else {
+            return Ok(self.ineligible());
+        };
+        let [separator] = separator_literal.0.as_ref() else {
+            return Ok(self.ineligible());
+        };
+        self.charge(1)?;
+        let Some(final_field) = self.field(final_field_hir)? else {
+            return Ok(self.ineligible());
+        };
+        if !self.fields_equal(&repeated_field, &final_field)? {
+            return Ok(self.ineligible());
+        }
+        Ok(BoundedSeparatedFieldsInspection::Eligible {
+            field: repeated_field,
+            separator: *separator,
+            fields,
+            work: self.work,
+            hir_nodes: self.hir_nodes,
+            captures: self.captures,
+        })
+    }
+
+    fn field<'a>(
+        &mut self,
+        hir: &'a Hir,
+    ) -> Result<Option<BoundedSeparatedFieldInspection<'a>>, BoundedSeparatedFieldsInspectionError>
+    {
+        let Some(hir) = self.peel(hir)? else {
+            return Ok(None);
+        };
+        let HirKind::Alternation(branches) = hir.kind() else {
+            return Ok(None);
+        };
+        if branches.is_empty() || branches.len() > BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES {
+            return Ok(None);
+        }
+        let mut field = BoundedSeparatedFieldInspection::EMPTY;
+        for (index, branch) in branches.iter().enumerate() {
+            let Some(alternative) = self.alternative(branch)? else {
+                return Ok(None);
+            };
+            field.alternatives[index] = Some(alternative);
+        }
+        field.alternative_count = u8::try_from(branches.len())
+            .map_err(|_| BoundedSeparatedFieldsInspectionError::Overflow)?;
+        Ok(Some(field))
+    }
+
+    fn alternative<'a>(
+        &mut self,
+        hir: &'a Hir,
+    ) -> Result<
+        Option<BoundedSeparatedAlternativeInspection<'a>>,
+        BoundedSeparatedFieldsInspectionError,
+    > {
+        let Some(hir) = self.peel(hir)? else {
+            return Ok(None);
+        };
+        let HirKind::Concat(parts) = hir.kind() else {
+            return Ok(None);
+        };
+        let mut alternative = BoundedSeparatedAlternativeInspection::EMPTY;
+        for part in parts {
+            let Some(part) = self.peel(part)? else {
+                return Ok(None);
+            };
+            match part.kind() {
+                HirKind::Literal(literal) if !literal.0.is_empty() => {
+                    self.charge(literal.0.len())?;
+                    for &byte in literal.0.as_ref() {
+                        if !push_bounded_separated_atom(
+                            &mut alternative,
+                            BoundedByteClassAtom::Singleton(byte),
+                            false,
+                        )? {
+                            return Ok(None);
+                        }
+                    }
+                }
+                HirKind::Class(Class::Bytes(class)) if class.ranges().len() == 1 => {
+                    self.charge(class.ranges().len())?;
+                    if !push_bounded_separated_atom(
+                        &mut alternative,
+                        BoundedByteClassAtom::Bytes(class),
+                        false,
+                    )? {
+                        return Ok(None);
+                    }
+                }
+                HirKind::Repetition(optional)
+                    if optional.min == 0 && optional.max == Some(1) && optional.greedy =>
+                {
+                    if alternative.optional_index.is_some() {
+                        return Ok(None);
+                    }
+                    let Some(optional_atom) = self.peel(optional.sub.as_ref())? else {
+                        return Ok(None);
+                    };
+                    let atom = match optional_atom.kind() {
+                        HirKind::Literal(literal) => {
+                            let [byte] = literal.0.as_ref() else {
+                                return Ok(None);
+                            };
+                            self.charge(1)?;
+                            BoundedByteClassAtom::Singleton(*byte)
+                        }
+                        HirKind::Class(Class::Bytes(class)) if class.ranges().len() == 1 => {
+                            self.charge(1)?;
+                            BoundedByteClassAtom::Bytes(class)
+                        }
+                        _ => return Ok(None),
+                    };
+                    if !push_bounded_separated_atom(&mut alternative, atom, true)? {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        if alternative.atom_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(alternative))
+    }
+
+    fn fields_equal(
+        &mut self,
+        left: &BoundedSeparatedFieldInspection<'_>,
+        right: &BoundedSeparatedFieldInspection<'_>,
+    ) -> Result<bool, BoundedSeparatedFieldsInspectionError> {
+        self.charge(1)?;
+        if left.alternative_count != right.alternative_count {
+            return Ok(false);
+        }
+        for index in 0..usize::from(left.alternative_count) {
+            let (Some(left), Some(right)) = (left.alternatives[index], right.alternatives[index])
+            else {
+                return Err(BoundedSeparatedFieldsInspectionError::Overflow);
+            };
+            self.charge(1)?;
+            if left.atom_count != right.atom_count || left.optional_index != right.optional_index {
+                return Ok(false);
+            }
+            for atom_index in 0..usize::from(left.atom_count) {
+                let (Some(left), Some(right)) = (left.atoms[atom_index], right.atoms[atom_index])
+                else {
+                    return Err(BoundedSeparatedFieldsInspectionError::Overflow);
+                };
+                let comparisons = left
+                    .range_count()
+                    .checked_add(right.range_count())
+                    .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+                self.charge(comparisons)?;
+                if !left.ranges().eq(right.ranges()) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn peel<'a>(
+        &mut self,
+        mut hir: &'a Hir,
+    ) -> Result<Option<&'a Hir>, BoundedSeparatedFieldsInspectionError> {
+        loop {
+            self.charge(1)?;
+            self.hir_nodes = self
+                .hir_nodes
+                .checked_add(1)
+                .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+            let HirKind::Capture(capture) = hir.kind() else {
+                return Ok(Some(hir));
+            };
+            self.captures = self
+                .captures
+                .checked_add(1)
+                .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+            hir = capture.sub.as_ref();
+        }
+    }
+
+    fn charge(&mut self, amount: usize) -> Result<(), BoundedSeparatedFieldsInspectionError> {
+        let needed = self
+            .work
+            .checked_add(amount)
+            .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+        if needed > self.limit {
+            return Err(BoundedSeparatedFieldsInspectionError::WorkLimit {
+                needed,
+                limit: self.limit,
+            });
+        }
+        self.work = needed;
+        Ok(())
+    }
+
+    const fn ineligible(&self) -> BoundedSeparatedFieldsInspection<'static> {
+        BoundedSeparatedFieldsInspection::Ineligible { work: self.work }
+    }
+}
+
+fn push_bounded_separated_atom<'a>(
+    alternative: &mut BoundedSeparatedAlternativeInspection<'a>,
+    atom: BoundedByteClassAtom<'a>,
+    optional: bool,
+) -> Result<bool, BoundedSeparatedFieldsInspectionError> {
+    let index = usize::from(alternative.atom_count);
+    if index >= BOUNDED_SEPARATED_FIELDS_MAX_ATOMS {
+        return Ok(false);
+    }
+    alternative.atoms[index] = Some(atom);
+    if optional {
+        alternative.optional_index =
+            Some(u8::try_from(index).map_err(|_| BoundedSeparatedFieldsInspectionError::Overflow)?);
+    }
+    alternative.atom_count = alternative
+        .atom_count
+        .checked_add(1)
+        .ok_or(BoundedSeparatedFieldsInspectionError::Overflow)?;
+    Ok(true)
+}
+
+fn inspect_bounded_separated_fields(
+    hir: &Hir,
+    limit: usize,
+) -> Result<BoundedSeparatedFieldsInspection<'_>, BoundedSeparatedFieldsInspectionError> {
+    BoundedSeparatedFieldsInspector::new(limit).inspect(hir)
 }
 
 enum BoundedClassSequenceInspection<'a> {
