@@ -10,8 +10,17 @@ use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
 use crate::{Error, Resource};
 
 pub(crate) struct Inspection {
-    pub(crate) plan: Plan,
+    pub(crate) plan: Option<Plan>,
     pub(crate) inspection_work: usize,
+}
+
+impl Inspection {
+    const fn refused(inspection_work: usize) -> Self {
+        Self {
+            plan: None,
+            inspection_work,
+        }
+    }
 }
 
 /// Inspect the canonical HIR for the first admitted verifier configuration.
@@ -25,38 +34,38 @@ pub(crate) fn inspect(
     max_work: usize,
     max_literal_bytes: usize,
     max_program_bytes: usize,
-) -> Result<Option<Inspection>, Error> {
+) -> Result<Inspection, Error> {
     let mut budget = Budget::new(max_work);
     let root = transparent(hir, &mut budget)?;
     let HirKind::Concat(parts) = root.kind() else {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     };
     if !(4..=4 + REQUIRED_INTERNAL_ANCHOR_MAX_OPTIONAL_STAGES).contains(&parts.len()) {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     }
 
     let Some(prefix) = one_or_more_class(&parts[0], &mut budget)? else {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     };
     let anchor = transparent(&parts[1], &mut budget)?;
     let HirKind::Literal(anchor) = anchor.kind() else {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     };
     charge(&mut budget, anchor.0.len())?;
     if anchor.0.is_empty() {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     }
     let Some(head) = one_or_more_class(&parts[2], &mut budget)? else {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     };
     let Some(tail) = one_or_more_class(&parts[3], &mut budget)? else {
-        return Ok(None);
+        return Ok(Inspection::refused(budget.work));
     };
 
     let mut continuation = ContinuationSource::new(head, tail);
     for (index, optional) in parts[4..].iter().enumerate() {
         let Some(stage) = optional_stage(optional, &mut budget)? else {
-            return Ok(None);
+            return Ok(Inspection::refused(budget.work));
         };
         continuation.optional[index] = Some(stage);
     }
@@ -68,28 +77,28 @@ pub(crate) fn inspect(
             resource: Resource::CompileWork,
         })?;
 
-    let remaining_build_work =
-        max_work
-            .checked_sub(budget.work)
-            .ok_or(Error::ArithmeticOverflow {
-                resource: Resource::CompileWork,
-            })?;
-    let Some(plan) = build_plan(
+    let build_work_upper_bound =
+        Plan::build_work_upper_bound(anchor.0.len(), continuation.optional_count).map_err(
+            |error| match error {
+                BuildError::Overflow(_) => Error::ArithmeticOverflow {
+                    resource: Resource::CompileWork,
+                },
+                _ => Error::InternalInvariant("required internal-anchor work derivation refused"),
+            },
+        )?;
+    charge(&mut budget, build_work_upper_bound)?;
+    let plan = build_plan(
         prefix,
         &anchor.0,
         &continuation,
-        remaining_build_work,
+        build_work_upper_bound,
         max_literal_bytes,
         max_program_bytes,
-    )?
-    else {
-        return Ok(None);
-    };
-    charge(&mut budget, plan.build_accounting().structural_work)?;
-    Ok(Some(Inspection {
+    )?;
+    Ok(Inspection {
         plan,
         inspection_work: budget.work,
-    }))
+    })
 }
 
 fn build_plan(
@@ -160,6 +169,11 @@ fn build_plan(
             | BuildError::SourceCopyLimit { .. }
             | BuildError::ScratchLimit { .. },
         ) => return Ok(None),
+        Err(BuildError::AccountingInvariant { .. }) => {
+            return Err(Error::InternalInvariant(
+                "required internal-anchor build accounting exceeded its envelope",
+            ));
+        }
         Err(_) => {
             return Err(Error::InternalInvariant(
                 "unclassified required internal-anchor build refusal",
@@ -304,9 +318,10 @@ mod tests {
     #[test]
     fn uri_configuration_is_derived_from_hir_and_retained_by_compilation() {
         let hir = parse(URI);
-        let inspected = inspect(&hir, 1 << 20, 1 << 20, 1 << 20).unwrap().unwrap();
-        assert_eq!(inspected.plan.anchor(), b"://");
-        assert_eq!(inspected.plan.build_accounting().optional_stages, 2);
+        let inspected = inspect(&hir, 1 << 20, 1 << 20, 1 << 20).unwrap();
+        let plan = inspected.plan.as_ref().expect("required-anchor plan");
+        assert_eq!(plan.anchor(), b"://");
+        assert_eq!(plan.build_accounting().optional_stages, 2);
 
         let compiled = CompiledRegex::from_hir(
             &hir,
@@ -318,13 +333,24 @@ mod tests {
         assert_eq!(accounting.required_internal_anchors, 1);
         assert_eq!(accounting.required_internal_anchor_bytes, 3);
         assert_eq!(accounting.required_internal_anchor_optional_stages, 2);
+        assert!(accounting.required_internal_anchor_build_work > 0);
+        assert!(
+            accounting.required_internal_anchor_build_work
+                <= accounting.required_internal_anchor_build_work_upper_bound
+        );
     }
 
     #[test]
     fn anchored_count_matches_pinned_bytes_semantics_on_priority_adversaries() {
         for (pattern, haystack) in [
+            (URI, b"://a/b".as_slice()),
+            (URI, b"x://a".as_slice()),
+            (URI, b"x://a/".as_slice()),
             (URI, b"bad://x good://a/b?q=x#f\xFF".as_slice()),
             (URI, b"x://a/b://c/d y://a/b".as_slice()),
+            (URI, b"x://a/b\r\ny://c/d\n\tz://e/f".as_slice()),
+            (URI, b"\xFFx://a/\xFE?q=\xFD#\xFC y://c/d".as_slice()),
+            (URI, b"x://a/one?two?three#four#five".as_slice()),
             (r"a+Xb+[ab]+", b"aXbaaaXba".as_slice()),
             (r"a+Xb+[ab]+", b"aXc aXbba".as_slice()),
         ] {
@@ -358,6 +384,33 @@ mod tests {
     }
 
     #[test]
+    fn uri_count_uses_only_the_authenticated_operation_range() {
+        let compiled = CompiledRegex::from_hir(
+            &parse(URI),
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"outside://x/a | x://a/b?q=x#f y://c/d | z://e/f";
+        let range = 16..43;
+        let actual = compiled
+            .count_value(
+                haystack,
+                range.clone(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let expected = regex::bytes::RegexBuilder::new(URI)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(&haystack[range])
+            .count();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn optional_or_bordered_anchor_shapes_remain_on_the_general_route() {
         for pattern in [r"a+(?:X)?b+[ab]+", r"a+aba+b+[ab]+", r"a+X(?:b+|c+)"] {
             let compiled = CompiledRegex::from_hir(
@@ -368,6 +421,21 @@ mod tests {
             .unwrap();
             assert_eq!(compiled.compile_accounting().required_internal_anchors, 0);
         }
+    }
+
+    #[test]
+    fn rejected_inspections_retain_hir_and_kernel_attempt_work() {
+        let bordered = parse(r"x+(aba)b+[ab]+");
+        let inspected = inspect(&bordered, 1 << 20, 1 << 20, 1 << 20).unwrap();
+        assert!(inspected.plan.is_none());
+        let kernel_upper = fre_kernels::RequiredInternalAnchorPlan::build_work_upper_bound(3, 0)
+            .expect("kernel upper bound");
+        assert!(inspected.inspection_work > kernel_upper);
+
+        let non_shape = inspect(&parse(r"a+"), 1 << 20, 1 << 20, 1 << 20).unwrap();
+        assert!(non_shape.plan.is_none());
+        assert!(non_shape.inspection_work > 0);
+        assert!(non_shape.inspection_work < inspected.inspection_work);
     }
 
     #[test]
@@ -384,10 +452,10 @@ mod tests {
         let exact = OperationLimits {
             max_boundaries: haystack.len() + 1,
             max_table_cells: 0,
-            max_random_access_bytes: 0,
+            max_random_access_bytes: upper.random_access_bytes,
             max_scratch_bytes: upper.scratch_bytes,
             max_log_bytes: 0,
-            max_sequential_bytes: upper.source_accesses,
+            max_sequential_bytes: upper.sequential_bytes,
             max_match_events: upper.candidate_visits,
             max_output_matches: usize::try_from(upper.count).unwrap(),
             max_output_bytes: 0,
@@ -405,10 +473,20 @@ mod tests {
             .unwrap();
         assert_eq!(admitted.value(), 0);
         assert_eq!(admitted.accounting().required_anchor_candidates, 3);
+        assert!(admitted.accounting().work < admitted.certificate().work_bound);
+        assert_eq!(
+            admitted.accounting().random_access_bytes_read,
+            admitted.accounting().required_anchor_prefix_steps
+        );
+        assert!(admitted.accounting().work <= admitted.certificate().work_bound);
         assert_eq!(admitted.certificate().work_bound, upper.work);
         assert_eq!(
+            admitted.certificate().random_access_bytes,
+            upper.random_access_bytes
+        );
+        assert_eq!(
             admitted.certificate().sequential_bytes_bound,
-            upper.source_accesses
+            upper.sequential_bytes
         );
 
         for (resource, limits) in [
@@ -430,6 +508,13 @@ mod tests {
                 Resource::OutputMatches,
                 OperationLimits {
                     max_output_matches: exact.max_output_matches - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::RandomAccessBytes,
+                OperationLimits {
+                    max_random_access_bytes: exact.max_random_access_bytes - 1,
                     ..exact
                 },
             ),

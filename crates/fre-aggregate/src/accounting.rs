@@ -29,7 +29,10 @@ pub struct CompileAccounting {
     pub required_internal_anchors: usize,
     pub required_internal_anchor_bytes: usize,
     pub required_internal_anchor_optional_stages: usize,
+    /// Exact logical work observed while constructing the admitted plan.
     pub required_internal_anchor_build_work: usize,
+    /// Work charged prospectively before any plan descriptor/source traversal.
+    pub required_internal_anchor_build_work_upper_bound: usize,
     pub required_internal_anchor_persistent_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
@@ -79,6 +82,8 @@ pub struct ExecutionAccounting {
     pub utf8_validation_work: usize,
     pub sequential_bytes_written: usize,
     pub sequential_bytes_read: usize,
+    /// Exact logical input bytes read through backward/random access.
+    pub random_access_bytes_read: usize,
     pub random_access_peak_bytes: usize,
     pub scratch_peak_bytes: usize,
     pub log_bytes: usize,

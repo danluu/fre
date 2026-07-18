@@ -553,7 +553,7 @@ impl CompiledRegex {
     ) -> Result<ExecutionResult, Error> {
         let (boundaries, upper) = preflight_required_internal_anchor(plan, local.len(), limits)?;
         let result = plan
-            .count(local, exact_required_anchor_limits(upper))
+            .count(local, exact_required_anchor_limits(upper, limits))
             .map_err(|error| map_required_anchor_error(&error))?;
         let matches = usize::try_from(result.count).map_err(|_| Error::ArithmeticOverflow {
             resource: Resource::OutputMatches,
@@ -564,15 +564,16 @@ impl CompiledRegex {
             root_probes: actual.candidate_visits,
             successful_paths: matches,
             emitted_matches: matches,
-            sequential_bytes_read: upper.source_accesses,
-            peak_bytes: upper.peak_bytes,
-            work: upper.work,
+            sequential_bytes_read: actual.sequential_bytes,
+            random_access_bytes_read: actual.random_access_bytes,
+            peak_bytes: actual.peak_bytes,
+            work: actual.work,
             required_anchor_candidates: actual.candidate_visits,
             required_anchor_prefix_steps: actual.prefix_steps,
             required_anchor_continuation_steps: actual.continuation_steps,
-            required_anchor_source_accesses: upper.source_accesses,
-            required_anchor_queue_peak: upper.queue_entries,
-            required_anchor_frontier_peak: upper.frontier_entries,
+            required_anchor_source_accesses: actual.source_accesses,
+            required_anchor_queue_peak: actual.queue_entries,
+            required_anchor_frontier_peak: actual.frontier_entries,
             ..ExecutionAccounting::default()
         };
         let certificate = OperationCertificate {
@@ -586,10 +587,10 @@ impl CompiledRegex {
             row_storage: None,
             row_record_bytes: 0,
             work_bound: upper.work,
-            random_access_bytes: 0,
+            random_access_bytes: upper.random_access_bytes,
             scratch_bytes: 0,
             log_bytes: 0,
-            sequential_bytes_bound: upper.source_accesses,
+            sequential_bytes_bound: upper.sequential_bytes,
             match_events: matches,
             output_matches: matches,
             output_bytes: 0,
@@ -630,7 +631,12 @@ fn preflight_required_internal_anchor(
     })?;
     enforce(count, limits.max_output_matches, Resource::OutputMatches)?;
     enforce(
-        upper.source_accesses,
+        upper.random_access_bytes,
+        limits.max_random_access_bytes,
+        Resource::RandomAccessBytes,
+    )?;
+    enforce(
+        upper.sequential_bytes,
         limits.max_sequential_bytes,
         Resource::SequentialBytes,
     )?;
@@ -644,23 +650,27 @@ fn preflight_required_internal_anchor(
     Ok((boundaries, upper))
 }
 
-const fn exact_required_anchor_limits(
+fn exact_required_anchor_limits(
     upper: RequiredInternalAnchorCountUpperBounds,
+    public: OperationLimits,
 ) -> RequiredInternalAnchorCountLimits {
+    let public_count = u64::try_from(public.max_output_matches).unwrap_or(u64::MAX);
     RequiredInternalAnchorCountLimits {
         max_input_bytes: upper.input_bytes,
-        max_candidate_visits: upper.candidate_visits,
+        max_candidate_visits: upper.candidate_visits.min(public.max_match_events),
         max_continuation_steps: upper.continuation_steps,
         max_source_accesses: upper.source_accesses,
-        max_random_access_bytes: upper.random_access_bytes,
-        max_sequential_bytes: upper.sequential_bytes,
-        max_work: upper.work,
-        max_count: upper.count,
+        max_random_access_bytes: upper
+            .random_access_bytes
+            .min(public.max_random_access_bytes),
+        max_sequential_bytes: upper.sequential_bytes.min(public.max_sequential_bytes),
+        max_work: upper.work.min(public.max_work),
+        max_count: upper.count.min(public_count),
         max_queue_entries: upper.queue_entries,
         max_frontier_entries: upper.frontier_entries,
         max_allocations: upper.allocations,
         max_scratch_bytes: upper.scratch_bytes,
-        max_peak_bytes: upper.peak_bytes,
+        max_peak_bytes: upper.peak_bytes.min(public.max_peak_bytes),
     }
 }
 

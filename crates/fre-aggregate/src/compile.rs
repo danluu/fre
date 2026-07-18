@@ -177,17 +177,21 @@ impl CompiledRegex {
                 limits.max_literal_bytes,
                 remaining_program_bytes,
             )?;
-            if let Some(inspection) = inspection {
-                budget.charge(inspection.inspection_work)?;
-                let build = inspection.plan.build_accounting();
+            budget.charge(inspection.inspection_work)?;
+            if let Some(plan) = inspection.plan {
+                let build = plan.build_accounting();
                 budget.acquire_construction_bytes(build.persistent_bytes)?;
                 budget.accounting.required_internal_anchors = 1;
                 budget.accounting.required_internal_anchor_bytes = build.anchor_bytes;
                 budget.accounting.required_internal_anchor_optional_stages = build.optional_stages;
-                budget.accounting.required_internal_anchor_build_work = build.structural_work;
+                budget.accounting.required_internal_anchor_build_work =
+                    build.observed_structural_work;
+                budget
+                    .accounting
+                    .required_internal_anchor_build_work_upper_bound = build.work_upper_bound;
                 budget.accounting.required_internal_anchor_persistent_bytes =
                     build.persistent_bytes;
-                Some(inspection.plan)
+                Some(plan)
             } else {
                 None
             }
@@ -317,6 +321,7 @@ impl CompileBudget {
                 required_internal_anchor_bytes: 0,
                 required_internal_anchor_optional_stages: 0,
                 required_internal_anchor_build_work: 0,
+                required_internal_anchor_build_work_upper_bound: 0,
                 required_internal_anchor_persistent_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
@@ -1638,18 +1643,60 @@ fn bind_required_internal_anchor_identity(
 ) -> Result<PlanId, Error> {
     let domain = fre_kernels::REQUIRED_INTERNAL_ANCHOR_PLAN_ID.as_bytes();
     let operation = fre_kernels::REQUIRED_INTERNAL_ANCHOR_COUNT_OPERATION_ID.as_bytes();
+    let class_identity_bytes = mul(7, 4 * core::mem::size_of::<u64>(), Resource::CompileWork)?;
+    let optional_identity_bytes = mul(
+        fre_kernels::REQUIRED_INTERNAL_ANCHOR_MAX_OPTIONAL_STAGES,
+        2,
+        Resource::CompileWork,
+    )?;
+    let configuration_identity_bytes = add(
+        add(
+            class_identity_bytes,
+            optional_identity_bytes,
+            Resource::CompileWork,
+        )?,
+        1 + core::mem::size_of::<u64>(),
+        Resource::CompileWork,
+    )?;
     budget.charge(add(
-        add(program.0.len(), domain.len(), Resource::CompileWork)?,
-        add(operation.len(), plan.anchor().len(), Resource::CompileWork)?,
+        add(
+            add(program.0.len(), domain.len(), Resource::CompileWork)?,
+            add(operation.len(), plan.anchor().len(), Resource::CompileWork)?,
+            Resource::CompileWork,
+        )?,
+        configuration_identity_bytes,
         Resource::CompileWork,
     )?)?;
+    let continuation = plan.continuation();
     let mut first = StableHash::new(0xa87c_19e2_d4b5_6301);
     let mut second = StableHash::new(0x6301_d4b5_19e2_a87c);
     for hash in [&mut first, &mut second] {
         hash.bytes(&program.0);
         hash.bytes(domain);
         hash.bytes(operation);
+        hash_usize(hash, plan.anchor().len());
         hash.bytes(plan.anchor());
+        for word in plan.prefix().words() {
+            hash.bytes(&word.to_le_bytes());
+        }
+        for word in continuation.head.words() {
+            hash.bytes(&word.to_le_bytes());
+        }
+        for word in continuation.tail.words() {
+            hash.bytes(&word.to_le_bytes());
+        }
+        hash.byte(continuation.optional_count);
+        for stage in continuation.optional {
+            if let Some(stage) = stage {
+                hash.byte(1);
+                hash.byte(stage.introducer);
+                for word in stage.class.words() {
+                    hash.bytes(&word.to_le_bytes());
+                }
+            } else {
+                hash.byte(0);
+            }
+        }
     }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
@@ -1993,5 +2040,52 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn required_anchor_plan_id(
+        prefix: &[u8],
+        anchor: &[u8],
+        head: &[u8],
+        tail: &[u8],
+        optional: Option<(u8, &[u8])>,
+    ) -> PlanId {
+        let mut continuation = fre_kernels::RequiredInternalAnchorContinuationSource::new(
+            fre_kernels::RequiredInternalAnchorByteClass::from_bytes(head),
+            fre_kernels::RequiredInternalAnchorByteClass::from_bytes(tail),
+        );
+        if let Some((introducer, class)) = optional {
+            continuation.optional[0] =
+                Some(fre_kernels::RequiredInternalAnchorOptionalStageSource {
+                    introducer,
+                    class: fre_kernels::RequiredInternalAnchorByteClass::from_bytes(class),
+                });
+            continuation.optional_count = 1;
+        }
+        let plan = fre_kernels::RequiredInternalAnchorPlan::build(
+            fre_kernels::RequiredInternalAnchorByteClass::from_bytes(prefix),
+            anchor,
+            continuation,
+            fre_kernels::RequiredInternalAnchorBuildLimits::default(),
+        )
+        .expect("valid identity fixture");
+        let mut budget = CompileBudget::new(CompileLimits::default());
+        bind_required_internal_anchor_identity(PlanId([0x5a; 16]), &plan, &mut budget)
+            .expect("bind required-anchor identity")
+    }
+
+    #[test]
+    fn required_anchor_identity_binds_every_resource_bearing_configuration_field() {
+        let base = required_anchor_plan_id(b"a", b"X", b"b", b"bc", None);
+        for changed in [
+            required_anchor_plan_id(b"d", b"X", b"b", b"bc", None),
+            required_anchor_plan_id(b"a", b"Y", b"b", b"bc", None),
+            required_anchor_plan_id(b"a", b"X", b"c", b"bc", None),
+            required_anchor_plan_id(b"a", b"X", b"b", b"bd", None),
+            required_anchor_plan_id(b"a", b"X", b"b", b"bc", Some((b'?', b"d"))),
+            required_anchor_plan_id(b"a", b"X", b"b", b"bc", Some((b'!', b"d"))),
+            required_anchor_plan_id(b"a", b"X", b"b", b"bc", Some((b'?', b"e"))),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 }

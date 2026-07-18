@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v1-structural-quota-v8-regex-redux-composite-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v2-structural-quota-v8-regex-redux-composite-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -5760,11 +5760,10 @@ fn required_internal_anchor_operation_limits(
         checked_aggregate_mul(candidates, per_candidate, "anchor continuation work")?,
         "anchor continuation work",
     )?;
-    let source = checked_aggregate_add(
-        checked_aggregate_add(finder_source, haystack_len, "anchor source")?,
-        continuation,
-        "anchor source",
-    )?;
+    let random_access = haystack_len;
+    let sequential =
+        checked_aggregate_add(finder_source, continuation, "anchor sequential source")?;
+    let source = checked_aggregate_add(random_access, sequential, "anchor source")?;
     let work = checked_aggregate_add(
         checked_aggregate_add(
             source,
@@ -5781,10 +5780,10 @@ fn required_internal_anchor_operation_limits(
     Ok(AggregateOperationLimits {
         max_boundaries: boundaries,
         max_table_cells: 0,
-        max_random_access_bytes: 0,
+        max_random_access_bytes: random_access.min(limits.fre_aggregate_random_access_bytes),
         max_scratch_bytes: 0,
         max_log_bytes: 0,
-        max_sequential_bytes: source.min(limits.fre_aggregate_sequential_bytes),
+        max_sequential_bytes: sequential.min(limits.fre_aggregate_sequential_bytes),
         max_match_events: candidates.min(reducer_events),
         max_output_matches: candidates.min(reducer_matches),
         max_output_bytes: 0,
@@ -12715,7 +12714,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v1-structural-quota-v8-regex-redux-composite-v2"
+            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v2-structural-quota-v8-regex-redux-composite-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -14399,6 +14398,60 @@ mod tests {
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn required_anchor_limits_split_random_and_sequential_and_never_widen_quotas() {
+        let shape = ContinuationProgramShape {
+            states: 9,
+            execution_state_work: 27,
+            has_scalar_transitions: false,
+            max_scalar_search_checks: 0,
+            requires_utf8_validation: false,
+            required_internal_anchors: 1,
+            required_internal_anchor_bytes: 3,
+            required_internal_anchor_optional_stages: 2,
+            required_internal_anchor_persistent_bytes: 128,
+        };
+        let derived = required_internal_anchor_operation_limits(10, shape, &RunLimits::default())
+            .expect("derive required-anchor limits");
+        assert_eq!(derived.max_boundaries, 11);
+        assert_eq!(derived.max_table_cells, 0);
+        assert_eq!(derived.max_random_access_bytes, 10);
+        assert_eq!(derived.max_sequential_bytes, 44);
+        assert_eq!(derived.max_scratch_bytes, 0);
+        assert_eq!(derived.max_log_bytes, 0);
+        assert_eq!(derived.max_output_bytes, 0);
+        assert_eq!(
+            derived.max_random_access_bytes + derived.max_sequential_bytes,
+            54
+        );
+        assert_eq!(derived.max_peak_bytes, 128);
+        assert_eq!(derived.max_work, 94);
+
+        let capped = required_internal_anchor_operation_limits(
+            10,
+            shape,
+            &RunLimits {
+                reducer_steps: 2,
+                fre_aggregate_random_access_bytes: 7,
+                fre_aggregate_sequential_bytes: 6,
+                fre_aggregate_peak_bytes: 5,
+                fre_aggregate_operation_work: 4,
+                ..RunLimits::default()
+            },
+        )
+        .expect("derive capped required-anchor limits");
+        assert_eq!(capped.max_random_access_bytes, 7);
+        assert_eq!(capped.max_sequential_bytes, 6);
+        assert_eq!(capped.max_match_events, 3);
+        assert_eq!(capped.max_output_matches, 2);
+        assert_eq!(capped.max_peak_bytes, 5);
+        assert_eq!(capped.max_work, 4);
+        assert_eq!(capped.max_table_cells, 0);
+        assert_eq!(capped.max_scratch_bytes, 0);
+        assert_eq!(capped.max_log_bytes, 0);
+        assert_eq!(capped.max_output_bytes, 0);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::required_literal::ByteClass;
 
-pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v1";
-pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v1";
+pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v2";
+pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v2";
 pub const MAX_OPTIONAL_STAGES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,7 +77,21 @@ pub struct BuildAccounting {
     pub anchor_bytes: usize,
     pub class_words: usize,
     pub optional_stages: usize,
-    pub structural_work: usize,
+    /// Conservative work envelope admitted before any descriptor or source traversal.
+    pub work_upper_bound: usize,
+    /// Exact logical work observed in the metered Rust structural proof and source copy.
+    pub observed_structural_work: usize,
+    /// Conservative work reserved for construction inside the pinned native finder.
+    pub native_finder_work_upper_bound: usize,
+    pub admission_checks: usize,
+    pub descriptor_checks: usize,
+    pub class_word_checks: usize,
+    pub class_membership_checks: usize,
+    pub optional_slot_checks: usize,
+    pub optional_pair_checks: usize,
+    pub border_candidates: usize,
+    pub border_byte_comparisons: usize,
+    pub anchor_copy_bytes: usize,
     pub allocations: usize,
     pub reserves: usize,
     pub source_copies: usize,
@@ -114,8 +128,8 @@ impl Default for CountLimits {
             max_sequential_bytes: 1 << 29,
             max_work: 1 << 29,
             max_count: 128 << 20,
-            max_queue_entries: 1,
-            max_frontier_entries: 1,
+            max_queue_entries: 0,
+            max_frontier_entries: 0,
             max_allocations: 0,
             max_scratch_bytes: 0,
             max_peak_bytes: 1 << 24,
@@ -148,8 +162,20 @@ pub struct CountUpperBounds {
 pub struct CountActual {
     pub candidate_visits: usize,
     pub finder_calls: usize,
+    pub finder_source_accesses: usize,
     pub prefix_steps: usize,
     pub continuation_steps: usize,
+    pub source_accesses: usize,
+    pub random_access_bytes: usize,
+    pub sequential_bytes: usize,
+    /// Exact logical non-source control transitions executed by this operation.
+    pub control_work: usize,
+    pub work: usize,
+    pub queue_entries: usize,
+    pub frontier_entries: usize,
+    pub allocations: usize,
+    pub scratch_bytes: usize,
+    pub peak_bytes: usize,
     pub matches: u64,
 }
 
@@ -191,6 +217,7 @@ pub enum BuildError {
     SourceCopyLimit { needed: usize, limit: usize },
     ScratchLimit { needed: usize, limit: usize },
     AllocationFailed { additional: usize },
+    AccountingInvariant { actual: usize, upper: usize },
     Overflow(&'static str),
 }
 
@@ -256,6 +283,16 @@ pub struct RequiredInternalAnchorPlan {
 }
 
 impl RequiredInternalAnchorPlan {
+    /// Derive the complete build-work envelope from scalar descriptor dimensions only.
+    ///
+    /// This performs no anchor-byte, byte-class, or optional-stage traversal.
+    pub fn build_work_upper_bound(
+        anchor_bytes: usize,
+        optional_count: u8,
+    ) -> Result<usize, BuildError> {
+        build_work_upper_bound(anchor_bytes, usize::from(optional_count))
+    }
+
     /// Build a descriptor-driven candidate stream after proving its bounds.
     pub fn build(
         prefix: ByteClass,
@@ -263,68 +300,105 @@ impl RequiredInternalAnchorPlan {
         continuation: ContinuationSource,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if prefix.is_empty() {
-            return Err(BuildError::EmptyPrefix);
+        let anchor_bytes = anchor.len();
+        let optional_count = usize::from(continuation.optional_count);
+        let work_upper_bound = build_work_upper_bound(anchor_bytes, optional_count)?;
+        if work_upper_bound > limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed: work_upper_bound,
+                limit: limits.max_build_work,
+            });
         }
-        let Some(&first_anchor) = anchor.first() else {
-            return Err(BuildError::EmptyAnchor);
-        };
-        if anchor.len() > limits.max_anchor_bytes {
+        let persistent_bytes = size_of::<Self>()
+            .checked_add(anchor_bytes)
+            .ok_or(BuildError::Overflow("persistent bytes"))?;
+        let peak_bytes = persistent_bytes;
+        let mut meter = BuildMeter::default();
+        meter.admission(1)?;
+        meter.admission(1)?;
+        if anchor_bytes > limits.max_anchor_bytes {
             return Err(BuildError::AnchorLimit {
-                needed: anchor.len(),
+                needed: anchor_bytes,
                 limit: limits.max_anchor_bytes,
             });
         }
+        preflight_build_resources(persistent_bytes, peak_bytes, limits, &mut meter)?;
+
+        if class_is_empty(prefix, &mut meter)? {
+            return Err(BuildError::EmptyPrefix);
+        }
+        meter.descriptor(1)?;
+        let Some(&first_anchor) = anchor.first() else {
+            return Err(BuildError::EmptyAnchor);
+        };
+        meter.class_membership(1)?;
         if prefix.contains(first_anchor) {
             return Err(BuildError::AnchorStartsInPrefix { byte: first_anchor });
         }
-        if continuation.head.is_empty() {
+        if class_is_empty(continuation.head, &mut meter)? {
             return Err(BuildError::EmptyHead);
         }
-        if continuation.tail.is_empty() {
+        if class_is_empty(continuation.tail, &mut meter)? {
             return Err(BuildError::EmptyTail);
         }
-        if !is_subset(continuation.head, continuation.tail) {
+        if !is_subset(continuation.head, continuation.tail, &mut meter)? {
             return Err(BuildError::HeadNotSubsetOfTail);
         }
-        let optional_count = usize::from(continuation.optional_count);
+        meter.descriptor(1)?;
         if optional_count > MAX_OPTIONAL_STAGES {
             return Err(BuildError::OptionalCount {
                 count: continuation.optional_count,
             });
         }
-        validate_optional(&continuation, optional_count)?;
+        validate_optional(&continuation, optional_count, &mut meter)?;
 
-        let structural_work = build_work(anchor.len(), optional_count)?;
-        preflight_build_resources(structural_work, 0, 0, limits)?;
-        if let Some(border) = longest_border(anchor)? {
+        if let Some(border) = longest_border(anchor, &mut meter)? {
             return Err(BuildError::OverlappingAnchor { border });
         }
-        let persistent_bytes = size_of::<Self>()
-            .checked_add(anchor.len())
-            .ok_or(BuildError::Overflow("persistent bytes"))?;
-        let peak_bytes = persistent_bytes;
-        preflight_build_resources(structural_work, persistent_bytes, peak_bytes, limits)?;
 
         let mut owned_anchor = Vec::new();
         owned_anchor
-            .try_reserve_exact(anchor.len())
+            .try_reserve_exact(anchor_bytes)
             .map_err(|_| BuildError::AllocationFailed {
-                additional: anchor.len(),
+                additional: anchor_bytes,
             })?;
+        meter.anchor_copy(anchor_bytes)?;
         owned_anchor.extend_from_slice(anchor);
         let class_words = (3_usize.checked_add(optional_count))
             .and_then(|classes| classes.checked_mul(4))
             .ok_or(BuildError::Overflow("class words"))?;
+        let observed_structural_work = meter.total()?;
+        let native_finder_work_upper_bound = native_finder_work_upper_bound(anchor_bytes)?;
+        let reconciled_upper = observed_structural_work
+            .checked_add(native_finder_work_upper_bound)
+            .ok_or(BuildError::Overflow("reconciled build work"))?;
+        if reconciled_upper > work_upper_bound {
+            return Err(BuildError::AccountingInvariant {
+                actual: reconciled_upper,
+                upper: work_upper_bound,
+            });
+        }
+        let finder = FinderBuilder::new().build_forward_owned(owned_anchor);
         Ok(Self {
             prefix,
             continuation,
-            finder: FinderBuilder::new().build_forward_owned(owned_anchor),
+            finder,
             build: BuildAccounting {
-                anchor_bytes: anchor.len(),
+                anchor_bytes,
                 class_words,
                 optional_stages: optional_count,
-                structural_work,
+                work_upper_bound,
+                observed_structural_work,
+                native_finder_work_upper_bound,
+                admission_checks: meter.admission_checks,
+                descriptor_checks: meter.descriptor_checks,
+                class_word_checks: meter.class_word_checks,
+                class_membership_checks: meter.class_membership_checks,
+                optional_slot_checks: meter.optional_slot_checks,
+                optional_pair_checks: meter.optional_pair_checks,
+                border_candidates: meter.border_candidates,
+                border_byte_comparisons: meter.border_byte_comparisons,
+                anchor_copy_bytes: meter.anchor_copy_bytes,
                 allocations: 1,
                 reserves: 1,
                 source_copies: 1,
@@ -351,6 +425,16 @@ impl RequiredInternalAnchorPlan {
     }
 
     #[must_use]
+    pub const fn prefix(&self) -> ByteClass {
+        self.prefix
+    }
+
+    #[must_use]
+    pub const fn continuation(&self) -> ContinuationSource {
+        self.continuation
+    }
+
+    #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
     }
@@ -360,25 +444,48 @@ impl RequiredInternalAnchorPlan {
         let upper = self.count_upper_bounds(haystack.len())?;
         enforce(&upper, limits)?;
         let mut actual = CountActual::default();
+        actual.control_work = add(actual.control_work, 1, "operation initialization")?;
         let mut search = 0_usize;
         let mut match_floor = 0_usize;
         while search <= haystack.len() {
+            actual.control_work = add(actual.control_work, 1, "finder dispatch")?;
             actual.finder_calls = add(actual.finder_calls, 1, "finder calls")?;
+            let remaining = haystack
+                .len()
+                .checked_sub(search)
+                .ok_or(CountError::Overflow("finder remaining bytes"))?;
             let Some(relative) = self.finder.find(&haystack[search..]) else {
+                actual.finder_source_accesses = add(
+                    actual.finder_source_accesses,
+                    remaining,
+                    "finder source accesses",
+                )?;
+                actual.control_work = add(actual.control_work, 1, "terminal finder miss")?;
                 break;
             };
+            actual.control_work = add(actual.control_work, 1, "candidate dispatch")?;
+            let finder_accesses = add(relative, self.anchor().len(), "finder source accesses")?;
+            actual.finder_source_accesses = add(
+                actual.finder_source_accesses,
+                finder_accesses,
+                "finder source accesses",
+            )?;
             actual.candidate_visits = add(actual.candidate_visits, 1, "candidate visits")?;
             let candidate = add(search, relative, "candidate position")?;
             let after_anchor = add(candidate, self.anchor().len(), "after anchor")?;
-            let Some(start) = self.prefix_start(haystack, candidate, match_floor, &mut actual)?
-            else {
+            let prefix_start = self.prefix_start(haystack, candidate, match_floor, &mut actual)?;
+            actual.control_work = add(actual.control_work, 1, "prefix result")?;
+            let Some(start) = prefix_start else {
                 search = after_anchor;
                 continue;
             };
-            let Some(end) = self.verify_continuation(haystack, after_anchor, &mut actual)? else {
+            let continuation = self.verify_continuation(haystack, after_anchor, &mut actual)?;
+            actual.control_work = add(actual.control_work, 1, "continuation result")?;
+            let Some(end) = continuation else {
                 search = after_anchor;
                 continue;
             };
+            actual.control_work = add(actual.control_work, 1, "match reduction")?;
             debug_assert!(start < end);
             actual.matches = actual
                 .matches
@@ -387,6 +494,8 @@ impl RequiredInternalAnchorPlan {
             search = end;
             match_floor = end;
         }
+        actual.control_work = add(actual.control_work, 1, "operation finalization")?;
+        finish_actual(&mut actual, self.build.persistent_bytes)?;
         check_actual(&actual, &upper)?;
         Ok(CountResult {
             count: actual.matches,
@@ -455,8 +564,8 @@ impl RequiredInternalAnchorPlan {
             sequential_bytes,
             work,
             count,
-            queue_entries: 1,
-            frontier_entries: 1,
+            queue_entries: 0,
+            frontier_entries: 0,
             allocations: 0,
             scratch_bytes: 0,
             persistent_bytes: self.build.persistent_bytes,
@@ -539,27 +648,150 @@ impl RequiredInternalAnchorPlan {
     }
 }
 
-fn validate_optional(source: &ContinuationSource, count: usize) -> Result<(), BuildError> {
+#[derive(Default)]
+struct BuildMeter {
+    admission_checks: usize,
+    descriptor_checks: usize,
+    class_word_checks: usize,
+    class_membership_checks: usize,
+    optional_slot_checks: usize,
+    optional_pair_checks: usize,
+    border_candidates: usize,
+    border_byte_comparisons: usize,
+    anchor_copy_bytes: usize,
+}
+
+impl BuildMeter {
+    fn admission(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(&mut self.admission_checks, amount, "admission checks")
+    }
+
+    fn descriptor(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(&mut self.descriptor_checks, amount, "descriptor checks")
+    }
+
+    fn class_words(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(&mut self.class_word_checks, amount, "class word checks")
+    }
+
+    fn class_membership(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(
+            &mut self.class_membership_checks,
+            amount,
+            "class membership checks",
+        )
+    }
+
+    fn optional_slots(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(
+            &mut self.optional_slot_checks,
+            amount,
+            "optional slot checks",
+        )
+    }
+
+    fn optional_pairs(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(
+            &mut self.optional_pair_checks,
+            amount,
+            "optional pair checks",
+        )
+    }
+
+    fn border_candidate(&mut self) -> Result<(), BuildError> {
+        checked_meter_add(&mut self.border_candidates, 1, "border candidates")
+    }
+
+    fn border_byte(&mut self) -> Result<(), BuildError> {
+        checked_meter_add(
+            &mut self.border_byte_comparisons,
+            1,
+            "border byte comparisons",
+        )
+    }
+
+    fn anchor_copy(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(&mut self.anchor_copy_bytes, amount, "anchor copy bytes")
+    }
+
+    fn total(&self) -> Result<usize, BuildError> {
+        [
+            self.admission_checks,
+            self.descriptor_checks,
+            self.class_word_checks,
+            self.class_membership_checks,
+            self.optional_slot_checks,
+            self.optional_pair_checks,
+            self.border_candidates,
+            self.border_byte_comparisons,
+            self.anchor_copy_bytes,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, amount| {
+            total
+                .checked_add(amount)
+                .ok_or(BuildError::Overflow("observed build work"))
+        })
+    }
+}
+
+fn checked_meter_add(
+    value: &mut usize,
+    amount: usize,
+    computation: &'static str,
+) -> Result<(), BuildError> {
+    *value = value
+        .checked_add(amount)
+        .ok_or(BuildError::Overflow(computation))?;
+    Ok(())
+}
+
+fn class_is_empty(class: ByteClass, meter: &mut BuildMeter) -> Result<bool, BuildError> {
+    for word in class.words() {
+        meter.class_words(1)?;
+        if word != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_optional(
+    source: &ContinuationSource,
+    count: usize,
+    meter: &mut BuildMeter,
+) -> Result<(), BuildError> {
     let mut preceding = source.tail;
     for index in 0..MAX_OPTIONAL_STAGES {
+        meter.optional_slots(1)?;
+        let active = index < count;
+        meter.optional_slots(1)?;
         let stage = source.optional[index];
-        if index < count {
+        if active {
             let stage = stage.ok_or(BuildError::MissingOptional { index })?;
-            if stage.class.is_empty() {
+            if class_is_empty(stage.class, meter)? {
                 return Err(BuildError::EmptyOptionalClass { stage: index });
             }
+            meter.class_membership(1)?;
             if preceding.contains(stage.introducer) {
                 return Err(BuildError::IntroducerInPrecedingClass {
                     byte: stage.introducer,
                     stage: index,
                 });
             }
-            for earlier in source.optional[..index].iter().flatten() {
+            for earlier_index in 0..index {
+                meter.optional_slots(1)?;
+                let earlier =
+                    source.optional[earlier_index].ok_or(BuildError::MissingOptional {
+                        index: earlier_index,
+                    })?;
+                meter.optional_pairs(1)?;
                 if earlier.introducer == stage.introducer {
                     return Err(BuildError::DuplicateIntroducer {
                         byte: stage.introducer,
                     });
                 }
+                meter.class_membership(1)?;
                 if earlier.class.contains(stage.introducer) {
                     return Err(BuildError::IntroducerInPrecedingClass {
                         byte: stage.introducer,
@@ -575,47 +807,93 @@ fn validate_optional(source: &ContinuationSource, count: usize) -> Result<(), Bu
     Ok(())
 }
 
-fn is_subset(left: ByteClass, right: ByteClass) -> bool {
-    left.words()
-        .into_iter()
-        .zip(right.words())
-        .all(|(left, right)| left & !right == 0)
+fn is_subset(
+    left: ByteClass,
+    right: ByteClass,
+    meter: &mut BuildMeter,
+) -> Result<bool, BuildError> {
+    for (left, right) in left.words().into_iter().zip(right.words()) {
+        meter.class_words(1)?;
+        if left & !right != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-fn build_work(anchor_bytes: usize, optional_count: usize) -> Result<usize, BuildError> {
-    let border_work = anchor_bytes
-        .checked_mul(anchor_bytes)
-        .ok_or(BuildError::Overflow("border work"))?;
-    let class_words = (3_usize
+fn build_work_upper_bound(
+    anchor_bytes: usize,
+    raw_optional_count: usize,
+) -> Result<usize, BuildError> {
+    let optional_count = raw_optional_count.min(MAX_OPTIONAL_STAGES);
+    let admission_checks = 8_usize;
+    let descriptor_checks = 2_usize;
+    let class_word_checks = optional_count
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(16))
+        .ok_or(BuildError::Overflow("class word upper bound"))?;
+    let preceding_optional_count = optional_count.checked_sub(1).unwrap_or(0);
+    let optional_pairs = optional_count
+        .checked_mul(preceding_optional_count)
+        .and_then(|value| value.checked_div(2))
+        .ok_or(BuildError::Overflow("optional pair upper bound"))?;
+    let class_membership_checks = 1_usize
         .checked_add(optional_count)
-        .ok_or(BuildError::Overflow("class count"))?)
-    .checked_mul(4)
-    .ok_or(BuildError::Overflow("class words"))?;
-    border_work
-        .checked_add(class_words)
-        .and_then(|work| work.checked_add(optional_count.checked_mul(16)?))
+        .and_then(|value| value.checked_add(optional_pairs))
+        .ok_or(BuildError::Overflow("class membership upper bound"))?;
+    let optional_slot_checks = MAX_OPTIONAL_STAGES
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(optional_pairs))
+        .ok_or(BuildError::Overflow("optional slot upper bound"))?;
+    let optional_pair_checks = optional_pairs;
+    let border_candidates = anchor_bytes.checked_sub(1).unwrap_or(0);
+    let preceding_anchor_bytes = anchor_bytes.checked_sub(1).unwrap_or(0);
+    let border_byte_comparisons = anchor_bytes
+        .checked_mul(preceding_anchor_bytes)
+        .and_then(|value| value.checked_div(2))
+        .ok_or(BuildError::Overflow("border comparison upper bound"))?;
+    let native_finder_work_upper_bound = native_finder_work_upper_bound(anchor_bytes)?;
+    [
+        admission_checks,
+        descriptor_checks,
+        class_word_checks,
+        class_membership_checks,
+        optional_slot_checks,
+        optional_pair_checks,
+        border_candidates,
+        border_byte_comparisons,
+        anchor_bytes,
+        native_finder_work_upper_bound,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, amount| {
+        total
+            .checked_add(amount)
+            .ok_or(BuildError::Overflow("build work upper bound"))
+    })
+}
+
+fn native_finder_work_upper_bound(anchor_bytes: usize) -> Result<usize, BuildError> {
+    anchor_bytes
+        .checked_mul(12)
         .and_then(|work| work.checked_add(32))
-        .ok_or(BuildError::Overflow("build work"))
+        .ok_or(BuildError::Overflow("native finder work upper bound"))
 }
 
 fn preflight_build_resources(
-    structural_work: usize,
     persistent_bytes: usize,
     peak_bytes: usize,
     limits: BuildLimits,
+    meter: &mut BuildMeter,
 ) -> Result<(), BuildError> {
-    if structural_work > limits.max_build_work {
-        return Err(BuildError::WorkLimit {
-            needed: structural_work,
-            limit: limits.max_build_work,
-        });
-    }
+    meter.admission(1)?;
     if persistent_bytes > limits.max_persistent_bytes {
         return Err(BuildError::PersistentLimit {
             needed: persistent_bytes,
             limit: limits.max_persistent_bytes,
         });
     }
+    meter.admission(1)?;
     if peak_bytes > limits.max_peak_bytes {
         return Err(BuildError::PeakLimit {
             needed: peak_bytes,
@@ -656,6 +934,7 @@ fn preflight_build_resources(
             },
         ),
     ] {
+        meter.admission(1)?;
         if needed > limit {
             return Err(error);
         }
@@ -663,13 +942,22 @@ fn preflight_build_resources(
     Ok(())
 }
 
-fn longest_border(anchor: &[u8]) -> Result<Option<usize>, BuildError> {
+fn longest_border(anchor: &[u8], meter: &mut BuildMeter) -> Result<Option<usize>, BuildError> {
     for border in (1..anchor.len()).rev() {
+        meter.border_candidate()?;
         let suffix_start = anchor
             .len()
             .checked_sub(border)
             .ok_or(BuildError::Overflow("border suffix"))?;
-        if anchor[..border] == anchor[suffix_start..] {
+        let mut matches = true;
+        for offset in 0..border {
+            meter.border_byte()?;
+            if anchor[offset] != anchor[suffix_start + offset] {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
             return Ok(Some(border));
         }
     }
@@ -752,12 +1040,38 @@ fn enforce(upper: &CountUpperBounds, limits: CountLimits) -> Result<(), CountErr
     Ok(())
 }
 
+fn finish_actual(actual: &mut CountActual, persistent_bytes: usize) -> Result<(), CountError> {
+    actual.random_access_bytes = actual.prefix_steps;
+    actual.sequential_bytes = add(
+        actual.finder_source_accesses,
+        actual.continuation_steps,
+        "actual sequential bytes",
+    )?;
+    actual.source_accesses = add(
+        actual.random_access_bytes,
+        actual.sequential_bytes,
+        "actual source accesses",
+    )?;
+    actual.work = add(actual.source_accesses, actual.control_work, "actual work")?;
+    actual.queue_entries = 0;
+    actual.frontier_entries = 0;
+    actual.allocations = 0;
+    actual.scratch_bytes = 0;
+    actual.peak_bytes = persistent_bytes;
+    Ok(())
+}
+
 fn check_actual(actual: &CountActual, upper: &CountUpperBounds) -> Result<(), CountError> {
     for (counter, actual, upper) in [
         (
             "candidate visits",
             actual.candidate_visits,
             upper.candidate_visits,
+        ),
+        (
+            "finder source accesses",
+            actual.finder_source_accesses,
+            upper.finder_source_accesses,
         ),
         ("finder calls", actual.finder_calls, upper.finder_calls),
         ("prefix steps", actual.prefix_steps, upper.prefix_steps),
@@ -766,6 +1080,40 @@ fn check_actual(actual: &CountActual, upper: &CountUpperBounds) -> Result<(), Co
             actual.continuation_steps,
             upper.continuation_steps,
         ),
+        (
+            "source accesses",
+            actual.source_accesses,
+            upper.source_accesses,
+        ),
+        (
+            "random access bytes",
+            actual.random_access_bytes,
+            upper.random_access_bytes,
+        ),
+        (
+            "sequential bytes",
+            actual.sequential_bytes,
+            upper.sequential_bytes,
+        ),
+        (
+            "control work",
+            actual.control_work,
+            add(
+                mul(upper.candidate_visits, 8, "control work bound")?,
+                16,
+                "control work bound",
+            )?,
+        ),
+        ("work", actual.work, upper.work),
+        ("queue entries", actual.queue_entries, upper.queue_entries),
+        (
+            "frontier entries",
+            actual.frontier_entries,
+            upper.frontier_entries,
+        ),
+        ("allocations", actual.allocations, upper.allocations),
+        ("scratch bytes", actual.scratch_bytes, upper.scratch_bytes),
+        ("peak bytes", actual.peak_bytes, upper.peak_bytes),
     ] {
         if actual > upper {
             return Err(CountError::AccountingInvariant {
@@ -864,6 +1212,22 @@ mod tests {
                 result.accounting.actual.continuation_steps
                     <= result.accounting.upper_bounds.continuation_steps
             );
+            let actual = result.accounting.actual;
+            assert_eq!(actual.random_access_bytes, actual.prefix_steps);
+            assert_eq!(
+                actual.sequential_bytes,
+                actual.finder_source_accesses + actual.continuation_steps
+            );
+            assert_eq!(
+                actual.source_accesses,
+                actual.random_access_bytes + actual.sequential_bytes
+            );
+            assert!(actual.source_accesses <= result.accounting.upper_bounds.source_accesses);
+            assert!(actual.work <= result.accounting.upper_bounds.work);
+            assert_eq!(actual.queue_entries, 0);
+            assert_eq!(actual.frontier_entries, 0);
+            assert_eq!(actual.allocations, 0);
+            assert_eq!(actual.scratch_bytes, 0);
             assert_eq!(result.accounting.upper_bounds.allocations, 0);
             assert_eq!(result.accounting.upper_bounds.scratch_bytes, 0);
         }
@@ -970,20 +1334,6 @@ mod tests {
                 },
             ),
             (
-                CountResource::QueueEntries,
-                CountLimits {
-                    max_queue_entries: 0,
-                    ..exact
-                },
-            ),
-            (
-                CountResource::FrontierEntries,
-                CountLimits {
-                    max_frontier_entries: 0,
-                    ..exact
-                },
-            ),
-            (
                 CountResource::PeakBytes,
                 CountLimits {
                     max_peak_bytes: upper.peak_bytes - 1,
@@ -1005,6 +1355,8 @@ mod tests {
         ));
         assert_eq!(upper.allocations, 0);
         assert_eq!(upper.scratch_bytes, 0);
+        assert_eq!(upper.queue_entries, 0);
+        assert_eq!(upper.frontier_entries, 0);
     }
 
     #[test]
@@ -1070,10 +1422,14 @@ mod tests {
         assert_eq!(build.reserves, 1);
         assert_eq!(build.source_copies, 1);
         assert_eq!(build.scratch_bytes, 0);
+        assert!(
+            build.observed_structural_work + build.native_finder_work_upper_bound
+                <= build.work_upper_bound
+        );
         assert!(build.persistent_bytes <= build.peak_bytes);
         let exact = BuildLimits {
             max_anchor_bytes: build.anchor_bytes,
-            max_build_work: build.structural_work,
+            max_build_work: build.work_upper_bound,
             max_persistent_bytes: build.persistent_bytes,
             max_peak_bytes: build.peak_bytes,
             max_allocations: build.allocations,
@@ -1089,40 +1445,69 @@ mod tests {
                 b"://",
                 source,
                 BuildLimits {
-                    max_build_work: build.structural_work - 1,
+                    max_build_work: build.work_upper_bound - 1,
                     ..exact
                 }
             ),
             Err(BuildError::WorkLimit { .. })
         ));
-        for limits in [
-            BuildLimits {
-                max_anchor_bytes: build.anchor_bytes - 1,
-                ..exact
-            },
-            BuildLimits {
-                max_persistent_bytes: build.persistent_bytes - 1,
-                ..exact
-            },
-            BuildLimits {
-                max_peak_bytes: build.peak_bytes - 1,
-                ..exact
-            },
-            BuildLimits {
-                max_allocations: build.allocations - 1,
-                ..exact
-            },
-            BuildLimits {
-                max_reserves: build.reserves - 1,
-                ..exact
-            },
-            BuildLimits {
-                max_source_copies: build.source_copies - 1,
-                ..exact
-            },
+        for (limits, expected) in [
+            (
+                BuildLimits {
+                    max_anchor_bytes: build.anchor_bytes - 1,
+                    ..exact
+                },
+                "anchor",
+            ),
+            (
+                BuildLimits {
+                    max_persistent_bytes: build.persistent_bytes - 1,
+                    ..exact
+                },
+                "persistent",
+            ),
+            (
+                BuildLimits {
+                    max_peak_bytes: build.peak_bytes - 1,
+                    ..exact
+                },
+                "peak",
+            ),
+            (
+                BuildLimits {
+                    max_allocations: build.allocations - 1,
+                    ..exact
+                },
+                "allocations",
+            ),
+            (
+                BuildLimits {
+                    max_reserves: build.reserves - 1,
+                    ..exact
+                },
+                "reserves",
+            ),
+            (
+                BuildLimits {
+                    max_source_copies: build.source_copies - 1,
+                    ..exact
+                },
+                "source copies",
+            ),
         ] {
+            let error = RequiredInternalAnchorPlan::build(ascii_word(), b"://", source, limits)
+                .expect_err("one-below build resource must refuse");
             assert!(
-                RequiredInternalAnchorPlan::build(ascii_word(), b"://", source, limits).is_err()
+                matches!(
+                    (expected, &error),
+                    ("anchor", BuildError::AnchorLimit { .. })
+                        | ("persistent", BuildError::PersistentLimit { .. })
+                        | ("peak", BuildError::PeakLimit { .. })
+                        | ("allocations", BuildError::AllocationLimit { .. })
+                        | ("reserves", BuildError::ReserveLimit { .. })
+                        | ("source copies", BuildError::SourceCopyLimit { .. })
+                ),
+                "wrong one-below refusal for {expected}: {error:?}"
             );
         }
         assert!(matches!(
@@ -1138,5 +1523,135 @@ mod tests {
             RequiredInternalAnchorPlan::build(ascii_word(), b":a:", source, BuildLimits::default()),
             Err(BuildError::OverlappingAnchor { .. })
         ));
+    }
+
+    fn assert_semantic_refusal_is_preflighted(
+        prefix: ByteClass,
+        anchor: &[u8],
+        source: ContinuationSource,
+        expected: fn(&BuildError) -> bool,
+    ) {
+        let upper =
+            RequiredInternalAnchorPlan::build_work_upper_bound(anchor.len(), source.optional_count)
+                .unwrap();
+        assert!(upper > 0);
+        let exact = BuildLimits {
+            max_build_work: upper,
+            ..BuildLimits::default()
+        };
+        let error = RequiredInternalAnchorPlan::build(prefix, anchor, source, exact)
+            .expect_err("invalid descriptor must refuse");
+        assert!(expected(&error), "unexpected semantic refusal: {error:?}");
+        assert!(matches!(
+            RequiredInternalAnchorPlan::build(
+                prefix,
+                anchor,
+                source,
+                BuildLimits {
+                    max_build_work: upper - 1,
+                    ..exact
+                }
+            ),
+            Err(BuildError::WorkLimit {
+                needed,
+                limit
+            }) if needed == upper && limit == upper - 1
+        ));
+    }
+
+    #[test]
+    fn every_semantic_refusal_is_behind_the_build_work_preflight() {
+        let valid = uri_source();
+        assert_semantic_refusal_is_preflighted(ByteClass::default(), b"://", valid, |error| {
+            matches!(error, BuildError::EmptyPrefix)
+        });
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"", valid, |error| {
+            matches!(error, BuildError::EmptyAnchor)
+        });
+        assert_semantic_refusal_is_preflighted(
+            ByteClass::from_bytes(b":a"),
+            b"://",
+            valid,
+            |error| matches!(error, BuildError::AnchorStartsInPrefix { .. }),
+        );
+
+        let mut empty_head = valid;
+        empty_head.head = ByteClass::default();
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", empty_head, |error| {
+            matches!(error, BuildError::EmptyHead)
+        });
+        let mut empty_tail = valid;
+        empty_tail.tail = ByteClass::default();
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", empty_tail, |error| {
+            matches!(error, BuildError::EmptyTail)
+        });
+        let mut bad_subset = valid;
+        bad_subset.head = ByteClass::from_bytes(b"z");
+        bad_subset.tail = ByteClass::from_bytes(b"a");
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", bad_subset, |error| {
+            matches!(error, BuildError::HeadNotSubsetOfTail)
+        });
+
+        let mut optional_count = valid;
+        optional_count.optional_count = 5;
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", optional_count, |error| {
+            matches!(error, BuildError::OptionalCount { .. })
+        });
+        let mut missing =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"a"));
+        missing.optional_count = 1;
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", missing, |error| {
+            matches!(error, BuildError::MissingOptional { .. })
+        });
+        let mut unexpected =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"a"));
+        unexpected.optional[0] = Some(OptionalStageSource {
+            introducer: b'?',
+            class: ByteClass::from_bytes(b"b"),
+        });
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", unexpected, |error| {
+            matches!(error, BuildError::UnexpectedOptional { .. })
+        });
+
+        let mut duplicate =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"a"));
+        duplicate.optional[0] = Some(OptionalStageSource {
+            introducer: b'?',
+            class: ByteClass::from_bytes(b"b"),
+        });
+        duplicate.optional[1] = Some(OptionalStageSource {
+            introducer: b'?',
+            class: ByteClass::from_bytes(b"c"),
+        });
+        duplicate.optional_count = 2;
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", duplicate, |error| {
+            matches!(error, BuildError::DuplicateIntroducer { .. })
+        });
+        let mut preceding =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"a?"));
+        preceding.optional[0] = Some(OptionalStageSource {
+            introducer: b'?',
+            class: ByteClass::from_bytes(b"b"),
+        });
+        preceding.optional_count = 1;
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", preceding, |error| {
+            matches!(error, BuildError::IntroducerInPrecedingClass { .. })
+        });
+        let mut empty_optional =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"a"));
+        empty_optional.optional[0] = Some(OptionalStageSource {
+            introducer: b'?',
+            class: ByteClass::default(),
+        });
+        empty_optional.optional_count = 1;
+        assert_semantic_refusal_is_preflighted(ascii_word(), b"://", empty_optional, |error| {
+            matches!(error, BuildError::EmptyOptionalClass { .. })
+        });
+        assert_semantic_refusal_is_preflighted(
+            ByteClass::from_bytes(b"x"),
+            b"aba",
+            valid,
+            |error| matches!(error, BuildError::OverlappingAnchor { .. }),
+        );
     }
 }
