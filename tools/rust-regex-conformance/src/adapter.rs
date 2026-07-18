@@ -10,12 +10,12 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableFindIterError, PortableFindIterLimits, PortableRegex,
-    PortableRegexSet, PortableRegexSetBuildError, PortableRegexSetBuilder,
-    PortableRegexSetRunLimits, PortableTextBuildError, PortableTextBuilder,
-    PortableTextCaptureBuildError, PortableTextCaptureBuilder, PortableTextCaptureRegex,
-    PortableTextRegex, PortableTextRegexSet, PortableTextRegexSetBuildError,
-    PortableTextRegexSetBuilder, RustProfile, SearchError, SearchLimits, SearchWindow,
+    PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
+    PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
+    PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
+    PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, PortableTextSearchError,
+    RustProfile, SearchError, SearchLimits, SearchWindow,
 };
 use fre_syntax::ErrorCategory;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v9";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v10";
 
 const LIMITATIONS: [&str; 2] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -586,8 +586,15 @@ fn execute_text_is_match(case: &CaseReceipt, input: &ExecutableCase) -> AdapterD
     let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
         return fault("adapter.text-haystack-invalid-utf8");
     };
-    match regex.is_match(haystack, SearchLimits::unlimited()) {
-        Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed)),
+    let Some(bounds) = text_search_bounds(haystack, input.bounds) else {
+        return compare(&expected, &SemanticValue::IsMatch(false));
+    };
+    match regex.find_window(
+        haystack,
+        SearchWindow::new(bounds.start, bounds.end),
+        SearchLimits::unlimited(),
+    ) {
+        Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed.is_some())),
         Err(_) => unsupported(
             CapabilityId::RustTextFacade,
             "search.portable-execution-refused",
@@ -616,7 +623,7 @@ fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDispo
     let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
         return fault("adapter.text-haystack-invalid-utf8");
     };
-    match collect_text_matches(&regex, haystack, case.match_limit) {
+    match collect_text_matches(&regex, haystack, input.bounds, case.match_limit) {
         Ok(observed) => compare(&expected, &SemanticValue::Matches(observed)),
         Err(_) => unsupported(
             CapabilityId::RustTextFacade,
@@ -1006,7 +1013,11 @@ fn execute_bytes_is_match(case: &CaseReceipt, input: &ExecutableCase) -> Adapter
             return disposition;
         }
     };
-    match regex.is_match(&input.haystack, SearchLimits::unlimited()) {
+    match regex.is_match_window(
+        &input.haystack,
+        SearchWindow::new(input.bounds.start, input.bounds.end),
+        SearchLimits::unlimited(),
+    ) {
         Ok((observed, _)) => compare(&expected, &SemanticValue::IsMatch(observed)),
         Err(_) => unsupported(
             CapabilityId::RustBytesFacade,
@@ -1033,7 +1044,7 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
             return disposition;
         }
     };
-    match collect_byte_matches(&regex, &input.haystack, case.match_limit) {
+    match collect_byte_matches(&regex, &input.haystack, input.bounds, case.match_limit) {
         Ok(observed) => compare(&expected, &SemanticValue::Matches(observed)),
         Err(_) => unsupported(
             CapabilityId::RustBytesFacade,
@@ -1045,45 +1056,63 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
 fn collect_text_matches(
     regex: &PortableTextRegex,
     haystack: &str,
+    bounds: SearchBounds,
     match_limit: Option<usize>,
-) -> Result<Vec<ExpectedSpan>, PortableFindIterError> {
-    let limit = match_limit.unwrap_or(usize::MAX);
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    regex
-        .find_iter(haystack, PortableFindIterLimits::unlimited())
-        .map_err(PortableFindIterError::from)?
-        .take(limit)
-        .map(|matched| {
-            matched.map(|matched| ExpectedSpan {
-                start: matched.start(),
-                end: matched.end(),
-            })
-        })
-        .collect()
-}
-
-fn collect_byte_matches(
-    regex: &PortableRegex,
-    haystack: &[u8],
-    match_limit: Option<usize>,
-) -> Result<Vec<ExpectedSpan>, SearchError> {
+) -> Result<Vec<ExpectedSpan>, PortableTextSearchError> {
     let limit = match_limit.unwrap_or(usize::MAX);
     let mut spans = Vec::new();
-    let mut start = 0_usize;
+    let Some(bounds) = text_search_bounds(haystack, bounds) else {
+        return Ok(spans);
+    };
+    let mut start = bounds.start;
     let mut last_match_end = None;
     while spans.len() < limit {
         let (matched, _) = regex.find_window(
             haystack,
-            SearchWindow::new(start, haystack.len()),
+            SearchWindow::new(start, bounds.end),
             SearchLimits::unlimited(),
         )?;
         let Some(matched) = matched else {
             break;
         };
         if matched.is_empty() && last_match_end == Some(matched.end()) {
-            if start == haystack.len() {
+            if start == bounds.end {
+                break;
+            }
+            start = next_text_boundary(haystack, start.saturating_add(1), bounds.end);
+            continue;
+        }
+        spans.push(ExpectedSpan {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        start = matched.end();
+        last_match_end = Some(matched.end());
+    }
+    Ok(spans)
+}
+
+fn collect_byte_matches(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    bounds: SearchBounds,
+    match_limit: Option<usize>,
+) -> Result<Vec<ExpectedSpan>, SearchError> {
+    let limit = match_limit.unwrap_or(usize::MAX);
+    let mut spans = Vec::new();
+    let mut start = bounds.start;
+    let mut last_match_end = None;
+    while spans.len() < limit {
+        let (matched, _) = regex.find_window(
+            haystack,
+            SearchWindow::new(start, bounds.end),
+            SearchLimits::unlimited(),
+        )?;
+        let Some(matched) = matched else {
+            break;
+        };
+        if matched.is_empty() && last_match_end == Some(matched.end()) {
+            if start == bounds.end {
                 break;
             }
             start = start.saturating_add(1);
@@ -1097,6 +1126,29 @@ fn collect_byte_matches(
         last_match_end = Some(matched.end());
     }
     Ok(spans)
+}
+
+fn next_text_boundary(haystack: &str, start: usize, end: usize) -> usize {
+    let mut boundary = start.min(end);
+    while boundary < end && !haystack.is_char_boundary(boundary) {
+        boundary = boundary.saturating_add(1);
+    }
+    boundary
+}
+
+fn text_search_bounds(haystack: &str, bounds: SearchBounds) -> Option<SearchBounds> {
+    if bounds.start > bounds.end || bounds.end > haystack.len() {
+        return None;
+    }
+    let mut start = bounds.start;
+    while start <= bounds.end && !haystack.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    let mut end = bounds.end;
+    while end >= start && !haystack.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    (start <= end).then_some(SearchBounds { start, end })
 }
 
 fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
@@ -1160,7 +1212,7 @@ fn execute_capture_free_text_captures(
     let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
         return fault("adapter.text-haystack-invalid-utf8");
     };
-    let Ok(spans) = collect_text_matches(&regex, haystack, case.match_limit) else {
+    let Ok(spans) = collect_text_matches(&regex, haystack, input.bounds, case.match_limit) else {
         return unsupported(
             CapabilityId::CaptureIteration,
             "search.text-capture-free-execution-refused",
@@ -1383,11 +1435,15 @@ fn surface_applicability(
         AdapterSurface::RustTextCompile
         | AdapterSurface::RustTextIsMatch
         | AdapterSurface::RustTextFindIter
-        | AdapterSurface::RustTextCapturesIter => single_applicability(case, input, true)?,
+        | AdapterSurface::RustTextCapturesIter => {
+            single_applicability(surface, case, input, true)?;
+        }
         AdapterSurface::RustBytesCompile
         | AdapterSurface::RustBytesIsMatch
         | AdapterSurface::RustBytesFindIter
-        | AdapterSurface::RustBytesCapturesIter => single_applicability(case, input, false)?,
+        | AdapterSurface::RustBytesCapturesIter => {
+            single_applicability(surface, case, input, false)?;
+        }
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
         | AdapterSurface::RustTextSetWhich => set_applicability(case, input, true)?,
@@ -1402,6 +1458,7 @@ fn surface_applicability(
 }
 
 fn single_applicability(
+    surface: AdapterSurface,
     case: &CaseReceipt,
     input: &ExecutableCase,
     text: bool,
@@ -1418,7 +1475,10 @@ fn single_applicability(
     if case.anchored && case.match_limit != Some(1) {
         return Err(NotApplicableReason::ProfileCannotRepresentAnchoring);
     }
-    if input.bounds
+    if matches!(
+        surface,
+        AdapterSurface::RustTextCapturesIter | AdapterSurface::RustBytesCapturesIter
+    ) && input.bounds
         != (SearchBounds {
             start: 0,
             end: input.haystack.len(),
@@ -2078,7 +2138,8 @@ mod tests {
     fn complete_iteration_matches_rust_empty_progress_and_limits() {
         let bytes = PortableBuilder::new("a|").build().unwrap();
         assert_eq!(
-            collect_byte_matches(&bytes, b"abba", None).unwrap(),
+            collect_byte_matches(&bytes, b"abba", SearchBounds { start: 0, end: 4 }, None,)
+                .unwrap(),
             vec![
                 ExpectedSpan { start: 0, end: 1 },
                 ExpectedSpan { start: 2, end: 2 },
@@ -2086,13 +2147,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            collect_byte_matches(&bytes, b"abba", Some(1)).unwrap(),
+            collect_byte_matches(&bytes, b"abba", SearchBounds { start: 0, end: 4 }, Some(1),)
+                .unwrap(),
             vec![ExpectedSpan { start: 0, end: 1 }]
         );
 
         let empty_text = PortableTextBuilder::new("").build().unwrap();
         assert_eq!(
-            collect_text_matches(&empty_text, "éa", None).unwrap(),
+            collect_text_matches(&empty_text, "éa", SearchBounds { start: 0, end: 3 }, None,)
+                .unwrap(),
             vec![
                 ExpectedSpan { start: 0, end: 0 },
                 ExpectedSpan { start: 2, end: 2 },
@@ -2101,16 +2164,128 @@ mod tests {
         );
         let nullable_text = PortableTextBuilder::new("a*").build().unwrap();
         assert_eq!(
-            collect_text_matches(&nullable_text, "ba", None).unwrap(),
+            collect_text_matches(
+                &nullable_text,
+                "ba",
+                SearchBounds { start: 0, end: 2 },
+                None,
+            )
+            .unwrap(),
             vec![
                 ExpectedSpan { start: 0, end: 0 },
                 ExpectedSpan { start: 1, end: 2 },
             ]
         );
         assert!(
-            collect_text_matches(&nullable_text, "ba", Some(0))
-                .unwrap()
-                .is_empty()
+            collect_text_matches(
+                &nullable_text,
+                "ba",
+                SearchBounds { start: 0, end: 2 },
+                Some(0),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_single_surfaces_use_context_preserving_windows() {
+        let mut case = fixture_case(true, true, None);
+        case.bounded_search = true;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec![r"(?-u:\b)a".to_owned()],
+            haystack: "éa a".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 2, end: 4 },
+            line_terminator: b'\n',
+            expected: vec![ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![Some(ExpectedSpan { start: 2, end: 3 })],
+            }],
+        };
+        for surface in [
+            AdapterSurface::RustTextCompile,
+            AdapterSurface::RustTextIsMatch,
+            AdapterSurface::RustTextFindIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextCapturesIter, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut bytes_case = fixture_case(true, false, None);
+        bytes_case.bounded_search = true;
+        let bytes_input = ExecutableCase {
+            id: bytes_case.id.clone(),
+            patterns: vec!["a".to_owned()],
+            haystack: b"zaz".to_vec(),
+            bounds: SearchBounds { start: 1, end: 2 },
+            line_terminator: b'\n',
+            expected: vec![ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+            }],
+        };
+        for surface in [
+            AdapterSurface::RustBytesCompile,
+            AdapterSurface::RustBytesIsMatch,
+            AdapterSurface::RustBytesFindIter,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &bytes_case, &bytes_input),
+                Ok(())
+            );
+            assert!(matches!(
+                execute_case(surface, &bytes_case, &bytes_input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustBytesCapturesIter,
+                &bytes_case,
+                &bytes_input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+    }
+
+    #[test]
+    fn bounded_iteration_normalizes_utf8_endpoints_and_preserves_empty_progress() {
+        let text = PortableTextBuilder::new("a|").build().unwrap();
+        assert_eq!(
+            collect_text_matches(&text, "xéay", SearchBounds { start: 2, end: 4 }, None,).unwrap(),
+            vec![ExpectedSpan { start: 3, end: 4 }]
+        );
+        let empty = PortableTextBuilder::new("").build().unwrap();
+        assert_eq!(
+            collect_text_matches(&empty, "éa", SearchBounds { start: 0, end: 1 }, None,).unwrap(),
+            vec![ExpectedSpan { start: 0, end: 0 }]
+        );
+        assert_eq!(
+            collect_text_matches(&empty, "éa", SearchBounds { start: 1, end: 1 }, None,).unwrap(),
+            Vec::<ExpectedSpan>::new()
+        );
+
+        let bytes = PortableBuilder::new("a|").build().unwrap();
+        assert_eq!(
+            collect_byte_matches(&bytes, b"abba", SearchBounds { start: 1, end: 3 }, None,)
+                .unwrap(),
+            vec![
+                ExpectedSpan { start: 1, end: 1 },
+                ExpectedSpan { start: 2, end: 2 },
+                ExpectedSpan { start: 3, end: 3 },
+            ]
         );
     }
 
