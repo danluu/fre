@@ -24,6 +24,7 @@ mod ordered_literal_aggregate;
 mod packed_literal_set;
 mod packed_ordered_literal_aggregate;
 mod prefix_class_alternation;
+mod required_internal_anchor;
 mod required_literal;
 mod sparse_ordered_literal_aggregate;
 mod unicode_scalar_aggregate;
@@ -189,6 +190,23 @@ pub use prefix_class_alternation::{
     ReduceError as PrefixClassAlternationReduceError,
     ReduceLimits as PrefixClassAlternationReduceLimits,
     ReduceUpperBounds as PrefixClassAlternationUpperBounds,
+};
+pub use required_internal_anchor::{
+    BuildAccounting as RequiredInternalAnchorBuildAccounting,
+    BuildError as RequiredInternalAnchorBuildError,
+    BuildLimits as RequiredInternalAnchorBuildLimits,
+    COUNT_OPERATION_ID as REQUIRED_INTERNAL_ANCHOR_COUNT_OPERATION_ID,
+    ContinuationSource as RequiredInternalAnchorContinuationSource,
+    CountAccounting as RequiredInternalAnchorCountAccounting,
+    CountActual as RequiredInternalAnchorCountActual,
+    CountError as RequiredInternalAnchorCountError,
+    CountLimits as RequiredInternalAnchorCountLimits,
+    CountResource as RequiredInternalAnchorCountResource,
+    CountResult as RequiredInternalAnchorCountResult,
+    CountUpperBounds as RequiredInternalAnchorCountUpperBounds,
+    MAX_OPTIONAL_STAGES as REQUIRED_INTERNAL_ANCHOR_MAX_OPTIONAL_STAGES,
+    OptionalStageSource as RequiredInternalAnchorOptionalStageSource,
+    PLAN_ID as REQUIRED_INTERNAL_ANCHOR_PLAN_ID, RequiredInternalAnchorPlan,
 };
 pub use required_literal::{
     Anchors as RequiredLiteralAnchors, BuildAccounting as RequiredLiteralBuildAccounting,
