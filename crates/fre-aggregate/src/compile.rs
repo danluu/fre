@@ -177,24 +177,7 @@ impl CompiledRegex {
                 limits.max_literal_bytes,
                 remaining_program_bytes,
             )?;
-            budget.charge(inspection.inspection_work)?;
-            if let Some(plan) = inspection.plan {
-                let build = plan.build_accounting();
-                budget.acquire_construction_bytes(build.persistent_bytes)?;
-                budget.accounting.required_internal_anchors = 1;
-                budget.accounting.required_internal_anchor_bytes = build.anchor_bytes;
-                budget.accounting.required_internal_anchor_optional_stages = build.optional_stages;
-                budget.accounting.required_internal_anchor_build_work =
-                    build.observed_structural_work;
-                budget
-                    .accounting
-                    .required_internal_anchor_build_work_upper_bound = build.work_upper_bound;
-                budget.accounting.required_internal_anchor_persistent_bytes =
-                    build.persistent_bytes;
-                Some(plan)
-            } else {
-                None
-            }
+            retain_required_internal_anchor(inspection, &mut budget)?
         };
         let mut builder = Builder::new(
             limits.max_program_states,
@@ -285,6 +268,27 @@ impl CompiledRegex {
     pub fn state_count(&self) -> usize {
         self.program.insts.len()
     }
+}
+
+fn retain_required_internal_anchor(
+    inspection: required_internal_anchor::Inspection,
+    budget: &mut CompileBudget,
+) -> Result<Option<fre_kernels::RequiredInternalAnchorPlan>, Error> {
+    budget.charge(inspection.inspection_work)?;
+    let Some(plan) = inspection.plan else {
+        return Ok(None);
+    };
+    let build = plan.build_accounting();
+    budget.acquire_construction_bytes(build.persistent_bytes)?;
+    budget.accounting.required_internal_anchors = 1;
+    budget.accounting.required_internal_anchor_bytes = build.anchor_bytes;
+    budget.accounting.required_internal_anchor_optional_stages = build.optional_stages;
+    budget.accounting.required_internal_anchor_build_work = build.observed_structural_work;
+    budget
+        .accounting
+        .required_internal_anchor_build_work_upper_bound = build.work_upper_bound;
+    budget.accounting.required_internal_anchor_persistent_bytes = build.persistent_bytes;
+    Ok(Some(plan))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1643,7 +1647,8 @@ fn bind_required_internal_anchor_identity(
 ) -> Result<PlanId, Error> {
     let domain = fre_kernels::REQUIRED_INTERNAL_ANCHOR_PLAN_ID.as_bytes();
     let operation = fre_kernels::REQUIRED_INTERNAL_ANCHOR_COUNT_OPERATION_ID.as_bytes();
-    let class_identity_bytes = mul(7, 4 * core::mem::size_of::<u64>(), Resource::CompileWork)?;
+    let class_bytes = mul(4, core::mem::size_of::<u64>(), Resource::CompileWork)?;
+    let class_identity_bytes = mul(7, class_bytes, Resource::CompileWork)?;
     let optional_identity_bytes = mul(
         fre_kernels::REQUIRED_INTERNAL_ANCHOR_MAX_OPTIONAL_STAGES,
         2,
@@ -1655,7 +1660,7 @@ fn bind_required_internal_anchor_identity(
             optional_identity_bytes,
             Resource::CompileWork,
         )?,
-        1 + core::mem::size_of::<u64>(),
+        add(1, core::mem::size_of::<u64>(), Resource::CompileWork)?,
         Resource::CompileWork,
     )?;
     budget.charge(add(

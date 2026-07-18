@@ -569,6 +569,8 @@ impl CompiledRegex {
             peak_bytes: actual.peak_bytes,
             work: actual.work,
             required_anchor_candidates: actual.candidate_visits,
+            required_anchor_scan_windows: actual.anchor_window_attempts,
+            required_anchor_anchor_comparisons: actual.finder_source_accesses,
             required_anchor_prefix_steps: actual.prefix_steps,
             required_anchor_continuation_steps: actual.continuation_steps,
             required_anchor_source_accesses: actual.source_accesses,

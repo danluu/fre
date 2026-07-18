@@ -69,6 +69,8 @@ pub struct ExecutionAccounting {
     pub assertion_checks: usize,
     pub root_probes: usize,
     pub required_anchor_candidates: usize,
+    pub required_anchor_scan_windows: usize,
+    pub required_anchor_anchor_comparisons: usize,
     pub required_anchor_prefix_steps: usize,
     pub required_anchor_continuation_steps: usize,
     pub required_anchor_source_accesses: usize,

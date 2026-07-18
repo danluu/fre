@@ -536,11 +536,57 @@ pub struct AggregateBuildReport {
     /// different bounded separated-field resource certificate into this
     /// report while retaining the original compiled artifact.
     sealed_bounded_separated_fields_identity: Option<AggregateBoundedSeparatedFieldsIdentity>,
+    sealed_required_internal_anchor_identity: Option<AggregateRequiredInternalAnchorSeal>,
     /// Selected plan's retained capacity/persistent bytes.
     pub retained_capacity_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregateRequiredInternalAnchorSeal {
+    program: AggregatePlanId,
+    compile: AggregateCompileAccounting,
+}
+
 impl AggregateBuildReport {
+    /// Require the public required-anchor discriminators and private compiled
+    /// artifact to be either coherently active or coherently absent.
+    #[must_use]
+    pub fn has_closed_required_internal_anchor_identity(&self) -> bool {
+        let AggregateBuildAccounting::Continuation(compile) = self.build else {
+            return self.sealed_required_internal_anchor_identity.is_none();
+        };
+        let absent = compile.required_internal_anchors == 0
+            && compile.required_internal_anchor_bytes == 0
+            && compile.required_internal_anchor_optional_stages == 0
+            && compile.required_internal_anchor_build_work == 0
+            && compile.required_internal_anchor_build_work_upper_bound == 0
+            && compile.required_internal_anchor_persistent_bytes == 0;
+        match self.sealed_required_internal_anchor_identity {
+            Some(sealed) => {
+                matches!(
+                    self.plan_identity,
+                    AggregatePlanIdentity::Continuation(identity)
+                        if identity.semantics == AggregateContinuationSemantics::UnicodeOffByteBoundaries
+                            && identity.program == sealed.program
+                ) && self.plan == AggregatePlanKind::ContinuationProgram
+                    && compile.required_internal_anchors == 1
+                    && compile.required_internal_anchor_bytes > 0
+                    && compile.required_internal_anchor_build_work > 0
+                    && compile.required_internal_anchor_build_work
+                        <= compile.required_internal_anchor_build_work_upper_bound
+                    && compile.required_internal_anchor_persistent_bytes > 0
+                    && compile == sealed.compile
+            }
+            None => absent,
+        }
+    }
+
+    #[must_use]
+    pub fn authenticates_required_internal_anchor_identity(&self) -> bool {
+        self.has_closed_required_internal_anchor_identity()
+            && self.sealed_required_internal_anchor_identity.is_some()
+    }
+
     /// Check that the public bounded-separated discriminators and private
     /// construction seal form one closed identity state. A report is valid
     /// either when every bounded discriminator and the seal are absent, or
@@ -1532,6 +1578,7 @@ impl AggregateBuilder {
                 build: AggregateBuildAccounting::ExactLiteral(build),
                 plan_identity,
                 sealed_bounded_separated_fields_identity: None,
+                sealed_required_internal_anchor_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -1719,6 +1766,7 @@ impl AggregateBuilder {
                         },
                     ),
                     sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -1845,6 +1893,7 @@ impl AggregateBuilder {
                         },
                     ),
                     sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2024,6 +2073,7 @@ impl AggregateBuilder {
                     },
                 ),
                 sealed_bounded_separated_fields_identity: None,
+                sealed_required_internal_anchor_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -2140,6 +2190,7 @@ impl AggregateBuilder {
                         engine.count_identity(),
                     ),
                     sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2248,6 +2299,7 @@ impl AggregateBuilder {
                     build: AggregateBuildAccounting::BoundedSeparatedFields(build),
                     plan_identity: AggregatePlanIdentity::BoundedSeparatedFields(plan_identity),
                     sealed_bounded_separated_fields_identity: Some(plan_identity),
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2365,6 +2417,7 @@ impl AggregateBuilder {
                         },
                     ),
                     sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2471,6 +2524,7 @@ impl AggregateBuilder {
                             },
                         ),
                         sealed_bounded_separated_fields_identity: None,
+                        sealed_required_internal_anchor_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2592,6 +2646,7 @@ impl AggregateBuilder {
                         },
                     ),
                     sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2760,6 +2815,7 @@ impl AggregateBuilder {
                             },
                         ),
                         sealed_bounded_separated_fields_identity: None,
+                        sealed_required_internal_anchor_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2899,6 +2955,7 @@ impl AggregateBuilder {
                             },
                         ),
                         sealed_bounded_separated_fields_identity: None,
+                        sealed_required_internal_anchor_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2942,6 +2999,9 @@ impl AggregateBuilder {
                 detail: "syntax summary differs from aggregate compiler traversal",
             });
         }
+        let program = engine.plan_id();
+        let sealed_required_internal_anchor_identity = (compile.required_internal_anchors == 1)
+            .then_some(AggregateRequiredInternalAnchorSeal { program, compile });
         let report = AggregateBuildReport {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
             syntax_key,
@@ -2971,9 +3031,10 @@ impl AggregateBuilder {
                 } else {
                     AggregateContinuationSemantics::UnicodeOffByteBoundaries
                 },
-                program: engine.plan_id(),
+                program,
             }),
             sealed_bounded_separated_fields_identity: None,
+            sealed_required_internal_anchor_identity,
             retained_capacity_bytes: compile.program_bytes,
         };
         Ok(AggregatePlan {

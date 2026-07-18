@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v2-structural-quota-v8-regex-redux-composite-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -5744,12 +5744,11 @@ fn required_internal_anchor_operation_limits(
     let candidates = haystack_len.checked_div(anchor_bytes).ok_or_else(|| {
         ExecutionError::fault("FRE required internal-anchor route reported an empty anchor")
     })?;
-    let finder_calls = checked_aggregate_add(candidates, 1, "anchor finder calls")?;
-    let finder_source = checked_aggregate_add(
-        haystack_len,
-        checked_aggregate_mul(finder_calls, anchor_bytes, "anchor finder source")?,
-        "anchor finder source",
-    )?;
+    let anchor_starts = match haystack_len.checked_sub(anchor_bytes) {
+        Some(last) => checked_aggregate_add(last, 1, "anchor scan starts")?,
+        None => 0,
+    };
+    let anchor_source = checked_aggregate_mul(anchor_starts, anchor_bytes, "anchor scan source")?;
     let per_candidate = checked_aggregate_add(
         2,
         shape.required_internal_anchor_optional_stages,
@@ -5760,19 +5759,19 @@ fn required_internal_anchor_operation_limits(
         checked_aggregate_mul(candidates, per_candidate, "anchor continuation work")?,
         "anchor continuation work",
     )?;
-    let random_access = haystack_len;
-    let sequential =
-        checked_aggregate_add(finder_source, continuation, "anchor sequential source")?;
+    let random_access = checked_aggregate_add(anchor_source, haystack_len, "anchor random source")?;
+    let sequential = continuation;
     let source = checked_aggregate_add(random_access, sequential, "anchor source")?;
-    let work = checked_aggregate_add(
+    let control = checked_aggregate_add(
+        anchor_starts,
         checked_aggregate_add(
-            source,
-            checked_aggregate_mul(candidates, 8, "anchor candidate control")?,
-            "anchor work",
+            checked_aggregate_mul(candidates, 5, "anchor candidate control")?,
+            4,
+            "anchor fixed control",
         )?,
-        16,
-        "anchor work",
+        "anchor control",
     )?;
+    let work = checked_aggregate_add(source, control, "anchor work")?;
     let boundaries = checked_aggregate_add(haystack_len, 1, "boundary count")?;
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
@@ -5787,7 +5786,7 @@ fn required_internal_anchor_operation_limits(
         max_match_events: candidates.min(reducer_events),
         max_output_matches: candidates.min(reducer_matches),
         max_output_bytes: 0,
-        max_span_sum: haystack_len,
+        max_span_sum: 0,
         max_peak_bytes: shape
             .required_internal_anchor_persistent_bytes
             .min(limits.fre_aggregate_peak_bytes),
@@ -6617,6 +6616,7 @@ fn aggregate_run_limits(
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
     require_closed_bounded_separated_fields_identity(report)?;
+    require_closed_required_internal_anchor_identity(report)?;
     match report.build {
         AggregateBuildAccounting::ExactLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: literal_operation_limits(haystack_len, build, limits)?,
@@ -6929,6 +6929,17 @@ fn require_closed_bounded_separated_fields_identity(
     ))
 }
 
+fn require_closed_required_internal_anchor_identity(
+    report: &AggregateBuildReport,
+) -> Result<(), ExecutionError> {
+    if report.has_closed_required_internal_anchor_identity() {
+        return Ok(());
+    }
+    Err(ExecutionError::fault(
+        "FRE required internal-anchor aggregate identity mismatch: public/private closure is open",
+    ))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive identity verifier keeps every supported plan's invariants adjacent"
@@ -6939,6 +6950,7 @@ fn require_unicode_plan_identity(
     operation: LiteralAggregateOperation,
 ) -> Result<(), ExecutionError> {
     require_closed_bounded_separated_fields_identity(report)?;
+    require_closed_required_internal_anchor_identity(report)?;
     if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
         if finite_plan_identity_matches(identity, unicode, operation) {
             return Ok(());
@@ -12714,7 +12726,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v2-structural-quota-v8-regex-redux-composite-v2"
+            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -14417,17 +14429,18 @@ mod tests {
             .expect("derive required-anchor limits");
         assert_eq!(derived.max_boundaries, 11);
         assert_eq!(derived.max_table_cells, 0);
-        assert_eq!(derived.max_random_access_bytes, 10);
-        assert_eq!(derived.max_sequential_bytes, 44);
+        assert_eq!(derived.max_random_access_bytes, 34);
+        assert_eq!(derived.max_sequential_bytes, 22);
         assert_eq!(derived.max_scratch_bytes, 0);
         assert_eq!(derived.max_log_bytes, 0);
         assert_eq!(derived.max_output_bytes, 0);
         assert_eq!(
             derived.max_random_access_bytes + derived.max_sequential_bytes,
-            54
+            56
         );
         assert_eq!(derived.max_peak_bytes, 128);
-        assert_eq!(derived.max_work, 94);
+        assert_eq!(derived.max_work, 83);
+        assert_eq!(derived.max_span_sum, 0);
 
         let capped = required_internal_anchor_operation_limits(
             10,
@@ -14452,6 +14465,33 @@ mod tests {
         assert_eq!(capped.max_scratch_bytes, 0);
         assert_eq!(capped.max_log_bytes, 0);
         assert_eq!(capped.max_output_bytes, 0);
+    }
+
+    #[test]
+    fn required_anchor_public_private_identity_is_fail_closed() {
+        let regex = AggregateBuilder::new(r"[\w]+://[^/\s?#]+[^\s?#]+(?:\?[^\s#]*)?(?:#[^\s]*)?")
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        let report = regex.build_report();
+        assert!(report.authenticates_required_internal_anchor_identity());
+        require_closed_required_internal_anchor_identity(report).unwrap();
+        aggregate_run_limits(128, report, &RunLimits::default()).unwrap();
+
+        let mut forged = report.clone();
+        let AggregateBuildAccounting::Continuation(ref mut compile) = forged.build else {
+            panic!("URI must retain continuation accounting");
+        };
+        compile.required_internal_anchor_bytes = compile
+            .required_internal_anchor_bytes
+            .checked_sub(1)
+            .unwrap();
+        assert!(!forged.has_closed_required_internal_anchor_identity());
+        assert!(require_closed_required_internal_anchor_identity(&forged).is_err());
+        assert!(aggregate_run_limits(128, &forged, &RunLimits::default()).is_err());
     }
 
     #[test]

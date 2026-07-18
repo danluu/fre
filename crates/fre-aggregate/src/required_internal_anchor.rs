@@ -438,6 +438,75 @@ mod tests {
         assert!(non_shape.inspection_work < inspected.inspection_work);
     }
 
+    fn assert_operation_one_below(
+        compiled: &CompiledRegex,
+        haystack: &[u8],
+        exact: OperationLimits,
+    ) {
+        let one_below = |value: usize| value.checked_sub(1).expect("positive exact limit");
+        for (resource, limits) in [
+            (
+                Resource::Boundaries,
+                OperationLimits {
+                    max_boundaries: one_below(exact.max_boundaries),
+                    ..exact
+                },
+            ),
+            (
+                Resource::MatchEvents,
+                OperationLimits {
+                    max_match_events: one_below(exact.max_match_events),
+                    ..exact
+                },
+            ),
+            (
+                Resource::OutputMatches,
+                OperationLimits {
+                    max_output_matches: one_below(exact.max_output_matches),
+                    ..exact
+                },
+            ),
+            (
+                Resource::RandomAccessBytes,
+                OperationLimits {
+                    max_random_access_bytes: one_below(exact.max_random_access_bytes),
+                    ..exact
+                },
+            ),
+            (
+                Resource::SequentialBytes,
+                OperationLimits {
+                    max_sequential_bytes: one_below(exact.max_sequential_bytes),
+                    ..exact
+                },
+            ),
+            (
+                Resource::PeakBytes,
+                OperationLimits {
+                    max_peak_bytes: one_below(exact.max_peak_bytes),
+                    ..exact
+                },
+            ),
+            (
+                Resource::ExecutionWork,
+                OperationLimits {
+                    max_work: one_below(exact.max_work),
+                    ..exact
+                },
+            ),
+        ] {
+            assert!(matches!(
+                compiled.admit_count(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                ),
+                Err(Error::ResourceLimit { resource: got, .. }) if got == resource
+            ));
+        }
+    }
+
     #[test]
     fn operation_resources_are_prospective_exact_and_one_below() {
         let compiled = CompiledRegex::from_hir(
@@ -474,9 +543,14 @@ mod tests {
         assert_eq!(admitted.value(), 0);
         assert_eq!(admitted.accounting().required_anchor_candidates, 3);
         assert!(admitted.accounting().work < admitted.certificate().work_bound);
+        assert!(
+            admitted.accounting().random_access_bytes_read
+                >= admitted.accounting().required_anchor_prefix_steps
+        );
         assert_eq!(
             admitted.accounting().random_access_bytes_read,
-            admitted.accounting().required_anchor_prefix_steps
+            admitted.accounting().required_anchor_anchor_comparisons
+                + admitted.accounting().required_anchor_prefix_steps
         );
         assert!(admitted.accounting().work <= admitted.certificate().work_bound);
         assert_eq!(admitted.certificate().work_bound, upper.work);
@@ -489,67 +563,7 @@ mod tests {
             upper.sequential_bytes
         );
 
-        for (resource, limits) in [
-            (
-                Resource::Boundaries,
-                OperationLimits {
-                    max_boundaries: exact.max_boundaries - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::MatchEvents,
-                OperationLimits {
-                    max_match_events: exact.max_match_events - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::OutputMatches,
-                OperationLimits {
-                    max_output_matches: exact.max_output_matches - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::RandomAccessBytes,
-                OperationLimits {
-                    max_random_access_bytes: exact.max_random_access_bytes - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::SequentialBytes,
-                OperationLimits {
-                    max_sequential_bytes: exact.max_sequential_bytes - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::PeakBytes,
-                OperationLimits {
-                    max_peak_bytes: exact.max_peak_bytes - 1,
-                    ..exact
-                },
-            ),
-            (
-                Resource::ExecutionWork,
-                OperationLimits {
-                    max_work: exact.max_work - 1,
-                    ..exact
-                },
-            ),
-        ] {
-            assert!(matches!(
-                compiled.admit_count(
-                    haystack,
-                    0..haystack.len(),
-                    Strategy::ReverseSequentialRows,
-                    limits,
-                ),
-                Err(Error::ResourceLimit { resource: got, .. }) if got == resource
-            ));
-        }
+        assert_operation_one_below(&compiled, haystack, exact);
         assert_eq!(upper.allocations, 0);
         assert_eq!(upper.scratch_bytes, 0);
     }
