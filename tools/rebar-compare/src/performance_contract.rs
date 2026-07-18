@@ -2044,7 +2044,7 @@ pub fn validate_capture_lifecycle_observation(
     if !matches!(
         observation.model.as_str(),
         "count-captures" | "grep-captures"
-    ) || observation.candidate_plan != crate::CURRENT_FRE_CAPTURE_PLAN
+    ) || !crate::is_current_fre_capture_plan(&observation.candidate_plan)
         || !model
             .lifecycle_boundaries
             .iter()
@@ -2612,7 +2612,9 @@ fn performance_runner_route(
             2..,
         ) => PerformanceRunnerRoute::AggregateMany,
         ("grep", "portable-single-search", 1) => PerformanceRunnerRoute::PortableGrep,
-        ("count-captures" | "grep-captures", crate::CURRENT_FRE_CAPTURE_PLAN, 1) => {
+        ("count-captures" | "grep-captures", plan, 1)
+            if crate::is_current_fre_capture_plan(plan) =>
+        {
             PerformanceRunnerRoute::Capture
         }
         _ => {

@@ -41,7 +41,8 @@ use fre::{
     GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
     GraphemeScalarDfaReduceLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
+    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
@@ -88,9 +89,21 @@ pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-unif
 /// Stable plan label for the proved uniform captured scalar-alternation path.
 pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-unicode-scalar";
 
+fn is_current_fre_capture_plan(plan: &str) -> bool {
+    matches!(
+        plan,
+        CURRENT_FRE_CAPTURE_PLAN
+            | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
+            | CURRENT_FRE_CAPTURE_SCALAR_PLAN
+            | fre::NOQA_ASCII_LEADING_PLAN_ID
+            | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
+            | fre::NOQA_UNICODE_LEADING_PLAN_ID
+    )
+}
+
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v19-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v19-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -424,10 +437,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1638,6 +1651,12 @@ enum CurrentFreCapturePreparation {
     Grep,
 }
 
+#[derive(Clone, Debug)]
+enum CurrentFreCaptureRegex {
+    General(Box<CaptureRegex>),
+    Noqa(Box<NoqaGrepCaptureRegex>),
+}
+
 impl CurrentFreCaptureModel {
     fn parse(model: &str) -> Result<Self, CompareError> {
         match model {
@@ -1666,7 +1685,7 @@ impl CurrentFreCaptureModel {
 #[derive(Clone, Debug)]
 pub struct CurrentFreCaptureLifecycle {
     model: CurrentFreCaptureModel,
-    regex: CaptureRegex,
+    regex: CurrentFreCaptureRegex,
     limits: RunLimits,
     unicode: bool,
     case_insensitive: bool,
@@ -1684,7 +1703,10 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
-        capture_plan_label(&self.regex)
+        match &self.regex {
+            CurrentFreCaptureRegex::General(regex) => capture_plan_label(regex),
+            CurrentFreCaptureRegex::Noqa(regex) => regex.build_report().plan_identity.plan_id,
+        }
     }
 
     /// Exact Rust-regex Unicode option bound at construction.
@@ -1714,12 +1736,21 @@ impl CurrentFreCaptureLifecycle {
                 self.haystack_len
             )));
         }
-        let result = match &self.preparation {
-            CurrentFreCapturePreparation::Count(run_limits) => {
-                execute_count_captures_with_limits(&self.regex, haystack, **run_limits)
+        let result = match (&self.regex, &self.preparation) {
+            (
+                CurrentFreCaptureRegex::General(regex),
+                CurrentFreCapturePreparation::Count(run_limits),
+            ) => execute_count_captures_with_limits(regex, haystack, **run_limits),
+            (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
+                execute_grep_captures(regex, haystack, &self.limits)
             }
-            CurrentFreCapturePreparation::Grep => {
-                execute_grep_captures(&self.regex, haystack, &self.limits)
+            (CurrentFreCaptureRegex::Noqa(regex), CurrentFreCapturePreparation::Grep) => {
+                execute_noqa_grep_captures(regex, haystack, &self.limits)
+            }
+            (CurrentFreCaptureRegex::Noqa(_), CurrentFreCapturePreparation::Count(_)) => {
+                return Err(CompareError::new(
+                    "noqa grep-only artifact reached count-captures lifecycle",
+                ));
             }
         };
         result.map_err(|error| CompareError::new(error.message))
@@ -1743,14 +1774,31 @@ pub fn current_fre_rebar_capture_lifecycle(
 ) -> Result<CurrentFreCaptureLifecycle, CompareError> {
     let model = CurrentFreCaptureModel::parse(model)?;
     let limits = RunLimits::default();
-    let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
-        .map_err(|error| CompareError::new(error.message))?;
-    let preparation = match model {
-        CurrentFreCaptureModel::CountCaptures => CurrentFreCapturePreparation::Count(Box::new(
-            capture_count_run_limits(&regex, haystack_len, &limits)
-                .map_err(|error| CompareError::new(error.message))?,
-        )),
-        CurrentFreCaptureModel::GrepCaptures => CurrentFreCapturePreparation::Grep,
+    let (regex, preparation) = match model {
+        CurrentFreCaptureModel::CountCaptures => {
+            let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
+                .map_err(|error| CompareError::new(error.message))?;
+            let run_limits = capture_count_run_limits(&regex, haystack_len, &limits)
+                .map_err(|error| CompareError::new(error.message))?;
+            (
+                CurrentFreCaptureRegex::General(Box::new(regex)),
+                CurrentFreCapturePreparation::Count(Box::new(run_limits)),
+            )
+        }
+        CurrentFreCaptureModel::GrepCaptures => {
+            let regex = if let Some(regex) =
+                noqa_grep_capture_regex_one(pattern, unicode, case_insensitive, &limits)
+                    .map_err(|error| CompareError::new(error.message))?
+            {
+                CurrentFreCaptureRegex::Noqa(Box::new(regex))
+            } else {
+                CurrentFreCaptureRegex::General(Box::new(
+                    capture_regex_one(pattern, unicode, case_insensitive, &limits)
+                        .map_err(|error| CompareError::new(error.message))?,
+                ))
+            };
+            (regex, CurrentFreCapturePreparation::Grep)
+        }
     };
     Ok(CurrentFreCaptureLifecycle {
         model,
@@ -3117,6 +3165,13 @@ fn fre_grep_captures(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
+    if let Some(regex) = noqa_grep_capture_regex(request, limits)? {
+        let actual = execute_noqa_grep_captures(&regex, request.haystack, limits)?;
+        return Ok(FreReduction {
+            actual,
+            plan: regex.build_report().plan_identity.plan_id,
+        });
+    }
     if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
         let actual =
             execute_uniform_capture_scalar(&regex, participating, request.haystack, true, limits)?;
@@ -3129,6 +3184,78 @@ fn fre_grep_captures(
     let plan = capture_plan_label(&regex);
     let actual = execute_grep_captures(&regex, request.haystack, limits)?;
     Ok(FreReduction { actual, plan })
+}
+
+fn noqa_grep_capture_regex(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<NoqaGrepCaptureRegex>, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return Ok(None);
+    }
+    noqa_grep_capture_regex_one(
+        request.patterns[0].as_str(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )
+}
+
+fn noqa_grep_capture_regex_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<Option<NoqaGrepCaptureRegex>, ExecutionError> {
+    let regex = NoqaGrepCaptureBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(NoqaBuildLimits {
+            max_work: limits.fre_literal_planner_work,
+            ..NoqaBuildLimits::default()
+        })
+        .build();
+    match regex {
+        Ok(regex) => Ok(Some(regex)),
+        Err(NoqaBuildError::Syntax(_) | NoqaBuildError::Unsupported) => Ok(None),
+        Err(error @ NoqaBuildError::WorkLimit { .. }) => Err(ExecutionError::unsupported(format!(
+            "FRE noqa grep-capture build refused input: {error}"
+        ))),
+        Err(error @ (NoqaBuildError::Overflow | NoqaBuildError::InternalInvariant(_))) => Err(
+            ExecutionError::fault(format!("FRE noqa grep-capture build faulted: {error}")),
+        ),
+    }
+}
+
+fn noqa_run_limits(limits: &RunLimits) -> Result<NoqaRunLimits, ExecutionError> {
+    let reducer = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE noqa reducer limit does not fit usize"))?;
+    Ok(NoqaRunLimits {
+        max_work: limits.fre_aggregate_operation_work,
+        max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
+        max_capture_events: reducer,
+        max_capture_count: reducer,
+    })
+}
+
+fn execute_noqa_grep_captures(
+    regex: &NoqaGrepCaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
+    let outcome = regex
+        .count_captures(haystack, noqa_run_limits(limits)?)
+        .map_err(|error| match error {
+            NoqaRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE noqa grep-capture reducer refused execution: {error}"
+            )),
+            NoqaRunError::Overflow => {
+                ExecutionError::fault(format!("FRE noqa grep-capture reducer faulted: {error}"))
+            }
+        })?;
+    u64::try_from(outcome.capture_count)
+        .map_err(|_| ExecutionError::fault("FRE noqa capture count does not fit u64"))
 }
 
 fn uniform_capture_scalar_regex(
@@ -6827,6 +6954,67 @@ mod tests {
     }
 
     #[test]
+    fn noqa_grep_capture_routes_preserve_three_exact_identities() {
+        let limits = RunLimits::default();
+        let haystack = b"# noqa\n# noqa: A1, B2\r\nnoise # NOQA\n";
+        let fixtures = [
+            (
+                r"(\s*)((?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?)",
+                false,
+                11,
+                fre::NOQA_ASCII_LEADING_PLAN_ID,
+            ),
+            (
+                r"(?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?",
+                false,
+                5,
+                fre::NOQA_ASCII_NO_LEADING_PLAN_ID,
+            ),
+            (
+                r"(?P<spaces>\s*)(?P<noqa>(?i:# noqa)(?::\s?(?P<codes>([A-Z]+[0-9]+(?:[,\s]+)?)+))?)",
+                true,
+                11,
+                fre::NOQA_UNICODE_LEADING_PLAN_ID,
+            ),
+        ];
+        for (pattern, unicode, expected, expected_plan) in fixtures {
+            let patterns = vec![pattern.to_string()];
+            let reduction = fre_reducer(
+                CandidateRequest {
+                    job_id: "test/noqa-grep-capture",
+                    model: "grep-captures",
+                    patterns: &patterns,
+                    haystack,
+                    unicode,
+                    case_insensitive: false,
+                },
+                &limits,
+            )
+            .expect("exact noqa route executes");
+            assert_eq!(reduction.actual, expected);
+            assert_eq!(reduction.plan, expected_plan);
+
+            let lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                unicode,
+                false,
+                haystack.len(),
+            )
+            .expect("exact noqa lifecycle builds");
+            assert_eq!(lifecycle.plan(), expected_plan);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first operation"),
+                expected
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady operation"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn capture_lifecycle_reuses_one_authenticated_artifact_across_boundaries() {
         let count =
             current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
@@ -7186,7 +7374,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v19-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
+            "fre-current-aggregate-capture-v19-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

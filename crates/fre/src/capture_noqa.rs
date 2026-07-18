@@ -6,8 +6,20 @@
 //! expression optimizer.
 
 use core::fmt;
+use std::sync::Arc;
 
+use fre_syntax::{
+    AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
+    ParseSummary, RustProfile, SafetyEnvelope,
+};
 use regex_syntax::hir::{Capture, Class, Hir, HirKind, Repetition};
+
+/// Stable plan identity for the ASCII-leading pinned HIR.
+pub const NOQA_ASCII_LEADING_PLAN_ID: &str = "capture-noqa-ascii-leading-v1";
+/// Stable plan identity for the ASCII HIR without a leading capture.
+pub const NOQA_ASCII_NO_LEADING_PLAN_ID: &str = "capture-noqa-ascii-no-leading-v1";
+/// Stable plan identity for the Unicode-leading pinned HIR.
+pub const NOQA_UNICODE_LEADING_PLAN_ID: &str = "capture-noqa-unicode-leading-v1";
 
 const ASCII_SPACE_RANGES: &[(u32, u32)] = &[(0x09, 0x0D), (0x20, 0x20)];
 const UNICODE_SPACE_RANGES: &[(u32, u32)] = &[
@@ -43,7 +55,7 @@ const UNICODE_SEPARATOR_RANGES: &[(u32, u32)] = &[
     reason = "the route names state both whitespace semantics and prefix participation"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NoqaVariant {
+pub enum NoqaVariant {
     /// `\s*` is ASCII-only and participates as capture 1.
     AsciiLeading,
     /// The match begins at `# ` and has no leading capture.
@@ -70,54 +82,241 @@ impl NoqaVariant {
     const fn unicode_space(self) -> bool {
         matches!(self, Self::UnicodeLeading)
     }
+
+    /// Stable algorithm and semantic identity for this exact route.
+    #[must_use]
+    pub const fn plan_id(self) -> &'static str {
+        match self {
+            Self::AsciiLeading => NOQA_ASCII_LEADING_PLAN_ID,
+            Self::AsciiNoLeading => NOQA_ASCII_NO_LEADING_PLAN_ID,
+            Self::UnicodeLeading => NOQA_UNICODE_LEADING_PLAN_ID,
+        }
+    }
 }
 
 /// Exact construction budget for HIR inspection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaBuildLimits {
+pub struct NoqaBuildLimits {
+    /// Syntax admission policy.
+    pub admission: AdmissionPolicy,
+    /// Non-configurable-in-production syntax safety envelope.
+    pub syntax_safety: SafetyEnvelope,
+    /// Maximum exact-HIR inspection work.
     pub max_work: usize,
 }
 
 impl Default for NoqaBuildLimits {
     fn default() -> Self {
-        Self { max_work: 4_096 }
+        Self {
+            admission: AdmissionPolicy::default(),
+            syntax_safety: SafetyEnvelope::default(),
+            max_work: 4_096,
+        }
     }
 }
 
 /// Metered exact-HIR inspection receipt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct NoqaBuildAccounting {
+pub struct NoqaBuildAccounting {
+    /// Total metered HIR inspection work.
     pub work: usize,
+    /// HIR nodes inspected, including deliberate exact-shape reinspection.
     pub hir_nodes: usize,
+    /// Literal bytes compared.
     pub literal_bytes: usize,
+    /// Canonical class ranges compared.
     pub class_ranges: usize,
 }
 
 /// Prospective HIR inspection refusal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NoqaBuildError {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NoqaBuildError {
+    /// Syntax/profile/admission failure.
+    Syntax(ParseError),
+    /// Valid syntax outside the three exact certified HIRs.
+    Unsupported,
+    /// Exact structural inspection exceeded its prospective limit.
     WorkLimit { required: usize, limit: usize },
+    /// Checked structural accounting overflowed.
     Overflow,
+    /// Facade invariant failure.
+    InternalInvariant(&'static str),
 }
 
 impl fmt::Display for NoqaBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Syntax(error) => write!(formatter, "noqa syntax failed: {error}"),
+            Self::Unsupported => formatter.write_str("HIR is not an exact certified noqa shape"),
             Self::WorkLimit { required, limit } => write!(
                 formatter,
                 "noqa HIR inspection needs {required} work, limit is {limit}"
             ),
             Self::Overflow => formatter.write_str("noqa HIR inspection accounting overflowed"),
+            Self::InternalInvariant(detail) => {
+                write!(formatter, "noqa facade invariant failed: {detail}")
+            }
         }
     }
 }
 
-impl std::error::Error for NoqaBuildError {}
+impl std::error::Error for NoqaBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Syntax(error) => Some(error),
+            Self::Unsupported
+            | Self::WorkLimit { .. }
+            | Self::Overflow
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
+/// Immutable source and route identity for one exact plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoqaPlanIdentity {
+    /// Complete syntax/profile/admission identity.
+    pub syntax: Arc<CacheKey>,
+    /// Distinct exact HIR and execution route.
+    pub variant: NoqaVariant,
+    /// Stable algorithm and semantic identifier.
+    pub plan_id: &'static str,
+}
+
+/// Complete construction receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoqaBuildReport {
+    /// What syntax admission established.
+    pub admission: AdmissionStatus,
+    /// Bounded syntax facts.
+    pub syntax: ParseSummary,
+    /// Exact-HIR inspection accounting.
+    pub inspection: NoqaBuildAccounting,
+    /// Source-distinct plan identity.
+    pub plan_identity: NoqaPlanIdentity,
+}
+
+/// Builder for the exact pinned `# noqa` grep-capture reducer.
+#[derive(Clone, Debug)]
+pub struct NoqaGrepCaptureBuilder {
+    pattern: String,
+    profile: RustProfile,
+    limits: NoqaBuildLimits,
+}
+
+impl NoqaGrepCaptureBuilder {
+    /// Start from the pinned Rust byte profile.
+    #[must_use]
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            profile: RustProfile::default(),
+            limits: NoqaBuildLimits::default(),
+        }
+    }
+
+    /// Select the complete Rust constructor/profile identity.
+    #[must_use]
+    pub fn profile(mut self, profile: RustProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Select Unicode syntax mode.
+    #[must_use]
+    pub fn unicode(mut self, enabled: bool) -> Self {
+        self.profile.options.unicode = enabled;
+        self
+    }
+
+    /// Select case-insensitive syntax lowering.
+    #[must_use]
+    pub fn case_insensitive(mut self, enabled: bool) -> Self {
+        self.profile.options.case_insensitive = enabled;
+        self
+    }
+
+    /// Replace every checked construction limit.
+    #[must_use]
+    pub const fn limits(mut self, limits: NoqaBuildLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Parse and recognize exactly one of the three certified HIRs.
+    pub fn build(self) -> Result<NoqaGrepCaptureRegex, NoqaBuildError> {
+        let limits = self.limits;
+        let profile = CompatibilityProfile::RustBytes(self.profile);
+        let parsed = fre_syntax::parse(
+            fre_syntax::ParseRequest::rust(self.pattern, profile)
+                .with_admission(limits.admission)
+                .with_safety_envelope(limits.syntax_safety),
+        )
+        .map_err(NoqaBuildError::Syntax)?;
+        let syntax_key = Arc::new(parsed.key);
+        let admission = parsed.admission_status;
+        let syntax = parsed.summary;
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            return Err(NoqaBuildError::InternalInvariant(
+                "Rust byte request produced non-Rust syntax",
+            ));
+        };
+        let plan = NoqaPlan::inspect(&rust.hir, limits)?.ok_or(NoqaBuildError::Unsupported)?;
+        let variant = plan.variant();
+        let plan_identity = NoqaPlanIdentity {
+            syntax: syntax_key,
+            variant,
+            plan_id: variant.plan_id(),
+        };
+        let report = NoqaBuildReport {
+            admission,
+            syntax,
+            inspection: plan.build_accounting(),
+            plan_identity,
+        };
+        Ok(NoqaGrepCaptureRegex {
+            plan,
+            build_limits: limits,
+            report,
+        })
+    }
+}
+
+/// Immutable exact-shape, literal-anchored grep-capture reducer.
+#[derive(Clone, Debug)]
+pub struct NoqaGrepCaptureRegex {
+    plan: NoqaPlan,
+    build_limits: NoqaBuildLimits,
+    report: NoqaBuildReport,
+}
+
+impl NoqaGrepCaptureRegex {
+    /// Construction and route identity.
+    #[must_use]
+    pub const fn build_report(&self) -> &NoqaBuildReport {
+        &self.report
+    }
+
+    /// Exact construction limits retained with this immutable plan.
+    #[must_use]
+    pub const fn build_limits(&self) -> NoqaBuildLimits {
+        self.build_limits
+    }
+
+    /// Reduce participating captures over bstr-compatible lines.
+    pub fn count_captures(
+        &self,
+        haystack: &[u8],
+        limits: NoqaRunLimits,
+    ) -> Result<NoqaRunOutcome, NoqaRunError> {
+        self.plan.count_captures(haystack, limits)
+    }
+}
 
 /// Immutable exact-shape plan. It contains no compiled automaton or dynamic
 /// storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaPlan {
+struct NoqaPlan {
     variant: NoqaVariant,
     build: NoqaBuildAccounting,
 }
@@ -125,10 +324,7 @@ pub(super) struct NoqaPlan {
 impl NoqaPlan {
     /// Inspect one HIR. `Ok(None)` is an exact typed non-selection, not a
     /// partially compatible plan.
-    pub(super) fn inspect(
-        hir: &Hir,
-        limits: NoqaBuildLimits,
-    ) -> Result<Option<Self>, NoqaBuildError> {
+    fn inspect(hir: &Hir, limits: NoqaBuildLimits) -> Result<Option<Self>, NoqaBuildError> {
         let mut inspector = Inspector::new(limits.max_work);
         let variant = inspector.inspect_root(hir)?;
         Ok(variant.map(|variant| Self {
@@ -137,18 +333,18 @@ impl NoqaPlan {
         }))
     }
 
-    pub(super) const fn variant(self) -> NoqaVariant {
+    const fn variant(self) -> NoqaVariant {
         self.variant
     }
 
-    pub(super) const fn build_accounting(self) -> NoqaBuildAccounting {
+    const fn build_accounting(self) -> NoqaBuildAccounting {
         self.build
     }
 
     /// Count participating captures over bstr-compatible lines. Empty input
     /// has no lines. LF is removed, and the CR immediately preceding LF is
     /// removed; a lone CR remains part of its line.
-    pub(super) fn count_captures(
+    fn count_captures(
         self,
         haystack: &[u8],
         limits: NoqaRunLimits,
@@ -157,6 +353,8 @@ impl NoqaPlan {
             return Ok(NoqaRunOutcome {
                 capture_count: 0,
                 report: NoqaRunReport {
+                    variant: self.variant,
+                    limits,
                     bounds: NoqaUpperBounds::ZERO,
                     actual: NoqaActualCounters::default(),
                 },
@@ -202,7 +400,12 @@ impl NoqaPlan {
         let capture_count = actual.capture_count;
         Ok(NoqaRunOutcome {
             capture_count,
-            report: NoqaRunReport { bounds, actual },
+            report: NoqaRunReport {
+                variant: self.variant,
+                limits,
+                bounds,
+                actual,
+            },
         })
     }
 }
@@ -213,10 +416,14 @@ impl NoqaPlan {
     reason = "every field is an independently enforced maximum in the public limit identity"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaRunLimits {
+pub struct NoqaRunLimits {
+    /// Maximum whole-operation work.
     pub max_work: usize,
+    /// Maximum charged sequential bytes.
     pub max_sequential_bytes: usize,
+    /// Maximum line plus capture-group events.
     pub max_capture_events: usize,
+    /// Maximum participating-capture result.
     pub max_capture_count: usize,
 }
 
@@ -233,22 +440,31 @@ impl Default for NoqaRunLimits {
 
 /// Resource named by a prospective execution refusal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NoqaResource {
+pub enum NoqaResource {
+    /// Whole-operation work.
     Work,
+    /// Sequential byte traffic.
     SequentialBytes,
+    /// Line plus capture-group events.
     CaptureEvents,
+    /// Participating-capture result.
     CaptureCount,
 }
 
 /// Prospective execution refusal. No candidate has been examined when any of
 /// these errors is returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum NoqaRunError {
+pub enum NoqaRunError {
+    /// A prospective whole-operation bound exceeds its configured limit.
     Resource {
+        /// Refused resource.
         resource: NoqaResource,
+        /// Complete amount required before candidate traversal.
         required: usize,
+        /// Configured maximum.
         limit: usize,
     },
+    /// Checked dimension arithmetic overflowed.
     Overflow,
 }
 
@@ -272,14 +488,22 @@ impl std::error::Error for NoqaRunError {}
 
 /// Route-specific whole-input upper bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaUpperBounds {
+pub struct NoqaUpperBounds {
+    /// Original haystack bytes, including line terminators.
     pub haystack_bytes: usize,
+    /// Sum of bstr-compatible line bytes.
     pub line_bytes: usize,
+    /// Number of bstr-compatible lines.
     pub lines: usize,
+    /// Prospective maximum occurrences of the unbordered literal `# `.
     pub literal_candidates: usize,
+    /// Complete route-specific work bound.
     pub work: usize,
+    /// Complete route-specific sequential-byte bound.
     pub sequential_bytes: usize,
+    /// Complete line plus group-event bound.
     pub capture_events: usize,
+    /// Complete participating-capture bound.
     pub capture_count: usize,
 }
 
@@ -298,27 +522,42 @@ impl NoqaUpperBounds {
 
 /// Scalar actual counters. The reducer owns no dynamic scratch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct NoqaActualCounters {
+pub struct NoqaActualCounters {
+    /// Lines visited.
     pub lines: usize,
+    /// Literal-scan positions visited.
     pub candidate_positions: usize,
+    /// Exact `# ` occurrences examined.
     pub literal_candidates: usize,
+    /// Selected non-overlapping matches.
     pub matches: usize,
+    /// Selected matches whose optional code capture participated.
     pub coded_matches: usize,
+    /// Actual line plus participating-group events.
     pub capture_events: usize,
+    /// Actual participating-capture result.
     pub capture_count: usize,
 }
 
 /// Successful execution receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaRunReport {
+pub struct NoqaRunReport {
+    /// Distinct execution route.
+    pub variant: NoqaVariant,
+    /// Exact invocation limits.
+    pub limits: NoqaRunLimits,
+    /// Prospective whole-operation bounds.
     pub bounds: NoqaUpperBounds,
+    /// Scalar actual counters; dynamic scratch is zero.
     pub actual: NoqaActualCounters,
 }
 
 /// Reduced value and complete receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct NoqaRunOutcome {
+pub struct NoqaRunOutcome {
+    /// Participating captures including group zero.
     pub capture_count: usize,
+    /// Complete execution receipt.
     pub report: NoqaRunReport,
 }
 
@@ -977,14 +1216,11 @@ mod tests {
     const WILD: &str =
         r"(?P<spaces>\s*)(?P<noqa>(?i:# noqa)(?::\s?(?P<codes>([A-Z]+[0-9]+(?:[,\s]+)?)+))?)";
 
-    fn plan(pattern: &str, unicode: bool) -> NoqaPlan {
-        let hir = ParserBuilder::new()
+    fn regex(pattern: &str, unicode: bool) -> NoqaGrepCaptureRegex {
+        NoqaGrepCaptureBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
             .unicode(unicode)
             .build()
-            .parse(pattern)
-            .expect("fixture parses");
-        NoqaPlan::inspect(&hir, NoqaBuildLimits::default())
-            .expect("inspection fits")
             .expect("fixture is eligible")
     }
 
@@ -1010,8 +1246,8 @@ mod tests {
     }
 
     fn assert_differential(pattern: &str, unicode: bool, haystack: &[u8]) {
-        let plan = plan(pattern, unicode);
-        let actual = plan
+        let regex = regex(pattern, unicode);
+        let actual = regex
             .count_captures(haystack, NoqaRunLimits::default())
             .expect("fixture fits");
         assert_eq!(
@@ -1041,9 +1277,15 @@ mod tests {
             assert_eq!(admitted.variant(), variant);
             let exact = admitted.build_accounting().work;
             assert!(
-                NoqaPlan::inspect(&hir, NoqaBuildLimits { max_work: exact })
-                    .expect("exact limit admits")
-                    .is_some()
+                NoqaPlan::inspect(
+                    &hir,
+                    NoqaBuildLimits {
+                        max_work: exact,
+                        ..NoqaBuildLimits::default()
+                    },
+                )
+                .expect("exact limit admits")
+                .is_some()
             );
             let one_below = exact.checked_sub(1).expect("positive build work");
             assert_eq!(
@@ -1051,6 +1293,7 @@ mod tests {
                     &hir,
                     NoqaBuildLimits {
                         max_work: one_below,
+                        ..NoqaBuildLimits::default()
                     },
                 ),
                 Err(NoqaBuildError::WorkLimit {
@@ -1075,7 +1318,7 @@ mod tests {
     #[test]
     fn empty_has_no_lines_and_zero_bounds() {
         for (pattern, unicode) in [(REAL, false), (TWEAKED, false), (WILD, true)] {
-            let outcome = plan(pattern, unicode)
+            let outcome = regex(pattern, unicode)
                 .count_captures(
                     b"",
                     NoqaRunLimits {
@@ -1131,9 +1374,9 @@ mod tests {
 
     #[test]
     fn exact_and_one_below_run_preflight() {
-        let plan = plan(WILD, true);
+        let regex = regex(WILD, true);
         let haystack = b"\xC2\xA0# noqa: A1, B2\r\n# noqa\n";
-        let admitted = plan
+        let admitted = regex
             .count_captures(haystack, NoqaRunLimits::default())
             .expect("fixture admitted");
         let bounds = admitted.report.bounds;
@@ -1151,7 +1394,8 @@ mod tests {
                 NoqaResource::CaptureEvents => exact.max_capture_events = required,
                 NoqaResource::CaptureCount => exact.max_capture_count = required,
             }
-            plan.count_captures(haystack, exact)
+            regex
+                .count_captures(haystack, exact)
                 .expect("exact limit admits");
             let mut below = NoqaRunLimits::default();
             match resource {
@@ -1161,7 +1405,7 @@ mod tests {
                 NoqaResource::CaptureCount => below.max_capture_count = one_below,
             }
             assert_eq!(
-                plan.count_captures(haystack, below),
+                regex.count_captures(haystack, below),
                 Err(NoqaRunError::Resource {
                     resource,
                     required,
@@ -1177,7 +1421,7 @@ mod tests {
         let path = std::env::var_os("FRE_NOQA_HARD_CORPUS")
             .expect("FRE_NOQA_HARD_CORPUS names the authenticated raw corpus");
         let haystack = std::fs::read(path).expect("hard corpus is readable");
-        let outcome = plan(WILD, true)
+        let outcome = regex(WILD, true)
             .count_captures(&haystack, NoqaRunLimits::default())
             .expect("hard corpus stays inside locked ceilings");
         assert_eq!(outcome.capture_count, 84);

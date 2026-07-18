@@ -27,10 +27,6 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_many;
-#[allow(
-    dead_code,
-    reason = "private proof kernel is checkpointed before facade integration"
-)]
 mod capture_noqa;
 mod captures;
 mod finite;
@@ -73,6 +69,12 @@ pub use aggregate_many::{
     AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
     AggregateManySpanIter, AggregateManySpanSumRegex, AggregateManySpanSumResult,
     AggregateManySpans, AggregateManySpansRegex,
+};
+pub use capture_noqa::{
+    NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,
+    NoqaActualCounters, NoqaBuildAccounting, NoqaBuildError, NoqaBuildLimits, NoqaBuildReport,
+    NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaPlanIdentity, NoqaResource, NoqaRunError,
+    NoqaRunLimits, NoqaRunOutcome, NoqaRunReport, NoqaUpperBounds, NoqaVariant,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
