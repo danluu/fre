@@ -1,3 +1,4 @@
+use fre_exact_alloc::{CopyError, ExactVec};
 use regex_syntax::hir::Look;
 
 use crate::Error;
@@ -58,7 +59,19 @@ impl ScalarRange {
 /// fallible callback lets execution charge every binary-search comparison
 /// before it is performed.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ScalarSet(Box<[ScalarRange]>);
+pub(crate) struct ScalarSet(ExactVec<ScalarRange>);
+
+fn exact_scalar_ranges(length: usize) -> Result<ExactVec<ScalarRange>, Error> {
+    ExactVec::try_with_capacity(length).map_err(|error| match error {
+        CopyError::LayoutOverflow => Error::ArithmeticOverflow {
+            resource: crate::Resource::ProgramBytes,
+        },
+        CopyError::AllocationFailed => Error::AllocationFailed {
+            resource: crate::Resource::ProgramBytes,
+            items: length,
+        },
+    })
+}
 
 impl ScalarSet {
     pub(crate) fn required_bytes(range_count: usize) -> Result<usize, Error> {
@@ -72,20 +85,18 @@ impl ScalarSet {
     pub(crate) fn from_unicode_class(
         class: &regex_syntax::hir::ClassUnicode,
     ) -> Result<Self, Error> {
-        let mut ranges = Vec::new();
-        ranges
-            .try_reserve_exact(class.ranges().len())
-            .map_err(|_| Error::AllocationFailed {
-                resource: crate::Resource::ProgramBytes,
-                items: class.ranges().len(),
-            })?;
+        let mut ranges = exact_scalar_ranges(class.ranges().len())?;
         for range in class.ranges() {
-            ranges.push(ScalarRange::new(range.start(), range.end())?);
+            ranges
+                .try_push(ScalarRange::new(range.start(), range.end())?)
+                .map_err(|_| {
+                    Error::InternalInvariant("Unicode scalar class exceeded exact allocation")
+                })?;
         }
         if ranges.is_empty() {
             return Err(Error::InternalInvariant("empty Unicode scalar class"));
         }
-        Ok(Self(ranges.into_boxed_slice()))
+        Ok(Self(ranges))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -97,15 +108,13 @@ impl ScalarSet {
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self, Error> {
-        let mut ranges = Vec::new();
-        ranges
-            .try_reserve_exact(self.0.len())
-            .map_err(|_| Error::AllocationFailed {
-                resource: crate::Resource::ProgramBytes,
-                items: self.0.len(),
+        let mut ranges = exact_scalar_ranges(self.0.len())?;
+        for &range in &*self.0 {
+            ranges.try_push(range).map_err(|_| {
+                Error::InternalInvariant("Unicode scalar clone exceeded exact allocation")
             })?;
-        ranges.extend_from_slice(&self.0);
-        Ok(Self(ranges.into_boxed_slice()))
+        }
+        Ok(Self(ranges))
     }
 
     pub(crate) fn max_search_checks(&self) -> usize {
@@ -177,14 +186,16 @@ fn scalar_search_comparison_bound(ranges: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod scalar_search_tests {
-    use super::{ScalarRange, ScalarSet, scalar_search_comparison_bound};
+    use super::{ScalarRange, ScalarSet, exact_scalar_ranges, scalar_search_comparison_bound};
 
     fn four_singletons() -> ScalarSet {
-        ScalarSet(
-            ['a', 'c', 'e', 'g']
-                .map(|scalar| ScalarRange::new(scalar, scalar).unwrap())
-                .into(),
-        )
+        let mut ranges = exact_scalar_ranges(4).unwrap();
+        for scalar in ['a', 'c', 'e', 'g'] {
+            ranges
+                .try_push(ScalarRange::new(scalar, scalar).unwrap())
+                .unwrap();
+        }
+        ScalarSet(ranges)
     }
 
     #[test]
@@ -545,10 +556,10 @@ pub(crate) enum Inst {
 
 #[derive(Debug)]
 pub(crate) struct Program {
-    pub(crate) insts: Box<[Inst]>,
+    pub(crate) insts: ExactVec<Inst>,
     pub(crate) entry: usize,
-    pub(crate) epsilon_order: Box<[usize]>,
-    pub(crate) split_rank: Box<[usize]>,
+    pub(crate) epsilon_order: ExactVec<usize>,
+    pub(crate) split_rank: ExactVec<usize>,
     pub(crate) split_count: usize,
     pub(crate) execution_state_work: usize,
     pub(crate) has_scalar_transition: bool,

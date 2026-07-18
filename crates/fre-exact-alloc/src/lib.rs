@@ -31,16 +31,16 @@ impl fmt::Display for CopyError {
 
 impl std::error::Error for CopyError {}
 
-/// Fallible, exact-layout storage for incrementally initialized `Copy` values.
+/// Fallible, exact-layout storage for incrementally initialized values.
 ///
 /// Capacity is exactly the requested element count. `try_push` refuses rather
 /// than reallocating, so callers may charge the complete allocation before it
 /// occurs and retain the storage without a conversion copy.
-pub struct ExactVec<T: Copy> {
+pub struct ExactVec<T> {
     inner: Vec<T>,
 }
 
-impl<T: Copy> ExactVec<T> {
+impl<T> ExactVec<T> {
     /// Allocate exactly `capacity` elements without initializing them.
     pub fn try_with_capacity(capacity: usize) -> Result<Self, CopyError> {
         exact_vec_with_capacity(capacity, false)
@@ -86,13 +86,21 @@ impl<T: Copy> ExactVec<T> {
     }
 }
 
-impl<T: Copy + fmt::Debug> fmt::Debug for ExactVec<T> {
+impl<T: fmt::Debug> fmt::Debug for ExactVec<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_list().entries(self.as_slice()).finish()
     }
 }
 
-impl<T: Copy> Deref for ExactVec<T> {
+impl<T: PartialEq> PartialEq for ExactVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Eq> Eq for ExactVec<T> {}
+
+impl<T> Deref for ExactVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
@@ -100,9 +108,27 @@ impl<T: Copy> Deref for ExactVec<T> {
     }
 }
 
-impl<T: Copy> DerefMut for ExactVec<T> {
+impl<T> DerefMut for ExactVec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ExactVec<T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut ExactVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
     }
 }
 
@@ -110,7 +136,7 @@ impl<T: Copy> DerefMut for ExactVec<T> {
     unsafe_code,
     reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
 )]
-fn exact_vec_with_capacity<T: Copy>(
+fn exact_vec_with_capacity<T>(
     capacity: usize,
     force_failure: bool,
 ) -> Result<ExactVec<T>, CopyError> {
@@ -208,10 +234,42 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::{
         CopyError, ExactVec, copy_exact, copy_exact_with, exact_vec_with_capacity, zeroed_exact,
         zeroed_exact_with,
     };
+
+    #[derive(Debug)]
+    struct DropSpy(Rc<Cell<usize>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0
+                .set(self.0.get().checked_add(1).expect("two test drops fit"));
+        }
+    }
+
+    #[test]
+    fn non_copy_values_use_exact_fallible_storage_and_drop_once() {
+        let drops = Rc::new(Cell::new(0));
+        let mut values = ExactVec::try_with_capacity(1).unwrap();
+        values.try_push(DropSpy(Rc::clone(&drops))).unwrap();
+        let rejected = values
+            .try_push(DropSpy(Rc::clone(&drops)))
+            .expect_err("full exact storage must return ownership");
+        drop(rejected);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values.capacity(), 1);
+        drop(values);
+        assert_eq!(drops.get(), 2);
+        assert!(matches!(
+            exact_vec_with_capacity::<String>(1, true),
+            Err(CopyError::AllocationFailed)
+        ));
+    }
 
     #[test]
     fn typed_exact_storage_never_overallocates_or_grows() {

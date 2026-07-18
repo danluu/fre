@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use fre_exact_alloc::{CopyError, ExactVec};
 use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
 use regex_syntax::utf8::Utf8Sequences;
 
@@ -76,10 +77,19 @@ pub struct CompiledRegex {
 /// A small construction-proved set: every match ends with one of these
 /// nonempty byte strings. It is only an execution hint; an ineligible HIR
 /// retains the dense continuation route.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RequiredSuffixes {
-    bytes: Box<[u8]>,
-    ends: Box<[usize]>,
+    bytes: ExactVec<u8>,
+    ends: ExactVec<usize>,
+}
+
+impl Default for RequiredSuffixes {
+    fn default() -> Self {
+        Self {
+            bytes: ExactVec::try_with_capacity(0).expect("u8 has a valid empty exact allocation"),
+            ends: ExactVec::try_with_capacity(0).expect("usize has a valid empty exact allocation"),
+        }
+    }
 }
 
 impl RequiredSuffixes {
@@ -580,25 +590,29 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
     )?;
     // Preflight every retained endpoint and byte before allocation or copy.
     budget.charge(add(suffix_count, suffix_bytes, Resource::CompileWork)?)?;
-    let mut bytes = Vec::new();
-    if bytes.try_reserve_exact(suffix_bytes).is_err() {
-        return Ok(RequiredSuffixes::default());
-    }
-    let mut ends = Vec::new();
-    if ends.try_reserve_exact(suffix_count).is_err() {
-        return Ok(RequiredSuffixes::default());
-    }
+    let mut bytes = exact_program_vec(suffix_bytes)?;
+    let mut ends = exact_program_vec(suffix_count)?;
     match analysis {
         SuffixAnalysis::Literals(literals) => {
             for literal in literals.iter() {
-                bytes.extend_from_slice(literal);
-                ends.push(bytes.len());
+                for &byte in literal {
+                    bytes.try_push(byte).map_err(|_| {
+                        Error::InternalInvariant("required suffix exceeded exact byte allocation")
+                    })?;
+                }
+                ends.try_push(bytes.len()).map_err(|_| {
+                    Error::InternalInvariant("required suffix exceeded exact endpoint allocation")
+                })?;
             }
         }
         SuffixAnalysis::TerminalBytes(terminals) => {
             for byte in terminals.iter() {
-                bytes.push(byte);
-                ends.push(bytes.len());
+                bytes.try_push(byte).map_err(|_| {
+                    Error::InternalInvariant("required suffix exceeded exact byte allocation")
+                })?;
+                ends.try_push(bytes.len()).map_err(|_| {
+                    Error::InternalInvariant("required suffix exceeded exact endpoint allocation")
+                })?;
             }
         }
         SuffixAnalysis::ZeroWidth | SuffixAnalysis::None => {
@@ -607,10 +621,7 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
             ));
         }
     }
-    Ok(RequiredSuffixes {
-        bytes: bytes.into_boxed_slice(),
-        ends: ends.into_boxed_slice(),
-    })
+    Ok(RequiredSuffixes { bytes, ends })
 }
 
 fn analyze_required_suffixes<'a>(
@@ -1050,11 +1061,27 @@ impl<'a> Builder<'a> {
         self.enforce_program_shape(states, scalar_range_bytes)
     }
 
-    fn finish(self) -> Result<Box<[Inst]>, Error> {
+    fn finish(self) -> Result<ExactVec<Inst>, Error> {
         if self.slots.iter().any(|inst| matches!(inst, Inst::Unfilled)) {
             return Err(Error::InternalInvariant("unfilled compiler state"));
         }
-        Ok(self.slots.into_boxed_slice())
+        let retained_state_bytes = mul(
+            self.slots.len(),
+            core::mem::size_of::<Inst>(),
+            Resource::ProgramBytes,
+        )?;
+        let construction_state_bytes = mul(
+            self.slots.capacity(),
+            core::mem::size_of::<Inst>(),
+            Resource::ProgramBytes,
+        )?;
+        self.budget.charge(self.slots.len())?;
+        self.budget
+            .acquire_construction_bytes(retained_state_bytes)?;
+        let retained = retain_exact_program_vec(self.slots)?;
+        self.budget
+            .release_construction_bytes(construction_state_bytes)?;
+        Ok(retained)
     }
 
     fn compile_node(
@@ -1416,8 +1443,8 @@ fn translate_progress(
 }
 
 struct ProgramCertificate {
-    epsilon_order: Box<[usize]>,
-    split_rank: Box<[usize]>,
+    epsilon_order: ExactVec<usize>,
+    split_rank: ExactVec<usize>,
     split_count: usize,
     execution_state_work: usize,
     has_scalar_transition: bool,
@@ -1425,7 +1452,7 @@ struct ProgramCertificate {
 }
 
 struct EpsilonParentIndex {
-    outgoing: Vec<usize>,
+    outgoing: ExactVec<usize>,
     offsets: Vec<usize>,
     parents: Vec<usize>,
     scratch_bytes: usize,
@@ -1453,9 +1480,9 @@ fn build_epsilon_parent_index(
     budget: &mut CompileBudget,
 ) -> Result<EpsilonParentIndex, Error> {
     let states = insts.len();
-    let mut outgoing = zeroed_vec(states, Resource::TemporaryStates)?;
+    let mut outgoing = zeroed_exact_program_vec(states)?;
     let mut parent_counts = zeroed_vec(states, Resource::TemporaryStates)?;
-    let outgoing_bytes = vector_capacity_bytes(&outgoing)?;
+    let outgoing_bytes = exact_vector_bytes(&outgoing)?;
     let parent_counts_bytes = vector_capacity_bytes(&parent_counts)?;
     budget.acquire_construction_bytes(add(
         outgoing_bytes,
@@ -1524,13 +1551,7 @@ fn certify_program_admitted(
         parents,
         scratch_bytes,
     } = build_epsilon_parent_index(insts, budget)?;
-    let mut queue = VecDeque::new();
-    queue
-        .try_reserve(states)
-        .map_err(|_| Error::AllocationFailed {
-            resource: Resource::TemporaryStates,
-            items: states,
-        })?;
+    let mut queue = reserved_queue(states)?;
     let queue_bytes = mul(
         queue.capacity(),
         core::mem::size_of::<usize>(),
@@ -1542,11 +1563,13 @@ fn certify_program_admitted(
             queue.push_back(state);
         }
     }
-    let mut order = reserved_vec(states, Resource::TemporaryStates)?;
-    let order_bytes = vector_capacity_bytes(&order)?;
+    let mut order = exact_program_vec(states)?;
+    let order_bytes = exact_vector_bytes(&order)?;
     budget.acquire_construction_bytes(order_bytes)?;
     while let Some(child) = queue.pop_front() {
-        order.push(child);
+        order.try_push(child).map_err(|_| {
+            Error::InternalInvariant("certificate order exceeded exact state allocation")
+        })?;
         let next_child = add(child, 1, Resource::TemporaryStates)?;
         for &parent in &parents[offsets[child]..offsets[next_child]] {
             budget.charge(1)?;
@@ -1592,8 +1615,8 @@ fn certify_program_admitted(
     drop(queue);
     budget.release_construction_bytes(add(scratch_bytes, queue_bytes, Resource::ProgramBytes)?)?;
     Ok(ProgramCertificate {
-        epsilon_order: order.into_boxed_slice(),
-        split_rank: split_rank.into_boxed_slice(),
+        epsilon_order: order,
+        split_rank,
         split_count,
         execution_state_work,
         has_scalar_transition,
@@ -1703,9 +1726,9 @@ fn program_bytes(
     )
 }
 
-fn inst_vec_owned_bytes(insts: &Vec<Inst>) -> Result<usize, Error> {
+fn inst_vec_owned_bytes(insts: &[Inst]) -> Result<usize, Error> {
     let state_bytes = mul(
-        insts.capacity(),
+        insts.len(),
         core::mem::size_of::<Inst>(),
         Resource::ProgramBytes,
     )?;
@@ -1921,6 +1944,57 @@ fn vector_capacity_bytes<T>(values: &Vec<T>) -> Result<usize, Error> {
         core::mem::size_of::<T>(),
         Resource::ProgramBytes,
     )
+}
+
+fn exact_vector_bytes<T>(values: &ExactVec<T>) -> Result<usize, Error> {
+    mul(
+        values.capacity(),
+        core::mem::size_of::<T>(),
+        Resource::ProgramBytes,
+    )
+}
+
+fn reserved_queue(length: usize) -> Result<VecDeque<usize>, Error> {
+    let mut queue = VecDeque::new();
+    queue
+        .try_reserve(length)
+        .map_err(|_| Error::AllocationFailed {
+            resource: Resource::TemporaryStates,
+            items: length,
+        })?;
+    Ok(queue)
+}
+
+fn exact_program_vec<T>(capacity: usize) -> Result<ExactVec<T>, Error> {
+    ExactVec::try_with_capacity(capacity).map_err(|error| match error {
+        CopyError::LayoutOverflow => Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        },
+        CopyError::AllocationFailed => Error::AllocationFailed {
+            resource: Resource::ProgramBytes,
+            items: capacity,
+        },
+    })
+}
+
+fn retain_exact_program_vec<T>(values: Vec<T>) -> Result<ExactVec<T>, Error> {
+    let mut retained = exact_program_vec(values.len())?;
+    for value in values {
+        retained.try_push(value).map_err(|_| {
+            Error::InternalInvariant("exact retained program allocation changed capacity")
+        })?;
+    }
+    Ok(retained)
+}
+
+fn zeroed_exact_program_vec(length: usize) -> Result<ExactVec<usize>, Error> {
+    let mut values = exact_program_vec(length)?;
+    for _ in 0..length {
+        values.try_push(0).map_err(|_| {
+            Error::InternalInvariant("exact zeroed program allocation changed capacity")
+        })?;
+    }
+    Ok(values)
 }
 
 fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
@@ -2169,10 +2243,10 @@ mod tests {
         };
         assert_eq!(exact_insts.len(), 1);
         assert_eq!(
-            core::mem::size_of_val(exact_insts.as_ref()),
+            core::mem::size_of_val(&*exact_insts),
             core::mem::size_of::<Inst>()
         );
-        assert_eq!(exact.accounting.work, 1);
+        assert_eq!(exact.accounting.work, 2);
         assert_eq!(exact.current_temporary_states, 1);
 
         let mut one_below = CompileBudget::new(CompileLimits {
@@ -2201,7 +2275,8 @@ mod tests {
         assert_eq!(one_below.accounting.work, 0);
         assert_eq!(one_below.current_temporary_states, 0);
 
-        let insts = vec![Inst::Match].into_boxed_slice();
+        let mut insts = exact_program_vec(1).unwrap();
+        insts.try_push(Inst::Match).unwrap();
         let certificate_limit = preflight_certification_program_bytes(
             insts.len(),
             insts.len(),
@@ -2219,11 +2294,11 @@ mod tests {
         assert_eq!(certificate.epsilon_order.len(), insts.len());
         assert_eq!(certificate.split_rank.len(), insts.len());
         assert_eq!(
-            core::mem::size_of_val(certificate.epsilon_order.as_ref()),
+            core::mem::size_of_val(&*certificate.epsilon_order),
             core::mem::size_of::<usize>()
         );
         assert_eq!(
-            core::mem::size_of_val(certificate.split_rank.as_ref()),
+            core::mem::size_of_val(&*certificate.split_rank),
             core::mem::size_of::<usize>()
         );
         let mut certificate_one_below = CompileBudget::new(CompileLimits {
