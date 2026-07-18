@@ -251,6 +251,11 @@ pub(crate) struct CaptureRequiredLiteralBuildOutcome {
     pub(crate) planner_work: usize,
 }
 
+pub(crate) struct CaptureRequiredLiteralBuildFailure {
+    pub(crate) source: CaptureRequiredLiteralBuildError,
+    pub(crate) planner_work: usize,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the bounded proof, allocation, publication, and DFA receipts remain one auditable transaction"
@@ -259,13 +264,28 @@ pub(crate) fn build_from_hir(
     hir: &Hir,
     syntax: Arc<CacheKey>,
     limits: CaptureRequiredLiteralBuildLimits,
-) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildError> {
+) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
     let mut meter = Meter::new(limits);
-    let Some(raw_metrics) = measure(hir, 1, &mut meter)? else {
-        return Ok(CaptureRequiredLiteralBuildOutcome {
-            plan: None,
+    match build_from_hir_metered(hir, syntax, limits, &mut meter) {
+        Ok(plan) => Ok(CaptureRequiredLiteralBuildOutcome {
+            plan,
             planner_work: meter.work,
-        });
+        }),
+        Err(source) => Err(CaptureRequiredLiteralBuildFailure {
+            source,
+            planner_work: meter.work,
+        }),
+    }
+}
+
+fn build_from_hir_metered(
+    hir: &Hir,
+    syntax: Arc<CacheKey>,
+    limits: CaptureRequiredLiteralBuildLimits,
+    meter: &mut Meter,
+) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
+    let Some(raw_metrics) = measure(hir, 1, meter)? else {
+        return Ok(None);
     };
     if raw_metrics.needles > MAX_INLINE_NEEDLES {
         return Err(CaptureRequiredLiteralBuildError::Resource {
@@ -284,19 +304,16 @@ pub(crate) fn build_from_hir(
 
     let mut raw_needles = [&[][..]; MAX_INLINE_NEEDLES];
     let mut raw_count = 0_usize;
-    collect_refs(hir, 1, &mut meter, &mut raw_needles, &mut raw_count)?;
+    collect_refs(hir, 1, meter, &mut raw_needles, &mut raw_count)?;
     if raw_count != raw_metrics.needles {
         return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
             "collected raw needle count differs from proof",
         ));
     }
-    let (retained, effective) = effective_antichain(&raw_needles[..raw_count], &mut meter)?;
+    let (retained, effective) = effective_antichain(&raw_needles[..raw_count], meter)?;
     check_metric_limits(effective, limits)?;
     if effective.needles < 2 || effective.minimum_bytes < 2 {
-        return Ok(CaptureRequiredLiteralBuildOutcome {
-            plan: None,
-            planner_work: meter.work,
-        });
+        return Ok(None);
     }
 
     let reference_scratch = effective.needles.checked_mul(size_of::<&[u8]>()).ok_or(
@@ -448,14 +465,11 @@ pub(crate) fn build_from_hir(
             literal_set,
         },
     };
-    Ok(CaptureRequiredLiteralBuildOutcome {
-        planner_work: meter.work,
-        plan: Some(CaptureRequiredLiteralPlan {
-            matcher: Arc::new(matcher),
-            build_limits: limits,
-            report,
-        }),
-    })
+    Ok(Some(CaptureRequiredLiteralPlan {
+        matcher: Arc::new(matcher),
+        build_limits: limits,
+        report,
+    }))
 }
 
 /// Immutable, cheaply cloneable candidate prefilter.
@@ -851,7 +865,7 @@ mod tests {
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
             panic!("Rust parser returned a non-Rust pattern")
         };
-        build_from_hir(&rust.hir, key, limits)
+        build_from_hir(&rust.hir, key, limits).map_err(|failure| failure.source)
     }
 
     fn owned_needles(plan: &CaptureRequiredLiteralPlan) -> Vec<Vec<u8>> {

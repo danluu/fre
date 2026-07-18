@@ -19,6 +19,7 @@ use fre_capture_lab::{
     SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
     SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
 };
+use fre_kernels::LiteralSetError;
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
@@ -883,6 +884,23 @@ impl std::error::Error for CaptureIterationError {
     }
 }
 
+fn optional_required_literal_refusal(error: &CaptureRequiredLiteralBuildError) -> bool {
+    match error {
+        CaptureRequiredLiteralBuildError::Resource { .. }
+        | CaptureRequiredLiteralBuildError::Allocation { .. } => true,
+        CaptureRequiredLiteralBuildError::LiteralSet(source) => matches!(
+            source,
+            LiteralSetError::PatternLimit { .. }
+                | LiteralSetError::PatternBytesLimit { .. }
+                | LiteralSetError::BuildWorkLimit { .. }
+                | LiteralSetError::BuildBytesLimit { .. }
+                | LiteralSetError::PersistentBytesLimit { .. }
+        ),
+        CaptureRequiredLiteralBuildError::Overflow(_)
+        | CaptureRequiredLiteralBuildError::InternalInvariant(_) => false,
+    }
+}
+
 /// Builder for the capture-preserving persistent-history plan.
 #[derive(Clone, Debug)]
 pub struct CaptureBuilder {
@@ -976,14 +994,24 @@ impl CaptureBuilder {
             required_limits.max_planner_work =
                 required_limits.max_planner_work.min(remaining_hir_work);
             required_limits.max_hir_depth = required_limits.max_hir_depth.min(limits.max_hir_depth);
-            let outcome = capture_required_literal::build_from_hir(
+            match capture_required_literal::build_from_hir(
                 &rust.hir,
                 Arc::clone(&syntax_key),
                 required_limits,
-            )
-            .map_err(CaptureBuildError::RequiredLiteral)?;
-            charge_hir(&mut accounting, outcome.planner_work, limits.max_hir_work)?;
-            outcome.plan
+            ) {
+                Ok(outcome) => {
+                    charge_hir(&mut accounting, outcome.planner_work, limits.max_hir_work)?;
+                    outcome.plan
+                }
+                Err(failure) => {
+                    charge_hir(&mut accounting, failure.planner_work, limits.max_hir_work)?;
+                    if optional_required_literal_refusal(&failure.source) {
+                        None
+                    } else {
+                        return Err(CaptureBuildError::RequiredLiteral(failure.source));
+                    }
+                }
+            }
         } else {
             None
         };

@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use fre::{
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
-    CaptureExecutionSource, CaptureRequiredLiteralBuildError, CaptureRequiredLiteralBuildLimits,
-    CaptureRequiredLiteralRunLimits, CaptureResource, CaptureRunLimits, CaptureSearchError,
-    CaptureSearchLimits, LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource,
-    LineCaptureBuilder, LineCaptureConfiguration, LineCapturePlanKind, LineCaptureResource,
-    LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN,
+    CaptureExecutionSource, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralRunLimits,
+    CaptureResource, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
+    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder,
+    LineCaptureConfiguration, LineCapturePlanKind, LineCaptureResource, LineCaptureRunError,
+    LineCaptureRunLimits, PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN,
     SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
     SPACE_AROUND_OPERATOR_INSPECTION_WORK, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
     STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
@@ -1620,7 +1620,7 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
     assert_eq!(accounting.literal_set.trie_states_upper_bound, 5);
     assert_eq!(accounting.literal_set.dfa_cells_upper_bound, 1_280);
     assert_eq!(accounting.literal_set.build_work_upper_bound, 1_286);
-    assert_eq!(accounting.planner_work, 25);
+    assert_eq!(accounting.planner_work, 35);
     assert!(
         plan.is_candidate(
             b"zzAB",
@@ -1704,43 +1704,75 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
             .unicode(false)
             .limits(shallow)
             .build(),
-        Err(CaptureBuildError::RequiredLiteral(
-            CaptureRequiredLiteralBuildError::Resource {
-                resource: "HIR depth",
-                required: 2,
-                limit: 1,
-            }
-        ))
+        Err(CaptureBuildError::HirResource { .. })
     ));
 
-    for (resource, one_below) in [
-        ("planner work", accounting.planner_work - 1),
-        ("HIR depth", accounting.hir_depth - 1),
-        ("needle count", accounting.needles - 1),
-        ("needle bytes", accounting.needle_bytes - 1),
-        ("source bytes", accounting.source_bytes - 1),
-        ("scratch bytes", accounting.scratch_bytes - 1),
-        ("peak bytes", accounting.peak_bytes_upper_bound - 1),
+    let expected_count = disabled
+        .count_captures(b"AB CD AB", CaptureRunLimits::default())
+        .expect("general capture route")
+        .accounting
+        .count;
+    for (resource, exact) in [
+        ("planner work", accounting.planner_work),
+        ("HIR depth", accounting.hir_depth),
+        ("needle count", accounting.needles),
+        ("needle bytes", accounting.needle_bytes),
+        ("source bytes", accounting.source_bytes),
+        ("scratch bytes", accounting.scratch_bytes),
+        ("peak bytes", accounting.peak_bytes_upper_bound),
     ] {
-        let mut required = CaptureRequiredLiteralBuildLimits::default();
+        let mut admitted_limits = CaptureRequiredLiteralBuildLimits::default();
         match resource {
-            "planner work" => required.max_planner_work = one_below,
-            "HIR depth" => required.max_hir_depth = one_below,
-            "needle count" => required.max_needles = one_below,
-            "needle bytes" => required.max_needle_bytes = one_below,
-            "source bytes" => required.max_source_bytes = one_below,
-            "scratch bytes" => required.max_scratch_bytes = one_below,
-            "peak bytes" => required.max_peak_bytes = one_below,
+            "planner work" => admitted_limits.max_planner_work = exact,
+            "HIR depth" => admitted_limits.max_hir_depth = exact,
+            "needle count" => admitted_limits.max_needles = exact,
+            "needle bytes" => admitted_limits.max_needle_bytes = exact,
+            "source bytes" => admitted_limits.max_source_bytes = exact,
+            "scratch bytes" => admitted_limits.max_scratch_bytes = exact,
+            "peak bytes" => admitted_limits.max_peak_bytes = exact,
             _ => unreachable!(),
         }
-        assert!(matches!(
-            build("(?:AB|CD)", required, usize::MAX),
-            Err(CaptureBuildError::RequiredLiteral(
-                CaptureRequiredLiteralBuildError::Resource { .. }
-                    | CaptureRequiredLiteralBuildError::LiteralSet(_)
-            ))
-        ));
+        assert!(
+            build("(?:AB|CD)", admitted_limits, usize::MAX)
+                .expect("exact optional-plan resource limit")
+                .required_literal_plan()
+                .is_some(),
+            "{resource} exact limit must retain the optional plan"
+        );
+
+        let mut refused_limits = admitted_limits;
+        match resource {
+            "planner work" => refused_limits.max_planner_work = exact - 1,
+            "HIR depth" => refused_limits.max_hir_depth = exact - 1,
+            "needle count" => refused_limits.max_needles = exact - 1,
+            "needle bytes" => refused_limits.max_needle_bytes = exact - 1,
+            "source bytes" => refused_limits.max_source_bytes = exact - 1,
+            "scratch bytes" => refused_limits.max_scratch_bytes = exact - 1,
+            "peak bytes" => refused_limits.max_peak_bytes = exact - 1,
+            _ => unreachable!(),
+        }
+        let fallback = build("(?:AB|CD)", refused_limits, usize::MAX)
+            .expect("optional-plan refusal must preserve the general capture route");
+        assert!(fallback.required_literal_plan().is_none());
+        assert_eq!(
+            fallback
+                .count_captures(b"AB CD AB", CaptureRunLimits::default())
+                .expect("fallback general route execution")
+                .accounting
+                .count,
+            expected_count,
+            "{resource} refusal changed general capture semantics"
+        );
     }
+
+    let mut dfa_refused = CaptureRequiredLiteralBuildLimits::default();
+    dfa_refused.literal_set.max_build_work = accounting.literal_set.build_work_upper_bound - 1;
+    assert!(
+        build("(?:AB|CD)", dfa_refused, usize::MAX)
+            .expect("optional DFA refusal must preserve the general route")
+            .required_literal_plan()
+            .is_none()
+    );
 
     build(
         "(?:AB|CD)",
