@@ -71,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=20 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=20 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -1293,6 +1293,25 @@ mod tests {
         output
     }
 
+    fn aws_required_literal_klv() -> Vec<u8> {
+        const PATTERN: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
+        const HAYSTACK: &[u8] =
+            b"miss\n\xFF no key\n\"AKIAIOSFODNN7EXAMPLE\" \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+
+        let mut output = Vec::new();
+        field(&mut output, "name", b"curated/09-aws-keys/full");
+        field(&mut output, "model", b"grep-captures");
+        field(&mut output, "case-insensitive", b"false");
+        field(&mut output, "unicode", b"false");
+        field(&mut output, "max-iters", b"1");
+        field(&mut output, "max-warmup-iters", b"0");
+        field(&mut output, "max-time", b"1000");
+        field(&mut output, "max-warmup-time", b"100");
+        field(&mut output, "pattern", PATTERN.as_bytes());
+        field(&mut output, "haystack", HAYSTACK);
+        output
+    }
+
     fn multi_klv(model: &str) -> Vec<u8> {
         let mut output = Vec::new();
         field(&mut output, "name", b"test/model/multi");
@@ -1945,6 +1964,47 @@ mod tests {
             );
             assert!(!measured.get(), "wrong Ruff plan reached measurement");
         }
+    }
+
+    #[test]
+    fn aws_required_literal_formal_klv_binds_first_and_steady_lifecycle() {
+        let benchmark =
+            Benchmark::parse(&aws_required_literal_klv()).expect("exact AWS required-literal KLV");
+        assert_eq!(benchmark.name, "curated/09-aws-keys/full");
+        assert_eq!(benchmark.model, "grep-captures");
+        assert!(!benchmark.unicode);
+        assert!(!benchmark.case_insensitive);
+
+        let mut first_expectations = capture_expectations("first-public-operation", 9);
+        first_expectations.plan =
+            Some(rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN.to_string());
+        let first = model_captures_with_measurement(
+            &benchmark,
+            &first_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(41), operation.execute(haystack)?)),
+        )
+        .expect("formal AWS first operation");
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.actual, 9);
+        assert_eq!(
+            first.candidate_plan,
+            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+        );
+
+        let mut steady_expectations = first_expectations;
+        steady_expectations.boundary = Some("steady-public-operation".to_string());
+        let steady = model_captures_with_measurement(
+            &benchmark,
+            &steady_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(43), operation.execute(haystack)?)),
+        )
+        .expect("formal AWS steady operation");
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.actual, 9);
+        assert_eq!(
+            steady.candidate_plan,
+            rebar_compare::CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+        );
     }
 
     #[test]

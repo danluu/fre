@@ -36,8 +36,9 @@ use fre::{
     BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
     CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
-    CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRunLimits, CaptureSearchError,
-    CaptureSearchLimits, CompatibilityProfile, FixedClassSandwichBuildError,
+    CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, FixedClassSandwichBuildError,
     FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
     GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
@@ -104,6 +105,8 @@ pub const CURRENT_FRE_CAPTURE_SHEBANG_PLAN: &str = fre::SHEBANG_OPERATION_ID;
 pub const CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN: &str = fre::STRING_QUOTE_PREFIX_OPERATION_ID;
 /// Stable plan label for Ruff's exact Unicode-word Python-keyword stream.
 pub const CURRENT_FRE_CAPTURE_KEYWORDS_PLAN: &str = fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID;
+/// Stable plan label for generic required-literal line pruning plus exact capture replay.
+pub const CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN: &str = fre::CAPTURE_REQUIRED_LITERAL_PLAN_ID;
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
@@ -115,6 +118,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
             | CURRENT_FRE_CAPTURE_SHEBANG_PLAN
             | CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN
             | CURRENT_FRE_CAPTURE_KEYWORDS_PLAN
+            | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
             | fre::NOQA_ASCII_LEADING_PLAN_ID
             | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
             | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -132,6 +136,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
                 | CURRENT_FRE_CAPTURE_SHEBANG_PLAN
                 | CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN
                 | CURRENT_FRE_CAPTURE_KEYWORDS_PLAN
+                | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
                 | fre::NOQA_ASCII_LEADING_PLAN_ID
                 | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
                 | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -143,7 +148,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -477,10 +482,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations with distinct immutable identities; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations with distinct immutable identities and a same-parse bounded required-any-literal DFA that prunes impossible LF-framed lines before unchanged selector/replay; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and prune impossible lines through a bounded DFA before unchanged exact selector/replay; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1885,11 +1890,10 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                     CurrentFreCapturePreparation::RuffGrep(Box::new(run_limits)),
                 )
             } else {
+                let general = capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
+                    .map_err(|error| CompareError::new(error.message))?;
                 (
-                    CurrentFreCaptureRegex::General(Box::new(
-                        capture_regex_one(pattern, unicode, case_insensitive, &limits)
-                            .map_err(|error| CompareError::new(error.message))?,
-                    )),
+                    CurrentFreCaptureRegex::General(Box::new(general)),
                     CurrentFreCapturePreparation::Grep,
                 )
             };
@@ -2983,6 +2987,11 @@ fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
             fre::AggregateEngineError::Unsupported(_)
             | fre::AggregateEngineError::ResourceLimit { .. },
         )
+        | CaptureBuildError::RequiredLiteral(
+            fre::CaptureRequiredLiteralBuildError::Resource { .. }
+            | fre::CaptureRequiredLiteralBuildError::Allocation { .. }
+            | fre::CaptureRequiredLiteralBuildError::LiteralSet(_),
+        )
         | CaptureBuildError::Syntax(_) => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
@@ -3014,11 +3023,25 @@ fn capture_regex_one(
     case_insensitive: bool,
     limits: &RunLimits,
 ) -> Result<CaptureRegex, ExecutionError> {
+    capture_regex_one_with_build_limits(
+        pattern,
+        unicode,
+        case_insensitive,
+        &capture_build_limits(limits),
+    )
+}
+
+fn capture_regex_one_with_build_limits(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    build_limits: &CaptureBuildLimits,
+) -> Result<CaptureRegex, ExecutionError> {
     let regex = CaptureBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(unicode)
         .case_insensitive(case_insensitive)
-        .limits(capture_build_limits(limits))
+        .limits(*build_limits)
         .build()
         .map_err(|error| capture_build_error(&error))?;
     let identity = &regex.build_report().plan_identity;
@@ -3036,11 +3059,64 @@ fn capture_regex_one(
     Ok(regex)
 }
 
+fn capture_grep_regex_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<CaptureRegex, ExecutionError> {
+    let mut build_limits = capture_build_limits(limits);
+    build_limits.required_literal = Some(capture_required_literal_build_limits(limits));
+    capture_regex_one_with_build_limits(pattern, unicode, case_insensitive, &build_limits)
+}
+
+fn capture_required_literal_build_limits(limits: &RunLimits) -> CaptureRequiredLiteralBuildLimits {
+    let mut build = CaptureRequiredLiteralBuildLimits::default();
+    build.max_planner_work = limits.fre_literal_planner_work;
+    build.max_needle_bytes = build
+        .max_needle_bytes
+        .min(limits.fre_literal_build_needle_bytes);
+    build.max_source_bytes = build
+        .max_source_bytes
+        .min(limits.fre_literal_build_persistent_bytes);
+    build.max_scratch_bytes = build
+        .max_scratch_bytes
+        .min(limits.fre_literal_build_scratch_bytes);
+    build.max_peak_bytes = build
+        .max_peak_bytes
+        .min(limits.fre_literal_build_peak_bytes);
+    build.literal_set.max_patterns = build.max_needles;
+    build.literal_set.max_pattern_bytes = build.max_needle_bytes;
+    build.literal_set.max_build_work = usize::try_from(limits.fre_literal_build_work)
+        .unwrap_or(usize::MAX)
+        .min(build.literal_set.max_build_work);
+    build.literal_set.max_build_bytes = build
+        .literal_set
+        .max_build_bytes
+        .min(limits.fre_literal_build_peak_bytes);
+    build.literal_set.max_persistent_bytes = build
+        .literal_set
+        .max_persistent_bytes
+        .min(limits.fre_literal_build_persistent_bytes);
+    build
+}
+
 fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
+    if active_capture_required_literal_plan(regex).is_some() {
+        return CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN;
+    }
     match regex.build_report().plan_identity.plan {
         CapturePlanKind::LinearSelectorUniformParticipation => CURRENT_FRE_CAPTURE_UNIFORM_PLAN,
         CapturePlanKind::LinearSelectorPersistentHistory => CURRENT_FRE_CAPTURE_PLAN,
     }
+}
+
+fn active_capture_required_literal_plan(
+    regex: &CaptureRegex,
+) -> Option<&CaptureRequiredLiteralPlan> {
+    let plan = regex.required_literal_plan()?;
+    let accounting = plan.build_report().accounting;
+    (accounting.needles >= 2 && accounting.minimum_needle_bytes >= 2).then_some(plan)
 }
 
 fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
@@ -3149,6 +3225,40 @@ impl CaptureSelectorLedger {
         Ok(Self {
             work: haystack_len,
             sequential_bytes: haystack_len,
+        })
+    }
+
+    fn preflight_lf_and_required_literal(
+        haystack_len: usize,
+        limits: &RunLimits,
+    ) -> Result<Self, ExecutionError> {
+        let prefilter_transitions =
+            checked_aggregate_add(haystack_len, 1, "required-literal prospective transitions")?;
+        let work = checked_aggregate_add(
+            haystack_len,
+            prefilter_transitions,
+            "grep-captures LF and required-literal work",
+        )?;
+        let sequential_bytes = checked_aggregate_mul(
+            haystack_len,
+            2,
+            "grep-captures LF and required-literal sequential bytes",
+        )?;
+        if work > limits.fre_aggregate_operation_work {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures LF and required-literal scans require {work} work, limit is {}",
+                limits.fre_aggregate_operation_work
+            )));
+        }
+        if sequential_bytes > limits.fre_aggregate_sequential_bytes {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE grep-captures LF and required-literal scans require {sequential_bytes} sequential bytes, limit is {}",
+                limits.fre_aggregate_sequential_bytes
+            )));
+        }
+        Ok(Self {
+            work,
+            sequential_bytes,
         })
     }
 
@@ -3279,7 +3389,8 @@ fn fre_grep_captures(
             plan: CURRENT_FRE_CAPTURE_SCALAR_PLAN,
         });
     }
-    let regex = capture_regex(request, limits)?;
+    let pattern = one_fre_pattern(request)?;
+    let regex = capture_grep_regex_one(pattern, request.unicode, request.case_insensitive, limits)?;
     let plan = capture_plan_label(&regex);
     let actual = execute_grep_captures(&regex, request.haystack, limits)?;
     Ok(FreReduction { actual, plan })
@@ -3703,6 +3814,24 @@ fn execute_grep_captures(
     haystack: &[u8],
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
+    execute_grep_captures_inner(
+        active_capture_required_literal_plan(regex),
+        regex,
+        haystack,
+        limits,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "whole-input preflight and exact per-line prefilter/selector accounting remain one auditable transaction"
+)]
+fn execute_grep_captures_inner(
+    prefilter: Option<&CaptureRequiredLiteralPlan>,
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+) -> Result<u64, ExecutionError> {
     let (reducer_limit, work_limit) = capture_reducer_budget(limits)?;
     let groups = regex
         .build_report()
@@ -3713,9 +3842,16 @@ fn execute_grep_captures(
     let mut reducer_events = 0_usize;
     let mut count = 0_usize;
     // `ByteSlice::lines` scans the complete haystack for LF delimiters. Bind
-    // that work and sequential read before constructing the iterator so a
-    // one-below caller cannot trigger an uncharged partial traversal.
-    let mut selector = CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?;
+    // that work and sequential read, plus the complete optional DFA pass,
+    // before constructing the iterator so one-below callers cannot trigger a
+    // partial traversal.
+    let mut selector = if prefilter.is_some() {
+        CaptureSelectorLedger::preflight_lf_and_required_literal(haystack.len(), limits)?
+    } else {
+        CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?
+    };
+    let mut prefilter_transitions = 0_usize;
+    let mut prefilter_sequential = 0_usize;
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
@@ -3725,6 +3861,36 @@ fn execute_grep_captures(
             return Err(ExecutionError::unsupported(format!(
                 "FRE grep-captures line events need {reducer_events}, exceeding {reducer_limit}"
             )));
+        }
+        if let Some(prefilter) = prefilter {
+            let transitions = line.len().checked_add(1).ok_or_else(|| {
+                ExecutionError::fault("required-literal line transition overflow")
+            })?;
+            let filtered = prefilter
+                .is_candidate(
+                    line,
+                    CaptureRequiredLiteralRunLimits {
+                        max_transitions: transitions,
+                    },
+                )
+                .map_err(|error| {
+                    ExecutionError::fault(format!(
+                        "FRE required-literal prefilter violated its exact line bound: {error}"
+                    ))
+                })?;
+            prefilter_transitions = checked_aggregate_add(
+                prefilter_transitions,
+                filtered.accounting.transitions_upper_bound,
+                "required-literal cumulative transitions",
+            )?;
+            prefilter_sequential = checked_aggregate_add(
+                prefilter_sequential,
+                filtered.accounting.searched_bytes,
+                "required-literal cumulative sequential bytes",
+            )?;
+            if !filtered.candidate {
+                continue;
+            }
         }
         let event_remaining = reducer_limit
             .checked_sub(reducer_events)
@@ -3795,6 +3961,18 @@ fn execute_grep_captures(
             result.accounting.total_history_walk,
             "capture history walk",
         )?;
+    }
+    let prospective_prefilter_transitions = haystack
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("required-literal input transition overflow"))?;
+    if prefilter.is_some()
+        && (prefilter_transitions > prospective_prefilter_transitions
+            || prefilter_sequential > haystack.len())
+    {
+        return Err(ExecutionError::fault(
+            "FRE required-literal prefilter exceeded its prospective whole-input bound",
+        ));
     }
     u64::try_from(count)
         .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))
@@ -8063,6 +8241,23 @@ mod tests {
         .expect("FRE grep capture count");
         assert_eq!(grep.actual, 12);
         assert_eq!(grep.plan, "capture-linear-selector-persistent-history");
+
+        for invalid in [Vec::new(), vec!["(a)".to_string(), "(b)".to_string()]] {
+            let error = fre_reducer(
+                CandidateRequest {
+                    job_id: "test/capture-grep-pattern-cardinality",
+                    model: "grep-captures",
+                    patterns: &invalid,
+                    haystack: b"ab",
+                    unicode: false,
+                    case_insensitive: false,
+                },
+                &limits,
+            )
+            .expect_err("grep-captures requires exactly one pattern");
+            assert_eq!(error.status, Status::Unsupported);
+            assert!(error.message.contains("requires exactly one pattern"));
+        }
     }
 
     #[test]
@@ -8383,6 +8578,177 @@ mod tests {
         assert_eq!(
             unicode.execute("雪".as_bytes()).expect("Unicode capture"),
             2
+        );
+    }
+
+    #[test]
+    fn required_literal_capture_lifecycle_is_single_build_exact_and_bounded() {
+        const AWS: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
+        let haystack = b"miss\n\xFF no key\n\"AKIAIOSFODNN7EXAMPLE\" \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        let upstream = rust_compile_options(&[AWS.to_string()], false, false)
+            .expect("pinned Rust AWS pattern");
+        let expected =
+            grep_captures(&upstream, haystack, u64::MAX).expect("Rust AWS grep-captures");
+        assert_eq!(expected, 9);
+        let lifecycle =
+            current_fre_rebar_capture_lifecycle("grep-captures", AWS, false, false, haystack.len())
+                .expect("required-literal lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert!(is_current_fre_capture_route(
+            lifecycle.model(),
+            lifecycle.plan()
+        ));
+        assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
+        assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
+
+        for miss in [b"".as_slice(), b"xx\n".as_slice()] {
+            let work = miss
+                .len()
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .expect("small prefilter work");
+            let sequential = miss.len().checked_mul(2).expect("small sequential");
+            let exact = RunLimits {
+                fre_aggregate_operation_work: work,
+                fre_aggregate_sequential_bytes: sequential,
+                ..RunLimits::default()
+            };
+            let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+                "grep-captures",
+                AWS,
+                false,
+                false,
+                miss.len(),
+                exact.clone(),
+            )
+            .expect("exact required-literal lifecycle");
+            assert_eq!(lifecycle.execute(miss).expect("exact miss"), 0);
+
+            let work_one_below = RunLimits {
+                fre_aggregate_operation_work: work
+                    .checked_sub(1)
+                    .expect("required initial transition"),
+                ..exact.clone()
+            };
+            assert!(
+                current_fre_rebar_capture_lifecycle_with_limits(
+                    "grep-captures",
+                    AWS,
+                    false,
+                    false,
+                    miss.len(),
+                    work_one_below,
+                )
+                .expect("one-below work lifecycle builds")
+                .execute(miss)
+                .expect_err("one-below work must refuse")
+                .to_string()
+                .contains("required-literal scans require")
+            );
+            if sequential > 0 {
+                let sequential_one_below = RunLimits {
+                    fre_aggregate_sequential_bytes: sequential - 1,
+                    ..exact
+                };
+                assert!(
+                    current_fre_rebar_capture_lifecycle_with_limits(
+                        "grep-captures",
+                        AWS,
+                        false,
+                        false,
+                        miss.len(),
+                        sequential_one_below,
+                    )
+                    .expect("one-below sequential lifecycle builds")
+                    .execute(miss)
+                    .expect_err("one-below sequential must refuse")
+                    .to_string()
+                    .contains("sequential bytes")
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_aws_keys_full_real_row_canary() {
+        const JOB_ID: &str = "curated/09-aws-keys/full@rust/regex";
+        const PATTERN_SHA256: &str =
+            "280d3fd784adec2abe6d59663f2676aa97a0b239135d761522e2d7e008ffe24d";
+        const HAYSTACK_SHA256: &str =
+            "140a09e1134154c3222186d21ace797cf3ffaa1ed317480064e3faffd4fe85b6";
+        const AWS: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact AWS keys full row");
+        assert!(matching.next().is_none(), "duplicate AWS keys full row");
+        assert_eq!(job.engine, "rust/regex");
+        assert_eq!(job.model, "grep-captures");
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 0);
+        assert_eq!(job.regex.patterns.len(), 1);
+        assert_eq!(job.regex.patterns[0].bytes, AWS.len());
+        assert_eq!(job.regex.patterns[0].sha256, PATTERN_SHA256);
+        assert_eq!(job.haystack.bytes, 32_514_634);
+        assert_eq!(job.haystack.sha256, HAYSTACK_SHA256);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader
+            .load(job)
+            .expect("load authenticated AWS keys full row");
+        assert_eq!(input.patterns, [AWS.to_string()]);
+        assert_eq!(sha256(input.patterns[0].as_bytes()), PATTERN_SHA256);
+        assert_eq!(input.haystack.len(), 32_514_634);
+        assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
+
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust AWS result");
+        assert_eq!(rust, 0);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE AWS required-literal result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN)
+        );
+
+        let lifecycle = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            AWS,
+            false,
+            false,
+            input.haystack.len(),
+        )
+        .expect("retained AWS required-literal lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(lifecycle.execute(&input.haystack).expect("first"), rust);
+        assert_eq!(lifecycle.execute(&input.haystack).expect("steady"), rust);
+        println!(
+            "aws-keys-full-canary manifest_sha256={manifest_hash} job={JOB_ID} pattern_sha256={PATTERN_SHA256} haystack_sha256={HAYSTACK_SHA256} rust={rust} fre={} plan={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan")
         );
     }
 
@@ -9322,7 +9688,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
+            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
