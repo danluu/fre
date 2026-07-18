@@ -180,14 +180,22 @@ impl std::error::Error for CaptureRequiredLiteralSearchError {
     }
 }
 
+pub(crate) struct CaptureRequiredLiteralBuildOutcome {
+    pub(crate) plan: Option<CaptureRequiredLiteralPlan>,
+    pub(crate) planner_work: usize,
+}
+
 pub(crate) fn build_from_hir(
     hir: &Hir,
     syntax: Arc<CacheKey>,
     limits: CaptureRequiredLiteralBuildLimits,
-) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
+) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildError> {
     let mut meter = Meter::new(limits);
     let Some(metrics) = measure(hir, 1, &mut meter)? else {
-        return Ok(None);
+        return Ok(CaptureRequiredLiteralBuildOutcome {
+            plan: None,
+            planner_work: meter.work,
+        });
     };
     check_metric_limits(metrics, limits)?;
 
@@ -340,11 +348,14 @@ pub(crate) fn build_from_hir(
             literal_set,
         },
     };
-    Ok(Some(CaptureRequiredLiteralPlan {
-        matcher: Arc::new(matcher),
-        build_limits: limits,
-        report,
-    }))
+    Ok(CaptureRequiredLiteralBuildOutcome {
+        planner_work: meter.work,
+        plan: Some(CaptureRequiredLiteralPlan {
+            matcher: Arc::new(matcher),
+            build_limits: limits,
+            report,
+        }),
+    })
 }
 
 /// Immutable, cheaply cloneable candidate prefilter.
@@ -604,7 +615,7 @@ mod tests {
     fn build(
         pattern: &str,
         limits: CaptureRequiredLiteralBuildLimits,
-    ) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
+    ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildError> {
         let mut profile = RustProfile::rebar_1_12_4();
         profile.options.unicode = false;
         let parsed = fre_syntax::parse(ParseRequest::rust(
@@ -626,6 +637,7 @@ mod tests {
             CaptureRequiredLiteralBuildLimits::default(),
         )
         .unwrap()
+        .plan
         .unwrap();
         assert_eq!(
             plan.build_report().identity.needles.as_ref(),
@@ -634,11 +646,13 @@ mod tests {
         assert!(
             build("(?:AB|)", CaptureRequiredLiteralBuildLimits::default())
                 .unwrap()
+                .plan
                 .is_none()
         );
         assert!(
             build("(?:AB)?", CaptureRequiredLiteralBuildLimits::default())
                 .unwrap()
+                .plan
                 .is_none()
         );
     }
@@ -647,6 +661,7 @@ mod tests {
     fn aws_hir_proves_the_access_prefix_set_and_byte_search_is_malformed_safe() {
         let plan = build(AWS, CaptureRequiredLiteralBuildLimits::default())
             .unwrap()
+            .plan
             .unwrap();
         assert_eq!(plan.build_report().accounting.needles, 8);
         assert_eq!(plan.build_report().accounting.needle_bytes, 32);
@@ -683,6 +698,7 @@ mod tests {
     fn planner_and_search_exact_limits_refuse_one_below() {
         let baseline = build("(?:AB|CD)", CaptureRequiredLiteralBuildLimits::default())
             .unwrap()
+            .plan
             .unwrap();
         let accounting = baseline.build_report().accounting;
         for (resource, limit) in [

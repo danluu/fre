@@ -1654,6 +1654,57 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
         );
     }
 
+    let nullable_without_proof = CaptureBuilder::new("(?:AB|)")
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build()
+        .expect("nullable capture without proof traversal");
+    let nullable_with_proof = build(
+        "(?:AB|)",
+        CaptureRequiredLiteralBuildLimits::default(),
+        usize::MAX,
+    )
+    .expect("nullable proof traversal remains supported");
+    assert!(nullable_with_proof.required_literal_plan().is_none());
+    assert!(
+        nullable_with_proof.build_report().hir.work
+            > nullable_without_proof.build_report().hir.work,
+        "unsuccessful optional proof traversal must remain in cumulative compiler work"
+    );
+    let nullable_exact_work = nullable_with_proof.build_report().hir.work;
+    build(
+        "(?:AB|)",
+        CaptureRequiredLiteralBuildLimits::default(),
+        nullable_exact_work,
+    )
+    .expect("exact cumulative nullable HIR-work limit");
+    assert!(
+        build(
+            "(?:AB|)",
+            CaptureRequiredLiteralBuildLimits::default(),
+            nullable_exact_work - 1,
+        )
+        .is_err()
+    );
+
+    let mut shallow = CaptureBuildLimits::default();
+    shallow.max_hir_depth = 1;
+    shallow.required_literal = Some(CaptureRequiredLiteralBuildLimits::default());
+    assert!(matches!(
+        CaptureBuilder::new("(?:AB|CD)")
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .limits(shallow)
+            .build(),
+        Err(CaptureBuildError::RequiredLiteral(
+            CaptureRequiredLiteralBuildError::Resource {
+                resource: "HIR depth",
+                required: 2,
+                limit: 1,
+            }
+        ))
+    ));
+
     for (resource, one_below) in [
         ("planner work", accounting.planner_work - 1),
         ("HIR depth", accounting.hir_depth - 1),

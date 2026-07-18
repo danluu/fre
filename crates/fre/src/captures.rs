@@ -710,17 +710,6 @@ impl PortableTextCaptureBuilder {
         self
     }
 
-    /// Enable one bounded generic required-any-literal certificate from the
-    /// same parsed HIR and syntax identity used by the capture executors.
-    #[must_use]
-    pub const fn required_literal_prefilter(
-        mut self,
-        limits: CaptureRequiredLiteralBuildLimits,
-    ) -> Self {
-        self.limits.required_literal = Some(limits);
-        self
-    }
-
     /// Prove exact capture-preserving HIR equivalence and build the tagged
     /// byte-stable executor.
     pub fn build(self) -> Result<PortableTextCaptureRegex, PortableTextCaptureBuildError> {
@@ -982,20 +971,15 @@ impl CaptureBuilder {
             )?;
             required_limits.max_planner_work =
                 required_limits.max_planner_work.min(remaining_hir_work);
-            let plan = capture_required_literal::build_from_hir(
+            required_limits.max_hir_depth = required_limits.max_hir_depth.min(limits.max_hir_depth);
+            let outcome = capture_required_literal::build_from_hir(
                 &rust.hir,
                 Arc::clone(&syntax_key),
                 required_limits,
             )
             .map_err(CaptureBuildError::RequiredLiteral)?;
-            if let Some(plan) = &plan {
-                charge_hir(
-                    &mut accounting,
-                    plan.build_report().accounting.planner_work,
-                    limits.max_hir_work,
-                )?;
-            }
-            plan
+            charge_hir(&mut accounting, outcome.planner_work, limits.max_hir_work)?;
+            outcome.plan
         } else {
             None
         };
