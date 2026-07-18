@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
+mod candidate;
 mod compile;
 mod error;
 mod limits;

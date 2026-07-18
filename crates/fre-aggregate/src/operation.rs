@@ -8,6 +8,7 @@ use fre_kernels::{
 };
 
 use crate::accounting::ExecutionAccounting;
+use crate::candidate;
 use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes, TerminalFrontierSeed};
 use crate::error::{add, enforce, mul};
 use crate::program::{
@@ -366,6 +367,14 @@ impl CompiledRegex {
         {
             return self.execute_required_internal_anchor(plan, local, range, strategy, limits);
         }
+        if OBSERVED_WORK
+            && kind == OperationKind::Count
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.candidate
+            && candidate::executable_for(&self.program)
+        {
+            return self.execute_candidate(plan, haystack, range, strategy, limits);
+        }
         let mut accounting = ExecutionAccounting::default();
         let utf8_validation =
             preflight_unicode_word_utf8(&self.program, haystack, limits, &mut accounting)?;
@@ -677,6 +686,58 @@ impl CompiledRegex {
             summary: ScanSummary {
                 matches,
                 events: matches,
+                suppressed: 0,
+                span_sum: 0,
+            },
+            spans: Vec::new(),
+        })
+    }
+
+    fn execute_candidate(
+        &self,
+        plan: &candidate::Plan,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<ExecutionResult, Error> {
+        let result = candidate::count(plan, &self.program, haystack, range.clone(), limits)?;
+        let boundaries = add(
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or(Error::InternalInvariant("candidate range reversed"))?,
+            1,
+            Resource::Boundaries,
+        )?;
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_id: operation_identity(self.plan_id(), strategy, OperationKind::Count, false),
+            strategy,
+            range,
+            states: self.program.insts.len(),
+            boundaries,
+            table_cells: 0,
+            row_storage: None,
+            row_record_bytes: 0,
+            terminal_frontier: false,
+            work_bound: result.accounting.work,
+            random_access_bytes: result.accounting.random_access_peak_bytes,
+            scratch_bytes: result.accounting.scratch_peak_bytes,
+            log_bytes: 0,
+            sequential_bytes_bound: result.accounting.sequential_bytes_read,
+            match_events: result.value,
+            output_matches: result.value,
+            output_bytes: 0,
+            span_sum: 0,
+            peak_bytes: result.accounting.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting: result.accounting,
+            summary: ScanSummary {
+                matches: result.value,
+                events: result.value,
                 suppressed: 0,
                 span_sum: 0,
             },

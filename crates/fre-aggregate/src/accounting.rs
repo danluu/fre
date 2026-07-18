@@ -39,6 +39,11 @@ pub struct CompileAccounting {
     pub terminal_frontier_prefix_bytes: usize,
     /// Alternatives in the retained terminal byte class.
     pub terminal_frontier_bytes: usize,
+    /// Direct root alternatives covered by the retained candidate scheduler.
+    /// Zero preserves the established dense continuation route.
+    pub candidate_entries: usize,
+    /// Exact retained bytes for candidate entries and first-byte buckets.
+    pub candidate_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,

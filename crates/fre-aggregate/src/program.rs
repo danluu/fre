@@ -463,8 +463,105 @@ impl<'h> AssertionContext<'h> {
         })
     }
 
+    /// Exact adjacent haystack bytes inspected by the byte-only candidate
+    /// executor for one assertion evaluation at `local_position`.
+    pub(crate) fn candidate_source_bytes(
+        self,
+        assertion: Assertion,
+        local_position: usize,
+    ) -> Result<usize, Error> {
+        if local_position > self.local_len {
+            return Err(Error::InternalInvariant(
+                "assertion source census outside operation range",
+            ));
+        }
+        let absolute = self
+            .base
+            .checked_add(local_position)
+            .ok_or(Error::InternalInvariant("assertion position overflow"))?;
+        let left = usize::from(absolute > 0);
+        let right = usize::from(absolute < self.haystack.len());
+        match assertion {
+            Assertion::StartText | Assertion::EndText => Ok(0),
+            Assertion::StartLf | Assertion::WordStartHalfAscii => Ok(left),
+            Assertion::EndLf | Assertion::WordEndHalfAscii => Ok(right),
+            Assertion::StartCrlf if absolute == 0 => Ok(0),
+            Assertion::EndCrlf if absolute == self.haystack.len() => Ok(0),
+            Assertion::StartCrlf
+            | Assertion::EndCrlf
+            | Assertion::WordAscii
+            | Assertion::WordAsciiNegate
+            | Assertion::WordStartAscii
+            | Assertion::WordEndAscii => left.checked_add(right).ok_or(Error::ArithmeticOverflow {
+                resource: crate::Resource::RandomAccessBytes,
+            }),
+            Assertion::WordUnicode
+            | Assertion::WordUnicodeNegate
+            | Assertion::WordStartUnicode
+            | Assertion::WordEndUnicode
+            | Assertion::WordStartHalfUnicode
+            | Assertion::WordEndHalfUnicode => Err(Error::InternalInvariant(
+                "candidate source census reached Unicode assertion",
+            )),
+        }
+    }
+
     pub(crate) const fn base(self) -> usize {
         self.base
+    }
+}
+
+#[cfg(test)]
+mod assertion_source_tests {
+    use super::{Assertion, AssertionContext};
+
+    #[test]
+    fn candidate_assertion_source_bytes_are_exact_at_edges_and_interior() {
+        let context = AssertionContext::new(b"ab", 0, 2).unwrap();
+        for assertion in [
+            Assertion::StartText,
+            Assertion::EndText,
+            Assertion::StartLf,
+            Assertion::StartCrlf,
+            Assertion::WordStartHalfAscii,
+        ] {
+            assert_eq!(context.candidate_source_bytes(assertion, 0).unwrap(), 0);
+        }
+        for assertion in [
+            Assertion::EndLf,
+            Assertion::EndCrlf,
+            Assertion::WordEndHalfAscii,
+        ] {
+            assert_eq!(context.candidate_source_bytes(assertion, 0).unwrap(), 1);
+        }
+        assert_eq!(
+            context
+                .candidate_source_bytes(Assertion::WordAscii, 0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            context
+                .candidate_source_bytes(Assertion::WordAscii, 1)
+                .unwrap(),
+            2
+        );
+        for assertion in [
+            Assertion::StartLf,
+            Assertion::StartCrlf,
+            Assertion::WordStartHalfAscii,
+        ] {
+            assert_eq!(context.candidate_source_bytes(assertion, 2).unwrap(), 1);
+        }
+        for assertion in [
+            Assertion::StartText,
+            Assertion::EndText,
+            Assertion::EndLf,
+            Assertion::EndCrlf,
+            Assertion::WordEndHalfAscii,
+        ] {
+            assert_eq!(context.candidate_source_bytes(assertion, 2).unwrap(), 0);
+        }
     }
 }
 

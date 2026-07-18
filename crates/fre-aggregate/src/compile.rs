@@ -5,6 +5,7 @@ use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
 use regex_syntax::utf8::Utf8Sequences;
 
 use crate::accounting::CompileAccounting;
+use crate::candidate::{self, Draft as CandidateDraft, Entry as CandidateEntry};
 use crate::error::{add, enforce, mul};
 use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet};
 use crate::required_internal_anchor;
@@ -68,6 +69,7 @@ impl core::fmt::Display for PlanId {
 #[derive(Debug)]
 pub struct CompiledRegex {
     pub(crate) program: Program,
+    pub(crate) candidate: Option<candidate::Plan>,
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     pub(crate) terminal_frontier: TerminalFrontierSeed,
@@ -212,6 +214,10 @@ impl CompiledRegex {
         Self::compile(hir, profile, limits, CapturePolicy::EraseForWholeMatch)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "compile keeps resource lifetime and publication ordering in one auditable transaction"
+    )]
     fn compile(
         hir: &Hir,
         profile: RustByteProfile,
@@ -226,6 +232,20 @@ impl CompiledRegex {
             terminal_frontier,
             retained_program_bytes,
         ) = build_retained_components(hir, profile, limits, &mut budget)?;
+        let mut candidate = build_candidate_plan(hir, profile, &mut budget)?;
+        let candidate_bytes = candidate
+            .as_ref()
+            .map_or(Ok(0), candidate::Plan::retained_bytes)?;
+        let retained_program_bytes = add(
+            retained_program_bytes,
+            candidate_bytes,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            retained_program_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
@@ -234,7 +254,11 @@ impl CompiledRegex {
             &mut budget,
         );
         let accept = builder.push(Inst::Match)?;
-        let entry = builder.compile_node(hir, accept, 1)?;
+        let entry = if let Some(plan) = &mut candidate {
+            builder.compile_candidate_root(hir, accept, &mut plan.entries)?
+        } else {
+            builder.compile_node(hir, accept, 1)?
+        };
         let scalar_range_bytes = builder.scalar_range_bytes;
         let insts = builder.finish()?;
         enforce(
@@ -285,6 +309,9 @@ impl CompiledRegex {
             has_unicode_word_boundary: false,
         };
         let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, &mut budget)?;
+        if let Some(candidate) = &candidate {
+            plan_id = bind_candidate_identity(plan_id, candidate, &mut budget)?;
+        }
         if let Some(plan) = &required_internal_anchor {
             plan_id = bind_required_internal_anchor_identity(plan_id, plan, &mut budget)?;
         }
@@ -296,6 +323,7 @@ impl CompiledRegex {
         let accounting = budget.finish();
         Ok(Self {
             program,
+            candidate,
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
@@ -317,6 +345,869 @@ impl CompiledRegex {
     #[must_use]
     pub fn state_count(&self) -> usize {
         self.program.insts.len()
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "candidate construction keeps every retained allocation and charged initialization explicit"
+)]
+fn build_candidate_plan(
+    hir: &Hir,
+    profile: RustByteProfile,
+    budget: &mut CompileBudget,
+) -> Result<Option<candidate::Plan>, Error> {
+    // The executor is deliberately byte-only. Unicode-on plans retain their
+    // existing scalar-aware execution route even when a particular HIR happens
+    // to contain only ASCII atoms.
+    budget.charge(1)?;
+    if profile.unicode {
+        return Ok(None);
+    }
+    let HirKind::Alternation(branches) = hir.kind() else {
+        return Ok(None);
+    };
+    if !(2..=candidate::MAX_ENTRIES).contains(&branches.len()) {
+        return Ok(None);
+    }
+
+    let draft_bytes = mul(
+        branches.len(),
+        core::mem::size_of::<CandidateDraft>(),
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        add(
+            budget.current_construction_bytes,
+            draft_bytes,
+            Resource::ProgramBytes,
+        )?,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    budget.charge(branches.len())?;
+    budget.acquire_construction_bytes(draft_bytes)?;
+    let mut drafts = candidate::exact_drafts(branches.len())?;
+    for branch in branches {
+        budget.charge(1)?;
+        let fallback = if let Some(draft) = required_candidate(branch, budget)? {
+            draft
+        } else {
+            let Some(draft) = leading_candidate(branch, budget)? else {
+                budget.release_construction_bytes(draft_bytes)?;
+                return Ok(None);
+            };
+            draft
+        };
+        let mut draft = match leading_fixed_candidate(branch, budget)? {
+            Some(fixed) if fixed.check_len >= 2 => choose_candidate(Some(fallback), fixed, budget)?
+                .ok_or(Error::InternalInvariant(
+                    "candidate choice lost both proved alternatives",
+                ))?,
+            _ => fallback,
+        };
+        let Some(global) = required_global_candidate(branch, budget)? else {
+            budget.release_construction_bytes(draft_bytes)?;
+            return Ok(None);
+        };
+        draft.global_bytes = global.bytes;
+        draft.global_checks = global.checks;
+        draft.global_check_len = global.check_len;
+        draft.leading_assertion = leading_assertion(branch, budget)?;
+        if draft.max_offset > candidate::MAX_OFFSET {
+            budget.release_construction_bytes(draft_bytes)?;
+            return Ok(None);
+        }
+        drafts.try_push(draft).map_err(|_| {
+            Error::InternalInvariant("candidate analysis exceeded exact branch census")
+        })?;
+    }
+    if drafts.len() != branches.len() {
+        return Err(Error::InternalInvariant(
+            "candidate analysis changed direct-root branch count",
+        ));
+    }
+
+    let entry_bytes = mul(
+        drafts.len(),
+        core::mem::size_of::<CandidateEntry>(),
+        Resource::ProgramBytes,
+    )?;
+    let bucket_bytes = mul(
+        candidate::bucket_count(),
+        core::mem::size_of::<u128>(),
+        Resource::ProgramBytes,
+    )?;
+    let retained_bytes = add(
+        entry_bytes,
+        mul(2, bucket_bytes, Resource::ProgramBytes)?,
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        add(
+            budget.current_construction_bytes,
+            retained_bytes,
+            Resource::ProgramBytes,
+        )?,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    let entry_initialization = mul(
+        drafts.len(),
+        add(
+            mul(2, candidate::MAX_FILTER_CHECKS, Resource::CompileWork)?,
+            6,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    let initialization = add(
+        entry_initialization,
+        mul(2, candidate::bucket_count(), Resource::CompileWork)?,
+        Resource::CompileWork,
+    )?;
+    budget.charge(initialization)?;
+    budget.acquire_construction_bytes(retained_bytes)?;
+    let mut entries = candidate::exact_entries(drafts.len())?;
+    for draft in &*drafts {
+        entries
+            .try_push(CandidateEntry {
+                pc: usize::MAX,
+                min_offset: draft.min_offset,
+                max_offset: draft.max_offset,
+                checks: draft.checks,
+                check_len: draft.check_len,
+                leading_assertion: draft.leading_assertion,
+                global_checks: draft.global_checks,
+                global_check_len: draft.global_check_len,
+            })
+            .map_err(|_| Error::InternalInvariant("candidate entry allocation filled early"))?;
+    }
+    let mut buckets = candidate::exact_buckets()?;
+    for _ in 0..candidate::bucket_count() {
+        buckets
+            .try_push(0)
+            .map_err(|_| Error::InternalInvariant("candidate bucket allocation filled early"))?;
+    }
+    let mut global_buckets = candidate::exact_buckets()?;
+    for _ in 0..candidate::bucket_count() {
+        global_buckets.try_push(0).map_err(|_| {
+            Error::InternalInvariant("candidate global bucket allocation filled early")
+        })?;
+    }
+    let mut max_offset = 0_usize;
+    for (ordinal, draft) in drafts.iter().enumerate() {
+        budget.charge(2)?; // maximum-offset comparison and owner derivation
+        max_offset = max_offset.max(draft.max_offset);
+        let shift = u32::try_from(ordinal).map_err(|_| {
+            Error::InternalInvariant("candidate ordinal exceeds bucket shift width")
+        })?;
+        let owner = 1_u128.checked_shl(shift).ok_or(Error::InternalInvariant(
+            "candidate ordinal outside bucket word",
+        ))?;
+        for byte in u8::MIN..=u8::MAX {
+            budget.charge(2)?;
+            if draft.bytes.contains(byte) {
+                budget.charge(1)?;
+                *buckets
+                    .get_mut(usize::from(byte))
+                    .ok_or(Error::InternalInvariant(
+                        "candidate bucket publication outside table",
+                    ))? |= owner;
+            }
+            if draft.global_bytes.contains(byte) {
+                budget.charge(1)?;
+                *global_buckets
+                    .get_mut(usize::from(byte))
+                    .ok_or(Error::InternalInvariant(
+                        "candidate global bucket publication outside table",
+                    ))? |= owner;
+            }
+        }
+    }
+    budget.release_construction_bytes(draft_bytes)?;
+    budget.accounting.candidate_entries = entries.len();
+    budget.accounting.candidate_bytes = retained_bytes;
+    Ok(Some(candidate::Plan {
+        entries,
+        buckets,
+        global_buckets,
+        max_offset,
+    }))
+}
+
+const FILTER_WIDTH: usize = candidate::MAX_FILTER_CHECKS + 1;
+
+#[derive(Clone, Copy)]
+struct FixedPrefix {
+    sets: [ByteSet; FILTER_WIDTH],
+    len: usize,
+    exact: bool,
+}
+
+impl FixedPrefix {
+    const fn empty(exact: bool) -> Self {
+        Self {
+            sets: [ByteSet::empty(); FILTER_WIDTH],
+            len: 0,
+            exact,
+        }
+    }
+
+    fn append(&mut self, other: Self, budget: &mut CompileBudget) -> Result<(), Error> {
+        let available = FILTER_WIDTH.saturating_sub(self.len);
+        let copied = available.min(other.len);
+        budget.charge(add(copied, 2, Resource::CompileWork)?)?;
+        for index in 0..copied {
+            let output = self
+                .len
+                .checked_add(index)
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::CompileWork,
+                })?;
+            self.sets[output] = other.sets[index];
+        }
+        let complete = copied == other.len;
+        self.len = add(self.len, copied, Resource::CompileWork)?;
+        self.exact &= other.exact && complete;
+        Ok(())
+    }
+}
+
+fn initialized_fixed_prefix(exact: bool, budget: &mut CompileBudget) -> Result<FixedPrefix, Error> {
+    budget.charge(FILTER_WIDTH)?;
+    Ok(FixedPrefix::empty(exact))
+}
+
+fn initialized_filter_checks(
+    budget: &mut CompileBudget,
+) -> Result<[candidate::FilterCheck; candidate::MAX_FILTER_CHECKS], Error> {
+    budget.charge(candidate::MAX_FILTER_CHECKS)?;
+    Ok([candidate::EMPTY_FILTER_CHECK; candidate::MAX_FILTER_CHECKS])
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the fixed-width proof array is deliberately copied into one retained descriptor"
+)]
+const fn candidate_draft(
+    bytes: ByteSet,
+    min_offset: usize,
+    max_offset: usize,
+    checks: [candidate::FilterCheck; candidate::MAX_FILTER_CHECKS],
+    check_len: usize,
+) -> CandidateDraft {
+    CandidateDraft {
+        bytes,
+        min_offset,
+        max_offset,
+        checks,
+        check_len,
+        leading_assertion: None,
+        global_bytes: bytes,
+        global_checks: checks,
+        global_check_len: check_len,
+    }
+}
+
+fn leading_fixed_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let fixed = fixed_prefix(hir, budget)?;
+    if fixed.len < 2 {
+        return Ok(None);
+    }
+    let mut selected = 0_usize;
+    let mut selected_weight = byte_set_weight(fixed.sets[0], budget)?;
+    for index in 1..fixed.len {
+        let weight = byte_set_weight(fixed.sets[index], budget)?;
+        budget.charge(1)?;
+        if weight < selected_weight {
+            selected = index;
+            selected_weight = weight;
+        }
+    }
+    let mut checks = initialized_filter_checks(budget)?;
+    let mut check_len = 0_usize;
+    for index in 0..fixed.len {
+        budget.charge(1)?;
+        if index == selected {
+            continue;
+        }
+        let relative = isize::try_from(index)
+            .ok()
+            .and_then(|index| {
+                isize::try_from(selected)
+                    .ok()
+                    .and_then(|selected| index.checked_sub(selected))
+            })
+            .and_then(|relative| i8::try_from(relative).ok())
+            .ok_or(Error::InternalInvariant(
+                "candidate fixed-prefix relative offset overflow",
+            ))?;
+        checks[check_len] = candidate::FilterCheck {
+            relative,
+            bytes: fixed.sets[index],
+        };
+        check_len = add(check_len, 1, Resource::CompileWork)?;
+    }
+    Ok(Some(candidate_draft(
+        fixed.sets[selected],
+        selected,
+        selected,
+        checks,
+        check_len,
+    )))
+}
+
+fn fixed_prefix(hir: &Hir, budget: &mut CompileBudget) -> Result<FixedPrefix, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => initialized_fixed_prefix(true, budget),
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            let mut output = initialized_fixed_prefix(bytes.len() <= FILTER_WIDTH, budget)?;
+            let retained = bytes.len().min(FILTER_WIDTH);
+            budget.charge(add(bytes.len(), retained, Resource::CompileWork)?)?;
+            for (index, &byte) in bytes.iter().take(retained).enumerate() {
+                let mut set = ByteSet::empty();
+                set.insert(byte);
+                output.sets[index] = set;
+            }
+            output.len = retained;
+            Ok(output)
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            let mut set = ByteSet::empty();
+            for range in class.ranges() {
+                let width = inclusive_byte_width(range.start(), range.end())?;
+                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                set.insert_range(range.start(), range.end());
+            }
+            let mut output = initialized_fixed_prefix(true, budget)?;
+            output.sets[0] = set;
+            output.len = 1;
+            Ok(output)
+        }
+        HirKind::Class(Class::Unicode(_)) => initialized_fixed_prefix(false, budget),
+        HirKind::Capture(capture) => fixed_prefix(&capture.sub, budget),
+        HirKind::Concat(parts) => {
+            let mut output = initialized_fixed_prefix(true, budget)?;
+            for part in parts {
+                budget.charge(1)?;
+                let child = fixed_prefix(part, budget)?;
+                output.append(child, budget)?;
+                if !child.exact || output.len == FILTER_WIDTH {
+                    output.exact = false;
+                    break;
+                }
+            }
+            Ok(output)
+        }
+        HirKind::Alternation(branches) => {
+            let Some((first, rest)) = branches.split_first() else {
+                return initialized_fixed_prefix(false, budget);
+            };
+            let mut output = fixed_prefix(first, budget)?;
+            for branch in rest {
+                budget.charge(1)?;
+                let branch = fixed_prefix(branch, budget)?;
+                let shared = output.len.min(branch.len);
+                for index in 0..shared {
+                    for word in 0..output.sets[index].0.len() {
+                        budget.charge(2)?;
+                        output.sets[index].0[word] |= branch.sets[index].0[word];
+                    }
+                }
+                output.exact &= branch.exact && output.len == branch.len;
+                output.len = shared;
+                if output.len == 0 {
+                    break;
+                }
+            }
+            Ok(output)
+        }
+        HirKind::Repetition(repetition) => {
+            budget.charge(1)?;
+            if repetition.min == 0 {
+                return initialized_fixed_prefix(false, budget);
+            }
+            let child = fixed_prefix(&repetition.sub, budget)?;
+            if child.len == 0 {
+                return initialized_fixed_prefix(false, budget);
+            }
+            let mut output = initialized_fixed_prefix(true, budget)?;
+            for _ in 0..repetition.min {
+                budget.charge(1)?;
+                output.append(child, budget)?;
+                if !child.exact || output.len == FILTER_WIDTH {
+                    output.exact = false;
+                    break;
+                }
+            }
+            output.exact &= child.exact && repetition.max == Some(repetition.min);
+            Ok(output)
+        }
+    }
+}
+
+fn leading_assertion(hir: &Hir, budget: &mut CompileBudget) -> Result<Option<Assertion>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Look(look) => Ok(Some(Assertion::from_look(*look))),
+        HirKind::Capture(capture) => leading_assertion(&capture.sub, budget),
+        HirKind::Concat(parts) => {
+            for part in parts {
+                budget.charge(2)?; // child visit and minimum-length property
+                if let Some(assertion) = leading_assertion(part, budget)? {
+                    return Ok(Some(assertion));
+                }
+                if part.properties().maximum_len() != Some(0) {
+                    break;
+                }
+            }
+            Ok(None)
+        }
+        HirKind::Repetition(repetition) if repetition.min > 0 => {
+            leading_assertion(&repetition.sub, budget)
+        }
+        HirKind::Alternation(branches) => {
+            let mut common = None;
+            for branch in branches {
+                budget.charge(1)?;
+                let assertion = leading_assertion(branch, budget)?;
+                match (common, assertion) {
+                    (None, Some(assertion)) => common = Some(assertion),
+                    (Some(expected), Some(actual)) if expected == actual => {}
+                    _ => return Ok(None),
+                }
+            }
+            Ok(common)
+        }
+        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Repetition(_) => {
+            Ok(None)
+        }
+    }
+}
+
+fn byte_set_weight(set: ByteSet, budget: &mut CompileBudget) -> Result<usize, Error> {
+    let mut weight = 0_usize;
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        if set.contains(byte) {
+            budget.charge(1)?;
+            weight = add(
+                weight,
+                usize::from(candidate_byte_weight(byte)),
+                Resource::CompileWork,
+            )?;
+        }
+    }
+    Ok(weight)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded HIR proof keeps every syntax case and offset update explicit"
+)]
+fn required_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => Ok(None),
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            let Some((&first, tail)) = bytes.split_first() else {
+                return Ok(None);
+            };
+            let mut selected = first;
+            let mut selected_offset = 0_usize;
+            for (index, &byte) in tail.iter().enumerate() {
+                // Visit, rank comparison and potential publication are all
+                // charged before consulting the next literal byte.
+                budget.charge(3)?;
+                if candidate_byte_weight(byte) < candidate_byte_weight(selected) {
+                    selected = byte;
+                    selected_offset = add(index, 1, Resource::CompileWork)?;
+                }
+            }
+            let mut set = ByteSet::empty();
+            budget.charge(1)?;
+            set.insert(selected);
+            Ok(Some(candidate_draft(
+                set,
+                selected_offset,
+                selected_offset,
+                initialized_filter_checks(budget)?,
+                0,
+            )))
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            let mut set = ByteSet::empty();
+            for range in class.ranges() {
+                let width = inclusive_byte_width(range.start(), range.end())?;
+                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                set.insert_range(range.start(), range.end());
+            }
+            Ok(Some(candidate_draft(
+                set,
+                0,
+                0,
+                initialized_filter_checks(budget)?,
+                0,
+            )))
+        }
+        HirKind::Capture(capture) => required_candidate(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            budget.charge(1)?;
+            if repetition.min == 0 {
+                Ok(None)
+            } else {
+                required_candidate(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            let mut prefix_min = 0_usize;
+            let mut prefix_max = Some(0_usize);
+            let mut selected = None;
+            for part in parts {
+                budget.charge(3)?; // child, min property and max property
+                if let Some(maximum) = prefix_max
+                    && let Some(mut candidate) = required_candidate(part, budget)?
+                {
+                    candidate.min_offset =
+                        add(candidate.min_offset, prefix_min, Resource::CompileWork)?;
+                    candidate.max_offset =
+                        add(candidate.max_offset, maximum, Resource::CompileWork)?;
+                    selected = choose_candidate(selected, candidate, budget)?;
+                }
+                let Some(minimum) = part.properties().minimum_len() else {
+                    return Ok(None);
+                };
+                prefix_min = add(prefix_min, minimum, Resource::CompileWork)?;
+                prefix_max = match (prefix_max, part.properties().maximum_len()) {
+                    (Some(prefix), Some(maximum)) => {
+                        Some(add(prefix, maximum, Resource::CompileWork)?)
+                    }
+                    _ => None,
+                };
+            }
+            Ok(selected)
+        }
+        HirKind::Alternation(branches) => {
+            let mut combined: Option<CandidateDraft> = None;
+            for branch in branches {
+                budget.charge(1)?;
+                let Some(branch) = required_candidate(branch, budget)? else {
+                    return Ok(None);
+                };
+                combined = Some(match combined {
+                    None => branch,
+                    Some(mut combined) => {
+                        for word in 0..combined.bytes.0.len() {
+                            budget.charge(2)?; // word visit and union write
+                            combined.bytes.0[word] |= branch.bytes.0[word];
+                        }
+                        budget.charge(4)?; // two min/max comparisons and writes
+                        combined.min_offset = combined.min_offset.min(branch.min_offset);
+                        combined.max_offset = combined.max_offset.max(branch.max_offset);
+                        combined
+                    }
+                });
+            }
+            Ok(combined)
+        }
+    }
+}
+
+fn required_global_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => Ok(None),
+        HirKind::Literal(_) | HirKind::Class(Class::Bytes(_)) => {
+            if let Some(fixed) = leading_fixed_candidate(hir, budget)? {
+                Ok(Some(fixed))
+            } else {
+                required_candidate(hir, budget)
+            }
+        }
+        HirKind::Capture(capture) => required_global_candidate(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            budget.charge(1)?;
+            if repetition.min == 0 {
+                Ok(None)
+            } else {
+                required_global_candidate(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            let mut selected = if hir
+                .properties()
+                .minimum_len()
+                .is_some_and(|minimum| minimum > 0)
+            {
+                leading_fixed_candidate(hir, budget)?
+            } else {
+                None
+            };
+            for part in parts {
+                budget.charge(2)?; // child visit and nonempty property
+                if part
+                    .properties()
+                    .minimum_len()
+                    .is_some_and(|minimum| minimum > 0)
+                    && let Some(candidate) = required_global_candidate(part, budget)?
+                {
+                    selected = choose_candidate(selected, candidate, budget)?;
+                }
+            }
+            Ok(selected)
+        }
+        HirKind::Alternation(branches) => {
+            let mut combined: Option<CandidateDraft> = None;
+            for branch in branches {
+                budget.charge(1)?;
+                let Some(branch) = required_global_candidate(branch, budget)? else {
+                    return Ok(None);
+                };
+                combined = Some(match combined {
+                    None => branch,
+                    Some(mut combined) => {
+                        if global_probe_equal(&combined, &branch, budget)? {
+                            combined
+                        } else {
+                            for word in 0..combined.bytes.0.len() {
+                                budget.charge(2)?;
+                                combined.bytes.0[word] |= branch.bytes.0[word];
+                            }
+                            combined.checks = initialized_filter_checks(budget)?;
+                            combined.check_len = 0;
+                            combined.min_offset = 0;
+                            combined.max_offset = 0;
+                            combined.global_bytes = combined.bytes;
+                            combined.global_checks = combined.checks;
+                            combined.global_check_len = 0;
+                            combined
+                        }
+                    }
+                });
+            }
+            Ok(combined)
+        }
+    }
+}
+
+fn global_probe_equal(
+    left: &CandidateDraft,
+    right: &CandidateDraft,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    budget.charge(1)?;
+    if left.check_len != right.check_len {
+        return Ok(false);
+    }
+    for word in 0..left.bytes.0.len() {
+        budget.charge(1)?;
+        if left.bytes.0[word] != right.bytes.0[word] {
+            return Ok(false);
+        }
+    }
+    for index in 0..left.check_len {
+        let left = left.checks[index];
+        let right = right.checks[index];
+        budget.charge(1)?;
+        if left.relative != right.relative {
+            return Ok(false);
+        }
+        for word in 0..left.bytes.0.len() {
+            budget.charge(1)?;
+            if left.bytes.0[word] != right.bytes.0[word] {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn leading_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    if hir
+        .properties()
+        .minimum_len()
+        .is_none_or(|minimum| minimum == 0)
+    {
+        return Ok(None);
+    }
+    let bytes = possible_first_bytes(hir, budget)?;
+    budget.charge(bytes.0.len())?;
+    if bytes.0.iter().all(|&word| word == 0) {
+        return Ok(None);
+    }
+    Ok(Some(candidate_draft(
+        bytes,
+        0,
+        0,
+        initialized_filter_checks(budget)?,
+        0,
+    )))
+}
+
+fn possible_first_bytes(hir: &Hir, budget: &mut CompileBudget) -> Result<ByteSet, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => {
+            Ok(ByteSet::empty())
+        }
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            let mut output = ByteSet::empty();
+            if let Some(&byte) = bytes.first() {
+                budget.charge(1)?;
+                output.insert(byte);
+            }
+            Ok(output)
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            let mut output = ByteSet::empty();
+            for range in class.ranges() {
+                let width = inclusive_byte_width(range.start(), range.end())?;
+                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                output.insert_range(range.start(), range.end());
+            }
+            Ok(output)
+        }
+        HirKind::Capture(capture) => possible_first_bytes(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            budget.charge(1)?;
+            possible_first_bytes(&repetition.sub, budget)
+        }
+        HirKind::Concat(parts) => {
+            let mut output = ByteSet::empty();
+            for part in parts {
+                budget.charge(2)?; // child visit and nullability property
+                let child = possible_first_bytes(part, budget)?;
+                for word in 0..output.0.len() {
+                    budget.charge(2)?;
+                    output.0[word] |= child.0[word];
+                }
+                if part
+                    .properties()
+                    .minimum_len()
+                    .is_some_and(|minimum| minimum > 0)
+                {
+                    break;
+                }
+            }
+            Ok(output)
+        }
+        HirKind::Alternation(branches) => {
+            let mut output = ByteSet::empty();
+            for branch in branches {
+                budget.charge(1)?;
+                let child = possible_first_bytes(branch, budget)?;
+                for word in 0..output.0.len() {
+                    budget.charge(2)?;
+                    output.0[word] |= child.0[word];
+                }
+            }
+            Ok(output)
+        }
+    }
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "selection transfers ownership of one fixed bounded descriptor without allocation"
+)]
+fn choose_candidate(
+    selected: Option<CandidateDraft>,
+    candidate: CandidateDraft,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let Some(selected) = selected else {
+        return Ok(Some(candidate));
+    };
+    let selected_score = candidate_score(&selected, budget)?;
+    let candidate_score = candidate_score(&candidate, budget)?;
+    budget.charge(1)?;
+    Ok(Some(if candidate_score < selected_score {
+        candidate
+    } else {
+        selected
+    }))
+}
+
+fn candidate_score(candidate: &CandidateDraft, budget: &mut CompileBudget) -> Result<usize, Error> {
+    let mut byte_weight = 0_usize;
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        if candidate.bytes.contains(byte) {
+            budget.charge(1)?;
+            byte_weight = add(
+                byte_weight,
+                usize::from(candidate_byte_weight(byte)),
+                Resource::CompileWork,
+            )?;
+        }
+    }
+    let width = add(
+        candidate
+            .max_offset
+            .checked_sub(candidate.min_offset)
+            .ok_or(Error::InternalInvariant(
+                "candidate offset interval reversed",
+            ))?,
+        1,
+        Resource::CompileWork,
+    )?;
+    mul(byte_weight, width, Resource::CompileWork)
+}
+
+const fn candidate_byte_weight(byte: u8) -> u8 {
+    let lower = byte.to_ascii_lowercase();
+    if lower.is_ascii_alphabetic() {
+        match lower {
+            b't' => 58,
+            b'a' => 54,
+            b'o' => 52,
+            b'i' => 50,
+            b'n' => 48,
+            b's' => 46,
+            b'r' => 44,
+            b'h' => 40,
+            b'l' => 38,
+            b'd' => 36,
+            b'c' => 34,
+            b'u' => 32,
+            b'm' => 30,
+            b'f' => 28,
+            b'p' => 26,
+            b'g' => 24,
+            b'w' => 22,
+            b'y' => 20,
+            b'b' => 18,
+            b'v' => 14,
+            b'k' => 12,
+            b'x' => 8,
+            b'j' => 6,
+            b'q' => 4,
+            b'z' => 2,
+            _ => 64,
+        }
+    } else if byte.is_ascii_digit() {
+        12
+    } else if byte.is_ascii_whitespace() {
+        4
+    } else if byte == b'_' || byte == b'-' || byte == b'/' || byte == b'.' {
+        2
+    } else {
+        1
     }
 }
 
@@ -452,6 +1343,8 @@ impl CompileBudget {
                 required_internal_anchor_persistent_bytes: 0,
                 terminal_frontier_prefix_bytes: 0,
                 terminal_frontier_bytes: 0,
+                candidate_entries: 0,
+                candidate_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -1415,6 +2308,39 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn compile_candidate_root(
+        &mut self,
+        hir: &Hir,
+        continuation: usize,
+        entries: &mut [CandidateEntry],
+    ) -> Result<usize, Error> {
+        self.budget.charge(1)?;
+        let HirKind::Alternation(branches) = hir.kind() else {
+            return Err(Error::InternalInvariant(
+                "candidate plan lost its direct-root alternation",
+            ));
+        };
+        if branches.len() != entries.len() || branches.is_empty() {
+            return Err(Error::InternalInvariant(
+                "candidate entry count differs from root alternatives",
+            ));
+        }
+        let mut fallback = None;
+        for index in (0..branches.len()).rev() {
+            self.budget.charge(2)?; // branch visit and entry-PC publication
+            let preferred = self.compile_node(&branches[index], continuation, 2)?;
+            entries[index].pc = preferred;
+            fallback = Some(match fallback {
+                None => preferred,
+                Some(fallback) => self.push(Inst::Split {
+                    preferred,
+                    fallback,
+                })?,
+            });
+        }
+        fallback.ok_or(Error::EmptyAlternation)
+    }
+
     fn compile_unicode_class(
         &mut self,
         class: &regex_syntax::hir::ClassUnicode,
@@ -2106,6 +3032,120 @@ fn finalize_program(
     Ok(PlanId(bytes))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity binding enumerates every resource-bearing candidate field explicitly"
+)]
+fn bind_candidate_identity(
+    program: PlanId,
+    plan: &candidate::Plan,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = b"fre.aggregate.candidate-intervals.v1";
+    let check_payload = mul(
+        candidate::MAX_FILTER_CHECKS,
+        add(
+            1,
+            mul(4, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    let scheduled_entry_payload = add(
+        add(
+            mul(4, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+            check_payload,
+            Resource::CompileWork,
+        )?,
+        2,
+        Resource::CompileWork,
+    )?;
+    let one_entry_payload = add(
+        scheduled_entry_payload,
+        add(
+            core::mem::size_of::<u64>(),
+            check_payload,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    let entry_payload = mul(plan.entries.len(), one_entry_payload, Resource::CompileWork)?;
+    let bucket_payload = mul(
+        add(
+            plan.buckets.len(),
+            plan.global_buckets.len(),
+            Resource::CompileWork,
+        )?,
+        core::mem::size_of::<u128>(),
+        Resource::CompileWork,
+    )?;
+    let payload = add(
+        add(program.0.len(), domain.len(), Resource::CompileWork)?,
+        add(
+            add(entry_payload, bucket_payload, Resource::CompileWork)?,
+            core::mem::size_of::<u64>(),
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0x4d0a_7309_d0f3_4521);
+    let mut second = StableHash::new(0x9b76_18c2_2a41_e70d);
+    first.bytes(domain);
+    second.bytes(domain);
+    first.bytes(&program.0);
+    second.bytes(&program.0);
+    hash_usize(&mut first, plan.max_offset);
+    hash_usize(&mut second, plan.max_offset);
+    for entry in &*plan.entries {
+        hash_usize(&mut first, entry.pc);
+        hash_usize(&mut second, entry.pc);
+        hash_usize(&mut first, entry.min_offset);
+        hash_usize(&mut second, entry.min_offset);
+        hash_usize(&mut first, entry.max_offset);
+        hash_usize(&mut second, entry.max_offset);
+        hash_usize(&mut first, entry.check_len);
+        hash_usize(&mut second, entry.check_len);
+        for check in entry.checks {
+            first.byte(check.relative.cast_unsigned());
+            second.byte(check.relative.cast_unsigned());
+            for word in check.bytes.0 {
+                first.bytes(&word.to_le_bytes());
+                second.bytes(&word.to_le_bytes());
+            }
+        }
+        let (present, assertion) = entry
+            .leading_assertion
+            .map_or((0_u8, 0_u8), |assertion| (1, assertion.identity_tag()));
+        first.byte(present);
+        second.byte(present);
+        first.byte(assertion);
+        second.byte(assertion);
+        hash_usize(&mut first, entry.global_check_len);
+        hash_usize(&mut second, entry.global_check_len);
+        for check in entry.global_checks {
+            first.byte(check.relative.cast_unsigned());
+            second.byte(check.relative.cast_unsigned());
+            for word in check.bytes.0 {
+                first.bytes(&word.to_le_bytes());
+                second.bytes(&word.to_le_bytes());
+            }
+        }
+    }
+    for &bucket in &*plan.buckets {
+        first.bytes(&bucket.to_le_bytes());
+        second.bytes(&bucket.to_le_bytes());
+    }
+    for &bucket in &*plan.global_buckets {
+        first.bytes(&bucket.to_le_bytes());
+        second.bytes(&bucket.to_le_bytes());
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
 fn bind_required_internal_anchor_identity(
     program: PlanId,
     plan: &fre_kernels::RequiredInternalAnchorPlan,
@@ -2524,6 +3564,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn candidate_analysis_and_retained_bytes_are_exact_and_one_below() {
+        let hir = parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z");
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = compiled.compile_accounting();
+        assert_eq!(accounting.candidate_entries, 3);
+        assert!(accounting.candidate_bytes > 0);
+        let exact_program_limit = accounting
+            .program_bytes
+            .max(accounting.construction_peak_bytes);
+        let exact = CompileLimits {
+            max_program_bytes: exact_program_limit,
+            max_work: accounting.work,
+            ..CompileLimits::default()
+        };
+        assert_eq!(
+            CompiledRegex::from_hir(&hir, RustByteProfile::PINNED_1_12_4, exact)
+                .unwrap()
+                .compile_accounting(),
+            accounting
+        );
+        assert!(matches!(
+            CompiledRegex::from_hir(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_work: accounting.work - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        let one_below_bytes = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_program_bytes: accounting.program_bytes - 1,
+                ..exact
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                one_below_bytes,
+                Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    ..
+                }
+            ),
+            "unexpected one-below candidate byte error: {one_below_bytes:?}"
+        );
     }
 
     #[test]
