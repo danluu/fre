@@ -16,6 +16,7 @@ mod bounded_class_sequence;
 mod bounded_context;
 mod fixed_class_sandwich;
 mod forward_anchored;
+mod grapheme_scalar_dfa;
 mod literal_aggregate;
 mod literal_set;
 mod ordered_literal_aggregate;
@@ -71,6 +72,22 @@ pub use forward_anchored::{
     ClassImplementation as ForwardClassImplementation, ForwardAnchoredPlan,
     PLAN_ID as FORWARD_ANCHORED_PLAN_ID, SearchAccounting as ForwardAnchoredSearchAccounting,
     SearchError as ForwardAnchoredSearchError, SearchLimits as ForwardAnchoredSearchLimits,
+};
+
+pub use grapheme_scalar_dfa::{
+    BuildAccounting as GraphemeScalarDfaBuildAccounting, BuildError as GraphemeScalarDfaBuildError,
+    BuildLimits as GraphemeScalarDfaBuildLimits,
+    COUNT_OPERATION_ID as GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID,
+    CountResult as GraphemeScalarDfaCountResult, GraphemeScalarClassRole,
+    GraphemeScalarClassRole as GraphemeScalarDfaRole, GraphemeScalarDfaPlan,
+    Operation as GraphemeScalarDfaOperation,
+    OperationIdentity as GraphemeScalarDfaOperationIdentity,
+    PLAN_ID as GRAPHEME_SCALAR_DFA_PLAN_ID, ReduceAccounting as GraphemeScalarDfaReduceAccounting,
+    ReduceActualCounters as GraphemeScalarDfaActualCounters,
+    ReduceError as GraphemeScalarDfaReduceError, ReduceLimits as GraphemeScalarDfaReduceLimits,
+    ReduceUpperBounds as GraphemeScalarDfaUpperBounds,
+    SPAN_SUM_OPERATION_ID as GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID,
+    Semantics as GraphemeScalarDfaSemantics, SpanSumResult as GraphemeScalarDfaSpanSumResult,
 };
 
 pub use literal_aggregate::{
