@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8-regex-redux-composite-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8-regex-redux-composite-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -3653,6 +3653,37 @@ fn require_composite_count_minimum_identity(
     Ok(())
 }
 
+fn composite_component_build_peak(report: &AggregateBuildReport) -> Result<usize, ExecutionError> {
+    let (persistent, peak, valid_peak) = match report.build {
+        AggregateBuildAccounting::FiniteLiteral(build) => (
+            build.persistent_bytes,
+            build.peak_bytes,
+            build.persistent_bytes.checked_add(build.scratch_bytes) == Some(build.peak_bytes),
+        ),
+        AggregateBuildAccounting::SparseFiniteLiteral(build) => (
+            build.persistent_bytes,
+            build.peak_bytes,
+            build.peak_bytes >= build.persistent_bytes && build.peak_bytes >= build.scratch_bytes,
+        ),
+        AggregateBuildAccounting::Continuation(build) => (
+            build.program_bytes,
+            build.construction_peak_bytes,
+            build.construction_peak_bytes >= build.program_bytes,
+        ),
+        _ => {
+            return Err(ExecutionError::fault(
+                "regex-redux selected an unauthenticated construction-peak family",
+            ));
+        }
+    };
+    if report.retained_capacity_bytes != persistent || !valid_peak {
+        return Err(ExecutionError::fault(
+            "regex-redux component construction-peak identity mismatch",
+        ));
+    }
+    Ok(peak)
+}
+
 fn charge_composite_build(
     accounting: &mut CompositeAccounting,
     report: &AggregateBuildReport,
@@ -3661,9 +3692,10 @@ fn charge_composite_build(
     let work = composite_build_work(report)?;
     accounting.build_work = composite_checked_add(accounting.build_work, work, "build work")?;
     composite_enforce(accounting.build_work, limits.build_work, "build work")?;
+    let component_peak = composite_component_build_peak(report)?;
     accounting.owned_peak_bytes = accounting.owned_peak_bytes.max(composite_usize_add(
         accounting.current_sequence_capacity_bytes,
-        report.retained_capacity_bytes,
+        component_peak,
         "build owned peak",
     )?);
     composite_enforce(
@@ -9700,10 +9732,115 @@ mod tests {
         ]
     }
 
+    fn assert_regex_redux_component_build_peak(
+        report: &AggregateBuildReport,
+        current_sequence_capacity: usize,
+        run_limits: &RunLimits,
+    ) {
+        let independent_peak = match report.build {
+            AggregateBuildAccounting::FiniteLiteral(build) => {
+                assert_eq!(
+                    build.persistent_bytes.checked_add(build.scratch_bytes),
+                    Some(build.peak_bytes)
+                );
+                build.peak_bytes
+            }
+            AggregateBuildAccounting::SparseFiniteLiteral(build) => {
+                assert!(build.peak_bytes >= build.persistent_bytes);
+                assert!(build.peak_bytes >= build.scratch_bytes);
+                build.peak_bytes
+            }
+            AggregateBuildAccounting::Continuation(build) => {
+                assert!(build.construction_peak_bytes > build.program_bytes);
+                build.construction_peak_bytes
+            }
+            other => panic!("unexpected regex-redux component build: {other:?}"),
+        };
+        assert_eq!(
+            composite_component_build_peak(report).expect("authenticated component build peak"),
+            independent_peak
+        );
+        let exact_peak = current_sequence_capacity
+            .checked_add(independent_peak)
+            .expect("component plus live sequence peak");
+        let mut exact_limits = composite_limits(run_limits).expect("composite limits");
+        exact_limits.owned_peak_bytes = exact_peak;
+        let mut exact_accounting = CompositeAccounting {
+            current_sequence_capacity_bytes: current_sequence_capacity,
+            ..CompositeAccounting::default()
+        };
+        charge_composite_build(&mut exact_accounting, report, exact_limits)
+            .expect("independently derived exact component build peak");
+        assert_eq!(exact_accounting.owned_peak_bytes, exact_peak);
+
+        let mut one_below = exact_limits;
+        one_below.owned_peak_bytes = exact_peak.checked_sub(1).expect("one-below peak");
+        let mut refused_accounting = CompositeAccounting {
+            current_sequence_capacity_bytes: current_sequence_capacity,
+            ..CompositeAccounting::default()
+        };
+        let refusal = charge_composite_build(&mut refused_accounting, report, one_below)
+            .expect_err("one below independent component build peak");
+        assert_eq!(refusal.status, Status::Unsupported);
+        assert!(refusal.message.contains("owned peak bytes"));
+    }
+
+    fn assert_regex_redux_all_component_build_peaks(run_limits: &RunLimits) {
+        let build_limits = aggregate_build_limits(run_limits);
+        let dense = AggregateBuilder::new(REGEX_REDUX_VARIANTS[0])
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(build_limits)
+            .plan_selection(AggregatePlanSelection::Auto)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .expect("dense regex-redux count component");
+        assert_regex_redux_component_build_peak(dense.build_report(), 17, run_limits);
+
+        let mut sparse_pattern = String::from("(?:");
+        for index in 0..32 {
+            if index != 0 {
+                sparse_pattern.push('|');
+            }
+            write!(&mut sparse_pattern, "p{index:03}").expect("write sparse arm");
+        }
+        sparse_pattern.push(')');
+        let mut sparse_limits = build_limits;
+        sparse_limits.finite_literal.max_dfa_cells = 32 * 4;
+        let sparse = AggregateBuilder::new(sparse_pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(sparse_limits)
+            .plan_selection(AggregatePlanSelection::Auto)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .expect("sparse regex-redux count control");
+        assert!(matches!(
+            sparse.build_report().build,
+            AggregateBuildAccounting::SparseFiniteLiteral(_)
+        ));
+        assert_regex_redux_component_build_peak(sparse.build_report(), 23, run_limits);
+
+        let replacement = AggregateBuilder::new(r">[^\n]*\n|\n")
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(build_limits)
+            .plan_selection(AggregatePlanSelection::Auto)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_spans()
+            .expect("continuation regex-redux replacement component");
+        assert_regex_redux_component_build_peak(replacement.build_report(), 29, run_limits);
+    }
+
     #[test]
     fn current_fre_regex_redux_composite_resource_limits_are_exact() {
         let run_limits = RunLimits::default();
         let input = b"tHaN";
+        assert_regex_redux_all_component_build_peaks(&run_limits);
+
         let exact = exact_regex_redux_limits(input, &run_limits);
         let probe = run_fre_composite(input, &REGEX_REDUX_STAGES, &run_limits, exact)
             .expect("all exact prospective composite limits");
@@ -12418,7 +12555,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8-regex-redux-composite-v1"
+            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8-regex-redux-composite-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

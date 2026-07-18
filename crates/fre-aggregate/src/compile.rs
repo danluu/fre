@@ -147,6 +147,7 @@ impl CompiledRegex {
         let mut budget = CompileBudget::new(limits);
         validate_hir(hir, profile, capture_policy, &mut budget)?;
         let required_suffixes = required_suffixes(hir, &mut budget)?;
+        budget.acquire_construction_bytes(required_suffixes.retained_bytes()?)?;
         budget.accounting.required_suffixes = required_suffixes.ends.len();
         budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
         let mut builder = Builder::new(
@@ -199,6 +200,11 @@ impl CompiledRegex {
             has_unicode_word_boundary: false,
         };
         let plan_id = finalize_program(&mut program, profile, &mut budget)?;
+        if budget.current_construction_bytes != program_bytes {
+            return Err(Error::InternalInvariant(
+                "compiler retained bytes differ from construction accounting",
+            ));
+        }
         let accounting = budget.finish();
         Ok(Self {
             program,
@@ -234,6 +240,7 @@ struct CompileBudget {
     limits: CompileLimits,
     accounting: CompileAccounting,
     current_temporary_states: usize,
+    current_construction_bytes: usize,
 }
 
 impl CompileBudget {
@@ -256,6 +263,7 @@ impl CompileBudget {
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
+                construction_peak_bytes: 0,
                 execution_state_work: 0,
                 has_scalar_transitions: false,
                 max_scalar_search_checks: 0,
@@ -264,6 +272,7 @@ impl CompileBudget {
                 work: 0,
             },
             current_temporary_states: 0,
+            current_construction_bytes: 0,
         }
     }
 
@@ -271,6 +280,29 @@ impl CompileBudget {
         let required = add(self.accounting.work, amount, Resource::CompileWork)?;
         enforce(required, self.limits.max_work, Resource::CompileWork)?;
         self.accounting.work = required;
+        Ok(())
+    }
+
+    fn acquire_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        self.current_construction_bytes = add(
+            self.current_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        self.accounting.construction_peak_bytes = self
+            .accounting
+            .construction_peak_bytes
+            .max(self.current_construction_bytes);
+        Ok(())
+    }
+
+    fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+        self.current_construction_bytes = self
+            .current_construction_bytes
+            .checked_sub(amount)
+            .ok_or(Error::InternalInvariant(
+                "compiler construction-byte accounting underflow",
+            ))?;
         Ok(())
     }
 
@@ -557,6 +589,11 @@ fn validate_hir(
             resource: Resource::HirStackItems,
             items: 1,
         })?;
+    budget.acquire_construction_bytes(mul(
+        stack.capacity(),
+        core::mem::size_of::<(&Hir, usize)>(),
+        Resource::ProgramBytes,
+    )?)?;
     enforce(
         1,
         budget.limits.max_hir_stack_items,
@@ -628,6 +665,11 @@ fn validate_hir(
             }
         }
     }
+    budget.release_construction_bytes(mul(
+        stack.capacity(),
+        core::mem::size_of::<(&Hir, usize)>(),
+        Resource::ProgramBytes,
+    )?)?;
     Ok(())
 }
 
@@ -694,10 +736,23 @@ fn push_children<'a>(
             budget.limits.max_hir_stack_items,
             Resource::HirStackItems,
         )?;
+        let old_capacity = stack.capacity();
         stack.try_reserve(1).map_err(|_| Error::AllocationFailed {
             resource: Resource::HirStackItems,
             items: 1,
         })?;
+        let added_capacity =
+            stack
+                .capacity()
+                .checked_sub(old_capacity)
+                .ok_or(Error::InternalInvariant(
+                    "HIR stack capacity decreased during reserve",
+                ))?;
+        budget.acquire_construction_bytes(mul(
+            added_capacity,
+            core::mem::size_of::<(&Hir, usize)>(),
+            Resource::ProgramBytes,
+        )?)?;
         stack.push((child, next_depth));
         budget.accounting.peak_hir_stack_items =
             budget.accounting.peak_hir_stack_items.max(stack.len());
@@ -782,12 +837,30 @@ impl<'a> Builder<'a> {
         )?;
         self.enforce_program_shape(required, scalar_range_bytes)?;
         self.budget.acquire_state()?;
+        let old_capacity = self.slots.capacity();
         self.slots
             .try_reserve(1)
             .map_err(|_| Error::AllocationFailed {
                 resource: Resource::TemporaryStates,
                 items: 1,
             })?;
+        let added_capacity =
+            self.slots
+                .capacity()
+                .checked_sub(old_capacity)
+                .ok_or(Error::InternalInvariant(
+                    "compiler state capacity decreased during reserve",
+                ))?;
+        let state_capacity_bytes = mul(
+            added_capacity,
+            core::mem::size_of::<Inst>(),
+            Resource::ProgramBytes,
+        )?;
+        self.budget.acquire_construction_bytes(add(
+            state_capacity_bytes,
+            added_scalar_bytes,
+            Resource::ProgramBytes,
+        )?)?;
         let index = self.slots.len();
         self.slots.push(inst);
         self.scalar_range_bytes = scalar_range_bytes;
@@ -810,6 +883,7 @@ impl<'a> Builder<'a> {
             Resource::ProgramBytes,
         )?;
         self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
+        self.budget.acquire_construction_bytes(added_scalar_bytes)?;
         self.slots[index] = inst;
         self.scalar_range_bytes = scalar_range_bytes;
         Ok(())
@@ -1054,10 +1128,13 @@ impl<'a> Builder<'a> {
             (fragment_builder.finish()?, fragment_entry)
         };
         let fragment_len = fragment.len();
+        let fragment_bytes = inst_vec_owned_bytes(&fragment)?;
         let initial_body =
             self.import_progress_product(&fragment, fragment_entry, continuation, progressed_loop)?;
         let progressed_body =
             self.import_progress_product(&fragment, fragment_entry, fail, progressed_loop)?;
+        drop(fragment);
+        self.budget.release_construction_bytes(fragment_bytes)?;
         self.budget.release_states(fragment_len)?;
         let (preferred, fallback) = if greedy {
             (initial_body, continuation)
@@ -1098,8 +1175,11 @@ impl<'a> Builder<'a> {
             (fragment_builder.finish()?, entry)
         };
         let required_len = required.len();
+        let required_bytes = inst_vec_owned_bytes(&required)?;
         let entry =
             self.import_progress_product(&required, required_entry, initial_loop, progressed_loop)?;
+        drop(required);
+        self.budget.release_construction_bytes(required_bytes)?;
         self.budget.release_states(required_len)?;
         Ok(entry)
     }
@@ -1113,6 +1193,20 @@ impl<'a> Builder<'a> {
     ) -> Result<usize, Error> {
         let mut zero_map = reserved_vec(fragment.len(), Resource::TemporaryStates)?;
         let mut consumed_map = reserved_vec(fragment.len(), Resource::TemporaryStates)?;
+        let map_bytes = add(
+            mul(
+                zero_map.capacity(),
+                core::mem::size_of::<usize>(),
+                Resource::ProgramBytes,
+            )?,
+            mul(
+                consumed_map.capacity(),
+                core::mem::size_of::<usize>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )?;
+        self.budget.acquire_construction_bytes(map_bytes)?;
         for inst in fragment {
             if matches!(inst, Inst::Match) {
                 zero_map.push(zero_continuation);
@@ -1134,10 +1228,14 @@ impl<'a> Builder<'a> {
             let consumed = translate_progress(inst, &zero_map, &consumed_map, true)?;
             self.fill_unfilled(consumed_map[pc], consumed)?;
         }
-        zero_map
+        let entry = zero_map
             .get(fragment_entry)
             .copied()
-            .ok_or(Error::InternalInvariant("fragment entry outside fragment"))
+            .ok_or(Error::InternalInvariant("fragment entry outside fragment"))?;
+        drop(zero_map);
+        drop(consumed_map);
+        self.budget.release_construction_bytes(map_bytes)?;
+        Ok(entry)
     }
 }
 
@@ -1197,13 +1295,27 @@ struct ProgramCertificate {
     max_scalar_search_checks: usize,
 }
 
-fn certify_program(
+struct EpsilonParentIndex {
+    outgoing: Vec<usize>,
+    offsets: Vec<usize>,
+    parents: Vec<usize>,
+    scratch_bytes: usize,
+}
+
+fn build_epsilon_parent_index(
     insts: &[Inst],
     budget: &mut CompileBudget,
-) -> Result<ProgramCertificate, Error> {
+) -> Result<EpsilonParentIndex, Error> {
     let states = insts.len();
     let mut outgoing = zeroed_vec(states, Resource::TemporaryStates)?;
     let mut parent_counts = zeroed_vec(states, Resource::TemporaryStates)?;
+    let outgoing_bytes = vector_capacity_bytes(&outgoing)?;
+    let parent_counts_bytes = vector_capacity_bytes(&parent_counts)?;
+    budget.acquire_construction_bytes(add(
+        outgoing_bytes,
+        parent_counts_bytes,
+        Resource::ProgramBytes,
+    )?)?;
     let mut edge_count = 0_usize;
     for (parent, inst) in insts.iter().enumerate() {
         for child in epsilon_targets(inst) {
@@ -1220,6 +1332,8 @@ fn certify_program(
         add(states, 1, Resource::TemporaryStates)?,
         Resource::TemporaryStates,
     )?;
+    let offsets_bytes = vector_capacity_bytes(&offsets)?;
+    budget.acquire_construction_bytes(offsets_bytes)?;
     for index in 0..states {
         let next_index = add(index, 1, Resource::TemporaryStates)?;
         offsets[next_index] = add(
@@ -1233,6 +1347,8 @@ fn certify_program(
     let mut cursor = parent_counts;
     cursor.copy_from_slice(&offsets[..states]);
     let mut parents = zeroed_vec(edge_count, Resource::TemporaryStates)?;
+    let parents_bytes = vector_capacity_bytes(&parents)?;
+    budget.acquire_construction_bytes(parents_bytes)?;
     for (parent, inst) in insts.iter().enumerate() {
         for child in epsilon_targets(inst) {
             let slot = cursor[child];
@@ -1241,6 +1357,27 @@ fn certify_program(
             budget.charge(1)?;
         }
     }
+    drop(cursor);
+    budget.release_construction_bytes(parent_counts_bytes)?;
+    Ok(EpsilonParentIndex {
+        outgoing,
+        offsets,
+        parents,
+        scratch_bytes: add(offsets_bytes, parents_bytes, Resource::ProgramBytes)?,
+    })
+}
+
+fn certify_program(
+    insts: &[Inst],
+    budget: &mut CompileBudget,
+) -> Result<ProgramCertificate, Error> {
+    let states = insts.len();
+    let EpsilonParentIndex {
+        mut outgoing,
+        offsets,
+        parents,
+        scratch_bytes,
+    } = build_epsilon_parent_index(insts, budget)?;
     let mut queue = VecDeque::new();
     queue
         .try_reserve(states)
@@ -1248,12 +1385,20 @@ fn certify_program(
             resource: Resource::TemporaryStates,
             items: states,
         })?;
+    let queue_bytes = mul(
+        queue.capacity(),
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
+    budget.acquire_construction_bytes(queue_bytes)?;
     for (state, count) in outgoing.iter().enumerate() {
         if *count == 0 {
             queue.push_back(state);
         }
     }
     let mut order = reserved_vec(states, Resource::TemporaryStates)?;
+    let order_bytes = vector_capacity_bytes(&order)?;
+    budget.acquire_construction_bytes(order_bytes)?;
     while let Some(child) = queue.pop_front() {
         order.push(child);
         let next_child = add(child, 1, Resource::TemporaryStates)?;
@@ -1296,6 +1441,10 @@ fn certify_program(
             Resource::ExecutionWork,
         )?;
     }
+    drop(offsets);
+    drop(parents);
+    drop(queue);
+    budget.release_construction_bytes(add(scratch_bytes, queue_bytes, Resource::ProgramBytes)?)?;
     Ok(ProgramCertificate {
         epsilon_order: order,
         split_rank,
@@ -1367,6 +1516,21 @@ fn program_bytes(
         ranks,
         Resource::ProgramBytes,
     )
+}
+
+fn inst_vec_owned_bytes(insts: &Vec<Inst>) -> Result<usize, Error> {
+    let state_bytes = mul(
+        insts.capacity(),
+        core::mem::size_of::<Inst>(),
+        Resource::ProgramBytes,
+    )?;
+    insts.iter().try_fold(state_bytes, |total, inst| {
+        let scalar_bytes = match inst {
+            Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
+            _ => 0,
+        };
+        add(total, scalar_bytes, Resource::ProgramBytes)
+    })
 }
 
 fn finalize_program(
@@ -1495,6 +1659,14 @@ fn reserved_vec<T>(length: usize, resource: Resource) -> Result<Vec<T>, Error> {
             items: length,
         })?;
     Ok(values)
+}
+
+fn vector_capacity_bytes<T>(values: &Vec<T>) -> Result<usize, Error> {
+    mul(
+        values.capacity(),
+        core::mem::size_of::<T>(),
+        Resource::ProgramBytes,
+    )
 }
 
 fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {

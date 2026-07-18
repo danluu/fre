@@ -27,6 +27,11 @@ pub struct CompileAccounting {
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
+    /// Exact maximum logical bytes simultaneously owned by compilation.
+    /// This includes observed vector capacities, deeply owned scalar ranges,
+    /// retained required-suffix storage, and phase-local validation,
+    /// repetition-product, and certification scratch.
+    pub construction_peak_bytes: usize,
     /// Exact work to evaluate every state once at one input boundary,
     /// including each state's worst-case transition checks.
     pub execution_state_work: usize,
