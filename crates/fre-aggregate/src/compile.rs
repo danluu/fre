@@ -78,8 +78,8 @@ pub struct CompiledRegex {
 /// retains the dense continuation route.
 #[derive(Debug, Default)]
 pub(crate) struct RequiredSuffixes {
-    bytes: Vec<u8>,
-    ends: Vec<usize>,
+    bytes: Box<[u8]>,
+    ends: Box<[usize]>,
 }
 
 impl RequiredSuffixes {
@@ -98,9 +98,9 @@ impl RequiredSuffixes {
 
     fn retained_bytes(&self) -> Result<usize, Error> {
         add(
-            self.bytes.capacity(),
+            self.bytes.len(),
             mul(
-                self.ends.capacity(),
+                self.ends.len(),
                 core::mem::size_of::<usize>(),
                 Resource::ProgramBytes,
             )?,
@@ -168,7 +168,6 @@ impl CompiledRegex {
         )?;
         let certificate = certify_program(
             &insts,
-            insts.capacity(),
             scalar_range_bytes,
             retained_program_bytes,
             &mut budget,
@@ -179,9 +178,9 @@ impl CompiledRegex {
         let program_bytes = add(
             program_bytes(
                 &insts,
-                insts.capacity(),
-                certificate.epsilon_order.capacity(),
-                certificate.split_rank.capacity(),
+                insts.len(),
+                certificate.epsilon_order.len(),
+                certificate.split_rank.len(),
             )?,
             retained_program_bytes,
             Resource::ProgramBytes,
@@ -589,20 +588,6 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
     if ends.try_reserve_exact(suffix_count).is_err() {
         return Ok(RequiredSuffixes::default());
     }
-    let retained_program_bytes = add(
-        bytes.capacity(),
-        mul(
-            ends.capacity(),
-            core::mem::size_of::<usize>(),
-            Resource::ProgramBytes,
-        )?,
-        Resource::ProgramBytes,
-    )?;
-    enforce(
-        retained_program_bytes,
-        budget.limits.max_program_bytes,
-        Resource::ProgramBytes,
-    )?;
     match analysis {
         SuffixAnalysis::Literals(literals) => {
             for literal in literals.iter() {
@@ -622,7 +607,10 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
             ));
         }
     }
-    Ok(RequiredSuffixes { bytes, ends })
+    Ok(RequiredSuffixes {
+        bytes: bytes.into_boxed_slice(),
+        ends: ends.into_boxed_slice(),
+    })
 }
 
 fn analyze_required_suffixes<'a>(
@@ -1062,11 +1050,11 @@ impl<'a> Builder<'a> {
         self.enforce_program_shape(states, scalar_range_bytes)
     }
 
-    fn finish(self) -> Result<Vec<Inst>, Error> {
+    fn finish(self) -> Result<Box<[Inst]>, Error> {
         if self.slots.iter().any(|inst| matches!(inst, Inst::Unfilled)) {
             return Err(Error::InternalInvariant("unfilled compiler state"));
         }
-        Ok(self.slots)
+        Ok(self.slots.into_boxed_slice())
     }
 
     fn compile_node(
@@ -1428,8 +1416,8 @@ fn translate_progress(
 }
 
 struct ProgramCertificate {
-    epsilon_order: Vec<usize>,
-    split_rank: Vec<usize>,
+    epsilon_order: Box<[usize]>,
+    split_rank: Box<[usize]>,
     split_count: usize,
     execution_state_work: usize,
     has_scalar_transition: bool,
@@ -1445,14 +1433,13 @@ struct EpsilonParentIndex {
 
 fn certify_program(
     insts: &[Inst],
-    state_capacity: usize,
     scalar_range_bytes: usize,
     retained_program_bytes: usize,
     budget: &mut CompileBudget,
 ) -> Result<ProgramCertificate, Error> {
     let states = insts.len();
     preflight_certification_program_bytes(
-        state_capacity,
+        states,
         states,
         scalar_range_bytes,
         retained_program_bytes,
@@ -1605,8 +1592,8 @@ fn certify_program_admitted(
     drop(queue);
     budget.release_construction_bytes(add(scratch_bytes, queue_bytes, Resource::ProgramBytes)?)?;
     Ok(ProgramCertificate {
-        epsilon_order: order,
-        split_rank,
+        epsilon_order: order.into_boxed_slice(),
+        split_rank: split_rank.into_boxed_slice(),
         split_count,
         execution_state_work,
         has_scalar_transition,
@@ -1615,14 +1602,14 @@ fn certify_program_admitted(
 }
 
 fn preflight_certification_program_bytes(
-    state_capacity: usize,
+    retained_state_count: usize,
     states: usize,
     scalar_range_bytes: usize,
     retained_program_bytes: usize,
     limit: usize,
 ) -> Result<usize, Error> {
     let state_bytes = mul(
-        state_capacity,
+        retained_state_count,
         core::mem::size_of::<Inst>(),
         Resource::ProgramBytes,
     )?;
@@ -1682,12 +1669,12 @@ fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
 
 fn program_bytes(
     insts: &[Inst],
-    inst_capacity: usize,
-    order: usize,
-    ranks: usize,
+    retained_inst_count: usize,
+    retained_order_count: usize,
+    retained_rank_count: usize,
 ) -> Result<usize, Error> {
     let state_bytes = mul(
-        inst_capacity,
+        retained_inst_count,
         core::mem::size_of::<Inst>(),
         Resource::ProgramBytes,
     )?;
@@ -1699,8 +1686,16 @@ fn program_bytes(
         add(total, bytes, Resource::ProgramBytes)
     })?;
     let insts = add(state_bytes, scalar_bytes, Resource::ProgramBytes)?;
-    let order = mul(order, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
-    let ranks = mul(ranks, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
+    let order = mul(
+        retained_order_count,
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
+    let ranks = mul(
+        retained_rank_count,
+        core::mem::size_of::<usize>(),
+        Resource::ProgramBytes,
+    )?;
     add(
         add(insts, order, Resource::ProgramBytes)?,
         ranks,
@@ -2160,7 +2155,7 @@ mod tests {
             max_program_bytes: exact_limit,
             ..CompileLimits::default()
         });
-        {
+        let exact_insts = {
             let mut builder = Builder::new(
                 CompileLimits::default().max_program_states,
                 RustByteProfile::PINNED_1_12_4,
@@ -2170,7 +2165,13 @@ mod tests {
             );
             assert_eq!(builder.slots.capacity(), 0);
             builder.push(Inst::Match).unwrap();
-        }
+            builder.finish().unwrap()
+        };
+        assert_eq!(exact_insts.len(), 1);
+        assert_eq!(
+            core::mem::size_of_val(exact_insts.as_ref()),
+            core::mem::size_of::<Inst>()
+        );
         assert_eq!(exact.accounting.work, 1);
         assert_eq!(exact.current_temporary_states, 1);
 
@@ -2200,26 +2201,38 @@ mod tests {
         assert_eq!(one_below.accounting.work, 0);
         assert_eq!(one_below.current_temporary_states, 0);
 
-        let insts = vec![Inst::Match];
+        let insts = vec![Inst::Match].into_boxed_slice();
         let certificate_limit = preflight_certification_program_bytes(
-            insts.capacity(),
+            insts.len(),
             insts.len(),
             0,
             retained_bytes,
             usize::MAX,
         )
         .unwrap();
+        let mut certificate_exact = CompileBudget::new(CompileLimits {
+            max_program_bytes: certificate_limit,
+            ..CompileLimits::default()
+        });
+        let certificate =
+            certify_program(&insts, 0, retained_bytes, &mut certificate_exact).unwrap();
+        assert_eq!(certificate.epsilon_order.len(), insts.len());
+        assert_eq!(certificate.split_rank.len(), insts.len());
+        assert_eq!(
+            core::mem::size_of_val(certificate.epsilon_order.as_ref()),
+            core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::size_of_val(certificate.split_rank.as_ref()),
+            core::mem::size_of::<usize>()
+        );
         let mut certificate_one_below = CompileBudget::new(CompileLimits {
             max_program_bytes: certificate_limit - 1,
             ..CompileLimits::default()
         });
-        let Err(certificate_error) = certify_program(
-            &insts,
-            insts.capacity(),
-            0,
-            retained_bytes,
-            &mut certificate_one_below,
-        ) else {
+        let Err(certificate_error) =
+            certify_program(&insts, 0, retained_bytes, &mut certificate_one_below)
+        else {
             panic!("one-below certificate admission must refuse");
         };
         assert_eq!(

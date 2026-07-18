@@ -545,10 +545,10 @@ pub(crate) enum Inst {
 
 #[derive(Debug)]
 pub(crate) struct Program {
-    pub(crate) insts: Vec<Inst>,
+    pub(crate) insts: Box<[Inst]>,
     pub(crate) entry: usize,
-    pub(crate) epsilon_order: Vec<usize>,
-    pub(crate) split_rank: Vec<usize>,
+    pub(crate) epsilon_order: Box<[usize]>,
+    pub(crate) split_rank: Box<[usize]>,
     pub(crate) split_count: usize,
     pub(crate) execution_state_work: usize,
     pub(crate) has_scalar_transition: bool,
