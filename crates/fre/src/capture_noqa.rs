@@ -639,6 +639,17 @@ impl NoqaPlan {
             reduce_line(self.variant, line, &mut actual)
         })?;
         actual.line_traversal_bytes = traversal_bytes;
+        actual.work = checked_sum(&[
+            actual.census_bytes,
+            actual.line_traversal_bytes,
+            actual.lines,
+            mul(actual.candidate_positions, 2)?,
+            mul(actual.literal_candidates, 6)?,
+            actual.route_work,
+        ])?;
+        if actual.work > bounds.work {
+            return Err(NoqaRunError::Overflow);
+        }
         let capture_count = actual.capture_count;
         Ok(NoqaRunOutcome {
             capture_count,
@@ -771,6 +782,11 @@ pub struct NoqaActualCounters {
     pub line_traversal_bytes: usize,
     /// Lines visited.
     pub lines: usize,
+    /// Charged suffix, code-token, and leading-whitespace route work.
+    pub route_work: usize,
+    /// Complete charged work covering both line passes, per-line reduction,
+    /// literal/case checks, route work, and candidate control.
+    pub work: usize,
     /// Literal-scan positions visited.
     pub candidate_positions: usize,
     /// Exact `# ` occurrences examined.
@@ -860,8 +876,9 @@ fn upper_bounds(
     // The census and delimiter traversal each read exactly N bytes. Manual
     // literal scan: <=2B byte checks. Case checks: <=4C. The
     // remaining route-specific replay bounds are ASCII-leading <=5B,
-    // ASCII-no-leading <=3B, and Unicode-leading <=9B. Reducer/control is
-    // <=2C+2. Sequential accounting charges the corresponding byte visits.
+    // ASCII-no-leading <=3B, and Unicode-leading <=9B. Mandatory per-line
+    // reduction is L and remaining reducer/control is <=2C+2. Sequential
+    // accounting charges the corresponding byte visits.
     let (work_bytes_factor, sequential_bytes_factor) = match variant {
         NoqaVariant::AsciiLeading => (7, 4),
         NoqaVariant::AsciiNoLeading => (5, 3),
@@ -872,6 +889,7 @@ fn upper_bounds(
         line_pass_bytes,
         mul(census.bytes, work_bytes_factor)?,
         mul(candidates, 6)?,
+        census.lines,
         2,
     ])?;
     let sequential_bytes = checked_sum(&[
@@ -955,11 +973,20 @@ fn reduce_line(
             scan = add(scan, 1)?;
             continue;
         };
-        let (end, coded) = noqa_end(line, base_end, variant.unicode_space())?;
+        let (end, coded) = noqa_end(
+            line,
+            base_end,
+            variant.unicode_space(),
+            &mut actual.route_work,
+        )?;
         let start = match variant {
             NoqaVariant::AsciiNoLeading => scan,
-            NoqaVariant::AsciiLeading => leading_ascii_start(line, scan, cursor)?,
-            NoqaVariant::UnicodeLeading => leading_unicode_start(line, scan, cursor)?,
+            NoqaVariant::AsciiLeading => {
+                leading_ascii_start(line, scan, cursor, &mut actual.route_work)?
+            }
+            NoqaVariant::UnicodeLeading => {
+                leading_unicode_start(line, scan, cursor, &mut actual.route_work)?
+            }
         };
         if start < cursor {
             return Err(NoqaRunError::Overflow);
@@ -997,33 +1024,45 @@ fn noqa_end(
     line: &[u8],
     base_end: usize,
     unicode_space: bool,
+    route_work: &mut usize,
 ) -> Result<(usize, bool), NoqaRunError> {
+    charge_route(route_work, 1)?;
     if line.get(base_end) != Some(&b':') {
         return Ok((base_end, false));
     }
     let mut code_start = add(base_end, 1)?;
-    if let Some(width) = space_forward(line, code_start, unicode_space) {
+    if let Some(width) = space_forward(line, code_start, unicode_space, route_work)? {
         code_start = add(code_start, width)?;
     }
-    Ok(parse_codes(line, code_start, unicode_space)?.map_or((base_end, false), |end| (end, true)))
+    Ok(parse_codes(line, code_start, unicode_space, route_work)?
+        .map_or((base_end, false), |end| (end, true)))
 }
 
 fn parse_codes(
     line: &[u8],
     mut cursor: usize,
     unicode_space: bool,
+    route_work: &mut usize,
 ) -> Result<Option<usize>, NoqaRunError> {
     let mut committed = None;
     loop {
         let uppercase_start = cursor;
-        while line.get(cursor).is_some_and(u8::is_ascii_uppercase) {
+        loop {
+            charge_route(route_work, 1)?;
+            if !line.get(cursor).is_some_and(u8::is_ascii_uppercase) {
+                break;
+            }
             cursor = add(cursor, 1)?;
         }
         if cursor == uppercase_start {
             break;
         }
         let digit_start = cursor;
-        while line.get(cursor).is_some_and(u8::is_ascii_digit) {
+        loop {
+            charge_route(route_work, 1)?;
+            if !line.get(cursor).is_some_and(u8::is_ascii_digit) {
+                break;
+            }
             cursor = add(cursor, 1)?;
         }
         if cursor == digit_start {
@@ -1031,12 +1070,13 @@ fn parse_codes(
         }
         committed = Some(cursor);
         loop {
+            charge_route(route_work, 1)?;
             if line.get(cursor) == Some(&b',') {
                 cursor = add(cursor, 1)?;
                 committed = Some(cursor);
                 continue;
             }
-            let Some(width) = space_forward(line, cursor, unicode_space) else {
+            let Some(width) = space_forward(line, cursor, unicode_space, route_work)? else {
                 break;
             };
             cursor = add(cursor, width)?;
@@ -1050,9 +1090,11 @@ fn leading_ascii_start(
     line: &[u8],
     mut cursor: usize,
     floor: usize,
+    route_work: &mut usize,
 ) -> Result<usize, NoqaRunError> {
     while cursor > floor {
         let previous = cursor.checked_sub(1).ok_or(NoqaRunError::Overflow)?;
+        charge_route(route_work, 1)?;
         if !is_ascii_space(line[previous]) {
             break;
         }
@@ -1065,9 +1107,10 @@ fn leading_unicode_start(
     line: &[u8],
     mut cursor: usize,
     floor: usize,
+    route_work: &mut usize,
 ) -> Result<usize, NoqaRunError> {
     while cursor > floor {
-        let Some(width) = unicode_space_backward(line, cursor, floor) else {
+        let Some(width) = unicode_space_backward(line, cursor, floor, route_work)? else {
             break;
         };
         cursor = cursor.checked_sub(width).ok_or(NoqaRunError::Overflow)?;
@@ -1079,49 +1122,77 @@ const fn is_ascii_space(byte: u8) -> bool {
     matches!(byte, b'\t'..=b'\r' | b' ')
 }
 
-fn space_forward(input: &[u8], start: usize, unicode: bool) -> Option<usize> {
-    let first = *input.get(start)?;
+fn space_forward(
+    input: &[u8],
+    start: usize,
+    unicode: bool,
+    route_work: &mut usize,
+) -> Result<Option<usize>, NoqaRunError> {
+    charge_route(route_work, 1)?;
+    let Some(&first) = input.get(start) else {
+        return Ok(None);
+    };
     if is_ascii_space(first) {
-        return Some(1);
+        return Ok(Some(1));
     }
     if !unicode {
-        return None;
+        return Ok(None);
     }
-    match input.get(start..) {
-        Some([0xC2, 0x85 | 0xA0, ..]) => Some(2),
-        Some(
-            [0xE1, 0x9A, 0x80, ..]
-            | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF, ..]
-            | [0xE2, 0x81, 0x9F, ..]
-            | [0xE3, 0x80, 0x80, ..],
-        ) => Some(3),
+    let remaining = input.get(start..).ok_or(NoqaRunError::Overflow)?;
+    charge_route(route_work, remaining.len().min(3).saturating_sub(1))?;
+    Ok(match remaining {
+        [0xC2, 0x85 | 0xA0, ..] => Some(2),
+        [0xE1, 0x9A, 0x80, ..]
+        | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF, ..]
+        | [0xE2, 0x81, 0x9F, ..]
+        | [0xE3, 0x80, 0x80, ..] => Some(3),
         _ => None,
-    }
+    })
 }
 
-fn unicode_space_backward(input: &[u8], end: usize, floor: usize) -> Option<usize> {
-    let distance = end.checked_sub(floor)?;
-    let previous = end.checked_sub(1)?;
-    if distance >= 1 && is_ascii_space(*input.get(previous)?) {
-        return Some(1);
+fn unicode_space_backward(
+    input: &[u8],
+    end: usize,
+    floor: usize,
+    route_work: &mut usize,
+) -> Result<Option<usize>, NoqaRunError> {
+    let distance = end.checked_sub(floor).ok_or(NoqaRunError::Overflow)?;
+    if distance >= 1 {
+        let previous = end.checked_sub(1).ok_or(NoqaRunError::Overflow)?;
+        charge_route(route_work, 1)?;
+        if is_ascii_space(*input.get(previous).ok_or(NoqaRunError::Overflow)?) {
+            return Ok(Some(1));
+        }
     }
-    let two_start = end.checked_sub(2)?;
-    if distance >= 2 && matches!(input.get(two_start..end)?, [0xC2, 0x85 | 0xA0]) {
-        return Some(2);
+    if distance >= 2 {
+        let two_start = end.checked_sub(2).ok_or(NoqaRunError::Overflow)?;
+        charge_route(route_work, 2)?;
+        if matches!(
+            input.get(two_start..end).ok_or(NoqaRunError::Overflow)?,
+            [0xC2, 0x85 | 0xA0]
+        ) {
+            return Ok(Some(2));
+        }
     }
-    let three_start = end.checked_sub(3)?;
-    if distance >= 3
-        && matches!(
-            input.get(three_start..end)?,
+    if distance >= 3 {
+        let three_start = end.checked_sub(3).ok_or(NoqaRunError::Overflow)?;
+        charge_route(route_work, 3)?;
+        if matches!(
+            input.get(three_start..end).ok_or(NoqaRunError::Overflow)?,
             [0xE1, 0x9A, 0x80]
                 | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF]
                 | [0xE2, 0x81, 0x9F]
                 | [0xE3, 0x80, 0x80]
-        )
-    {
-        return Some(3);
+        ) {
+            return Ok(Some(3));
+        }
     }
-    None
+    Ok(None)
+}
+
+fn charge_route(work: &mut usize, amount: usize) -> Result<(), NoqaRunError> {
+    *work = add(*work, amount)?;
+    Ok(())
 }
 
 fn require(resource: NoqaResource, required: usize, limit: usize) -> Result<(), NoqaRunError> {
@@ -1529,6 +1600,17 @@ mod tests {
         assert!(actual.report.actual.capture_count <= actual.report.bounds.capture_count);
         assert!(actual.report.actual.capture_events <= actual.report.bounds.capture_events);
         assert!(actual.report.actual.literal_candidates <= actual.report.bounds.literal_candidates);
+        assert!(actual.report.actual.work <= actual.report.bounds.work);
+    }
+
+    fn parse_codes_for_test(input: &[u8], start: usize, unicode: bool) -> Option<usize> {
+        let mut route_work = 0;
+        parse_codes(input, start, unicode, &mut route_work).expect("indices fit")
+    }
+
+    fn noqa_end_for_test(input: &[u8], base_end: usize, unicode: bool) -> (usize, bool) {
+        let mut route_work = 0;
+        noqa_end(input, base_end, unicode, &mut route_work).expect("indices fit")
     }
 
     #[test]
@@ -1663,47 +1745,63 @@ mod tests {
 
     #[test]
     fn delimiter_only_line_passes_are_cumulative_and_exact() {
-        let regex = regex(WILD, true);
-        for (haystack, expected_line_bytes, expected_lines) in [
-            (b"\n\n".as_slice(), 0_usize, 2_usize),
-            (b"\r\n".as_slice(), 0_usize, 1_usize),
-            (b"\xFF\r\n\x80".as_slice(), 2_usize, 2_usize),
-        ] {
-            let admitted = regex
-                .count_captures(haystack, NoqaRunLimits::default())
-                .expect("delimiter-only fixture fits");
-            let bounds = admitted.report.bounds;
-            assert_eq!(bounds.haystack_bytes, haystack.len());
-            assert_eq!(bounds.line_bytes, expected_line_bytes);
-            assert_eq!(bounds.lines, expected_lines);
-            if expected_line_bytes == 0 {
-                assert_eq!(bounds.sequential_bytes, haystack.len() * 2);
-            }
-            assert_eq!(admitted.report.actual.census_bytes, haystack.len());
-            assert_eq!(admitted.report.actual.line_traversal_bytes, haystack.len());
+        for (pattern, unicode) in [(REAL, false), (TWEAKED, false), (WILD, true)] {
+            let regex = regex(pattern, unicode);
+            for (haystack, expected_line_bytes, expected_lines) in [
+                (b"\n\n\n".as_slice(), 0_usize, 3_usize),
+                (b"\r\n\r\n\r\n".as_slice(), 0_usize, 3_usize),
+                (b"\n\n\n\n".as_slice(), 0_usize, 4_usize),
+                (b"\xFF\r\n\x80".as_slice(), 2_usize, 2_usize),
+            ] {
+                let admitted = regex
+                    .count_captures(haystack, NoqaRunLimits::default())
+                    .expect("delimiter-only fixture fits");
+                let bounds = admitted.report.bounds;
+                assert_eq!(bounds.haystack_bytes, haystack.len());
+                assert_eq!(bounds.line_bytes, expected_line_bytes);
+                assert_eq!(bounds.lines, expected_lines);
+                if expected_line_bytes == 0 {
+                    assert_eq!(bounds.sequential_bytes, haystack.len() * 2);
+                    assert_eq!(bounds.work, haystack.len() * 2 + expected_lines + 2);
+                    assert_eq!(
+                        admitted.report.actual.work,
+                        haystack.len() * 2 + expected_lines
+                    );
+                }
+                assert_eq!(admitted.report.actual.census_bytes, haystack.len());
+                assert_eq!(admitted.report.actual.line_traversal_bytes, haystack.len());
+                assert!(admitted.report.actual.work <= bounds.work);
 
-            let exact = NoqaRunLimits {
-                max_sequential_bytes: bounds.sequential_bytes,
-                ..NoqaRunLimits::default()
-            };
-            regex
-                .count_captures(haystack, exact)
-                .expect("exact cumulative sequential limit admits");
-            let one_below = bounds.sequential_bytes - 1;
-            assert_eq!(
-                regex.count_captures(
-                    haystack,
-                    NoqaRunLimits {
-                        max_sequential_bytes: one_below,
-                        ..NoqaRunLimits::default()
-                    },
-                ),
-                Err(NoqaRunError::Resource {
-                    resource: NoqaResource::SequentialBytes,
-                    required: bounds.sequential_bytes,
-                    limit: one_below,
-                })
-            );
+                for (resource, required) in [
+                    (NoqaResource::Work, bounds.work),
+                    (NoqaResource::SequentialBytes, bounds.sequential_bytes),
+                ] {
+                    let mut exact = NoqaRunLimits::default();
+                    let mut one_below = NoqaRunLimits::default();
+                    match resource {
+                        NoqaResource::Work => {
+                            exact.max_work = required;
+                            one_below.max_work = required - 1;
+                        }
+                        NoqaResource::SequentialBytes => {
+                            exact.max_sequential_bytes = required;
+                            one_below.max_sequential_bytes = required - 1;
+                        }
+                        NoqaResource::CaptureEvents | NoqaResource::CaptureCount => unreachable!(),
+                    }
+                    regex
+                        .count_captures(haystack, exact)
+                        .expect("exact delimiter-only limit admits");
+                    assert_eq!(
+                        regex.count_captures(haystack, one_below),
+                        Err(NoqaRunError::Resource {
+                            resource,
+                            required,
+                            limit: required - 1,
+                        })
+                    );
+                }
+            }
         }
     }
 
@@ -1727,22 +1825,10 @@ mod tests {
 
     #[test]
     fn suffix_commit_retains_separators_but_rolls_back_failed_token() {
-        assert_eq!(
-            parse_codes(b"A1, FOO", 0, false).expect("indices fit"),
-            Some(4)
-        );
-        assert_eq!(
-            parse_codes(b"A1FOO", 0, false).expect("indices fit"),
-            Some(2)
-        );
-        assert_eq!(
-            noqa_end(b"# noqa: FOO", 6, false).expect("indices fit"),
-            (6, false)
-        );
-        assert_eq!(
-            noqa_end(b"# noqa: A1, FOO", 6, false).expect("indices fit"),
-            (12, true)
-        );
+        assert_eq!(parse_codes_for_test(b"A1, FOO", 0, false), Some(4));
+        assert_eq!(parse_codes_for_test(b"A1FOO", 0, false), Some(2));
+        assert_eq!(noqa_end_for_test(b"# noqa: FOO", 6, false), (6, false));
+        assert_eq!(noqa_end_for_test(b"# noqa: A1, FOO", 6, false), (12, true));
     }
 
     #[test]
@@ -1808,7 +1894,7 @@ mod tests {
                 line_bytes: 31_623_613,
                 lines: 890_906,
                 literal_candidates: 15_811_806,
-                work: 507_759_633,
+                work: 508_650_539,
                 sequential_bytes: 381_265_180,
                 capture_events: 79_949_936,
                 capture_count: 79_059_030,
@@ -1817,6 +1903,7 @@ mod tests {
         let bounds = outcome.report.bounds;
         assert_eq!(outcome.report.actual.census_bytes, haystack.len());
         assert_eq!(outcome.report.actual.line_traversal_bytes, haystack.len());
+        assert!(outcome.report.actual.work <= bounds.work);
         regex
             .count_captures(
                 &haystack,
