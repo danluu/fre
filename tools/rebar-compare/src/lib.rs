@@ -22,7 +22,8 @@ use fre::{
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCaptureSemantics,
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
-    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
+    AggregateExecutionSource,
     AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
     AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
@@ -48,8 +49,9 @@ use fre::{
     LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
     LineCaptureRunLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
-    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    LiteralReplacementErrorSource, LiteralReplacementLimits, NoqaBuildError, NoqaBuildLimits,
+    NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
@@ -155,7 +157,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8-regex-redux-composite-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -489,10 +491,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus five exact-HIR allocation-free configured line-stream plans, including Unicode-off anchored ASCII separated fields, with distinct immutable identities and a same-parse bounded required-any-literal DFA that prunes impossible LF-framed lines before unchanged selector/replay; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus five exact-HIR allocation-free configured line-stream plans, including Unicode-off anchored ASCII separated fields, with distinct immutable identities and a same-parse bounded required-any-literal DFA that prunes impossible LF-framed lines before unchanged selector/replay; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and prune impossible lines through a bounded DFA before unchanged exact selector/replay; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and prune impossible lines through a bounded DFA before unchanged exact selector/replay; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -2921,6 +2923,1111 @@ fn charge(value: &mut u64, amount: u64, limit: u64, what: &str) -> Result<(), Ex
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompositeStage {
+    Count {
+        pattern: &'static str,
+        output: usize,
+    },
+    ReplaceAllLiteral {
+        pattern: &'static str,
+        replacement: &'static [u8],
+        minimum_match_bytes: usize,
+        records_clean_length: bool,
+    },
+}
+
+const REGEX_REDUX_VARIANTS: [&str; 9] = [
+    r"agggtaaa|tttaccct",
+    r"[cgt]gggtaaa|tttaccc[acg]",
+    r"a[act]ggtaaa|tttacc[agt]t",
+    r"ag[act]gtaaa|tttac[agt]ct",
+    r"agg[act]taaa|ttta[agt]cct",
+    r"aggg[acg]aaa|ttt[cgt]ccct",
+    r"agggt[cgt]aa|tt[acg]accct",
+    r"agggta[cgt]a|t[acg]taccct",
+    r"agggtaa[cgt]|[acg]ttaccct",
+];
+
+const REGEX_REDUX_STAGES: [CompositeStage; 15] = [
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r">[^\n]*\n|\n",
+        replacement: b"",
+        minimum_match_bytes: 1,
+        records_clean_length: true,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[0],
+        output: 0,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[1],
+        output: 1,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[2],
+        output: 2,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[3],
+        output: 3,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[4],
+        output: 4,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[5],
+        output: 5,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[6],
+        output: 6,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[7],
+        output: 7,
+    },
+    CompositeStage::Count {
+        pattern: REGEX_REDUX_VARIANTS[8],
+        output: 8,
+    },
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r"tHa[Nt]",
+        replacement: b"<4>",
+        minimum_match_bytes: 4,
+        records_clean_length: false,
+    },
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r"aND|caN|Ha[DS]|WaS",
+        replacement: b"<3>",
+        minimum_match_bytes: 3,
+        records_clean_length: false,
+    },
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r"a[NSt]|BY",
+        replacement: b"<2>",
+        minimum_match_bytes: 2,
+        records_clean_length: false,
+    },
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r"<[^>]*>",
+        replacement: b"|",
+        minimum_match_bytes: 2,
+        records_clean_length: false,
+    },
+    CompositeStage::ReplaceAllLiteral {
+        pattern: r"\|[^|][^|]*\|",
+        replacement: b"-",
+        minimum_match_bytes: 3,
+        records_clean_length: false,
+    },
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompositeLimits {
+    stages: usize,
+    pattern_bytes: usize,
+    replacement_bytes: usize,
+    input_bytes: usize,
+    intermediate_bytes: usize,
+    build_work: u64,
+    execution_work: u64,
+    match_events: u64,
+    span_visits: u64,
+    copied_bytes: u64,
+    allocation_bytes: u64,
+    owned_peak_bytes: usize,
+    report_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompositeAccounting {
+    stages: usize,
+    pattern_bytes: usize,
+    replacement_bytes: usize,
+    build_work: u64,
+    execution_work: u64,
+    match_events: u64,
+    span_visits: u64,
+    copied_bytes: u64,
+    allocation_bytes: u64,
+    max_intermediate_bytes: usize,
+    owned_peak_bytes: usize,
+    report_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompositeResult {
+    counts: [u64; 9],
+    input_length: usize,
+    clean_length: usize,
+    final_bytes: Vec<u8>,
+    report: String,
+    accounting: CompositeAccounting,
+}
+
+fn composite_checked_add(left: u64, right: u64, dimension: &str) -> Result<u64, ExecutionError> {
+    left.checked_add(right)
+        .ok_or_else(|| ExecutionError::fault(format!("regex-redux {dimension} overflow")))
+}
+
+fn composite_usize_add(
+    left: usize,
+    right: usize,
+    dimension: &str,
+) -> Result<usize, ExecutionError> {
+    left.checked_add(right)
+        .ok_or_else(|| ExecutionError::fault(format!("regex-redux {dimension} overflow")))
+}
+
+fn composite_usize_mul(
+    left: usize,
+    right: usize,
+    dimension: &str,
+) -> Result<usize, ExecutionError> {
+    left.checked_mul(right)
+        .ok_or_else(|| ExecutionError::fault(format!("regex-redux {dimension} overflow")))
+}
+
+fn composite_u64(value: usize, dimension: &str) -> Result<u64, ExecutionError> {
+    u64::try_from(value)
+        .map_err(|_| ExecutionError::fault(format!("regex-redux {dimension} does not fit u64")))
+}
+
+fn composite_enforce(needed: u64, limit: u64, dimension: &str) -> Result<(), ExecutionError> {
+    if needed > limit {
+        return Err(ExecutionError::unsupported(format!(
+            "regex-redux {dimension} needs {needed}, exceeding {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn composite_limits(limits: &RunLimits) -> Result<CompositeLimits, ExecutionError> {
+    let stage_build = limits
+        .fre_aggregate_compile_work
+        .max(usize::try_from(limits.fre_literal_build_work).unwrap_or(usize::MAX));
+    let build_work = composite_u64(
+        composite_usize_mul(REGEX_REDUX_STAGES.len(), stage_build, "build ceiling")?,
+        "build ceiling",
+    )?;
+    let execution_work = composite_u64(
+        composite_usize_mul(
+            REGEX_REDUX_STAGES.len(),
+            limits.fre_aggregate_operation_work,
+            "execution ceiling",
+        )?,
+        "execution ceiling",
+    )?;
+    let replacement_stages = REGEX_REDUX_STAGES
+        .iter()
+        .filter(|stage| matches!(stage, CompositeStage::ReplaceAllLiteral { .. }))
+        .count();
+    let pipeline_copies = replacement_stages
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("regex-redux copy count overflow"))?;
+    let copied_bytes = composite_u64(
+        composite_usize_mul(limits.haystack_bytes, pipeline_copies, "copy ceiling")?,
+        "copy ceiling",
+    )?;
+    let allocation_bytes = composite_u64(
+        composite_usize_mul(limits.haystack_bytes, 32, "allocation ceiling")?,
+        "allocation ceiling",
+    )?;
+    let owned_peak_bytes = [
+        composite_usize_mul(limits.haystack_bytes, 3, "owned input/output peak")?,
+        limits.fre_aggregate_peak_bytes,
+        limits.fre_aggregate_program_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |sum, term| {
+        composite_usize_add(sum, term, "owned peak ceiling")
+    })?;
+    Ok(CompositeLimits {
+        stages: REGEX_REDUX_STAGES.len(),
+        pattern_bytes: limits.pattern_bytes_per_job,
+        replacement_bytes: limits.pattern_bytes_per_job,
+        input_bytes: limits.haystack_bytes,
+        intermediate_bytes: limits.haystack_bytes,
+        build_work,
+        execution_work: composite_checked_add(
+            composite_checked_add(execution_work, copied_bytes, "execution plus copy ceiling")?,
+            composite_checked_add(
+                composite_u64(limits.haystack_bytes, "validation ceiling")?,
+                limits.reducer_steps.saturating_mul(2),
+                "validation plus span ceiling",
+            )?,
+            "execution plus copy ceiling",
+        )?,
+        match_events: limits.reducer_steps,
+        span_visits: limits.reducer_steps.saturating_mul(2),
+        copied_bytes,
+        allocation_bytes,
+        owned_peak_bytes,
+        report_bytes: limits.pattern_bytes_per_job,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompositeProspective {
+    pattern_bytes: usize,
+    replacement_bytes: usize,
+    sequence_bytes: usize,
+    copied_bytes: usize,
+    allocation_bytes: usize,
+    span_visits: usize,
+    match_events: usize,
+    owned_peak_bytes: usize,
+    declared_build_work: u64,
+    declared_execution_work: u64,
+    report_bytes: usize,
+}
+
+fn preflight_replacement_stage(
+    prospective: &mut CompositeProspective,
+    replacement: &[u8],
+    minimum_match_bytes: usize,
+    run_limits: &RunLimits,
+) -> Result<(), ExecutionError> {
+    if minimum_match_bytes == 0 {
+        return Err(ExecutionError::unsupported(
+            "regex-redux replacement stage is nullable",
+        ));
+    }
+    prospective.replacement_bytes = composite_usize_add(
+        prospective.replacement_bytes,
+        replacement.len(),
+        "replacement bytes",
+    )?;
+    let old_sequence = prospective.sequence_bytes;
+    let matches = old_sequence
+        .checked_div(minimum_match_bytes)
+        .ok_or_else(|| ExecutionError::fault("regex-redux minimum match width is zero"))?;
+    prospective.match_events = composite_usize_add(
+        prospective.match_events,
+        matches,
+        "replacement match events",
+    )?;
+    let inserted = composite_usize_mul(matches, replacement.len(), "inserted bytes")?;
+    prospective.sequence_bytes = composite_usize_add(old_sequence, inserted, "intermediate bytes")?;
+    prospective.copied_bytes = composite_usize_add(
+        prospective.copied_bytes,
+        prospective.sequence_bytes,
+        "copy bytes",
+    )?;
+    prospective.span_visits = composite_usize_add(
+        prospective.span_visits,
+        composite_usize_mul(matches, 2, "span visits")?,
+        "span visits",
+    )?;
+    let span_bytes = composite_usize_mul(
+        matches,
+        core::mem::size_of::<fre::AggregateSpan>(),
+        "selector span bytes",
+    )?;
+    prospective.allocation_bytes = composite_usize_add(
+        prospective.allocation_bytes,
+        composite_usize_add(prospective.sequence_bytes, span_bytes, "stage allocation")?,
+        "allocation bytes",
+    )?;
+    let live = [
+        old_sequence,
+        run_limits.fre_aggregate_program_bytes,
+        run_limits.fre_aggregate_peak_bytes,
+        prospective.sequence_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |sum, term| {
+        composite_usize_add(sum, term, "owned peak bytes")
+    })?;
+    prospective.owned_peak_bytes = prospective.owned_peak_bytes.max(live);
+    Ok(())
+}
+
+fn composite_prospective(
+    input_len: usize,
+    stages: &[CompositeStage],
+    run_limits: &RunLimits,
+) -> Result<CompositeProspective, ExecutionError> {
+    let stage_build = run_limits
+        .fre_aggregate_compile_work
+        .max(usize::try_from(run_limits.fre_literal_build_work).unwrap_or(usize::MAX));
+    let mut prospective = CompositeProspective {
+        sequence_bytes: input_len,
+        copied_bytes: input_len,
+        allocation_bytes: input_len,
+        owned_peak_bytes: input_len,
+        declared_build_work: composite_u64(
+            composite_usize_mul(stages.len(), stage_build, "declared build work")?,
+            "declared build work",
+        )?,
+        ..CompositeProspective::default()
+    };
+    for stage in stages {
+        let pattern = match stage {
+            CompositeStage::Count { pattern, .. }
+            | CompositeStage::ReplaceAllLiteral { pattern, .. } => pattern,
+        };
+        prospective.pattern_bytes =
+            composite_usize_add(prospective.pattern_bytes, pattern.len(), "pattern bytes")?;
+        match stage {
+            CompositeStage::Count { .. } => {
+                prospective.match_events = composite_usize_add(
+                    prospective.match_events,
+                    prospective.sequence_bytes,
+                    "count match events",
+                )?;
+            }
+            CompositeStage::ReplaceAllLiteral {
+                replacement,
+                minimum_match_bytes,
+                ..
+            } => preflight_replacement_stage(
+                &mut prospective,
+                replacement,
+                *minimum_match_bytes,
+                run_limits,
+            )?,
+        }
+    }
+    let stage_execution = composite_usize_mul(
+        stages.len(),
+        run_limits.fre_aggregate_operation_work,
+        "declared stage execution work",
+    )?;
+    prospective.declared_execution_work = composite_u64(
+        [
+            stage_execution,
+            input_len,
+            prospective.copied_bytes,
+            prospective.span_visits,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, term| {
+            composite_usize_add(sum, term, "declared execution work")
+        })?,
+        "declared execution work",
+    )?;
+    prospective.report_bytes = REGEX_REDUX_VARIANTS
+        .iter()
+        .try_fold(1_usize, |sum, pattern| {
+            composite_usize_add(sum, pattern.len(), "report pattern bytes")
+                .and_then(|sum| composite_usize_add(sum, 22, "report count bytes"))
+        })
+        .and_then(|sum| composite_usize_add(sum, 63, "report length bytes"))?;
+    Ok(prospective)
+}
+
+fn enforce_composite_prospective(
+    input_len: usize,
+    stage_count: usize,
+    prospective: CompositeProspective,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    for (needed, limit, dimension) in [
+        (stage_count, limits.stages, "stages"),
+        (input_len, limits.input_bytes, "input bytes"),
+        (
+            prospective.pattern_bytes,
+            limits.pattern_bytes,
+            "pattern bytes",
+        ),
+        (
+            prospective.replacement_bytes,
+            limits.replacement_bytes,
+            "replacement bytes",
+        ),
+        (
+            prospective.sequence_bytes,
+            limits.intermediate_bytes,
+            "intermediate bytes",
+        ),
+        (
+            prospective.owned_peak_bytes,
+            limits.owned_peak_bytes,
+            "owned peak bytes",
+        ),
+        (
+            prospective.report_bytes,
+            limits.report_bytes,
+            "report bytes",
+        ),
+    ] {
+        composite_enforce(
+            composite_u64(needed, dimension)?,
+            composite_u64(limit, dimension)?,
+            dimension,
+        )?;
+    }
+    for (needed, limit, dimension) in [
+        (
+            prospective.declared_build_work,
+            limits.build_work,
+            "declared build work",
+        ),
+        (
+            prospective.declared_execution_work,
+            limits.execution_work,
+            "declared execution work",
+        ),
+        (
+            composite_u64(prospective.match_events, "match events")?,
+            limits.match_events,
+            "match events",
+        ),
+        (
+            composite_u64(prospective.span_visits, "span visits")?,
+            limits.span_visits,
+            "span visits",
+        ),
+        (
+            composite_u64(prospective.copied_bytes, "copy bytes")?,
+            limits.copied_bytes,
+            "copy bytes",
+        ),
+        (
+            composite_u64(prospective.allocation_bytes, "allocation bytes")?,
+            limits.allocation_bytes,
+            "allocation bytes",
+        ),
+    ] {
+        composite_enforce(needed, limit, dimension)?;
+    }
+    Ok(())
+}
+
+fn composite_preflight(
+    input_len: usize,
+    stages: &[CompositeStage],
+    run_limits: &RunLimits,
+    limits: CompositeLimits,
+) -> Result<CompositeAccounting, ExecutionError> {
+    let prospective = composite_prospective(input_len, stages, run_limits)?;
+    enforce_composite_prospective(input_len, stages.len(), prospective, limits)?;
+    Ok(CompositeAccounting {
+        pattern_bytes: prospective.pattern_bytes,
+        replacement_bytes: prospective.replacement_bytes,
+        execution_work: composite_u64(input_len, "UTF-8 validation work")?,
+        copied_bytes: composite_u64(input_len, "initial copy bytes")?,
+        allocation_bytes: composite_u64(input_len, "initial allocation bytes")?,
+        max_intermediate_bytes: input_len,
+        owned_peak_bytes: input_len,
+        ..CompositeAccounting::default()
+    })
+}
+
+fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionError> {
+    let mut work = report.syntax.parse_work;
+    for planner in [
+        report.planner_work,
+        report.unicode_scalar_planner_work,
+        report.fixed_class_sandwich_planner_work,
+        report.bounded_affix_planner_work,
+        report.grapheme_scalar_dfa_planner_work,
+        report.bounded_class_sequence_planner_work,
+        report.bounded_separated_fields_planner_work,
+        report.prefix_class_alternation_planner_work,
+        report.bounded_context_planner_work,
+        report.capture_erasure_work,
+    ] {
+        work = composite_checked_add(work, composite_u64(planner, "planner work")?, "build work")?;
+    }
+    work = composite_checked_add(work, report.finite_planner_work, "finite planner work")?;
+    let selected = match report.build {
+        AggregateBuildAccounting::FiniteLiteral(build) => build.build_work_upper_bound,
+        AggregateBuildAccounting::SparseFiniteLiteral(build) => build.build_work,
+        AggregateBuildAccounting::Continuation(build) => composite_u64(build.work, "compile work")?,
+        _ => {
+            return Err(ExecutionError::fault(
+                "regex-redux selected an unauthenticated build family",
+            ));
+        }
+    };
+    composite_checked_add(work, selected, "selected build work")
+}
+
+fn require_composite_build_identity(
+    report: &AggregateBuildReport,
+    pattern: &str,
+    operation: AggregateOperation,
+) -> Result<(), ExecutionError> {
+    let mut profile = rebar_profile();
+    profile.options.unicode = false;
+    profile.options.case_insensitive = false;
+    if report.operation != operation
+        || report.syntax_key.pattern.as_bytes() != pattern.as_bytes()
+        || report.syntax_key.profile != CompatibilityProfile::RustBytes(profile)
+        || report.capture_semantics != AggregateCaptureSemantics::ErasedForWholeMatchOnly
+    {
+        return Err(ExecutionError::fault(
+            "regex-redux component build identity mismatch",
+        ));
+    }
+    let valid_plan = match operation {
+        AggregateOperation::Count => matches!(
+            report.build,
+            AggregateBuildAccounting::FiniteLiteral(_)
+                | AggregateBuildAccounting::SparseFiniteLiteral(_)
+        ),
+        AggregateOperation::Spans => {
+            matches!(report.build, AggregateBuildAccounting::Continuation(_))
+        }
+        _ => false,
+    };
+    if !valid_plan {
+        return Err(ExecutionError::fault(
+            "regex-redux component selected an unexpected plan",
+        ));
+    }
+    Ok(())
+}
+
+fn charge_composite_build(
+    accounting: &mut CompositeAccounting,
+    report: &AggregateBuildReport,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    let work = composite_build_work(report)?;
+    accounting.build_work = composite_checked_add(accounting.build_work, work, "build work")?;
+    composite_enforce(accounting.build_work, limits.build_work, "build work")?;
+    accounting.owned_peak_bytes = accounting.owned_peak_bytes.max(composite_usize_add(
+        accounting.max_intermediate_bytes,
+        report.retained_capacity_bytes,
+        "build owned peak",
+    )?);
+    composite_enforce(
+        composite_u64(accounting.owned_peak_bytes, "owned peak bytes")?,
+        composite_u64(limits.owned_peak_bytes, "owned peak limit")?,
+        "owned peak bytes",
+    )
+}
+
+fn charge_count_execution(
+    accounting: &mut CompositeAccounting,
+    details: &AggregateExecutionDetails,
+    value: u64,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    let (work, events, peak) = match details {
+        AggregateExecutionDetails::FiniteLiteral {
+            upper_bounds,
+            actual,
+        } => {
+            if actual.total_work > upper_bounds.total_work
+                || actual.match_events > composite_u64(upper_bounds.match_events, "match events")?
+                || actual.count != Some(value)
+            {
+                return Err(ExecutionError::fault(
+                    "regex-redux dense finite execution accounting mismatch",
+                ));
+            }
+            (
+                composite_u64(upper_bounds.total_work, "execution work")?,
+                actual.match_events,
+                actual.peak_bytes,
+            )
+        }
+        AggregateExecutionDetails::SparseFiniteLiteral {
+            upper_bounds,
+            actual,
+        } => {
+            if actual.total_work > upper_bounds.total_work
+                || actual.match_events > composite_u64(upper_bounds.match_events, "match events")?
+                || actual.count != Some(value)
+            {
+                return Err(ExecutionError::fault(
+                    "regex-redux sparse finite execution accounting mismatch",
+                ));
+            }
+            (
+                upper_bounds.total_work,
+                actual.match_events,
+                actual.peak_bytes,
+            )
+        }
+        _ => {
+            return Err(ExecutionError::fault(
+                "regex-redux count execution changed plan family",
+            ));
+        }
+    };
+    accounting.execution_work =
+        composite_checked_add(accounting.execution_work, work, "execution work")?;
+    accounting.match_events =
+        composite_checked_add(accounting.match_events, events, "match events")?;
+    accounting.owned_peak_bytes = accounting.owned_peak_bytes.max(composite_usize_add(
+        accounting.max_intermediate_bytes,
+        peak,
+        "count owned peak",
+    )?);
+    composite_enforce(
+        accounting.execution_work,
+        limits.execution_work,
+        "execution work",
+    )?;
+    composite_enforce(accounting.match_events, limits.match_events, "match events")
+}
+
+fn composite_report_length(
+    counts: &[u64; 9],
+    input: usize,
+    clean: usize,
+    final_len: usize,
+) -> Result<usize, ExecutionError> {
+    fn digits(value: u64) -> Result<usize, ExecutionError> {
+        if value == 0 {
+            Ok(1)
+        } else {
+            usize::try_from(value.ilog10())
+                .ok()
+                .and_then(|digits| digits.checked_add(1))
+                .ok_or_else(|| ExecutionError::fault("regex-redux decimal width overflow"))
+        }
+    }
+    let mut bytes = 1_usize;
+    for (pattern, count) in REGEX_REDUX_VARIANTS.iter().zip(counts) {
+        bytes = composite_usize_add(bytes, pattern.len(), "report bytes")?;
+        bytes = composite_usize_add(bytes, 1, "report separator")?;
+        bytes = composite_usize_add(bytes, digits(*count)?, "report count")?;
+        bytes = composite_usize_add(bytes, 1, "report newline")?;
+    }
+    for value in [input, clean, final_len] {
+        bytes = composite_usize_add(
+            bytes,
+            composite_usize_add(
+                digits(composite_u64(value, "report length")?)?,
+                1,
+                "report length newline",
+            )?,
+            "report bytes",
+        )?;
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug)]
+struct CompositeRunState {
+    sequence: Vec<u8>,
+    clean_length: Option<usize>,
+    counts: [u64; 9],
+    count_seen: [bool; 9],
+    accounting: CompositeAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompositeReplacementUsage {
+    work: u64,
+    events: u64,
+    output: usize,
+    peak: usize,
+}
+
+fn composite_replacement_usage(
+    replaced: &fre::LiteralReplacementResult,
+) -> Result<CompositeReplacementUsage, ExecutionError> {
+    let report = replaced.report();
+    let usage = match &report.selector_details {
+        AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } => {
+            if accounting.work > certificate.work_bound
+                || accounting.emitted_matches > certificate.output_matches
+                || accounting.output_bytes > certificate.output_bytes
+            {
+                return Err(ExecutionError::fault(
+                    "regex-redux replacement selector accounting mismatch",
+                ));
+            }
+            CompositeReplacementUsage {
+                work: composite_u64(certificate.work_bound, "selector work")?,
+                events: composite_u64(accounting.emitted_matches, "selector matches")?,
+                output: accounting.output_bytes,
+                peak: accounting.peak_bytes,
+            }
+        }
+        _ => {
+            return Err(ExecutionError::fault(
+                "regex-redux replacement execution changed plan family",
+            ));
+        }
+    };
+    let accounting = report.accounting;
+    if accounting.replacements != accounting.selected_matches
+        || accounting.span_visits != accounting.selected_matches.saturating_mul(2)
+        || accounting.output_bytes != replaced.as_bytes().len()
+    {
+        return Err(ExecutionError::fault(
+            "regex-redux replacement accounting mismatch",
+        ));
+    }
+    Ok(usage)
+}
+
+fn enforce_composite_runtime(
+    accounting: &CompositeAccounting,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    for (needed, cap, dimension) in [
+        (
+            accounting.execution_work,
+            limits.execution_work,
+            "execution work",
+        ),
+        (accounting.match_events, limits.match_events, "match events"),
+        (accounting.span_visits, limits.span_visits, "span visits"),
+        (accounting.copied_bytes, limits.copied_bytes, "copied bytes"),
+        (
+            accounting.allocation_bytes,
+            limits.allocation_bytes,
+            "allocation bytes",
+        ),
+    ] {
+        composite_enforce(needed, cap, dimension)?;
+    }
+    composite_enforce(
+        composite_u64(accounting.owned_peak_bytes, "owned peak bytes")?,
+        composite_u64(limits.owned_peak_bytes, "owned peak limit")?,
+        "owned peak bytes",
+    )
+}
+
+fn charge_composite_replacement(
+    state: &mut CompositeRunState,
+    replaced: &fre::LiteralReplacementResult,
+    retained_capacity: usize,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    let usage = composite_replacement_usage(replaced)?;
+    let replacement = replaced.report().accounting;
+    let loop_work = [
+        replacement.span_visits,
+        replacement.haystack_bytes_copied,
+        replacement.replacement_bytes_copied,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |sum, term| {
+        composite_usize_add(sum, term, "replacement loop work")
+    })?;
+    let accounting = &mut state.accounting;
+    accounting.execution_work = composite_checked_add(
+        accounting.execution_work,
+        composite_checked_add(
+            usage.work,
+            composite_u64(loop_work, "replacement loop work")?,
+            "replacement execution work",
+        )?,
+        "execution work",
+    )?;
+    accounting.match_events =
+        composite_checked_add(accounting.match_events, usage.events, "match events")?;
+    accounting.span_visits = composite_checked_add(
+        accounting.span_visits,
+        composite_u64(replacement.span_visits, "span visits")?,
+        "span visits",
+    )?;
+    accounting.copied_bytes = composite_checked_add(
+        accounting.copied_bytes,
+        composite_u64(replacement.output_bytes, "copied bytes")?,
+        "copied bytes",
+    )?;
+    let allocation = composite_usize_add(
+        usage.output,
+        replacement.output_bytes,
+        "replacement allocation",
+    )?;
+    accounting.allocation_bytes = composite_checked_add(
+        accounting.allocation_bytes,
+        composite_u64(allocation, "replacement allocation")?,
+        "allocation bytes",
+    )?;
+    let next_len = replaced.as_bytes().len();
+    accounting.max_intermediate_bytes = accounting.max_intermediate_bytes.max(next_len);
+    let live = [
+        state.sequence.len(),
+        retained_capacity,
+        usage.peak,
+        next_len,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |sum, term| {
+        composite_usize_add(sum, term, "replacement owned peak")
+    })?;
+    accounting.owned_peak_bytes = accounting.owned_peak_bytes.max(live);
+    enforce_composite_runtime(accounting, limits)
+}
+
+fn composite_replacement_run_limits(
+    sequence_len: usize,
+    report: &AggregateBuildReport,
+    run_limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    let mut limits = aggregate_run_limits(sequence_len, report, run_limits)?;
+    let boundaries = composite_usize_add(sequence_len, 1, "span boundaries")?;
+    limits.continuation.max_output_matches = boundaries;
+    limits.continuation.max_output_bytes = composite_usize_mul(
+        boundaries,
+        core::mem::size_of::<fre::AggregateSpan>(),
+        "span output bytes",
+    )?;
+    limits.continuation.max_match_events = boundaries.saturating_mul(2);
+    limits.continuation.max_work = run_limits.fre_aggregate_operation_work;
+    limits.continuation.max_sequential_bytes = run_limits.fre_aggregate_sequential_bytes;
+    limits.continuation.max_peak_bytes = run_limits.fre_aggregate_peak_bytes;
+    Ok(limits)
+}
+
+fn execute_composite_count_stage(
+    state: &mut CompositeRunState,
+    pattern: &str,
+    output: usize,
+    run_limits: &RunLimits,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    let slot = state
+        .count_seen
+        .get_mut(output)
+        .ok_or_else(|| ExecutionError::fault("regex-redux count output slot is out of range"))?;
+    if *slot {
+        return Err(ExecutionError::fault(
+            "regex-redux count output slot is duplicated",
+        ));
+    }
+    let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(false)
+        .case_insensitive(false)
+        .limits(aggregate_build_limits(run_limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_count()
+        .map_err(|error| aggregate_build_error(&error))?;
+    require_composite_build_identity(regex.build_report(), pattern, AggregateOperation::Count)?;
+    charge_composite_build(&mut state.accounting, regex.build_report(), limits)?;
+    let operation_limits =
+        aggregate_run_limits(state.sequence.len(), regex.build_report(), run_limits)?;
+    let result = regex
+        .count(&state.sequence, operation_limits)
+        .map_err(|error| {
+            aggregate_execution_error(
+                &error.source,
+                format!("regex-redux count execution failed: {error}"),
+            )
+        })?;
+    state.counts[output] = result.value();
+    *slot = true;
+    charge_count_execution(
+        &mut state.accounting,
+        &result.report().details,
+        result.value(),
+        limits,
+    )
+}
+
+fn execute_composite_replacement_stage(
+    state: &mut CompositeRunState,
+    component: CompositeStage,
+    run_limits: &RunLimits,
+    limits: CompositeLimits,
+) -> Result<(), ExecutionError> {
+    let CompositeStage::ReplaceAllLiteral {
+        pattern,
+        replacement,
+        minimum_match_bytes,
+        records_clean_length,
+    } = component
+    else {
+        return Err(ExecutionError::fault(
+            "regex-redux replacement helper received a count stage",
+        ));
+    };
+    if minimum_match_bytes == 0 {
+        return Err(ExecutionError::unsupported(
+            "regex-redux replacement stage is nullable",
+        ));
+    }
+    let regex = AggregateBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(false)
+        .case_insensitive(false)
+        .limits(aggregate_build_limits(run_limits))
+        .plan_selection(AggregatePlanSelection::Auto)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_spans()
+        .map_err(|error| aggregate_build_error(&error))?;
+    require_composite_build_identity(regex.build_report(), pattern, AggregateOperation::Spans)?;
+    charge_composite_build(&mut state.accounting, regex.build_report(), limits)?;
+    let operation_limits =
+        composite_replacement_run_limits(state.sequence.len(), regex.build_report(), run_limits)?;
+    let replaced = regex
+        .replace_all_literal(
+            &state.sequence,
+            replacement,
+            LiteralReplacementLimits {
+                aggregate: operation_limits,
+                max_output_bytes: limits.intermediate_bytes,
+            },
+        )
+        .map_err(|error| match &error.source {
+            LiteralReplacementErrorSource::Selector(source) => aggregate_execution_error(
+                source,
+                format!("regex-redux replacement execution failed: {error}"),
+            ),
+            LiteralReplacementErrorSource::OutputBytesLimit { .. } => ExecutionError::unsupported(
+                format!("regex-redux replacement resource refusal: {error}"),
+            ),
+            _ => ExecutionError::fault(format!("regex-redux replacement failed: {error}")),
+        })?;
+    charge_composite_replacement(
+        state,
+        &replaced,
+        regex.build_report().retained_capacity_bytes,
+        limits,
+    )?;
+    state.sequence = replaced.into_bytes();
+    if records_clean_length && state.clean_length.replace(state.sequence.len()).is_some() {
+        return Err(ExecutionError::fault(
+            "regex-redux clean length was recorded twice",
+        ));
+    }
+    Ok(())
+}
+
+fn finish_composite_result(
+    mut state: CompositeRunState,
+    input_length: usize,
+    expected_stages: usize,
+    limits: CompositeLimits,
+) -> Result<CompositeResult, ExecutionError> {
+    if state.accounting.stages != expected_stages || state.count_seen.iter().any(|seen| !seen) {
+        return Err(ExecutionError::fault(
+            "regex-redux composite did not publish every stage output",
+        ));
+    }
+    let clean_length = state.clean_length.ok_or_else(|| {
+        ExecutionError::fault("regex-redux composite did not record clean length")
+    })?;
+    let report_bytes = composite_report_length(
+        &state.counts,
+        input_length,
+        clean_length,
+        state.sequence.len(),
+    )?;
+    composite_enforce(
+        composite_u64(report_bytes, "report bytes")?,
+        composite_u64(limits.report_bytes, "report limit")?,
+        "report bytes",
+    )?;
+    let mut report = String::new();
+    report
+        .try_reserve_exact(report_bytes)
+        .map_err(|_| ExecutionError::fault("regex-redux report allocation failed"))?;
+    for (pattern, count) in REGEX_REDUX_VARIANTS.iter().zip(state.counts) {
+        writeln!(&mut report, "{pattern} {count}")
+            .map_err(|error| ExecutionError::fault(format!("format regex-redux: {error}")))?;
+    }
+    writeln!(
+        &mut report,
+        "\n{input_length}\n{clean_length}\n{}",
+        state.sequence.len()
+    )
+    .map_err(|error| ExecutionError::fault(format!("format regex-redux: {error}")))?;
+    if report.len() != report_bytes {
+        return Err(ExecutionError::fault(
+            "regex-redux report preflight length mismatch",
+        ));
+    }
+    state.accounting.report_bytes = report_bytes;
+    state.accounting.allocation_bytes = composite_checked_add(
+        state.accounting.allocation_bytes,
+        composite_u64(report_bytes, "report allocation")?,
+        "allocation bytes",
+    )?;
+    let live = composite_usize_add(state.sequence.len(), report_bytes, "report owned peak")?;
+    state.accounting.owned_peak_bytes = state.accounting.owned_peak_bytes.max(live);
+    enforce_composite_runtime(&state.accounting, limits)?;
+    Ok(CompositeResult {
+        counts: state.counts,
+        input_length,
+        clean_length,
+        final_bytes: state.sequence,
+        report,
+        accounting: state.accounting,
+    })
+}
+
+fn run_fre_composite(
+    input: &[u8],
+    stages: &[CompositeStage],
+    run_limits: &RunLimits,
+    limits: CompositeLimits,
+) -> Result<CompositeResult, ExecutionError> {
+    let accounting = composite_preflight(input.len(), stages, run_limits, limits)?;
+    std::str::from_utf8(input)
+        .map_err(|error| ExecutionError::fault(format!("regex-redux haystack UTF-8: {error}")))?;
+    let mut sequence = Vec::new();
+    sequence
+        .try_reserve_exact(input.len())
+        .map_err(|_| ExecutionError::fault("regex-redux initial allocation failed"))?;
+    sequence.extend_from_slice(input);
+    let mut state = CompositeRunState {
+        sequence,
+        clean_length: None,
+        counts: [0_u64; 9],
+        count_seen: [false; 9],
+        accounting,
+    };
+    for stage in stages {
+        match *stage {
+            CompositeStage::Count { pattern, output } => {
+                execute_composite_count_stage(&mut state, pattern, output, run_limits, limits)?;
+            }
+            replacement @ CompositeStage::ReplaceAllLiteral { .. } => {
+                execute_composite_replacement_stage(&mut state, replacement, run_limits, limits)?;
+            }
+        }
+        state.accounting.stages = state
+            .accounting
+            .stages
+            .checked_add(1)
+            .ok_or_else(|| ExecutionError::fault("regex-redux stage counter overflow"))?;
+    }
+    finish_composite_result(state, input.len(), stages.len(), limits)
+}
+
+fn fre_regex_redux(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<FreReduction, ExecutionError> {
+    if !request.patterns.is_empty() || request.unicode || request.case_insensitive {
+        return Err(ExecutionError::unsupported(
+            "regex-redux requires an empty external pattern list, Unicode off and case sensitivity",
+        ));
+    }
+    let result = run_fre_composite(
+        request.haystack,
+        &REGEX_REDUX_STAGES,
+        limits,
+        composite_limits(limits)?,
+    )?;
+    if result.input_length != request.haystack.len()
+        || result.report.len() != result.accounting.report_bytes
+        || result.accounting.stages != REGEX_REDUX_STAGES.len()
+        || result.counts.iter().copied().sum::<u64>() > result.accounting.match_events
+        || result.clean_length > result.input_length
+    {
+        return Err(ExecutionError::fault(
+            "regex-redux completed result failed its publication invariants",
+        ));
+    }
+    let actual = composite_u64(result.final_bytes.len(), "final length")?;
+    Ok(FreReduction {
+        actual,
+        plan: "regex-redux-sequential-composite-v1",
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FreReduction {
     actual: u64,
     plan: &'static str,
@@ -2931,6 +4038,7 @@ fn fre_reducer(
     limits: &RunLimits,
 ) -> Result<FreReduction, ExecutionError> {
     match request.model {
+        "regex-redux" => fre_regex_redux(request, limits),
         "compile" => fre_compile_verify(request, limits),
         "count" => fre_aggregate_count(request, limits),
         "count-spans" => fre_aggregate_span_sum(request, limits),
@@ -7499,6 +8607,331 @@ pub fn report_bytes(report: &Report) -> Result<Vec<u8>, CompareError> {
 mod tests {
     use super::*;
     use fre::AggregateResource;
+
+    #[test]
+    fn current_fre_regex_redux_composite_semantics_and_inventory() {
+        let limits = RunLimits::default();
+        let result = run_fre_composite(
+            b">header\r\n\nagggtaaatHaN",
+            &REGEX_REDUX_STAGES,
+            &limits,
+            composite_limits(&limits).expect("composite limits"),
+        )
+        .expect("synthetic regex-redux program");
+        assert_eq!(result.input_length, 22);
+        assert_eq!(result.clean_length, 12);
+        assert_eq!(result.counts[0], 1);
+        assert_eq!(result.final_bytes, b"agggtaaa|");
+        assert_eq!(result.accounting.stages, 15);
+        assert_eq!(result.accounting.pattern_bytes, 283);
+        assert_eq!(result.accounting.replacement_bytes, 11);
+        assert_eq!(result.report.len(), result.accounting.report_bytes);
+        assert!(result.accounting.build_work > 0);
+        assert!(result.accounting.execution_work > 0);
+    }
+
+    #[test]
+    fn current_fre_regex_redux_stage_order_is_semantic() {
+        let limits = RunLimits::default();
+        let caps = composite_limits(&limits).expect("composite limits");
+        let ordered = run_fre_composite(b"tHaN", &REGEX_REDUX_STAGES, &limits, caps)
+            .expect("ordered program");
+        assert_eq!(ordered.final_bytes, b"|");
+
+        let mut reversed = REGEX_REDUX_STAGES;
+        reversed.swap(10, 13);
+        let reordered =
+            run_fre_composite(b"tHaN", &reversed, &limits, caps).expect("reordered program");
+        assert_eq!(reordered.final_bytes, b"tH<2>");
+    }
+
+    #[test]
+    fn current_fre_regex_redux_metadata_limits_are_exact() {
+        let limits = RunLimits::default();
+        let default_caps = composite_limits(&limits).expect("composite limits");
+        let input = b">h\n\nagggtaaa";
+        let exact = CompositeLimits {
+            stages: 15,
+            pattern_bytes: 283,
+            replacement_bytes: 11,
+            input_bytes: input.len(),
+            ..default_caps
+        };
+        run_fre_composite(input, &REGEX_REDUX_STAGES, &limits, exact)
+            .expect("exact metadata limits");
+
+        for one_below in [
+            CompositeLimits {
+                stages: 14,
+                ..exact
+            },
+            CompositeLimits {
+                pattern_bytes: 282,
+                ..exact
+            },
+            CompositeLimits {
+                replacement_bytes: 10,
+                ..exact
+            },
+            CompositeLimits {
+                input_bytes: input.len() - 1,
+                ..exact
+            },
+        ] {
+            let error = run_fre_composite(input, &REGEX_REDUX_STAGES, &limits, one_below)
+                .expect_err("one-below metadata limit");
+            assert_eq!(error.status, Status::Unsupported);
+        }
+    }
+
+    #[test]
+    fn current_fre_regex_redux_dispatch_ignores_job_id_but_binds_model_shape() {
+        let limits = RunLimits::default();
+        let patterns = Vec::new();
+        let request = |job_id| CandidateRequest {
+            job_id,
+            model: "regex-redux",
+            patterns: &patterns,
+            haystack: b"tHaN",
+            unicode: false,
+            case_insensitive: false,
+        };
+        let first = fre_regex_redux(request("unrelated/a"), &limits).expect("first synthetic ID");
+        let second = fre_regex_redux(request("unrelated/b"), &limits).expect("second synthetic ID");
+        assert_eq!(first.actual, second.actual);
+        assert_eq!(first.actual, 1);
+
+        let external = vec!["a".to_string()];
+        let error = fre_regex_redux(
+            CandidateRequest {
+                job_id: "unrelated/c",
+                model: "regex-redux",
+                patterns: &external,
+                haystack: b"tHaN",
+                unicode: false,
+                case_insensitive: false,
+            },
+            &limits,
+        )
+        .expect_err("external patterns are not model input");
+        assert_eq!(error.status, Status::Unsupported);
+    }
+
+    #[test]
+    fn current_fre_regex_redux_invalid_utf8_fails_before_publication() {
+        let limits = RunLimits::default();
+        let error = run_fre_composite(
+            b"\xff",
+            &REGEX_REDUX_STAGES,
+            &limits,
+            composite_limits(&limits).expect("composite limits"),
+        )
+        .expect_err("invalid UTF-8");
+        assert_eq!(error.status, Status::Fault);
+        assert!(error.message.contains("UTF-8"));
+    }
+
+    #[test]
+    fn current_fre_regex_redux_declared_minima_are_pinned_nonnullable_hir() {
+        for stage in REGEX_REDUX_STAGES {
+            let CompositeStage::ReplaceAllLiteral {
+                pattern,
+                minimum_match_bytes,
+                ..
+            } = stage
+            else {
+                continue;
+            };
+            let mut builder = regex_syntax::ParserBuilder::new();
+            builder.unicode(false).utf8(false);
+            let hir = builder
+                .build()
+                .parse(pattern)
+                .expect("pinned replacement HIR");
+            assert_eq!(hir.properties().minimum_len(), Some(minimum_match_bytes));
+            assert!(minimum_match_bytes > 0);
+        }
+
+        let mut nullable = REGEX_REDUX_STAGES;
+        nullable[10] = CompositeStage::ReplaceAllLiteral {
+            pattern: "a*",
+            replacement: b"x",
+            minimum_match_bytes: 0,
+            records_clean_length: false,
+        };
+        let limits = RunLimits::default();
+        let error = run_fre_composite(
+            b"aaa",
+            &nullable,
+            &limits,
+            composite_limits(&limits).expect("composite limits"),
+        )
+        .expect_err("nullable replacement declaration");
+        assert_eq!(error.status, Status::Unsupported);
+    }
+
+    #[test]
+    fn current_fre_regex_redux_counts_match_pinned_rust_independently() {
+        let limits = RunLimits::default();
+        let input = b"xxagggtaaayytttaccctagggtaaa";
+        let result = run_fre_composite(
+            input,
+            &REGEX_REDUX_STAGES,
+            &limits,
+            composite_limits(&limits).expect("composite limits"),
+        )
+        .expect("generated DNA composite");
+        for (index, pattern) in REGEX_REDUX_VARIANTS.iter().enumerate() {
+            let reference = rust_compile_options(&[(*pattern).to_string()], false, false)
+                .expect("pinned Rust variant");
+            let expected =
+                count_matches(&reference, input, u64::MAX).expect("pinned Rust variant count");
+            assert_eq!(result.counts[index], expected, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn current_fre_regex_redux_preserves_gaps_adjacency_and_literal_bytes() {
+        let limits = RunLimits::default();
+        let caps = composite_limits(&limits).expect("composite limits");
+        let adjacent = run_fre_composite(
+            b"prefix tHaNtHaN suffix",
+            &REGEX_REDUX_STAGES,
+            &limits,
+            caps,
+        )
+        .expect("adjacent replacements");
+        assert_eq!(adjacent.final_bytes, b"prefix || suffix");
+
+        let mut literal = REGEX_REDUX_STAGES;
+        literal[10] = CompositeStage::ReplaceAllLiteral {
+            pattern: r"tHa[Nt]",
+            replacement: b"$x",
+            minimum_match_bytes: 4,
+            records_clean_length: false,
+        };
+        let literal_result =
+            run_fre_composite(b"tHaN", &literal, &limits, caps).expect("literal dollar bytes");
+        assert_eq!(literal_result.final_bytes, b"$x");
+    }
+
+    fn exact_regex_redux_limits(input: &[u8], run_limits: &RunLimits) -> CompositeLimits {
+        let prospective = composite_prospective(input.len(), &REGEX_REDUX_STAGES, run_limits)
+            .expect("prospective composite accounting");
+        let mut exact = composite_limits(run_limits).expect("composite limits");
+        exact.stages = REGEX_REDUX_STAGES.len();
+        exact.pattern_bytes = prospective.pattern_bytes;
+        exact.replacement_bytes = prospective.replacement_bytes;
+        exact.input_bytes = input.len();
+        exact.intermediate_bytes = prospective.sequence_bytes;
+        exact.build_work = prospective.declared_build_work;
+        exact.execution_work = prospective.declared_execution_work;
+        exact.match_events =
+            composite_u64(prospective.match_events, "test events").expect("events");
+        exact.span_visits = composite_u64(prospective.span_visits, "test spans").expect("spans");
+        exact.copied_bytes =
+            composite_u64(prospective.copied_bytes, "test copied").expect("copied");
+        exact.allocation_bytes =
+            composite_u64(prospective.allocation_bytes, "test allocation").expect("allocation");
+        exact.owned_peak_bytes = prospective.owned_peak_bytes;
+        exact.report_bytes = prospective.report_bytes;
+        assert_eq!(exact.pattern_bytes, 283);
+        assert_eq!(exact.replacement_bytes, 11);
+        exact
+    }
+
+    fn regex_redux_one_below(exact: CompositeLimits) -> [CompositeLimits; 9] {
+        [
+            CompositeLimits {
+                build_work: exact.build_work.checked_sub(1).expect("build work"),
+                ..exact
+            },
+            CompositeLimits {
+                execution_work: exact.execution_work.checked_sub(1).expect("execution work"),
+                ..exact
+            },
+            CompositeLimits {
+                match_events: exact.match_events.checked_sub(1).expect("events"),
+                ..exact
+            },
+            CompositeLimits {
+                span_visits: exact.span_visits.checked_sub(1).expect("span visits"),
+                ..exact
+            },
+            CompositeLimits {
+                copied_bytes: exact.copied_bytes.checked_sub(1).expect("copied bytes"),
+                ..exact
+            },
+            CompositeLimits {
+                allocation_bytes: exact
+                    .allocation_bytes
+                    .checked_sub(1)
+                    .expect("allocation bytes"),
+                ..exact
+            },
+            CompositeLimits {
+                intermediate_bytes: exact
+                    .intermediate_bytes
+                    .checked_sub(1)
+                    .expect("intermediate bytes"),
+                ..exact
+            },
+            CompositeLimits {
+                owned_peak_bytes: exact
+                    .owned_peak_bytes
+                    .checked_sub(1)
+                    .expect("owned peak bytes"),
+                ..exact
+            },
+            CompositeLimits {
+                report_bytes: exact.report_bytes.checked_sub(1).expect("report bytes"),
+                ..exact
+            },
+        ]
+    }
+
+    #[test]
+    fn current_fre_regex_redux_composite_resource_limits_are_exact() {
+        let run_limits = RunLimits::default();
+        let input = b"tHaN";
+        let exact = exact_regex_redux_limits(input, &run_limits);
+        run_fre_composite(input, &REGEX_REDUX_STAGES, &run_limits, exact)
+            .expect("all exact composite limits");
+        for limited in regex_redux_one_below(exact) {
+            let error = run_fre_composite(input, &REGEX_REDUX_STAGES, &run_limits, limited)
+                .expect_err("one below a prospective composite limit");
+            assert_eq!(error.status, Status::Unsupported);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the authenticated external Rebar haystack"]
+    fn current_fre_regex_redux_authenticated_hard_canary() {
+        let path = std::env::var("FRE_REGEX_REDUX_CANARY_HAYSTACK")
+            .expect("FRE_REGEX_REDUX_CANARY_HAYSTACK");
+        let haystack = fs::read(path).expect("authenticated regex-redux haystack");
+        assert_eq!(haystack.len(), 1_016_745);
+        assert_eq!(
+            sha256(&haystack),
+            "2907f3fb66fea247549c0f26b5b5d5cd1940a055574b72dad344283e1eb0fd10"
+        );
+        let limits = RunLimits::default();
+        let result = run_fre_composite(
+            &haystack,
+            &REGEX_REDUX_STAGES,
+            &limits,
+            composite_limits(&limits).expect("composite limits"),
+        )
+        .expect("authenticated regex-redux hard canary");
+        assert_eq!(result.counts, [6, 26, 86, 58, 113, 31, 31, 32, 43]);
+        assert_eq!(result.input_length, 1_016_745);
+        assert_eq!(result.clean_length, 1_000_000);
+        assert_eq!(result.final_bytes.len(), 547_899);
+        assert_eq!(
+            result.report,
+            "agggtaaa|tttaccct 6\n[cgt]gggtaaa|tttaccc[acg] 26\na[act]ggtaaa|tttacc[agt]t 86\nag[act]gtaaa|tttac[agt]ct 58\nagg[act]taaa|ttta[agt]cct 113\naggg[acg]aaa|ttt[cgt]ccct 31\nagggt[cgt]aa|tt[acg]accct 31\nagggta[cgt]a|t[acg]taccct 32\nagggtaa[cgt]|[acg]ttaccct 43\n\n1016745\n1000000\n547899\n"
+        );
+    }
 
     const PROGRAM_STATE_SENTINEL_MANIFEST_SHA256: &str =
         "09a7bfe5df8a4d78c21144b4d45f584167a1607f412990a60045878227553e43";
