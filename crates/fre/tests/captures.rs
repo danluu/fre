@@ -1355,6 +1355,31 @@ fn uniform_participation_uses_selector_without_history() {
 }
 
 #[test]
+fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
+    let pattern = r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)[\\/]";
+    let haystack = b"xcargo/registry/src/hash/name-1.2.3/ cargo\\registry\\src\\hash\\other-2.0.1\\ cargcargo/registry/src/hash/no-3.4.5/ \xFF";
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("terminal frontier capture build");
+    let build = regex.build_report();
+    assert_eq!(
+        build.plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorUniformParticipation
+    );
+    assert_eq!(build.selector.terminal_frontier_prefix_bytes, 5);
+    assert_eq!(build.selector.terminal_frontier_bytes, 2);
+    let result = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("terminal frontier capture count");
+    assert_eq!(result.accounting.count, reference_count(pattern, haystack));
+    assert!(result.selector_certificate.terminal_frontier);
+    assert!(result.selector_accounting.frontier_peak_states > 0);
+    assert_eq!(result.accounting.total_state_visits, 0);
+    assert_eq!(result.accounting.total_history_nodes, 0);
+}
+
+#[test]
 fn uniform_participation_preserves_count_and_event_limits() {
     let regex = CaptureBuilder::new(r"fn is_(\w+)|fn as_(\w+)")
         .unicode(false)

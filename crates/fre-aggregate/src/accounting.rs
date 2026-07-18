@@ -34,6 +34,11 @@ pub struct CompileAccounting {
     /// Work charged prospectively before any plan descriptor/source traversal.
     pub required_internal_anchor_build_work_upper_bound: usize,
     pub required_internal_anchor_persistent_bytes: usize,
+    /// Bytes in the mandatory leading literal retained by the unbounded
+    /// terminal-frontier certificate.
+    pub terminal_frontier_prefix_bytes: usize,
+    /// Alternatives in the retained terminal byte class.
+    pub terminal_frontier_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
@@ -45,6 +50,8 @@ pub struct CompileAccounting {
     /// Exact work to evaluate every state once at one input boundary,
     /// including each state's worst-case transition checks.
     pub execution_state_work: usize,
+    /// Exact raw successor edges retained by the continuation program.
+    pub predecessor_edges: usize,
     /// Whether row construction decodes one candidate scalar per boundary.
     pub has_scalar_transitions: bool,
     /// Worst-case binary-search comparisons for one scalar transition.
@@ -82,6 +89,19 @@ pub struct ExecutionAccounting {
     pub emitted_matches: usize,
     /// Bytes prospectively charged before whole-haystack UTF-8 validation.
     pub utf8_validation_work: usize,
+    /// Peak number of live continuation states in a terminal frontier.
+    pub frontier_peak_states: usize,
+    /// Candidate-set insertion attempts, including duplicate attempts.
+    pub frontier_insertions: usize,
+    /// Continuation states evaluated after ordered frontier selection.
+    pub frontier_evaluations: usize,
+    /// Haystack bytes admitted to and visited by the reverse frontier sweep.
+    pub frontier_source_bytes: usize,
+    /// Retained random-access bytes allocated for the frontier and its index.
+    pub frontier_bytes: usize,
+    /// Frontier indexing, source, insertion, pop, and clearing work not
+    /// already represented by state or transition counters.
+    pub frontier_bookkeeping: usize,
     pub sequential_bytes_written: usize,
     pub sequential_bytes_read: usize,
     /// Exact logical input bytes read through backward/random access.

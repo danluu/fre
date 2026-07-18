@@ -70,6 +70,7 @@ pub struct CompiledRegex {
     pub(crate) program: Program,
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
+    pub(crate) terminal_frontier: TerminalFrontierSeed,
     plan_id: PlanId,
     accounting: CompileAccounting,
 }
@@ -119,6 +120,67 @@ impl RequiredSuffixes {
     }
 }
 
+const MAX_TERMINAL_FRONTIER_PREFIX_BYTES: usize = 32;
+const MIN_TERMINAL_FRONTIER_PREFIX_BYTES: usize = 2;
+
+/// Construction-proved hints for the unbounded terminal-frontier route.
+///
+/// Every admitted match starts with `prefix` and ends immediately after one
+/// byte in `terminals`. Both facts come from the same canonical HIR used to
+/// build the continuation program. Fixed inline storage makes the proof
+/// immutable without introducing a second allocation or allocator-dependent
+/// capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalFrontierSeed {
+    prefix: [u8; MAX_TERMINAL_FRONTIER_PREFIX_BYTES],
+    prefix_len: usize,
+    terminals: TerminalByteSet,
+}
+
+impl TerminalFrontierSeed {
+    const fn empty() -> Self {
+        Self {
+            prefix: [0; MAX_TERMINAL_FRONTIER_PREFIX_BYTES],
+            prefix_len: 0,
+            terminals: TerminalByteSet::empty(),
+        }
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.prefix_len == 0 || self.terminals.len == 0
+    }
+
+    pub(crate) fn prefix_bytes(&self) -> &[u8] {
+        &self.prefix[..self.prefix_len]
+    }
+
+    pub(crate) const fn prefix_len(self) -> usize {
+        self.prefix_len
+    }
+
+    pub(crate) fn terminal_bytes(self) -> impl Iterator<Item = u8> {
+        self.terminals.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_matches(self, byte: u8) -> bool {
+        self.terminal_bytes().any(|terminal| terminal == byte)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn terminal_count(self) -> usize {
+        self.terminals.len
+    }
+
+    const fn retained_bytes() -> usize {
+        // The certificate is retained inline in every compiled artifact. Its
+        // complete fixed representation, including an empty/ineligible seed,
+        // is therefore persistent program storage. Logical prefix/terminal
+        // lengths must not under-report the zero-filled arrays or metadata.
+        core::mem::size_of::<Self>()
+    }
+}
+
 impl CompiledRegex {
     /// Compile canonical HIR for the explicit pinned byte profile.
     ///
@@ -158,8 +220,12 @@ impl CompiledRegex {
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
         validate_hir(hir, profile, capture_policy, &mut budget)?;
-        let (required_suffixes, required_internal_anchor, retained_program_bytes) =
-            build_retained_components(hir, profile, limits, &mut budget)?;
+        let (
+            required_suffixes,
+            required_internal_anchor,
+            terminal_frontier,
+            retained_program_bytes,
+        ) = build_retained_components(hir, profile, limits, &mut budget)?;
         let mut builder = Builder::new(
             limits.max_program_states,
             profile,
@@ -203,6 +269,7 @@ impl CompiledRegex {
         budget.accounting.program_states = insts.len();
         budget.accounting.program_bytes = program_bytes;
         budget.accounting.execution_state_work = certificate.execution_state_work;
+        budget.accounting.predecessor_edges = certificate.predecessor_edges;
         budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
         budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
         let mut program = Program {
@@ -212,11 +279,12 @@ impl CompiledRegex {
             split_rank: certificate.split_rank,
             split_count: certificate.split_count,
             execution_state_work: certificate.execution_state_work,
+            predecessor_edges: certificate.predecessor_edges,
             has_scalar_transition: certificate.has_scalar_transition,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
         };
-        let mut plan_id = finalize_program(&mut program, profile, &mut budget)?;
+        let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, &mut budget)?;
         if let Some(plan) = &required_internal_anchor {
             plan_id = bind_required_internal_anchor_identity(plan_id, plan, &mut budget)?;
         }
@@ -230,6 +298,7 @@ impl CompiledRegex {
             program,
             required_suffixes,
             required_internal_anchor,
+            terminal_frontier,
             plan_id,
             accounting,
         })
@@ -260,15 +329,22 @@ fn build_retained_components(
     (
         RequiredSuffixes,
         Option<fre_kernels::RequiredInternalAnchorPlan>,
+        TerminalFrontierSeed,
         usize,
     ),
     Error,
 > {
-    let required_suffixes = required_suffixes(hir, budget)?;
+    let (required_suffixes, terminal_frontier) = execution_seeds(hir, profile, budget)?;
     budget.accounting.required_suffixes = required_suffixes.ends.len();
     budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
-    let required_suffix_program_bytes = required_suffixes.retained_bytes()?;
-    budget.acquire_construction_bytes(required_suffix_program_bytes)?;
+    budget.accounting.terminal_frontier_prefix_bytes = terminal_frontier.prefix_len;
+    budget.accounting.terminal_frontier_bytes = terminal_frontier.terminals.len;
+    let seed_program_bytes = add(
+        required_suffixes.retained_bytes()?,
+        TerminalFrontierSeed::retained_bytes(),
+        Resource::ProgramBytes,
+    )?;
+    budget.acquire_construction_bytes(seed_program_bytes)?;
     enforce(
         budget.current_construction_bytes,
         limits.max_program_bytes,
@@ -300,7 +376,7 @@ fn build_retained_components(
         .as_ref()
         .map_or(0, |plan| plan.build_accounting().persistent_bytes);
     let retained_program_bytes = add(
-        required_suffix_program_bytes,
+        seed_program_bytes,
         required_internal_anchor_program_bytes,
         Resource::ProgramBytes,
     )?;
@@ -312,6 +388,7 @@ fn build_retained_components(
     Ok((
         required_suffixes,
         required_internal_anchor,
+        terminal_frontier,
         retained_program_bytes,
     ))
 }
@@ -373,11 +450,14 @@ impl CompileBudget {
                 required_internal_anchor_build_work: 0,
                 required_internal_anchor_build_work_upper_bound: 0,
                 required_internal_anchor_persistent_bytes: 0,
+                terminal_frontier_prefix_bytes: 0,
+                terminal_frontier_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
                 construction_peak_bytes: 0,
                 execution_state_work: 0,
+                predecessor_edges: 0,
                 has_scalar_transitions: false,
                 max_scalar_search_checks: 0,
                 unicode_word_boundary_checks: 0,
@@ -522,6 +602,7 @@ impl<'a> SuffixSet<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum SuffixAnalysis<'a> {
     /// This HIR consumes no bytes, so a containing concatenation must continue
     /// looking to its left.
@@ -533,7 +614,7 @@ enum SuffixAnalysis<'a> {
     TerminalBytes(TerminalByteSet),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TerminalByteSet {
     bytes: [u8; MAX_REQUIRED_SUFFIXES],
     len: usize,
@@ -552,8 +633,28 @@ impl TerminalByteSet {
     }
 }
 
+fn execution_seeds(
+    hir: &Hir,
+    profile: RustByteProfile,
+    budget: &mut CompileBudget,
+) -> Result<(RequiredSuffixes, TerminalFrontierSeed), Error> {
+    let analysis = analyze_required_suffixes(hir, budget)?;
+    let terminal_frontier = terminal_frontier_seed(hir, profile, &analysis, budget)?;
+    let required_suffixes = materialize_required_suffixes(hir, analysis, budget)?;
+    Ok((required_suffixes, terminal_frontier))
+}
+
+#[cfg(test)]
 fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSuffixes, Error> {
     let analysis = analyze_required_suffixes(hir, budget)?;
+    materialize_required_suffixes(hir, analysis, budget)
+}
+
+fn materialize_required_suffixes(
+    hir: &Hir,
+    analysis: SuffixAnalysis<'_>,
+    budget: &mut CompileBudget,
+) -> Result<RequiredSuffixes, Error> {
     if matches!(&analysis, SuffixAnalysis::TerminalBytes(_)) {
         // A byte-class endpoint can occur far more often than a multi-byte
         // literal. Retain it only when the authenticated HIR proves a finite
@@ -622,6 +723,160 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
         }
     }
     Ok(RequiredSuffixes { bytes, ends })
+}
+
+#[derive(Clone, Copy)]
+enum LeadingLiteral<'a> {
+    ZeroWidth,
+    Literal(&'a [u8]),
+    None,
+}
+
+fn terminal_frontier_seed(
+    hir: &Hir,
+    profile: RustByteProfile,
+    suffix: &SuffixAnalysis<'_>,
+    budget: &mut CompileBudget,
+) -> Result<TerminalFrontierSeed, Error> {
+    budget.charge(1)?;
+    let properties = hir.properties();
+    if profile.unicode
+        || properties.maximum_len().is_some()
+        || properties.minimum_len().is_none_or(|minimum| minimum == 0)
+    {
+        return Ok(TerminalFrontierSeed::empty());
+    }
+    let SuffixAnalysis::TerminalBytes(terminals) = suffix else {
+        return Ok(TerminalFrontierSeed::empty());
+    };
+    if terminals.len < 2 || !ends_in_byte_class(hir, budget)? {
+        return Ok(TerminalFrontierSeed::empty());
+    }
+    let LeadingLiteral::Literal(prefix) = analyze_leading_literal(hir, budget)? else {
+        return Ok(TerminalFrontierSeed::empty());
+    };
+    if !(MIN_TERMINAL_FRONTIER_PREFIX_BYTES..=MAX_TERMINAL_FRONTIER_PREFIX_BYTES)
+        .contains(&prefix.len())
+    {
+        return Ok(TerminalFrontierSeed::empty());
+    }
+    // Charge the complete inline initialization and both logical copies before
+    // publishing the certificate. The fixed arrays add no heap allocation;
+    // `program_bytes` below reports the complete fixed inline proof object.
+    let initialization = add(
+        MAX_TERMINAL_FRONTIER_PREFIX_BYTES,
+        MAX_REQUIRED_SUFFIXES,
+        Resource::CompileWork,
+    )?;
+    budget.charge(add(
+        initialization,
+        add(prefix.len(), terminals.len, Resource::CompileWork)?,
+        Resource::CompileWork,
+    )?)?;
+    let mut retained = [0_u8; MAX_TERMINAL_FRONTIER_PREFIX_BYTES];
+    retained[..prefix.len()].copy_from_slice(prefix);
+    Ok(TerminalFrontierSeed {
+        prefix: retained,
+        prefix_len: prefix.len(),
+        terminals: *terminals,
+    })
+}
+
+fn ends_in_byte_class(mut hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Concat(parts) => {
+                let mut last_consuming = None;
+                for part in parts.iter().rev() {
+                    budget.charge(1)?;
+                    if part
+                        .properties()
+                        .minimum_len()
+                        .is_some_and(|length| length > 0)
+                    {
+                        last_consuming = Some(part);
+                        break;
+                    }
+                }
+                let Some(last_consuming) = last_consuming else {
+                    return Ok(false);
+                };
+                hir = last_consuming;
+            }
+            HirKind::Class(Class::Bytes(_)) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn analyze_leading_literal<'a>(
+    hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<LeadingLiteral<'a>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => Ok(LeadingLiteral::ZeroWidth),
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            if bytes.is_empty() {
+                Ok(LeadingLiteral::ZeroWidth)
+            } else {
+                Ok(LeadingLiteral::Literal(bytes))
+            }
+        }
+        HirKind::Capture(capture) => analyze_leading_literal(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                Ok(LeadingLiteral::None)
+            } else {
+                analyze_leading_literal(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            for part in parts {
+                match analyze_leading_literal(part, budget)? {
+                    LeadingLiteral::ZeroWidth => {}
+                    leading => return Ok(leading),
+                }
+            }
+            Ok(LeadingLiteral::ZeroWidth)
+        }
+        HirKind::Alternation(branches) => common_leading_literal(branches, budget),
+        HirKind::Class(_) => Ok(LeadingLiteral::None),
+    }
+}
+
+fn common_leading_literal<'a>(
+    branches: &'a [Hir],
+    budget: &mut CompileBudget,
+) -> Result<LeadingLiteral<'a>, Error> {
+    let mut common = None;
+    for branch in branches {
+        budget.charge(1)?;
+        let LeadingLiteral::Literal(candidate) = analyze_leading_literal(branch, budget)? else {
+            return Ok(LeadingLiteral::None);
+        };
+        let Some(expected) = common else {
+            common = Some(candidate);
+            continue;
+        };
+        budget.charge(add(
+            expected.len().min(candidate.len()),
+            1,
+            Resource::CompileWork,
+        )?)?;
+        let shared_limit = expected.len().min(candidate.len());
+        let mut shared = 0_usize;
+        while shared < shared_limit && expected[shared] == candidate[shared] {
+            shared = shared.saturating_add(1);
+        }
+        if shared == 0 {
+            return Ok(LeadingLiteral::None);
+        }
+        common = Some(&expected[..shared]);
+    }
+    Ok(common.map_or(LeadingLiteral::None, LeadingLiteral::Literal))
 }
 
 fn analyze_required_suffixes<'a>(
@@ -1447,6 +1702,7 @@ struct ProgramCertificate {
     split_rank: ExactVec<usize>,
     split_count: usize,
     execution_state_work: usize,
+    predecessor_edges: usize,
     has_scalar_transition: bool,
     max_scalar_search_checks: usize,
 }
@@ -1587,29 +1843,7 @@ fn certify_program_admitted(
     // A successful topological drain leaves every outgoing count dead. Reuse
     // the exact state-width allocation as the persistent split-rank table.
     let mut split_rank = outgoing;
-    let mut split_count = 0_usize;
-    let mut execution_state_work = 0_usize;
-    let mut has_scalar_transition = false;
-    let mut max_scalar_search_checks = 0_usize;
-    for (rank, inst) in split_rank.iter_mut().zip(insts) {
-        budget.charge(1)?;
-        if matches!(inst, Inst::Split { .. }) {
-            *rank = split_count;
-            split_count = add(split_count, 1, Resource::ProgramStates)?;
-        } else {
-            *rank = NO_SPLIT_RANK;
-        }
-        let transitions = execution_transitions(
-            inst,
-            &mut has_scalar_transition,
-            &mut max_scalar_search_checks,
-        )?;
-        execution_state_work = add(
-            add(execution_state_work, 1, Resource::ExecutionWork)?,
-            transitions,
-            Resource::ExecutionWork,
-        )?;
-    }
+    let metadata = certify_execution_metadata(&mut split_rank, insts, budget)?;
     drop(offsets);
     drop(parents);
     drop(queue);
@@ -1617,10 +1851,11 @@ fn certify_program_admitted(
     Ok(ProgramCertificate {
         epsilon_order: order,
         split_rank,
-        split_count,
-        execution_state_work,
-        has_scalar_transition,
-        max_scalar_search_checks,
+        split_count: metadata.split_count,
+        execution_state_work: metadata.state_work,
+        predecessor_edges: metadata.predecessor_edges,
+        has_scalar_transition: metadata.has_scalar_transition,
+        max_scalar_search_checks: metadata.max_scalar_search_checks,
     })
 }
 
@@ -1653,6 +1888,62 @@ fn preflight_certification_program_bytes(
     )?;
     enforce(required, limit, Resource::ProgramBytes)?;
     Ok(required)
+}
+
+struct ExecutionMetadata {
+    split_count: usize,
+    state_work: usize,
+    predecessor_edges: usize,
+    has_scalar_transition: bool,
+    max_scalar_search_checks: usize,
+}
+
+fn certify_execution_metadata(
+    split_rank: &mut [usize],
+    insts: &[Inst],
+    budget: &mut CompileBudget,
+) -> Result<ExecutionMetadata, Error> {
+    let mut metadata = ExecutionMetadata {
+        split_count: 0,
+        state_work: 0,
+        predecessor_edges: 0,
+        has_scalar_transition: false,
+        max_scalar_search_checks: 0,
+    };
+    for (rank, inst) in split_rank.iter_mut().zip(insts) {
+        budget.charge(1)?;
+        if matches!(inst, Inst::Split { .. }) {
+            *rank = metadata.split_count;
+            metadata.split_count = add(metadata.split_count, 1, Resource::ProgramStates)?;
+        } else {
+            *rank = NO_SPLIT_RANK;
+        }
+        let transitions = execution_transitions(
+            inst,
+            &mut metadata.has_scalar_transition,
+            &mut metadata.max_scalar_search_checks,
+        )?;
+        metadata.state_work = add(
+            add(metadata.state_work, 1, Resource::ExecutionWork)?,
+            transitions,
+            Resource::ExecutionWork,
+        )?;
+        metadata.predecessor_edges = add(
+            metadata.predecessor_edges,
+            predecessor_edge_count(inst),
+            Resource::ProgramStates,
+        )?;
+    }
+    Ok(metadata)
+}
+
+const fn predecessor_edge_count(inst: &Inst) -> usize {
+    match inst {
+        Inst::Unfilled | Inst::Fail | Inst::Match => 0,
+        Inst::Consume { .. } | Inst::Assert { .. } => 1,
+        Inst::Split { .. } => 2,
+        Inst::ConsumeScalar { .. } => 4,
+    }
 }
 
 fn execution_transitions(
@@ -1744,12 +2035,46 @@ fn inst_vec_owned_bytes(insts: &[Inst]) -> Result<usize, Error> {
 fn finalize_program(
     program: &mut Program,
     profile: RustByteProfile,
+    terminal_frontier: TerminalFrontierSeed,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
     let mut first = StableHash::new(0xcbf2_9ce4_8422_2325);
     let mut second = StableHash::new(0x8422_2325_cbf2_9ce4);
     first.bytes(profile.identity_domain());
     second.bytes(profile.identity_domain());
+    if !terminal_frontier.is_empty() {
+        let identity_payload = add(
+            add(
+                b"terminal-class-frontier-v1".len(),
+                mul(2, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+                Resource::CompileWork,
+            )?,
+            add(
+                terminal_frontier.prefix_len,
+                terminal_frontier.terminals.len,
+                Resource::CompileWork,
+            )?,
+            Resource::CompileWork,
+        )?;
+        let identity_work = add(
+            mul(2, identity_payload, Resource::CompileWork)?,
+            1,
+            Resource::CompileWork,
+        )?;
+        budget.charge(identity_work)?;
+        first.bytes(b"terminal-class-frontier-v1");
+        second.bytes(b"terminal-class-frontier-v1");
+        hash_usize(&mut first, terminal_frontier.prefix_len);
+        hash_usize(&mut second, terminal_frontier.prefix_len);
+        first.bytes(terminal_frontier.prefix_bytes());
+        second.bytes(terminal_frontier.prefix_bytes());
+        hash_usize(&mut first, terminal_frontier.terminals.len);
+        hash_usize(&mut second, terminal_frontier.terminals.len);
+        for terminal in terminal_frontier.terminals.iter() {
+            first.byte(terminal);
+            second.byte(terminal);
+        }
+    }
     hash_usize(&mut first, program.entry);
     hash_usize(&mut second, program.entry);
     let mut has_unicode_word_boundary = false;
@@ -2070,6 +2395,135 @@ mod tests {
             .build()
             .parse("[a-z]")
             .unwrap()
+    }
+
+    fn parse_bytes(pattern: &str) -> Hir {
+        ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_frontier_seed_is_hir_derived_capture_transparent_and_exactly_charged() {
+        let hir = parse_bytes(r"(?P<root>cargo)[\\/][^/]+[\\/]");
+        let mut census = suffix_budget(CompileLimits::default().max_work);
+        let (suffixes, seed) =
+            execution_seeds(&hir, RustByteProfile::PINNED_1_12_4, &mut census).unwrap();
+        assert!(suffixes.is_empty());
+        assert_eq!(seed.prefix_bytes(), b"cargo");
+        assert_eq!(seed.terminal_count(), 2);
+        assert!(seed.terminal_matches(b'/'));
+        assert!(seed.terminal_matches(b'\\'));
+        let exact_work = census.accounting.work;
+
+        let mut exact = suffix_budget(exact_work);
+        execution_seeds(&hir, RustByteProfile::PINNED_1_12_4, &mut exact).unwrap();
+        assert_eq!(exact.accounting.work, exact_work);
+        let mut one_below = suffix_budget(exact_work - 1);
+        assert_eq!(
+            execution_seeds(&hir, RustByteProfile::PINNED_1_12_4, &mut one_below,).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: exact_work,
+                limit: exact_work - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_frontier_leading_literal_uses_common_prefix_and_refuses_nullable_or_scalar() {
+        let cases = [
+            (r"(?:cargo.*|cargoes.*)[\\/]", b"cargo".as_slice()),
+            (r"(?:cargo.*|carpet.*)[\\/]", b"car".as_slice()),
+        ];
+        for (pattern, expected) in cases {
+            let hir = parse_bytes(pattern);
+            let mut budget = suffix_budget(CompileLimits::default().max_work);
+            let (_, seed) =
+                execution_seeds(&hir, RustByteProfile::PINNED_1_12_4, &mut budget).unwrap();
+            assert_eq!(seed.prefix_bytes(), expected, "{pattern}");
+        }
+
+        for pattern in [
+            r"(?:cargo|dog).*[\\/]",
+            r"(?:cargo|).*[\\/]",
+            r".*cargo[\\/]",
+            r"cargo/.*/",
+            r"cargo/.*/|cargo\\.*\\",
+        ] {
+            let hir = parse_bytes(pattern);
+            let mut budget = suffix_budget(CompileLimits::default().max_work);
+            let (_, seed) =
+                execution_seeds(&hir, RustByteProfile::PINNED_1_12_4, &mut budget).unwrap();
+            assert!(seed.is_empty(), "{pattern}");
+        }
+
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(r"cargo.*[\\/]")
+            .unwrap();
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        let (_, seed) = execution_seeds(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(seed.is_empty());
+    }
+
+    #[test]
+    fn terminal_frontier_persistent_bytes_and_full_compile_work_are_exact() {
+        let hir = parse_bytes(r"cargo[\\/]registry[\\/]src[\\/].*[\\/]");
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = compiled.compile_accounting();
+        assert!(accounting.program_bytes >= core::mem::size_of::<TerminalFrontierSeed>());
+        let exact = CompileLimits {
+            max_program_bytes: accounting.program_bytes,
+            max_work: accounting.work,
+            ..CompileLimits::default()
+        };
+        let replay = CompiledRegex::from_hir(&hir, RustByteProfile::PINNED_1_12_4, exact).unwrap();
+        assert_eq!(replay.compile_accounting(), accounting);
+
+        assert!(matches!(
+            CompiledRegex::from_hir(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_program_bytes: accounting.program_bytes - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            CompiledRegex::from_hir(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_work: accounting.work - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
     }
 
     #[test]

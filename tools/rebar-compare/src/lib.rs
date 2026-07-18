@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4629,7 +4629,7 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
 )]
 fn capture_run_limits(
     haystack_len: usize,
-    selector_states: usize,
+    selector_shape: ContinuationProgramShape,
     selector_work: usize,
     selector_sequential_bytes: usize,
     reducer_events: usize,
@@ -4642,11 +4642,7 @@ fn capture_run_limits(
     let searches = checked_aggregate_add(haystack_len, 1, "capture searches")?;
     let search_work = usize::try_from(limits.fre_search_work)
         .map_err(|_| ExecutionError::fault("FRE capture search work does not fit usize"))?;
-    let mut selector = continuation_operation_limits(
-        haystack_len,
-        conservative_continuation_shape(selector_states)?,
-        limits,
-    )?;
+    let mut selector = continuation_operation_limits(haystack_len, selector_shape, limits)?;
     let boundaries = checked_aggregate_add(haystack_len, 1, "capture selector boundaries")?;
     selector.max_output_bytes = checked_aggregate_mul(
         boundaries,
@@ -4822,7 +4818,7 @@ fn capture_count_run_limits(
     let (reducer, work) = capture_reducer_budget(limits)?;
     capture_run_limits(
         haystack_len,
-        regex.build_report().selector.program_states,
+        regex.build_report().selector.into(),
         work,
         limits.fre_aggregate_sequential_bytes,
         reducer,
@@ -5444,7 +5440,7 @@ fn execute_grep_captures_inner(
             .ok_or_else(|| ExecutionError::fault("FRE capture walk accounting underflow"))?;
         let run_limits = capture_run_limits(
             line.len(),
-            regex.build_report().selector.program_states,
+            regex.build_report().selector.into(),
             selector_work_remaining,
             selector_sequential_remaining,
             event_remaining,
@@ -5668,6 +5664,9 @@ fn checked_aggregate_u64_mul(
 #[derive(Clone, Copy)]
 struct ContinuationProgramShape {
     states: usize,
+    predecessor_edges: usize,
+    terminal_frontier_prefix_bytes: usize,
+    terminal_frontier_bytes: usize,
     execution_state_work: usize,
     has_scalar_transitions: bool,
     max_scalar_search_checks: usize,
@@ -5682,6 +5681,9 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
     fn from(accounting: fre::AggregateCompileAccounting) -> Self {
         Self {
             states: accounting.program_states,
+            predecessor_edges: accounting.predecessor_edges,
+            terminal_frontier_prefix_bytes: accounting.terminal_frontier_prefix_bytes,
+            terminal_frontier_bytes: accounting.terminal_frontier_bytes,
             execution_state_work: accounting.execution_state_work,
             has_scalar_transitions: accounting.has_scalar_transitions,
             max_scalar_search_checks: accounting.max_scalar_search_checks,
@@ -5699,6 +5701,9 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
 fn inactive_continuation_shape() -> ContinuationProgramShape {
     ContinuationProgramShape {
         states: 1,
+        predecessor_edges: 0,
+        terminal_frontier_prefix_bytes: 0,
+        terminal_frontier_bytes: 0,
         // One Match state is evaluated once and has no outgoing transition.
         execution_state_work: 1,
         has_scalar_transitions: false,
@@ -5711,6 +5716,7 @@ fn inactive_continuation_shape() -> ContinuationProgramShape {
     }
 }
 
+#[cfg(test)]
 fn conservative_continuation_shape(
     states: usize,
 ) -> Result<ContinuationProgramShape, ExecutionError> {
@@ -5718,8 +5724,12 @@ fn conservative_continuation_shape(
     // row/log storage. Three units per state is the non-scalar Thompson
     // maximum: one evaluation and two Split transition checks.
     let execution_state_work = checked_aggregate_mul(states, 3, "state work")?;
+    let predecessor_edges = checked_aggregate_mul(states, 2, "predecessor edges")?;
     Ok(ContinuationProgramShape {
         states,
+        predecessor_edges,
+        terminal_frontier_prefix_bytes: 0,
+        terminal_frontier_bytes: 0,
         execution_state_work,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
@@ -5729,6 +5739,59 @@ fn conservative_continuation_shape(
         required_internal_anchor_optional_stages: 0,
         required_internal_anchor_persistent_bytes: 0,
     })
+}
+
+fn terminal_frontier_resource_upper(
+    haystack_len: usize,
+    shape: ContinuationProgramShape,
+    row_random_access: usize,
+) -> Result<Option<(usize, usize)>, ExecutionError> {
+    match (
+        shape.terminal_frontier_prefix_bytes > 0,
+        shape.terminal_frontier_bytes > 0,
+    ) {
+        (false, false) => return Ok(None),
+        (true, true) => {}
+        _ => {
+            return Err(ExecutionError::fault(
+                "FRE terminal-frontier compile accounting is incomplete",
+            ));
+        }
+    }
+    let word_bits = usize::try_from(usize::BITS)
+        .map_err(|_| ExecutionError::fault("platform word width does not fit usize"))?;
+    let candidate_words = shape.states.div_ceil(word_bits);
+    let summary_words = candidate_words.div_ceil(word_bits);
+    let frontier_state_words = checked_aggregate_mul(shape.states, 4, "frontier state words")?;
+    let frontier_words = checked_aggregate_add(
+        checked_aggregate_add(
+            checked_aggregate_add(frontier_state_words, 1, "frontier offset words")?,
+            shape.predecessor_edges,
+            "frontier predecessor words",
+        )?,
+        checked_aggregate_add(candidate_words, summary_words, "frontier bit words")?,
+        "frontier words",
+    )?;
+    let frontier_bytes = checked_aggregate_mul(
+        frontier_words,
+        core::mem::size_of::<usize>(),
+        "frontier bytes",
+    )?;
+    let prefix_starts = haystack_len
+        .checked_sub(shape.terminal_frontier_prefix_bytes)
+        .map_or(Ok(0), |remaining| {
+            checked_aggregate_add(remaining, 1, "terminal prefix starts")
+        })?;
+    let prefix_source = checked_aggregate_mul(
+        prefix_starts,
+        shape.terminal_frontier_prefix_bytes,
+        "terminal prefix source visits",
+    )?;
+    let sweep_source = checked_aggregate_mul(haystack_len, 4, "frontier source bytes")?;
+    Ok(Some((
+        row_random_access.max(frontier_bytes),
+        checked_aggregate_add(prefix_source, sweep_source, "frontier source visits")?,
+    )))
 }
 
 /// Build every operation limit explicitly from authenticated input size,
@@ -5817,17 +5880,23 @@ fn continuation_operation_limits(
     let record_bytes = checked_aggregate_add(program_states, 1, "row decision bits")?.div_ceil(8);
     let row_words = checked_aggregate_mul(program_states, 2, "row words")?;
     let row_bytes = checked_aggregate_mul(row_words, core::mem::size_of::<usize>(), "row bytes")?;
-    let random_access_upper =
-        checked_aggregate_add(row_bytes, record_bytes, "random-access bytes")?;
+    let row_random_access = checked_aggregate_add(row_bytes, record_bytes, "random-access bytes")?;
     let log_upper = checked_aggregate_mul(record_bytes, boundaries, "row-log bytes")?;
     let row_sequential_upper = checked_aggregate_mul(log_upper, 2, "row sequential bytes")?;
+    let (random_access_upper, route_source) =
+        terminal_frontier_resource_upper(haystack_len, shape, row_random_access)?
+            .unwrap_or((row_random_access, 0));
     let prevalidation = if shape.requires_utf8_validation {
         haystack_len
     } else {
         0
     };
     let sequential_upper = checked_aggregate_add(
-        row_sequential_upper,
+        checked_aggregate_add(
+            row_sequential_upper,
+            route_source,
+            "row plus frontier sequential bytes",
+        )?,
         prevalidation,
         "sequential bytes including UTF-8 prevalidation",
     )?;
@@ -10497,6 +10566,68 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_rustsec_both_slashes_terminal_frontier_canary() {
+        const JOB_ID: &str = "wild/rustsec-cargo-audit/both-slashes@rust/regex";
+        const PATTERN_SHA256: &str =
+            "a303f14a4fb17aff87505e48b619e8c7d23252ee596fbe51ed15ca80541bed19";
+        const HAYSTACK_SHA256: &str =
+            "4ef156371199b3ddac1bf584e0e52b1828279af82e4ea864b4d9c816adb5db40";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact rustsec both-slashes row");
+        assert!(matching.next().is_none(), "duplicate rustsec row");
+        assert_eq!(job.model, "count-captures");
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 471);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader.load(job).expect("load authenticated rustsec row");
+        assert_eq!(input.patterns.len(), 1);
+        assert_eq!(sha256(input.patterns[0].as_bytes()), PATTERN_SHA256);
+        assert_eq!(input.haystack.len(), 5_266_960);
+        assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
+
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE terminal-frontier result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some("capture-linear-selector-uniform-participation")
+        );
+        println!(
+            "rustsec-both-slashes-terminal-frontier-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan")
+        );
+    }
+
     const CONTINUATION_FAMILY_SCREEN_JOB_IDS: [&str; 7] = [
         "curated/03-date/ascii@rust/regex",
         "curated/03-date/unicode@rust/regex",
@@ -12742,7 +12873,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -14541,9 +14672,70 @@ mod tests {
     }
 
     #[test]
+    fn terminal_frontier_derivation_stays_within_existing_policy_components() {
+        let policy = RunLimits {
+            fre_aggregate_random_access_bytes: 71,
+            fre_aggregate_scratch_bytes: 67,
+            fre_aggregate_log_bytes: 61,
+            fre_aggregate_sequential_bytes: 59,
+            fre_aggregate_peak_bytes: 53,
+            fre_aggregate_operation_work: 47,
+            ..RunLimits::default()
+        };
+        let derived = continuation_operation_limits(
+            10,
+            ContinuationProgramShape {
+                predecessor_edges: 10,
+                terminal_frontier_prefix_bytes: 5,
+                terminal_frontier_bytes: 2,
+                ..conservative_continuation_shape(5).unwrap()
+            },
+            &policy,
+        )
+        .unwrap();
+        assert!(derived.max_random_access_bytes <= policy.fre_aggregate_random_access_bytes);
+        assert!(derived.max_scratch_bytes <= policy.fre_aggregate_scratch_bytes);
+        assert!(derived.max_log_bytes <= policy.fre_aggregate_log_bytes);
+        assert!(derived.max_sequential_bytes <= policy.fre_aggregate_sequential_bytes);
+        assert!(derived.max_peak_bytes <= policy.fre_aggregate_peak_bytes);
+        assert!(derived.max_work <= policy.fre_aggregate_operation_work);
+    }
+
+    #[test]
+    fn capture_run_limits_retain_exact_terminal_frontier_shape() {
+        let regex = CaptureBuilder::new(
+            r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)[\\/]",
+        )
+        .unicode(false)
+        .build()
+        .unwrap();
+        let shape = ContinuationProgramShape::from(regex.build_report().selector);
+        assert_eq!(shape.terminal_frontier_prefix_bytes, 5);
+        assert_eq!(shape.terminal_frontier_bytes, 2);
+        let limits = RunLimits::default();
+        let exact = continuation_operation_limits(1_024, shape, &limits).unwrap();
+        let legacy = continuation_operation_limits(
+            1_024,
+            conservative_continuation_shape(shape.states).unwrap(),
+            &limits,
+        )
+        .unwrap();
+        assert!(exact.max_random_access_bytes > legacy.max_random_access_bytes);
+        let capture = capture_count_run_limits(&regex, 1_024, &limits).unwrap();
+        assert_eq!(
+            capture.selector.max_random_access_bytes,
+            exact.max_random_access_bytes
+        );
+        assert_eq!(capture.selector.max_scratch_bytes, exact.max_scratch_bytes);
+    }
+
+    #[test]
     fn aggregate_operation_limits_include_scalar_search_and_shared_decode() {
         let shape = ContinuationProgramShape {
             states: 5,
+            predecessor_edges: 4,
+            terminal_frontier_prefix_bytes: 0,
+            terminal_frontier_bytes: 0,
             execution_state_work: 11,
             has_scalar_transitions: true,
             max_scalar_search_checks: 10,

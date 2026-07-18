@@ -562,6 +562,7 @@ pub(crate) struct Program {
     pub(crate) split_rank: ExactVec<usize>,
     pub(crate) split_count: usize,
     pub(crate) execution_state_work: usize,
+    pub(crate) predecessor_edges: usize,
     pub(crate) has_scalar_transition: bool,
     pub(crate) max_scalar_search_checks: usize,
     pub(crate) has_unicode_word_boundary: bool,
@@ -580,6 +581,10 @@ impl Program {
 
     pub(crate) const fn execution_state_work(&self) -> usize {
         self.execution_state_work
+    }
+
+    pub(crate) const fn predecessor_edges(&self) -> usize {
+        self.predecessor_edges
     }
 
     pub(crate) const fn contains_scalar_transition(&self) -> bool {

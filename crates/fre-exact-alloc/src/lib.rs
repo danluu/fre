@@ -40,6 +40,12 @@ pub struct ExactVec<T> {
     inner: Vec<T>,
 }
 
+impl<T> Default for ExactVec<T> {
+    fn default() -> Self {
+        Self { inner: Vec::new() }
+    }
+}
+
 impl<T> ExactVec<T> {
     /// Allocate exactly `capacity` elements without initializing them.
     pub fn try_with_capacity(capacity: usize) -> Result<Self, CopyError> {
@@ -71,6 +77,16 @@ impl<T> ExactVec<T> {
         }
         self.inner.push(value);
         Ok(())
+    }
+
+    /// Remove and return the final initialized element.
+    pub fn pop(&mut self) -> Option<T> {
+        self.inner.pop()
+    }
+
+    /// Drop every initialized element without changing exact capacity.
+    pub fn clear(&mut self) {
+        self.inner.clear();
     }
 
     /// Borrow all initialized elements.
@@ -284,6 +300,17 @@ mod tests {
             assert_eq!(values.as_slice(), (0..capacity).collect::<Vec<_>>());
             assert_eq!(values.try_push(capacity), Err(capacity));
             assert_eq!(values.capacity(), capacity);
+            if capacity > 0 {
+                assert_eq!(values.pop(), Some(capacity - 1));
+                assert_eq!(values.capacity(), capacity);
+            }
+            values.clear();
+            assert!(values.is_empty());
+            assert_eq!(values.capacity(), capacity);
+            if capacity > 0 {
+                values.try_push(7).unwrap();
+                assert_eq!(values.as_slice(), &[7]);
+            }
         }
         assert!(matches!(
             exact_vec_with_capacity::<u32>(1, true),

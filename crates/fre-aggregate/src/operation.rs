@@ -7,10 +7,12 @@ use fre_kernels::{
 };
 
 use crate::accounting::ExecutionAccounting;
-use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes};
+use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes, TerminalFrontierSeed};
 use crate::error::{add, enforce, mul};
 use crate::program::{AssertionContext, Inst, NO_SPLIT_RANK, Program, decode_first_scalar};
 use crate::{Error, OperationLimits, Resource};
+
+mod terminal_frontier;
 
 /// Half-open absolute byte span in the original haystack.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -91,6 +93,9 @@ pub struct OperationCertificate {
     pub table_cells: usize,
     pub row_storage: Option<RowStorage>,
     pub row_record_bytes: usize,
+    /// Whether HIR-certified terminal candidates fed a bounded ordered
+    /// frontier instead of evaluating every program state at every boundary.
+    pub terminal_frontier: bool,
     pub work_bound: usize,
     pub random_access_bytes: usize,
     pub scratch_bytes: usize,
@@ -377,49 +382,84 @@ impl CompiledRegex {
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
         enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
         let passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let (requirements, sparse_seed) = match Requirements::new::<OBSERVED_WORK>(
+        let terminal_seed = (strategy == Strategy::ReverseSequentialRows
+            && !self.terminal_frontier.is_empty())
+        .then_some(SparseSeed::TerminalFrontier(&self.terminal_frontier));
+        let fallback_seed = if self.required_suffixes.is_empty() {
+            None
+        } else {
+            Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
+        };
+        let dense = Requirements::new::<OBSERVED_WORK>(
             &self.program,
             boundaries,
             strategy,
             passes,
             engine_limits,
-        ) {
-            Ok(requirements)
-                if OBSERVED_WORK
-                    && requirements.work_bound > engine_limits.max_work
-                    && strategy == Strategy::ReverseSequentialRows
-                    && !self.required_suffixes.is_empty() =>
-            {
-                (
-                    Requirements::new_sparse(
-                        &self.program,
-                        boundaries,
-                        strategy,
-                        passes,
-                        engine_limits,
-                    )?,
-                    Some(&self.required_suffixes),
-                )
+        );
+        let (requirements, sparse_seed) = if let Some(seed) = terminal_seed {
+            match Requirements::new_for_seed(
+                &self.program,
+                boundaries,
+                strategy,
+                passes,
+                engine_limits,
+                seed,
+            ) {
+                Ok(requirements) => (requirements, Some(seed)),
+                Err(terminal_error) => match dense {
+                    Ok(requirements)
+                        if !OBSERVED_WORK || requirements.work_bound <= engine_limits.max_work =>
+                    {
+                        (requirements, None)
+                    }
+                    Ok(_) | Err(_) => return Err(terminal_error),
+                },
             }
-            Ok(requirements) => (requirements, None),
-            Err(Error::ResourceLimit {
-                resource: Resource::ExecutionWork,
-                ..
-            }) if strategy == Strategy::ReverseSequentialRows
-                && !self.required_suffixes.is_empty() =>
-            {
-                (
-                    Requirements::new_sparse(
-                        &self.program,
-                        boundaries,
-                        strategy,
-                        passes,
-                        engine_limits,
-                    )?,
-                    Some(&self.required_suffixes),
-                )
+        } else {
+            match dense {
+                Ok(requirements)
+                    if OBSERVED_WORK
+                        && requirements.work_bound > engine_limits.max_work
+                        && fallback_seed.is_some() =>
+                {
+                    let seed = fallback_seed.ok_or(Error::InternalInvariant(
+                        "missing continuation fallback seed",
+                    ))?;
+                    (
+                        Requirements::new_for_seed(
+                            &self.program,
+                            boundaries,
+                            strategy,
+                            passes,
+                            engine_limits,
+                            seed,
+                        )?,
+                        Some(seed),
+                    )
+                }
+                Ok(requirements) => (requirements, None),
+                Err(Error::ResourceLimit {
+                    resource: Resource::ExecutionWork,
+                    ..
+                }) if fallback_seed.is_some() => {
+                    let seed = fallback_seed.ok_or(Error::InternalInvariant(
+                        "missing continuation fallback seed",
+                    ))?;
+                    (
+                        Requirements::new_for_seed(
+                            &self.program,
+                            boundaries,
+                            strategy,
+                            passes,
+                            engine_limits,
+                            seed,
+                        )?,
+                        Some(seed),
+                    )
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         let requirements = requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, limits)?;
         let mut engine = Engine::build::<OBSERVED_WORK>(
@@ -516,7 +556,12 @@ impl CompiledRegex {
         accounting.emitted_matches = summary.matches;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(self.plan_id(), strategy, kind),
+            operation_id: operation_identity(
+                self.plan_id(),
+                strategy,
+                kind,
+                requirements.terminal_frontier,
+            ),
             strategy,
             range,
             states: self.program.insts.len(),
@@ -524,6 +569,7 @@ impl CompiledRegex {
             table_cells: requirements.table_cells,
             row_storage: requirements.row_storage,
             row_record_bytes: requirements.record_bytes,
+            terminal_frontier: requirements.terminal_frontier,
             work_bound: requirements.work_bound,
             random_access_bytes: accounting.random_access_peak_bytes,
             scratch_bytes: accounting.scratch_peak_bytes,
@@ -580,7 +626,7 @@ impl CompiledRegex {
         };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(self.plan_id(), strategy, OperationKind::Count),
+            operation_id: operation_identity(self.plan_id(), strategy, OperationKind::Count, false),
             strategy,
             range,
             states: self.program.insts.len(),
@@ -588,6 +634,7 @@ impl CompiledRegex {
             table_cells: 0,
             row_storage: None,
             row_record_bytes: 0,
+            terminal_frontier: false,
             work_bound: upper.work,
             random_access_bytes: upper.random_access_bytes,
             scratch_bytes: 0,
@@ -741,6 +788,12 @@ struct ExecutionResult {
     spans: Vec<Span>,
 }
 
+#[derive(Clone, Copy)]
+enum SparseSeed<'a> {
+    RequiredSuffixes(&'a RequiredSuffixes),
+    TerminalFrontier(&'a TerminalFrontierSeed),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Requirements {
     table_cells: usize,
@@ -749,9 +802,32 @@ struct Requirements {
     requested_log_bytes: usize,
     sequential_bound: usize,
     work_bound: usize,
+    terminal_frontier: bool,
+    frontier: Option<terminal_frontier::FrontierRequirements>,
 }
 
 impl Requirements {
+    fn new_for_seed(
+        program: &Program,
+        boundaries: usize,
+        strategy: Strategy,
+        passes: usize,
+        limits: OperationLimits,
+        seed: SparseSeed<'_>,
+    ) -> Result<Self, Error> {
+        match seed {
+            SparseSeed::RequiredSuffixes(_) => {
+                Self::new_sparse(program, boundaries, strategy, passes, limits)
+            }
+            SparseSeed::TerminalFrontier(_) => {
+                let SparseSeed::TerminalFrontier(seed) = seed else {
+                    return Err(Error::InternalInvariant("terminal seed changed variant"));
+                };
+                Self::new_terminal_frontier(program, boundaries, strategy, passes, seed, limits)
+            }
+        }
+    }
+
     fn with_prefix<const OBSERVED_WORK: bool>(
         mut self,
         work: usize,
@@ -846,6 +922,8 @@ impl Requirements {
             requested_log_bytes: log,
             sequential_bound: sequential,
             work_bound,
+            terminal_frontier: false,
+            frontier: None,
         })
     }
 
@@ -887,6 +965,71 @@ impl Requirements {
             // Sparse construction charges every observed unit before it is
             // performed, so the caller's limit is its explicit admission cap.
             work_bound: limits.max_work,
+            terminal_frontier: false,
+            frontier: None,
+        })
+    }
+
+    fn new_terminal_frontier(
+        program: &Program,
+        boundaries: usize,
+        strategy: Strategy,
+        passes: usize,
+        seed: &TerminalFrontierSeed,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        if strategy != Strategy::ReverseSequentialRows {
+            return Err(Error::InternalInvariant(
+                "terminal frontier requires reverse sequential rows",
+            ));
+        }
+        let rows = ReverseRowRequirements::new_terminal_frontier(program, boundaries, passes)?;
+        let scan_work = mul(
+            mul(boundaries, 4, Resource::ExecutionWork)?,
+            passes,
+            Resource::ExecutionWork,
+        )?;
+        let post_build_work = add(scan_work, rows.replay_bound, Resource::ExecutionWork)?;
+        let frontier = terminal_frontier::requirements(
+            program,
+            seed,
+            boundaries,
+            rows.log_bytes,
+            post_build_work,
+            limits,
+        )?;
+        enforce(
+            frontier.bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            frontier.bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(rows.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        let source = frontier.source_bytes_bound;
+        let sequential = add(rows.sequential_bound, source, Resource::SequentialBytes)?;
+        enforce(
+            sequential,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        enforce(
+            add(rows.log_bytes, frontier.bytes, Resource::PeakBytes)?,
+            limits.max_peak_bytes,
+            Resource::PeakBytes,
+        )?;
+        Ok(Self {
+            table_cells: 0,
+            row_storage: Some(rows.storage),
+            record_bytes: rows.record_bytes,
+            requested_log_bytes: rows.log_bytes,
+            sequential_bound: sequential,
+            work_bound: limits.max_work,
+            terminal_frontier: true,
+            frontier: Some(frontier),
         })
     }
 }
@@ -949,12 +1092,45 @@ impl ReverseRowRequirements {
             replay_bound,
         })
     }
+
+    fn new_terminal_frontier(
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+    ) -> Result<Self, Error> {
+        // The frontier has already selected the exact ordered endpoint for
+        // every boundary. Retain that endpoint directly: replaying split
+        // decisions would re-walk every program state at every boundary and
+        // discard the frontier's prospective candidate bound.
+        let record_bytes = encoded_width(boundaries);
+        let log_bytes = mul(record_bytes, boundaries, Resource::LogBytes)?;
+        let row_words = mul(program.insts.len(), 2, Resource::RandomAccessBytes)?;
+        let row_bytes = mul(
+            row_words,
+            core::mem::size_of::<usize>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let sequential_bound = mul(
+            log_bytes,
+            add(passes, 1, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            storage: RowStorage::ReachableEndpoints,
+            record_bytes,
+            row_bytes,
+            log_bytes,
+            sequential_bound,
+            replay_bound: 0,
+        })
+    }
 }
 
 enum Engine {
     Full(FullTable),
     Rows(RowStore),
     SparseRows(RowStore),
+    TerminalFrontier(RowStore),
 }
 
 impl Engine {
@@ -968,7 +1144,7 @@ impl Engine {
         assertions: AssertionContext<'_>,
         strategy: Strategy,
         requirements: Requirements,
-        sparse_seed: Option<&RequiredSuffixes>,
+        sparse_seed: Option<SparseSeed<'_>>,
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
     ) -> Result<Self, Error> {
@@ -983,7 +1159,7 @@ impl Engine {
             )
             .map(Self::Full),
             Strategy::ReverseSequentialRows => match sparse_seed {
-                Some(seed) => RowStore::build_sparse(
+                Some(SparseSeed::RequiredSuffixes(seed)) => RowStore::build_sparse(
                     program,
                     haystack,
                     assertions,
@@ -993,6 +1169,16 @@ impl Engine {
                     accounting,
                 )
                 .map(Self::SparseRows),
+                Some(SparseSeed::TerminalFrontier(seed)) => terminal_frontier::build(
+                    program,
+                    haystack,
+                    assertions,
+                    requirements,
+                    seed,
+                    limits,
+                    accounting,
+                )
+                .map(Self::TerminalFrontier),
                 None => RowStore::build::<OBSERVED_WORK>(
                     program,
                     haystack,
@@ -1060,7 +1246,7 @@ impl Engine {
                     &mut emit,
                 )
             }
-            Self::SparseRows(store) => {
+            Self::SparseRows(store) | Self::TerminalFrontier(store) => {
                 let mut reader = store.reader();
                 scan_sequence_sparse(
                     haystack.len(),
@@ -1094,7 +1280,7 @@ impl Engine {
     fn peak_with_output(&self, output_bytes: usize) -> Result<usize, Error> {
         match self {
             Self::Full(table) => add(table.allocated_bytes, output_bytes, Resource::PeakBytes),
-            Self::Rows(store) | Self::SparseRows(store) => {
+            Self::Rows(store) | Self::SparseRows(store) | Self::TerminalFrontier(store) => {
                 let build = add(
                     store.allocated_store_bytes,
                     store.build_scratch_bytes,
@@ -2498,8 +2684,12 @@ fn validate_admitted_work(
                 Resource::ExecutionWork,
             )?,
             add(
-                accounting.replay_steps,
-                accounting.successful_paths,
+                add(
+                    accounting.replay_steps,
+                    accounting.successful_paths,
+                    Resource::ExecutionWork,
+                )?,
+                accounting.frontier_bookkeeping,
                 Resource::ExecutionWork,
             )?,
             Resource::ExecutionWork,
@@ -2619,7 +2809,12 @@ fn zeroed_bytes(length: usize, resource: Resource) -> Result<Vec<u8>, Error> {
     Ok(values)
 }
 
-fn operation_identity(plan: PlanId, strategy: Strategy, kind: OperationKind) -> OperationId {
+fn operation_identity(
+    plan: PlanId,
+    strategy: Strategy,
+    kind: OperationKind,
+    terminal_frontier: bool,
+) -> OperationId {
     let strategy_tag = match strategy {
         Strategy::FullTable => 1_u8,
         Strategy::ReverseSequentialRows => 2,
@@ -2629,11 +2824,13 @@ fn operation_identity(plan: PlanId, strategy: Strategy, kind: OperationKind) -> 
         OperationKind::Count => 2,
         OperationKind::Sum => 3,
     };
+    let route_tag = u8::from(terminal_frontier).wrapping_mul(43);
     let mut bytes = plan.bytes();
     for (index, byte) in bytes.iter_mut().enumerate() {
         let ordinal = u8::try_from(index).unwrap_or(0);
         *byte = byte
             .wrapping_add(strategy_tag.wrapping_mul(17))
+            .wrapping_add(route_tag)
             .rotate_left(u32::from(kind_tag % 8))
             ^ ordinal.wrapping_mul(29);
     }

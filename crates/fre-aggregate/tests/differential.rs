@@ -391,7 +391,7 @@ fn unicode_word_validation_scales_with_input_not_program_size() {
         .admit_count(
             &invalid,
             0..invalid.len(),
-            Strategy::FullTable,
+            Strategy::ReverseSequentialRows,
             OperationLimits::default(),
         )
         .unwrap();
@@ -446,7 +446,7 @@ fn observed_unicode_word_utf8_validation_has_exact_work_limits() {
         .admit_spans_observed(
             haystack,
             0..haystack.len(),
-            Strategy::ReverseSequentialRows,
+            Strategy::FullTable,
             OperationLimits::default(),
         )
         .unwrap();
@@ -813,6 +813,177 @@ fn terminal_byte_class_sparse_rows_preserve_priority_invalid_bytes_and_exact_wor
             limit,
         }) if required == limit + 1
     ));
+}
+
+fn terminal_frontier_fixture() -> (&'static str, Vec<u8>) {
+    let pattern = r"cargo[\\/](?:registry|registrx|registru|registra|registb|registc|registd|registe)[\\/]src[\\/][^/]+[\\/](?:a.*z|a)[\\/]";
+    let chunk = b"xxcargo/registry/src/one/a/ cargo\\registry\\src\\two\\axyz\\ cargo/registry/src/\xFF/a/ cargo!cargo/registry/src/three/a/ cargcargo/registry/src/no/a/";
+    (pattern, chunk.repeat(96))
+}
+
+fn forced_terminal_frontier(pattern: &str, haystack: &[u8]) -> (OperationLimits, usize) {
+    let regex = compile(pattern);
+    let dense = regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::FullTable,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert!(!dense.certificate().terminal_frontier);
+    (OperationLimits::default(), dense.certificate().work_bound)
+}
+
+#[test]
+fn terminal_frontier_preserves_slashes_priority_unbounded_middle_and_malformed_bytes() {
+    let (pattern, haystack) = terminal_frontier_fixture();
+    let expected = upstream(pattern, &haystack);
+    let regex = compile(pattern);
+    let compile = regex.compile_accounting();
+    assert_eq!(compile.required_suffixes, 0);
+    assert_eq!(compile.required_suffix_bytes, 0);
+    assert_eq!(compile.terminal_frontier_prefix_bytes, 5);
+    assert_eq!(compile.terminal_frontier_bytes, 2);
+    let (limits, _) = forced_terminal_frontier(pattern, &haystack);
+    let actual = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap_or_else(|error| panic!("terminal frontier failed: {error}"));
+    assert_eq!(expected, actual.as_slice());
+    assert!(actual.certificate().terminal_frontier);
+    assert!(actual.accounting().frontier_peak_states > 0);
+    assert!(actual.accounting().frontier_insertions > 0);
+    assert_eq!(
+        actual.accounting().frontier_evaluations,
+        actual.accounting().state_evaluations
+    );
+    assert!(actual.accounting().frontier_source_bytes < haystack.len() * 5);
+    assert!(actual.accounting().frontier_source_bytes > haystack.len() * 2);
+}
+
+#[test]
+fn terminal_frontier_exact_existing_component_limits_admit_without_widening() {
+    let (pattern, haystack) = terminal_frontier_fixture();
+    let regex = compile(pattern);
+    let (limits, _) = forced_terminal_frontier(pattern, &haystack);
+    let baseline = regex
+        .admit_spans_observed(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    let certificate = baseline.certificate();
+    assert!(certificate.terminal_frontier);
+    assert_eq!(
+        certificate.row_storage,
+        Some(RowStorage::ReachableEndpoints)
+    );
+    assert_eq!(certificate.work_bound, limits.max_work);
+    assert!(certificate.random_access_bytes <= limits.max_random_access_bytes);
+    assert!(certificate.scratch_bytes <= limits.max_scratch_bytes);
+    assert!(certificate.log_bytes <= limits.max_log_bytes);
+    assert!(certificate.sequential_bytes_bound <= limits.max_sequential_bytes);
+    assert!(certificate.peak_bytes <= limits.max_peak_bytes);
+    assert!(baseline.accounting().work <= limits.max_work);
+
+    let exact = OperationLimits {
+        max_random_access_bytes: certificate.random_access_bytes,
+        max_scratch_bytes: certificate.scratch_bytes,
+        max_log_bytes: certificate.log_bytes,
+        max_sequential_bytes: certificate.sequential_bytes_bound,
+        max_peak_bytes: certificate.peak_bytes,
+        max_work: limits.max_work,
+        ..limits
+    };
+    regex
+        .admit_spans_observed(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            exact,
+        )
+        .unwrap();
+    assert!(
+        baseline.accounting().frontier_insertions <= baseline.accounting().frontier_bookkeeping
+    );
+    assert!(baseline.accounting().frontier_evaluations <= baseline.accounting().work);
+    assert!(
+        baseline.accounting().frontier_source_bytes
+            <= baseline.certificate().sequential_bytes_bound
+    );
+}
+
+#[test]
+fn terminal_frontier_ineligible_controls_stay_on_existing_routes() {
+    let controls = [
+        r"cargo[/]x[/]",
+        r"[cC]argo[/].*[/]",
+        r"(?:cargo)?[/].*[/]",
+        r".*cargo[/].*[/]",
+    ];
+    for pattern in controls {
+        let accounting = compile(pattern).compile_accounting();
+        assert_eq!(accounting.terminal_frontier_prefix_bytes, 0, "{pattern}");
+        assert_eq!(accounting.terminal_frontier_bytes, 0, "{pattern}");
+    }
+    let scalar = compile_unicode(r"cargo[/].*[/]").compile_accounting();
+    assert_eq!(scalar.terminal_frontier_prefix_bytes, 0);
+    assert_eq!(scalar.terminal_frontier_bytes, 0);
+}
+
+#[test]
+fn terminal_frontier_required_prefix_absence_skips_slash_dense_frontier_work() {
+    let pattern = r"cargo[\\/].*[\\/]";
+    let haystack = b"/\\//\\/not-the-required-prefix/\\//\\/".repeat(256);
+    let regex = compile(pattern);
+    let actual = regex
+        .admit_spans(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert!(actual.as_slice().is_empty());
+    assert!(actual.certificate().terminal_frontier);
+    assert_eq!(actual.accounting().frontier_insertions, 0);
+    assert_eq!(actual.accounting().frontier_evaluations, 0);
+    assert_eq!(actual.accounting().frontier_peak_states, 0);
+    assert_eq!(actual.accounting().frontier_bytes, 0);
+    assert!(actual.accounting().frontier_source_bytes > 0);
+}
+
+#[test]
+fn rustsec_literal_and_root_alternate_controls_keep_existing_routes() {
+    let controls = [
+        r"cargo/registry/src/[^/]+/(?:[0-9A-Za-z_-]+)-(?:[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/",
+        r"cargo\\registry\\src\\[^\\]+\\(?:[0-9A-Za-z_-]+)-(?:[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)\\",
+        r"cargo/registry/src/[^/]+/(?:[0-9A-Za-z_-]+)-(?:[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/|cargo\\registry\\src\\[^\\]+\\(?:[0-9A-Za-z_-]+)-(?:[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)\\",
+    ];
+    let haystack =
+        b"cargo/registry/src/example/a-1.2.3/ cargo\\registry\\src\\example\\b-2.3.4\\".repeat(32);
+    for pattern in controls {
+        let regex = compile(pattern);
+        assert_eq!(regex.compile_accounting().terminal_frontier_bytes, 0);
+        let expected = upstream(pattern, &haystack);
+        let actual = regex
+            .admit_spans(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(actual.as_slice(), expected, "{pattern}");
+        assert!(!actual.certificate().terminal_frontier, "{pattern}");
+    }
 }
 
 #[test]
