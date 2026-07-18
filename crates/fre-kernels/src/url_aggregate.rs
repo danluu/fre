@@ -131,6 +131,33 @@ pub struct ReduceAccounting {
     pub peak_bytes: usize,
 }
 
+/// Conservative input-only authorization envelope for URL reduction.
+///
+/// The kernel still allocates records only for the longest delimiter-bounded
+/// segment. This envelope deliberately authorizes the worst case of one
+/// segment spanning the complete input, without exposing or duplicating the
+/// private candidate-record layout outside this module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReduceUpperBounds {
+    pub input_bytes: usize,
+    pub boundaries: usize,
+    pub candidate_records: usize,
+    pub candidate_record_bytes: usize,
+    pub random_access_storage_bytes: usize,
+    pub scratch_bytes: usize,
+    pub peak_bytes: usize,
+    pub sequential_bytes: usize,
+    pub match_events: usize,
+    pub output_matches: usize,
+    pub span_sum: usize,
+}
+
+/// Derive the authoritative input-only URL reduction envelope without
+/// constructing a plan.
+pub fn reduce_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+    UrlAggregatePlan::reduce_upper_bounds(input_bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpanSumResult {
     pub value: usize,
@@ -312,6 +339,34 @@ fn random_read(source: &[u8], index: usize, meter: &mut Meter) -> Result<u8, Red
 }
 
 impl UrlAggregatePlan {
+    /// Derive a safe resource envelope from input length alone.
+    ///
+    /// Source access consists of one complete segment-size census, one
+    /// complete delimiter scan, and at most one additional scan of every
+    /// non-delimiter byte. Thus `3 * input_bytes` is a checked upper bound;
+    /// observed access is normally smaller. Candidate workspace is bounded by
+    /// the single-segment case and uses this module's exact private record
+    /// size.
+    pub fn reduce_upper_bounds(input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+        let boundaries = reduce_add(input_bytes, 1, "boundaries")?;
+        let candidate_record_bytes = size_of::<CandidateRecord>();
+        let workspace = reduce_mul(boundaries, candidate_record_bytes, "candidate record bytes")?;
+        let sequential_bytes = reduce_mul(input_bytes, 3, "sequential bytes")?;
+        Ok(ReduceUpperBounds {
+            input_bytes,
+            boundaries,
+            candidate_records: boundaries,
+            candidate_record_bytes,
+            random_access_storage_bytes: workspace,
+            scratch_bytes: workspace,
+            peak_bytes: workspace,
+            sequential_bytes,
+            match_events: boundaries,
+            output_matches: boundaries,
+            span_sum: input_bytes,
+        })
+    }
+
     /// Build the finite TLD island after the caller has certified all of these
     /// HIR invariants:
     ///
@@ -1551,6 +1606,92 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn input_only_upper_bounds_cover_long_segments_and_scratch_one_below() {
+        let plan = plan(&["COM", "ORG"]);
+        let mut long = vec![b'a'; 4_096];
+        long.extend_from_slice(b".com");
+        let upper = UrlAggregatePlan::reduce_upper_bounds(long.len()).unwrap();
+        assert_eq!(upper.boundaries, long.len() + 1);
+        assert_eq!(upper.candidate_records, upper.boundaries);
+        assert_eq!(upper.candidate_record_bytes, size_of::<CandidateRecord>());
+        assert_eq!(
+            upper.scratch_bytes,
+            upper.boundaries * size_of::<CandidateRecord>()
+        );
+        assert_eq!(upper.random_access_storage_bytes, upper.scratch_bytes);
+        assert_eq!(upper.peak_bytes, upper.scratch_bytes);
+        assert_eq!(upper.sequential_bytes, long.len() * 3);
+
+        let exact = ReduceLimits {
+            max_input_bytes: long.len(),
+            max_boundaries: upper.boundaries,
+            max_candidates: usize::MAX,
+            max_match_events: upper.match_events,
+            max_output_matches: upper.output_matches,
+            max_span_sum: upper.span_sum,
+            max_sequential_bytes: upper.sequential_bytes,
+            max_random_access_bytes: usize::MAX,
+            max_random_access_storage_bytes: upper.random_access_storage_bytes,
+            max_work: usize::MAX,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        let result = plan.span_sum(&long, 0..long.len(), exact).unwrap();
+        assert_eq!(result.accounting.scratch_bytes, upper.scratch_bytes);
+        assert_eq!(
+            result.accounting.random_access_storage_bytes,
+            upper.random_access_storage_bytes
+        );
+        assert_eq!(result.accounting.peak_bytes, upper.peak_bytes);
+        assert_eq!(result.accounting.sequential_bytes, upper.sequential_bytes);
+        assert!(result.matches <= upper.match_events);
+        assert!(result.value <= upper.span_sum);
+
+        assert!(matches!(
+            plan.span_sum(
+                &long,
+                0..long.len(),
+                ReduceLimits {
+                    max_scratch_bytes: upper.scratch_bytes - 1,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::Resource {
+                resource: "scratch bytes",
+                needed,
+                limit,
+            }) if needed == upper.scratch_bytes && limit == upper.scratch_bytes - 1
+        ));
+
+        for separated in [b"".as_slice(), b" \t\n", b"a.com b.org"] {
+            let separated_upper = UrlAggregatePlan::reduce_upper_bounds(separated.len()).unwrap();
+            let observed = plan
+                .span_sum(separated, 0..separated.len(), ReduceLimits::default())
+                .unwrap()
+                .accounting;
+            assert!(observed.scratch_bytes <= separated_upper.scratch_bytes);
+            assert!(
+                observed.random_access_storage_bytes <= separated_upper.random_access_storage_bytes
+            );
+            assert!(observed.peak_bytes <= separated_upper.peak_bytes);
+            assert!(observed.sequential_bytes <= separated_upper.sequential_bytes);
+            assert!(observed.matches <= separated_upper.output_matches);
+            assert!(observed.span_sum <= separated_upper.span_sum);
+        }
+
+        assert!(matches!(
+            UrlAggregatePlan::reduce_upper_bounds(usize::MAX),
+            Err(ReduceError::Overflow("boundaries"))
+        ));
+        assert!(matches!(
+            UrlAggregatePlan::reduce_upper_bounds(usize::MAX / 3 + 1),
+            Err(ReduceError::Overflow(
+                "candidate record bytes" | "sequential bytes"
+            ))
+        ));
     }
 
     #[test]

@@ -6136,6 +6136,35 @@ fn continuation_operation_limits(
     })
 }
 
+fn url_aggregate_operation_limits(
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
+    let upper = fre::url_aggregate_reduce_upper_bounds(haystack_len).map_err(|error| {
+        ExecutionError::fault(format!("FRE URL aggregate upper-bound derivation: {error}"))
+    })?;
+    let reducer_matches = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    Ok(AggregateOperationLimits {
+        max_boundaries: upper.boundaries,
+        max_table_cells: 0,
+        max_random_access_bytes: upper
+            .random_access_storage_bytes
+            .min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: upper.scratch_bytes.min(limits.fre_aggregate_scratch_bytes),
+        max_log_bytes: 0,
+        max_sequential_bytes: upper
+            .sequential_bytes
+            .min(limits.fre_aggregate_sequential_bytes),
+        max_match_events: upper.match_events.min(reducer_matches),
+        max_output_matches: upper.output_matches.min(reducer_matches),
+        max_output_bytes: 0,
+        max_span_sum: upper.span_sum,
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+        max_work: limits.fre_aggregate_operation_work,
+    })
+}
+
 /// Derive the complete two-pass reverse-row limits for a materialized span
 /// operation. Every term comes from the authenticated compile shape, input
 /// length, HIR minimum width and a named public quota. This is separate from
@@ -7070,6 +7099,27 @@ fn aggregate_run_limits(
             )?,
         }),
         AggregateBuildAccounting::Continuation(compile) => {
+            if report.authenticates_url_aggregate_identity()
+                && report.continuation_strategy == Some(AggregateStrategy::ReverseSequentialRows)
+                && matches!(
+                    report.operation,
+                    AggregateOperation::Count | AggregateOperation::SpanSum
+                )
+            {
+                let continuation = url_aggregate_operation_limits(haystack_len, limits)?;
+                return Ok(AggregateRunLimits {
+                    exact_literal: inactive_literal_operation_limits(limits),
+                    unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                    fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                    grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                    bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                    bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                    prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                    bounded_context: inactive_bounded_context_operation_limits(),
+                    finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                    continuation,
+                });
+            }
             let mut shape = ContinuationProgramShape::from(compile);
             if report.operation != fre::AggregateOperation::Count {
                 shape.required_internal_anchors = 0;
@@ -13066,6 +13116,10 @@ mod tests {
     }
     #[test]
     #[ignore = "requires FRE_TEST_URL_PATTERN to name the authenticated Rebar URL pattern"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated URL transaction covers route gating, exported bounds, and typed one-below refusals"
+    )]
     fn current_fre_url_identity_and_route_label_are_fail_closed() {
         let path = std::env::var_os("FRE_TEST_URL_PATTERN")
             .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
@@ -13116,6 +13170,145 @@ mod tests {
             aggregate_single_plan_label("count-spans", dormant.build_report()),
             "aggregate-continuation-program"
         );
+
+        let mut long_segment = vec![b'a'; 600 * 1_024];
+        long_segment.extend_from_slice(b".com");
+        let upper = fre::url_aggregate_reduce_upper_bounds(long_segment.len()).unwrap();
+        let policy = RunLimits::default();
+        let count_limits = aggregate_run_limits(long_segment.len(), count_report, &policy).unwrap();
+        let sum_limits =
+            aggregate_run_limits(long_segment.len(), span_sum_report, &policy).unwrap();
+        let specialized = url_aggregate_operation_limits(long_segment.len(), &policy).unwrap();
+        assert_eq!(count_limits.continuation, specialized);
+        assert_eq!(sum_limits.continuation, specialized);
+
+        let AggregateBuildAccounting::Continuation(count_compile) = count_report.build else {
+            panic!("URL count must retain continuation compile accounting");
+        };
+        let generic = continuation_operation_limits(
+            long_segment.len(),
+            ContinuationProgramShape::from(count_compile),
+            &policy,
+        )
+        .unwrap();
+        assert!(
+            generic.max_random_access_bytes < specialized.max_random_access_bytes,
+            "generic continuation storage {} must not authorize URL workspace {}",
+            generic.max_random_access_bytes,
+            specialized.max_random_access_bytes
+        );
+
+        let dormant_limits =
+            aggregate_run_limits(long_segment.len(), dormant.build_report(), &policy).unwrap();
+        let AggregateBuildAccounting::Continuation(dormant_compile) = dormant.build_report().build
+        else {
+            panic!("dormant URL plan must retain continuation compile accounting");
+        };
+        let mut dormant_shape = ContinuationProgramShape::from(dormant_compile);
+        dormant_shape.required_internal_anchors = 0;
+        dormant_shape.required_internal_anchor_bytes = 0;
+        dormant_shape.required_internal_anchor_optional_stages = 0;
+        dormant_shape.required_internal_anchor_persistent_bytes = 0;
+        assert_eq!(
+            dormant_limits.continuation,
+            continuation_operation_limits(long_segment.len(), dormant_shape, &policy).unwrap()
+        );
+        assert_ne!(dormant_limits.continuation, specialized);
+
+        let compile_limits =
+            aggregate_run_limits(long_segment.len(), compile.build_report(), &policy).unwrap();
+        let AggregateBuildAccounting::Continuation(compile_accounting) =
+            compile.build_report().build
+        else {
+            panic!("URL compile route must retain continuation compile accounting");
+        };
+        let mut compile_shape = ContinuationProgramShape::from(compile_accounting);
+        compile_shape.required_internal_anchors = 0;
+        compile_shape.required_internal_anchor_bytes = 0;
+        compile_shape.required_internal_anchor_optional_stages = 0;
+        compile_shape.required_internal_anchor_persistent_bytes = 0;
+        assert_eq!(
+            compile_limits.continuation,
+            continuation_operation_limits(long_segment.len(), compile_shape, &policy).unwrap()
+        );
+        assert_ne!(compile_limits.continuation, specialized);
+
+        let result = count.count(&long_segment, count_limits).unwrap();
+        let AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = &result.report().details
+        else {
+            panic!("URL count must publish continuation execution details");
+        };
+        assert_eq!(
+            certificate.random_access_bytes,
+            upper.random_access_storage_bytes
+        );
+        assert_eq!(certificate.scratch_bytes, upper.scratch_bytes);
+        assert_eq!(certificate.peak_bytes, upper.peak_bytes);
+        assert_eq!(certificate.sequential_bytes_bound, upper.sequential_bytes);
+        assert_eq!(
+            accounting.random_access_peak_bytes,
+            upper.random_access_storage_bytes
+        );
+        assert_eq!(accounting.scratch_peak_bytes, upper.scratch_bytes);
+        assert_eq!(accounting.peak_bytes, upper.peak_bytes);
+        assert_eq!(accounting.sequential_bytes_read, upper.sequential_bytes);
+
+        let mut generic_limits = count_limits;
+        generic_limits.continuation = generic;
+        let error = count.count(&long_segment, generic_limits).unwrap_err();
+        assert!(matches!(
+            error.source,
+            AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::RandomAccessBytes,
+                ..
+            })
+        ));
+
+        for (resource, one_below) in [
+            (
+                AggregateResource::RandomAccessBytes,
+                AggregateOperationLimits {
+                    max_random_access_bytes: upper.random_access_storage_bytes - 1,
+                    ..specialized
+                },
+            ),
+            (
+                AggregateResource::ScratchBytes,
+                AggregateOperationLimits {
+                    max_scratch_bytes: upper.scratch_bytes - 1,
+                    ..specialized
+                },
+            ),
+            (
+                AggregateResource::PeakBytes,
+                AggregateOperationLimits {
+                    max_peak_bytes: upper.peak_bytes - 1,
+                    ..specialized
+                },
+            ),
+            (
+                AggregateResource::SequentialBytes,
+                AggregateOperationLimits {
+                    max_sequential_bytes: upper.sequential_bytes - 1,
+                    ..specialized
+                },
+            ),
+        ] {
+            let mut limits = count_limits;
+            limits.continuation = one_below;
+            let error = count.count(&long_segment, limits).unwrap_err();
+            assert!(matches!(
+                error.source,
+                AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+                    resource: actual,
+                    required,
+                    limit,
+                }) if actual == resource && required == limit + 1
+            ));
+        }
 
         for field in 0..5 {
             let mut forged = count_report.clone();
@@ -14898,6 +15091,59 @@ mod tests {
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn url_aggregate_operation_limits_are_exported_and_quota_capped() {
+        let input_bytes = 4_100;
+        let upper = fre::url_aggregate_reduce_upper_bounds(input_bytes)
+            .expect("URL input-only upper bound");
+        let derived = url_aggregate_operation_limits(input_bytes, &RunLimits::default())
+            .expect("URL adapter limits");
+        assert_eq!(derived.max_boundaries, upper.boundaries);
+        assert_eq!(derived.max_table_cells, 0);
+        assert_eq!(
+            derived.max_random_access_bytes,
+            upper.random_access_storage_bytes
+        );
+        assert_eq!(derived.max_scratch_bytes, upper.scratch_bytes);
+        assert_eq!(derived.max_log_bytes, 0);
+        assert_eq!(derived.max_sequential_bytes, upper.sequential_bytes);
+        assert_eq!(derived.max_match_events, upper.match_events);
+        assert_eq!(derived.max_output_matches, upper.output_matches);
+        assert_eq!(derived.max_output_bytes, 0);
+        assert_eq!(derived.max_span_sum, upper.span_sum);
+        assert_eq!(derived.max_peak_bytes, upper.peak_bytes);
+        assert_eq!(
+            derived.max_work,
+            RunLimits::default().fre_aggregate_operation_work
+        );
+
+        let capped = url_aggregate_operation_limits(
+            input_bytes,
+            &RunLimits {
+                reducer_steps: u64::try_from(upper.boundaries - 1).unwrap(),
+                fre_aggregate_random_access_bytes: upper.random_access_storage_bytes - 1,
+                fre_aggregate_scratch_bytes: upper.scratch_bytes - 2,
+                fre_aggregate_sequential_bytes: upper.sequential_bytes - 3,
+                fre_aggregate_peak_bytes: upper.peak_bytes - 4,
+                fre_aggregate_operation_work: 17,
+                ..RunLimits::default()
+            },
+        )
+        .expect("URL named quotas cap independently");
+        assert_eq!(
+            capped.max_random_access_bytes,
+            upper.random_access_storage_bytes - 1
+        );
+        assert_eq!(capped.max_scratch_bytes, upper.scratch_bytes - 2);
+        assert_eq!(capped.max_sequential_bytes, upper.sequential_bytes - 3);
+        assert_eq!(capped.max_peak_bytes, upper.peak_bytes - 4);
+        assert_eq!(capped.max_match_events, upper.boundaries - 1);
+        assert_eq!(capped.max_output_matches, upper.boundaries - 1);
+        assert_eq!(capped.max_work, 17);
+        assert_eq!(capped.max_boundaries, upper.boundaries);
+        assert_eq!(capped.max_span_sum, upper.span_sum);
     }
 
     #[test]

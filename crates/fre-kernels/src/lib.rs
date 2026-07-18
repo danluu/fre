@@ -264,9 +264,10 @@ pub use url_aggregate::{
     BuildAccounting as UrlAggregateBuildAccounting, BuildError as UrlAggregateBuildError,
     BuildLimits as UrlAggregateBuildLimits, PLAN_ID as URL_AGGREGATE_PLAN_ID,
     ReduceAccounting as UrlAggregateReduceAccounting, ReduceError as UrlAggregateReduceError,
-    ReduceLimits as UrlAggregateReduceLimits,
+    ReduceLimits as UrlAggregateReduceLimits, ReduceUpperBounds as UrlAggregateReduceUpperBounds,
     SPAN_SUM_OPERATION_ID as URL_AGGREGATE_SPAN_SUM_OPERATION_ID,
     SpanSumResult as UrlAggregateSpanSumResult, UrlAggregateBuildAuthority, UrlAggregatePlan,
+    reduce_upper_bounds as url_aggregate_reduce_upper_bounds,
 };
 
 /// Hard limits for building one exact-literal plan.

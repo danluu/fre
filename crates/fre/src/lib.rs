@@ -165,7 +165,8 @@ pub use fre_kernels::{
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds, UrlAggregateReduceError,
+    UrlAggregateReduceUpperBounds, url_aggregate_reduce_upper_bounds,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
