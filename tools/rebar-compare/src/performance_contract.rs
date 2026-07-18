@@ -5950,43 +5950,25 @@ mod tests {
     }
 
     #[test]
-    fn ruff_capture_plan_is_registered_for_the_capture_runner_route() {
-        assert!(crate::is_current_fre_capture_plan(
-            crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
-        ));
-        assert_eq!(
-            performance_runner_route(
-                "grep-captures",
-                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-                1,
-            )
-            .expect("exact Ruff capture route"),
-            PerformanceRunnerRoute::Capture
-        );
-        assert!(
-            performance_runner_route(
-                "grep-captures",
-                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-                2,
-            )
-            .is_err()
-        );
-        assert!(
-            performance_runner_route(
-                "count-captures",
-                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            performance_runner_route(
-                "grep-captures",
-                "capture-line-space-around-operator-stream-v2-alias",
-                1,
-            )
-            .is_err()
-        );
+    fn ruff_capture_plans_are_registered_only_for_the_single_pattern_grep_route() {
+        for plan in [
+            crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+            fre::SHEBANG_OPERATION_ID,
+            fre::STRING_QUOTE_PREFIX_OPERATION_ID,
+            fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+        ] {
+            assert!(crate::is_current_fre_capture_plan(plan));
+            assert_eq!(
+                performance_runner_route("grep-captures", plan, 1)
+                    .expect("exact Ruff capture route"),
+                PerformanceRunnerRoute::Capture
+            );
+            assert!(performance_runner_route("grep-captures", plan, 2).is_err());
+            assert!(performance_runner_route("count-captures", plan, 1).is_err());
+            assert!(
+                performance_runner_route("grep-captures", &format!("{plan}-alias"), 1).is_err()
+            );
+        }
     }
 
     #[test]

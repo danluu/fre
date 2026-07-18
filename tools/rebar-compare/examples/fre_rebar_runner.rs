@@ -71,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=19 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=19 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -1232,9 +1232,51 @@ mod tests {
         output
     }
 
-    fn ruff_capture_klv() -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    struct RuffCaptureFixture {
+        name: &'static str,
+        pattern: &'static str,
+        haystack: &'static [u8],
+        expected: u64,
+        plan: &'static str,
+    }
+
+    fn ruff_capture_fixtures() -> [RuffCaptureFixture; 4] {
+        [
+            RuffCaptureFixture {
+                name: "wild/ruff/space-around-operator",
+                pattern: fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+                haystack: b"x+\n\xFF++\r\nx + ",
+                expected: 9,
+                plan: rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+            },
+            RuffCaptureFixture {
+                name: "wild/ruff/shebang",
+                pattern: fre::SHEBANG_CAPTURE_PATTERN,
+                haystack: b"#!x\nx#!\n \t#!z",
+                expected: 6,
+                plan: fre::SHEBANG_OPERATION_ID,
+            },
+            RuffCaptureFixture {
+                name: "wild/ruff/string-quote-prefix",
+                pattern: fre::STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
+                haystack: b"''\nr\"x\"\nno\n",
+                expected: 4,
+                plan: fre::STRING_QUOTE_PREFIX_OPERATION_ID,
+            },
+            RuffCaptureFixture {
+                name: "wild/ruff/whitespace-around-keywords",
+                pattern: fre::WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+                haystack: b"if else\nif_\n",
+                expected: 6,
+                plan: fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+            },
+        ]
+    }
+
+    fn ruff_capture_klv(fixture: RuffCaptureFixture) -> Vec<u8> {
         let mut output = Vec::new();
-        field(&mut output, "name", b"wild/ruff/space-around-operator");
+        field(&mut output, "name", fixture.name.as_bytes());
         field(&mut output, "model", b"grep-captures");
         field(&mut output, "case-insensitive", b"false");
         field(&mut output, "unicode", b"true");
@@ -1242,12 +1284,8 @@ mod tests {
         field(&mut output, "max-warmup-iters", b"0");
         field(&mut output, "max-time", b"1000");
         field(&mut output, "max-warmup-time", b"100");
-        field(
-            &mut output,
-            "pattern",
-            fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.as_bytes(),
-        );
-        field(&mut output, "haystack", b"x+\n\xFF++\r\nx + ");
+        field(&mut output, "pattern", fixture.pattern.as_bytes());
+        field(&mut output, "haystack", fixture.haystack);
         output
     }
 
@@ -1844,71 +1882,65 @@ mod tests {
     }
 
     #[test]
-    fn ruff_formal_klv_binds_first_steady_and_performance_capture_paths() {
-        let benchmark = Benchmark::parse(&ruff_capture_klv()).expect("exact Ruff KLV");
-        assert_eq!(benchmark.model, "grep-captures");
-        assert!(benchmark.unicode);
-        assert!(!benchmark.case_insensitive);
-        assert_eq!(
-            benchmark.pattern(),
-            fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
-        );
+    fn ruff_formal_klv_binds_each_plan_to_first_steady_and_performance_capture_paths() {
+        for fixture in ruff_capture_fixtures() {
+            let benchmark = Benchmark::parse(&ruff_capture_klv(fixture)).expect("exact Ruff KLV");
+            assert_eq!(benchmark.name, fixture.name);
+            assert_eq!(benchmark.model, "grep-captures");
+            assert!(benchmark.unicode);
+            assert!(!benchmark.case_insensitive);
+            assert_eq!(benchmark.pattern(), fixture.pattern);
 
-        let mut first_expectations = capture_expectations("first-public-operation", 9);
-        first_expectations.plan =
-            Some(rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN.to_string());
-        let first = model_captures_with_measurement(
-            &benchmark,
-            &first_expectations,
-            |operation, haystack| Ok((Duration::from_nanos(29), operation.execute(haystack)?)),
-        )
-        .expect("formal Ruff first operation");
-        assert_eq!(first.priming_operations, 0);
-        assert_eq!(first.actual, 9);
-        assert_eq!(
-            first.candidate_plan,
-            rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
-        );
+            let mut first_expectations =
+                capture_expectations("first-public-operation", fixture.expected);
+            first_expectations.plan = Some(fixture.plan.to_string());
+            let first = model_captures_with_measurement(
+                &benchmark,
+                &first_expectations,
+                |operation, haystack| Ok((Duration::from_nanos(29), operation.execute(haystack)?)),
+            )
+            .expect("formal Ruff first operation");
+            assert_eq!(first.priming_operations, 0);
+            assert_eq!(first.actual, fixture.expected);
+            assert_eq!(first.candidate_plan, fixture.plan);
 
-        let mut steady_expectations = first_expectations.clone();
-        steady_expectations.boundary = Some("steady-public-operation".to_string());
-        let steady = model_captures_with_measurement(
-            &benchmark,
-            &steady_expectations,
-            |operation, haystack| Ok((Duration::from_nanos(31), operation.execute(haystack)?)),
-        )
-        .expect("formal Ruff steady operation");
-        assert_eq!(steady.priming_operations, 1);
-        assert_eq!(steady.actual, 9);
+            let mut steady_expectations = first_expectations.clone();
+            steady_expectations.boundary = Some("steady-public-operation".to_string());
+            let steady = model_captures_with_measurement(
+                &benchmark,
+                &steady_expectations,
+                |operation, haystack| Ok((Duration::from_nanos(31), operation.execute(haystack)?)),
+            )
+            .expect("formal Ruff steady operation");
+            assert_eq!(steady.priming_operations, 1);
+            assert_eq!(steady.actual, fixture.expected);
 
-        let performance = model_capture_performance_raw_with_measurement(
-            &benchmark,
-            &performance_expectations(
-                "steady-public-operation",
-                rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
-                9,
-            ),
-            |operation, haystack| Ok((Duration::from_nanos(37), operation.execute(haystack)?)),
-        )
-        .expect("formal Ruff performance-raw operation");
-        assert_eq!(performance.priming_operations, 1);
-        assert_eq!(performance.actual, 9);
-        assert_eq!(
-            performance.candidate_plan.as_deref(),
-            Some(rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN)
-        );
+            let performance = model_capture_performance_raw_with_measurement(
+                &benchmark,
+                &performance_expectations(
+                    "steady-public-operation",
+                    fixture.plan,
+                    fixture.expected,
+                ),
+                |operation, haystack| Ok((Duration::from_nanos(37), operation.execute(haystack)?)),
+            )
+            .expect("formal Ruff performance-raw operation");
+            assert_eq!(performance.priming_operations, 1);
+            assert_eq!(performance.actual, fixture.expected);
+            assert_eq!(performance.candidate_plan.as_deref(), Some(fixture.plan));
 
-        let mut wrong_plan = first_expectations;
-        wrong_plan.plan = Some("capture-line-space-around-operator-stream-v2-alias".to_string());
-        let measured = std::cell::Cell::new(false);
-        assert!(
-            model_captures_with_measurement(&benchmark, &wrong_plan, |operation, haystack| {
-                measured.set(true);
-                Ok((Duration::from_nanos(1), operation.execute(haystack)?))
-            })
-            .is_err()
-        );
-        assert!(!measured.get(), "wrong Ruff plan reached measurement");
+            let mut wrong_plan = first_expectations;
+            wrong_plan.plan = Some(format!("{}-alias", fixture.plan));
+            let measured = std::cell::Cell::new(false);
+            assert!(
+                model_captures_with_measurement(&benchmark, &wrong_plan, |operation, haystack| {
+                    measured.set(true);
+                    Ok((Duration::from_nanos(1), operation.execute(haystack)?))
+                })
+                .is_err()
+            );
+            assert!(!measured.get(), "wrong Ruff plan reached measurement");
+        }
     }
 
     #[test]
