@@ -413,6 +413,10 @@ impl std::error::Error for AggregateManyExecutionError {}
 
 /// Exact execution accounting detached from any plan-borrowing kernel identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "continuation accounting is an allocation-free authenticated receipt; boxing it would introduce an unreported heap allocation"
+)]
 pub enum AggregateManyExecutionDetails {
     OrderedLiteral {
         upper_bounds: OrderedLiteralAggregateUpperBounds,

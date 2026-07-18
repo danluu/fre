@@ -391,7 +391,7 @@ fn unicode_word_validation_scales_with_input_not_program_size() {
         .admit_count(
             &invalid,
             0..invalid.len(),
-            Strategy::ReverseSequentialRows,
+            Strategy::FullTable,
             OperationLimits::default(),
         )
         .unwrap();
@@ -446,7 +446,7 @@ fn observed_unicode_word_utf8_validation_has_exact_work_limits() {
         .admit_spans_observed(
             haystack,
             0..haystack.len(),
-            Strategy::FullTable,
+            Strategy::ReverseSequentialRows,
             OperationLimits::default(),
         )
         .unwrap();

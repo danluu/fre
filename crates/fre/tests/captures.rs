@@ -1477,7 +1477,10 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
         .expect("overlapping Unicode-word selector fits the bounded default");
     assert_eq!(regex.build_report().selector.program_states, 390);
     assert_eq!(regex.build_report().selector.temporary_states_peak, 390);
-    assert_eq!(regex.build_report().selector.program_bytes, 549_432);
+    // Exact-vector certification on the current URI frontier retains 542,600
+    // bytes; the fixed terminal-frontier proof adds exactly 56 bytes even
+    // when this Unicode plan is ineligible for that route.
+    assert_eq!(regex.build_report().selector.program_bytes, 542_656);
     assert!(regex.build_report().selector.work >= 126_986);
 
     for haystack in [

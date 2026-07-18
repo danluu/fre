@@ -14264,7 +14264,7 @@ mod tests {
 
         let selector_starved = RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 549_431,
+            fre_capture_selector_program_bytes: 542_655,
             ..RunLimits::default()
         };
         let refusal = current_fre(
@@ -14277,7 +14277,7 @@ mod tests {
         );
         assert!(
             matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 549432, limit is 549431")),
+                if reason.contains("ProgramBytes requires 542656, limit is 542655")),
             "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }
@@ -14563,6 +14563,9 @@ mod tests {
     fn required_anchor_limits_split_random_and_sequential_and_never_widen_quotas() {
         let shape = ContinuationProgramShape {
             states: 9,
+            predecessor_edges: 0,
+            terminal_frontier_prefix_bytes: 0,
+            terminal_frontier_bytes: 0,
             execution_state_work: 27,
             has_scalar_transitions: false,
             max_scalar_search_checks: 0,
