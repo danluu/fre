@@ -14,6 +14,7 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 mod bounded_class_sequence;
 mod bounded_context;
+mod bounded_separated_fields;
 mod fixed_class_sandwich;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
@@ -49,6 +50,26 @@ pub use bounded_context::{
     PLAN_ID as BOUNDED_CONTEXT_PLAN_ID, ReduceAccounting as BoundedContextReduceAccounting,
     ReduceActualCounters as BoundedContextActualCounters, ReduceError as BoundedContextReduceError,
     ReduceLimits as BoundedContextReduceLimits, ReduceUpperBounds as BoundedContextUpperBounds,
+};
+pub use bounded_separated_fields::{
+    AlternativeSource as BoundedSeparatedFieldsAlternativeSource,
+    AtomSource as BoundedSeparatedFieldsAtomSource, BoundedSeparatedFieldsPlan,
+    BuildAccounting as BoundedSeparatedFieldsBuildAccounting,
+    BuildError as BoundedSeparatedFieldsBuildError,
+    BuildLimits as BoundedSeparatedFieldsBuildLimits,
+    COUNT_OPERATION_ID as BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
+    CountResult as BoundedSeparatedFieldsCountResult,
+    FieldSource as BoundedSeparatedFieldsFieldSource,
+    MAX_ALTERNATIVES as BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
+    MAX_ATOMS as BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
+    MAX_FIELDS as BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
+    OperationIdentity as BoundedSeparatedFieldsOperationIdentity,
+    PLAN_ID as BOUNDED_SEPARATED_FIELDS_PLAN_ID,
+    ReduceAccounting as BoundedSeparatedFieldsReduceAccounting,
+    ReduceActualCounters as BoundedSeparatedFieldsActualCounters,
+    ReduceError as BoundedSeparatedFieldsReduceError,
+    ReduceLimits as BoundedSeparatedFieldsReduceLimits,
+    ReduceUpperBounds as BoundedSeparatedFieldsUpperBounds,
 };
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,
