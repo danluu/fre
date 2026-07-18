@@ -751,6 +751,71 @@ fn required_suffix_sparse_rows_preserve_priority_and_exact_work_admission() {
 }
 
 #[test]
+fn terminal_byte_class_sparse_rows_preserve_priority_invalid_bytes_and_exact_work() {
+    let pattern = r#"["'][^"']{0,30}[?!.]["']"#;
+    let haystack = b"\"?\"|'x!'|\"a\r\n?\"|'\xFF?'|\"?\"?\"|nope";
+    let regex = compile(pattern);
+    assert_eq!(
+        (
+            regex.compile_accounting().required_suffixes,
+            regex.compile_accounting().required_suffix_bytes,
+        ),
+        (2, 2)
+    );
+    let expected = upstream(pattern, haystack);
+    let dense = regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    let mut limits = OperationLimits {
+        max_work: dense.certificate().work_bound - 1,
+        ..OperationLimits::default()
+    };
+    let sparse = regex
+        .admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(expected, sparse.as_slice());
+    assert!(sparse.accounting().work < dense.certificate().work_bound);
+
+    limits.max_work = sparse.accounting().work;
+    assert_eq!(
+        expected,
+        regex
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap()
+            .as_slice()
+    );
+    limits.max_work -= 1;
+    assert!(matches!(
+        regex.admit_spans(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            limits,
+        ),
+        Err(Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required,
+            limit,
+        }) if required == limit + 1
+    ));
+}
+
+#[test]
 fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
     let pattern = r"[é雪]+ing";
     let mut chunk = "!é雪ing!雪雪ing!éing!".as_bytes().to_vec();

@@ -384,28 +384,79 @@ enum SuffixAnalysis<'a> {
     /// No bounded nonempty suffix theorem was proved.
     None,
     Literals(SuffixSet<'a>),
+    /// Every match ends in one member of this small canonical byte class.
+    TerminalBytes(TerminalByteSet),
+}
+
+#[derive(Clone, Copy)]
+struct TerminalByteSet {
+    bytes: [u8; MAX_REQUIRED_SUFFIXES],
+    len: usize,
+}
+
+impl TerminalByteSet {
+    const fn empty() -> Self {
+        Self {
+            bytes: [0; MAX_REQUIRED_SUFFIXES],
+            len: 0,
+        }
+    }
+
+    fn iter(self) -> impl Iterator<Item = u8> {
+        self.bytes.into_iter().take(self.len)
+    }
 }
 
 fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSuffixes, Error> {
-    let SuffixAnalysis::Literals(literals) = analyze_required_suffixes(hir, budget)? else {
-        return Ok(RequiredSuffixes::default());
+    let analysis = analyze_required_suffixes(hir, budget)?;
+    if matches!(&analysis, SuffixAnalysis::TerminalBytes(_)) {
+        // A byte-class endpoint can occur far more often than a multi-byte
+        // literal. Retain it only when the authenticated HIR proves a finite
+        // predecessor window; sparse execution then naturally clears live
+        // rows outside that window.
+        budget.charge(1)?;
+        if hir.properties().maximum_len().is_none() {
+            return Ok(RequiredSuffixes::default());
+        }
+    }
+    let (suffix_count, suffix_bytes) = match &analysis {
+        SuffixAnalysis::Literals(literals) => (literals.len, literals.bytes),
+        SuffixAnalysis::TerminalBytes(terminals) => (terminals.len, terminals.len),
+        SuffixAnalysis::ZeroWidth | SuffixAnalysis::None => {
+            return Ok(RequiredSuffixes::default());
+        }
     };
-    if literals.len == 0 {
+    if suffix_count == 0 {
         return Ok(RequiredSuffixes::default());
     }
     // Preflight every retained endpoint and byte before allocation or copy.
-    budget.charge(add(literals.len, literals.bytes, Resource::CompileWork)?)?;
+    budget.charge(add(suffix_count, suffix_bytes, Resource::CompileWork)?)?;
     let mut bytes = Vec::new();
-    if bytes.try_reserve_exact(literals.bytes).is_err() {
+    if bytes.try_reserve_exact(suffix_bytes).is_err() {
         return Ok(RequiredSuffixes::default());
     }
     let mut ends = Vec::new();
-    if ends.try_reserve_exact(literals.len).is_err() {
+    if ends.try_reserve_exact(suffix_count).is_err() {
         return Ok(RequiredSuffixes::default());
     }
-    for literal in literals.iter() {
-        bytes.extend_from_slice(literal);
-        ends.push(bytes.len());
+    match analysis {
+        SuffixAnalysis::Literals(literals) => {
+            for literal in literals.iter() {
+                bytes.extend_from_slice(literal);
+                ends.push(bytes.len());
+            }
+        }
+        SuffixAnalysis::TerminalBytes(terminals) => {
+            for byte in terminals.iter() {
+                bytes.push(byte);
+                ends.push(bytes.len());
+            }
+        }
+        SuffixAnalysis::ZeroWidth | SuffixAnalysis::None => {
+            return Err(Error::InternalInvariant(
+                "ineligible required suffix reached materialization",
+            ));
+        }
     }
     Ok(RequiredSuffixes { bytes, ends })
 }
@@ -429,7 +480,29 @@ fn analyze_required_suffixes<'a>(
                 }
             }
         }
-        HirKind::Class(_) => Ok(SuffixAnalysis::None),
+        HirKind::Class(Class::Bytes(class)) => {
+            let mut terminals = TerminalByteSet::empty();
+            for range in class.ranges() {
+                let width = inclusive_byte_width(range.start(), range.end())?;
+                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                let Some(next_len) = terminals.len.checked_add(width) else {
+                    return Ok(SuffixAnalysis::None);
+                };
+                if next_len > MAX_REQUIRED_SUFFIXES {
+                    return Ok(SuffixAnalysis::None);
+                }
+                for byte in range.start()..=range.end() {
+                    terminals.bytes[terminals.len] = byte;
+                    terminals.len = terminals.len.saturating_add(1);
+                }
+            }
+            if terminals.len == 0 {
+                Ok(SuffixAnalysis::None)
+            } else {
+                Ok(SuffixAnalysis::TerminalBytes(terminals))
+            }
+        }
+        HirKind::Class(Class::Unicode(_)) => Ok(SuffixAnalysis::None),
         HirKind::Capture(capture) => analyze_required_suffixes(&capture.sub, budget),
         HirKind::Repetition(repetition) => {
             if repetition.min == 0 {
@@ -1609,6 +1682,60 @@ mod tests {
                 limit: ADVERSARIAL_RETAINED_ONE_BELOW,
             },
             required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn terminal_byte_class_suffix_copy_is_exact_and_bounded() {
+        const EXACT_WORK: usize = 10;
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r#"["']"#)
+            .unwrap();
+        let mut exact = suffix_budget(EXACT_WORK);
+        let suffixes = required_suffixes(&hir, &mut exact).unwrap();
+        assert_eq!(
+            suffixes.iter().collect::<Vec<_>>(),
+            [b"\"".as_slice(), b"'".as_slice()]
+        );
+        assert_eq!(EXACT_WORK, exact.accounting.work);
+
+        let mut one_below = suffix_budget(EXACT_WORK - 1);
+        assert_eq!(
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: EXACT_WORK - 1,
+            },
+            required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+
+        let too_wide = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse("[a-i]")
+            .unwrap();
+        let mut bounded = suffix_budget(CompileLimits::default().max_work);
+        assert!(
+            required_suffixes(&too_wide, &mut bounded)
+                .unwrap()
+                .is_empty()
+        );
+
+        let unbounded = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r#"[a-z]+["']"#)
+            .unwrap();
+        let mut bounded = suffix_budget(CompileLimits::default().max_work);
+        assert!(
+            required_suffixes(&unbounded, &mut bounded)
+                .unwrap()
+                .is_empty()
         );
     }
 }
