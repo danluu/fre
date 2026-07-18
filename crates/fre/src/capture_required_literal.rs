@@ -17,6 +17,27 @@ pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-lit
 const MAX_INLINE_NEEDLES: usize = 64;
 const NEEDLE_OFFSET_SLOTS: usize = MAX_INLINE_NEEDLES + 1;
 
+#[cfg(test)]
+mod exact_allocation_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().checked_add(1).expect("test probe overflow"));
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 /// Fixed construction limits included in plan identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureRequiredLiteralBuildLimits {
@@ -100,7 +121,8 @@ impl CaptureRequiredLiteralNeedles {
         if index >= self.count {
             return None;
         }
-        Some(&self.arena[self.offsets[index]..self.offsets[index + 1]])
+        let end_index = index.checked_add(1)?;
+        Some(&self.arena[self.offsets[index]..self.offsets[end_index]])
     }
 
     /// Iterate over effective needles in deterministic first-occurrence order.
@@ -278,6 +300,10 @@ pub(crate) fn build_from_hir(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact antichain, resource preflight, allocation, DFA construction, and publication form one auditable transaction"
+)]
 fn build_from_hir_metered(
     hir: &Hir,
     syntax: Arc<CacheKey>,
@@ -332,7 +358,7 @@ fn build_from_hir_metered(
         limits.max_source_bytes,
     )?;
 
-    let mut dfa_limits = limits.literal_set;
+    let dfa_limits = limits.literal_set;
     let matcher_arc_block = arc_block_bytes::<LiteralSetPlan>()?;
     let plan_value_bytes = size_of::<CaptureRequiredLiteralPlan>();
     let fixed_persistent = source_before_matcher
@@ -341,30 +367,22 @@ fn build_from_hir_metered(
         .ok_or(CaptureRequiredLiteralBuildError::Overflow(
             "fixed persistent bytes",
         ))?;
-    let source_headroom = limits
-        .max_source_bytes
-        .checked_sub(fixed_persistent)
-        .ok_or(CaptureRequiredLiteralBuildError::Resource {
-            resource: "source bytes",
-            required: fixed_persistent,
-            limit: limits.max_source_bytes,
-        })?;
-    dfa_limits.max_persistent_bytes = dfa_limits.max_persistent_bytes.min(source_headroom);
+    let source_bytes = fixed_persistent
+        .checked_add(dfa_limits.max_persistent_bytes)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "reserved published source bytes",
+        ))?;
+    check_limit("source bytes", source_bytes, limits.max_source_bytes)?;
 
     let live_before_dfa = fixed_persistent.checked_add(scratch_bytes).ok_or(
         CaptureRequiredLiteralBuildError::Overflow("live bytes before DFA"),
     )?;
-    check_limit("peak bytes", live_before_dfa, limits.max_peak_bytes)?;
-    dfa_limits.max_build_bytes =
-        dfa_limits
-            .max_build_bytes
-            .min(limits.max_peak_bytes.checked_sub(live_before_dfa).ok_or(
-                CaptureRequiredLiteralBuildError::Resource {
-                    resource: "peak bytes",
-                    required: live_before_dfa,
-                    limit: limits.max_peak_bytes,
-                },
-            )?);
+    let peak_bytes_upper_bound = live_before_dfa
+        .checked_add(dfa_limits.max_build_bytes)
+        .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+            "reserved peak build bytes",
+        ))?;
+    check_limit("peak bytes", peak_bytes_upper_bound, limits.max_peak_bytes)?;
     // Admit every retained offset, byte copy, reference publication, and final
     // publication before either exact allocation or copy work begins.
     let publication_work = effective
@@ -377,6 +395,8 @@ fn build_from_hir_metered(
         ))?;
     meter.charge(publication_work)?;
 
+    #[cfg(test)]
+    exact_allocation_probe::record();
     let mut arena = ExactVec::try_with_capacity(effective.bytes)
         .map_err(|error| map_exact_allocation(error, "effective needle byte", effective.bytes))?;
     let mut offsets = [0_usize; NEEDLE_OFFSET_SLOTS];
@@ -411,6 +431,8 @@ fn build_from_hir_metered(
         offsets,
         count: effective.needles,
     };
+    #[cfg(test)]
+    exact_allocation_probe::record();
     let mut refs = ExactVec::try_with_capacity(effective.needles).map_err(|error| {
         map_exact_allocation(error, "effective needle reference", effective.needles)
     })?;
@@ -430,18 +452,26 @@ fn build_from_hir_metered(
         .map_err(CaptureRequiredLiteralBuildError::LiteralSet)?;
     let literal_set = matcher.build_accounting();
 
-    let source_bytes = fixed_persistent
+    let actual_source_bytes = fixed_persistent
         .checked_add(literal_set.persistent_bytes)
         .ok_or(CaptureRequiredLiteralBuildError::Overflow(
             "published source bytes",
         ))?;
-    check_limit("source bytes", source_bytes, limits.max_source_bytes)?;
-    let peak_bytes_upper_bound = live_before_dfa
+    if actual_source_bytes > source_bytes {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "literal-set source exceeded its admitted reservation",
+        ));
+    }
+    let actual_peak_bytes_upper_bound = live_before_dfa
         .checked_add(literal_set.build_bytes_upper_bound)
         .ok_or(CaptureRequiredLiteralBuildError::Overflow(
             "peak build bytes",
         ))?;
-    check_limit("peak bytes", peak_bytes_upper_bound, limits.max_peak_bytes)?;
+    if actual_peak_bytes_upper_bound > peak_bytes_upper_bound {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "literal-set peak exceeded its admitted reservation",
+        ));
+    }
 
     let identity = CaptureRequiredLiteralIdentity {
         syntax,
@@ -678,7 +708,12 @@ fn effective_antichain(
 ) -> Result<([bool; MAX_INLINE_NEEDLES], Metrics), CaptureRequiredLiteralBuildError> {
     let mut retained = [true; MAX_INLINE_NEEDLES];
     for left in 0..raw.len() {
-        for right in left + 1..raw.len() {
+        let right_start = left
+            .checked_add(1)
+            .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                "antichain pair index",
+            ))?;
+        for right in right_start..raw.len() {
             // One pair visit and both length inspections are admitted before
             // choosing the only comparison that can remove a redundant item.
             meter.charge(3)?;
@@ -768,7 +803,13 @@ fn contains_metered(
         let mut equal = true;
         for (offset, &needle_byte) in shorter.iter().enumerate() {
             meter.charge(1)?;
-            if longer[start + offset] != needle_byte {
+            let longer_index =
+                start
+                    .checked_add(offset)
+                    .ok_or(CaptureRequiredLiteralBuildError::Overflow(
+                        "containment byte index",
+                    ))?;
+            if longer[longer_index] != needle_byte {
                 equal = false;
                 break;
             }
@@ -1043,5 +1084,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn source_scratch_and_peak_refuse_before_any_exact_allocation() {
+        let baseline = build("(?:AB|CD)", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .unwrap();
+        let accounting = baseline.build_report().accounting;
+
+        for (resource, exact) in [
+            ("source bytes", accounting.source_bytes),
+            ("scratch bytes", accounting.scratch_bytes),
+            ("peak bytes", accounting.peak_bytes_upper_bound),
+        ] {
+            let mut admitted = CaptureRequiredLiteralBuildLimits::default();
+            match resource {
+                "source bytes" => admitted.max_source_bytes = exact,
+                "scratch bytes" => admitted.max_scratch_bytes = exact,
+                "peak bytes" => admitted.max_peak_bytes = exact,
+                _ => unreachable!(),
+            }
+            exact_allocation_probe::reset();
+            let plan = build("(?:AB|CD)", admitted)
+                .expect("exact resource admission")
+                .plan
+                .expect("exact resource retains plan");
+            assert_eq!(
+                plan.build_report().accounting.source_bytes,
+                accounting.source_bytes
+            );
+            assert_eq!(exact_allocation_probe::calls(), 2);
+
+            let mut refused = admitted;
+            match resource {
+                "source bytes" => refused.max_source_bytes = exact - 1,
+                "scratch bytes" => refused.max_scratch_bytes = exact - 1,
+                "peak bytes" => refused.max_peak_bytes = exact - 1,
+                _ => unreachable!(),
+            }
+            exact_allocation_probe::reset();
+            assert!(matches!(
+                build("(?:AB|CD)", refused),
+                Err(CaptureRequiredLiteralBuildError::Resource {
+                    resource: actual,
+                    ..
+                }) if actual == resource
+            ));
+            assert_eq!(
+                exact_allocation_probe::calls(),
+                0,
+                "{resource} refusal occurred after an exact allocation"
+            );
+        }
     }
 }
