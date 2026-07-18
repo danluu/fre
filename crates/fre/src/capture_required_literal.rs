@@ -185,6 +185,10 @@ pub(crate) struct CaptureRequiredLiteralBuildOutcome {
     pub(crate) planner_work: usize,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded proof, allocation, publication, and DFA receipts remain one auditable transaction"
+)]
 pub(crate) fn build_from_hir(
     hir: &Hir,
     syntax: Arc<CacheKey>,
@@ -372,6 +376,10 @@ impl CaptureRequiredLiteralPlan {
         &self.report
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "typed refusal retains complete cache identity without an unmetered error-path allocation"
+    )]
     pub fn is_candidate(
         &self,
         haystack: &[u8],

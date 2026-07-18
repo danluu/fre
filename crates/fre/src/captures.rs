@@ -933,6 +933,10 @@ impl CaptureBuilder {
     }
 
     /// Compile a capture-participation reducer for non-empty matches.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single-parse proof, selector, replay, identity, and accounting publication remain locally auditable"
+    )]
     pub fn build(self) -> Result<CaptureRegex, CaptureBuildError> {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;

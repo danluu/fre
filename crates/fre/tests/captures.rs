@@ -1577,15 +1577,21 @@ fn source_and_execution_limits_remain_in_capture_identity() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused proof binds shared identity and every exact/one-below resource dimension"
+)]
 fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
     fn build(
         pattern: &str,
         required: CaptureRequiredLiteralBuildLimits,
         max_hir_work: usize,
     ) -> Result<fre::CaptureRegex, CaptureBuildError> {
-        let mut limits = CaptureBuildLimits::default();
-        limits.max_hir_work = max_hir_work;
-        limits.required_literal = Some(required);
+        let limits = CaptureBuildLimits {
+            max_hir_work,
+            required_literal: Some(required),
+            ..CaptureBuildLimits::default()
+        };
         CaptureBuilder::new(pattern)
             .profile(fre::RustProfile::rebar_1_12_4())
             .unicode(false)
@@ -1687,9 +1693,11 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
         .is_err()
     );
 
-    let mut shallow = CaptureBuildLimits::default();
-    shallow.max_hir_depth = 1;
-    shallow.required_literal = Some(CaptureRequiredLiteralBuildLimits::default());
+    let shallow = CaptureBuildLimits {
+        max_hir_depth: 1,
+        required_literal: Some(CaptureRequiredLiteralBuildLimits::default()),
+        ..CaptureBuildLimits::default()
+    };
     assert!(matches!(
         CaptureBuilder::new("(?:AB|CD)")
             .profile(fre::RustProfile::rebar_1_12_4())
