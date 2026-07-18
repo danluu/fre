@@ -38,12 +38,16 @@ const SEGMENT_WRITE_WORK: usize = 8;
 const SEMANTIC_SEGMENT_WORK: usize = 64;
 const ALLOCATION_WORK: usize = 16;
 // Execution consumes each decoded token exactly once. One role probe is one
-// classified transition, including the mask-to-class decision, state lookup,
-// action dispatch, checked state/output updates and state write. The fixed
-// charge intentionally dominates those operations and is also charged once
-// for the terminal transition. Decode, classification, range-search and token
-// traversal work remain separate published counters.
-const TRANSITION_WORK: usize = 48;
+// classified transition. Its charge is the checked sum of constant envelopes
+// for the O(1) mask/trailing-zero class decode, state/class lookup, action
+// dispatch, checked output updates and state write. It is also charged once
+// for the terminal transition. Decode, segment classification, range-search
+// and token traversal work remain separate published counters.
+const TRANSITION_CLASS_WORK: usize = 8;
+const TRANSITION_STATE_WORK: usize = 8;
+const TRANSITION_ACTION_WORK: usize = 32;
+const TRANSITION_WORK: usize =
+    TRANSITION_CLASS_WORK + TRANSITION_STATE_WORK + TRANSITION_ACTION_WORK;
 const EXECUTION_TERMINAL_TRANSITIONS: usize = 1;
 const EXECUTION_SCRATCH_BYTES: usize = 512;
 
@@ -1495,30 +1499,30 @@ enum ScalarClass {
 
 impl ScalarClass {
     fn from_roles(roles: u32) -> Self {
-        for (role, class) in [
-            (GraphemeScalarClassRole::Cr, Self::Cr),
-            (GraphemeScalarClassRole::Lf, Self::Lf),
-            (GraphemeScalarClassRole::Control, Self::Control),
-            (GraphemeScalarClassRole::Prepend, Self::Prepend),
-            (GraphemeScalarClassRole::L, Self::L),
-            (GraphemeScalarClassRole::V, Self::V),
-            (GraphemeScalarClassRole::Lv, Self::Lv),
-            (GraphemeScalarClassRole::Lvt, Self::Lvt),
-            (GraphemeScalarClassRole::T, Self::T),
-            (GraphemeScalarClassRole::Ri, Self::Ri),
-            (GraphemeScalarClassRole::Extend, Self::Extend),
-            (GraphemeScalarClassRole::Zwj, Self::Zwj),
-            (GraphemeScalarClassRole::SpacingMark, Self::SpacingMark),
-            (
-                GraphemeScalarClassRole::ExtendedPictographic,
-                Self::ExtendedPictographic,
-            ),
-        ] {
-            if roles & role.bit() != 0 {
-                return class;
-            }
+        let gcb = roles & GCB_MASK;
+        if gcb != 0 {
+            return match gcb.trailing_zeros() {
+                0 => Self::Cr,
+                1 => Self::Lf,
+                2 => Self::Control,
+                3 => Self::Prepend,
+                4 => Self::L,
+                5 => Self::V,
+                6 => Self::Lv,
+                7 => Self::Lvt,
+                8 => Self::T,
+                9 => Self::Ri,
+                10 => Self::Extend,
+                11 => Self::Zwj,
+                12 => Self::SpacingMark,
+                _ => Self::Other,
+            };
         }
-        Self::Other
+        if roles & GraphemeScalarClassRole::ExtendedPictographic.bit() != 0 {
+            Self::ExtendedPictographic
+        } else {
+            Self::Other
+        }
     }
 
     const fn is_tail(self) -> bool {
@@ -1567,7 +1571,6 @@ impl ClusterState {
 
     const fn accept(self, class: ScalarClass) -> Option<Self> {
         match self {
-            Self::Empty => None,
             Self::Cr if matches!(class, ScalarClass::Lf) => Some(Self::Closed),
             Self::Prepend if matches!(class, ScalarClass::Prepend) => Some(Self::Prepend),
             Self::Prepend if class.is_generic_core() => Some(Self::start(class)),
@@ -1577,13 +1580,11 @@ impl ClusterState {
             }
             Self::HangulL if matches!(class, ScalarClass::Lvt) => Some(Self::HangulT),
             Self::HangulV if matches!(class, ScalarClass::V) => Some(Self::HangulV),
-            Self::HangulV if matches!(class, ScalarClass::T) => Some(Self::HangulT),
-            Self::HangulT if matches!(class, ScalarClass::T) => Some(Self::HangulT),
+            Self::HangulV | Self::HangulT if matches!(class, ScalarClass::T) => Some(Self::HangulT),
             Self::RiOne if matches!(class, ScalarClass::Ri) => Some(Self::RiPair),
-            Self::ExtendedPictographic if matches!(class, ScalarClass::Extend) => {
-                Some(Self::ExtendedPictographicExtend)
-            }
-            Self::ExtendedPictographicExtend if matches!(class, ScalarClass::Extend) => {
+            Self::ExtendedPictographic | Self::ExtendedPictographicExtend
+                if matches!(class, ScalarClass::Extend) =>
+            {
                 Some(Self::ExtendedPictographicExtend)
             }
             Self::ExtendedPictographic | Self::ExtendedPictographicExtend
@@ -1965,8 +1966,8 @@ mod tests {
         BuildAccounting, BuildError, BuildLimits, BuildPreflight, EXECUTION_SCRATCH_BYTES, Event,
         GraphemeScalarClassRole as Role, GraphemeScalarDfaPlan, Operation, ReduceActualCounters,
         ReduceError, ReduceLimits, ReduceUpperBounds, RoleSegment, admitted_build_preflight,
-        build_memory_bounds, prospective_build_work, reconcile_actual, reduce_upper_bounds,
-        sort_comparison_bound,
+        build_memory_bounds, enforce_upper_bounds, prospective_build_work, reconcile_actual,
+        reduce_upper_bounds, sort_comparison_bound,
     };
 
     #[derive(Clone, Copy)]
@@ -2568,6 +2569,36 @@ mod tests {
         ] {
             assert_eq!(reduce_upper_bounds(input_bytes, build).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn large_input_transition_bound_is_exact_and_one_below() {
+        const INPUT_BYTES: usize = 7_384_531;
+        const PUBLIC_WORK_CAP: usize = 536_870_912;
+        let build = BuildAccounting {
+            binary_search_comparisons_per_scalar: 11,
+            ..plan().build_accounting()
+        };
+        let upper = reduce_upper_bounds(INPUT_BYTES, build).unwrap();
+        assert_eq!(upper.role_probes, INPUT_BYTES + 1);
+        assert_eq!(upper.branch_checks, 0);
+        assert_eq!(upper.repetition_tests, 0);
+        assert_eq!(upper.work, 479_994_564);
+        assert!(upper.work <= PUBLIC_WORK_CAP);
+
+        let exact = exact_reduce_limits(upper);
+        enforce_upper_bounds(upper, Operation::Count, exact).unwrap();
+        let one_below = ReduceLimits {
+            max_work: upper.work - 1,
+            ..exact
+        };
+        assert_eq!(
+            enforce_upper_bounds(upper, Operation::Count, one_below),
+            Err(ReduceError::WorkLimit {
+                needed: upper.work,
+                limit: upper.work - 1,
+            })
+        );
     }
 
     #[test]
