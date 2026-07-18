@@ -3114,9 +3114,7 @@ fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
 fn active_capture_required_literal_plan(
     regex: &CaptureRegex,
 ) -> Option<&CaptureRequiredLiteralPlan> {
-    let plan = regex.required_literal_plan()?;
-    let accounting = plan.build_report().accounting;
-    (accounting.needles >= 2 && accounting.minimum_needle_bytes >= 2).then_some(plan)
+    regex.required_literal_plan()
 }
 
 fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
@@ -8667,6 +8665,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn required_literal_activation_uses_only_the_effective_antichain() {
+        let haystack = b"AB\nXAB\nCD\nmiss";
+        for pattern in ["(?:(AB)|(AB))", "(?:(AB)|(XAB))"] {
+            let upstream = rust_compile_options(&[pattern.to_string()], false, false)
+                .expect("pinned Rust redundant capture pattern");
+            let expected =
+                grep_captures(&upstream, haystack, u64::MAX).expect("Rust redundant grep-captures");
+            let lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("redundant any-literal set falls back to capture route");
+            assert_ne!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("fallback execution"),
+                expected
+            );
+        }
+
+        let distinct = "(?:(AB)|(CD))";
+        let upstream = rust_compile_options(&[distinct.to_string()], false, false)
+            .expect("pinned Rust distinct capture pattern");
+        let expected =
+            grep_captures(&upstream, haystack, u64::MAX).expect("Rust distinct grep-captures");
+        let active = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            distinct,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("distinct effective antichain lifecycle");
+        assert_eq!(active.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(
+            active.execute(haystack).expect("prefilter execution"),
+            expected
+        );
+
+        let refused_limits = RunLimits {
+            fre_literal_build_needle_bytes: 3,
+            ..RunLimits::default()
+        };
+        let fallback = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            distinct,
+            false,
+            false,
+            haystack.len(),
+            refused_limits,
+        )
+        .expect("optional effective-set refusal preserves capture lifecycle");
+        assert_ne!(fallback.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(
+            fallback
+                .execute(haystack)
+                .expect("resource fallback execution"),
+            expected
+        );
     }
 
     #[test]
