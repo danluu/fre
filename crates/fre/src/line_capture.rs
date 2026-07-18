@@ -14,7 +14,7 @@ pub const SPACE_AROUND_OPERATOR_CAPTURE_PATTERN: &str = r"[^,\s](\s*)(?:[-+*/|!<
 /// Exact source spelling for Ruff's start-anchored shebang capture row.
 pub const SHEBANG_CAPTURE_PATTERN: &str = r"^(?P<spaces>\s*)#!(?P<directive>.*)";
 /// Exact source spelling for Ruff's whole-line string quote-prefix capture row.
-pub const STRING_QUOTE_PREFIX_CAPTURE_PATTERN: &str = r#"^(?i)[urb]*['\"](?P<raw>.*)['\"]$"#;
+pub const STRING_QUOTE_PREFIX_CAPTURE_PATTERN: &str = r#"^(?i)[urb]*['"](?P<raw>.*)['"]$"#;
 /// Exact source spelling for Ruff's whitespace-delimited Python-keyword row.
 pub const WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN: &str = r"(\s*)\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b(\s*)";
 
