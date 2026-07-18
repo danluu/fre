@@ -5,7 +5,7 @@
 //! isolation. It recognizes three exact HIRs; it is not a general regular
 //! expression optimizer.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 use std::sync::Arc;
 
 use fre_syntax::{
@@ -20,6 +20,24 @@ pub const NOQA_ASCII_LEADING_PLAN_ID: &str = "capture-noqa-ascii-leading-v1";
 pub const NOQA_ASCII_NO_LEADING_PLAN_ID: &str = "capture-noqa-ascii-no-leading-v1";
 /// Stable plan identity for the Unicode-leading pinned HIR.
 pub const NOQA_UNICODE_LEADING_PLAN_ID: &str = "capture-noqa-unicode-leading-v1";
+
+const ASCII_LEADING_SOURCE: &str =
+    r"(\s*)((?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?)";
+const ASCII_NO_LEADING_SOURCE: &str =
+    r"(?:# [Nn][Oo][Qq][Aa])(?::\s?(([A-Z]+[0-9]+(?:[,\s]+)?)+))?";
+const UNICODE_LEADING_SOURCE: &str =
+    r"(?P<spaces>\s*)(?P<noqa>(?i:# noqa)(?::\s?(?P<codes>([A-Z]+[0-9]+(?:[,\s]+)?)+))?)";
+
+// The zero-allocation source/profile prefilter below restricts parsing to
+// three fixed inputs under one pinned constructor. For those inputs the
+// largest canonical syntax receipt has 153 parse-work units. Charging 4 KiB
+// per unit plus a fixed 64 KiB parser envelope deliberately dominates every
+// source, AST/HIR, class-range, capture-name and traversal-stack allocation in
+// the audited regex-syntax 0.8.11 construction. Retained CacheKey/Arc bytes are
+// then added separately into one cumulative preflight checked before parsing.
+const SYNTAX_ALLOCATION_BYTES_PER_WORK: usize = 4_096;
+const SYNTAX_ALLOCATION_FIXED_BYTES: usize = 64 * 1_024;
+const DEFAULT_MAX_BUILD_ALLOCATION_BYTES: usize = 1_048_576;
 
 const ASCII_SPACE_RANGES: &[(u32, u32)] = &[(0x09, 0x0D), (0x20, 0x20)];
 const UNICODE_SPACE_RANGES: &[(u32, u32)] = &[
@@ -92,6 +110,64 @@ impl NoqaVariant {
             Self::UnicodeLeading => NOQA_UNICODE_LEADING_PLAN_ID,
         }
     }
+
+    const fn source_shape(self) -> ExactSourceShape {
+        match self {
+            Self::AsciiLeading => ExactSourceShape {
+                source_bytes: 66,
+                hir_nodes: 27,
+                parse_work: 113,
+                literal_bytes: 3,
+                class_ranges: 17,
+                captures: 4,
+                repetitions: 8,
+            },
+            Self::AsciiNoLeading => ExactSourceShape {
+                source_bytes: 59,
+                hir_nodes: 22,
+                parse_work: 99,
+                literal_bytes: 3,
+                class_ranges: 15,
+                captures: 2,
+                repetitions: 7,
+            },
+            Self::UnicodeLeading => ExactSourceShape {
+                source_bytes: 82,
+                hir_nodes: 27,
+                parse_work: 153,
+                literal_bytes: 3,
+                class_ranges: 41,
+                captures: 4,
+                repetitions: 8,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactSourceShape {
+    source_bytes: usize,
+    hir_nodes: usize,
+    parse_work: usize,
+    literal_bytes: usize,
+    class_ranges: usize,
+    captures: usize,
+    repetitions: usize,
+}
+
+fn exact_source_variant(pattern: &str, profile: &RustProfile) -> Option<NoqaVariant> {
+    if profile.options.case_insensitive {
+        return None;
+    }
+    let variant = match (pattern, profile.options.unicode) {
+        (ASCII_LEADING_SOURCE, false) => Some(NoqaVariant::AsciiLeading),
+        (ASCII_NO_LEADING_SOURCE, false) => Some(NoqaVariant::AsciiNoLeading),
+        (UNICODE_LEADING_SOURCE, true) => Some(NoqaVariant::UnicodeLeading),
+        _ => None,
+    }?;
+    let mut expected = RustProfile::rebar_1_12_4();
+    expected.options.unicode = profile.options.unicode;
+    (profile == &expected).then_some(variant)
 }
 
 /// Exact construction budget for HIR inspection.
@@ -103,6 +179,9 @@ pub struct NoqaBuildLimits {
     pub syntax_safety: SafetyEnvelope,
     /// Maximum exact-HIR inspection work.
     pub max_work: usize,
+    /// Maximum cumulative FRE-owned construction allocation bytes. The exact
+    /// source/profile prefilter checks this before parsing allocates.
+    pub max_allocation_bytes: usize,
 }
 
 impl Default for NoqaBuildLimits {
@@ -111,6 +190,7 @@ impl Default for NoqaBuildLimits {
             admission: AdmissionPolicy::default(),
             syntax_safety: SafetyEnvelope::default(),
             max_work: 4_096,
+            max_allocation_bytes: DEFAULT_MAX_BUILD_ALLOCATION_BYTES,
         }
     }
 }
@@ -128,6 +208,21 @@ pub struct NoqaBuildAccounting {
     pub class_ranges: usize,
 }
 
+/// Cumulative construction-allocation preflight and observed logical receipt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoqaBuildAllocationAccounting {
+    /// Conservative parser/temporary allocation envelope.
+    pub syntax_temporary_bytes_bound: usize,
+    /// Retained source, CacheKey/Arc and inline published-plan bytes.
+    pub retained_bytes_bound: usize,
+    /// Single cumulative prospective charge enforced before the first parse
+    /// allocation.
+    pub cumulative_bytes_bound: usize,
+    /// Logical bytes observed from the retained source capacity and canonical
+    /// HIR receipt after parsing. This must not exceed the prospective charge.
+    pub observed_logical_bytes: usize,
+}
+
 /// Prospective HIR inspection refusal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NoqaBuildError {
@@ -137,6 +232,9 @@ pub enum NoqaBuildError {
     Unsupported,
     /// Exact structural inspection exceeded its prospective limit.
     WorkLimit { required: usize, limit: usize },
+    /// Cumulative construction allocation bytes exceeded their prospective
+    /// limit before parsing or publication allocated.
+    AllocationLimit { required: usize, limit: usize },
     /// Checked structural accounting overflowed.
     Overflow,
     /// Facade invariant failure.
@@ -152,6 +250,10 @@ impl fmt::Display for NoqaBuildError {
                 formatter,
                 "noqa HIR inspection needs {required} work, limit is {limit}"
             ),
+            Self::AllocationLimit { required, limit } => write!(
+                formatter,
+                "noqa construction needs {required} allocation bytes, limit is {limit}"
+            ),
             Self::Overflow => formatter.write_str("noqa HIR inspection accounting overflowed"),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "noqa facade invariant failed: {detail}")
@@ -166,6 +268,7 @@ impl std::error::Error for NoqaBuildError {
             Self::Syntax(error) => Some(error),
             Self::Unsupported
             | Self::WorkLimit { .. }
+            | Self::AllocationLimit { .. }
             | Self::Overflow
             | Self::InternalInvariant(_) => None,
         }
@@ -192,24 +295,145 @@ pub struct NoqaBuildReport {
     pub syntax: ParseSummary,
     /// Exact-HIR inspection accounting.
     pub inspection: NoqaBuildAccounting,
+    /// Cumulative pre-allocation construction accounting.
+    pub allocation: NoqaBuildAllocationAccounting,
     /// Source-distinct plan identity.
     pub plan_identity: NoqaPlanIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "all three values are byte dimensions at distinct build lifetimes"
+)]
+struct BuildAllocationPreflight {
+    syntax_temporary_bytes: usize,
+    retained_bytes: usize,
+    cumulative_bytes: usize,
+}
+
+impl BuildAllocationPreflight {
+    fn for_variant(variant: NoqaVariant) -> Result<Self, NoqaBuildError> {
+        let shape = variant.source_shape();
+        let syntax_temporary_bytes = shape
+            .parse_work
+            .checked_mul(SYNTAX_ALLOCATION_BYTES_PER_WORK)
+            .and_then(|bytes| bytes.checked_add(SYNTAX_ALLOCATION_FIXED_BYTES))
+            .ok_or(NoqaBuildError::Overflow)?;
+        let arc_block_bytes = cache_key_arc_bytes()?;
+        let retained_bytes = shape
+            .source_bytes
+            .checked_add(arc_block_bytes)
+            .and_then(|bytes| bytes.checked_add(size_of::<NoqaGrepCaptureRegex>()))
+            .ok_or(NoqaBuildError::Overflow)?;
+        let cumulative_bytes = syntax_temporary_bytes
+            .checked_add(retained_bytes)
+            .ok_or(NoqaBuildError::Overflow)?;
+        Ok(Self {
+            syntax_temporary_bytes,
+            retained_bytes,
+            cumulative_bytes,
+        })
+    }
+
+    fn enforce(self, limit: usize) -> Result<(), NoqaBuildError> {
+        if self.cumulative_bytes > limit {
+            return Err(NoqaBuildError::AllocationLimit {
+                required: self.cumulative_bytes,
+                limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        variant: NoqaVariant,
+        syntax: &ParseSummary,
+        key: &CacheKey,
+    ) -> Result<NoqaBuildAllocationAccounting, NoqaBuildError> {
+        let shape = variant.source_shape();
+        if usize::try_from(syntax.hir_nodes) != Ok(shape.hir_nodes)
+            || usize::try_from(syntax.parse_work) != Ok(shape.parse_work)
+            || usize::try_from(syntax.literal_bytes) != Ok(shape.literal_bytes)
+            || usize::try_from(syntax.class_ranges) != Ok(shape.class_ranges)
+            || usize::try_from(syntax.captures) != Ok(shape.captures)
+            || usize::try_from(syntax.repetitions) != Ok(shape.repetitions)
+        {
+            return Err(NoqaBuildError::InternalInvariant(
+                "exact source produced an unaudited syntax allocation shape",
+            ));
+        }
+        if key.pattern.as_bytes().len() != shape.source_bytes {
+            return Err(NoqaBuildError::InternalInvariant(
+                "retained exact source length changed during parsing",
+            ));
+        }
+        let hir_bytes = shape
+            .hir_nodes
+            .checked_mul(size_of::<Hir>())
+            .ok_or(NoqaBuildError::Overflow)?;
+        let range_bytes = shape
+            .class_ranges
+            .checked_mul(size_of::<(u32, u32)>())
+            .ok_or(NoqaBuildError::Overflow)?;
+        let traversal_bytes = shape
+            .parse_work
+            .checked_mul(size_of::<usize>())
+            .ok_or(NoqaBuildError::Overflow)?;
+        let arc_block_bytes = cache_key_arc_bytes()?;
+        let observed_logical_bytes = checked_build_sum(&[
+            key.pattern.capacity_bytes(),
+            hir_bytes,
+            range_bytes,
+            shape.literal_bytes,
+            traversal_bytes,
+            arc_block_bytes,
+            size_of::<NoqaGrepCaptureRegex>(),
+        ])?;
+        if observed_logical_bytes > self.cumulative_bytes {
+            return Err(NoqaBuildError::InternalInvariant(
+                "observed construction allocation model exceeded preflight",
+            ));
+        }
+        Ok(NoqaBuildAllocationAccounting {
+            syntax_temporary_bytes_bound: self.syntax_temporary_bytes,
+            retained_bytes_bound: self.retained_bytes,
+            cumulative_bytes_bound: self.cumulative_bytes,
+            observed_logical_bytes,
+        })
+    }
+}
+
+fn cache_key_arc_bytes() -> Result<usize, NoqaBuildError> {
+    let header = size_of::<usize>()
+        .checked_mul(2)
+        .ok_or(NoqaBuildError::Overflow)?;
+    size_of::<CacheKey>()
+        .checked_add(header)
+        .ok_or(NoqaBuildError::Overflow)
+}
+
+fn checked_build_sum(values: &[usize]) -> Result<usize, NoqaBuildError> {
+    values.iter().try_fold(0_usize, |sum, value| {
+        sum.checked_add(*value).ok_or(NoqaBuildError::Overflow)
+    })
+}
+
 /// Builder for the exact pinned `# noqa` grep-capture reducer.
 #[derive(Clone, Debug)]
-pub struct NoqaGrepCaptureBuilder {
-    pattern: String,
+pub struct NoqaGrepCaptureBuilder<'a> {
+    pattern: &'a str,
     profile: RustProfile,
     limits: NoqaBuildLimits,
 }
 
-impl NoqaGrepCaptureBuilder {
+impl<'a> NoqaGrepCaptureBuilder<'a> {
     /// Start from the pinned Rust byte profile.
     #[must_use]
-    pub fn new(pattern: impl Into<String>) -> Self {
+    pub fn new(pattern: &'a str) -> Self {
         Self {
-            pattern: pattern.into(),
+            pattern,
             profile: RustProfile::default(),
             limits: NoqaBuildLimits::default(),
         }
@@ -246,6 +470,14 @@ impl NoqaGrepCaptureBuilder {
     /// Parse and recognize exactly one of the three certified HIRs.
     pub fn build(self) -> Result<NoqaGrepCaptureRegex, NoqaBuildError> {
         let limits = self.limits;
+        // Borrowed exact-source/profile selection performs no allocation. A
+        // near miss therefore falls through before this route constructs any
+        // owned syntax, and an exact source has one complete cumulative byte
+        // charge checked before its first parse allocation.
+        let source_variant =
+            exact_source_variant(self.pattern, &self.profile).ok_or(NoqaBuildError::Unsupported)?;
+        let allocation_preflight = BuildAllocationPreflight::for_variant(source_variant)?;
+        allocation_preflight.enforce(limits.max_allocation_bytes)?;
         let profile = CompatibilityProfile::RustBytes(self.profile);
         let parsed = fre_syntax::parse(
             fre_syntax::ParseRequest::rust(self.pattern, profile)
@@ -253,7 +485,6 @@ impl NoqaGrepCaptureBuilder {
                 .with_safety_envelope(limits.syntax_safety),
         )
         .map_err(NoqaBuildError::Syntax)?;
-        let syntax_key = Arc::new(parsed.key);
         let admission = parsed.admission_status;
         let syntax = parsed.summary;
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
@@ -263,6 +494,13 @@ impl NoqaGrepCaptureBuilder {
         };
         let plan = NoqaPlan::inspect(&rust.hir, limits)?.ok_or(NoqaBuildError::Unsupported)?;
         let variant = plan.variant();
+        if variant != source_variant {
+            return Err(NoqaBuildError::InternalInvariant(
+                "exact source and exact HIR selected different noqa routes",
+            ));
+        }
+        let allocation = allocation_preflight.finish(variant, &syntax, &parsed.key)?;
+        let syntax_key = Arc::new(parsed.key);
         let plan_identity = NoqaPlanIdentity {
             syntax: syntax_key,
             variant,
@@ -272,6 +510,7 @@ impl NoqaGrepCaptureBuilder {
             admission,
             syntax,
             inspection: plan.build_accounting(),
+            allocation,
             plan_identity,
         };
         Ok(NoqaGrepCaptureRegex {
@@ -392,11 +631,14 @@ impl NoqaPlan {
 
         let mut actual = NoqaActualCounters {
             lines: census.lines,
+            census_bytes: census.scanned_bytes,
             ..NoqaActualCounters::default()
         };
-        for_each_line(haystack, |line| {
+        let mut traversal_bytes = 0_usize;
+        for_each_line_accounted(haystack, &mut traversal_bytes, |line| {
             reduce_line(self.variant, line, &mut actual)
         })?;
+        actual.line_traversal_bytes = traversal_bytes;
         let capture_count = actual.capture_count;
         Ok(NoqaRunOutcome {
             capture_count,
@@ -523,6 +765,10 @@ impl NoqaUpperBounds {
 /// Scalar actual counters. The reducer owns no dynamic scratch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NoqaActualCounters {
+    /// Bytes read by the complete line census.
+    pub census_bytes: usize,
+    /// Bytes read by the second delimiter traversal.
+    pub line_traversal_bytes: usize,
     /// Lines visited.
     pub lines: usize,
     /// Literal-scan positions visited.
@@ -565,27 +811,30 @@ pub struct NoqaRunOutcome {
 struct LineCensus {
     bytes: usize,
     lines: usize,
+    scanned_bytes: usize,
 }
 
 fn census_lines(haystack: &[u8]) -> Result<LineCensus, NoqaRunError> {
     let mut start = 0_usize;
     let mut bytes = 0_usize;
     let mut lines = 0_usize;
+    let mut scanned_bytes = 0_usize;
+    let mut previous_was_cr = false;
     for (index, byte) in haystack.iter().copied().enumerate() {
+        scanned_bytes = add(scanned_bytes, 1)?;
         if byte != b'\n' {
+            previous_was_cr = byte == b'\r';
             continue;
         }
         let raw_length = index.checked_sub(start).ok_or(NoqaRunError::Overflow)?;
-        let preceding = index
-            .checked_sub(1)
-            .and_then(|previous| haystack.get(previous));
-        let stripped = usize::from(raw_length > 0 && preceding == Some(&b'\r'));
+        let stripped = usize::from(raw_length > 0 && previous_was_cr);
         let line_bytes = raw_length
             .checked_sub(stripped)
             .ok_or(NoqaRunError::Overflow)?;
         bytes = add(bytes, line_bytes)?;
         lines = add(lines, 1)?;
         start = add(index, 1)?;
+        previous_was_cr = false;
     }
     if start < haystack.len() {
         let trailing = haystack
@@ -595,7 +844,11 @@ fn census_lines(haystack: &[u8]) -> Result<LineCensus, NoqaRunError> {
         bytes = add(bytes, trailing)?;
         lines = add(lines, 1)?;
     }
-    Ok(LineCensus { bytes, lines })
+    Ok(LineCensus {
+        bytes,
+        lines,
+        scanned_bytes,
+    })
 }
 
 fn upper_bounds(
@@ -604,7 +857,8 @@ fn upper_bounds(
     census: LineCensus,
 ) -> Result<NoqaUpperBounds, NoqaRunError> {
     let candidates = census.bytes / 2;
-    // Manual literal scan: <=2B byte checks. Case checks: <=4C. The
+    // The census and delimiter traversal each read exactly N bytes. Manual
+    // literal scan: <=2B byte checks. Case checks: <=4C. The
     // remaining route-specific replay bounds are ASCII-leading <=5B,
     // ASCII-no-leading <=3B, and Unicode-leading <=9B. Reducer/control is
     // <=2C+2. Sequential accounting charges the corresponding byte visits.
@@ -613,14 +867,15 @@ fn upper_bounds(
         NoqaVariant::AsciiNoLeading => (5, 3),
         NoqaVariant::UnicodeLeading => (11, 8),
     };
+    let line_pass_bytes = mul(haystack_bytes, 2)?;
     let work = checked_sum(&[
-        haystack_bytes,
+        line_pass_bytes,
         mul(census.bytes, work_bytes_factor)?,
         mul(candidates, 6)?,
         2,
     ])?;
     let sequential_bytes = checked_sum(&[
-        haystack_bytes,
+        line_pass_bytes,
         mul(census.bytes, sequential_bytes_factor)?,
         mul(candidates, 4)?,
     ])?;
@@ -638,21 +893,38 @@ fn upper_bounds(
     })
 }
 
+#[cfg(test)]
 fn for_each_line(
     haystack: &[u8],
+    visit: impl FnMut(&[u8]) -> Result<(), NoqaRunError>,
+) -> Result<(), NoqaRunError> {
+    let mut scanned_bytes = 0_usize;
+    for_each_line_accounted(haystack, &mut scanned_bytes, visit)
+}
+
+fn for_each_line_accounted(
+    haystack: &[u8],
+    scanned_bytes: &mut usize,
     mut visit: impl FnMut(&[u8]) -> Result<(), NoqaRunError>,
 ) -> Result<(), NoqaRunError> {
     let mut start = 0_usize;
     while start < haystack.len() {
         let mut end = start;
-        while end < haystack.len() && haystack[end] != b'\n' {
+        let mut previous_was_cr = false;
+        while end < haystack.len() {
+            let byte = haystack[end];
+            *scanned_bytes = add(*scanned_bytes, 1)?;
+            if byte == b'\n' {
+                break;
+            }
+            previous_was_cr = byte == b'\r';
             end = add(end, 1)?;
         }
         let mut content_end = end;
         let previous = content_end
             .checked_sub(1)
             .filter(|_| end < haystack.len() && content_end > start);
-        if previous.and_then(|index| haystack.get(index)) == Some(&b'\r') {
+        if previous_was_cr {
             content_end = previous.ok_or(NoqaRunError::Overflow)?;
         }
         visit(&haystack[start..content_end])?;
@@ -1316,6 +1588,61 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_build_allocation_preflight_is_exact_and_near_misses_are_free() {
+        for (pattern, unicode) in [(REAL, false), (TWEAKED, false), (WILD, true)] {
+            let admitted = regex(pattern, unicode);
+            let allocation = admitted.build_report().allocation;
+            assert!(allocation.observed_logical_bytes <= allocation.cumulative_bytes_bound);
+            assert_eq!(
+                allocation.cumulative_bytes_bound,
+                allocation
+                    .syntax_temporary_bytes_bound
+                    .checked_add(allocation.retained_bytes_bound)
+                    .expect("allocation sum fits")
+            );
+
+            NoqaGrepCaptureBuilder::new(pattern)
+                .profile(RustProfile::rebar_1_12_4())
+                .unicode(unicode)
+                .limits(NoqaBuildLimits {
+                    max_allocation_bytes: allocation.cumulative_bytes_bound,
+                    ..NoqaBuildLimits::default()
+                })
+                .build()
+                .expect("exact cumulative allocation limit admits");
+            let one_below = allocation.cumulative_bytes_bound - 1;
+            assert_eq!(
+                NoqaGrepCaptureBuilder::new(pattern)
+                    .profile(RustProfile::rebar_1_12_4())
+                    .unicode(unicode)
+                    .limits(NoqaBuildLimits {
+                        max_allocation_bytes: one_below,
+                        ..NoqaBuildLimits::default()
+                    })
+                    .build()
+                    .unwrap_err(),
+                NoqaBuildError::AllocationLimit {
+                    required: allocation.cumulative_bytes_bound,
+                    limit: one_below,
+                }
+            );
+        }
+
+        assert_eq!(
+            NoqaGrepCaptureBuilder::new(r"# [Nn][Oo][Qq][Bb]")
+                .profile(RustProfile::rebar_1_12_4())
+                .unicode(false)
+                .limits(NoqaBuildLimits {
+                    max_allocation_bytes: 0,
+                    ..NoqaBuildLimits::default()
+                })
+                .build()
+                .unwrap_err(),
+            NoqaBuildError::Unsupported
+        );
+    }
+
+    #[test]
     fn empty_has_no_lines_and_zero_bounds() {
         for (pattern, unicode) in [(REAL, false), (TWEAKED, false), (WILD, true)] {
             let outcome = regex(pattern, unicode)
@@ -1331,6 +1658,52 @@ mod tests {
                 .expect("empty input is free");
             assert_eq!(outcome.capture_count, 0);
             assert_eq!(outcome.report.bounds, NoqaUpperBounds::ZERO);
+        }
+    }
+
+    #[test]
+    fn delimiter_only_line_passes_are_cumulative_and_exact() {
+        let regex = regex(WILD, true);
+        for (haystack, expected_line_bytes, expected_lines) in [
+            (b"\n\n".as_slice(), 0_usize, 2_usize),
+            (b"\r\n".as_slice(), 0_usize, 1_usize),
+            (b"\xFF\r\n\x80".as_slice(), 2_usize, 2_usize),
+        ] {
+            let admitted = regex
+                .count_captures(haystack, NoqaRunLimits::default())
+                .expect("delimiter-only fixture fits");
+            let bounds = admitted.report.bounds;
+            assert_eq!(bounds.haystack_bytes, haystack.len());
+            assert_eq!(bounds.line_bytes, expected_line_bytes);
+            assert_eq!(bounds.lines, expected_lines);
+            if expected_line_bytes == 0 {
+                assert_eq!(bounds.sequential_bytes, haystack.len() * 2);
+            }
+            assert_eq!(admitted.report.actual.census_bytes, haystack.len());
+            assert_eq!(admitted.report.actual.line_traversal_bytes, haystack.len());
+
+            let exact = NoqaRunLimits {
+                max_sequential_bytes: bounds.sequential_bytes,
+                ..NoqaRunLimits::default()
+            };
+            regex
+                .count_captures(haystack, exact)
+                .expect("exact cumulative sequential limit admits");
+            let one_below = bounds.sequential_bytes - 1;
+            assert_eq!(
+                regex.count_captures(
+                    haystack,
+                    NoqaRunLimits {
+                        max_sequential_bytes: one_below,
+                        ..NoqaRunLimits::default()
+                    },
+                ),
+                Err(NoqaRunError::Resource {
+                    resource: NoqaResource::SequentialBytes,
+                    required: bounds.sequential_bytes,
+                    limit: one_below,
+                })
+            );
         }
     }
 
@@ -1421,7 +1794,8 @@ mod tests {
         let path = std::env::var_os("FRE_NOQA_HARD_CORPUS")
             .expect("FRE_NOQA_HARD_CORPUS names the authenticated raw corpus");
         let haystack = std::fs::read(path).expect("hard corpus is readable");
-        let outcome = regex(WILD, true)
+        let regex = regex(WILD, true);
+        let outcome = regex
             .count_captures(&haystack, NoqaRunLimits::default())
             .expect("hard corpus stays inside locked ceilings");
         assert_eq!(outcome.capture_count, 84);
@@ -1434,11 +1808,48 @@ mod tests {
                 line_bytes: 31_623_613,
                 lines: 890_906,
                 literal_candidates: 15_811_806,
-                work: 475_245_107,
-                sequential_bytes: 348_750_654,
+                work: 507_759_633,
+                sequential_bytes: 381_265_180,
                 capture_events: 79_949_936,
                 capture_count: 79_059_030,
             }
         );
+        let bounds = outcome.report.bounds;
+        assert_eq!(outcome.report.actual.census_bytes, haystack.len());
+        assert_eq!(outcome.report.actual.line_traversal_bytes, haystack.len());
+        regex
+            .count_captures(
+                &haystack,
+                NoqaRunLimits {
+                    max_work: bounds.work,
+                    max_sequential_bytes: bounds.sequential_bytes,
+                    max_capture_events: bounds.capture_events,
+                    max_capture_count: bounds.capture_count,
+                },
+            )
+            .expect("all exact hard limits admit");
+        for (resource, required) in [
+            (NoqaResource::Work, bounds.work),
+            (NoqaResource::SequentialBytes, bounds.sequential_bytes),
+            (NoqaResource::CaptureEvents, bounds.capture_events),
+            (NoqaResource::CaptureCount, bounds.capture_count),
+        ] {
+            let one_below = required - 1;
+            let mut limits = NoqaRunLimits::default();
+            match resource {
+                NoqaResource::Work => limits.max_work = one_below,
+                NoqaResource::SequentialBytes => limits.max_sequential_bytes = one_below,
+                NoqaResource::CaptureEvents => limits.max_capture_events = one_below,
+                NoqaResource::CaptureCount => limits.max_capture_count = one_below,
+            }
+            assert_eq!(
+                regex.count_captures(&haystack, limits),
+                Err(NoqaRunError::Resource {
+                    resource,
+                    required,
+                    limit: one_below,
+                })
+            );
+        }
     }
 }

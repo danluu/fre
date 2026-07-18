@@ -3219,7 +3219,9 @@ fn noqa_grep_capture_regex_one(
     match regex {
         Ok(regex) => Ok(Some(regex)),
         Err(NoqaBuildError::Syntax(_) | NoqaBuildError::Unsupported) => Ok(None),
-        Err(error @ NoqaBuildError::WorkLimit { .. }) => Err(ExecutionError::unsupported(format!(
+        Err(
+            error @ (NoqaBuildError::WorkLimit { .. } | NoqaBuildError::AllocationLimit { .. }),
+        ) => Err(ExecutionError::unsupported(format!(
             "FRE noqa grep-capture build refused input: {error}"
         ))),
         Err(error @ (NoqaBuildError::Overflow | NoqaBuildError::InternalInvariant(_))) => Err(

@@ -72,9 +72,10 @@ pub use aggregate_many::{
 };
 pub use capture_noqa::{
     NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,
-    NoqaActualCounters, NoqaBuildAccounting, NoqaBuildError, NoqaBuildLimits, NoqaBuildReport,
-    NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaPlanIdentity, NoqaResource, NoqaRunError,
-    NoqaRunLimits, NoqaRunOutcome, NoqaRunReport, NoqaUpperBounds, NoqaVariant,
+    NoqaActualCounters, NoqaBuildAccounting, NoqaBuildAllocationAccounting, NoqaBuildError,
+    NoqaBuildLimits, NoqaBuildReport, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex,
+    NoqaPlanIdentity, NoqaResource, NoqaRunError, NoqaRunLimits, NoqaRunOutcome, NoqaRunReport,
+    NoqaUpperBounds, NoqaVariant,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
