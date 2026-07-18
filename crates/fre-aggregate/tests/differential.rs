@@ -392,7 +392,7 @@ fn unicode_word_validation_scales_with_input_not_program_size() {
 }
 
 #[test]
-fn unicode_word_utf8_validation_is_prospectively_charged() {
+fn unicode_word_utf8_validation_limits_are_prospective() {
     let regex = compile_unicode_byte_stable(r"\b[a-z]+\b").unwrap();
     let haystack = b"alpha beta gamma delta";
     for strategy in STRATEGIES {
@@ -428,7 +428,12 @@ fn unicode_word_utf8_validation_is_prospectively_charged() {
             Resource::SequentialBytes,
         );
     }
+}
 
+#[test]
+fn observed_unicode_word_utf8_validation_has_exact_work_limits() {
+    let regex = compile_unicode_byte_stable(r"\b[a-z]+\b").unwrap();
+    let haystack = b"alpha beta gamma delta";
     let observed = regex
         .admit_spans_observed(
             haystack,
@@ -461,7 +466,11 @@ fn unicode_word_utf8_validation_is_prospectively_charged() {
         ),
         Resource::ExecutionWork,
     );
+}
 
+#[test]
+fn invalid_utf8_validation_obeys_prospective_limits() {
+    let regex = compile_unicode_byte_stable(r"\b[a-z]+\b").unwrap();
     let invalid = [b'a', 0xFF, b'b', b'c'];
     expect_exact_resource(
         regex.admit_count(
@@ -560,18 +569,20 @@ fn unicode_word_subranges_charge_full_haystack_with_range_precedence() {
         ),
         Err(Error::InvalidUtf8ForUnicodeWordBoundary)
     ));
+    let invalid_start = invalid_outside.len();
+    let invalid_end = invalid_start - 1;
     assert!(matches!(
         regex.admit_count(
             &invalid_outside,
-            3..2,
+            invalid_start..invalid_end,
             Strategy::FullTable,
             OperationLimits::default(),
         ),
         Err(Error::InvalidRange {
-            start: 3,
-            end: 2,
+            start,
+            end,
             haystack_len: 3,
-        })
+        }) if start == invalid_start && end == invalid_end
     ));
 }
 
