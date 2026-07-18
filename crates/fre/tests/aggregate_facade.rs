@@ -432,6 +432,7 @@ fn continuation_details(
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
+        | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::BoundedContext(_)

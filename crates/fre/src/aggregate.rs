@@ -17,31 +17,35 @@ use fre_kernels::{
     FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
-    LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateCountResult, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
-    LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
-    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
-    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
-    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
-    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
-    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
-    SparseOrderedLiteralSpanSumPlan, UnicodeScalarAggregateBuildAccounting,
-    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
-    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperationIdentity,
-    UnicodeScalarAggregatePlan, UnicodeScalarAggregateReduceAccounting,
-    UnicodeScalarAggregateReduceError, UnicodeScalarAggregateReduceLimits,
-    UnicodeScalarAggregateRepetition, UnicodeScalarAggregateSpanSumResult,
+    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
+    GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
+    GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
+    GraphemeScalarDfaRole, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateCountResult, LiteralAggregateOperationIdentity,
+    LiteralAggregatePlan, LiteralAggregateReduceAccounting, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
+    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
+    PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
+    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
+    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
+    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
+    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
+    UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
+    UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
+    UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
+    UnicodeScalarAggregateSpanSumResult,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -54,13 +58,13 @@ use regex_syntax::hir::{
 use crate::{
     AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
     AggregateExecutionAccounting, AggregateOperationCertificate, AggregateOperationLimits,
-    AggregatePlanId, BuildError, Match, finite, finite_root,
+    AggregatePlanId, BuildError, Match, finite, finite_root, grapheme_scalar,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 18;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 19;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -101,6 +105,8 @@ pub enum AggregatePlanKind {
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
     FixedClassSandwich,
+    /// Direct ordered scalar-property grammar with constant phase state.
+    GraphemeScalarDfa,
     /// Linear count reducer for a greedy bounded sequence of deterministic
     /// `HEAD BODY+ TRAIL*` byte-class units.
     BoundedClassSequence,
@@ -125,6 +131,8 @@ pub enum AggregatePlanIdentity {
     UnicodeScalar(AggregateUnicodeScalarIdentity),
     /// Fixed-width three-atom class sequence plus native reducer identity.
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
+    /// Ordered scalar-property grammar plus native reducer identity.
+    GraphemeScalarDfa(AggregateGraphemeScalarDfaIdentity),
     /// Unicode-off compound byte-class sequence plus count identity.
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
     /// Unicode-off two-branch prefix/class proof and native count identity.
@@ -234,6 +242,22 @@ pub struct AggregateFixedClassSandwichIdentity {
     pub kernel: FixedClassSandwichOperationIdentity,
 }
 
+/// Canonical-HIR proof attached to the ordered scalar reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateGraphemeScalarDfaSemantics {
+    /// Rust bytes with Unicode enabled and `utf8(false)`: captures are
+    /// transparent and HIR exactly proves the ordered CRLF/control/
+    /// Prepend-Hangul-RI-EP-tail/Any scalar grammar.
+    UnicodeOnOrderedScalarGrammarUtf8False,
+}
+
+/// Facade identity for the construction-selected ordered scalar reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateGraphemeScalarDfaIdentity {
+    pub semantics: AggregateGraphemeScalarDfaSemantics,
+    pub kernel: GraphemeScalarDfaOperationIdentity,
+}
+
 /// Facade identity for the Unicode-off two-branch prefix/class reducer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregatePrefixClassAlternationIdentity {
@@ -287,6 +311,8 @@ pub enum AggregateBuildAccounting {
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
     /// Bounded class-sandwich construction certificate.
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
+    /// Ordered scalar-property classifier construction certificate.
+    GraphemeScalarDfa(GraphemeScalarDfaBuildAccounting),
     /// Allocation-free bounded compound byte-class construction certificate.
     BoundedClassSequence(BoundedClassSequenceBuildAccounting),
     /// Two-branch prefix/class construction certificate.
@@ -324,6 +350,9 @@ pub struct AggregateBuildLimits {
     /// bounded-context selector so adding the specialization cannot consume a
     /// caller's previously sufficient bounded-context budget.
     pub max_bounded_affix_planner_work: usize,
+    /// Maximum structural HIR/range inspection work for the ordered scalar
+    /// grammar specialization.
+    pub max_grapheme_scalar_dfa_planner_work: usize,
     /// Maximum structural HIR/range/disjointness inspection work for bounded
     /// compound byte-class sequences. This separate quota preserves every
     /// request previously admitted at its exact fixed-sandwich limit.
@@ -341,6 +370,8 @@ pub struct AggregateBuildLimits {
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
     /// Complete bounded fixed-class construction limits.
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
+    /// Complete ordered scalar-grammar construction limits.
+    pub grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits,
     /// Complete inline bounded class-sequence construction limits.
     pub bounded_class_sequence: BoundedClassSequenceBuildLimits,
     /// Complete two-branch prefix/class construction limits.
@@ -362,6 +393,7 @@ impl Default for AggregateBuildLimits {
             max_unicode_scalar_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_affix_planner_work: 4_096,
+            max_grapheme_scalar_dfa_planner_work: 1 << 20,
             max_bounded_class_sequence_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
             max_bounded_context_planner_work: 4_096,
@@ -369,6 +401,7 @@ impl Default for AggregateBuildLimits {
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
+            grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             bounded_context: BoundedContextBuildLimits::default(),
@@ -388,6 +421,8 @@ pub struct AggregateRunLimits {
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
+    /// Direct ordered scalar-grammar reducer limits.
+    pub grapheme_scalar_dfa: GraphemeScalarDfaReduceLimits,
     /// Direct bounded class-sequence count limits.
     pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
     /// Direct two-branch prefix/class count limits.
@@ -438,6 +473,8 @@ pub struct AggregateBuildReport {
     /// Charged direct bounded-affix inspection work, including an ineligible
     /// inspection followed by another plan.
     pub bounded_affix_planner_work: usize,
+    /// Ordered scalar-grammar HIR/range inspection work.
+    pub grapheme_scalar_dfa_planner_work: usize,
     /// Bounded compound-class structural inspection work, including every
     /// HIR/range visit and admitted disjointness-comparison upper bound.
     pub bounded_class_sequence_planner_work: usize,
@@ -542,6 +579,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Ordered scalar-grammar inspection crossed its structural work cap.
+    GraphemeScalarDfaPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Bounded compound byte-class inspection crossed its independent
     /// structural work cap.
     BoundedClassSequencePlannerWorkLimit {
@@ -601,6 +645,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: FixedClassSandwichBuildError,
+    },
+    /// Ordered scalar-property classifier construction failed after selection.
+    GraphemeScalarDfaBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: GraphemeScalarDfaBuildError,
     },
     /// Bounded compound byte-class construction failed after selection.
     BoundedClassSequenceBuild {
@@ -701,6 +751,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded-affix inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::GraphemeScalarDfaPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} ordered scalar-grammar inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::BoundedClassSequencePlannerWorkLimit {
                 operation,
                 selection,
@@ -778,6 +837,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} fixed class-sandwich construction failed: {source}"
             ),
+            Self::GraphemeScalarDfaBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} ordered scalar-grammar construction failed: {source}"
+            ),
             Self::BoundedClassSequenceBuild {
                 operation,
                 selection,
@@ -846,6 +913,7 @@ impl std::error::Error for AggregateBuildError {
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
+            Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::BoundedContextBuild { source, .. } => Some(source),
@@ -856,6 +924,7 @@ impl std::error::Error for AggregateBuildError {
             | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedAffixPlannerWorkLimit { .. }
+            | Self::GraphemeScalarDfaPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
             | Self::BoundedContextPlannerWorkLimit { .. }
@@ -876,6 +945,8 @@ pub enum AggregateExecutionSource {
     UnicodeScalar(UnicodeScalarAggregateReduceError),
     /// Direct fixed class-sandwich refusal.
     FixedClassSandwich(FixedClassSandwichReduceError),
+    /// Direct ordered scalar-grammar refusal.
+    GraphemeScalarDfa(GraphemeScalarDfaReduceError),
     /// Direct bounded class-sequence refusal.
     BoundedClassSequence(BoundedClassSequenceReduceError),
     /// Direct two-branch prefix/class refusal.
@@ -898,6 +969,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
+            Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::BoundedContext(source) => source.fmt(f),
@@ -917,6 +989,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
+            Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
             Self::BoundedContext(source) => Some(source),
@@ -963,6 +1036,8 @@ pub enum AggregateExecutionDetails {
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
     /// Fixed class-sandwich bounds, counters, and operation identity.
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
+    /// Ordered scalar-grammar bounds, counters, and operation identity.
+    GraphemeScalarDfa(GraphemeScalarDfaReduceAccounting),
     /// Bounded class-sequence bounds, counters, and operation identity.
     BoundedClassSequence(BoundedClassSequenceReduceAccounting),
     /// Prefix/class stream bounds, counters, and identity.
@@ -1181,6 +1256,7 @@ impl AggregateBuilder {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
+        let grapheme_profile = self.profile == RustProfile::rebar_1_12_4();
         if selection == AggregatePlanSelection::ForceExactLiteral
             && operation == AggregateOperation::Spans
         {
@@ -1321,6 +1397,7 @@ impl AggregateBuilder {
                 unicode_scalar_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
                 bounded_affix_planner_work: 0,
+                grapheme_scalar_dfa_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
@@ -1494,6 +1571,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work: work,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1614,6 +1692,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1644,6 +1723,195 @@ impl AggregateBuilder {
             }
             Some(FixedClassSandwichInspection::Ineligible { work }) => work,
             None => 0,
+        };
+        let grapheme_scalar_inspection = if grapheme_profile
+            && unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation == AggregateOperation::Count
+        {
+            Some(
+                grapheme_scalar::inspect(&rust.hir, limits.max_grapheme_scalar_dfa_planner_work)
+                    .map_err(|error| match error {
+                        grapheme_scalar::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::GraphemeScalarDfaPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        grapheme_scalar::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "ordered scalar-grammar inspection accounting overflow",
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let grapheme_scalar_dfa_planner_work = if let Some(
+            grapheme_scalar::InspectionOutcome::Eligible(inspection),
+        ) = grapheme_scalar_inspection
+        {
+            if inspection.hir_nodes != expected_nodes || inspection.captures != expected_captures {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "syntax summary differs from ordered scalar-grammar inspection",
+                });
+            }
+            let classes = inspection.classes;
+            let range_counts = [
+                1,
+                1,
+                classes.control.ranges().len(),
+                classes.prepend.ranges().len(),
+                classes.l.ranges().len(),
+                classes.v.ranges().len(),
+                classes.lv.ranges().len(),
+                classes.lvt.ranges().len(),
+                classes.t.ranges().len(),
+                classes.ri.ranges().len(),
+                classes.extended_pictographic.ranges().len(),
+                classes.extend.ranges().len(),
+                1,
+                classes.spacing_mark_ranges,
+                classes.generic.ranges().len(),
+                classes.tail.ranges().len(),
+                classes.any.ranges().len(),
+            ];
+            let source_ranges = range_counts.into_iter().try_fold(0_usize, |total, count| {
+                total
+                    .checked_add(count)
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "ordered scalar-grammar source range count overflow",
+                    })
+            })?;
+            let ranges = core::iter::once((GraphemeScalarDfaRole::Cr, '\r', '\r'))
+                .chain(core::iter::once((GraphemeScalarDfaRole::Lf, '\n', '\n')))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Control,
+                    classes.control,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Prepend,
+                    classes.prepend,
+                ))
+                .chain(tagged_grapheme_ranges(GraphemeScalarDfaRole::L, classes.l))
+                .chain(tagged_grapheme_ranges(GraphemeScalarDfaRole::V, classes.v))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Lv,
+                    classes.lv,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Lvt,
+                    classes.lvt,
+                ))
+                .chain(tagged_grapheme_ranges(GraphemeScalarDfaRole::T, classes.t))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Ri,
+                    classes.ri,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::ExtendedPictographic,
+                    classes.extended_pictographic,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Extend,
+                    classes.extend,
+                ))
+                .chain(core::iter::once((
+                    GraphemeScalarDfaRole::Zwj,
+                    '\u{200D}',
+                    '\u{200D}',
+                )))
+                .chain(grapheme_scalar::spacing_mark_ranges(&classes).map(|range| {
+                    (
+                        GraphemeScalarDfaRole::SpacingMark,
+                        range.start(),
+                        range.end(),
+                    )
+                }))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::GenericCore,
+                    classes.generic,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Tail,
+                    classes.tail,
+                ))
+                .chain(tagged_grapheme_ranges(
+                    GraphemeScalarDfaRole::Any,
+                    classes.any,
+                ));
+            let engine = GraphemeScalarDfaPlan::build_from_counted_iter(
+                source_ranges,
+                ranges,
+                limits.grapheme_scalar_dfa,
+            )
+            .map_err(|source| AggregateBuildError::GraphemeScalarDfaBuild {
+                operation,
+                selection,
+                source,
+            })?;
+            let build = engine.build_accounting();
+            let report = AggregateBuildReport {
+                schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                syntax_key,
+                admission,
+                syntax,
+                operation,
+                selection,
+                plan: AggregatePlanKind::GraphemeScalarDfa,
+                continuation_strategy: None,
+                capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                planner_work,
+                unicode_scalar_planner_work,
+                fixed_class_sandwich_planner_work,
+                bounded_affix_planner_work: 0,
+                grapheme_scalar_dfa_planner_work: inspection.work,
+                bounded_class_sequence_planner_work: 0,
+                prefix_class_alternation_planner_work: 0,
+                bounded_context_planner_work: 0,
+                finite_planner_work: 0,
+                capture_erasure_work: inspection.captures,
+                captures_erased: inspection.captures,
+                build: AggregateBuildAccounting::GraphemeScalarDfa(build),
+                plan_identity: AggregatePlanIdentity::GraphemeScalarDfa(
+                    AggregateGraphemeScalarDfaIdentity {
+                        semantics: AggregateGraphemeScalarDfaSemantics::UnicodeOnOrderedScalarGrammarUtf8False,
+                        kernel: engine.count_identity(),
+                    },
+                ),
+                retained_capacity_bytes: build.persistent_bytes,
+            };
+            return Ok(AggregatePlan {
+                engine: AggregateEngine::GraphemeScalarDfa(engine),
+                limits,
+                report,
+            });
+        } else if let Some(grapheme_scalar::InspectionOutcome::Ineligible {
+            work,
+            hir_nodes,
+            captures,
+        }) = grapheme_scalar_inspection
+        {
+            if hir_nodes != expected_nodes || captures != expected_captures {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "syntax summary differs from ineligible ordered scalar-grammar inspection",
+                });
+            }
+            work
+        } else {
+            0
         };
         let bounded_class_sequence_inspection = if !unicode
             && selection == AggregatePlanSelection::Auto
@@ -1723,6 +1991,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work: work,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
@@ -1834,6 +2103,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     prefix_class_alternation_planner_work: work,
                     bounded_context_planner_work: 0,
@@ -1936,6 +2206,7 @@ impl AggregateBuilder {
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work: work,
+                        grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work: 0,
@@ -2053,6 +2324,7 @@ impl AggregateBuilder {
                     unicode_scalar_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
+                    grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     prefix_class_alternation_planner_work,
                     bounded_context_planner_work: work,
@@ -2211,6 +2483,7 @@ impl AggregateBuilder {
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
+                        grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
@@ -2346,6 +2619,7 @@ impl AggregateBuilder {
                         unicode_scalar_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
+                        grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
@@ -2420,6 +2694,7 @@ impl AggregateBuilder {
             unicode_scalar_planner_work,
             fixed_class_sandwich_planner_work,
             bounded_affix_planner_work,
+            grapheme_scalar_dfa_planner_work,
             bounded_class_sequence_planner_work,
             prefix_class_alternation_planner_work,
             bounded_context_planner_work,
@@ -2452,11 +2727,22 @@ fn unicode_finite_words_preserve_scalar_boundaries(words: &[Vec<u8>]) -> bool {
             .all(|word| !word.is_empty() && core::str::from_utf8(word).is_ok())
 }
 
+fn tagged_grapheme_ranges(
+    role: GraphemeScalarDfaRole,
+    class: &ClassUnicode,
+) -> impl ExactSizeIterator<Item = (GraphemeScalarDfaRole, char, char)> + '_ {
+    class
+        .ranges()
+        .iter()
+        .map(move |range| (role, range.start(), range.end()))
+}
+
 #[derive(Debug)]
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
     FixedClassSandwich(FixedClassSandwichPlan),
+    GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
     BoundedContext(BoundedContextPlan),
@@ -2553,6 +2839,15 @@ impl AggregatePlan {
                     self.execution_error(
                         limits,
                         AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
+            AggregateEngine::GraphemeScalarDfa(engine) => engine
+                .count(haystack, limits.grapheme_scalar_dfa)
+                .map(AggregateCountExecution::GraphemeScalarDfa)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::GraphemeScalarDfa(source),
                     )
                 }),
             AggregateEngine::BoundedClassSequence(engine) => engine
@@ -2673,6 +2968,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::FixedClassSandwich(source),
                     )
                 }),
+            AggregateEngine::GraphemeScalarDfa(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a count-only ordered scalar-grammar plan",
+                ),
+            )),
             AggregateEngine::BoundedClassSequence(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
@@ -2846,6 +3147,7 @@ enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
+    GraphemeScalarDfa(GraphemeScalarDfaCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
     BoundedContext(BoundedContextCountResult),
@@ -2871,6 +3173,7 @@ impl AggregateCountExecution {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
+            Self::GraphemeScalarDfa(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
             Self::BoundedContext(result) => result.count,
@@ -2890,6 +3193,9 @@ impl AggregateCountExecution {
             }
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
+            }
+            Self::GraphemeScalarDfa(result) => {
+                AggregateExecutionDetails::GraphemeScalarDfa(result.accounting)
             }
             Self::BoundedClassSequence(result) => {
                 AggregateExecutionDetails::BoundedClassSequence(result.accounting)

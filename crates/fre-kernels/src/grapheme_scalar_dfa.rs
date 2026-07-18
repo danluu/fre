@@ -764,14 +764,28 @@ impl BuildTransaction {
         })
     }
 
-    fn populate(
+    fn populate_checked(
         &mut self,
-        ranges: &[(GraphemeScalarClassRole, char, char)],
+        ranges: impl IntoIterator<Item = (GraphemeScalarClassRole, char, char)>,
     ) -> Result<(), BuildError> {
-        for &(role, start, end) in ranges {
+        let mut previous = [None::<u32>; ROLE_COUNT];
+        let mut seen = [false; ROLE_COUNT];
+        let mut source_ranges = 0_usize;
+        for (role, start, end) in ranges {
+            if start > end {
+                return Err(BuildError::ReversedRange { role, start, end });
+            }
+            let start_u32 = u32::from(start);
+            let end_u32 = u32::from(end);
+            if previous[role.index()].is_some_and(|prior| start_u32 <= prior.saturating_add(1)) {
+                return Err(BuildError::NonCanonicalRanges { role });
+            }
+            previous[role.index()] = Some(end_u32);
+            seen[role.index()] = true;
+            source_ranges = checked_build_add(source_ranges, 1, "source range count")?;
             self.events
                 .try_push(Event {
-                    point: u32::from(start),
+                    point: start_u32,
                     role,
                     add: true,
                 })
@@ -780,7 +794,7 @@ impl BuildTransaction {
                 })?;
             self.events
                 .try_push(Event {
-                    point: u32::from(end)
+                    point: end_u32
                         .checked_add(1)
                         .ok_or(BuildError::ArithmeticOverflow {
                             computation: "range end event",
@@ -791,6 +805,18 @@ impl BuildTransaction {
                 .map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "preflight event capacity",
                 })?;
+        }
+        if source_ranges != self.preflight.source_ranges {
+            return Err(BuildError::ArithmeticOverflow {
+                computation: "preflight source range count",
+            });
+        }
+        for (index, role_seen) in seen.into_iter().enumerate() {
+            if !role_seen {
+                return Err(BuildError::MissingRole {
+                    role: role_from_index(index),
+                });
+            }
         }
         Ok(())
     }
@@ -886,33 +912,6 @@ impl BuildTransaction {
             peak_bytes: self.preflight.peak_bytes,
         })
     }
-}
-
-fn validate_source_ranges(
-    ranges: &[(GraphemeScalarClassRole, char, char)],
-) -> Result<(), BuildError> {
-    let mut previous = [None::<u32>; ROLE_COUNT];
-    let mut seen = [false; ROLE_COUNT];
-    for &(role, start, end) in ranges {
-        if start > end {
-            return Err(BuildError::ReversedRange { role, start, end });
-        }
-        let start_u32 = u32::from(start);
-        let end_u32 = u32::from(end);
-        if previous[role.index()].is_some_and(|prior| start_u32 <= prior.saturating_add(1)) {
-            return Err(BuildError::NonCanonicalRanges { role });
-        }
-        previous[role.index()] = Some(end_u32);
-        seen[role.index()] = true;
-    }
-    for (index, role_seen) in seen.into_iter().enumerate() {
-        if !role_seen {
-            return Err(BuildError::MissingRole {
-                role: role_from_index(index),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn prospective_build_work(
@@ -1036,10 +1035,20 @@ impl GraphemeScalarDfaPlan {
         ranges: &[(GraphemeScalarClassRole, char, char)],
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        let preflight = admitted_build_preflight(ranges.len(), limits)?;
-        validate_source_ranges(ranges)?;
+        Self::build_from_counted_iter(ranges.len(), ranges.iter().copied(), limits)
+    }
+
+    /// Overlay a prospectively counted canonical range stream without
+    /// materializing a second facade-owned range collection. A stream whose
+    /// actual length differs from `source_ranges` fails before publication.
+    pub fn build_from_counted_iter(
+        source_ranges: usize,
+        ranges: impl IntoIterator<Item = (GraphemeScalarClassRole, char, char)>,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        let preflight = admitted_build_preflight(source_ranges, limits)?;
         let mut transaction = BuildTransaction::allocate(preflight)?;
-        transaction.populate(ranges)?;
+        transaction.populate_checked(ranges)?;
         transaction.sort()?;
         transaction.sweep()?;
         let build = transaction.accounting()?;
@@ -2864,6 +2873,31 @@ mod tests {
             GraphemeScalarDfaPlan::build(&ranges, BuildLimits::unlimited()),
             Err(BuildError::DerivedClassMismatch {
                 role: Role::GenericCore
+            })
+        ));
+    }
+
+    #[test]
+    fn counted_stream_length_mismatch_fails_before_plan_publication() {
+        let ranges = ranges();
+        assert!(matches!(
+            GraphemeScalarDfaPlan::build_from_counted_iter(
+                ranges.len() + 1,
+                ranges.iter().copied(),
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::ArithmeticOverflow {
+                computation: "preflight source range count"
+            })
+        ));
+        assert!(matches!(
+            GraphemeScalarDfaPlan::build_from_counted_iter(
+                ranges.len() - 1,
+                ranges.iter().copied(),
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::ArithmeticOverflow {
+                computation: "preflight event capacity"
             })
         ));
     }
