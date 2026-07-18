@@ -19,20 +19,22 @@ use std::{fmt::Write as _, io::Write as _};
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
-    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionSource,
-    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
-    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
-    AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateBuilder, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateContinuationSemantics, AggregateCountRegex, AggregateEngineError,
+    AggregateExactLiteralSemantics, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
+    AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
+    AggregateGraphemeScalarDfaSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
     AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
     AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
     BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
-    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits, CaptureAggregateLimits,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
+    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
     CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
     CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRunLimits, CaptureSearchError,
     CaptureSearchLimits, CompatibilityProfile, FixedClassSandwichBuildError,
@@ -141,7 +143,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -475,10 +477,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations with distinct immutable identities; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations with distinct immutable identities; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -1618,6 +1620,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::BoundedClassSequence, _) => {
             "compile-aggregate-bounded-class-sequence"
         }
+        ("compile", AggregatePlanKind::BoundedSeparatedFields, _) => {
+            "compile-aggregate-bounded-separated-fields"
+        }
         ("compile", AggregatePlanKind::PrefixClassAlternation, _) => {
             "compile-aggregate-prefix-class-alternation"
         }
@@ -1636,6 +1641,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
+        (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
@@ -3819,6 +3825,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_fixed_class_sandwich_planner_work: limits.fre_unicode_scalar_planner_work,
         max_grapheme_scalar_dfa_planner_work: limits.fre_aggregate_compile_work,
         max_bounded_class_sequence_planner_work: limits.fre_unicode_scalar_planner_work,
+        max_bounded_separated_fields_planner_work: limits.fre_unicode_scalar_planner_work,
         max_bounded_affix_planner_work: limits.fre_bounded_affix_planner_work,
         max_prefix_class_alternation_planner_work: limits.fre_literal_planner_work,
         max_bounded_context_planner_work: limits.fre_unicode_scalar_planner_work,
@@ -3870,6 +3877,12 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         bounded_class_sequence: BoundedClassSequenceBuildLimits {
             max_source_ranges: limits.fre_unicode_scalar_build_source_ranges,
             max_repeat_bound: limits.fre_aggregate_repeat_bound,
+            max_build_work: limits.fre_unicode_scalar_build_work,
+            max_persistent_bytes: limits.fre_unicode_scalar_build_persistent_bytes,
+            max_peak_bytes: limits.fre_unicode_scalar_build_peak_bytes,
+        },
+        bounded_separated_fields: BoundedSeparatedFieldsBuildLimits {
+            max_source_ranges: limits.fre_unicode_scalar_build_source_ranges,
             max_build_work: limits.fre_unicode_scalar_build_work,
             max_persistent_bytes: limits.fre_unicode_scalar_build_persistent_bytes,
             max_peak_bytes: limits.fre_unicode_scalar_build_peak_bytes,
@@ -4375,6 +4388,111 @@ fn bounded_class_sequence_operation_limits(
 fn inactive_bounded_class_sequence_operation_limits() -> BoundedClassSequenceReduceLimits {
     BoundedClassSequenceReduceLimits::default()
 }
+
+fn bounded_separated_fields_operation_limits(
+    haystack_len: usize,
+    identity: fre::BoundedSeparatedFieldsOperationIdentity,
+    build: fre::BoundedSeparatedFieldsBuildAccounting,
+    limits: &RunLimits,
+) -> Result<BoundedSeparatedFieldsReduceLimits, ExecutionError> {
+    let authenticated_build = identity.build_accounting();
+    if build != authenticated_build {
+        return Err(ExecutionError::fault(
+            "FRE bounded separated-field resource identity mismatch",
+        ));
+    }
+    let fields = usize::try_from(authenticated_build.fields)
+        .map_err(|_| ExecutionError::fault("FRE bounded separated-field count overflow"))?;
+    let nonfinal = fields
+        .checked_sub(1)
+        .ok_or_else(|| ExecutionError::fault("FRE bounded separated-field count is below one"))?;
+    let separator_scan_width = authenticated_build
+        .maximum_field_width
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE bounded separated-field width overflow"))?;
+    let separator_checks = checked_aggregate_mul(
+        nonfinal,
+        separator_scan_width,
+        "bounded separated-field separator checks",
+    )?;
+    let class_checks = checked_aggregate_add(
+        checked_aggregate_mul(
+            nonfinal,
+            identity.exact_field_checks(),
+            "bounded separated-field exact checks",
+        )?,
+        identity.prefix_field_checks(),
+        "bounded separated-field class checks",
+    )?;
+    let sequential_per_candidate = checked_aggregate_add(
+        separator_checks,
+        class_checks,
+        "bounded separated-field sequential accesses per candidate",
+    )?;
+    let control_checks = checked_aggregate_add(
+        checked_aggregate_add(
+            checked_aggregate_mul(fields, 3, "bounded separated-field field control")?,
+            checked_aggregate_mul(
+                authenticated_build.alternatives,
+                fields,
+                "bounded separated-field alternative control",
+            )?,
+            "bounded separated-field loop control",
+        )?,
+        4,
+        "bounded separated-field fixed control",
+    )?;
+    let work_per_candidate = [separator_checks, class_checks, control_checks]
+        .into_iter()
+        .try_fold(0_usize, |sum, term| {
+            checked_aggregate_add(sum, term, "bounded separated-field candidate work")
+        })?;
+    let work = checked_aggregate_add(
+        checked_aggregate_mul(
+            haystack_len,
+            work_per_candidate,
+            "bounded separated-field haystack work",
+        )?,
+        8,
+        "bounded separated-field finalization work",
+    )?;
+    let sequential_bytes = checked_aggregate_mul(
+        haystack_len,
+        sequential_per_candidate,
+        "bounded separated-field sequential input accesses",
+    )?;
+    let minimum_match_width = checked_aggregate_add(
+        checked_aggregate_mul(
+            fields,
+            authenticated_build.minimum_field_width,
+            "bounded separated-field minimum fields",
+        )?,
+        nonfinal,
+        "bounded separated-field separators",
+    )?;
+    let count = u64::try_from(
+        haystack_len
+            .checked_div(minimum_match_width)
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE bounded separated-field minimum width is zero")
+            })?,
+    )
+    .map_err(|_| ExecutionError::fault("FRE bounded separated-field count overflow"))?;
+    Ok(BoundedSeparatedFieldsReduceLimits {
+        max_input_bytes: haystack_len,
+        max_sequential_bytes: sequential_bytes.min(limits.fre_aggregate_sequential_bytes),
+        max_count: count.min(limits.reducer_steps),
+        max_work: work.min(limits.fre_aggregate_operation_work),
+        max_peak_bytes: authenticated_build
+            .persistent_bytes
+            .min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
+fn inactive_bounded_separated_fields_operation_limits() -> BoundedSeparatedFieldsReduceLimits {
+    BoundedSeparatedFieldsReduceLimits::default()
+}
+
 fn prefix_class_alternation_operation_limits(
     haystack_len: usize,
     build: fre::PrefixClassAlternationBuildAccounting,
@@ -4604,6 +4722,7 @@ fn aggregate_run_limits(
     report: &AggregateBuildReport,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
+    require_closed_bounded_separated_fields_identity(report)?;
     match report.build {
         AggregateBuildAccounting::ExactLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: literal_operation_limits(haystack_len, build, limits)?,
@@ -4611,6 +4730,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4628,6 +4748,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4647,6 +4768,7 @@ fn aggregate_run_limits(
             )?,
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4662,6 +4784,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: grapheme_scalar_dfa_operation_limits(haystack_len, build, limits)?,
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4681,6 +4804,7 @@ fn aggregate_run_limits(
                 build,
                 limits,
             )?,
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4690,12 +4814,47 @@ fn aggregate_run_limits(
                 limits,
             )?,
         }),
+        AggregateBuildAccounting::BoundedSeparatedFields(build) => {
+            let AggregatePlanIdentity::BoundedSeparatedFields(identity) = report.plan_identity
+            else {
+                return Err(ExecutionError::fault(
+                    "FRE bounded separated-field resource identity is absent",
+                ));
+            };
+            if !report.authenticates_bounded_separated_fields_identity(identity) {
+                return Err(ExecutionError::fault(
+                    "FRE bounded separated-field resource identity mismatch",
+                ));
+            }
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: bounded_separated_fields_operation_limits(
+                    haystack_len,
+                    identity.kernel,
+                    build,
+                    limits,
+                )?,
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::PrefixClassAlternation(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: prefix_class_alternation_operation_limits(
                 haystack_len,
                 build,
@@ -4715,6 +4874,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: bounded_context_operation_limits(
                 haystack_len,
@@ -4735,6 +4895,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
@@ -4750,6 +4911,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
@@ -4767,6 +4929,7 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
@@ -4802,6 +4965,67 @@ fn finite_plan_identity_matches(
     identity.semantics == expected_semantics && representation_matches
 }
 
+fn bounded_separated_fields_plan_identity_matches(
+    report: &AggregateBuildReport,
+    identity: fre::AggregateBoundedSeparatedFieldsIdentity,
+    build: fre::BoundedSeparatedFieldsBuildAccounting,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    let kernel = identity.kernel;
+    let authenticated_build = kernel.build_accounting();
+    let fields_in_range = (2..=fre::BOUNDED_SEPARATED_FIELDS_MAX_FIELDS).contains(&kernel.fields);
+    let alternatives = usize::from(kernel.alternatives);
+    let alternatives_in_range =
+        (1..=fre::BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES).contains(&alternatives);
+    let minimum_width = usize::from(kernel.minimum_field_width);
+    let maximum_width = usize::from(kernel.maximum_field_width);
+    let widths_in_range = minimum_width <= maximum_width
+        && (1..=fre::BOUNDED_SEPARATED_FIELDS_MAX_ATOMS).contains(&maximum_width);
+    let peak_matches = authenticated_build
+        .persistent_bytes
+        .checked_add(authenticated_build.scratch_bytes)
+        == Some(authenticated_build.peak_bytes);
+
+    operation == LiteralAggregateOperation::Count
+        && report.operation == AggregateOperation::Count
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::BoundedSeparatedFields
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && kernel.plan_id == fre::BOUNDED_SEPARATED_FIELDS_PLAN_ID
+        && kernel.operation_id == fre::BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID
+        && kernel.greedy
+        && kernel.non_overlapping
+        && report.authenticates_bounded_separated_fields_identity(identity)
+        && fields_in_range
+        && alternatives_in_range
+        && widths_in_range
+        && build == authenticated_build
+        && kernel.separator == build.separator
+        && kernel.fields == build.fields
+        && alternatives == build.alternatives
+        && minimum_width == build.minimum_field_width
+        && maximum_width == build.maximum_field_width
+        && authenticated_build.allocations == 0
+        && authenticated_build.reserves == 0
+        && authenticated_build.temporary_copies == 1
+        && kernel.exact_field_checks() == authenticated_build.atoms
+        && kernel.prefix_field_checks() >= kernel.exact_field_checks()
+        && peak_matches
+        && report.retained_capacity_bytes == authenticated_build.persistent_bytes
+}
+
+fn require_closed_bounded_separated_fields_identity(
+    report: &AggregateBuildReport,
+) -> Result<(), ExecutionError> {
+    if report.has_closed_bounded_separated_fields_identity() {
+        return Ok(());
+    }
+    Err(ExecutionError::fault(
+        "FRE bounded separated-field aggregate identity mismatch: public/private closure is open",
+    ))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive identity verifier keeps every supported plan's invariants adjacent"
@@ -4811,12 +5035,43 @@ fn require_unicode_plan_identity(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> Result<(), ExecutionError> {
+    require_closed_bounded_separated_fields_identity(report)?;
     if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
         if finite_plan_identity_matches(identity, unicode, operation) {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
             "finite aggregate semantic identity mismatch for {operation:?}: {:?}",
+            report.plan_identity
+        )));
+    }
+    if report.plan == AggregatePlanKind::BoundedSeparatedFields
+        || matches!(
+            report.build,
+            AggregateBuildAccounting::BoundedSeparatedFields(_)
+        )
+        || matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::BoundedSeparatedFields(_)
+        )
+    {
+        let (
+            AggregatePlanIdentity::BoundedSeparatedFields(identity),
+            AggregateBuildAccounting::BoundedSeparatedFields(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(format!(
+                "bounded separated-field aggregate identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        };
+        if !unicode
+            && bounded_separated_fields_plan_identity_matches(report, identity, build, operation)
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(format!(
+            "bounded separated-field aggregate identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )));
     }
@@ -5151,6 +5406,21 @@ fn bounded_class_sequence_build_error(
     }
 }
 
+fn bounded_separated_fields_build_error(
+    source: &BoundedSeparatedFieldsBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        BoundedSeparatedFieldsBuildError::RangeLimit { .. }
+        | BoundedSeparatedFieldsBuildError::WorkLimit { .. }
+        | BoundedSeparatedFieldsBuildError::PersistentLimit { .. }
+        | BoundedSeparatedFieldsBuildError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn bounded_context_build_error(
     source: &fre::BoundedContextBuildError,
     message: String,
@@ -5177,6 +5447,22 @@ fn bounded_class_sequence_reduce_error(
         | BoundedClassSequenceReduceError::CountLimit { .. }
         | BoundedClassSequenceReduceError::WorkLimit { .. }
         | BoundedClassSequenceReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn bounded_separated_fields_reduce_error(
+    source: &BoundedSeparatedFieldsReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        BoundedSeparatedFieldsReduceError::InputLimit { .. }
+        | BoundedSeparatedFieldsReduceError::SequentialLimit { .. }
+        | BoundedSeparatedFieldsReduceError::CountLimit { .. }
+        | BoundedSeparatedFieldsReduceError::WorkLimit { .. }
+        | BoundedSeparatedFieldsReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
         _ => ExecutionError::fault(message),
     }
 }
@@ -5254,6 +5540,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::BoundedClassSequence(source) => {
             bounded_class_sequence_reduce_error(source, message)
         }
+        AggregateExecutionSource::BoundedSeparatedFields(source) => {
+            bounded_separated_fields_reduce_error(source, message)
+        }
         AggregateExecutionSource::PrefixClassAlternation(source) => {
             prefix_class_reduce_error(source, message)
         }
@@ -5281,6 +5570,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::BoundedAffixPlannerWorkLimit { .. }
         | AggregateBuildError::GraphemeScalarDfaPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedClassSequencePlannerWorkLimit { .. }
+        | AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit { .. }
         | AggregateBuildError::PrefixClassAlternationPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedContextPlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerWorkLimit { .. }
@@ -5302,6 +5592,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         }
         AggregateBuildError::BoundedClassSequenceBuild { source, .. } => {
             bounded_class_sequence_build_error(source, message)
+        }
+        AggregateBuildError::BoundedSeparatedFieldsBuild { source, .. } => {
+            bounded_separated_fields_build_error(source, message)
         }
         AggregateBuildError::PrefixClassAlternationBuild { source, .. } => {
             prefix_class_build_error(source, message)
@@ -8339,13 +8632,564 @@ mod tests {
         ));
     }
 
+    // rebar-row:imported/mariomka/ip@rust/regex
+    #[test]
+    fn current_fre_bounded_separated_ip_receipt_and_hard_limits_are_exact() {
+        const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &[PATTERN.to_string()],
+                b"10.20.30.40 xx 255.255.255.255",
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            2,
+            "aggregate-bounded-separated-fields",
+        );
+
+        let regex = AggregateBuilder::new(PATTERN)
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .build_count()
+            .expect("assigned IP row builds");
+        assert_eq!(
+            regex.build_report().plan,
+            AggregatePlanKind::BoundedSeparatedFields
+        );
+        let AggregateBuildAccounting::BoundedSeparatedFields(build) = regex.build_report().build
+        else {
+            panic!("assigned IP row retained another build receipt")
+        };
+        let AggregatePlanIdentity::BoundedSeparatedFields(identity) =
+            regex.build_report().plan_identity
+        else {
+            panic!("assigned IP row retained another operation identity")
+        };
+        let derived = bounded_separated_fields_operation_limits(
+            6_839_410,
+            identity.kernel,
+            build,
+            &RunLimits::default(),
+        )
+        .expect("hard dimensions fit");
+        assert_eq!(derived.max_input_bytes, 6_839_410);
+        assert_eq!(derived.max_sequential_bytes, 341_970_500);
+        assert_eq!(derived.max_work, 533_473_988);
+        assert!(derived.max_work < RunLimits::default().fre_aggregate_operation_work);
+        let one_below = bounded_separated_fields_operation_limits(
+            6_839_410,
+            identity.kernel,
+            build,
+            &RunLimits {
+                fre_aggregate_operation_work: 533_473_987,
+                ..RunLimits::default()
+            },
+        )
+        .expect("capped dimensions fit");
+        assert_eq!(one_below.max_work, 533_473_987);
+        let one_below = bounded_separated_fields_operation_limits(
+            6_839_410,
+            identity.kernel,
+            build,
+            &RunLimits {
+                fre_aggregate_sequential_bytes: 341_970_499,
+                ..RunLimits::default()
+            },
+        )
+        .expect("capped sequential dimensions fit");
+        assert_eq!(one_below.max_sequential_bytes, 341_970_499);
+    }
+
+    fn assert_bounded_separated_identity_fault(result: Result<(), ExecutionError>) {
+        let error = result.expect_err("forged bounded separated-field identity must fail");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("bounded separated-field aggregate identity mismatch"),
+            "unexpected identity error: {error:?}"
+        );
+    }
+
+    fn assert_bounded_separated_closure_faults(report: &AggregateBuildReport) {
+        assert!(!report.has_closed_bounded_separated_fields_identity());
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+        let error = aggregate_run_limits(usize::MAX, report, &RunLimits::default())
+            .expect_err("open closure must fail before limit derivation");
+        assert_eq!(error.status, Status::Fault);
+        assert!(error.message.contains("public/private closure is open"));
+
+        let error = current_fre_rebar_validate_aggregate_identity(report, false, "count")
+            .expect_err("public identity wrapper must reject an open closure")
+            .to_string();
+        assert!(error.contains("public/private closure is open"));
+        let error = current_fre_rebar_aggregate_run_limits(usize::MAX, report)
+            .expect_err("public limit wrapper must reject before arithmetic")
+            .to_string();
+        assert!(error.contains("public/private closure is open"));
+    }
+
+    fn exact_literal_control_report() -> AggregateBuildReport {
+        AggregateBuilder::new("x")
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .build_count()
+            .expect("control literal builds")
+            .build_report()
+            .clone()
+    }
+
+    fn reject_bounded_separated_kernel<F>(base: &AggregateBuildReport, mutate: F)
+    where
+        F: FnOnce(&mut fre::BoundedSeparatedFieldsOperationIdentity),
+    {
+        let mut report = base.clone();
+        let AggregatePlanIdentity::BoundedSeparatedFields(identity) = &mut report.plan_identity
+        else {
+            panic!("test report lost bounded separated-field identity")
+        };
+        mutate(&mut identity.kernel);
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+    }
+
+    fn reject_bounded_separated_build<F>(base: &AggregateBuildReport, mutate: F)
+    where
+        F: FnOnce(&mut fre::BoundedSeparatedFieldsBuildAccounting),
+    {
+        let mut report = base.clone();
+        let AggregateBuildAccounting::BoundedSeparatedFields(build) = &mut report.build else {
+            panic!("test report lost bounded separated-field build accounting")
+        };
+        mutate(build);
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+        let error = aggregate_run_limits(31, &report, &RunLimits::default())
+            .expect_err("forged build receipt must fail before limit derivation");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("bounded separated-field aggregate identity mismatch"),
+            "unexpected resource identity error: {error:?}"
+        );
+    }
+
+    fn reject_bounded_separated_report<F>(base: &AggregateBuildReport, mutate: F)
+    where
+        F: FnOnce(&mut AggregateBuildReport),
+    {
+        let mut report = base.clone();
+        mutate(&mut report);
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+    }
+
+    fn reject_bounded_separated_coherent_forgery<F>(base: &AggregateBuildReport, mutate: F)
+    where
+        F: FnOnce(
+            &mut fre::BoundedSeparatedFieldsOperationIdentity,
+            &mut fre::BoundedSeparatedFieldsBuildAccounting,
+            &mut usize,
+        ),
+    {
+        let mut report = base.clone();
+        let AggregatePlanIdentity::BoundedSeparatedFields(identity) = &mut report.plan_identity
+        else {
+            panic!("test report lost bounded separated-field identity")
+        };
+        let AggregateBuildAccounting::BoundedSeparatedFields(build) = &mut report.build else {
+            panic!("test report lost bounded separated-field build accounting")
+        };
+        mutate(
+            &mut identity.kernel,
+            build,
+            &mut report.retained_capacity_bytes,
+        );
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+        let error = aggregate_run_limits(31, &report, &RunLimits::default())
+            .expect_err("coherent forgery must fail before limit derivation");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("bounded separated-field aggregate identity mismatch"),
+            "unexpected coherent-forgery error: {error:?}"
+        );
+    }
+
+    fn assert_bounded_separated_authentic_resource_receipt(base: &AggregateBuildReport) {
+        let AggregateBuildAccounting::BoundedSeparatedFields(build) = base.build else {
+            panic!("authentic report lost bounded separated-field build accounting")
+        };
+        let AggregatePlanIdentity::BoundedSeparatedFields(identity) = base.plan_identity else {
+            panic!("authentic report lost bounded separated-field operation identity")
+        };
+        assert_eq!(
+            build,
+            fre::BoundedSeparatedFieldsBuildAccounting {
+                alternatives: 3,
+                atoms: 9,
+                optional_atoms: 1,
+                source_ranges: 9,
+                fields: 4,
+                separator: b'.',
+                minimum_field_width: 2,
+                maximum_field_width: 3,
+                structural_work: 320,
+                range_inspections: 9,
+                bitmap_zero_writes: 164,
+                bitmap_word_writes: 9,
+                separator_comparisons: 9,
+                work_bound: 392,
+                allocations: 0,
+                reserves: 0,
+                temporary_copies: 1,
+                scratch_bytes: build.scratch_bytes,
+                persistent_bytes: build.persistent_bytes,
+                peak_bytes: build.peak_bytes,
+            }
+        );
+        assert_eq!(
+            build.persistent_bytes.checked_add(build.scratch_bytes),
+            Some(build.peak_bytes)
+        );
+        assert_eq!(identity.kernel.build_accounting(), build);
+        assert_eq!(identity.kernel.exact_field_checks(), 9);
+        assert_eq!(identity.kernel.prefix_field_checks(), 11);
+    }
+
+    fn reject_bounded_separated_kernel_forgeries(base: &AggregateBuildReport) {
+        reject_bounded_separated_kernel(base, |kernel| kernel.plan_id = "forged-plan");
+        reject_bounded_separated_kernel(base, |kernel| kernel.operation_id = "forged-operation");
+        reject_bounded_separated_kernel(base, |kernel| kernel.separator = b'/');
+        for fields in [3, 1, 9] {
+            reject_bounded_separated_kernel(base, move |kernel| kernel.fields = fields);
+        }
+        for alternatives in [2, 0, 9] {
+            reject_bounded_separated_kernel(base, move |kernel| {
+                kernel.alternatives = alternatives;
+            });
+        }
+        for minimum in [1, 4] {
+            reject_bounded_separated_kernel(base, move |kernel| {
+                kernel.minimum_field_width = minimum;
+            });
+        }
+        for maximum in [4, 0, 5] {
+            reject_bounded_separated_kernel(base, move |kernel| {
+                kernel.maximum_field_width = maximum;
+            });
+        }
+        reject_bounded_separated_kernel(base, |kernel| kernel.greedy = false);
+        reject_bounded_separated_kernel(base, |kernel| kernel.non_overlapping = false);
+    }
+
+    fn reject_bounded_separated_build_forgeries(base: &AggregateBuildReport) {
+        reject_bounded_separated_build(base, |build| build.separator = b'/');
+        reject_bounded_separated_build(base, |build| build.fields = 3);
+        reject_bounded_separated_build(base, |build| build.alternatives = 2);
+        reject_bounded_separated_build(base, |build| build.atoms = 8);
+        reject_bounded_separated_build(base, |build| build.optional_atoms = 0);
+        reject_bounded_separated_build(base, |build| build.source_ranges = 8);
+        reject_bounded_separated_build(base, |build| build.minimum_field_width = 1);
+        reject_bounded_separated_build(base, |build| build.maximum_field_width = 4);
+        reject_bounded_separated_build(base, |build| build.structural_work = 319);
+        reject_bounded_separated_build(base, |build| build.range_inspections = 8);
+        reject_bounded_separated_build(base, |build| build.bitmap_zero_writes = 163);
+        reject_bounded_separated_build(base, |build| build.bitmap_word_writes = 8);
+        reject_bounded_separated_build(base, |build| build.separator_comparisons = 8);
+        reject_bounded_separated_build(base, |build| build.work_bound = 391);
+        reject_bounded_separated_build(base, |build| build.allocations = 1);
+        reject_bounded_separated_build(base, |build| build.reserves = 1);
+        reject_bounded_separated_build(base, |build| build.temporary_copies = 0);
+        reject_bounded_separated_build(base, |build| {
+            build.scratch_bytes = build.scratch_bytes.checked_sub(1).unwrap();
+        });
+        reject_bounded_separated_build(base, |build| {
+            build.persistent_bytes = build.persistent_bytes.checked_sub(1).unwrap();
+        });
+        reject_bounded_separated_build(base, |build| {
+            build.peak_bytes = build.peak_bytes.checked_sub(1).unwrap();
+        });
+    }
+
+    fn reject_bounded_separated_coherent_forgeries(base: &AggregateBuildReport) {
+        reject_bounded_separated_coherent_forgery(base, |kernel, build, _| {
+            kernel.separator = b'/';
+            build.separator = b'/';
+        });
+        reject_bounded_separated_coherent_forgery(base, |kernel, build, _| {
+            kernel.fields = 3;
+            build.fields = 3;
+        });
+        reject_bounded_separated_coherent_forgery(base, |kernel, build, _| {
+            kernel.alternatives = 2;
+            build.alternatives = 2;
+        });
+        reject_bounded_separated_coherent_forgery(base, |kernel, build, _| {
+            kernel.minimum_field_width = 1;
+            build.minimum_field_width = 1;
+        });
+        reject_bounded_separated_coherent_forgery(base, |kernel, build, _| {
+            kernel.maximum_field_width = 4;
+            build.maximum_field_width = 4;
+        });
+        reject_bounded_separated_coherent_forgery(base, |_, build, _| {
+            build.atoms = 8;
+            build.bitmap_zero_writes = 160;
+            build.separator_comparisons = 8;
+            build.work_bound = 391;
+        });
+        reject_bounded_separated_coherent_forgery(base, |_, build, _| {
+            build.source_ranges = 8;
+            build.range_inspections = 8;
+            build.bitmap_word_writes = 8;
+            build.work_bound = 385;
+        });
+        reject_bounded_separated_coherent_forgery(base, |_, build, _| {
+            build.structural_work = 319;
+            build.work_bound = 391;
+        });
+        reject_bounded_separated_coherent_forgery(base, |_, build, _| {
+            build.scratch_bytes = build.scratch_bytes.checked_sub(1).unwrap();
+            build.peak_bytes = build.peak_bytes.checked_sub(1).unwrap();
+        });
+        reject_bounded_separated_coherent_forgery(base, |_, build, retained| {
+            build.persistent_bytes = build.persistent_bytes.checked_sub(1).unwrap();
+            build.peak_bytes = build.peak_bytes.checked_sub(1).unwrap();
+            *retained = retained.checked_sub(1).unwrap();
+        });
+    }
+
+    fn reject_bounded_separated_report_forgeries(base: &AggregateBuildReport) {
+        let other = exact_literal_control_report();
+        reject_bounded_separated_report(base, |report| report.plan = other.plan);
+        reject_bounded_separated_report(base, |report| report.build = other.build);
+        reject_bounded_separated_report(base, |report| {
+            report.plan_identity = other.plan_identity;
+        });
+        reject_bounded_separated_report(base, |report| {
+            report.retained_capacity_bytes = report.retained_capacity_bytes.saturating_add(1);
+        });
+        reject_bounded_separated_report(base, |report| {
+            report.selection = AggregatePlanSelection::ForceContinuation;
+        });
+        reject_bounded_separated_report(base, |report| {
+            report.continuation_strategy = Some(AggregateStrategy::ReverseSequentialRows);
+        });
+        reject_bounded_separated_report(base, |report| {
+            report.operation = AggregateOperation::SpanSum;
+        });
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            base,
+            false,
+            LiteralAggregateOperation::SpanSum,
+        ));
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            base,
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+    }
+
+    fn reject_bounded_separated_whole_certificate_splice(base: &AggregateBuildReport) {
+        let smaller = AggregateBuilder::new(
+            r"(?:(?:25[0-5]|2[0-4][0-9]|[01][0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01][0-9][0-9])",
+        )
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .build_count()
+            .expect("smaller bounded separated-field control builds")
+            .build_report()
+            .clone();
+        assert_eq!(smaller.plan, AggregatePlanKind::BoundedSeparatedFields);
+        assert_ne!(base.syntax_key, smaller.syntax_key);
+
+        let mut report = base.clone();
+        report.plan_identity = smaller.plan_identity;
+        report.build = smaller.build;
+        report.retained_capacity_bytes = smaller.retained_capacity_bytes;
+        assert_bounded_separated_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+        let error = aggregate_run_limits(31, &report, &RunLimits::default())
+            .expect_err("whole-certificate splice must fail before limit derivation");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("bounded separated-field aggregate identity mismatch"),
+            "unexpected whole-certificate splice error: {error:?}"
+        );
+    }
+
+    fn reject_bounded_separated_cross_family_closure(base: &AggregateBuildReport) {
+        let exact = exact_literal_control_report();
+        assert!(base.has_closed_bounded_separated_fields_identity());
+        assert!(exact.has_closed_bounded_separated_fields_identity());
+        require_unicode_plan_identity(&exact, false, LiteralAggregateOperation::Count)
+            .expect("authentic exact-literal identity remains closed");
+        aggregate_run_limits(31, &exact, &RunLimits::default())
+            .expect("authentic exact-literal limits remain derivable");
+        current_fre_rebar_validate_aggregate_identity(&exact, false, "count")
+            .expect("public identity wrapper accepts the exact-literal control");
+        current_fre_rebar_aggregate_run_limits(31, &exact)
+            .expect("public limit wrapper accepts the exact-literal control");
+
+        let mut three_field = base.clone();
+        three_field.plan = exact.plan;
+        three_field.build = exact.build;
+        three_field.plan_identity = exact.plan_identity;
+        assert_bounded_separated_closure_faults(&three_field);
+
+        let mut whole_public_certificate = base.clone();
+        whole_public_certificate.syntax_key = exact.syntax_key.clone();
+        whole_public_certificate.admission = exact.admission;
+        whole_public_certificate.syntax = exact.syntax.clone();
+        whole_public_certificate.plan = exact.plan;
+        whole_public_certificate.build = exact.build;
+        whole_public_certificate.plan_identity = exact.plan_identity;
+        whole_public_certificate.retained_capacity_bytes = exact.retained_capacity_bytes;
+        assert_bounded_separated_closure_faults(&whole_public_certificate);
+
+        let mut reverse_missing_seal = exact;
+        reverse_missing_seal.plan = base.plan;
+        reverse_missing_seal.build = base.build;
+        reverse_missing_seal.plan_identity = base.plan_identity;
+        assert_bounded_separated_closure_faults(&reverse_missing_seal);
+
+        let mut reverse_matching_public_certificate = reverse_missing_seal;
+        reverse_matching_public_certificate.retained_capacity_bytes = base.retained_capacity_bytes;
+        assert_bounded_separated_closure_faults(&reverse_matching_public_certificate);
+    }
+
+    #[test]
+    fn current_fre_bounded_separated_identity_is_fail_closed() {
+        const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
+
+        let regex = AggregateBuilder::new(PATTERN)
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .build_count()
+            .expect("assigned IP row builds");
+        let base = regex.build_report().clone();
+        assert!(base.has_closed_bounded_separated_fields_identity());
+        require_unicode_plan_identity(&base, false, LiteralAggregateOperation::Count)
+            .expect("authentic bounded separated-field identity");
+        assert_bounded_separated_authentic_resource_receipt(&base);
+        reject_bounded_separated_kernel_forgeries(&base);
+        reject_bounded_separated_build_forgeries(&base);
+        reject_bounded_separated_coherent_forgeries(&base);
+        reject_bounded_separated_report_forgeries(&base);
+        reject_bounded_separated_whole_certificate_splice(&base);
+        reject_bounded_separated_cross_family_closure(&base);
+    }
+
+    // rebar-row:imported/mariomka/ip@rust/regex
+    #[test]
+    #[ignore = "requires FRE_BOUNDED_SEPARATED_FIELDS_HARD_CORPUS"]
+    fn current_fre_bounded_separated_ip_hard_no_clock_canary() {
+        const PATTERN: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
+        let path = std::env::var_os("FRE_BOUNDED_SEPARATED_FIELDS_HARD_CORPUS")
+            .expect("FRE_BOUNDED_SEPARATED_FIELDS_HARD_CORPUS names the authenticated corpus");
+        let haystack = fs::read(path).expect("hard corpus is readable");
+        assert_eq!(haystack.len(), 6_839_410);
+        assert_eq!(
+            sha256(&haystack),
+            "7b7f70c9ca999b2bede85b7ed8e37c9193edced196f4aed29651e37ef4f8e979"
+        );
+        let patterns = [PATTERN.to_string()];
+        for limits in [
+            RunLimits::default(),
+            RunLimits {
+                fre_aggregate_operation_work: 533_473_988,
+                ..RunLimits::default()
+            },
+            RunLimits {
+                fre_aggregate_sequential_bytes: 341_970_500,
+                ..RunLimits::default()
+            },
+        ] {
+            assert_current_fre_execution(
+                current_fre("count", &patterns, &haystack, false, false, &limits),
+                5,
+                "aggregate-bounded-separated-fields",
+            );
+        }
+        let refusal = current_fre(
+            "count",
+            &patterns,
+            &haystack,
+            false,
+            false,
+            &RunLimits {
+                fre_aggregate_operation_work: 533_473_987,
+                ..RunLimits::default()
+            },
+        );
+        assert!(
+            matches!(refusal, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("WorkLimit")
+                    && reason.contains("533473988")
+                    && reason.contains("533473987")),
+            "one-below hard work must be a typed refusal: {refusal:?}"
+        );
+        let refusal = current_fre(
+            "count",
+            &patterns,
+            &haystack,
+            false,
+            false,
+            &RunLimits {
+                fre_aggregate_sequential_bytes: 341_970_499,
+                ..RunLimits::default()
+            },
+        );
+        assert!(
+            matches!(refusal, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("SequentialLimit")
+                    && reason.contains("341970500")
+                    && reason.contains("341970499")),
+            "one-below hard sequential input access must be a typed refusal: {refusal:?}"
+        );
+    }
     #[test]
     fn current_fre_composition_keeps_unicode_capture_and_build_many_reachable() {
         let limits = RunLimits::default();
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
+            "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -9845,11 +10689,19 @@ mod tests {
         let build_limits = aggregate_build_limits(&run);
         assert_eq!(build_limits.max_unicode_scalar_planner_work, 7);
         assert_eq!(build_limits.max_grapheme_scalar_dfa_planner_work, 19);
+        assert_eq!(build_limits.max_bounded_separated_fields_planner_work, 7);
         assert_eq!(build_limits.unicode_scalar.max_source_ranges, 8);
         assert_eq!(build_limits.unicode_scalar.max_build_work, 9);
         assert_eq!(build_limits.unicode_scalar.max_scratch_bytes, 10);
         assert_eq!(build_limits.unicode_scalar.max_persistent_bytes, 11);
         assert_eq!(build_limits.unicode_scalar.max_peak_bytes, 12);
+        assert_eq!(build_limits.bounded_separated_fields.max_source_ranges, 8);
+        assert_eq!(build_limits.bounded_separated_fields.max_build_work, 9);
+        assert_eq!(
+            build_limits.bounded_separated_fields.max_persistent_bytes,
+            11
+        );
+        assert_eq!(build_limits.bounded_separated_fields.max_peak_bytes, 12);
 
         let defaults = aggregate_build_limits(&RunLimits::default());
         assert_eq!(defaults.max_unicode_scalar_planner_work, 4_096);
