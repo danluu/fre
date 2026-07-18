@@ -2,7 +2,13 @@
 
 #![deny(unsafe_code)]
 
-use core::{alloc::Layout, fmt, ptr};
+use core::{
+    alloc::Layout,
+    fmt,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    ptr,
+};
 use std::alloc::{alloc, alloc_zeroed};
 
 /// Failure to copy bytes into an exact-capacity allocation.
@@ -24,6 +30,110 @@ impl fmt::Display for CopyError {
 }
 
 impl std::error::Error for CopyError {}
+
+/// Fallible, exact-layout storage for incrementally initialized `Copy` values.
+///
+/// Capacity is exactly the requested element count. `try_push` refuses rather
+/// than reallocating, so callers may charge the complete allocation before it
+/// occurs and retain the storage without a conversion copy.
+pub struct ExactVec<T: Copy> {
+    inner: Vec<T>,
+}
+
+impl<T: Copy> ExactVec<T> {
+    /// Allocate exactly `capacity` elements without initializing them.
+    pub fn try_with_capacity(capacity: usize) -> Result<Self, CopyError> {
+        exact_vec_with_capacity(capacity, false)
+    }
+
+    /// Number of initialized elements.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether no elements have been initialized.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Exact element capacity selected at allocation.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Initialize the next element, refusing instead of reallocating when full.
+    pub fn try_push(&mut self, value: T) -> Result<(), T> {
+        if self.inner.len() == self.inner.capacity() {
+            return Err(value);
+        }
+        self.inner.push(value);
+        Ok(())
+    }
+
+    /// Borrow all initialized elements.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        self.inner.as_slice()
+    }
+
+    /// Mutably borrow all initialized elements.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.inner.as_mut_slice()
+    }
+}
+
+impl<T: Copy + fmt::Debug> fmt::Debug for ExactVec<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl<T: Copy> Deref for ExactVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T: Copy> DerefMut for ExactVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
+)]
+fn exact_vec_with_capacity<T: Copy>(
+    capacity: usize,
+    force_failure: bool,
+) -> Result<ExactVec<T>, CopyError> {
+    if size_of::<T>() == 0 {
+        return Err(CopyError::LayoutOverflow);
+    }
+    if capacity == 0 {
+        return Ok(ExactVec { inner: Vec::new() });
+    }
+    let layout = Layout::array::<T>(capacity).map_err(|_| CopyError::LayoutOverflow)?;
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+    // SAFETY: `alloc` returned exactly `layout`; a zero-length Vec owns the
+    // uninitialized spare capacity and later deallocates with the same layout.
+    let inner = unsafe { Vec::from_raw_parts(allocation.cast::<T>(), 0, capacity) };
+    Ok(ExactVec { inner })
+}
 
 /// Copy `bytes` into a fallible allocation with `capacity == len`.
 ///
@@ -98,7 +208,42 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
 
 #[cfg(test)]
 mod tests {
-    use super::{CopyError, copy_exact, copy_exact_with, zeroed_exact, zeroed_exact_with};
+    use super::{
+        CopyError, ExactVec, copy_exact, copy_exact_with, exact_vec_with_capacity, zeroed_exact,
+        zeroed_exact_with,
+    };
+
+    #[test]
+    fn typed_exact_storage_never_overallocates_or_grows() {
+        for capacity in [0_usize, 1, 2, 3, 7, 16, 255, 4096] {
+            let mut values = ExactVec::try_with_capacity(capacity).unwrap();
+            assert_eq!(values.capacity(), capacity);
+            assert!(values.is_empty());
+            for value in 0..capacity {
+                values.try_push(value).unwrap();
+                assert_eq!(values.capacity(), capacity);
+            }
+            assert_eq!(values.as_slice(), (0..capacity).collect::<Vec<_>>());
+            assert_eq!(values.try_push(capacity), Err(capacity));
+            assert_eq!(values.capacity(), capacity);
+        }
+        assert!(matches!(
+            exact_vec_with_capacity::<u32>(1, true),
+            Err(CopyError::AllocationFailed)
+        ));
+        assert!(matches!(
+            ExactVec::<u64>::try_with_capacity(usize::MAX),
+            Err(CopyError::LayoutOverflow)
+        ));
+        assert!(matches!(
+            ExactVec::<()>::try_with_capacity(0),
+            Err(CopyError::LayoutOverflow)
+        ));
+        assert!(matches!(
+            ExactVec::<()>::try_with_capacity(1),
+            Err(CopyError::LayoutOverflow)
+        ));
+    }
 
     #[test]
     fn empty_and_nonempty_copies_have_exact_capacity() {
