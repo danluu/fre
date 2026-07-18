@@ -31,7 +31,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v11-anchored-iteration";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v12-bytes-compile-utf8";
 
 const LIMITATIONS: [&str; 2] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -1584,7 +1584,7 @@ fn single_applicability(
     {
         return Err(NotApplicableReason::ProfileCannotRepresentBounds);
     }
-    if case.utf8 != text {
+    if case.utf8 != text && surface != AdapterSurface::RustBytesCompile {
         return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
     }
     if text && std::str::from_utf8(&input.haystack).is_err() {
@@ -2442,6 +2442,53 @@ mod tests {
     }
 
     #[test]
+    fn bytes_compile_is_independent_of_search_time_utf8_mode() {
+        let case = fixture_case(true, true, None);
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["a".to_owned()],
+            haystack: vec![0xFF],
+            bounds: SearchBounds { start: 0, end: 1 },
+            line_terminator: b'\n',
+            expected: Vec::new(),
+        };
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesIsMatch, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let rejected_case = fixture_case(false, true, None);
+        let mut rejected_input = input;
+        rejected_input.patterns = vec!["(".to_owned()];
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustBytesCompile,
+                &rejected_case,
+                &rejected_input,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let bytes_only_case = fixture_case(true, false, None);
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustTextCompile,
+                &bytes_only_case,
+                &rejected_input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+    }
+
+    #[test]
     fn bounded_single_surfaces_use_context_preserving_windows() {
         let mut case = fixture_case(true, true, None);
         case.bounded_search = true;
@@ -2473,6 +2520,14 @@ mod tests {
         );
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesIsMatch, &case, &input),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
         );
 
