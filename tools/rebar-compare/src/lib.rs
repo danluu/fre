@@ -4307,18 +4307,10 @@ fn grapheme_scalar_dfa_operation_limits(
         "grapheme scalar range comparisons",
     )?;
     let scanner_steps = checked_aggregate_add(haystack_len, 1, "grapheme scanner terminal")?;
-    let role_probes = checked_aggregate_mul(haystack_len, 16, "grapheme role probes")?;
-    let branch_checks = checked_aggregate_add(
-        checked_aggregate_mul(haystack_len, 24, "grapheme branch checks")?,
-        1,
-        "grapheme terminal branch",
-    )?;
-    let repetition_tests = checked_aggregate_add(
-        checked_aggregate_mul(haystack_len, 8, "grapheme repetition tests")?,
-        1,
-        "grapheme terminal repetition",
-    )?;
-    let role_probe_work = checked_aggregate_mul(role_probes, 4, "grapheme role probe work")?;
+    let role_probes = checked_aggregate_add(haystack_len, 1, "grapheme terminal transition")?;
+    let branch_checks = 0;
+    let repetition_tests = 0;
+    let role_probe_work = checked_aggregate_mul(role_probes, 48, "grapheme transition work")?;
     let work = [
         decode_byte_checks,
         haystack_len,
