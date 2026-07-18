@@ -9,7 +9,7 @@ use rebar_compare::{
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_validate_aggregate_identity,
 };
 
-const ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2";
+const ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1";
 
 const GRAPHEME: &str = r"(?x)
 \p{gcb=CR} \p{gcb=LF}
@@ -78,12 +78,15 @@ fn adapter_runner_and_typed_plan_identity_agree() {
     let adapter = CurrentFreAdapter;
     assert_eq!(adapter.adapter(), ADAPTER);
     assert_eq!(adapter.identity().adapter, ADAPTER);
+    let runner = include_str!("../examples/fre_rebar_runner.rs");
     assert_eq!(
-        include_str!("../examples/fre_rebar_runner.rs")
+        runner
             .matches(&format!("adapter={ADAPTER} report="))
             .count(),
         1,
     );
+    assert_eq!(runner.matches("aggregate-explain=22").count(), 1);
+    assert!(!runner.contains("aggregate-explain=21"));
 
     let regex = current_fre_rebar_aggregate_builder(GRAPHEME, true, false)
         .build_count()
