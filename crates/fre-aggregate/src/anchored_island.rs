@@ -83,6 +83,10 @@ impl Branch<'_> {
     pub(crate) fn words(&self) -> impl Iterator<Item = &[u8]> {
         self.words.iter().map(Word::bytes)
     }
+
+    pub(crate) fn word_count(&self) -> usize {
+        self.words.len()
+    }
 }
 
 #[derive(Debug)]
@@ -109,6 +113,39 @@ impl Certificate<'_> {
         let retained_bytes = self.accounting.retained_bytes;
         drop(self);
         budget.release_construction_bytes(retained_bytes)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct UrlCertificate<'a> {
+    inner: Certificate<'a>,
+}
+
+impl UrlCertificate<'_> {
+    pub(crate) fn tld(&self, index: usize) -> Option<&[u8]> {
+        self.inner
+            .branches
+            .get(1)?
+            .words
+            .get(index)?
+            .bytes()
+            .strip_prefix(b".")
+    }
+
+    pub(crate) fn tld_count(&self) -> Option<usize> {
+        self.inner.branches.get(1).map(Branch::word_count)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.inner.accounting.retained_bytes
+    }
+
+    pub(crate) const fn accounting(&self) -> Accounting {
+        self.inner.accounting
+    }
+
+    pub(crate) fn release(self, budget: &mut CompileBudget) -> Result<(), Error> {
+        self.inner.release(budget)
     }
 }
 
@@ -387,6 +424,536 @@ fn certify_inner<'a>(
         branches,
         delimiters,
     }))
+}
+
+/// Certify the exact structural grammar consumed by `UrlAggregatePlan`.
+/// Generic finite-anchor eligibility is deliberately insufficient: every
+/// branch, class, repetition, priority and suffix component is checked here.
+pub(crate) fn certify_url_authoritative<'a>(
+    hir: &'a Hir,
+    limits: Limits,
+    budget: &mut CompileBudget,
+) -> Result<Option<UrlCertificate<'a>>, Error> {
+    if !url_outer_candidate(hir, budget)? {
+        return Ok(None);
+    }
+    let Some(certificate) = certify(hir, limits, budget)? else {
+        return Ok(None);
+    };
+    let retained = certificate.accounting.retained_bytes;
+    let validation = validate_url_shape(hir, &certificate, budget);
+    match validation {
+        Ok(true) => Ok(Some(UrlCertificate { inner: certificate })),
+        Ok(false) => {
+            certificate.release(budget)?;
+            Ok(None)
+        }
+        Err(error) => {
+            drop(certificate);
+            budget.release_construction_bytes(retained)?;
+            Err(error)
+        }
+    }
+}
+
+fn url_outer_candidate(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    budget.charge(1)?;
+    let HirKind::Capture(capture) = hir.kind() else {
+        return Ok(false);
+    };
+    budget.charge(1)?;
+    let HirKind::Concat(parts) = capture.sub.kind() else {
+        return Ok(false);
+    };
+    if parts.len() != 6 {
+        return Ok(false);
+    }
+    budget.charge(1)?;
+    let HirKind::Alternation(branches) = parts[0].kind() else {
+        return Ok(false);
+    };
+    if branches.len() != 2 {
+        return Ok(false);
+    }
+    budget.charge(1)?;
+    let HirKind::Concat(domain) = branches[1].kind() else {
+        return Ok(false);
+    };
+    if domain.len() != 6 {
+        return Ok(false);
+    }
+    budget.charge(1)?;
+    Ok(matches!(
+        domain[5].kind(),
+        HirKind::Alternation(tlds) if tlds.len() == 1_498
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact URL grammar certificate keeps every accepted HIR component and priority adjacent"
+)]
+fn validate_url_shape(
+    hir: &Hir,
+    certificate: &Certificate<'_>,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    // The production source has exactly one outer capture annotation. The
+    // whole-match facade erases it transparently; a capture API or a different
+    // shell makes this aggregate route semantically inapplicable.
+    budget.charge(1)?;
+    let HirKind::Capture(capture) = hir.kind() else {
+        return Ok(false);
+    };
+    let shell = &capture.sub;
+    budget.charge(1)?;
+    if matches!(shell.kind(), HirKind::Capture(_)) {
+        return Ok(false);
+    }
+    budget.charge(1)?;
+    if certificate.branches.len() != 2 {
+        return Ok(false);
+    }
+    let ipv4 = &certificate.branches[0];
+    let domain = &certificate.branches[1];
+    if !ipv4.prefix().is_empty()
+        || ipv4.suffix().len() != 7
+        || domain.prefix().len() != 4
+        || domain.suffix().len() != 5
+    {
+        return Ok(false);
+    }
+
+    let schemes = [
+        b"https://".as_slice(),
+        b"http://".as_slice(),
+        b"ftp://".as_slice(),
+    ];
+    budget.charge(ipv4.word_count())?;
+    if ipv4.word_count() != schemes.len() {
+        return Ok(false);
+    }
+    for (actual, expected) in ipv4.words().zip(schemes) {
+        budget.charge(actual.len().max(expected.len()))?;
+        if actual != expected {
+            return Ok(false);
+        }
+    }
+
+    budget.charge(domain.word_count())?;
+    if domain.word_count() != 1_498 {
+        return Ok(false);
+    }
+    let mut anchor_bytes = 0_usize;
+    for word in domain.words() {
+        budget.charge(word.len())?;
+        anchor_bytes = checked_add(anchor_bytes, word.len(), Resource::LiteralBytes)?;
+        if word.len() < 3
+            || word.len() > 25
+            || word[0] != b'.'
+            || word[1..]
+                .iter()
+                .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+        {
+            return Ok(false);
+        }
+    }
+    if anchor_bytes != 10_003 || !exact_whitespace(certificate.delimiters, budget)? {
+        return Ok(false);
+    }
+
+    if !repeat_concat_octet_dot(ipv4.suffix()[0], budget)?
+        || !octet(ipv4.suffix()[1], budget)?
+        || !domain_scheme(domain.prefix()[0], budget)?
+        || !domain_auth(domain.prefix()[1], budget)?
+        || !subdomains(domain.prefix()[2], budget)?
+        || !base_label(domain.prefix()[3], budget)?
+    {
+        return Ok(false);
+    }
+    Ok(common_suffix(&ipv4.suffix()[2..], budget)? && common_suffix(domain.suffix(), budget)?)
+}
+
+fn repeat_concat_octet_dot(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 3, Some(3), budget)? else {
+        return Ok(false);
+    };
+    let Some(parts) = concat(sub, 2, budget)? else {
+        return Ok(false);
+    };
+    Ok(octet(&parts[0], budget)? && literal(&parts[1], b".", budget)?)
+}
+
+fn octet(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(branches) = alternation(hir, 3, budget)? else {
+        return Ok(false);
+    };
+    let Some(first) = concat(&branches[0], 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(second) = concat(&branches[1], 3, budget)? else {
+        return Ok(false);
+    };
+    let Some(third) = concat(&branches[2], 3, budget)? else {
+        return Ok(false);
+    };
+    Ok(literal(&first[0], b"25", budget)?
+        && byte_class(&first[1], is_digit_0_5, budget)?
+        && literal(&second[0], b"2", budget)?
+        && byte_class(&second[1], is_digit_0_4, budget)?
+        && byte_class(&second[2], is_digit, budget)?
+        && optional_class(&third[0], is_digit_0_1, budget)?
+        && byte_class(&third[1], is_digit, budget)?
+        && optional_class(&third[2], is_digit, budget)?)
+}
+
+fn domain_scheme(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(optional) = repetition(hir, 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    let Some(parts) = concat(optional, 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(branches) = alternation(&parts[0], 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(http) = concat(&branches[0], 5, budget)? else {
+        return Ok(false);
+    };
+    let Some(ftp) = concat(&branches[1], 3, budget)? else {
+        return Ok(false);
+    };
+    Ok(folded_letter(&http[0], b'h', budget)?
+        && folded_letter(&http[1], b't', budget)?
+        && folded_letter(&http[2], b't', budget)?
+        && folded_letter(&http[3], b'p', budget)?
+        && optional_folded_letter(&http[4], b's', budget)?
+        && folded_letter(&ftp[0], b'f', budget)?
+        && folded_letter(&ftp[1], b't', budget)?
+        && folded_letter(&ftp[2], b'p', budget)?
+        && literal(&parts[1], b"://", budget)?)
+}
+
+fn domain_auth(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(optional) = repetition(hir, 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    let Some(parts) = concat(optional, 4, budget)? else {
+        return Ok(false);
+    };
+    Ok(unbounded_class(&parts[0], 1, is_user, budget)?
+        && literal(&parts[1], b":", budget)?
+        && unbounded_class(&parts[2], 1, is_password, budget)?
+        && literal(&parts[3], b"@", budget)?)
+}
+
+fn subdomains(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 0, None, budget)? else {
+        return Ok(false);
+    };
+    let Some(parts) = concat(sub, 3, budget)? else {
+        return Ok(false);
+    };
+    Ok(label_repeat(&parts[0], is_subdomain_atom, budget)?
+        && byte_class(&parts[1], is_alnum, budget)?
+        && literal(&parts[2], b".", budget)?)
+}
+
+fn base_label(hir: &Hir, budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(branches) = alternation(hir, 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(regular) = concat(&branches[0], 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(xn) = concat(&branches[1], 4, budget)? else {
+        return Ok(false);
+    };
+    Ok(label_repeat(&regular[0], is_alnum, budget)?
+        && byte_class(&regular[1], is_alnum, budget)?
+        && folded_letter(&xn[0], b'x', budget)?
+        && folded_letter(&xn[1], b'n', budget)?
+        && literal(&xn[2], b"--", budget)?
+        && unbounded_class(&xn[3], 1, is_xn_body, budget)?)
+}
+
+fn label_repeat(
+    hir: &Hir,
+    predicate: fn(u8) -> bool,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 0, Some(62), budget)? else {
+        return Ok(false);
+    };
+    let Some(parts) = concat(sub, 2, budget)? else {
+        return Ok(false);
+    };
+    Ok(byte_class(&parts[0], predicate, budget)? && optional_literal(&parts[1], b"-", budget)?)
+}
+
+fn common_suffix(parts: &[&Hir], budget: &mut CompileBudget) -> Result<bool, Error> {
+    budget.charge(1)?;
+    if parts.len() != 5 {
+        return Ok(false);
+    }
+    let Some(port) = repetition(parts[0], 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    let Some(port_parts) = concat(port, 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(digits) = repetition(&port_parts[1], 2, Some(5), budget)? else {
+        return Ok(false);
+    };
+    let Some(path) = repetition(parts[1], 0, None, budget)? else {
+        return Ok(false);
+    };
+    let Some(path_parts) = concat(path, 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(path_body) = repetition(&path_parts[1], 1, None, budget)? else {
+        return Ok(false);
+    };
+    let Some(query) = repetition(parts[3], 0, None, budget)? else {
+        return Ok(false);
+    };
+    let Some(query_parts) = concat(query, 2, budget)? else {
+        return Ok(false);
+    };
+    let Some(nonspace) = repetition(&query_parts[1], 0, None, budget)? else {
+        return Ok(false);
+    };
+    Ok(literal(&port_parts[0], b":", budget)?
+        && byte_class(digits, is_digit, budget)?
+        && literal(&path_parts[0], b"/", budget)?
+        && byte_class(path_body, is_path, budget)?
+        && optional_literal(parts[2], b"/", budget)?
+        && byte_class(&query_parts[0], is_query_marker, budget)?
+        && byte_class(nonspace, is_nonspace, budget)?
+        && optional_literal(parts[4], b"/", budget)?)
+}
+
+fn repetition<'a>(
+    hir: &'a Hir,
+    min: u32,
+    max: Option<u32>,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a Hir>, Error> {
+    budget.charge(1)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    Ok(
+        (repetition.min == min && repetition.max == max && repetition.greedy)
+            .then_some(repetition.sub.as_ref()),
+    )
+}
+
+fn concat<'a>(
+    hir: &'a Hir,
+    length: usize,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a [Hir]>, Error> {
+    budget.charge(1)?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return Ok(None);
+    };
+    Ok((parts.len() == length).then_some(parts.as_slice()))
+}
+
+fn alternation<'a>(
+    hir: &'a Hir,
+    length: usize,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a [Hir]>, Error> {
+    budget.charge(1)?;
+    let HirKind::Alternation(branches) = hir.kind() else {
+        return Ok(None);
+    };
+    Ok((branches.len() == length).then_some(branches.as_slice()))
+}
+
+fn literal(hir: &Hir, expected: &[u8], budget: &mut CompileBudget) -> Result<bool, Error> {
+    budget.charge(1)?;
+    let HirKind::Literal(literal) = hir.kind() else {
+        return Ok(false);
+    };
+    budget.charge(literal.0.len().max(expected.len()))?;
+    Ok(literal.0.as_ref() == expected)
+}
+
+fn optional_literal(hir: &Hir, expected: &[u8], budget: &mut CompileBudget) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    literal(sub, expected, budget)
+}
+
+fn optional_class(
+    hir: &Hir,
+    predicate: fn(u8) -> bool,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    byte_class(sub, predicate, budget)
+}
+
+fn unbounded_class(
+    hir: &Hir,
+    min: u32,
+    predicate: fn(u8) -> bool,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, min, None, budget)? else {
+        return Ok(false);
+    };
+    byte_class(sub, predicate, budget)
+}
+
+fn optional_folded_letter(
+    hir: &Hir,
+    expected: u8,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    let Some(sub) = repetition(hir, 0, Some(1), budget)? else {
+        return Ok(false);
+    };
+    folded_letter(sub, expected, budget)
+}
+
+fn folded_letter(hir: &Hir, expected: u8, budget: &mut CompileBudget) -> Result<bool, Error> {
+    budget.charge(1)?;
+    let HirKind::Class(Class::Bytes(class)) = hir.kind() else {
+        return Ok(false);
+    };
+    let mut actual = ByteSet::empty();
+    for range in class.ranges() {
+        budget.charge(1)?;
+        for byte in range.start()..=range.end() {
+            budget.charge(1)?;
+            actual.insert(byte);
+        }
+    }
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        let wanted = byte == expected.to_ascii_lowercase() || byte == expected.to_ascii_uppercase();
+        if actual.contains(byte) != wanted {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn byte_class(
+    hir: &Hir,
+    predicate: fn(u8) -> bool,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    budget.charge(1)?;
+    let HirKind::Class(Class::Bytes(class)) = hir.kind() else {
+        return Ok(false);
+    };
+    let mut actual = ByteSet::empty();
+    for range in class.ranges() {
+        budget.charge(1)?;
+        for byte in range.start()..=range.end() {
+            budget.charge(1)?;
+            actual.insert(byte);
+        }
+    }
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        if actual.contains(byte) != predicate(byte) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn exact_whitespace(bytes: ByteSet, budget: &mut CompileBudget) -> Result<bool, Error> {
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        if bytes.contains(byte) != is_whitespace(byte) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const fn is_digit(byte: u8) -> bool {
+    byte.is_ascii_digit()
+}
+
+const fn is_digit_0_1(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'1')
+}
+
+const fn is_digit_0_4(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'4')
+}
+
+const fn is_digit_0_5(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'5')
+}
+
+const fn is_alnum(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+const fn is_subdomain_atom(byte: u8) -> bool {
+    is_alnum(byte) || matches!(byte, b'_' | b'~')
+}
+
+const fn is_user(byte: u8) -> bool {
+    is_alnum(byte) || matches!(byte, b'%' | b'.')
+}
+
+const fn is_password(byte: u8) -> bool {
+    is_alnum(byte) || byte == b'%'
+}
+
+const fn is_xn_body(byte: u8) -> bool {
+    is_alnum(byte) || byte == b'-'
+}
+
+const fn is_path(byte: u8) -> bool {
+    is_alnum(byte)
+        || matches!(
+            byte,
+            b'/' | b'-'
+                | b'_'
+                | b'%'
+                | b'$'
+                | b'@'
+                | b'&'
+                | b'('
+                | b')'
+                | b'!'
+                | b'?'
+                | b'\''
+                | b'='
+                | b'~'
+                | b'*'
+                | b'+'
+                | b':'
+                | b';'
+                | b','
+                | b'.'
+        )
+}
+
+const fn is_query_marker(byte: u8) -> bool {
+    matches!(byte, b'?' | b'#')
+}
+
+const fn is_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ')
+}
+
+const fn is_nonspace(byte: u8) -> bool {
+    !is_whitespace(byte)
 }
 
 fn build_branch<'a>(
@@ -1205,6 +1772,25 @@ mod tests {
     }
 
     #[test]
+    fn large_non_url_capture_is_rejected_by_bounded_prefilter() {
+        let alternatives = (0..512)
+            .map(|index| format!("word{index:04}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let hir = parsed(&format!("({alternatives})"), true, false);
+        let mut budget = CompileBudget::new(CompileLimits {
+            max_work: 8,
+            ..CompileLimits::default()
+        });
+        assert!(
+            certify_url_authoritative(&hir, Limits::default(), &mut budget)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.current_construction_bytes(), 0);
+    }
+
+    #[test]
     fn exact_work_and_scratch_limits_accept_exact_and_refuse_one_below() {
         let hir = parsed(r"(?:https?|ftp)://x|(?:AB|A)\.COM", true, false);
         let mut baseline_budget = CompileBudget::new(CompileLimits::default());
@@ -1299,7 +1885,7 @@ mod tests {
             max_program_bytes: 64 << 20,
             ..CompileLimits::default()
         });
-        let certificate = certify(
+        let certificate = certify_url_authoritative(
             &hir,
             Limits {
                 max_scratch_bytes: 64 << 20,
@@ -1308,8 +1894,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(certificate.branches().len(), 2);
-        let schemes = certificate.branches()[0]
+        assert_eq!(certificate.inner.branches().len(), 2);
+        let schemes = certificate.inner.branches()[0]
             .words()
             .map(<[u8]>::to_vec)
             .collect::<Vec<_>>();
@@ -1321,7 +1907,7 @@ mod tests {
                 b"ftp://".to_vec(),
             ]
         );
-        let domains = certificate.branches()[1]
+        let domains = certificate.inner.branches()[1]
             .words()
             .map(<[u8]>::to_vec)
             .collect::<Vec<_>>();
@@ -1333,11 +1919,35 @@ mod tests {
             certificate.accounting()
         );
         for byte in [b' ', b'\t', b'\n', b'\x0b', b'\x0c', b'\r'] {
-            assert!(certificate.delimiters().contains(byte));
+            assert!(certificate.inner.delimiters().contains(byte));
         }
         assert_eq!(certificate.accounting().branches, 2);
         assert_eq!(certificate.accounting().anchor_patterns, 1_501);
         certificate.release(&mut budget).unwrap();
         assert_eq!(budget.current_construction_bytes(), 0);
+
+        let source = source.trim_end();
+        assert!(source.starts_with('(') && source.ends_with(')'));
+        let zero_capture = parsed(&source[1..source.len() - 1], true, false);
+        let two_captures = parsed(&format!("({source})"), true, false);
+        for rejected in [&zero_capture, &two_captures] {
+            let mut rejected_budget = CompileBudget::new(CompileLimits {
+                max_work: 64 << 20,
+                max_program_bytes: 64 << 20,
+                ..CompileLimits::default()
+            });
+            assert!(
+                certify_url_authoritative(
+                    rejected,
+                    Limits {
+                        max_scratch_bytes: 64 << 20,
+                    },
+                    &mut rejected_budget,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(rejected_budget.current_construction_bytes(), 0);
+        }
     }
 }

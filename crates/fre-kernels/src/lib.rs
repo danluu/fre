@@ -266,7 +266,7 @@ pub use url_aggregate::{
     ReduceAccounting as UrlAggregateReduceAccounting, ReduceError as UrlAggregateReduceError,
     ReduceLimits as UrlAggregateReduceLimits,
     SPAN_SUM_OPERATION_ID as URL_AGGREGATE_SPAN_SUM_OPERATION_ID,
-    SpanSumResult as UrlAggregateSpanSumResult, UrlAggregatePlan,
+    SpanSumResult as UrlAggregateSpanSumResult, UrlAggregateBuildAuthority, UrlAggregatePlan,
 };
 
 /// Hard limits for building one exact-literal plan.

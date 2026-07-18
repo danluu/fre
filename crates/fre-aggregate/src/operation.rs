@@ -4,7 +4,8 @@ use core::ops::Range;
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::{
     RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
-    RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan,
+    RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan, UrlAggregatePlan,
+    UrlAggregateReduceError, UrlAggregateReduceLimits,
 };
 
 use crate::accounting::ExecutionAccounting;
@@ -361,6 +362,12 @@ impl CompiledRegex {
             });
         }
         let local = &haystack[range.clone()];
+        if matches!(kind, OperationKind::Count | OperationKind::Sum)
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.url_aggregate
+        {
+            return self.execute_url_aggregate(plan, local, range, strategy, kind, limits);
+        }
         if kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.required_internal_anchor
@@ -623,6 +630,103 @@ impl CompiledRegex {
         })
     }
 
+    fn execute_url_aggregate(
+        &self,
+        plan: &UrlAggregatePlan,
+        local: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        limits: OperationLimits,
+    ) -> Result<ExecutionResult, Error> {
+        let boundaries = add(local.len(), 1, Resource::Boundaries)?;
+        enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+        let result = plan
+            .span_sum(
+                local,
+                0..local.len(),
+                UrlAggregateReduceLimits {
+                    max_input_bytes: local.len(),
+                    max_boundaries: limits.max_boundaries,
+                    max_candidates: limits.max_work,
+                    max_match_events: limits.max_match_events,
+                    max_output_matches: limits.max_output_matches,
+                    max_span_sum: if kind == OperationKind::Sum {
+                        limits.max_span_sum
+                    } else {
+                        usize::MAX
+                    },
+                    max_sequential_bytes: limits.max_sequential_bytes,
+                    max_random_access_bytes: usize::MAX,
+                    max_random_access_storage_bytes: limits.max_random_access_bytes,
+                    max_work: limits.max_work,
+                    max_scratch_bytes: limits.max_scratch_bytes,
+                    max_peak_bytes: limits.max_peak_bytes,
+                },
+            )
+            .map_err(|error| map_url_reduce_error(&error))?;
+        let actual = result.accounting;
+        let accounting = ExecutionAccounting {
+            successful_paths: result.matches,
+            emitted_matches: result.matches,
+            sequential_bytes_read: actual.sequential_bytes,
+            random_access_bytes_read: actual.random_access_bytes,
+            random_access_peak_bytes: actual.random_access_storage_bytes,
+            scratch_peak_bytes: actual.scratch_bytes,
+            peak_bytes: actual.peak_bytes,
+            work: actual.work,
+            url_segments: actual.segments,
+            url_dot_probes: actual.dot_probes,
+            url_tld_transitions: actual.tld_transitions,
+            url_tld_candidates: actual.tld_candidates,
+            url_scheme_probes: actual.scheme_probes,
+            url_ipv4_candidates: actual.ipv4_candidates,
+            url_prefix_steps: actual.prefix_steps,
+            url_suffix_steps: actual.suffix_steps,
+            url_candidate_insertions: actual.candidate_insertions,
+            url_candidate_visits: actual.candidate_visits,
+            ..ExecutionAccounting::default()
+        };
+        let span_sum = if kind == OperationKind::Sum {
+            result.value
+        } else {
+            0
+        };
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_id: operation_identity(self.plan_id(), strategy, kind, false),
+            strategy,
+            range,
+            states: self.program.insts.len(),
+            boundaries,
+            table_cells: 0,
+            row_storage: None,
+            row_record_bytes: 0,
+            terminal_frontier: false,
+            work_bound: actual.work,
+            random_access_bytes: actual.random_access_storage_bytes,
+            scratch_bytes: actual.scratch_bytes,
+            log_bytes: 0,
+            sequential_bytes_bound: actual.sequential_bytes,
+            match_events: result.matches,
+            output_matches: result.matches,
+            output_bytes: 0,
+            span_sum,
+            peak_bytes: actual.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting,
+            summary: ScanSummary {
+                matches: result.matches,
+                events: result.matches,
+                suppressed: 0,
+                span_sum,
+            },
+            spans: Vec::new(),
+        })
+    }
+
     fn execute_required_internal_anchor(
         &self,
         plan: &RequiredInternalAnchorPlan,
@@ -743,6 +847,131 @@ impl CompiledRegex {
             },
             spans: Vec::new(),
         })
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive mapping keeps every kernel refusal tied to its public resource"
+)]
+fn map_url_reduce_error(error: &UrlAggregateReduceError) -> Error {
+    match *error {
+        UrlAggregateReduceError::InvalidRange {
+            start,
+            end,
+            haystack_len,
+        } => Error::InvalidRange {
+            start,
+            end,
+            haystack_len,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "boundaries",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::Boundaries,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "match events",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::MatchEvents,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "output matches",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::OutputMatches,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "span sum",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::SpanSum,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "sequential bytes",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::SequentialBytes,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "random access storage bytes",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::RandomAccessBytes,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "scratch bytes",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::ScratchBytes,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource {
+            resource: "peak bytes",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::PeakBytes,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Resource { needed, limit, .. } => Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required: needed,
+            limit,
+        },
+        UrlAggregateReduceError::Overflow(resource) => Error::ArithmeticOverflow {
+            resource: map_url_overflow_resource(resource),
+        },
+        UrlAggregateReduceError::Allocation { items, .. } => Error::AllocationFailed {
+            resource: Resource::ScratchBytes,
+            items,
+        },
+        UrlAggregateReduceError::Invariant(_) => {
+            Error::InternalInvariant("certified URL aggregate execution invariant failed")
+        }
+        _ => Error::InternalInvariant("unclassified URL aggregate execution refusal"),
+    }
+}
+
+#[allow(
+    clippy::match_same_arms,
+    reason = "named random-read overflow is proved work-dominated; unknown future counters also fail closed as execution work"
+)]
+fn map_url_overflow_resource(resource: &str) -> Resource {
+    match resource {
+        "boundaries" | "input cursor" | "segment start" => Resource::Boundaries,
+        "sequential bytes" => Resource::SequentialBytes,
+        "random access bytes" => Resource::ExecutionWork,
+        "random access storage bytes" => Resource::RandomAccessBytes,
+        "candidate records" | "scratch bytes" | "segment bytes" => Resource::ScratchBytes,
+        "span sum" => Resource::SpanSum,
+        "matches" => Resource::OutputMatches,
+        "candidate insertions" | "candidate visits" => Resource::ExecutionWork,
+        "peak bytes" => Resource::PeakBytes,
+        _ => Resource::ExecutionWork,
     }
 }
 
@@ -3966,9 +4195,14 @@ fn operation_identity(
 
 #[cfg(test)]
 mod tests {
+    use regex::bytes::RegexBuilder;
+    use regex_syntax::ParserBuilder;
+
     use crate::accounting::ExecutionAccounting;
     use crate::program::AssertionContext;
-    use crate::{CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile};
+    use crate::{
+        CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Strategy,
+    };
 
     use super::{
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot, RowReader,
@@ -4248,5 +4482,505 @@ mod tests {
         assert_eq!(None, reader.endpoint(1, &mut accounting).unwrap());
         assert_eq!(2, accounting.sequential_bytes_read);
         assert!(reader.root(1, &mut accounting).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires authenticated Rebar URL pattern and haystack paths"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated transaction covers compile, every operation route, and all one-below resources"
+    )]
+    fn authenticated_url_integrates_compile_count_sum_and_generic_spans() {
+        let pattern_path = std::env::var_os("FRE_TEST_URL_PATTERN")
+            .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
+        let haystack_path = std::env::var_os("FRE_TEST_URL_HAYSTACK")
+            .expect("FRE_TEST_URL_HAYSTACK must name the authenticated URL haystack");
+        let source = std::fs::read_to_string(pattern_path).unwrap();
+        let source = source.trim_end();
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .case_insensitive(true)
+            .build()
+            .parse(source)
+            .unwrap();
+        let base_compile = CompileLimits {
+            max_hir_nodes: 65_536,
+            max_hir_stack_items: 65_536,
+            max_repeat_bound: 1_024,
+            max_program_bytes: 16 * 1_048_576,
+            max_work: 16 * 1_048_576,
+            ..CompileLimits::default()
+        };
+        crate::compile::url_pack_allocation_probe::reset();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            base_compile,
+        )
+        .unwrap();
+        let compile = compiled.compile_accounting();
+        assert_eq!(compile.url_aggregate_plans, 1);
+        assert_eq!(compile.url_aggregate_tlds, 1_498);
+        assert_eq!(compile.url_aggregate_tld_bytes, 8_505);
+        assert!(compile.url_aggregate_build_work > 0);
+        assert!(compile.url_aggregate_persistent_bytes > 0);
+        assert!(compile.work <= base_compile.max_work);
+        assert_eq!(crate::compile::url_pack_allocation_probe::calls(), 2);
+        assert_eq!(crate::compile::url_pack_allocation_probe::count_calls(), 1);
+        assert_eq!(
+            crate::compile::url_pack_allocation_probe::copy_calls(),
+            compile.url_aggregate_tld_bytes
+        );
+        let pack_precount_work =
+            crate::compile::url_pack_allocation_probe::precount_work().unwrap();
+        let pack_precopy_work = crate::compile::url_pack_allocation_probe::precopy_work().unwrap();
+        let pack_preallocation_work =
+            crate::compile::url_pack_allocation_probe::preallocation_work().unwrap();
+
+        crate::compile::url_pack_allocation_probe::reset();
+        let count_accessor_refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_work: pack_precount_work,
+                ..base_compile
+            },
+        );
+        assert!(matches!(
+            count_accessor_refusal,
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        assert_eq!(crate::compile::url_pack_allocation_probe::count_calls(), 0);
+
+        crate::compile::url_pack_allocation_probe::reset();
+        let first_copy_refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_work: pack_precopy_work,
+                ..base_compile
+            },
+        );
+        assert!(matches!(
+            first_copy_refusal,
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        assert_eq!(crate::compile::url_pack_allocation_probe::copy_calls(), 0);
+
+        crate::compile::url_pack_allocation_probe::reset();
+        let pack_preallocation_refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_work: pack_preallocation_work + 3,
+                ..base_compile
+            },
+        );
+        assert!(matches!(
+            pack_preallocation_refusal,
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        assert_eq!(crate::compile::url_pack_allocation_probe::calls(), 0);
+
+        let exact = CompileLimits {
+            max_work: compile.work,
+            max_program_bytes: compile.program_bytes,
+            ..base_compile
+        };
+        let exact_compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            exact,
+        )
+        .unwrap();
+        assert_eq!(compiled.plan_id(), exact_compiled.plan_id());
+        assert!(matches!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_work: compile.work - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        let program_one_below = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_program_bytes: compile.program_bytes - 1,
+                ..exact
+            },
+        );
+        assert!(
+            matches!(
+                program_one_below,
+                Err(Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    ..
+                })
+            ),
+            "unexpected program-byte one-below result: {program_one_below:?}"
+        );
+
+        let haystack = std::fs::read(haystack_path).unwrap();
+        let limits = OperationLimits {
+            max_boundaries: haystack.len() + 1,
+            ..OperationLimits::default()
+        };
+        let sum = compiled
+            .admit_span_sum(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        assert_eq!(sum.value(), 234_965);
+        assert_eq!(sum.certificate().output_matches, 25_957);
+        assert_eq!(
+            sum.certificate().random_access_bytes,
+            sum.accounting().random_access_peak_bytes
+        );
+        assert!(sum.accounting().random_access_bytes_read > 0);
+        assert_eq!(
+            sum.certificate().scratch_bytes,
+            sum.accounting().scratch_peak_bytes
+        );
+        assert_eq!(sum.certificate().work_bound, sum.accounting().work);
+        let url = sum.accounting();
+        assert_eq!(url.url_segments, 742_904);
+        assert_eq!(url.url_dot_probes, 76_849);
+        assert_eq!(url.url_tld_transitions, 210_680);
+        assert_eq!(url.url_tld_candidates, 39_549);
+        assert_eq!(url.url_scheme_probes, 205_575);
+        assert_eq!(url.url_ipv4_candidates, 0);
+        assert_eq!(url.url_prefix_steps, 944_525);
+        assert_eq!(url.url_suffix_steps, 14_565);
+        assert_eq!(url.url_candidate_insertions, 142_571);
+        assert_eq!(url.url_candidate_visits, 25_957);
+        assert_eq!(url.state_evaluations, 0);
+        assert_eq!(url.transition_checks, 0);
+        assert_eq!(url.assertion_checks, 0);
+        assert_eq!(url.root_probes, 0);
+        assert_eq!(url.frontier_insertions, 0);
+        assert_eq!(url.frontier_evaluations, 0);
+        let exact_run = OperationLimits {
+            max_boundaries: sum.certificate().boundaries,
+            max_table_cells: 0,
+            max_random_access_bytes: sum.certificate().random_access_bytes,
+            max_scratch_bytes: sum.certificate().scratch_bytes,
+            max_log_bytes: 0,
+            max_sequential_bytes: sum.certificate().sequential_bytes_bound,
+            max_match_events: sum.certificate().match_events,
+            max_output_matches: sum.certificate().output_matches,
+            max_output_bytes: 0,
+            max_span_sum: sum.value(),
+            max_peak_bytes: sum.certificate().peak_bytes,
+            max_work: sum.certificate().work_bound,
+        };
+        assert_eq!(
+            compiled
+                .span_sum_value(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                )
+                .unwrap(),
+            234_965
+        );
+        assert_eq!(
+            compiled
+                .span_sum_value(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    exact_run,
+                )
+                .unwrap(),
+            234_965
+        );
+        let assert_sum_refusal = |limits, resource| {
+            assert!(matches!(
+                compiled.span_sum_value(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                ),
+                Err(Error::ResourceLimit {
+                    resource: actual,
+                    ..
+                }) if actual == resource
+            ));
+        };
+        assert_sum_refusal(
+            OperationLimits {
+                max_boundaries: exact_run.max_boundaries - 1,
+                ..exact_run
+            },
+            Resource::Boundaries,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_random_access_bytes: exact_run.max_random_access_bytes - 1,
+                ..exact_run
+            },
+            Resource::RandomAccessBytes,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_scratch_bytes: exact_run.max_scratch_bytes - 1,
+                ..exact_run
+            },
+            Resource::ScratchBytes,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_peak_bytes: exact_run.max_peak_bytes - 1,
+                ..exact_run
+            },
+            Resource::PeakBytes,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_sequential_bytes: exact_run.max_sequential_bytes - 1,
+                ..exact_run
+            },
+            Resource::SequentialBytes,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_match_events: exact_run.max_match_events - 1,
+                ..exact_run
+            },
+            Resource::MatchEvents,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_output_matches: exact_run.max_output_matches - 1,
+                ..exact_run
+            },
+            Resource::OutputMatches,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_span_sum: exact_run.max_span_sum - 1,
+                ..exact_run
+            },
+            Resource::SpanSum,
+        );
+        assert_sum_refusal(
+            OperationLimits {
+                max_work: exact_run.max_work - 1,
+                ..exact_run
+            },
+            Resource::ExecutionWork,
+        );
+        let count = compiled
+            .admit_count(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        assert_eq!(count.value(), 25_957);
+        assert_eq!(count.certificate().span_sum, 0);
+        assert_ne!(
+            count.certificate().operation_id,
+            sum.certificate().operation_id
+        );
+        assert_eq!(count.certificate().regex_plan_id, compiled.plan_id());
+        assert_eq!(sum.certificate().regex_plan_id, compiled.plan_id());
+        assert_eq!(
+            compiled
+                .count_value(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                )
+                .unwrap(),
+            25_957
+        );
+        assert_eq!(
+            compiled
+                .count_value(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_boundaries: haystack.len() + 1,
+                        max_span_sum: 0,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap(),
+            25_957
+        );
+
+        let sample = b"http://1.2.3.4x.com x.comdef.a.com";
+        let expected = RegexBuilder::new(source)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap()
+            .find_iter(sample)
+            .map(|found| (found.start(), found.end()))
+            .collect::<Vec<_>>();
+        let spans = compiled
+            .admit_spans(
+                sample,
+                0..sample.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap()
+            .iter()
+            .map(|span| (span.start, span.end))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, expected);
+        let reverse_sum = compiled
+            .admit_span_sum(
+                sample,
+                0..sample.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let reverse_count = compiled
+            .admit_count(
+                sample,
+                0..sample.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let full_sum = compiled
+            .admit_span_sum(
+                sample,
+                0..sample.len(),
+                Strategy::FullTable,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let full_count = compiled
+            .admit_count(
+                sample,
+                0..sample.len(),
+                Strategy::FullTable,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(reverse_sum.value(), full_sum.value());
+        assert_eq!(reverse_count.value(), full_count.value());
+        assert_eq!(
+            full_sum.value(),
+            expected.iter().map(|(start, end)| end - start).sum()
+        );
+        assert_eq!(full_count.value(), expected.len());
+        assert!(reverse_sum.accounting().url_segments > 0);
+        assert_eq!(full_sum.accounting().url_segments, 0);
+        assert_ne!(
+            reverse_sum.certificate().operation_id,
+            full_sum.certificate().operation_id
+        );
+        assert_ne!(
+            reverse_count.certificate().operation_id,
+            full_count.certificate().operation_id
+        );
+
+        let ranged_sum = compiled
+            .admit_span_sum(
+                b"!!x.com!!",
+                2..7,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let ranged_count = compiled
+            .admit_count(
+                b"!!x.com!!",
+                2..7,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(ranged_sum.value(), 5);
+        assert_eq!(ranged_count.value(), 1);
+        assert_eq!(ranged_sum.certificate().range, 2..7);
+        assert_eq!(ranged_count.certificate().range, 2..7);
+
+        let conflicting_source = source.replacen("ZIP|AC", "AB|ABC", 1);
+        assert_ne!(conflicting_source, source);
+        let conflicting_hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .case_insensitive(true)
+            .build()
+            .parse(&conflicting_source)
+            .unwrap();
+        let conflicting = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &conflicting_hir,
+            RustByteProfile::PINNED_1_12_4,
+            base_compile,
+        )
+        .unwrap();
+        let fallback = conflicting.compile_accounting();
+        assert_eq!(fallback.url_aggregate_plans, 0);
+        assert_eq!(fallback.url_aggregate_tlds, 0);
+        assert_eq!(fallback.url_aggregate_tld_bytes, 0);
+        assert_eq!(fallback.url_aggregate_build_work, 0);
+        assert_eq!(fallback.url_aggregate_persistent_bytes, 0);
+        assert_ne!(conflicting.plan_id(), compiled.plan_id());
+        let conflict_oracle = RegexBuilder::new(&conflicting_source)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        let conflict_spans = conflict_oracle.find_iter(b"x.ab").collect::<Vec<_>>();
+        assert_eq!(conflict_spans.len(), 1);
+        assert_eq!(conflict_spans[0].range(), 0..4);
+        assert_eq!(
+            conflicting
+                .span_sum_value(
+                    b"x.ab",
+                    0..4,
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            conflicting
+                .count_value(
+                    b"x.ab",
+                    0..4,
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+            1
+        );
     }
 }

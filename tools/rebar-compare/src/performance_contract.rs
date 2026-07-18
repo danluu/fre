@@ -2596,7 +2596,8 @@ fn performance_runner_route(
             "compile-aggregate-exact-literal"
             | "compile-aggregate-unicode-scalar-class"
             | "compile-aggregate-finite-literal-dfa"
-            | "compile-aggregate-continuation-program",
+            | "compile-aggregate-continuation-program"
+            | "compile-aggregate-url",
             1,
         )
         | (
@@ -2604,7 +2605,8 @@ fn performance_runner_route(
             "aggregate-exact-literal"
             | "aggregate-unicode-scalar-class"
             | "aggregate-finite-literal-dfa"
-            | "aggregate-continuation-program",
+            | "aggregate-continuation-program"
+            | "aggregate-url",
             1,
         ) => PerformanceRunnerRoute::AggregateSingle,
         ("compile", "compile-many-ordered-literal" | "compile-many-continuation-program", 2..)

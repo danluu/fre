@@ -11,6 +11,82 @@ use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet
 use crate::required_internal_anchor;
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
+#[cfg(test)]
+pub(crate) mod url_pack_allocation_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static PREALLOCATION_WORK: Cell<usize> = const { Cell::new(usize::MAX) };
+        static COUNT_CALLS: Cell<usize> = const { Cell::new(0) };
+        static PRECOUNT_WORK: Cell<usize> = const { Cell::new(usize::MAX) };
+        static COPY_CALLS: Cell<usize> = const { Cell::new(0) };
+        static PRECOPY_WORK: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    pub(crate) fn reset() {
+        CALLS.set(0);
+        PREALLOCATION_WORK.set(usize::MAX);
+        COUNT_CALLS.set(0);
+        PRECOUNT_WORK.set(usize::MAX);
+        COPY_CALLS.set(0);
+        PRECOPY_WORK.set(usize::MAX);
+    }
+
+    pub(crate) fn record_preallocation_work(work: usize) {
+        PREALLOCATION_WORK.set(work);
+    }
+
+    pub(crate) fn record_call() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(crate) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(crate) fn preallocation_work() -> Option<usize> {
+        let work = PREALLOCATION_WORK.get();
+        (work != usize::MAX).then_some(work)
+    }
+
+    pub(crate) fn record_precount_work(work: usize) {
+        PRECOUNT_WORK.set(work);
+    }
+
+    pub(crate) fn record_count_call() {
+        COUNT_CALLS.set(COUNT_CALLS.get().saturating_add(1));
+    }
+
+    pub(crate) fn count_calls() -> usize {
+        COUNT_CALLS.get()
+    }
+
+    pub(crate) fn precount_work() -> Option<usize> {
+        let work = PRECOUNT_WORK.get();
+        (work != usize::MAX).then_some(work)
+    }
+
+    pub(crate) fn record_precopy_work(work: usize) {
+        if PRECOPY_WORK.get() == usize::MAX {
+            PRECOPY_WORK.set(work);
+        }
+    }
+
+    pub(crate) fn record_copy_call() {
+        COPY_CALLS.set(COPY_CALLS.get().saturating_add(1));
+    }
+
+    pub(crate) fn copy_calls() -> usize {
+        COPY_CALLS.get()
+    }
+
+    pub(crate) fn precopy_work() -> Option<usize> {
+        let work = PRECOPY_WORK.get();
+        (work != usize::MAX).then_some(work)
+    }
+}
+
 /// Explicit semantic profile asserted by direct HIR callers.
 ///
 /// HIR intentionally does not retain every parser option. In particular, an
@@ -70,6 +146,7 @@ impl core::fmt::Display for PlanId {
 pub struct CompiledRegex {
     pub(crate) program: Program,
     pub(crate) candidate: Option<candidate::Plan>,
+    pub(crate) url_aggregate: Option<fre_kernels::UrlAggregatePlan>,
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     pub(crate) terminal_frontier: TerminalFrontierSeed,
@@ -226,6 +303,8 @@ impl CompiledRegex {
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
         validate_hir(hir, profile, capture_policy, &mut budget)?;
+        let url_aggregate =
+            build_url_aggregate_plan(hir, profile, capture_policy, limits, &mut budget)?;
         let (
             required_suffixes,
             required_internal_anchor,
@@ -237,8 +316,14 @@ impl CompiledRegex {
             .as_ref()
             .map_or(Ok(0), candidate::Plan::retained_bytes)?;
         let retained_program_bytes = add(
-            retained_program_bytes,
-            candidate_bytes,
+            add(
+                retained_program_bytes,
+                candidate_bytes,
+                Resource::ProgramBytes,
+            )?,
+            url_aggregate
+                .as_ref()
+                .map_or(0, |plan| plan.build_accounting().persistent_bytes),
             Resource::ProgramBytes,
         )?;
         enforce(
@@ -315,6 +400,9 @@ impl CompiledRegex {
         if let Some(plan) = &required_internal_anchor {
             plan_id = bind_required_internal_anchor_identity(plan_id, plan, &mut budget)?;
         }
+        if let Some(plan) = &url_aggregate {
+            plan_id = bind_url_aggregate_identity(plan_id, plan, &mut budget)?;
+        }
         if budget.current_construction_bytes != program_bytes {
             return Err(Error::InternalInvariant(
                 "compiler retained bytes differ from construction accounting",
@@ -324,6 +412,7 @@ impl CompiledRegex {
         Ok(Self {
             program,
             candidate,
+            url_aggregate,
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
@@ -345,6 +434,279 @@ impl CompiledRegex {
     #[must_use]
     pub fn state_count(&self) -> usize {
         self.program.insts.len()
+    }
+}
+
+struct PackedUrlTlds {
+    bytes: ExactVec<u8>,
+    ends: ExactVec<usize>,
+    allocated_bytes: usize,
+}
+
+impl PackedUrlTlds {
+    fn release(self, budget: &mut CompileBudget) -> Result<(), Error> {
+        let allocated_bytes = self.allocated_bytes;
+        drop(self);
+        budget.release_construction_bytes(allocated_bytes)
+    }
+}
+
+struct UrlBuildAuthority<'a> {
+    budget: &'a mut CompileBudget,
+    error: Option<Error>,
+}
+
+impl UrlBuildAuthority<'_> {
+    fn record(
+        &mut self,
+        result: Result<(), Error>,
+    ) -> Result<(), fre_kernels::UrlAggregateBuildError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.error = Some(error);
+                Err(fre_kernels::UrlAggregateBuildError::Invariant(
+                    "authoritative aggregate compile budget refused URL build",
+                ))
+            }
+        }
+    }
+}
+
+impl fre_kernels::UrlAggregateBuildAuthority for UrlBuildAuthority<'_> {
+    fn charge_work(&mut self, amount: usize) -> Result<(), fre_kernels::UrlAggregateBuildError> {
+        let result = self.budget.charge(amount);
+        self.record(result)
+    }
+
+    fn retain_bytes(&mut self, amount: usize) -> Result<(), fre_kernels::UrlAggregateBuildError> {
+        let result = self.budget.acquire_checked_construction_bytes(amount);
+        self.record(result)
+    }
+
+    fn release_bytes(&mut self, amount: usize) -> Result<(), fre_kernels::UrlAggregateBuildError> {
+        let result = self.budget.release_construction_bytes(amount);
+        self.record(result)
+    }
+}
+
+fn build_url_aggregate_plan(
+    hir: &Hir,
+    profile: RustByteProfile,
+    capture_policy: CapturePolicy,
+    limits: CompileLimits,
+    budget: &mut CompileBudget,
+) -> Result<Option<fre_kernels::UrlAggregatePlan>, Error> {
+    budget.charge(2)?;
+    if profile.unicode || capture_policy != CapturePolicy::EraseForWholeMatch {
+        return Ok(None);
+    }
+    let Some(certificate) = crate::anchored_island::certify_url_authoritative(
+        hir,
+        crate::anchored_island::Limits {
+            max_scratch_bytes: limits.max_program_bytes,
+        },
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
+    let result = build_url_aggregate_from_certificate(&certificate, budget);
+    let release = certificate.release(budget);
+    match (result, release) {
+        (Ok(plan), Ok(())) => Ok(plan),
+        (Err(error), Ok(())) | (Ok(None), Err(error)) => Err(error),
+        (Ok(Some(plan)), Err(error)) => {
+            budget.release_construction_bytes(plan.build_accounting().persistent_bytes)?;
+            Err(error)
+        }
+        (Err(_), Err(release_error)) => Err(release_error),
+    }
+}
+
+fn build_url_aggregate_from_certificate(
+    certificate: &crate::anchored_island::UrlCertificate<'_>,
+    budget: &mut CompileBudget,
+) -> Result<Option<fre_kernels::UrlAggregatePlan>, Error> {
+    let packed = pack_url_tlds(certificate, budget)?;
+    let build = {
+        let mut authority = UrlBuildAuthority {
+            budget,
+            error: None,
+        };
+        let result = fre_kernels::UrlAggregatePlan::build_with_authority(
+            &packed.bytes,
+            &packed.ends,
+            fre_kernels::UrlAggregateBuildLimits::default(),
+            &mut authority,
+        );
+        match result {
+            Ok(plan) => Ok(Some(plan)),
+            Err(_) if authority.error.is_some() => Err(authority.error.take().unwrap_or(
+                Error::InternalInvariant("URL build authority lost its refusal"),
+            )),
+            Err(
+                fre_kernels::UrlAggregateBuildError::DuplicateTld { .. }
+                | fre_kernels::UrlAggregateBuildError::PriorityConflict { .. },
+            ) => Ok(None),
+            Err(error) => Err(map_url_build_error(&error)),
+        }
+    };
+    let release = packed.release(budget);
+    match (build, release) {
+        (Ok(Some(plan)), Ok(())) => {
+            let accounting = plan.build_accounting();
+            budget.accounting.url_aggregate_plans = 1;
+            budget.accounting.url_aggregate_tlds = accounting.tlds;
+            budget.accounting.url_aggregate_tld_bytes = accounting.tld_bytes;
+            budget.accounting.url_aggregate_build_work = accounting.work;
+            budget.accounting.url_aggregate_persistent_bytes = accounting.persistent_bytes;
+            Ok(Some(plan))
+        }
+        (Ok(None), Ok(())) => Ok(None),
+        (Err(error), Ok(())) | (Ok(None), Err(error)) => Err(error),
+        (Ok(Some(plan)), Err(error)) => {
+            budget.release_construction_bytes(plan.build_accounting().persistent_bytes)?;
+            Err(error)
+        }
+        (Err(_), Err(release_error)) => Err(release_error),
+    }
+}
+
+fn pack_url_tlds(
+    certificate: &crate::anchored_island::UrlCertificate<'_>,
+    budget: &mut CompileBudget,
+) -> Result<PackedUrlTlds, Error> {
+    #[cfg(test)]
+    url_pack_allocation_probe::record_precount_work(budget.accounting.work);
+    budget.charge(1)?;
+    #[cfg(test)]
+    url_pack_allocation_probe::record_count_call();
+    let count = certificate.tld_count().ok_or(Error::InternalInvariant(
+        "URL certificate lost its authenticated domain branch",
+    ))?;
+    let mut byte_count = 0_usize;
+    for index in 0..count {
+        budget.charge(1)?;
+        let tld = certificate.tld(index).ok_or(Error::InternalInvariant(
+            "URL certificate TLD census changed before packing",
+        ))?;
+        budget.charge(add(tld.len(), 1, Resource::CompileWork)?)?;
+        byte_count = add(byte_count, tld.len(), Resource::LiteralBytes)?;
+    }
+    budget.charge(1)?;
+    if certificate.tld(count).is_some() {
+        return Err(Error::InternalInvariant(
+            "URL certificate TLD count omitted a retained entry",
+        ));
+    }
+    let ends_bytes = mul(count, core::mem::size_of::<usize>(), Resource::ProgramBytes)?;
+    let allocated_bytes = add(byte_count, ends_bytes, Resource::ProgramBytes)?;
+    // Two exact allocator calls and their eventual deallocations are prepaid
+    // before either allocation is attempted.
+    #[cfg(test)]
+    url_pack_allocation_probe::record_preallocation_work(budget.accounting.work);
+    budget.charge(4)?;
+    budget.acquire_checked_construction_bytes(allocated_bytes)?;
+    let packed = (|| {
+        #[cfg(test)]
+        url_pack_allocation_probe::record_call();
+        let mut bytes = ExactVec::try_with_capacity(byte_count).map_err(|error| {
+            exact_url_allocation_error(error, Resource::ProgramBytes, byte_count)
+        })?;
+        #[cfg(test)]
+        url_pack_allocation_probe::record_call();
+        let mut ends = ExactVec::try_with_capacity(count)
+            .map_err(|error| exact_url_allocation_error(error, Resource::ProgramBytes, count))?;
+        for index in 0..count {
+            budget.charge(1)?;
+            let tld = certificate.tld(index).ok_or(Error::InternalInvariant(
+                "URL certificate TLD language changed during exact copy",
+            ))?;
+            for offset in 0..tld.len() {
+                #[cfg(test)]
+                url_pack_allocation_probe::record_precopy_work(budget.accounting.work);
+                budget.charge(1)?;
+                let byte = *tld.get(offset).ok_or(Error::InternalInvariant(
+                    "URL certificate TLD byte disappeared during exact copy",
+                ))?;
+                #[cfg(test)]
+                url_pack_allocation_probe::record_copy_call();
+                bytes.try_push(byte).map_err(|_| {
+                    Error::InternalInvariant("URL TLD byte census changed during exact copy")
+                })?;
+            }
+            budget.charge(1)?;
+            ends.try_push(bytes.len())
+                .map_err(|_| Error::InternalInvariant("URL TLD count changed during exact copy"))?;
+        }
+        budget.charge(1)?;
+        if certificate.tld(count).is_some() {
+            return Err(Error::InternalInvariant(
+                "URL certificate TLD copy omitted a retained entry",
+            ));
+        }
+        if bytes.len() != byte_count || ends.len() != count {
+            return Err(Error::InternalInvariant(
+                "URL TLD language changed between census and exact copy",
+            ));
+        }
+        Ok(PackedUrlTlds {
+            bytes,
+            ends,
+            allocated_bytes,
+        })
+    })();
+    if packed.is_err() {
+        budget.release_construction_bytes(allocated_bytes)?;
+    }
+    packed
+}
+
+fn exact_url_allocation_error(error: CopyError, resource: Resource, items: usize) -> Error {
+    match error {
+        CopyError::LayoutOverflow => Error::ArithmeticOverflow { resource },
+        CopyError::AllocationFailed => Error::AllocationFailed { resource, items },
+    }
+}
+
+fn map_url_build_error(error: &fre_kernels::UrlAggregateBuildError) -> Error {
+    use fre_kernels::UrlAggregateBuildError as BuildError;
+    match *error {
+        BuildError::Resource {
+            resource: "work",
+            needed,
+            limit,
+        } => Error::ResourceLimit {
+            resource: Resource::CompileWork,
+            required: needed,
+            limit,
+        },
+        BuildError::Resource { needed, limit, .. } => Error::ResourceLimit {
+            resource: Resource::ProgramBytes,
+            required: needed,
+            limit,
+        },
+        BuildError::Overflow("work") => Error::ArithmeticOverflow {
+            resource: Resource::CompileWork,
+        },
+        BuildError::Overflow(_) => Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        },
+        BuildError::Allocation { items, .. } => Error::AllocationFailed {
+            resource: Resource::ProgramBytes,
+            items,
+        },
+        BuildError::EmptyLanguage
+        | BuildError::EmptyTld { .. }
+        | BuildError::InvalidTld { .. }
+        | BuildError::TldLength { .. }
+        | BuildError::DuplicateTld { .. }
+        | BuildError::PriorityConflict { .. }
+        | BuildError::Invariant(_) => Error::InternalInvariant(
+            "strict URL certificate disagrees with URL aggregate construction",
+        ),
+        _ => Error::InternalInvariant("unclassified URL aggregate construction refusal"),
     }
 }
 
@@ -1341,6 +1703,11 @@ impl CompileBudget {
                 required_internal_anchor_build_work: 0,
                 required_internal_anchor_build_work_upper_bound: 0,
                 required_internal_anchor_persistent_bytes: 0,
+                url_aggregate_plans: 0,
+                url_aggregate_tlds: 0,
+                url_aggregate_tld_bytes: 0,
+                url_aggregate_build_work: 0,
+                url_aggregate_persistent_bytes: 0,
                 terminal_frontier_prefix_bytes: 0,
                 terminal_frontier_bytes: 0,
                 candidate_entries: 0,
@@ -1369,7 +1736,7 @@ impl CompileBudget {
         Ok(())
     }
 
-    fn acquire_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+    pub(crate) fn acquire_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = add(
             self.current_construction_bytes,
             amount,
@@ -1398,7 +1765,6 @@ impl CompileBudget {
         )?;
         self.acquire_construction_bytes(amount)
     }
-
     pub(crate) fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = self
             .current_construction_bytes
@@ -3229,6 +3595,58 @@ fn bind_required_internal_anchor_identity(
             } else {
                 hash.byte(0);
             }
+        }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
+fn bind_url_aggregate_identity(
+    program: PlanId,
+    plan: &fre_kernels::UrlAggregatePlan,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = fre_kernels::URL_AGGREGATE_PLAN_ID.as_bytes();
+    let operation = fre_kernels::URL_AGGREGATE_SPAN_SUM_OPERATION_ID.as_bytes();
+    let accounting = plan.build_accounting();
+    let fields = [
+        accounting.tlds,
+        accounting.tld_bytes,
+        accounting.states_upper_bound,
+        accounting.states,
+        accounting.table_cells,
+        accounting.initialized_cells,
+        accounting.priority_comparisons,
+        accounting.trie_transitions,
+        accounting.work,
+        accounting.persistent_bytes,
+        accounting.scratch_bytes,
+        accounting.peak_bytes,
+    ];
+    let payload = add(
+        add(program.0.len(), domain.len(), Resource::CompileWork)?,
+        add(
+            operation.len(),
+            mul(
+                fields.len(),
+                core::mem::size_of::<u64>(),
+                Resource::CompileWork,
+            )?,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0xd7b9_0f23_6a15_4ce1);
+    let mut second = StableHash::new(0x4ce1_6a15_0f23_d7b9);
+    for hash in [&mut first, &mut second] {
+        hash.bytes(&program.0);
+        hash.bytes(domain);
+        hash.bytes(operation);
+        for field in fields {
+            hash_usize(hash, field);
         }
     }
     let mut bytes = [0_u8; 16];

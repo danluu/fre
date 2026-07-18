@@ -418,6 +418,10 @@ fn preflight_frontier_bytes(
     )
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the fixed accounting snapshot is copied deliberately before admission publication"
+)]
 fn preflight_completion(
     accounting: ExecutionAccounting,
     census: Delta,
@@ -1233,6 +1237,10 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the fixed accounting snapshot is copied deliberately for exact delta accounting"
+    )]
     const fn new(accounting: ExecutionAccounting) -> Self {
         Self {
             work: accounting.work,
@@ -1245,6 +1253,10 @@ impl Snapshot {
         }
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the fixed accounting snapshot is copied deliberately for exact delta accounting"
+    )]
     fn delta(self, accounting: ExecutionAccounting) -> Result<Delta, Error> {
         Ok(Delta {
             work: delta(accounting.work, self.work)?,

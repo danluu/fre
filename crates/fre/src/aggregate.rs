@@ -71,7 +71,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 21;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 22;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -537,6 +537,7 @@ pub struct AggregateBuildReport {
     /// report while retaining the original compiled artifact.
     sealed_bounded_separated_fields_identity: Option<AggregateBoundedSeparatedFieldsIdentity>,
     sealed_required_internal_anchor_identity: Option<AggregateRequiredInternalAnchorSeal>,
+    sealed_url_aggregate_identity: Option<AggregateUrlAggregateSeal>,
     /// Selected plan's retained capacity/persistent bytes.
     pub retained_capacity_bytes: usize,
 }
@@ -547,7 +548,52 @@ struct AggregateRequiredInternalAnchorSeal {
     compile: AggregateCompileAccounting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregateUrlAggregateSeal {
+    program: AggregatePlanId,
+    compile: AggregateCompileAccounting,
+}
+
 impl AggregateBuildReport {
+    /// Require the public URL-aggregate accounting and the private compiled
+    /// artifact to be either coherently active or coherently absent.
+    #[must_use]
+    pub fn has_closed_url_aggregate_identity(&self) -> bool {
+        let AggregateBuildAccounting::Continuation(compile) = self.build else {
+            return self.sealed_url_aggregate_identity.is_none();
+        };
+        let absent = compile.url_aggregate_plans == 0
+            && compile.url_aggregate_tlds == 0
+            && compile.url_aggregate_tld_bytes == 0
+            && compile.url_aggregate_build_work == 0
+            && compile.url_aggregate_persistent_bytes == 0;
+        match self.sealed_url_aggregate_identity {
+            Some(sealed) => {
+                compile.url_aggregate_plans == 1
+                    && compile.url_aggregate_tlds > 0
+                    && compile.url_aggregate_tld_bytes > 0
+                    && compile.url_aggregate_build_work > 0
+                    && compile.url_aggregate_persistent_bytes > 0
+                    && sealed.compile == compile
+                    && matches!(
+                        self.plan_identity,
+                        AggregatePlanIdentity::Continuation(identity)
+                            if identity.program == sealed.program
+                                && identity.semantics
+                                    == AggregateContinuationSemantics::UnicodeOffByteBoundaries
+                    )
+                    && self.plan == AggregatePlanKind::ContinuationProgram
+                    && self.retained_capacity_bytes == compile.program_bytes
+            }
+            None => absent,
+        }
+    }
+
+    #[must_use]
+    pub fn authenticates_url_aggregate_identity(&self) -> bool {
+        self.has_closed_url_aggregate_identity() && self.sealed_url_aggregate_identity.is_some()
+    }
+
     /// Require the public required-anchor discriminators and private compiled
     /// artifact to be either coherently active or coherently absent.
     #[must_use]
@@ -1580,6 +1626,7 @@ impl AggregateBuilder {
                 plan_identity,
                 sealed_bounded_separated_fields_identity: None,
                 sealed_required_internal_anchor_identity: None,
+                sealed_url_aggregate_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -1768,6 +1815,7 @@ impl AggregateBuilder {
                     ),
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -1895,6 +1943,7 @@ impl AggregateBuilder {
                     ),
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2075,6 +2124,7 @@ impl AggregateBuilder {
                 ),
                 sealed_bounded_separated_fields_identity: None,
                 sealed_required_internal_anchor_identity: None,
+                sealed_url_aggregate_identity: None,
                 retained_capacity_bytes: build.persistent_bytes,
             };
             return Ok(AggregatePlan {
@@ -2192,6 +2242,7 @@ impl AggregateBuilder {
                     ),
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2301,6 +2352,7 @@ impl AggregateBuilder {
                     plan_identity: AggregatePlanIdentity::BoundedSeparatedFields(plan_identity),
                     sealed_bounded_separated_fields_identity: Some(plan_identity),
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2419,6 +2471,7 @@ impl AggregateBuilder {
                     ),
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2526,6 +2579,7 @@ impl AggregateBuilder {
                         ),
                         sealed_bounded_separated_fields_identity: None,
                         sealed_required_internal_anchor_identity: None,
+                        sealed_url_aggregate_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2648,6 +2702,7 @@ impl AggregateBuilder {
                     ),
                     sealed_bounded_separated_fields_identity: None,
                     sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
@@ -2817,6 +2872,7 @@ impl AggregateBuilder {
                         ),
                         sealed_bounded_separated_fields_identity: None,
                         sealed_required_internal_anchor_identity: None,
+                        sealed_url_aggregate_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -2957,6 +3013,7 @@ impl AggregateBuilder {
                         ),
                         sealed_bounded_separated_fields_identity: None,
                         sealed_required_internal_anchor_identity: None,
+                        sealed_url_aggregate_identity: None,
                         retained_capacity_bytes: build.persistent_bytes,
                     };
                     return Ok(AggregatePlan {
@@ -3003,6 +3060,8 @@ impl AggregateBuilder {
         let program = engine.plan_id();
         let sealed_required_internal_anchor_identity = (compile.required_internal_anchors == 1)
             .then_some(AggregateRequiredInternalAnchorSeal { program, compile });
+        let sealed_url_aggregate_identity = (compile.url_aggregate_plans == 1)
+            .then_some(AggregateUrlAggregateSeal { program, compile });
         let report = AggregateBuildReport {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
             syntax_key,
@@ -3036,6 +3095,7 @@ impl AggregateBuilder {
             }),
             sealed_bounded_separated_fields_identity: None,
             sealed_required_internal_anchor_identity,
+            sealed_url_aggregate_identity,
             retained_capacity_bytes: compile.program_bytes,
         };
         Ok(AggregatePlan {
@@ -3583,6 +3643,10 @@ impl AggregateCountExecution {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would add an allocation to the operation whose complete accounting is retained inline"
+)]
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),

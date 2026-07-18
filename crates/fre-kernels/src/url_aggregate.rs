@@ -74,10 +74,14 @@ pub struct ReduceLimits {
     pub max_input_bytes: usize,
     pub max_boundaries: usize,
     pub max_candidates: usize,
-    pub max_matches: usize,
+    pub max_match_events: usize,
+    pub max_output_matches: usize,
     pub max_span_sum: usize,
     pub max_sequential_bytes: usize,
+    /// Cumulative backward/random source reads. This is work-like logical I/O,
+    /// not retained random-access storage.
     pub max_random_access_bytes: usize,
+    pub max_random_access_storage_bytes: usize,
     pub max_work: usize,
     pub max_scratch_bytes: usize,
     pub max_peak_bytes: usize,
@@ -89,10 +93,12 @@ impl Default for ReduceLimits {
             max_input_bytes: 128 << 20,
             max_boundaries: (128 << 20) + 1,
             max_candidates: 4 << 20,
-            max_matches: 1 << 20,
+            max_match_events: 1 << 20,
+            max_output_matches: 1 << 20,
             max_span_sum: usize::MAX,
             max_sequential_bytes: 512 << 20,
             max_random_access_bytes: 512 << 20,
+            max_random_access_storage_bytes: 256 << 20,
             max_work: 1 << 29,
             max_scratch_bytes: 256 << 20,
             max_peak_bytes: 512 << 20,
@@ -119,6 +125,7 @@ pub struct ReduceAccounting {
     pub span_sum: usize,
     pub sequential_bytes: usize,
     pub random_access_bytes: usize,
+    pub random_access_storage_bytes: usize,
     pub work: usize,
     pub scratch_bytes: usize,
     pub peak_bytes: usize,
@@ -165,6 +172,21 @@ pub enum BuildError {
         items: usize,
     },
     Invariant(&'static str),
+}
+
+/// Authoritative owner of compile work and retained construction bytes.
+///
+/// The aggregate compiler implements this adapter with its single
+/// `CompileBudget`; consequently no source traversal or trie action can occur
+/// under a private meter and be charged only after the fact.
+///
+/// `retain_bytes` must be failure-atomic: an error leaves the authority's
+/// retained-byte total unchanged. A successful reservation is transferred to
+/// the returned plan, or released exactly once before an error is returned.
+pub trait UrlAggregateBuildAuthority {
+    fn charge_work(&mut self, amount: usize) -> Result<(), BuildError>;
+    fn retain_bytes(&mut self, amount: usize) -> Result<(), BuildError>;
+    fn release_bytes(&mut self, amount: usize) -> Result<(), BuildError>;
 }
 
 impl fmt::Display for BuildError {
@@ -275,6 +297,20 @@ impl Meter {
     }
 }
 
+fn sequential_read(source: &[u8], index: usize, meter: &mut Meter) -> Result<u8, ReduceError> {
+    meter.sequential(1)?;
+    source.get(index).copied().ok_or(ReduceError::Invariant(
+        "charged sequential source index is out of bounds",
+    ))
+}
+
+fn random_read(source: &[u8], index: usize, meter: &mut Meter) -> Result<u8, ReduceError> {
+    meter.random(1)?;
+    source.get(index).copied().ok_or(ReduceError::Invariant(
+        "charged random source index is out of bounds",
+    ))
+}
+
 impl UrlAggregatePlan {
     /// Build the finite TLD island after the caller has certified all of these
     /// HIR invariants:
@@ -292,18 +328,40 @@ impl UrlAggregatePlan {
         clippy::too_many_lines,
         reason = "one construction transaction keeps validation, exact allocation, initialization and publication accounting adjacent"
     )]
-    pub fn build(tlds: Vec<&[u8]>, limits: BuildLimits) -> Result<Self, BuildError> {
-        if tlds.is_empty() {
+    pub fn build(
+        packed_tlds: &[u8],
+        tld_ends: &[usize],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        let mut authority = LocalBuildAuthority::new(limits);
+        Self::build_with_authority(packed_tlds, tld_ends, limits, &mut authority)
+    }
+
+    /// Build while every action is charged to the caller's authoritative
+    /// compile budget before that action occurs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one construction transaction keeps validation, exact allocation, initialization and publication accounting adjacent"
+    )]
+    pub fn build_with_authority(
+        packed_tlds: &[u8],
+        tld_ends: &[usize],
+        limits: BuildLimits,
+        authority: &mut impl UrlAggregateBuildAuthority,
+    ) -> Result<Self, BuildError> {
+        if tld_ends.is_empty() {
             return Err(BuildError::EmptyLanguage);
         }
-        build_enforce("TLDs", tlds.len(), limits.max_tlds)?;
-        let tld_count = tlds.len();
-        let mut meter = BuildMeter::new(limits.max_work);
-        meter.charge(tlds.len())?;
-        let mut tld_bytes = 0_usize;
+        build_enforce("TLDs", tld_ends.len(), limits.max_tlds)?;
+        let tld_count = tld_ends.len();
+        let mut work = 0_usize;
+        charge_build(authority, &mut work, tld_ends.len(), limits.max_work)?;
+        let tld_bytes = packed_tlds.len();
+        build_enforce("TLD bytes", tld_bytes, limits.max_tld_bytes)?;
         let mut max_tld_bytes = 0_usize;
-        for (index, tld) in tlds.iter().enumerate() {
-            meter.charge(1)?;
+        for index in 0..tld_ends.len() {
+            charge_build(authority, &mut work, 1, limits.max_work)?;
+            let tld = packed_tld(packed_tlds, tld_ends, index)?;
             if tld.is_empty() {
                 return Err(BuildError::EmptyTld { index });
             }
@@ -313,11 +371,12 @@ impl UrlAggregatePlan {
                     length: tld.len(),
                 });
             }
-            tld_bytes = build_add(tld_bytes, tld.len(), "TLD bytes")?;
-            build_enforce("TLD bytes", tld_bytes, limits.max_tld_bytes)?;
             max_tld_bytes = max_tld_bytes.max(tld.len());
-            for (offset, &byte) in tld.iter().enumerate() {
-                meter.charge(1)?;
+            for offset in 0..tld.len() {
+                charge_build(authority, &mut work, 1, limits.max_work)?;
+                let byte = *tld.get(offset).ok_or(BuildError::Invariant(
+                    "validated TLD offset disappeared before byte inspection",
+                ))?;
                 if alphabet(byte.to_ascii_lowercase()).is_none() {
                     return Err(BuildError::InvalidTld { index, offset });
                 }
@@ -325,13 +384,22 @@ impl UrlAggregatePlan {
         }
 
         let mut priority_comparisons = 0_usize;
-        for first in 0..tlds.len() {
-            for second in first + 1..tlds.len() {
-                meter.charge(1)?;
-                let compared = tlds[first].len().min(tlds[second].len());
+        for first in 0..tld_ends.len() {
+            charge_build(authority, &mut work, 1, limits.max_work)?;
+            let first_tld = packed_tld(packed_tlds, tld_ends, first)?;
+            for second in first + 1..tld_ends.len() {
+                charge_build(authority, &mut work, 1, limits.max_work)?;
+                let second_tld = packed_tld(packed_tlds, tld_ends, second)?;
+                let compared = first_tld.len().min(second_tld.len());
                 let mut equal_prefix = true;
-                for (&left, &right) in tlds[first].iter().zip(tlds[second]).take(compared) {
-                    meter.charge(1)?;
+                for offset in 0..compared {
+                    charge_build(authority, &mut work, 1, limits.max_work)?;
+                    let left = *first_tld.get(offset).ok_or(BuildError::Invariant(
+                        "priority left byte disappeared before comparison",
+                    ))?;
+                    let right = *second_tld.get(offset).ok_or(BuildError::Invariant(
+                        "priority right byte disappeared before comparison",
+                    ))?;
                     priority_comparisons =
                         build_add(priority_comparisons, 1, "priority comparisons")?;
                     if !left.eq_ignore_ascii_case(&right) {
@@ -339,10 +407,10 @@ impl UrlAggregatePlan {
                         break;
                     }
                 }
-                if equal_prefix && tlds[first].len() == tlds[second].len() {
+                if equal_prefix && first_tld.len() == second_tld.len() {
                     return Err(BuildError::DuplicateTld { first, second });
                 }
-                if equal_prefix && tlds[first].len() < tlds[second].len() {
+                if equal_prefix && first_tld.len() < second_tld.len() {
                     return Err(BuildError::PriorityConflict {
                         shorter: first,
                         longer: second,
@@ -370,77 +438,98 @@ impl UrlAggregatePlan {
         build_enforce("scratch bytes", 0, limits.max_scratch_bytes)?;
         build_enforce("peak bytes", persistent_bytes, limits.max_peak_bytes)?;
 
-        meter.charge(build_add(
-            table_cells,
-            states_upper_bound,
-            "initialization work",
-        )?)?;
-        let mut transitions = exact_build_vec(table_cells, "transition table")?;
-        for _ in 0..table_cells {
-            transitions.try_push(UNSET).map_err(|_| {
-                BuildError::Invariant("transition initialization exceeded exact capacity")
-            })?;
-        }
-        let mut terminal = exact_build_vec(states_upper_bound, "terminal states")?;
-        for _ in 0..states_upper_bound {
-            terminal.try_push(false).map_err(|_| {
-                BuildError::Invariant("terminal initialization exceeded exact capacity")
-            })?;
-        }
-
-        let mut states = 1_usize;
-        let mut trie_transitions = 0_usize;
-        for tld in tlds {
-            let mut state = 0_usize;
-            for source in tld {
-                meter.charge(4)?; // fold, alphabet map, lookup/branch, selected-state write
-                trie_transitions = build_add(trie_transitions, 1, "trie transitions")?;
-                let symbol = alphabet(source.to_ascii_lowercase())
-                    .ok_or(BuildError::Invariant("validated TLD left trie alphabet"))?;
-                let cell = build_add(
-                    build_mul(state, ALPHABET, "trie cell")?,
-                    symbol,
-                    "trie cell",
-                )?;
-                let target = transitions[cell];
-                if target == UNSET {
-                    let represented = u32::try_from(states)
-                        .map_err(|_| BuildError::Overflow("represented state"))?;
-                    transitions[cell] = represented;
-                    state = states;
-                    states = build_add(states, 1, "states")?;
-                } else {
-                    state = usize::try_from(target)
-                        .map_err(|_| BuildError::Invariant("state does not fit usize"))?;
-                }
+        charge_build(
+            authority,
+            &mut work,
+            build_add(
+                build_add(table_cells, states_upper_bound, "initialization work")?,
+                4, // two allocator calls and their eventual deallocations
+                "initialization work",
+            )?,
+            limits.max_work,
+        )?;
+        authority.retain_bytes(persistent_bytes)?;
+        let result = (|| {
+            let mut transitions = exact_build_vec(table_cells, "transition table")?;
+            for _ in 0..table_cells {
+                transitions.try_push(UNSET).map_err(|_| {
+                    BuildError::Invariant("transition initialization exceeded exact capacity")
+                })?;
             }
-            meter.charge(1)?;
-            terminal[state] = true;
+            let mut terminal = exact_build_vec(states_upper_bound, "terminal states")?;
+            for _ in 0..states_upper_bound {
+                terminal.try_push(false).map_err(|_| {
+                    BuildError::Invariant("terminal initialization exceeded exact capacity")
+                })?;
+            }
+
+            let mut states = 1_usize;
+            let mut trie_transitions = 0_usize;
+            for index in 0..tld_ends.len() {
+                charge_build(authority, &mut work, 1, limits.max_work)?;
+                let tld = packed_tld(packed_tlds, tld_ends, index)?;
+                let mut state = 0_usize;
+                for offset in 0..tld.len() {
+                    charge_build(authority, &mut work, 4, limits.max_work)?; // fold, alphabet map, lookup/branch, selected-state write
+                    let source = *tld.get(offset).ok_or(BuildError::Invariant(
+                        "validated trie byte disappeared before transition",
+                    ))?;
+                    trie_transitions = build_add(trie_transitions, 1, "trie transitions")?;
+                    let symbol = alphabet(source.to_ascii_lowercase())
+                        .ok_or(BuildError::Invariant("validated TLD left trie alphabet"))?;
+                    let cell = build_add(
+                        build_mul(state, ALPHABET, "trie cell")?,
+                        symbol,
+                        "trie cell",
+                    )?;
+                    let target = transitions[cell];
+                    if target == UNSET {
+                        let represented = u32::try_from(states)
+                            .map_err(|_| BuildError::Overflow("represented state"))?;
+                        transitions[cell] = represented;
+                        state = states;
+                        states = build_add(states, 1, "states")?;
+                    } else {
+                        state = usize::try_from(target)
+                            .map_err(|_| BuildError::Invariant("state does not fit usize"))?;
+                    }
+                }
+                charge_build(authority, &mut work, 1, limits.max_work)?;
+                terminal[state] = true;
+            }
+            if states > states_upper_bound {
+                return Err(BuildError::Invariant(
+                    "trie exceeded prospective state bound",
+                ));
+            }
+            Ok(Self {
+                transitions,
+                terminal,
+                max_tld_bytes,
+                build: BuildAccounting {
+                    tlds: tld_count,
+                    tld_bytes,
+                    states_upper_bound,
+                    states,
+                    table_cells,
+                    initialized_cells: build_add(
+                        table_cells,
+                        states_upper_bound,
+                        "initialized cells",
+                    )?,
+                    priority_comparisons,
+                    trie_transitions,
+                    work,
+                    persistent_bytes,
+                    scratch_bytes: 0,
+                    peak_bytes: persistent_bytes,
+                },
+            })
+        })();
+        if result.is_err() {
+            authority.release_bytes(persistent_bytes)?;
         }
-        if states > states_upper_bound {
-            return Err(BuildError::Invariant(
-                "trie exceeded prospective state bound",
-            ));
-        }
-        Ok(Self {
-            transitions,
-            terminal,
-            max_tld_bytes,
-            build: BuildAccounting {
-                tlds: tld_count,
-                tld_bytes,
-                states_upper_bound,
-                states,
-                table_cells,
-                initialized_cells: build_add(table_cells, states_upper_bound, "initialized cells")?,
-                priority_comparisons,
-                trie_transitions,
-                work: meter.work,
-                persistent_bytes,
-                scratch_bytes: 0,
-                peak_bytes: persistent_bytes,
-            },
-        })
+        result
     }
 
     #[must_use]
@@ -475,8 +564,8 @@ impl UrlAggregatePlan {
         // First pass determines the one exact reusable per-segment workspace.
         let mut segment_bytes = 0_usize;
         let mut segment_peak = 0_usize;
-        for &byte in &haystack[range.clone()] {
-            meter.sequential(1)?;
+        for position in range.clone() {
+            let byte = sequential_read(haystack, position, &mut meter)?;
             if is_delimiter(byte) {
                 segment_peak = segment_peak.max(segment_bytes);
                 segment_bytes = 0;
@@ -489,9 +578,17 @@ impl UrlAggregatePlan {
         let record_count = reduce_add(segment_peak, 1, "candidate records")?;
         let scratch_bytes =
             reduce_mul(record_count, size_of::<CandidateRecord>(), "scratch bytes")?;
+        reduce_enforce(
+            "random access storage bytes",
+            scratch_bytes,
+            limits.max_random_access_storage_bytes,
+        )?;
         reduce_enforce("scratch bytes", scratch_bytes, limits.max_scratch_bytes)?;
-        let peak_bytes = reduce_add(scratch_bytes, self.build.persistent_bytes, "peak bytes")?;
+        let peak_bytes = scratch_bytes;
         reduce_enforce("peak bytes", peak_bytes, limits.max_peak_bytes)?;
+        // Prepay the allocator call and eventual deallocation before the
+        // exact candidate-record allocation is attempted.
+        meter.work(2)?;
         let mut records = exact_reduce_vec(record_count, "candidate records")?;
         for _ in 0..record_count {
             meter.work(1)?;
@@ -500,6 +597,7 @@ impl UrlAggregatePlan {
             })?;
         }
         meter.accounting.scratch_bytes = scratch_bytes;
+        meter.accounting.random_access_storage_bytes = scratch_bytes;
         meter.accounting.peak_bytes = peak_bytes;
 
         let mut cursor = range.start;
@@ -507,10 +605,12 @@ impl UrlAggregatePlan {
         let mut position = range.start;
         while position <= range.end {
             let at_end = position == range.end;
-            if !at_end {
-                meter.sequential(1)?;
-            }
-            if at_end || is_delimiter(haystack[position]) {
+            let byte = if at_end {
+                None
+            } else {
+                Some(sequential_read(haystack, position, &mut meter)?)
+            };
+            if at_end || byte.is_some_and(is_delimiter) {
                 if segment_start < position {
                     meter.accounting.segments =
                         reduce_add(meter.accounting.segments, 1, "segments")?;
@@ -558,8 +658,7 @@ impl UrlAggregatePlan {
             *record = CandidateRecord::EMPTY;
         }
         for position in start..end {
-            meter.sequential(1)?;
-            let byte = haystack[position];
+            let byte = sequential_read(haystack, position, meter)?;
             if byte == b'.' {
                 meter.accounting.dot_probes =
                     reduce_add(meter.accounting.dot_probes, 1, "dot probes")?;
@@ -615,7 +714,8 @@ impl UrlAggregatePlan {
             let span_sum = reduce_add(meter.accounting.span_sum, width, "span sum")?;
             reduce_enforce("span sum", span_sum, meter.limits.max_span_sum)?;
             let matches = reduce_add(meter.accounting.matches, 1, "matches")?;
-            reduce_enforce("matches", matches, meter.limits.max_matches)?;
+            reduce_enforce("match events", matches, meter.limits.max_match_events)?;
+            reduce_enforce("output matches", matches, meter.limits.max_output_matches)?;
             reduce_enforce(
                 "candidates",
                 meter.accounting.candidate_visits,
@@ -638,9 +738,8 @@ impl UrlAggregatePlan {
         let mut state = 0_usize;
         let mut longest = None;
         let limit = end.min(reduce_add(start, self.max_tld_bytes, "TLD bound")?);
-        for (relative, &source) in haystack[start..limit].iter().enumerate() {
-            let position = start + relative;
-            meter.random(1)?;
+        for position in start..limit {
+            let source = random_read(haystack, position, meter)?;
             meter.accounting.tld_transitions =
                 reduce_add(meter.accounting.tld_transitions, 1, "TLD transitions")?;
             let Some(symbol) = alphabet(source.to_ascii_lowercase()) else {
@@ -677,17 +776,17 @@ fn domain_candidates(
     }
     if base_count > 0 {
         let earliest = base_starts[base_count - 1];
-        if earliest > segment && source[earliest - 1] == b'.' {
+        if earliest > segment && random_read(source, earliest - 1, meter)? == b'.' {
             extension_start = Some(earliest);
         }
     }
 
     let mut lower = dot;
     while lower > segment {
-        meter.random(1)?;
+        let byte = random_read(source, lower - 1, meter)?;
         meter.accounting.prefix_steps =
             reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-        if !is_xn_body(source[lower - 1]) {
+        if !is_xn_body(byte) {
             break;
         }
         lower -= 1;
@@ -697,7 +796,7 @@ fn domain_candidates(
         meter.work(1)?;
         if folded_equal(source, candidate, b"xn--", meter)? {
             publish_domain_candidate(source, segment, candidate, tld_end, records, meter)?;
-            if candidate > segment && source[candidate - 1] == b'.' {
+            if candidate > segment && random_read(source, candidate - 1, meter)? == b'.' {
                 extension_start = Some(candidate);
             }
         }
@@ -716,7 +815,11 @@ fn domain_candidates(
         }
         current = if sub_count > 0 {
             let earliest = sub_starts[sub_count - 1];
-            (earliest > segment && source[earliest - 1] == b'.').then_some(earliest)
+            if earliest > segment {
+                (random_read(source, earliest - 1, meter)? == b'.').then_some(earliest)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -735,8 +838,7 @@ fn regular_suffixes(
     if end <= segment {
         return Ok((starts, 0));
     }
-    meter.random(1)?;
-    if !is_alnum(source[end - 1]) {
+    if !is_alnum(random_read(source, end - 1, meter)?) {
         return Ok((starts, 0));
     }
     let mut position = end - 1;
@@ -744,10 +846,11 @@ fn regular_suffixes(
     starts[0] = position;
     for _ in 0..LABEL_REPETITIONS {
         if position >= segment + 2 {
-            meter.random(2)?;
+            let hyphen = random_read(source, position - 1, meter)?;
+            let atom = random_read(source, position - 2, meter)?;
             meter.accounting.prefix_steps =
                 reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-            if source[position - 1] == b'-' && is_label_atom(source[position - 2], subdomain) {
+            if hyphen == b'-' && is_label_atom(atom, subdomain) {
                 position -= 2;
                 starts[count] = position;
                 count += 1;
@@ -755,10 +858,10 @@ fn regular_suffixes(
             }
         }
         if position > segment {
-            meter.random(1)?;
+            let atom = random_read(source, position - 1, meter)?;
             meter.accounting.prefix_steps =
                 reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-            if is_label_atom(source[position - 1], subdomain) {
+            if is_label_atom(atom, subdomain) {
                 position -= 1;
                 starts[count] = position;
                 count += 1;
@@ -783,34 +886,36 @@ fn publish_domain_candidate(
     // Optional auth has an unambiguous reverse parse because ':' and '@' are
     // excluded from both nonempty auth fields. The unextended start remains a
     // candidate because matching is unanchored.
-    if start > segment {
-        meter.random(1)?;
-        if source[start - 1] == b'@' {
-            let at = start - 1;
-            let mut password = at;
-            while password > segment {
-                meter.random(1)?;
+    if start > segment && random_read(source, start - 1, meter)? == b'@' {
+        let at = start - 1;
+        let mut password = at;
+        while password > segment {
+            let byte = random_read(source, password - 1, meter)?;
+            meter.accounting.prefix_steps =
+                reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
+            if !is_password(byte) {
+                break;
+            }
+            password -= 1;
+        }
+        let has_colon = if password < at && password > segment {
+            random_read(source, password - 1, meter)? == b':'
+        } else {
+            false
+        };
+        if has_colon {
+            let colon = password - 1;
+            let mut user = colon;
+            while user > segment {
+                let byte = random_read(source, user - 1, meter)?;
                 meter.accounting.prefix_steps =
                     reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-                if !is_password(source[password - 1]) {
+                if !is_user(byte) {
                     break;
                 }
-                password -= 1;
-            }
-            if password < at && password > segment && source[password - 1] == b':' {
-                let colon = password - 1;
-                let mut user = colon;
-                while user > segment {
-                    meter.random(1)?;
-                    meter.accounting.prefix_steps =
-                        reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-                    if !is_user(source[user - 1]) {
-                        break;
-                    }
-                    user -= 1;
-                    publish_domain_record(segment, user, tld_end, records, meter)?;
-                    publish_scheme_extension(source, segment, user, tld_end, records, meter)?;
-                }
+                user -= 1;
+                publish_domain_record(segment, user, tld_end, records, meter)?;
+                publish_scheme_extension(source, segment, user, tld_end, records, meter)?;
             }
         }
     }
@@ -914,21 +1019,24 @@ fn octet_end(
     require_dot: bool,
     meter: &mut Meter,
 ) -> Result<Option<usize>, ReduceError> {
-    let context = |candidate: usize| !require_dot || (candidate < end && source[candidate] == b'.');
     if start + 3 <= end {
-        meter.random(3)?;
-        if source[start] == b'2'
-            && source[start + 1] == b'5'
-            && matches!(source[start + 2], b'0'..=b'5')
-            && context(start + 3)
+        let first = random_read(source, start, meter)?;
+        let second = random_read(source, start + 1, meter)?;
+        let third = random_read(source, start + 2, meter)?;
+        if first == b'2'
+            && second == b'5'
+            && matches!(third, b'0'..=b'5')
+            && octet_context(source, start + 3, end, require_dot, meter)?
         {
             return Ok(Some(start + 3));
         }
-        meter.random(3)?;
-        if source[start] == b'2'
-            && matches!(source[start + 1], b'0'..=b'4')
-            && source[start + 2].is_ascii_digit()
-            && context(start + 3)
+        let first = random_read(source, start, meter)?;
+        let second = random_read(source, start + 1, meter)?;
+        let third = random_read(source, start + 2, meter)?;
+        if first == b'2'
+            && matches!(second, b'0'..=b'4')
+            && third.is_ascii_digit()
+            && octet_context(source, start + 3, end, require_dot, meter)?
         {
             return Ok(Some(start + 3));
         }
@@ -937,14 +1045,35 @@ fn octet_end(
         if start + length > end {
             continue;
         }
-        meter.random(length)?;
-        let digits = source[start..start + length].iter().all(u8::is_ascii_digit);
-        let represented = length < 3 || matches!(source[start], b'0' | b'1');
-        if digits && represented && context(start + length) {
+        let mut digits = true;
+        let mut first = 0_u8;
+        for offset in 0..length {
+            let byte = random_read(source, start + offset, meter)?;
+            if offset == 0 {
+                first = byte;
+            }
+            digits &= byte.is_ascii_digit();
+        }
+        let represented = length < 3 || matches!(first, b'0' | b'1');
+        if digits && represented && octet_context(source, start + length, end, require_dot, meter)?
+        {
             return Ok(Some(start + length));
         }
     }
     Ok(None)
+}
+
+fn octet_context(
+    source: &[u8],
+    candidate: usize,
+    end: usize,
+    require_dot: bool,
+    meter: &mut Meter,
+) -> Result<bool, ReduceError> {
+    if !require_dot || candidate >= end {
+        return Ok(!require_dot);
+    }
+    Ok(random_read(source, candidate, meter)? == b'.')
 }
 
 fn suffix_end(
@@ -953,17 +1082,19 @@ fn suffix_end(
     end: usize,
     meter: &mut Meter,
 ) -> Result<usize, ReduceError> {
-    if position < end {
-        meter.random(1)?;
-    }
-    if position < end && source[position] == b':' {
+    let mut current = if position < end {
+        Some(random_read(source, position, meter)?)
+    } else {
+        None
+    };
+    if current == Some(b':') {
         let first = position + 1;
         let mut digits = first;
         while digits < end && digits - first < 5 {
-            meter.random(1)?;
+            let byte = random_read(source, digits, meter)?;
             meter.accounting.suffix_steps =
                 reduce_add(meter.accounting.suffix_steps, 1, "suffix steps")?;
-            if !source[digits].is_ascii_digit() {
+            if !byte.is_ascii_digit() {
                 break;
             }
             digits += 1;
@@ -972,29 +1103,33 @@ fn suffix_end(
             position = digits;
         }
     }
-    if position < end {
-        meter.random(1)?;
-    }
-    if position < end && source[position] == b'/' {
+    current = if position < end {
+        Some(random_read(source, position, meter)?)
+    } else {
+        None
+    };
+    if current == Some(b'/') {
         position += 1;
         while position < end {
-            meter.random(1)?;
+            let byte = random_read(source, position, meter)?;
             meter.accounting.suffix_steps =
                 reduce_add(meter.accounting.suffix_steps, 1, "suffix steps")?;
-            if !is_path(source[position]) {
+            if !is_path(byte) {
                 break;
             }
             position += 1;
         }
     }
-    if position < end {
-        meter.random(1)?;
-    }
-    if position < end && matches!(source[position], b'?' | b'#') {
+    current = if position < end {
+        Some(random_read(source, position, meter)?)
+    } else {
+        None
+    };
+    if matches!(current, Some(b'?' | b'#')) {
         // The segment was split on the exact complement of `\S`, so the
         // greedy non-space tail consumes the complete remainder.
         let tail = end - position;
-        meter.random(tail)?;
+        meter.work(tail)?;
         meter.accounting.suffix_steps =
             reduce_add(meter.accounting.suffix_steps, tail, "suffix steps")?;
         position = end;
@@ -1009,10 +1144,10 @@ fn folded_equal(
     meter: &mut Meter,
 ) -> Result<bool, ReduceError> {
     for (offset, &right) in expected.iter().enumerate() {
-        meter.random(1)?;
+        let left = random_read(source, start + offset, meter)?;
         meter.accounting.prefix_steps =
             reduce_add(meter.accounting.prefix_steps, 1, "prefix steps")?;
-        if !source[start + offset].eq_ignore_ascii_case(&right) {
+        if !left.eq_ignore_ascii_case(&right) {
             return Ok(false);
         }
     }
@@ -1079,23 +1214,86 @@ const fn is_path(byte: u8) -> bool {
 }
 
 #[derive(Debug)]
-struct BuildMeter {
-    limit: usize,
+struct LocalBuildAuthority {
+    limits: BuildLimits,
     work: usize,
+    retained: usize,
 }
 
-impl BuildMeter {
-    const fn new(limit: usize) -> Self {
-        Self { limit, work: 0 }
+impl LocalBuildAuthority {
+    const fn new(limits: BuildLimits) -> Self {
+        Self {
+            limits,
+            work: 0,
+            retained: 0,
+        }
+    }
+}
+
+impl UrlAggregateBuildAuthority for LocalBuildAuthority {
+    fn charge_work(&mut self, amount: usize) -> Result<(), BuildError> {
+        let required = build_add(self.work, amount, "work")?;
+        build_enforce("work", required, self.limits.max_work)?;
+        self.work = required;
+        Ok(())
     }
 
-    fn charge(&mut self, amount: usize) -> Result<(), BuildError> {
-        self.work = build_add(self.work, amount, "work")?;
-        build_enforce("work", self.work, self.limit)
+    fn retain_bytes(&mut self, amount: usize) -> Result<(), BuildError> {
+        let required = build_add(self.retained, amount, "persistent bytes")?;
+        build_enforce(
+            "persistent bytes",
+            required,
+            self.limits.max_persistent_bytes,
+        )?;
+        build_enforce("peak bytes", required, self.limits.max_peak_bytes)?;
+        self.retained = required;
+        Ok(())
     }
+
+    fn release_bytes(&mut self, amount: usize) -> Result<(), BuildError> {
+        self.retained = self
+            .retained
+            .checked_sub(amount)
+            .ok_or(BuildError::Invariant("retained byte release underflowed"))?;
+        Ok(())
+    }
+}
+
+fn charge_build(
+    authority: &mut impl UrlAggregateBuildAuthority,
+    observed: &mut usize,
+    amount: usize,
+    limit: usize,
+) -> Result<(), BuildError> {
+    let required = build_add(*observed, amount, "work")?;
+    build_enforce("work", required, limit)?;
+    authority.charge_work(amount)?;
+    *observed = required;
+    Ok(())
+}
+
+fn packed_tld<'a>(packed: &'a [u8], ends: &[usize], index: usize) -> Result<&'a [u8], BuildError> {
+    let end = *ends.get(index).ok_or(BuildError::Invariant(
+        "TLD index exceeds authenticated ends",
+    ))?;
+    let start = if index == 0 {
+        0
+    } else {
+        *ends
+            .get(index - 1)
+            .ok_or(BuildError::Invariant("TLD predecessor end is absent"))?
+    };
+    if start > end || end > packed.len() || (index + 1 == ends.len() && end != packed.len()) {
+        return Err(BuildError::Invariant(
+            "packed TLD ends do not exactly partition source bytes",
+        ));
+    }
+    Ok(&packed[start..end])
 }
 
 fn exact_build_vec<T>(capacity: usize, resource: &'static str) -> Result<ExactVec<T>, BuildError> {
+    #[cfg(test)]
+    allocation_probe::record_build();
     ExactVec::try_with_capacity(capacity).map_err(|error| match error {
         CopyError::LayoutOverflow => BuildError::Overflow(resource),
         CopyError::AllocationFailed => BuildError::Allocation {
@@ -1109,6 +1307,8 @@ fn exact_reduce_vec<T>(
     capacity: usize,
     resource: &'static str,
 ) -> Result<ExactVec<T>, ReduceError> {
+    #[cfg(test)]
+    allocation_probe::record_reduce();
     ExactVec::try_with_capacity(capacity).map_err(|error| match error {
         CopyError::LayoutOverflow => ReduceError::Overflow(resource),
         CopyError::AllocationFailed => ReduceError::Allocation {
@@ -1116,6 +1316,40 @@ fn exact_reduce_vec<T>(
             items: capacity,
         },
     })
+}
+
+#[cfg(test)]
+mod allocation_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static BUILD: Cell<usize> = const { Cell::new(0) };
+        static REDUCE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_build() {
+        BUILD.set(BUILD.get().saturating_add(1));
+    }
+
+    pub(super) fn record_reduce() {
+        REDUCE.set(REDUCE.get().saturating_add(1));
+    }
+
+    pub(super) fn reset_build() {
+        BUILD.set(0);
+    }
+
+    pub(super) fn reset_reduce() {
+        REDUCE.set(0);
+    }
+
+    pub(super) fn build_calls() -> usize {
+        BUILD.get()
+    }
+
+    pub(super) fn reduce_calls() -> usize {
+        REDUCE.get()
+    }
 }
 
 fn build_add(left: usize, right: usize, resource: &'static str) -> Result<usize, BuildError> {
@@ -1168,6 +1402,56 @@ mod tests {
     use regex::bytes::RegexBuilder;
     use std::fs;
 
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "independent injected authority failures are clearer as orthogonal test switches"
+    )]
+    #[derive(Debug, Default)]
+    struct TestAuthority {
+        work: usize,
+        retained: usize,
+        reservation_seen: bool,
+        work_at_reservation: usize,
+        releases: usize,
+        refuse_retain: bool,
+        refuse_post_retain_work: bool,
+        refuse_release: bool,
+    }
+
+    impl UrlAggregateBuildAuthority for TestAuthority {
+        fn charge_work(&mut self, amount: usize) -> Result<(), BuildError> {
+            if self.refuse_post_retain_work && self.reservation_seen {
+                return Err(BuildError::Invariant(
+                    "injected post-reservation work refusal",
+                ));
+            }
+            self.work = build_add(self.work, amount, "test authority work")?;
+            Ok(())
+        }
+
+        fn retain_bytes(&mut self, amount: usize) -> Result<(), BuildError> {
+            if self.refuse_retain {
+                return Err(BuildError::Invariant("injected reservation refusal"));
+            }
+            self.retained = build_add(self.retained, amount, "test retained bytes")?;
+            self.reservation_seen = true;
+            self.work_at_reservation = self.work;
+            Ok(())
+        }
+
+        fn release_bytes(&mut self, amount: usize) -> Result<(), BuildError> {
+            if self.refuse_release {
+                return Err(BuildError::Invariant("injected release refusal"));
+            }
+            self.retained = self
+                .retained
+                .checked_sub(amount)
+                .ok_or(BuildError::Invariant("test release underflowed"))?;
+            self.releases = build_add(self.releases, 1, "test releases")?;
+            Ok(())
+        }
+    }
+
     fn pattern(tlds: &[&str]) -> String {
         format!(
             r"((?:(?:(?:https?|ftp)://(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){{3}}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))|(?:(?:https?|ftp)://)?(?:[a-z0-9%.]+:[a-z0-9%]+@)?(?:(?:[a-z0-9_~]\-?){{0,62}}[a-z0-9]\.)*(?:(?:(?:[a-z0-9]\-?){{0,62}}[a-z0-9])|(?:xn--[a-z0-9\-]+))\.(?:{}))(?::\d{{2,5}})?(?:/[a-z0-9/\-_%$@&()!?'=~*+:;,.]+)*/?(?:[?#]\S*)*/?)",
@@ -1176,11 +1460,13 @@ mod tests {
     }
 
     fn plan(tlds: &[&str]) -> UrlAggregatePlan {
-        UrlAggregatePlan::build(
-            tlds.iter().map(|tld| tld.as_bytes()).collect(),
-            BuildLimits::default(),
-        )
-        .unwrap()
+        let mut packed = Vec::new();
+        let mut ends = Vec::new();
+        for tld in tlds {
+            packed.extend_from_slice(tld.as_bytes());
+            ends.push(packed.len());
+        }
+        UrlAggregatePlan::build(&packed, &ends, BuildLimits::default()).unwrap()
     }
 
     fn check(tlds: &[&str], haystack: &[u8]) -> SpanSumResult {
@@ -1239,6 +1525,35 @@ mod tests {
     }
 
     #[test]
+    fn extension_and_ipv4_context_source_accesses_are_exactly_bounded() {
+        let plan = plan(&["COM", "ORG"]);
+        for haystack in [
+            b"a.b.com".as_slice(),
+            b"a.xn--b.com",
+            b"a.b.c.com",
+            b"http://1.22.255.4",
+            b"http://12.3.44.255",
+            b"http://255x.example",
+        ] {
+            let exact = plan
+                .span_sum(haystack, 0..haystack.len(), ReduceLimits::default())
+                .unwrap();
+            assert!(exact.accounting.random_access_bytes > 0);
+            let below = ReduceLimits {
+                max_random_access_bytes: exact.accounting.random_access_bytes - 1,
+                ..ReduceLimits::default()
+            };
+            assert!(matches!(
+                plan.span_sum(haystack, 0..haystack.len(), below),
+                Err(ReduceError::Resource {
+                    resource: "random access bytes",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn exact_observed_limits_fail_one_below() {
         let plan = plan(&["EXAMPLECOM", "COM", "CO"]);
         let haystack = b"https://u:p@a.examplecom/path?q a.co http://1.2.3.4.com";
@@ -1252,10 +1567,12 @@ mod tests {
                 .accounting
                 .candidate_insertions
                 .max(exact.accounting.candidate_visits),
-            max_matches: exact.matches,
+            max_match_events: exact.matches,
+            max_output_matches: exact.matches,
             max_span_sum: exact.value,
             max_sequential_bytes: exact.accounting.sequential_bytes,
             max_random_access_bytes: exact.accounting.random_access_bytes,
+            max_random_access_storage_bytes: exact.accounting.random_access_storage_bytes,
             max_work: exact.accounting.work,
             max_scratch_bytes: exact.accounting.scratch_bytes,
             max_peak_bytes: exact.accounting.peak_bytes,
@@ -1278,6 +1595,10 @@ mod tests {
                 ..limits
             },
             ReduceLimits {
+                max_random_access_storage_bytes: limits.max_random_access_storage_bytes - 1,
+                ..limits
+            },
+            ReduceLimits {
                 max_scratch_bytes: limits.max_scratch_bytes - 1,
                 ..limits
             },
@@ -1287,6 +1608,14 @@ mod tests {
             },
             ReduceLimits {
                 max_span_sum: limits.max_span_sum - 1,
+                ..limits
+            },
+            ReduceLimits {
+                max_match_events: limits.max_match_events - 1,
+                ..limits
+            },
+            ReduceLimits {
+                max_output_matches: limits.max_output_matches - 1,
                 ..limits
             },
         ] {
@@ -1300,13 +1629,161 @@ mod tests {
     #[test]
     fn build_rejects_priority_conflict_and_duplicates() {
         assert!(matches!(
-            UrlAggregatePlan::build(vec![b"CO", b"COM"], BuildLimits::default()),
+            UrlAggregatePlan::build(b"COCOM", &[2, 5], BuildLimits::default()),
             Err(BuildError::PriorityConflict { .. })
         ));
         assert!(matches!(
-            UrlAggregatePlan::build(vec![b"COM", b"com"], BuildLimits::default()),
+            UrlAggregatePlan::build(b"COMcom", &[3, 6], BuildLimits::default()),
             Err(BuildError::DuplicateTld { .. })
         ));
+    }
+
+    #[test]
+    fn external_build_authority_is_transactional_and_limit_precedes_action() {
+        let limits = BuildLimits::default();
+        let successful = UrlAggregatePlan::build(b"EXAMPLECOMORG", &[10, 13], limits).unwrap();
+        let exact_work = successful.build_accounting().work;
+        let persistent = successful.build_accounting().persistent_bytes;
+
+        let mut refused = TestAuthority {
+            retained: 17,
+            refuse_retain: true,
+            ..TestAuthority::default()
+        };
+        assert!(matches!(
+            UrlAggregatePlan::build_with_authority(
+                b"EXAMPLECOMORG",
+                &[10, 13],
+                limits,
+                &mut refused
+            ),
+            Err(BuildError::Invariant("injected reservation refusal"))
+        ));
+        assert_eq!(refused.retained, 17);
+        assert_eq!(refused.releases, 0);
+
+        let mut rolled_back = TestAuthority {
+            retained: 19,
+            refuse_post_retain_work: true,
+            ..TestAuthority::default()
+        };
+        assert!(matches!(
+            UrlAggregatePlan::build_with_authority(
+                b"EXAMPLECOMORG",
+                &[10, 13],
+                limits,
+                &mut rolled_back
+            ),
+            Err(BuildError::Invariant(
+                "injected post-reservation work refusal"
+            ))
+        ));
+        assert_eq!(rolled_back.retained, 19);
+        assert_eq!(rolled_back.releases, 1);
+
+        let mut release_failed = TestAuthority {
+            retained: 23,
+            refuse_post_retain_work: true,
+            refuse_release: true,
+            ..TestAuthority::default()
+        };
+        assert!(matches!(
+            UrlAggregatePlan::build_with_authority(
+                b"EXAMPLECOMORG",
+                &[10, 13],
+                limits,
+                &mut release_failed
+            ),
+            Err(BuildError::Invariant("injected release refusal"))
+        ));
+        assert_eq!(release_failed.retained, 23 + persistent);
+        assert_eq!(release_failed.releases, 0);
+
+        let one_below = BuildLimits {
+            max_work: exact_work - 1,
+            ..limits
+        };
+        let mut bounded = TestAuthority::default();
+        let Err(BuildError::Resource {
+            resource: "work",
+            needed,
+            limit,
+        }) = UrlAggregatePlan::build_with_authority(
+            b"EXAMPLECOMORG",
+            &[10, 13],
+            one_below,
+            &mut bounded,
+        )
+        else {
+            panic!("one-below work limit did not refuse before the triggering action");
+        };
+        assert_eq!(limit, exact_work - 1);
+        assert!(needed > limit);
+        assert!(bounded.work <= limit);
+        assert_eq!(bounded.retained, 0);
+    }
+
+    #[test]
+    fn allocation_and_deallocation_actions_are_prepaid() {
+        allocation_probe::reset_build();
+        let mut authority = TestAuthority::default();
+        let plan = UrlAggregatePlan::build_with_authority(
+            b"COMORG",
+            &[3, 6],
+            BuildLimits::default(),
+            &mut authority,
+        )
+        .unwrap();
+        assert_eq!(allocation_probe::build_calls(), 2);
+        let preallocation_work = authority.work_at_reservation;
+        allocation_probe::reset_build();
+        assert!(matches!(
+            UrlAggregatePlan::build(
+                b"COMORG",
+                &[3, 6],
+                BuildLimits {
+                    max_work: preallocation_work - 1,
+                    ..BuildLimits::default()
+                }
+            ),
+            Err(BuildError::Resource {
+                resource: "work",
+                ..
+            })
+        ));
+        assert_eq!(allocation_probe::build_calls(), 0);
+
+        allocation_probe::reset_reduce();
+        assert!(matches!(
+            plan.span_sum(
+                b"",
+                0..0,
+                ReduceLimits {
+                    max_work: 1,
+                    ..ReduceLimits::default()
+                }
+            ),
+            Err(ReduceError::Resource {
+                resource: "work",
+                ..
+            })
+        ));
+        assert_eq!(allocation_probe::reduce_calls(), 0);
+        assert!(matches!(
+            plan.span_sum(
+                b"",
+                0..0,
+                ReduceLimits {
+                    max_work: 2,
+                    ..ReduceLimits::default()
+                }
+            ),
+            Err(ReduceError::Resource {
+                resource: "work",
+                ..
+            })
+        ));
+        assert_eq!(allocation_probe::reduce_calls(), 1);
     }
 
     #[test]

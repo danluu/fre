@@ -34,6 +34,13 @@ pub struct CompileAccounting {
     /// Work charged prospectively before any plan descriptor/source traversal.
     pub required_internal_anchor_build_work_upper_bound: usize,
     pub required_internal_anchor_persistent_bytes: usize,
+    /// Strictly certified URL aggregate plans retained by this artifact.
+    pub url_aggregate_plans: usize,
+    /// Ordered finite TLD alternatives retained by the URL aggregate trie.
+    pub url_aggregate_tlds: usize,
+    pub url_aggregate_tld_bytes: usize,
+    pub url_aggregate_build_work: usize,
+    pub url_aggregate_persistent_bytes: usize,
     /// Bytes in the mandatory leading literal retained by the unbounded
     /// terminal-frontier certificate.
     pub terminal_frontier_prefix_bytes: usize,
@@ -88,6 +95,18 @@ pub struct ExecutionAccounting {
     pub required_anchor_source_accesses: usize,
     pub required_anchor_queue_peak: usize,
     pub required_anchor_frontier_peak: usize,
+    /// Exact counters from the strictly certified URL aggregate route. These
+    /// remain zero for every generic continuation execution.
+    pub url_segments: usize,
+    pub url_dot_probes: usize,
+    pub url_tld_transitions: usize,
+    pub url_tld_candidates: usize,
+    pub url_scheme_probes: usize,
+    pub url_ipv4_candidates: usize,
+    pub url_prefix_steps: usize,
+    pub url_suffix_steps: usize,
+    pub url_candidate_insertions: usize,
+    pub url_candidate_visits: usize,
     pub replay_steps: usize,
     pub successful_paths: usize,
     pub suppressed_empty: usize,
