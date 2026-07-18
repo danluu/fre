@@ -87,7 +87,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v5";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v6";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -3434,6 +3434,7 @@ struct ContinuationProgramShape {
     execution_state_work: usize,
     has_scalar_transitions: bool,
     max_scalar_search_checks: usize,
+    requires_utf8_validation: bool,
 }
 
 impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
@@ -3443,6 +3444,7 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
             execution_state_work: accounting.execution_state_work,
             has_scalar_transitions: accounting.has_scalar_transitions,
             max_scalar_search_checks: accounting.max_scalar_search_checks,
+            requires_utf8_validation: accounting.requires_utf8_validation,
         }
     }
 }
@@ -3454,6 +3456,7 @@ fn inactive_continuation_shape() -> ContinuationProgramShape {
         execution_state_work: 1,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
+        requires_utf8_validation: false,
     }
 }
 
@@ -3469,6 +3472,7 @@ fn conservative_continuation_shape(
         execution_state_work,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
+        requires_utf8_validation: false,
     })
 }
 
@@ -3494,7 +3498,17 @@ fn continuation_operation_limits(
     let random_access_upper =
         checked_aggregate_add(row_bytes, record_bytes, "random-access bytes")?;
     let log_upper = checked_aggregate_mul(record_bytes, boundaries, "row-log bytes")?;
-    let sequential_upper = checked_aggregate_mul(log_upper, 2, "sequential bytes")?;
+    let row_sequential_upper = checked_aggregate_mul(log_upper, 2, "row sequential bytes")?;
+    let prevalidation = if shape.requires_utf8_validation {
+        haystack_len
+    } else {
+        0
+    };
+    let sequential_upper = checked_aggregate_add(
+        row_sequential_upper,
+        prevalidation,
+        "sequential bytes including UTF-8 prevalidation",
+    )?;
     let peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
 
     // These are the same structural terms enforced by
@@ -3514,10 +3528,15 @@ fn continuation_operation_limits(
     let state_boundaries =
         checked_aggregate_mul(program_states, boundaries, "state-boundary cells")?;
     let replay_work = checked_aggregate_mul(state_boundaries, replay_factor, "row-replay work")?;
-    let work_upper = checked_aggregate_add(
+    let engine_work_upper = checked_aggregate_add(
         checked_aggregate_add(build_work, scan_work, "build plus scan work")?,
         replay_work,
         "operation work",
+    )?;
+    let work_upper = checked_aggregate_add(
+        engine_work_upper,
+        prevalidation,
+        "operation work including UTF-8 prevalidation",
     )?;
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
@@ -6922,7 +6941,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v5"
+            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v6"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -7067,6 +7086,54 @@ mod tests {
             9,
             "aggregate-finite-literal-dfa",
         );
+    }
+
+    #[test]
+    fn canonical_unicode_word_boundary_rows_retain_support() {
+        let patterns = [r"\b".to_string()];
+        let limits = RunLimits::default();
+        for (job_id, haystack) in [
+            (
+                "test/unicode/word-boundary/unicode-alphabetic@rust/regex",
+                "δ".as_bytes(),
+            ),
+            (
+                "test/unicode/word-boundary/unicode-connector-punctuation@rust/regex",
+                "⁀".as_bytes(),
+            ),
+            (
+                "test/unicode/word-boundary/unicode-decimal-number@rust/regex",
+                "᠕".as_bytes(),
+            ),
+            (
+                "test/unicode/word-boundary/unicode-join-control@rust/regex",
+                "\u{200D}".as_bytes(),
+            ),
+            (
+                "test/unicode/word-boundary/unicode-mark@rust/regex",
+                "\u{0322}".as_bytes(),
+            ),
+        ] {
+            let outcome = CurrentFreAdapter.execute(
+                CandidateRequest {
+                    job_id,
+                    model: "count",
+                    patterns: &patterns,
+                    haystack,
+                    unicode: true,
+                    case_insensitive: false,
+                },
+                &limits,
+            );
+            assert_eq!(
+                outcome,
+                CandidateOutcome::ExecutedWithPlan {
+                    actual: 2,
+                    plan: "aggregate-continuation-program".to_string(),
+                },
+                "canonical row {job_id}"
+            );
+        }
     }
 
     #[test]
@@ -7889,8 +7956,18 @@ mod tests {
             count.build_report().plan,
             AggregatePlanKind::ContinuationProgram
         );
+        let AggregateBuildAccounting::Continuation(compile) = count.build_report().build else {
+            panic!("expected continuation compile accounting");
+        };
+        assert!(!compile.requires_utf8_validation);
         let run_limits =
             aggregate_run_limits(haystack.len(), count.build_report(), &baseline_limits).unwrap();
+        let record_bytes = (compile.program_states + 1).div_ceil(8);
+        let prior_sequential = record_bytes * (haystack.len() + 1) * 2;
+        assert_eq!(
+            run_limits.continuation.max_sequential_bytes,
+            prior_sequential
+        );
         let audited = count.count(&haystack, run_limits).unwrap();
         let fre::AggregateExecutionDetails::Continuation {
             certificate,
@@ -7953,6 +8030,82 @@ mod tests {
                     && reason.contains(&format!("requires {}", accounting.work))
                     && reason.contains(&format!("limit is {}", accounting.work - 1))),
             "one-below observed span-sum work must remain typed unsupported: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn unicode_word_prevalidation_exact_limits_execute_and_one_below_refuses() {
+        let pattern = r"\b";
+        let patterns = [pattern.to_string()];
+        let haystack = "δ".as_bytes();
+        let baseline = RunLimits::default();
+        let regex = AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(true)
+            .limits(aggregate_build_limits(&baseline))
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("Unicode word boundary did not select continuation");
+        };
+        assert!(compile.requires_utf8_validation);
+
+        let run_limits =
+            aggregate_run_limits(haystack.len(), regex.build_report(), &baseline).unwrap();
+        let sequential = run_limits.continuation.max_sequential_bytes;
+        let audited = regex.count(haystack, run_limits).unwrap();
+        let fre::AggregateExecutionDetails::Continuation { accounting, .. } =
+            &audited.report().details
+        else {
+            panic!("expected continuation execution details");
+        };
+        assert_eq!(accounting.utf8_validation_work, haystack.len());
+
+        let exact = RunLimits {
+            fre_aggregate_operation_work: accounting.work,
+            fre_aggregate_sequential_bytes: sequential,
+            ..RunLimits::default()
+        };
+        assert_current_fre_execution(
+            current_fre("count", &patterns, haystack, true, false, &exact),
+            2,
+            "aggregate-continuation-program",
+        );
+
+        let work_one_below = RunLimits {
+            fre_aggregate_operation_work: accounting.work - 1,
+            ..exact.clone()
+        };
+        let work = current_fre("count", &patterns, haystack, true, false, &work_one_below);
+        assert!(
+            matches!(work, CandidateOutcome::Unsupported(ref reason)
+                if reason.contains("ExecutionWork")
+                    && reason.contains(&format!("requires {}", accounting.work))
+                    && reason.contains(&format!("limit is {}", accounting.work - 1))),
+            "one-below Unicode validation work must be typed unsupported: {work:?}"
+        );
+
+        let sequential_one_below = RunLimits {
+            fre_aggregate_sequential_bytes: sequential - 1,
+            ..exact
+        };
+        let sequential_refusal = current_fre(
+            "count",
+            &patterns,
+            haystack,
+            true,
+            false,
+            &sequential_one_below,
+        );
+        let CandidateOutcome::Unsupported(reason) = sequential_refusal else {
+            panic!(
+                "one-below Unicode validation bytes must be typed unsupported: {sequential_refusal:?}"
+            );
+        };
+        assert!(
+            reason.contains("SequentialBytes"),
+            "expected a typed sequential-byte refusal in {reason:?}"
         );
     }
 
@@ -8427,6 +8580,22 @@ mod tests {
         assert_eq!(derived.max_peak_bytes, random.checked_add(11).unwrap());
         assert_eq!(derived.max_work, 429);
 
+        let one_below = continuation_operation_limits(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            &RunLimits {
+                fre_aggregate_sequential_bytes: derived.max_sequential_bytes - 1,
+                fre_aggregate_operation_work: derived.max_work - 1,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            one_below.max_sequential_bytes,
+            derived.max_sequential_bytes - 1
+        );
+        assert_eq!(one_below.max_work, derived.max_work - 1);
+
         run.fre_aggregate_random_access_bytes = 7;
         run.fre_aggregate_scratch_bytes = 6;
         run.fre_aggregate_log_bytes = 5;
@@ -8451,6 +8620,7 @@ mod tests {
             execution_state_work: 11,
             has_scalar_transitions: true,
             max_scalar_search_checks: 10,
+            requires_utf8_validation: false,
         };
         let derived = continuation_operation_limits(10, shape, &RunLimits::default()).unwrap();
         // 11 boundaries: (11 state work + one shared decode) * 11 to build
@@ -8467,6 +8637,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(capped.max_work, 945);
+    }
+
+    #[test]
+    fn continuation_limits_include_authenticated_utf8_prevalidation() {
+        let regex = AggregateBuilder::new(r"\b")
+            .profile(rebar_profile())
+            .unicode(true)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        let AggregateBuildAccounting::Continuation(compile) = regex.build_report().build else {
+            panic!("forced continuation returned another plan");
+        };
+        let shape = ContinuationProgramShape::from(compile);
+        assert!(shape.requires_utf8_validation);
+
+        let bytes = 10;
+        let exact = continuation_operation_limits(bytes, shape, &RunLimits::default()).unwrap();
+        let without_prevalidation = continuation_operation_limits(
+            bytes,
+            ContinuationProgramShape {
+                requires_utf8_validation: false,
+                ..shape
+            },
+            &RunLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            exact.max_sequential_bytes,
+            without_prevalidation.max_sequential_bytes + bytes
+        );
+        assert_eq!(exact.max_work, without_prevalidation.max_work + bytes);
+
+        let one_below = continuation_operation_limits(
+            bytes,
+            shape,
+            &RunLimits {
+                fre_aggregate_sequential_bytes: exact.max_sequential_bytes - 1,
+                fre_aggregate_operation_work: exact.max_work - 1,
+                ..RunLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            one_below.max_sequential_bytes,
+            exact.max_sequential_bytes - 1
+        );
+        assert_eq!(one_below.max_work, exact.max_work - 1);
     }
 
     #[test]

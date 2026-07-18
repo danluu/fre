@@ -312,12 +312,20 @@ fn unicode_word_property_is_cached_by_the_budgeted_identity_pass() {
         accounting.unicode_word_boundary_checks,
         accounting.program_states
     );
+    assert!(accounting.requires_utf8_validation);
     for pattern in [r"\b", r"\b(?:a|ab|abc|abcd|abcde){1,3}\b"] {
         let sized = compile_unicode_byte_stable(pattern)
             .unwrap()
             .compile_accounting();
         assert_eq!(sized.unicode_word_boundary_checks, sized.program_states);
+        assert!(sized.requires_utf8_validation);
     }
+    assert!(
+        !compile_unicode_byte_stable("[a-z]+")
+            .unwrap()
+            .compile_accounting()
+            .requires_utf8_validation
+    );
 
     let exact = CompileLimits {
         max_work: accounting.work,

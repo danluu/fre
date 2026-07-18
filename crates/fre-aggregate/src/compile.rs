@@ -260,6 +260,7 @@ impl CompileBudget {
                 has_scalar_transitions: false,
                 max_scalar_search_checks: 0,
                 unicode_word_boundary_checks: 0,
+                requires_utf8_validation: false,
                 work: 0,
             },
             current_temporary_states: 0,
@@ -1328,6 +1329,7 @@ fn finalize_program(
         hash_inst(&mut second, inst);
     }
     program.has_unicode_word_boundary = has_unicode_word_boundary;
+    budget.accounting.requires_utf8_validation = has_unicode_word_boundary;
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
     bytes[8..].copy_from_slice(&second.finish().to_le_bytes());

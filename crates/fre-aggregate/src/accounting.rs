@@ -37,6 +37,9 @@ pub struct CompileAccounting {
     /// Instruction-property checks performed during the already-budgeted
     /// plan-identity traversal to cache Unicode-word admission requirements.
     pub unicode_word_boundary_checks: usize,
+    /// Whether execution must prospectively charge and validate the complete
+    /// haystack before evaluating Unicode word-boundary assertions.
+    pub requires_utf8_validation: bool,
     pub work: usize,
 }
 
