@@ -41,7 +41,7 @@ pub use bounded_class_sequence::{
 };
 
 pub use bounded_context::{
-    BoundedContextPlan, BuildAccounting as BoundedContextBuildAccounting,
+    BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildAccounting as BoundedContextBuildAccounting,
     BuildError as BoundedContextBuildError, BuildLimits as BoundedContextBuildLimits,
     COUNT_OPERATION_ID as BOUNDED_CONTEXT_COUNT_OPERATION_ID,
     CountResult as BoundedContextCountResult, OperationIdentity as BoundedContextOperationIdentity,

@@ -9,7 +9,14 @@
 //! and monotone prefix resolution. No input position is paired with program
 //! states, so execution is `O(N + Q)`, never `O(N*Q)`.
 //!
+//! A distinct direct plan admits `LEFT MIDDLE{0,A} LITERAL RIGHT` with
+//! one-byte endpoint classes, `LEFT` and `RIGHT` disjoint from `MIDDLE`, and
+//! every literal byte in `MIDDLE`. It scans maximal middle runs once and tests
+//! only the suffix before a right endpoint. Those tests consume disjoint
+//! `LITERAL+RIGHT` regions, bounding literal-byte comparisons by input length.
+//!
 //! rebar-row:curated/10-bounded-repeat/context@rust/regex
+//! rebar-row:imported/leipzig/ing-whitespace@rust/regex
 
 use core::{fmt, mem::size_of};
 
@@ -18,6 +25,7 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 pub const PLAN_ID: &str = "bounded-context-count.literal-interval-stream.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-context-count.count.v1";
+pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
 
 const INTERVAL_BYTES: usize = 12;
 const MIN_FIXED_WIDTH: u32 = 2;
@@ -286,6 +294,9 @@ pub enum BuildError {
     LiteralStartsInSeparator {
         byte: u8,
     },
+    LiteralOutsideMiddle {
+        byte: u8,
+    },
     OverlappingLiteral {
         repeated_first: u8,
     },
@@ -421,6 +432,7 @@ pub struct BoundedContextPlan {
     right_gap_max: u32,
     tail_width: u32,
     build: BuildAccounting,
+    bounded_affix: bool,
 }
 
 impl BoundedContextPlan {
@@ -568,6 +580,142 @@ impl BoundedContextPlan {
                 persistent_bytes,
                 peak_bytes,
             },
+            bounded_affix: false,
+        })
+    }
+
+    /// Build `LEFT MIDDLE{0,max} LITERAL RIGHT` for byte-mode Count.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fail-closed affix construction keeps quota, class, copy, and identity checks together"
+    )]
+    pub fn build_bounded_affix<Left, Middle, Right>(
+        left: Left,
+        middle: Middle,
+        right: Right,
+        literal: &[u8],
+        middle_max: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        Left: IntoIterator<Item = (u8, u8)>,
+        Middle: IntoIterator<Item = (u8, u8)>,
+        Right: IntoIterator<Item = (u8, u8)>,
+    {
+        if literal.is_empty() {
+            return Err(BuildError::EmptyLiteral);
+        }
+        if middle_max > limits.max_gap_bound {
+            return Err(BuildError::GapLimit {
+                needed: middle_max,
+                limit: limits.max_gap_bound,
+            });
+        }
+        if literal.len() > limits.max_literal_bytes {
+            return Err(BuildError::LiteralLimit {
+                needed: literal.len(),
+                limit: limits.max_literal_bytes,
+            });
+        }
+        let persistent_bytes =
+            size_of::<Self>()
+                .checked_add(literal.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix persistent bytes",
+                })?;
+        let peak_bytes =
+            persistent_bytes
+                .checked_add(literal.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix construction peak bytes",
+                })?;
+        if literal.len() > limits.max_scratch_bytes {
+            return Err(BuildError::ScratchLimit {
+                needed: literal.len(),
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        if persistent_bytes > limits.max_persistent_bytes {
+            return Err(BuildError::PersistentLimit {
+                needed: persistent_bytes,
+                limit: limits.max_persistent_bytes,
+            });
+        }
+        if peak_bytes > limits.max_peak_bytes {
+            return Err(BuildError::PeakLimit {
+                needed: peak_bytes,
+                limit: limits.max_peak_bytes,
+            });
+        }
+        let mut budget = BuildTraversalBudget::new(literal.len(), limits)?;
+        let (left, left_ranges) = ByteClass::from_ranges(left, "left", &mut budget)?;
+        let (middle, middle_ranges) = ByteClass::from_ranges(middle, "middle", &mut budget)?;
+        let (right, right_ranges) = ByteClass::from_ranges(right, "right", &mut budget)?;
+        if left.is_empty() {
+            return Err(BuildError::EmptyClass { role: "left" });
+        }
+        if middle.is_empty() {
+            return Err(BuildError::EmptyClass { role: "middle" });
+        }
+        if right.is_empty() {
+            return Err(BuildError::EmptyClass { role: "right" });
+        }
+        if middle.overlaps(left) {
+            return Err(BuildError::OverlappingSeparator {
+                role: "bounded-affix left/middle",
+            });
+        }
+        if middle.overlaps(right) {
+            return Err(BuildError::OverlappingSeparator {
+                role: "bounded-affix right/middle",
+            });
+        }
+        if let Some(&byte) = literal.iter().find(|&&byte| !middle.contains(byte)) {
+            return Err(BuildError::LiteralOutsideMiddle { byte });
+        }
+        let copy_charged_work =
+            budget
+                .work
+                .checked_add(literal.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix literal copy work",
+                })?;
+        if copy_charged_work > limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed: copy_charged_work,
+                limit: limits.max_build_work,
+            });
+        }
+        budget.work = copy_charged_work;
+        let owned = copy_exact(literal).map_err(|error| {
+            allocation_build_error(error, "bounded-affix literal", literal.len())
+        })?;
+        let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
+        Ok(Self {
+            prefix: left,
+            separator: middle,
+            tail: right,
+            finder,
+            prefix_width: 1,
+            left_gap_max: middle_max,
+            right_gap_max: 0,
+            tail_width: 1,
+            build: BuildAccounting {
+                prefix_ranges: left_ranges,
+                separator_ranges: middle_ranges,
+                tail_ranges: right_ranges,
+                source_ranges: budget.source_ranges,
+                literal_bytes: literal.len(),
+                prefix_width: 1,
+                left_gap_max: middle_max,
+                right_gap_max: 0,
+                tail_width: 1,
+                work: budget.work,
+                temporary_capacity_bytes: literal.len(),
+                persistent_bytes,
+                peak_bytes,
+            },
+            bounded_affix: true,
         })
     }
 
@@ -579,7 +727,11 @@ impl BoundedContextPlan {
     #[must_use]
     pub const fn count_identity(&self) -> OperationIdentity {
         OperationIdentity {
-            plan_id: PLAN_ID,
+            plan_id: if self.bounded_affix {
+                BOUNDED_AFFIX_PLAN_ID
+            } else {
+                PLAN_ID
+            },
             operation_id: COUNT_OPERATION_ID,
             prefix_width: self.prefix_width,
             left_gap_max: self.left_gap_max,
@@ -591,6 +743,9 @@ impl BoundedContextPlan {
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        if self.bounded_affix {
+            return self.count_bounded_affix(haystack, limits);
+        }
         let upper_bounds = self.preflight(haystack.len(), limits)?;
         let scratch = zeroed_exact(upper_bounds.scratch_bytes).map_err(|error| {
             allocation_reduce_error(error, "suffix interval table", upper_bounds.scratch_bytes)
@@ -603,6 +758,269 @@ impl BoundedContextPlan {
                 upper_bounds,
                 actual,
             },
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded endpoint scan keeps selection and checked output publication adjacent"
+    )]
+    fn count_bounded_affix(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<CountResult, ReduceError> {
+        if haystack.len() > limits.max_input_bytes {
+            return Err(ReduceError::InputLimit {
+                needed: haystack.len(),
+                limit: limits.max_input_bytes,
+            });
+        }
+        if self.build.persistent_bytes > limits.max_peak_bytes {
+            return Err(ReduceError::PeakLimit {
+                needed: self.build.persistent_bytes,
+                limit: limits.max_peak_bytes,
+            });
+        }
+        let literal = self.finder.needle();
+        let upper_bounds = self.bounded_affix_preflight(haystack.len(), literal.len(), limits)?;
+        let middle_max =
+            usize::try_from(self.left_gap_max).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix middle maximum",
+            })?;
+        let mut cursor = 0_usize;
+        let mut middle_run = 0_usize;
+        let mut next_match_start = 0_usize;
+        let mut literal_attempts = 0_usize;
+        let mut successful_literals = 0_usize;
+        let mut prefix_candidates = 0_usize;
+        let mut count = 0_u64;
+        while cursor < haystack.len() {
+            let byte = haystack[cursor];
+            if self.separator.contains(byte) {
+                middle_run = middle_run
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix middle run",
+                    })?;
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix scan cursor",
+                    })?;
+                continue;
+            }
+            let mut selected = false;
+            if self.tail.contains(byte) && middle_run >= literal.len() {
+                literal_attempts =
+                    literal_attempts
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix literal attempts",
+                        })?;
+                let literal_start =
+                    cursor
+                        .checked_sub(literal.len())
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix literal start",
+                        })?;
+                if haystack[literal_start..cursor] == *literal {
+                    successful_literals = successful_literals.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix successful literal count",
+                        },
+                    )?;
+                    let middle_len = middle_run.checked_sub(literal.len()).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix middle length",
+                        },
+                    )?;
+                    let start = cursor
+                        .checked_sub(middle_run)
+                        .and_then(|value| value.checked_sub(1));
+                    if middle_len <= middle_max
+                        && start.is_some_and(|start| self.prefix.contains(haystack[start]))
+                    {
+                        prefix_candidates = prefix_candidates.checked_add(1).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "bounded-affix prefix candidate count",
+                            },
+                        )?;
+                        selected = start.is_some_and(|start| start >= next_match_start);
+                    }
+                }
+            }
+            if selected {
+                let needed_events = usize::try_from(count)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix match events",
+                    })?;
+                if needed_events > limits.max_match_events {
+                    return Err(ReduceError::MatchEventsLimit {
+                        needed: needed_events,
+                        limit: limits.max_match_events,
+                    });
+                }
+                count = count
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix count",
+                    })?;
+                if count > limits.max_count {
+                    return Err(ReduceError::CountLimit {
+                        needed: count,
+                        limit: limits.max_count,
+                    });
+                }
+                next_match_start =
+                    cursor
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix next match start",
+                        })?;
+            }
+            middle_run = 0;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix candidate cursor",
+                })?;
+        }
+        let events = usize::try_from(count).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix final event count",
+        })?;
+        Ok(CountResult {
+            count,
+            accounting: ReduceAccounting {
+                identity: self.count_identity(),
+                upper_bounds,
+                actual: ReduceActualCounters {
+                    suffix_intervals: 0,
+                    literal_occurrences: literal_attempts,
+                    successful_literals,
+                    prefix_candidates,
+                    match_events: events,
+                    count,
+                },
+            },
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the prospective certificate derives and enforces every named dimension before execution"
+    )]
+    fn bounded_affix_preflight(
+        &self,
+        input_bytes: usize,
+        literal_bytes: usize,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let candidate_denominator =
+            literal_bytes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix candidate denominator",
+                })?;
+        // `RIGHT` is disjoint from `MIDDLE`, and every literal byte is in
+        // `MIDDLE`. An attempted suffix therefore consumes at least the
+        // literal bytes plus its terminating right byte; attempts cannot
+        // overlap. This bounds both slice comparisons and prefix probes.
+        let suffix_candidates = input_bytes.checked_div(candidate_denominator).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix candidate bound",
+            },
+        )?;
+        let inspections = input_bytes
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(suffix_candidates))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix inspections",
+            })?;
+        let literal_comparisons = suffix_candidates.checked_mul(literal_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix literal comparisons",
+            },
+        )?;
+        let comparisons = inspections.checked_add(literal_comparisons).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix comparisons",
+            },
+        )?;
+        let branches =
+            comparisons
+                .checked_add(input_bytes)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix branches",
+                })?;
+        let state_writes = input_bytes
+            .checked_mul(3)
+            .and_then(|value| {
+                suffix_candidates
+                    .checked_mul(5)
+                    .and_then(|term| value.checked_add(term))
+            })
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix state writes",
+            })?;
+        let work = inspections
+            .checked_add(comparisons)
+            .and_then(|value| value.checked_add(branches))
+            .and_then(|value| value.checked_add(state_writes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix work",
+            })?;
+        if work > limits.max_work {
+            return Err(ReduceError::WorkLimit {
+                needed: work,
+                limit: limits.max_work,
+            });
+        }
+        let event_denominator =
+            literal_bytes
+                .checked_add(2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix event denominator",
+                })?;
+        let event_bound =
+            input_bytes
+                .checked_div(event_denominator)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix event bound",
+                })?;
+        if event_bound > limits.max_match_events {
+            return Err(ReduceError::MatchEventsLimit {
+                needed: event_bound,
+                limit: limits.max_match_events,
+            });
+        }
+        let count_bound =
+            u64::try_from(event_bound).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix count bound",
+            })?;
+        if count_bound > limits.max_count {
+            return Err(ReduceError::CountLimit {
+                needed: count_bound,
+                limit: limits.max_count,
+            });
+        }
+        Ok(ReduceUpperBounds {
+            input_bytes,
+            literal_bytes,
+            interval_records: 0,
+            interval_bytes: 0,
+            inspections,
+            branches,
+            comparisons,
+            state_writes,
+            work,
+            match_events: event_bound,
+            count: count_bound,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
         })
     }
 
@@ -1411,5 +1829,113 @@ mod tests {
             let interval_bytes = 12 * (n / 3);
             assert_eq!(21 * n + 11 + 3 * interval_bytes + 40, expected);
         }
+    }
+
+    fn bounded_affix(limits: BuildLimits) -> Result<BoundedContextPlan, BuildError> {
+        BoundedContextPlan::build_bounded_affix(
+            [(b'\t', b'\r'), (b' ', b' ')],
+            [(b'A', b'Z'), (b'a', b'z')],
+            [(b'\t', b'\r'), (b' ', b' ')],
+            b"ing",
+            12,
+            limits,
+        )
+    }
+
+    #[test]
+    fn bounded_affix_matches_oracle_and_precharges_exact_limits() {
+        let plan = bounded_affix(BuildLimits::default()).unwrap();
+        let oracle = RegexBuilder::new(r"\s[A-Za-z]{0,12}ing\s")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystack = b" ing  walking\t thing\n012ing x \xFFing\r";
+        let expected = u64::try_from(oracle.find_iter(haystack).count()).unwrap();
+        let default = plan.count(haystack, ReduceLimits::default()).unwrap();
+        assert_eq!(default.count, expected);
+        let shared_delimiter = b" ing ing ";
+        let shared = plan
+            .count(shared_delimiter, ReduceLimits::default())
+            .unwrap();
+        assert_eq!(
+            shared.count,
+            u64::try_from(oracle.find_iter(shared_delimiter).count()).unwrap()
+        );
+        assert_eq!(shared.accounting.actual.literal_occurrences, 2);
+        assert_eq!(shared.accounting.actual.successful_literals, 2);
+        assert_eq!(shared.accounting.actual.prefix_candidates, 2);
+        assert_eq!(shared.accounting.actual.match_events, 1);
+        assert!(
+            default.accounting.actual.literal_occurrences
+                >= default.accounting.actual.successful_literals
+        );
+        assert!(
+            default.accounting.actual.successful_literals
+                >= default.accounting.actual.prefix_candidates
+        );
+        assert!(
+            default.accounting.actual.prefix_candidates >= default.accounting.actual.match_events
+        );
+        assert_ne!(
+            default.accounting.upper_bounds.inspections,
+            default.accounting.upper_bounds.branches
+        );
+        let exact_work = default.accounting.upper_bounds.work;
+        assert_eq!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_work,
+                    ..ReduceLimits::default()
+                }
+            )
+            .unwrap()
+            .count,
+            expected
+        );
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_work - 1,
+                    ..ReduceLimits::default()
+                }
+            ),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == exact_work && limit == exact_work - 1
+        ));
+
+        let exact_build = plan.build_accounting().work;
+        assert!(
+            bounded_affix(BuildLimits {
+                max_build_work: exact_build,
+                ..BuildLimits::default()
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            bounded_affix(BuildLimits {
+                max_build_work: exact_build - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == exact_build && limit == exact_build - 1
+        ));
+    }
+
+    #[test]
+    fn bounded_affix_overflow_precedes_work_limit() {
+        let plan = bounded_affix(BuildLimits::default()).unwrap();
+        assert!(matches!(
+            plan.bounded_affix_preflight(
+                usize::MAX,
+                3,
+                ReduceLimits {
+                    max_work: 0,
+                    ..ReduceLimits::default()
+                }
+            ),
+            Err(ReduceError::ArithmeticOverflow { .. })
+        ));
     }
 }

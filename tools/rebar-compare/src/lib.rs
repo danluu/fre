@@ -87,7 +87,7 @@ pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-u
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v6";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v6";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -3832,6 +3832,7 @@ fn inactive_prefix_class_alternation_operation_limits() -> PrefixClassAlternatio
 fn bounded_context_operation_limits(
     haystack_len: usize,
     build: fre::BoundedContextBuildAccounting,
+    identity: AggregatePlanIdentity,
     limits: &RunLimits,
 ) -> Result<fre::BoundedContextReduceLimits, ExecutionError> {
     let tail = usize::try_from(build.tail_width)
@@ -3857,17 +3858,37 @@ fn bounded_context_operation_limits(
         )?,
         "bounded-context total work",
     )?;
-    let minimum_match = usize::try_from(build.prefix_width)
-        .ok()
-        .and_then(|value| value.checked_add(1))
-        .and_then(|value| value.checked_add(build.literal_bytes))
-        .and_then(|value| value.checked_add(1))
-        .and_then(|value| {
-            usize::try_from(build.tail_width)
-                .ok()
-                .and_then(|tail| value.checked_add(tail))
-        })
-        .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match overflow"))?;
+    let AggregatePlanIdentity::BoundedContext(identity) = identity else {
+        return Err(ExecutionError::fault(
+            "FRE bounded-context accounting lacks bounded-context identity",
+        ));
+    };
+    let minimum_match = if identity.kernel.plan_id == fre::BOUNDED_AFFIX_PLAN_ID {
+        usize::try_from(build.prefix_width)
+            .ok()
+            .and_then(|value| value.checked_add(build.literal_bytes))
+            .and_then(|value| {
+                usize::try_from(build.tail_width)
+                    .ok()
+                    .and_then(|tail| value.checked_add(tail))
+            })
+    } else if identity.kernel.plan_id == fre::BOUNDED_CONTEXT_PLAN_ID {
+        usize::try_from(build.prefix_width)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(build.literal_bytes))
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| {
+                usize::try_from(build.tail_width)
+                    .ok()
+                    .and_then(|tail| value.checked_add(tail))
+            })
+    } else {
+        return Err(ExecutionError::fault(
+            "FRE bounded-context accounting has unknown kernel identity",
+        ));
+    }
+    .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match overflow"))?;
     let match_events = haystack_len
         .checked_div(minimum_match)
         .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match is zero"))?;
@@ -4097,7 +4118,12 @@ fn aggregate_run_limits(
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            bounded_context: bounded_context_operation_limits(haystack_len, build, limits)?,
+            bounded_context: bounded_context_operation_limits(
+                haystack_len,
+                build,
+                report.plan_identity,
+                limits,
+            )?,
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -4240,7 +4266,10 @@ fn require_unicode_plan_identity(
         }
         if let AggregatePlanIdentity::BoundedContext(identity) = report.plan_identity {
             if operation == LiteralAggregateOperation::Count
-                && identity.kernel.plan_id == fre::BOUNDED_CONTEXT_PLAN_ID
+                && matches!(
+                    identity.kernel.plan_id,
+                    fre::BOUNDED_CONTEXT_PLAN_ID | fre::BOUNDED_AFFIX_PLAN_ID
+                )
                 && identity.kernel.operation_id == fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID
             {
                 return Ok(());
@@ -6941,7 +6970,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-uniform-participation-v1-structural-quota-v6"
+            "fre-current-aggregate-capture-v18-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v6"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

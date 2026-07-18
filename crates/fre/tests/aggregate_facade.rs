@@ -20,6 +20,35 @@ fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
 }
 
 #[test]
+fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
+    let pattern = r"\s[A-Za-z]{0,12}ing\s";
+    let haystack = b" ing  walking\t thing\n012ing x \xFFing\r";
+    let expected = upstream(pattern, haystack, false).len();
+    let regex = aggregate_builder(pattern)
+        .unicode(false)
+        .case_insensitive(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(regex.build_report().plan, AggregatePlanKind::BoundedContext);
+    let AggregatePlanIdentity::BoundedContext(identity) = regex.build_report().plan_identity else {
+        panic!("bounded-affix identity");
+    };
+    assert_eq!(identity.kernel.plan_id, "bounded-affix-count.direct.v1");
+    assert_eq!(
+        regex
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        u64::try_from(expected).unwrap()
+    );
+    assert_eq!(
+        regex
+            .count_value(b" ing ing ", AggregateRunLimits::default())
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families() {
     let cases: [(&str, &[u8], bool, u64, AggregatePlanKind); 3] = [
         ("aba", b"abaaba", false, 2, AggregatePlanKind::ExactLiteral),

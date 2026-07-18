@@ -94,8 +94,8 @@ pub use fre_capture_lab::{
     SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan,
 };
 pub use fre_kernels::{
-    BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CLASS_SEQUENCE_PLAN_ID,
-    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
+    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
+    BOUNDED_CLASS_SEQUENCE_PLAN_ID, BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
     BoundedClassSequenceActualCounters, BoundedClassSequenceBuildAccounting,
     BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
     BoundedClassSequenceOperationIdentity, BoundedClassSequenceReduceAccounting,
