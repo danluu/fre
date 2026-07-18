@@ -28,6 +28,7 @@ use regex_syntax::hir::{Hir, HirKind};
 mod aggregate;
 mod aggregate_many;
 mod capture_noqa;
+mod capture_required_literal;
 mod captures;
 mod finite;
 mod finite_root;
@@ -78,6 +79,14 @@ pub use capture_noqa::{
     NoqaBuildLimits, NoqaBuildReport, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex,
     NoqaPlanIdentity, NoqaResource, NoqaRunError, NoqaRunLimits, NoqaRunOutcome, NoqaRunReport,
     NoqaUpperBounds, NoqaVariant,
+};
+pub use capture_required_literal::{
+    CAPTURE_REQUIRED_LITERAL_PLAN_ID, CaptureRequiredLiteralBuildAccounting,
+    CaptureRequiredLiteralBuildError, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralBuildReport, CaptureRequiredLiteralBuilder,
+    CaptureRequiredLiteralCacheIdentity, CaptureRequiredLiteralIdentity,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchError,
+    CaptureRequiredLiteralSearchReport,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
