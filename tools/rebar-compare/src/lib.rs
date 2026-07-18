@@ -40,17 +40,18 @@ use fre::{
     FixedClassSandwichReduceLimits, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
     GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
     GraphemeScalarDfaReduceLimits, LineCaptureBuildError, LineCaptureBuildLimits,
-    LineCaptureBuilder, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
-    NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder,
-    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
-    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits, RustProfile,
-    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
+    LineCaptureRunLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
+    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, RustProfile, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    SPACE_AROUND_OPERATOR_INSPECTION_WORK, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits,
     SearchSessionLimits, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateReduceError, UnicodeScalarAggregateBuildError,
@@ -100,10 +101,28 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
         CURRENT_FRE_CAPTURE_PLAN
             | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
             | CURRENT_FRE_CAPTURE_SCALAR_PLAN
+            | CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
             | fre::NOQA_ASCII_LEADING_PLAN_ID
             | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
             | fre::NOQA_UNICODE_LEADING_PLAN_ID
     )
+}
+
+fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
+    if !is_current_fre_capture_plan(plan) {
+        return false;
+    }
+    match model {
+        "count-captures" => !matches!(
+            plan,
+            CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
+                | fre::NOQA_ASCII_LEADING_PLAN_ID
+                | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
+                | fre::NOQA_UNICODE_LEADING_PLAN_ID
+        ),
+        "grep-captures" => true,
+        _ => false,
+    }
 }
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
@@ -1654,12 +1673,14 @@ enum CurrentFreCaptureModel {
 enum CurrentFreCapturePreparation {
     Count(Box<CaptureRunLimits>),
     Grep,
+    RuffGrep(Box<LineCaptureRunLimits>),
 }
 
 #[derive(Clone, Debug)]
 enum CurrentFreCaptureRegex {
     General(Box<CaptureRegex>),
     Noqa(Box<NoqaGrepCaptureRegex>),
+    Ruff(Box<LineCapturePlan>),
 }
 
 impl CurrentFreCaptureModel {
@@ -1711,6 +1732,7 @@ impl CurrentFreCaptureLifecycle {
         match &self.regex {
             CurrentFreCaptureRegex::General(regex) => capture_plan_label(regex),
             CurrentFreCaptureRegex::Noqa(regex) => regex.build_report().plan_identity.plan_id,
+            CurrentFreCaptureRegex::Ruff(_) => CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
         }
     }
 
@@ -1752,9 +1774,23 @@ impl CurrentFreCaptureLifecycle {
             (CurrentFreCaptureRegex::Noqa(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_noqa_grep_captures(regex, haystack, &self.limits)
             }
+            (
+                CurrentFreCaptureRegex::Ruff(plan),
+                CurrentFreCapturePreparation::RuffGrep(run_limits),
+            ) => execute_space_around_operator_capture_with_limits(plan, haystack, **run_limits),
             (CurrentFreCaptureRegex::Noqa(_), CurrentFreCapturePreparation::Count(_)) => {
                 return Err(CompareError::new(
                     "noqa grep-only artifact reached count-captures lifecycle",
+                ));
+            }
+            (CurrentFreCaptureRegex::Ruff(_), _) => {
+                return Err(CompareError::new(
+                    "Ruff grep-only artifact reached an incompatible capture lifecycle",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::RuffGrep(_)) => {
+                return Err(CompareError::new(
+                    "Ruff grep preparation reached an incompatible capture artifact",
                 ));
             }
         };
@@ -1777,8 +1813,25 @@ pub fn current_fre_rebar_capture_lifecycle(
     case_insensitive: bool,
     haystack_len: usize,
 ) -> Result<CurrentFreCaptureLifecycle, CompareError> {
+    current_fre_rebar_capture_lifecycle_with_limits(
+        model,
+        pattern,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        RunLimits::default(),
+    )
+}
+
+fn current_fre_rebar_capture_lifecycle_with_limits(
+    model: &str,
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    limits: RunLimits,
+) -> Result<CurrentFreCaptureLifecycle, CompareError> {
     let model = CurrentFreCaptureModel::parse(model)?;
-    let limits = RunLimits::default();
     let (regex, preparation) = match model {
         CurrentFreCaptureModel::CountCaptures => {
             let regex = capture_regex_one(pattern, unicode, case_insensitive, &limits)
@@ -1791,18 +1844,34 @@ pub fn current_fre_rebar_capture_lifecycle(
             )
         }
         CurrentFreCaptureModel::GrepCaptures => {
-            let regex = if let Some(regex) =
+            let (regex, preparation) = if let Some(regex) =
                 noqa_grep_capture_regex_one(pattern, unicode, case_insensitive, &limits)
                     .map_err(|error| CompareError::new(error.message))?
             {
-                CurrentFreCaptureRegex::Noqa(Box::new(regex))
+                (
+                    CurrentFreCaptureRegex::Noqa(Box::new(regex)),
+                    CurrentFreCapturePreparation::Grep,
+                )
+            } else if let Some(plan) =
+                space_around_operator_capture_plan_one(pattern, unicode, case_insensitive, &limits)
+                    .map_err(|error| CompareError::new(error.message))?
+            {
+                let run_limits = space_around_operator_capture_run_limits(haystack_len, &limits)
+                    .map_err(|error| CompareError::new(error.message))?;
+                (
+                    CurrentFreCaptureRegex::Ruff(Box::new(plan)),
+                    CurrentFreCapturePreparation::RuffGrep(Box::new(run_limits)),
+                )
             } else {
-                CurrentFreCaptureRegex::General(Box::new(
-                    capture_regex_one(pattern, unicode, case_insensitive, &limits)
-                        .map_err(|error| CompareError::new(error.message))?,
-                ))
+                (
+                    CurrentFreCaptureRegex::General(Box::new(
+                        capture_regex_one(pattern, unicode, case_insensitive, &limits)
+                            .map_err(|error| CompareError::new(error.message))?,
+                    )),
+                    CurrentFreCapturePreparation::Grep,
+                )
             };
-            (regex, CurrentFreCapturePreparation::Grep)
+            (regex, preparation)
         }
     };
     Ok(CurrentFreCaptureLifecycle {
@@ -3268,47 +3337,112 @@ fn execute_noqa_grep_captures(
         .map_err(|_| ExecutionError::fault("FRE noqa capture count does not fit u64"))
 }
 
-fn space_around_operator_capture_reduction(
-    request: CandidateRequest<'_>,
+fn space_around_operator_capture_plan_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
     limits: &RunLimits,
-) -> Result<Option<FreReduction>, ExecutionError> {
-    if request.patterns.len() != 1
-        || request.patterns[0] != SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
-        || !request.unicode
-        || request.case_insensitive
-    {
+) -> Result<Option<LineCapturePlan>, ExecutionError> {
+    if pattern != SPACE_AROUND_OPERATOR_CAPTURE_PATTERN || !unicode || case_insensitive {
         return Ok(None);
     }
-    let build_limits = LineCaptureBuildLimits {
-        max_inspection_work: limits.fre_capture_scalar_planner_work,
-        ..LineCaptureBuildLimits::default()
-    };
-    let plan = LineCaptureBuilder::new(request.patterns[0].as_str())
+    let plan = LineCaptureBuilder::new(pattern)
         .profile(rebar_profile())
-        .limits(build_limits)
+        .limits(LineCaptureBuildLimits {
+            max_inspection_work: limits.fre_capture_scalar_planner_work,
+            ..LineCaptureBuildLimits::default()
+        })
         .build()
         .map_err(|error| match error {
-            LineCaptureBuildError::Unsupported(_)
-            | LineCaptureBuildError::InspectionWork { .. }
+            LineCaptureBuildError::InspectionWork { .. }
             | LineCaptureBuildError::Resource { .. } => ExecutionError::unsupported(format!(
                 "FRE direct line-capture build refused execution: {error}"
+            )),
+            LineCaptureBuildError::Unsupported(_) => ExecutionError::fault(format!(
+                "FRE exact direct line-capture identity was rejected after selection: {error}"
             )),
             _ => ExecutionError::fault(format!(
                 "FRE direct line-capture build returned an unknown failure: {error}"
             )),
         })?;
+    authenticate_space_around_operator_capture_plan(&plan)?;
+    Ok(Some(plan))
+}
+
+fn authenticate_space_around_operator_capture_plan(
+    plan: &LineCapturePlan,
+) -> Result<(), ExecutionError> {
+    let report = plan.build_report();
+    let plan_bytes = core::mem::size_of::<LineCapturePlan>();
+    if report.identity.source != SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
+        || report.identity.profile != rebar_profile()
+        || report.identity.plan != LineCapturePlanKind::SpaceAroundOperator
+        || report.hir_nodes != 12
+        || report.class_ranges != 40
+        || report.literal_bytes != 2
+        || report.inspection_work != SPACE_AROUND_OPERATOR_INSPECTION_WORK
+        || report.minimum_match_bytes != 2
+        || report.participating_groups_per_match != 3
+        || report.allocations != 0
+        || report.scratch_bytes != 0
+        || report.persistent_bytes != plan_bytes
+        || report.peak_bytes != plan_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE direct line-capture plan identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn space_around_operator_capture_run_limits(
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<LineCaptureRunLimits, ExecutionError> {
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE line-capture reducer limit does not fit usize"))?;
+    let work = haystack_len
+        .checked_mul(12)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle work overflow"))?;
+    let prospective_captures = haystack_len
+        .checked_div(2)
+        .and_then(|matches| matches.checked_mul(3))
+        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle capture overflow"))?;
+    let prospective_reducer_events = haystack_len
+        .checked_add(prospective_captures)
+        .ok_or_else(|| ExecutionError::fault("FRE line-capture lifecycle event overflow"))?;
+    for (resource, required, limit) in [
+        ("ExecutionWork", work, limits.fre_aggregate_operation_work),
+        (
+            "SequentialBytes",
+            haystack_len,
+            limits.fre_aggregate_sequential_bytes,
+        ),
+        ("CaptureCount", prospective_captures, reducer_limit),
+        ("ReducerEvents", prospective_reducer_events, reducer_limit),
+    ] {
+        if required > limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE direct line-capture lifecycle resource {resource} requires {required}, limit is {limit}"
+            )));
+        }
+    }
+    Ok(LineCaptureRunLimits {
+        max_work: limits.fre_aggregate_operation_work,
+        max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
+        max_capture_count: reducer_limit,
+        max_reducer_events: reducer_limit,
+    })
+}
+
+fn execute_space_around_operator_capture_with_limits(
+    plan: &LineCapturePlan,
+    haystack: &[u8],
+    run_limits: LineCaptureRunLimits,
+) -> Result<u64, ExecutionError> {
     let report = plan
-        .grep_capture_count(
-            request.haystack,
-            LineCaptureRunLimits {
-                max_work: limits.fre_aggregate_operation_work,
-                max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
-                max_capture_count: reducer_limit,
-                max_reducer_events: reducer_limit,
-            },
-        )
+        .grep_capture_count(haystack, run_limits)
         .map_err(|error| match error {
             LineCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
                 "FRE direct line-capture reducer refused execution: {error}"
@@ -3318,8 +3452,43 @@ fn space_around_operator_capture_reduction(
                 ExecutionError::fault(format!("FRE direct line-capture reducer faulted: {error}"))
             }
         })?;
-    let actual = u64::try_from(report.capture_count)
-        .map_err(|_| ExecutionError::fault("FRE line-capture count does not fit u64"))?;
+    if report.identity != plan.build_report().identity
+        || report.sequential_bytes != haystack.len()
+        || report.actual_input_loads != haystack.len()
+        || report.scratch_bytes != 0
+        || report.output_bytes != 0
+        || report.capture_count > report.prospective_capture_count
+        || report.reducer_events > report.prospective_reducer_events
+    {
+        return Err(ExecutionError::fault(
+            "FRE direct line-capture execution identity or accounting mismatch",
+        ));
+    }
+    u64::try_from(report.capture_count)
+        .map_err(|_| ExecutionError::fault("FRE line-capture count does not fit u64"))
+}
+
+fn space_around_operator_capture_reduction(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return Ok(None);
+    }
+    let Some(plan) = space_around_operator_capture_plan_one(
+        request.patterns[0].as_str(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    let actual = execute_space_around_operator_capture_with_limits(
+        &plan,
+        request.haystack,
+        space_around_operator_capture_run_limits(request.haystack.len(), limits)?,
+    )?;
     Ok(Some(FreReduction {
         actual,
         plan: CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
@@ -6948,6 +7117,122 @@ mod tests {
         );
     }
 
+    fn retained_ruff_lifecycle(
+        haystack_len: usize,
+        limits: RunLimits,
+    ) -> CurrentFreCaptureLifecycle {
+        current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+            true,
+            false,
+            haystack_len,
+            limits,
+        )
+        .expect("exact retained Ruff lifecycle")
+    }
+
+    fn assert_retained_ruff_first_and_steady(haystack: &[u8], expected: u64, limits: RunLimits) {
+        let lifecycle = retained_ruff_lifecycle(haystack.len(), limits);
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
+        assert_eq!(
+            lifecycle.execute(haystack).expect("first lifecycle"),
+            expected
+        );
+        assert_eq!(
+            lifecycle.execute(haystack).expect("steady lifecycle"),
+            expected
+        );
+    }
+
+    fn exact_ruff_lifecycle_limits(haystack_len: usize) -> (RunLimits, usize, usize, usize) {
+        let work = haystack_len
+            .checked_mul(12)
+            .and_then(|value| value.checked_add(1))
+            .expect("small exact work");
+        let sequential = haystack_len;
+        let prospective_captures = haystack_len
+            .checked_div(2)
+            .and_then(|matches| matches.checked_mul(3))
+            .expect("small capture bound");
+        let reducer_events = haystack_len
+            .checked_add(prospective_captures)
+            .expect("small reducer bound");
+        (
+            RunLimits {
+                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+                fre_aggregate_operation_work: work,
+                fre_aggregate_sequential_bytes: sequential,
+                reducer_steps: u64::try_from(reducer_events).expect("reducer u64"),
+                ..RunLimits::default()
+            },
+            work,
+            sequential,
+            reducer_events,
+        )
+    }
+
+    fn assert_ruff_lifecycle_preflight_refusal(
+        haystack_len: usize,
+        resource: &str,
+        required: usize,
+        limits: RunLimits,
+    ) {
+        let error = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+            true,
+            false,
+            haystack_len,
+            limits,
+        )
+        .expect_err("one-below resource must refuse before retaining the lifecycle")
+        .to_string();
+        assert!(
+            error.contains(resource),
+            "unexpected {resource} error: {error}"
+        );
+        assert!(error.contains(&required.to_string()));
+        assert!(
+            error.contains(
+                &required
+                    .checked_sub(1)
+                    .expect("positive resource")
+                    .to_string()
+            )
+        );
+    }
+
+    fn print_ruff_hard_canary_receipt(
+        manifest_hash: &str,
+        job_id: &str,
+        rust: u64,
+        candidate: &AdapterReduction,
+        build: &fre::LineCaptureBuildReport,
+        direct: &fre::LineCaptureRunReport,
+    ) {
+        println!(
+            "ruff-space-operator-canary manifest_sha256={manifest_hash} job={job_id} rust={rust} fre={} plan={} construction_allocations={} construction_scratch={} construction_persistent={} construction_peak={} prospective_work={} prospective_loads={} actual_loads={} prospective_matches={} actual_matches={} prospective_captures={} actual_captures={} prospective_lines={} actual_lines={} prospective_events={} actual_events={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan"),
+            build.allocations,
+            build.scratch_bytes,
+            build.persistent_bytes,
+            build.peak_bytes,
+            direct.work,
+            direct.sequential_bytes,
+            direct.actual_input_loads,
+            direct.prospective_matches,
+            direct.matches,
+            direct.prospective_capture_count,
+            direct.capture_count,
+            direct.prospective_line_events,
+            direct.lines,
+            direct.prospective_reducer_events,
+            direct.reducer_events,
+        );
+    }
+
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_ruff_space_operator_real_row_canary() {
@@ -7031,26 +7316,19 @@ mod tests {
             candidate.plan.as_deref(),
             Some(CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN)
         );
-        println!(
-            "ruff-space-operator-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={} construction_allocations={} construction_scratch={} construction_persistent={} construction_peak={} prospective_work={} prospective_loads={} actual_loads={} prospective_matches={} actual_matches={} prospective_captures={} actual_captures={} prospective_lines={} actual_lines={} prospective_events={} actual_events={}",
-            candidate.actual,
-            candidate.plan.as_deref().expect("candidate plan"),
-            build.allocations,
-            build.scratch_bytes,
-            build.persistent_bytes,
-            build.peak_bytes,
-            direct.work,
-            direct.sequential_bytes,
-            direct.actual_input_loads,
-            direct.prospective_matches,
-            direct.matches,
-            direct.prospective_capture_count,
-            direct.capture_count,
-            direct.prospective_line_events,
-            direct.lines,
-            direct.prospective_reducer_events,
-            direct.reducer_events,
+        assert_retained_ruff_first_and_steady(
+            &input.haystack,
+            rust,
+            RunLimits {
+                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+                fre_aggregate_operation_work: direct.work,
+                fre_aggregate_sequential_bytes: direct.sequential_bytes,
+                reducer_steps: u64::try_from(direct.prospective_reducer_events)
+                    .expect("reducer events u64"),
+                ..RunLimits::default()
+            },
         );
+        print_ruff_hard_canary_receipt(&manifest_hash, JOB_ID, rust, &candidate, build, &direct);
     }
 
     fn synthetic_job(model: &str, expected: u64) -> Job {
@@ -7184,6 +7462,110 @@ mod tests {
                 lifecycle.execute(haystack).expect("steady operation"),
                 expected
             );
+            assert!(
+                space_around_operator_capture_plan_one(
+                    pattern,
+                    unicode,
+                    false,
+                    &RunLimits::default(),
+                )
+                .expect("NOQA shape is not a Ruff resource failure")
+                .is_none()
+            );
+        }
+        assert!(
+            noqa_grep_capture_regex_one(
+                SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+                true,
+                false,
+                &RunLimits::default(),
+            )
+            .expect("Ruff shape is not a NOQA resource failure")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ruff_capture_lifecycle_is_retained_exact_and_bounded() {
+        let haystack = b"x+\n\xFF++\r\nx + ";
+        let upstream = rust_compile_options(
+            &[SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.to_string()],
+            true,
+            false,
+        )
+        .expect("pinned Rust Ruff pattern");
+        let expected = grep_captures(&upstream, haystack, u64::MAX).expect("Rust Ruff result");
+        let (exact_limits, work, sequential, reducer_events) =
+            exact_ruff_lifecycle_limits(haystack.len());
+        let lifecycle = retained_ruff_lifecycle(haystack.len(), exact_limits.clone());
+        assert_eq!(lifecycle.model(), "grep-captures");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
+        assert!(is_current_fre_capture_route(
+            lifecycle.model(),
+            lifecycle.plan()
+        ));
+        assert_eq!(
+            lifecycle.execute(haystack).expect("first operation"),
+            expected
+        );
+        assert_eq!(
+            lifecycle.execute(haystack).expect("steady operation"),
+            expected
+        );
+        assert!(lifecycle.execute(b"x+").is_err());
+
+        let planner_error = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+            true,
+            false,
+            haystack.len(),
+            RunLimits {
+                fre_capture_scalar_planner_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK
+                    .checked_sub(1)
+                    .expect("positive inspection work"),
+                ..exact_limits.clone()
+            },
+        )
+        .expect_err("one-below inspection must refuse construction");
+        let planner_error = planner_error.to_string();
+        assert!(planner_error.contains("requires 54 work"));
+        assert!(planner_error.contains("limit is 53"));
+
+        for (resource, required, limits) in [
+            (
+                "ExecutionWork",
+                work,
+                RunLimits {
+                    fre_aggregate_operation_work: work.checked_sub(1).expect("positive work"),
+                    ..exact_limits.clone()
+                },
+            ),
+            (
+                "SequentialBytes",
+                sequential,
+                RunLimits {
+                    fre_aggregate_sequential_bytes: sequential
+                        .checked_sub(1)
+                        .expect("nonempty input"),
+                    ..exact_limits.clone()
+                },
+            ),
+            (
+                "ReducerEvents",
+                reducer_events,
+                RunLimits {
+                    reducer_steps: u64::try_from(
+                        reducer_events
+                            .checked_sub(1)
+                            .expect("positive reducer bound"),
+                    )
+                    .expect("reducer u64"),
+                    ..exact_limits.clone()
+                },
+            ),
+        ] {
+            assert_ruff_lifecycle_preflight_refusal(haystack.len(), resource, required, limits);
         }
     }
 

@@ -2044,11 +2044,13 @@ pub fn validate_capture_lifecycle_observation(
     if !matches!(
         observation.model.as_str(),
         "count-captures" | "grep-captures"
-    ) || !crate::is_current_fre_capture_plan(&observation.candidate_plan)
-        || !model
-            .lifecycle_boundaries
-            .iter()
-            .any(|boundary| boundary == observation.boundary.as_str())
+    ) || !crate::is_current_fre_capture_route(
+        observation.model.as_str(),
+        &observation.candidate_plan,
+    ) || !model
+        .lifecycle_boundaries
+        .iter()
+        .any(|boundary| boundary == observation.boundary.as_str())
     {
         return Err(ContractError::new(
             "raw capture model or lifecycle boundary is not contracted",
@@ -2612,8 +2614,8 @@ fn performance_runner_route(
             2..,
         ) => PerformanceRunnerRoute::AggregateMany,
         ("grep", "portable-single-search", 1) => PerformanceRunnerRoute::PortableGrep,
-        ("count-captures" | "grep-captures", plan, 1)
-            if crate::is_current_fre_capture_plan(plan) =>
+        (model @ ("count-captures" | "grep-captures"), plan, 1)
+            if crate::is_current_fre_capture_route(model, plan) =>
         {
             PerformanceRunnerRoute::Capture
         }
@@ -5945,6 +5947,46 @@ mod tests {
             .expect("supported row exists");
         supported.boundaries[0].comparisons.pop();
         assert!(validate_observations(&contract, &universe, &hidden_comparator).is_err());
+    }
+
+    #[test]
+    fn ruff_capture_plan_is_registered_for_the_capture_runner_route() {
+        assert!(crate::is_current_fre_capture_plan(
+            crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
+        ));
+        assert_eq!(
+            performance_runner_route(
+                "grep-captures",
+                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                1,
+            )
+            .expect("exact Ruff capture route"),
+            PerformanceRunnerRoute::Capture
+        );
+        assert!(
+            performance_runner_route(
+                "grep-captures",
+                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            performance_runner_route(
+                "count-captures",
+                crate::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            performance_runner_route(
+                "grep-captures",
+                "capture-line-space-around-operator-stream-v2-alias",
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

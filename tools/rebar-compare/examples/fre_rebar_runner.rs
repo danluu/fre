@@ -1232,6 +1232,25 @@ mod tests {
         output
     }
 
+    fn ruff_capture_klv() -> Vec<u8> {
+        let mut output = Vec::new();
+        field(&mut output, "name", b"wild/ruff/space-around-operator");
+        field(&mut output, "model", b"grep-captures");
+        field(&mut output, "case-insensitive", b"false");
+        field(&mut output, "unicode", b"true");
+        field(&mut output, "max-iters", b"1");
+        field(&mut output, "max-warmup-iters", b"0");
+        field(&mut output, "max-time", b"1000");
+        field(&mut output, "max-warmup-time", b"100");
+        field(
+            &mut output,
+            "pattern",
+            fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.as_bytes(),
+        );
+        field(&mut output, "haystack", b"x+\n\xFF++\r\nx + ");
+        output
+    }
+
     fn multi_klv(model: &str) -> Vec<u8> {
         let mut output = Vec::new();
         field(&mut output, "name", b"test/model/multi");
@@ -1822,6 +1841,74 @@ mod tests {
         assert!(require_runtime_expectation("count-captures", None).is_ok());
         assert!(require_runtime_expectation("grep-captures", None).is_ok());
         assert!(require_runtime_expectation("grep-captures", Some("k0")).is_err());
+    }
+
+    #[test]
+    fn ruff_formal_klv_binds_first_steady_and_performance_capture_paths() {
+        let benchmark = Benchmark::parse(&ruff_capture_klv()).expect("exact Ruff KLV");
+        assert_eq!(benchmark.model, "grep-captures");
+        assert!(benchmark.unicode);
+        assert!(!benchmark.case_insensitive);
+        assert_eq!(
+            benchmark.pattern(),
+            fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
+        );
+
+        let mut first_expectations = capture_expectations("first-public-operation", 9);
+        first_expectations.plan =
+            Some(rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN.to_string());
+        let first = model_captures_with_measurement(
+            &benchmark,
+            &first_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(29), operation.execute(haystack)?)),
+        )
+        .expect("formal Ruff first operation");
+        assert_eq!(first.priming_operations, 0);
+        assert_eq!(first.actual, 9);
+        assert_eq!(
+            first.candidate_plan,
+            rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
+        );
+
+        let mut steady_expectations = first_expectations.clone();
+        steady_expectations.boundary = Some("steady-public-operation".to_string());
+        let steady = model_captures_with_measurement(
+            &benchmark,
+            &steady_expectations,
+            |operation, haystack| Ok((Duration::from_nanos(31), operation.execute(haystack)?)),
+        )
+        .expect("formal Ruff steady operation");
+        assert_eq!(steady.priming_operations, 1);
+        assert_eq!(steady.actual, 9);
+
+        let performance = model_capture_performance_raw_with_measurement(
+            &benchmark,
+            &performance_expectations(
+                "steady-public-operation",
+                rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                9,
+            ),
+            |operation, haystack| Ok((Duration::from_nanos(37), operation.execute(haystack)?)),
+        )
+        .expect("formal Ruff performance-raw operation");
+        assert_eq!(performance.priming_operations, 1);
+        assert_eq!(performance.actual, 9);
+        assert_eq!(
+            performance.candidate_plan.as_deref(),
+            Some(rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN)
+        );
+
+        let mut wrong_plan = first_expectations;
+        wrong_plan.plan = Some("capture-line-space-around-operator-stream-v2-alias".to_string());
+        let measured = std::cell::Cell::new(false);
+        assert!(
+            model_captures_with_measurement(&benchmark, &wrong_plan, |operation, haystack| {
+                measured.set(true);
+                Ok((Duration::from_nanos(1), operation.execute(haystack)?))
+            })
+            .is_err()
+        );
+        assert!(!measured.get(), "wrong Ruff plan reached measurement");
     }
 
     #[test]
