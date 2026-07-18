@@ -1,12 +1,15 @@
 use std::{env, fs, path::PathBuf};
 
-use fre::{AggregateExecutionDetails, AggregatePlanKind};
+use fre::{
+    AggregateExecutionDetails, AggregatePlanIdentity, AggregatePlanKind,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
+};
 use rebar_compare::{
     CandidateAdapter, CurrentFreAdapter, current_fre_rebar_aggregate_builder,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_validate_aggregate_identity,
 };
 
-const ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 
 const GRAPHEME: &str = r"(?x)
 \p{gcb=CR} \p{gcb=LF}
@@ -34,14 +37,52 @@ const GRAPHEME: &str = r"(?x)
 \p{Any}
 ";
 
+fn typed_grapheme_adapter_segment() -> (String, GraphemeScalarDfaOperationIdentity) {
+    fn version(identity: &str) -> &str {
+        identity
+            .rsplit_once(".v")
+            .map(|(_, version)| version)
+            .expect("grapheme identity must end in a version")
+    }
+
+    let count =
+        GraphemeScalarDfaOperationIdentity::for_operation(GraphemeScalarDfaOperation::Count);
+    let span_sum =
+        GraphemeScalarDfaOperationIdentity::for_operation(GraphemeScalarDfaOperation::SpanSum);
+    assert_eq!(
+        (
+            count.plan_id,
+            count.operation_id,
+            span_sum.plan_id,
+            span_sum.operation_id,
+        ),
+        (
+            "grapheme-scalar-dfa.utf8-role-transitions.v2",
+            "grapheme-scalar-dfa.count.non-overlapping.v2",
+            "grapheme-scalar-dfa.utf8-role-transitions.v2",
+            "grapheme-scalar-dfa.span-sum.non-overlapping.v2",
+        )
+    );
+    let plan_version = version(count.plan_id);
+    assert_eq!(plan_version, version(count.operation_id));
+    assert_eq!(plan_version, version(span_sum.plan_id));
+    assert_eq!(plan_version, version(span_sum.operation_id));
+    assert_eq!(plan_version, "2");
+    (format!("grapheme-scalar-dfa-v{plan_version}"), count)
+}
+
 #[test]
 fn adapter_runner_and_typed_plan_identity_agree() {
+    let (grapheme_segment, typed_count) = typed_grapheme_adapter_segment();
+    assert_eq!(ADAPTER.matches(&grapheme_segment).count(), 1);
     let adapter = CurrentFreAdapter;
     assert_eq!(adapter.adapter(), ADAPTER);
     assert_eq!(adapter.identity().adapter, ADAPTER);
-    assert!(
+    assert_eq!(
         include_str!("../examples/fre_rebar_runner.rs")
-            .contains(&format!("adapter={ADAPTER} report="))
+            .matches(&format!("adapter={ADAPTER} report="))
+            .count(),
+        1,
     );
 
     let regex = current_fre_rebar_aggregate_builder(GRAPHEME, true, false)
@@ -51,6 +92,11 @@ fn adapter_runner_and_typed_plan_identity_agree() {
         regex.build_report().plan,
         AggregatePlanKind::GraphemeScalarDfa
     );
+    let AggregatePlanIdentity::GraphemeScalarDfa(identity) = regex.build_report().plan_identity
+    else {
+        panic!("expected typed grapheme identity")
+    };
+    assert_eq!(identity.kernel, typed_count);
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), true, "count").unwrap();
     assert!(
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count")
