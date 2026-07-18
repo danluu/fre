@@ -383,15 +383,17 @@ fn build_from_hir_metered(
             "reserved peak build bytes",
         ))?;
     check_limit("peak bytes", peak_bytes_upper_bound, limits.max_peak_bytes)?;
-    // Admit every retained offset, byte copy, reference publication, and final
-    // publication before either exact allocation or copy work begins.
+    // Admit every raw publication-loop visit, retained offset, byte copy,
+    // reference publication, and final publication before either exact
+    // allocation or copy work begins.
     let publication_work = effective
         .needles
         .checked_mul(2)
+        .and_then(|work| work.checked_add(raw_count))
         .and_then(|work| work.checked_add(effective.bytes))
         .and_then(|work| work.checked_add(3))
         .ok_or(CaptureRequiredLiteralBuildError::Overflow(
-            "effective needle publication work",
+            "needle publication work",
         ))?;
     meter.charge(publication_work)?;
 
@@ -891,10 +893,23 @@ mod tests {
 
     const AWS: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
 
-    fn build(
+    fn raw64_effective2_pattern() -> String {
+        (0..MAX_INLINE_NEEDLES)
+            .map(|index| {
+                if index < MAX_INLINE_NEEDLES / 2 {
+                    "(AB)"
+                } else {
+                    "(CD)"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn build_detailed(
         pattern: &str,
         limits: CaptureRequiredLiteralBuildLimits,
-    ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildError> {
+    ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
         let mut profile = RustProfile::rebar_1_12_4();
         profile.options.unicode = false;
         let parsed = fre_syntax::parse(ParseRequest::rust(
@@ -906,7 +921,14 @@ mod tests {
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
             panic!("Rust parser returned a non-Rust pattern")
         };
-        build_from_hir(&rust.hir, key, limits).map_err(|failure| failure.source)
+        build_from_hir(&rust.hir, key, limits)
+    }
+
+    fn build(
+        pattern: &str,
+        limits: CaptureRequiredLiteralBuildLimits,
+    ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildError> {
+        build_detailed(pattern, limits).map_err(|failure| failure.source)
     }
 
     fn owned_needles(plan: &CaptureRequiredLiteralPlan) -> Vec<Vec<u8>> {
@@ -974,6 +996,79 @@ mod tests {
         assert_eq!(accounting.needles, 2);
         assert_eq!(accounting.minimum_needle_bytes, 2);
         assert_eq!(owned_needles(&plan), vec![b"AB".to_vec(), b"CD".to_vec()]);
+    }
+
+    #[test]
+    fn raw_publication_visits_are_precharged_and_survive_post_loop_failure() {
+        let pattern = raw64_effective2_pattern();
+        let baseline = build(&pattern, CaptureRequiredLiteralBuildLimits::default())
+            .expect("raw-64 baseline")
+            .plan
+            .expect("effective AB/CD plan");
+        let accounting = baseline.build_report().accounting;
+        assert_eq!(accounting.raw_needles, 64);
+        assert_eq!(accounting.needles, 2);
+        assert_eq!(accounting.planner_work, 9_837);
+        assert_eq!(
+            owned_needles(&baseline),
+            vec![b"AB".to_vec(), b"CD".to_vec()]
+        );
+
+        let exact = CaptureRequiredLiteralBuildLimits {
+            max_planner_work: accounting.planner_work,
+            ..CaptureRequiredLiteralBuildLimits::default()
+        };
+        exact_allocation_probe::reset();
+        let admitted = build(&pattern, exact)
+            .expect("exact raw publication work")
+            .plan
+            .expect("exact limit retains plan");
+        assert_eq!(
+            admitted.build_report().accounting.planner_work,
+            accounting.planner_work
+        );
+        assert_eq!(exact_allocation_probe::calls(), 2);
+
+        let mut one_below = exact;
+        one_below.max_planner_work -= 1;
+        exact_allocation_probe::reset();
+        let refusal = build_detailed(&pattern, one_below)
+            .err()
+            .expect("one-below publication work must refuse");
+        assert!(matches!(
+            refusal.source,
+            CaptureRequiredLiteralBuildError::Resource {
+                resource: "planner work",
+                required: 9_837,
+                limit: 9_836,
+            }
+        ));
+        assert_eq!(
+            exact_allocation_probe::calls(),
+            0,
+            "raw publication work was not refused before allocation"
+        );
+
+        let mut post_loop_failure = CaptureRequiredLiteralBuildLimits::default();
+        post_loop_failure.literal_set.max_build_work =
+            accounting.literal_set.build_work_upper_bound - 1;
+        exact_allocation_probe::reset();
+        let failure = build_detailed(&pattern, post_loop_failure)
+            .err()
+            .expect("post-loop literal-set refusal");
+        assert!(matches!(
+            failure.source,
+            CaptureRequiredLiteralBuildError::LiteralSet(LiteralSetError::BuildWorkLimit { .. })
+        ));
+        assert_eq!(
+            failure.planner_work, accounting.planner_work,
+            "post-loop failure lost cumulative raw publication work"
+        );
+        assert_eq!(
+            exact_allocation_probe::calls(),
+            2,
+            "fixture must fail after both exact publication allocations"
+        );
     }
 
     #[test]

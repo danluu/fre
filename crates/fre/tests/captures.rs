@@ -1620,7 +1620,7 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
     assert_eq!(accounting.literal_set.trie_states_upper_bound, 5);
     assert_eq!(accounting.literal_set.dfa_cells_upper_bound, 1_280);
     assert_eq!(accounting.literal_set.build_work_upper_bound, 1_286);
-    assert_eq!(accounting.planner_work, 35);
+    assert_eq!(accounting.planner_work, 37);
     assert!(
         plan.is_candidate(
             b"zzAB",
@@ -1772,6 +1772,69 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
             .expect("optional DFA refusal must preserve the general route")
             .required_literal_plan()
             .is_none()
+    );
+
+    let raw64_effective2 = (0..64)
+        .map(|index| if index < 32 { "(AB)" } else { "(CD)" })
+        .collect::<Vec<_>>()
+        .join("|");
+    let without_optional = CaptureBuilder::new(&raw64_effective2)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build()
+        .expect("raw-64 general capture route");
+    let active = build(
+        &raw64_effective2,
+        CaptureRequiredLiteralBuildLimits::default(),
+        usize::MAX,
+    )
+    .expect("raw-64 active optional plan");
+    let raw_accounting = active
+        .required_literal_plan()
+        .expect("raw-64 effective-two plan")
+        .build_report()
+        .accounting;
+    assert_eq!(raw_accounting.raw_needles, 64);
+    assert_eq!(raw_accounting.needles, 2);
+    assert_eq!(raw_accounting.planner_work, 9_837);
+    assert_eq!(
+        active.build_report().hir.work,
+        without_optional.build_report().hir.work + raw_accounting.planner_work
+    );
+
+    let post_loop_refusal = CaptureRequiredLiteralBuildLimits {
+        literal_set: fre_kernels::LiteralSetBuildLimits {
+            max_build_work: raw_accounting.literal_set.build_work_upper_bound - 1,
+            ..CaptureRequiredLiteralBuildLimits::default().literal_set
+        },
+        ..CaptureRequiredLiteralBuildLimits::default()
+    };
+    let fallback = build(&raw64_effective2, post_loop_refusal, usize::MAX)
+        .expect("post-loop optional failure preserves capture route");
+    assert!(fallback.required_literal_plan().is_none());
+    assert_eq!(
+        fallback.build_report().hir.work,
+        active.build_report().hir.work,
+        "post-loop optional failure lost cumulative planner work"
+    );
+    assert_eq!(
+        fallback
+            .count_captures(b"AB CD", CaptureRunLimits::default())
+            .expect("post-loop fallback execution")
+            .accounting
+            .count,
+        without_optional
+            .count_captures(b"AB CD", CaptureRunLimits::default())
+            .expect("general-route control execution")
+            .accounting
+            .count
+    );
+    let raw_exact_hir_work = fallback.build_report().hir.work;
+    build(&raw64_effective2, post_loop_refusal, raw_exact_hir_work)
+        .expect("exact cumulative post-loop fallback HIR work");
+    assert!(
+        build(&raw64_effective2, post_loop_refusal, raw_exact_hir_work - 1,).is_err(),
+        "one-below cumulative post-loop fallback HIR work must refuse"
     );
 
     build(
