@@ -1,6 +1,11 @@
+use core::mem::size_of;
+
 use fre::{
     CaptureAggregateLimits, CaptureBuilder, CaptureExecutionSource, CaptureResource,
-    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, PortableTextCaptureBuilder,
+    CaptureRunLimits, CaptureSearchError, CaptureSearchLimits, LineCaptureBuildError,
+    LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder, LineCapturePlanKind,
+    LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder,
+    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
 };
 use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
@@ -32,6 +37,418 @@ fn assert_count(pattern: &str, haystack: &[u8]) {
         result.identity.plan,
         regex.cache_identity(CaptureRunLimits::default()).plan
     );
+}
+
+fn space_operator_plan() -> fre::LineCapturePlan {
+    LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .build()
+        .expect("space-around-operator direct plan")
+}
+
+fn reference_grep_capture_count(pattern: &str, haystack: &[u8]) -> usize {
+    let reference = RegexBuilder::new(pattern)
+        .unicode(true)
+        .build()
+        .expect("reference grep-capture pattern");
+    if haystack.is_empty() {
+        return 0;
+    }
+    let mut count = 0_usize;
+    let mut start = 0_usize;
+    while start < haystack.len() {
+        let terminator = haystack[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start.checked_add(offset).expect("line terminator offset"));
+        let end = terminator.unwrap_or(haystack.len());
+        let mut line = &haystack[start..end];
+        if terminator.is_some() && line.last() == Some(&b'\r') {
+            line = &line[..line.len().checked_sub(1).expect("nonempty CR line")];
+        }
+        for captures in reference.captures_iter(line) {
+            count = count
+                .checked_add(captures.iter().flatten().count())
+                .expect("reference capture count");
+        }
+        let Some(terminator) = terminator else {
+            break;
+        };
+        start = terminator.checked_add(1).expect("line start");
+    }
+    count
+}
+
+#[test]
+fn space_around_operator_direct_plan_authenticates_exact_hir_and_inspection_limit() {
+    let plan = space_operator_plan();
+    let report = plan.build_report();
+    assert_eq!(
+        report.identity.plan,
+        LineCapturePlanKind::SpaceAroundOperator
+    );
+    assert_eq!(report.hir_nodes, 12);
+    assert_eq!(report.class_ranges, 40);
+    assert_eq!(report.literal_bytes, 2);
+    assert_eq!(
+        report.inspection_work,
+        SPACE_AROUND_OPERATOR_INSPECTION_WORK
+    );
+    assert_eq!(report.minimum_match_bytes, 2);
+    assert_eq!(report.participating_groups_per_match, 3);
+    assert_eq!(report.allocations, 0);
+    assert_eq!(report.scratch_bytes, 0);
+    assert_eq!(report.persistent_bytes, size_of::<fre::LineCapturePlan>());
+    assert_eq!(report.peak_bytes, size_of::<fre::LineCapturePlan>());
+    assert_eq!(
+        report.identity.source,
+        SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
+    );
+    assert_eq!(report.identity.profile, fre::RustProfile::rebar_1_12_4());
+
+    let one_below = LineCaptureBuildLimits {
+        max_inspection_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK - 1,
+        ..LineCaptureBuildLimits::default()
+    };
+    assert!(matches!(
+        LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .limits(one_below)
+            .build(),
+        Err(LineCaptureBuildError::InspectionWork {
+            required: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+            limit
+        }) if limit == SPACE_AROUND_OPERATOR_INSPECTION_WORK - 1
+    ));
+    assert!(matches!(
+        LineCaptureBuilder::new(r"[^,\s](\s*)[-+](\s*)$")
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .build(),
+        Err(LineCaptureBuildError::Unsupported(_))
+    ));
+
+    let plan_bytes = size_of::<fre::LineCapturePlan>();
+    for (resource, limits) in [
+        (
+            LineCaptureBuildResource::PersistentBytes,
+            LineCaptureBuildLimits {
+                max_persistent_bytes: plan_bytes.checked_sub(1).expect("nonempty plan"),
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+        (
+            LineCaptureBuildResource::PeakBytes,
+            LineCaptureBuildLimits {
+                max_peak_bytes: plan_bytes.checked_sub(1).expect("nonempty plan"),
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+    ] {
+        assert!(matches!(
+            LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+                .profile(fre::RustProfile::rebar_1_12_4())
+                .limits(limits)
+                .build(),
+            Err(LineCaptureBuildError::Resource {
+                resource: got,
+                required,
+                limit,
+            }) if got == resource
+                && required == plan_bytes
+                && Some(limit) == required.checked_sub(1)
+        ));
+    }
+}
+
+#[test]
+fn space_around_operator_direct_plan_matches_empty_unicode_malformed_crlf_and_overlap_oracles() {
+    let plan = space_operator_plan();
+    let cases: &[&[u8]] = &[
+        b"",
+        b"\n",
+        b"\n\n",
+        b"x+",
+        b"x + ",
+        b"++",
+        b"+++",
+        b"x+b+c",
+        b"x:+",
+        b"x:=",
+        b":=",
+        b"x:==",
+        b"x:=++",
+        b"x::=",
+        b"x::+",
+        b"x: =",
+        b",+",
+        b",++",
+        b" +",
+        b"x+ y+",
+        b"a b+",
+        "a\u{2003}b+".as_bytes(),
+        b"a++b+",
+        b"a:=b+",
+        b"x+=",
+        b"x+\r\n",
+        b"x+\r",
+        b"x+\r\r\n",
+        b"\xFFx+",
+        b"x \xFF+",
+        "雪\u{2003}+\u{3000}".as_bytes(),
+        "\u{2003}+".as_bytes(),
+        b"x+\n\xFF++\r\n,+\nx + ",
+    ];
+    for haystack in cases {
+        let expected =
+            reference_grep_capture_count(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, haystack);
+        let actual = plan
+            .grep_capture_count(haystack, LineCaptureRunLimits::default())
+            .unwrap_or_else(|error| panic!("haystack={haystack:?}: {error}"));
+        assert_eq!(actual.capture_count, expected, "haystack={haystack:?}");
+        assert_eq!(actual.actual_input_loads, haystack.len());
+        assert!(actual.capture_count <= actual.prospective_capture_count);
+        assert!(actual.reducer_events <= actual.prospective_reducer_events);
+        assert_eq!(actual.scratch_bytes, 0);
+        assert_eq!(actual.output_bytes, 0);
+    }
+}
+
+#[test]
+fn space_around_operator_direct_plan_small_alphabet_is_exact() {
+    let plan = space_operator_plan();
+    let tokens: &[&[u8]] = &[
+        b"a",
+        b",",
+        b" ",
+        b"\t",
+        b"\r",
+        b"\n",
+        b":",
+        b"=",
+        b"+",
+        b"!",
+        "é".as_bytes(),
+        "\u{2003}".as_bytes(),
+        b"\xFF",
+    ];
+    let mut haystacks = vec![Vec::<u8>::new()];
+    for _ in 0..4 {
+        let previous = haystacks.clone();
+        for prefix in previous {
+            for token in tokens {
+                let mut value = prefix.clone();
+                value.extend_from_slice(token);
+                haystacks.push(value);
+            }
+        }
+    }
+    for haystack in haystacks {
+        let expected =
+            reference_grep_capture_count(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, &haystack);
+        let actual = plan
+            .grep_capture_count(&haystack, LineCaptureRunLimits::default())
+            .unwrap_or_else(|error| panic!("haystack={haystack:?}: {error}"));
+        assert_eq!(actual.capture_count, expected, "haystack={haystack:?}");
+        assert_eq!(actual.actual_input_loads, haystack.len());
+    }
+}
+
+fn assert_space_operator_single_load_case(plan: &fre::LineCapturePlan, haystack: &[u8]) {
+    let expected = reference_grep_capture_count(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, haystack);
+    let baseline = plan
+        .grep_capture_count(haystack, LineCaptureRunLimits::default())
+        .unwrap_or_else(|error| panic!("haystack={haystack:?}: {error}"));
+    assert_eq!(baseline.capture_count, expected, "haystack={haystack:?}");
+    assert_eq!(baseline.sequential_bytes, haystack.len());
+    assert_eq!(baseline.actual_input_loads, haystack.len());
+
+    let exact = LineCaptureRunLimits {
+        max_work: baseline.work,
+        max_sequential_bytes: baseline.sequential_bytes,
+        max_capture_count: baseline.prospective_capture_count,
+        max_reducer_events: baseline.prospective_reducer_events,
+    };
+    let report = plan
+        .grep_capture_count(haystack, exact)
+        .unwrap_or_else(|error| panic!("exact haystack={haystack:?}: {error}"));
+    assert_eq!(report, baseline, "exact haystack={haystack:?}");
+
+    let one_below = [
+        (
+            LineCaptureResource::ExecutionWork,
+            LineCaptureRunLimits {
+                max_work: exact.max_work.checked_sub(1).expect("positive work"),
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::SequentialBytes,
+            LineCaptureRunLimits {
+                max_sequential_bytes: exact
+                    .max_sequential_bytes
+                    .checked_sub(1)
+                    .expect("nonempty input"),
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::ReducerEvents,
+            LineCaptureRunLimits {
+                max_reducer_events: exact
+                    .max_reducer_events
+                    .checked_sub(1)
+                    .expect("positive reducer bound"),
+                ..exact
+            },
+        ),
+    ];
+    for (resource, limits) in one_below {
+        assert!(matches!(
+            plan.grep_capture_count(haystack, limits),
+            Err(LineCaptureRunError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+    if exact.max_capture_count > 0 {
+        let one_below_capture = LineCaptureRunLimits {
+            max_capture_count: exact
+                .max_capture_count
+                .checked_sub(1)
+                .expect("positive capture bound"),
+            ..exact
+        };
+        assert!(matches!(
+            plan.grep_capture_count(haystack, one_below_capture),
+            Err(LineCaptureRunError::Resource {
+                resource: LineCaptureResource::CaptureCount,
+                required,
+                limit,
+            }) if required == exact.max_capture_count
+                && Some(limit) == required.checked_sub(1)
+        ));
+    }
+}
+
+#[test]
+fn space_around_operator_stream_loads_each_valid_malformed_and_cr_byte_once() {
+    let plan = space_operator_plan();
+    let cases: &[&[u8]] = &[
+        b"\ra",
+        b"\r\n",
+        b"\r\r\n",
+        b"\xC2\xA0x+",
+        b"\xE2\x80\x83x+",
+        b"\xF0\x9F\x92\xA9x+",
+        b"\xC2+",
+        b"\xE2+",
+        b"\xE2\x82+",
+        b"\xF0+",
+        b"\xF0\x9F+",
+        b"\xF0\x9F\x92+",
+        b"\xC2",
+        b"\xE2",
+        b"\xE2\x82",
+        b"\xF0",
+        b"\xF0\x9F",
+        b"\xF0\x9F\x92",
+        b"\xC2\r\n",
+        b"\xE2\r\n",
+        b"\xE2\x82\r\n",
+        b"\xF0\r\n",
+        b"\xF0\x9F\r\n",
+        b"\xF0\x9F\x92\r\n",
+        b"\xE0\x80\x80x+",
+        b"\xED\xA0\x80x+",
+        b"\xF4\x90\x80\x80x+",
+        b"\r\xE2\x82+\r\n\xF0\x9F\x92x+",
+    ];
+    for haystack in cases {
+        assert_space_operator_single_load_case(&plan, haystack);
+    }
+}
+
+#[test]
+fn space_around_operator_direct_plan_has_exact_prospective_limits() {
+    let plan = space_operator_plan();
+    let haystack = b"x+";
+    let exact = LineCaptureRunLimits {
+        max_work: 25,
+        max_sequential_bytes: 2,
+        max_capture_count: 3,
+        max_reducer_events: 5,
+    };
+    let report = plan
+        .grep_capture_count(haystack, exact)
+        .expect("exact direct limits");
+    assert_eq!(report.work, 25);
+    assert_eq!(report.sequential_bytes, 2);
+    assert_eq!(report.actual_input_loads, 2);
+    assert_eq!(report.prospective_matches, 1);
+    assert_eq!(report.prospective_capture_count, 3);
+    assert_eq!(report.prospective_line_events, 2);
+    assert_eq!(report.prospective_reducer_events, 5);
+    assert_eq!(report.matches, 1);
+    assert_eq!(report.capture_count, 3);
+    assert_eq!(report.reducer_events, 4);
+    assert_eq!(report.scratch_bytes, 0);
+    assert_eq!(report.output_bytes, 0);
+
+    let multiple = plan
+        .grep_capture_count(b"x+x+", LineCaptureRunLimits::default())
+        .expect("multiple non-overlapping matches");
+    assert_eq!(multiple.matches, 2);
+    assert_eq!(multiple.capture_count, 6);
+    assert_eq!(multiple.reducer_events, 7);
+    assert_eq!(multiple.prospective_matches, 2);
+    assert_eq!(multiple.prospective_capture_count, 6);
+    assert_eq!(multiple.prospective_line_events, 4);
+    assert_eq!(multiple.prospective_reducer_events, 10);
+
+    let cases = [
+        (
+            LineCaptureResource::ExecutionWork,
+            LineCaptureRunLimits {
+                max_work: 24,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::SequentialBytes,
+            LineCaptureRunLimits {
+                max_sequential_bytes: 1,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::CaptureCount,
+            LineCaptureRunLimits {
+                max_capture_count: 2,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::ReducerEvents,
+            LineCaptureRunLimits {
+                max_reducer_events: 4,
+                ..exact
+            },
+        ),
+    ];
+    for (resource, limits) in cases {
+        assert!(matches!(
+            plan.grep_capture_count(haystack, limits),
+            Err(LineCaptureRunError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+
+    for bytes in [1_usize, 64, 4_096] {
+        let haystack = vec![b'a'; bytes];
+        let report = plan
+            .grep_capture_count(&haystack, LineCaptureRunLimits::default())
+            .expect("scaled direct reduction");
+        assert_eq!(report.work, 12 * bytes + 1);
+        assert_eq!(report.sequential_bytes, bytes);
+        assert_eq!(report.actual_input_loads, bytes);
+    }
 }
 
 fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {

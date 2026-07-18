@@ -39,16 +39,18 @@ use fre::{
     FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
     GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
-    GraphemeScalarDfaReduceLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
-    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, RustProfile, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    GraphemeScalarDfaReduceLimits, LineCaptureBuildError, LineCaptureBuildLimits,
+    LineCaptureBuilder, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder,
+    NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder,
+    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits, RustProfile,
+    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SearchLimits,
     SearchSessionLimits, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateReduceError, UnicodeScalarAggregateBuildError,
@@ -88,6 +90,9 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-uniform-participation";
 /// Stable plan label for the proved uniform captured scalar-alternation path.
 pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-unicode-scalar";
+/// Stable plan label for the exact-HIR allocation-free hard Ruff line reducer.
+pub const CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN: &str =
+    "capture-line-space-around-operator-stream-v2";
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
@@ -103,7 +108,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v19-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -437,10 +442,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation; compact canonical scalar ranges; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus an exact-HIR allocation-free Ruff operator-line stream; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or the exact Unicode-on Ruff operator-line HIR to an allocation-free single stream with fixed participation; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         }
@@ -3172,6 +3177,9 @@ fn fre_grep_captures(
             plan: regex.build_report().plan_identity.plan_id,
         });
     }
+    if let Some(reduction) = space_around_operator_capture_reduction(request, limits)? {
+        return Ok(reduction);
+    }
     if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
         let actual =
             execute_uniform_capture_scalar(&regex, participating, request.haystack, true, limits)?;
@@ -3258,6 +3266,64 @@ fn execute_noqa_grep_captures(
         })?;
     u64::try_from(outcome.capture_count)
         .map_err(|_| ExecutionError::fault("FRE noqa capture count does not fit u64"))
+}
+
+fn space_around_operator_capture_reduction(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    if request.patterns.len() != 1
+        || request.patterns[0] != SPACE_AROUND_OPERATOR_CAPTURE_PATTERN
+        || !request.unicode
+        || request.case_insensitive
+    {
+        return Ok(None);
+    }
+    let build_limits = LineCaptureBuildLimits {
+        max_inspection_work: limits.fre_capture_scalar_planner_work,
+        ..LineCaptureBuildLimits::default()
+    };
+    let plan = LineCaptureBuilder::new(request.patterns[0].as_str())
+        .profile(rebar_profile())
+        .limits(build_limits)
+        .build()
+        .map_err(|error| match error {
+            LineCaptureBuildError::Unsupported(_)
+            | LineCaptureBuildError::InspectionWork { .. }
+            | LineCaptureBuildError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE direct line-capture build refused execution: {error}"
+            )),
+            _ => ExecutionError::fault(format!(
+                "FRE direct line-capture build returned an unknown failure: {error}"
+            )),
+        })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE line-capture reducer limit does not fit usize"))?;
+    let report = plan
+        .grep_capture_count(
+            request.haystack,
+            LineCaptureRunLimits {
+                max_work: limits.fre_aggregate_operation_work,
+                max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
+                max_capture_count: reducer_limit,
+                max_reducer_events: reducer_limit,
+            },
+        )
+        .map_err(|error| match error {
+            LineCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE direct line-capture reducer refused execution: {error}"
+            )),
+            LineCaptureRunError::ArithmeticOverflow(_)
+            | LineCaptureRunError::AccountingInvariant { .. } => {
+                ExecutionError::fault(format!("FRE direct line-capture reducer faulted: {error}"))
+            }
+        })?;
+    let actual = u64::try_from(report.capture_count)
+        .map_err(|_| ExecutionError::fault("FRE line-capture count does not fit u64"))?;
+    Ok(Some(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+    }))
 }
 
 fn uniform_capture_scalar_regex(
@@ -6882,6 +6948,111 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_ruff_space_operator_real_row_canary() {
+        const JOB_ID: &str = "wild/ruff/space-around-operator@rust/regex";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact Ruff hard row");
+        assert!(matching.next().is_none(), "duplicate Ruff hard row");
+        assert_eq!(job.model, "grep-captures");
+        assert!(job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 1_224_378);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader.load(job).expect("load authenticated Ruff hard row");
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let direct_plan = LineCaptureBuilder::new(SPACE_AROUND_OPERATOR_CAPTURE_PATTERN)
+            .profile(rebar_profile())
+            .build()
+            .expect("exact allocation-free direct plan");
+        let build = direct_plan.build_report();
+        assert_eq!((build.allocations, build.scratch_bytes), (0, 0));
+        let plan_bytes = core::mem::size_of::<fre::LineCapturePlan>();
+        assert_eq!(
+            (build.persistent_bytes, build.peak_bytes),
+            (plan_bytes, plan_bytes)
+        );
+        let reducer_limit = usize::try_from(limits.reducer_steps).expect("reducer limit usize");
+        let direct = direct_plan
+            .grep_capture_count(
+                &input.haystack,
+                LineCaptureRunLimits {
+                    max_work: limits.fre_aggregate_operation_work,
+                    max_sequential_bytes: limits.fre_aggregate_sequential_bytes,
+                    max_capture_count: reducer_limit,
+                    max_reducer_events: reducer_limit,
+                },
+            )
+            .expect("direct hard-row resource receipt");
+        assert_eq!(input.haystack.len(), 32_514_526);
+        assert_eq!(direct.work, 390_174_313);
+        assert_eq!(direct.sequential_bytes, 32_514_526);
+        assert_eq!(direct.actual_input_loads, 32_514_526);
+        assert_eq!(direct.prospective_matches, 16_257_263);
+        assert_eq!(direct.prospective_capture_count, 48_771_789);
+        assert_eq!(direct.prospective_line_events, 32_514_526);
+        assert_eq!(direct.prospective_reducer_events, 81_286_315);
+        assert_eq!(direct.matches, 408_126);
+        assert_eq!(direct.lines, 890_906);
+        assert_eq!(direct.reducer_events, 2_115_284);
+        assert_eq!(
+            u64::try_from(direct.capture_count).expect("capture u64"),
+            rust
+        );
+        assert!(direct.capture_count <= direct.prospective_capture_count);
+        assert!(direct.reducer_events <= direct.prospective_reducer_events);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE direct hard-row result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN)
+        );
+        println!(
+            "ruff-space-operator-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={} construction_allocations={} construction_scratch={} construction_persistent={} construction_peak={} prospective_work={} prospective_loads={} actual_loads={} prospective_matches={} actual_matches={} prospective_captures={} actual_captures={} prospective_lines={} actual_lines={} prospective_events={} actual_events={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan"),
+            build.allocations,
+            build.scratch_bytes,
+            build.persistent_bytes,
+            build.peak_bytes,
+            direct.work,
+            direct.sequential_bytes,
+            direct.actual_input_loads,
+            direct.prospective_matches,
+            direct.matches,
+            direct.prospective_capture_count,
+            direct.capture_count,
+            direct.prospective_line_events,
+            direct.lines,
+            direct.prospective_reducer_events,
+            direct.reducer_events,
+        );
+    }
+
     fn synthetic_job(model: &str, expected: u64) -> Job {
         serde_json::from_value(serde_json::json!({
             "id": format!("test/{model}@rust/regex"),
@@ -7371,12 +7542,74 @@ mod tests {
     }
 
     #[test]
+    fn current_fre_space_operator_capture_stream_binds_exact_limits_and_plan() {
+        assert!(
+            CurrentFreAdapter
+                .identity()
+                .identity
+                .contains("Ruff operator-line stream")
+        );
+        let patterns = [SPACE_AROUND_OPERATOR_CAPTURE_PATTERN.to_string()];
+        let haystack = b"x+\n\xFF++\r\nx + ";
+        let upstream = rust_compile_options(&patterns, true, false).expect("upstream pattern");
+        let expected = grep_captures(&upstream, haystack, u64::MAX).expect("upstream result");
+        assert_eq!(expected, 9);
+        assert_current_fre_execution(
+            current_fre(
+                "grep-captures",
+                &patterns,
+                haystack,
+                true,
+                false,
+                &RunLimits::default(),
+            ),
+            expected,
+            CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+        );
+
+        let work_one_below = RunLimits {
+            fre_aggregate_operation_work: 12 * haystack.len(),
+            ..RunLimits::default()
+        };
+        assert!(matches!(
+            current_fre(
+                "grep-captures",
+                &patterns,
+                haystack,
+                true,
+                false,
+                &work_one_below,
+            ),
+            CandidateOutcome::Unsupported(reason)
+                if reason.contains("ExecutionWork")
+                    && reason.contains(&format!("requires {}", 12 * haystack.len() + 1))
+        ));
+        let sequential_one_below = RunLimits {
+            fre_aggregate_sequential_bytes: haystack.len() - 1,
+            ..RunLimits::default()
+        };
+        assert!(matches!(
+            current_fre(
+                "grep-captures",
+                &patterns,
+                haystack,
+                true,
+                false,
+                &sequential_one_below,
+            ),
+            CandidateOutcome::Unsupported(reason)
+                if reason.contains("SequentialBytes")
+                    && reason.contains(&format!("requires {}", haystack.len()))
+        ));
+    }
+
+    #[test]
     fn current_fre_composition_keeps_unicode_capture_and_build_many_reachable() {
         let limits = RunLimits::default();
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v19-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
+            "fre-current-aggregate-capture-v20-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v1-bounded-class-sequence-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

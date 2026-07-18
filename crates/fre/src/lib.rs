@@ -33,6 +33,7 @@ mod finite;
 mod finite_root;
 mod forward_anchored;
 mod grapheme_scalar;
+mod line_capture;
 mod replacement;
 mod required_literal;
 mod set;
@@ -193,6 +194,13 @@ use fre_syntax::{
 };
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
+pub use line_capture::{
+    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildReport,
+    LineCaptureBuildResource, LineCaptureBuilder, LineCapturePlan, LineCapturePlanIdentity,
+    LineCapturePlanKind, LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits,
+    LineCaptureRunReport, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+};
 
 pub use fre_automata::{
     SearchError as K0SearchError, SearchLimits, SearchWindow,
