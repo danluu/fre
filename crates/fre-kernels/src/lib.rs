@@ -28,6 +28,7 @@ mod required_internal_anchor;
 mod required_literal;
 mod sparse_ordered_literal_aggregate;
 mod unicode_scalar_aggregate;
+mod url_aggregate;
 
 pub use bounded_class_sequence::{
     BoundedClassSequencePlan, BuildAccounting as BoundedClassSequenceBuildAccounting,
@@ -258,6 +259,14 @@ pub use unicode_scalar_aggregate::{
     SPAN_SUM_OPERATION_ID as UNICODE_SCALAR_AGGREGATE_SPAN_SUM_OPERATION_ID,
     ScalarSemantics as UnicodeScalarAggregateSemantics,
     SpanSumResult as UnicodeScalarAggregateSpanSumResult, UnicodeScalarAggregatePlan,
+};
+pub use url_aggregate::{
+    BuildAccounting as UrlAggregateBuildAccounting, BuildError as UrlAggregateBuildError,
+    BuildLimits as UrlAggregateBuildLimits, PLAN_ID as URL_AGGREGATE_PLAN_ID,
+    ReduceAccounting as UrlAggregateReduceAccounting, ReduceError as UrlAggregateReduceError,
+    ReduceLimits as UrlAggregateReduceLimits,
+    SPAN_SUM_OPERATION_ID as URL_AGGREGATE_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as UrlAggregateSpanSumResult, UrlAggregatePlan,
 };
 
 /// Hard limits for building one exact-literal plan.
