@@ -2,6 +2,8 @@ use core::mem::size_of;
 use std::sync::Arc;
 
 use fre::{
+    ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+    ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
     CaptureExecutionSource, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralRunLimits,
     CaptureResource, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
@@ -57,9 +59,25 @@ fn line_capture_plan(pattern: &str) -> fre::LineCapturePlan {
         .expect("exact direct line-capture plan")
 }
 
+fn fn_predicate_line_capture_plan() -> fre::LineCapturePlan {
+    LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build()
+        .expect("exact Unicode-off anchored separated-fields plan")
+}
+
 fn reference_grep_capture_count(pattern: &str, haystack: &[u8]) -> usize {
+    reference_grep_capture_count_with_unicode(pattern, haystack, true)
+}
+
+fn reference_grep_capture_count_with_unicode(
+    pattern: &str,
+    haystack: &[u8],
+    unicode: bool,
+) -> usize {
     let reference = RegexBuilder::new(pattern)
-        .unicode(true)
+        .unicode(unicode)
         .build()
         .expect("reference grep-capture pattern");
     if haystack.is_empty() {
@@ -804,6 +822,210 @@ fn remaining_ruff_line_plans_load_every_valid_malformed_and_cr_byte_once() {
         for haystack in inputs {
             assert_line_capture_oracle(pattern, haystack);
         }
+    }
+}
+
+#[test]
+fn fn_predicate_line_capture_authenticates_shape_profile_and_build_bounds() {
+    let plan = fn_predicate_line_capture_plan();
+    let report = plan.build_report();
+    let mut expected_profile = fre::RustProfile::rebar_1_12_4();
+    expected_profile.options.unicode = false;
+    assert_eq!(
+        report.identity.source,
+        ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN
+    );
+    assert_eq!(report.identity.profile, expected_profile);
+    assert_eq!(
+        report.identity.plan,
+        LineCapturePlanKind::AnchoredAsciiSeparatedFields
+    );
+    assert_eq!(
+        report.identity.operation.configuration,
+        LineCaptureConfiguration::AnchoredAsciiSeparatedFields
+    );
+    assert_eq!(
+        report.identity.operation.operation_id,
+        ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID
+    );
+    assert_eq!(report.identity.operation.work_per_input_byte, 12);
+    assert_eq!(report.identity.operation.unit_work, 10);
+    assert_eq!(report.hir_nodes, 19);
+    assert_eq!(report.class_ranges, 8);
+    assert_eq!(report.literal_bytes, 17);
+    assert_eq!(
+        report.inspection_work,
+        ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK
+    );
+    assert_eq!(report.minimum_match_bytes, 20);
+    assert_eq!(report.explicit_captures, 3);
+    assert_eq!(report.participating_groups_per_match, 4);
+    assert_eq!(report.allocations, 0);
+    assert_eq!(report.scratch_bytes, 0);
+    assert_eq!(report.persistent_bytes, size_of::<fre::LineCapturePlan>());
+    assert_eq!(report.peak_bytes, size_of::<fre::LineCapturePlan>());
+
+    assert!(matches!(
+        LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
+            .profile(fre::RustProfile::rebar_1_12_4())
+            .build(),
+        Err(LineCaptureBuildError::Unsupported("Rust profile identity"))
+    ));
+    assert!(matches!(
+        LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
+            .profile(expected_profile.clone())
+            .limits(LineCaptureBuildLimits {
+                max_inspection_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK - 1,
+                ..LineCaptureBuildLimits::default()
+            })
+            .build(),
+        Err(LineCaptureBuildError::InspectionWork { required, limit })
+            if required == ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK
+                && limit + 1 == required
+    ));
+    for (resource, limits) in [
+        (
+            LineCaptureBuildResource::PersistentBytes,
+            LineCaptureBuildLimits {
+                max_persistent_bytes: size_of::<fre::LineCapturePlan>() - 1,
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+        (
+            LineCaptureBuildResource::PeakBytes,
+            LineCaptureBuildLimits {
+                max_peak_bytes: size_of::<fre::LineCapturePlan>() - 1,
+                ..LineCaptureBuildLimits::default()
+            },
+        ),
+    ] {
+        assert!(matches!(
+            LineCaptureBuilder::new(ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN)
+                .profile(expected_profile.clone())
+                .limits(limits)
+                .build(),
+            Err(LineCaptureBuildError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+    let mutated = format!("{ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN} ");
+    assert!(matches!(
+        LineCaptureBuilder::new(&mutated)
+            .profile(expected_profile)
+            .build(),
+        Err(LineCaptureBuildError::Unsupported("source identity"))
+    ));
+}
+
+#[test]
+fn fn_predicate_line_capture_enforces_exact_prospective_bounds_before_scan() {
+    let plan = fn_predicate_line_capture_plan();
+    let haystack = b"fn is_a(x) -> bool {";
+    assert_eq!(haystack.len(), 20);
+    let exact = LineCaptureRunLimits {
+        max_work: 241,
+        max_sequential_bytes: 20,
+        max_capture_count: 4,
+        max_reducer_events: 24,
+    };
+    let report = plan
+        .grep_capture_count(haystack, exact)
+        .expect("exact separated-fields limits");
+    assert_eq!(report.work, 241);
+    assert_eq!(report.actual_work, 221);
+    assert_eq!(report.sequential_bytes, 20);
+    assert_eq!(report.actual_input_loads, 20);
+    assert_eq!(report.prospective_matches, 1);
+    assert_eq!(report.prospective_capture_count, 4);
+    assert_eq!(report.prospective_line_events, 20);
+    assert_eq!(report.prospective_reducer_events, 24);
+    assert_eq!(report.lines, 1);
+    assert_eq!(report.matches, 1);
+    assert_eq!(report.capture_count, 4);
+    assert_eq!(report.reducer_events, 5);
+    assert_eq!(report.scratch_bytes, 0);
+    assert_eq!(report.output_bytes, 0);
+
+    for (resource, limits) in [
+        (
+            LineCaptureResource::ExecutionWork,
+            LineCaptureRunLimits {
+                max_work: 240,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::SequentialBytes,
+            LineCaptureRunLimits {
+                max_sequential_bytes: 19,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::CaptureCount,
+            LineCaptureRunLimits {
+                max_capture_count: 3,
+                ..exact
+            },
+        ),
+        (
+            LineCaptureResource::ReducerEvents,
+            LineCaptureRunLimits {
+                max_reducer_events: 23,
+                ..exact
+            },
+        ),
+    ] {
+        assert!(matches!(
+            plan.grep_capture_count(haystack, limits),
+            Err(LineCaptureRunError::Resource { resource: got, .. }) if got == resource
+        ));
+    }
+}
+
+#[test]
+fn fn_predicate_line_capture_matches_ascii_crlf_malformed_and_near_miss_oracles() {
+    let plan = fn_predicate_line_capture_plan();
+    let cases: &[&[u8]] = &[
+        b"",
+        b"fn is_a(x) -> bool {",
+        b" \t\x0B\x0C\r fn is_name(args) -> bool {",
+        b"fn is_a(x) -> bool {\nfn is_b(y) -> bool {\r\n",
+        b"fn is_\xFF(x) -> bool {",
+        b"fn is_a(\xFF) -> bool {",
+        b"fn is_\0(x) -> bool {",
+        b"fn is_a(\0) -> bool {",
+        "fn is_é(β) -> bool {".as_bytes(),
+        b"fn is_a)b((x) -> bool {",
+        b"fnis_a(x) -> bool {",
+        b"fn is_(x) -> bool {",
+        b"fn is_a() -> bool {",
+        b"fn not_a(x) -> bool {",
+        b"fn is_a(x) -> bool",
+        b"fn is_a(x) -x bool {",
+        b"fn is_a(x) -> bool { ",
+        b"fn is_a(x)) -> bool {",
+        b"fn is_a\n(x) -> bool {",
+        b"\xFFfn is_a(x) -> bool {",
+        b"fn is_a(x) -> bool {\r",
+    ];
+    for haystack in cases {
+        let expected = reference_grep_capture_count_with_unicode(
+            ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+            haystack,
+            false,
+        );
+        let report = plan
+            .grep_capture_count(haystack, LineCaptureRunLimits::default())
+            .unwrap_or_else(|error| panic!("haystack={haystack:?}: {error}"));
+        assert_eq!(report.capture_count, expected, "haystack={haystack:?}");
+        assert_eq!(
+            report.actual_input_loads,
+            haystack.len(),
+            "haystack={haystack:?}"
+        );
+        assert!(report.actual_work <= report.work, "haystack={haystack:?}");
+        assert_eq!(report.scratch_bytes, 0);
+        assert_eq!(report.output_bytes, 0);
     }
 }
 

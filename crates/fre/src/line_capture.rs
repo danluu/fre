@@ -17,6 +17,9 @@ pub const SHEBANG_CAPTURE_PATTERN: &str = r"^(?P<spaces>\s*)#!(?P<directive>.*)"
 pub const STRING_QUOTE_PREFIX_CAPTURE_PATTERN: &str = r#"^(?i)[urb]*['"](?P<raw>.*)['"]$"#;
 /// Exact source spelling for Ruff's whitespace-delimited Python-keyword row.
 pub const WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN: &str = r"(\s*)\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b(\s*)";
+/// Exact source spelling for an anchored ASCII separated-fields capture plan.
+pub const ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN: &str =
+    r"^\s*fn\s+(is_([^\(]+))\(([^)]+)\) -> bool \{$";
 
 /// Exact structural-inspection charge for the pinned canonical HIR.
 pub const SPACE_AROUND_OPERATOR_INSPECTION_WORK: usize = 54;
@@ -26,6 +29,8 @@ pub const SHEBANG_INSPECTION_WORK: usize = 23;
 pub const STRING_QUOTE_PREFIX_INSPECTION_WORK: usize = 22;
 /// Exact structural-inspection charge for the Python-keyword plan.
 pub const WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK: usize = 220;
+/// Exact structural-inspection charge for the anchored separated-fields plan.
+pub const ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK: usize = 44;
 
 const SPACE_AROUND_OPERATOR_HIR_NODES: usize = 12;
 const SPACE_AROUND_OPERATOR_CLASS_RANGES: usize = 40;
@@ -52,6 +57,14 @@ const WHITESPACE_AROUND_KEYWORDS_LITERAL_BYTES: usize = 155;
 const WHITESPACE_AROUND_KEYWORDS_WORK_PER_INPUT_BYTE: usize = 16;
 const WHITESPACE_AROUND_KEYWORDS_UNIT_WORK: usize = 10;
 
+const ANCHORED_ASCII_SEPARATED_FIELDS_HIR_NODES: usize = 19;
+const ANCHORED_ASCII_SEPARATED_FIELDS_CLASS_RANGES: usize = 8;
+const ANCHORED_ASCII_SEPARATED_FIELDS_LITERAL_BYTES: usize = 17;
+const ANCHORED_ASCII_SEPARATED_FIELDS_MINIMUM_BYTES: usize = 20;
+const ANCHORED_ASCII_SEPARATED_FIELDS_PARTICIPATING_GROUPS: usize = 4;
+const ANCHORED_ASCII_SEPARATED_FIELDS_WORK_PER_INPUT_BYTE: usize = 12;
+const ANCHORED_ASCII_SEPARATED_FIELDS_UNIT_WORK: usize = 10;
+
 /// Stable operation identity for the retained space-operator configuration.
 pub const SPACE_AROUND_OPERATOR_OPERATION_ID: &str = "capture-line-space-around-operator-stream-v2";
 /// Stable operation identity for the configured shebang stream.
@@ -61,6 +74,9 @@ pub const STRING_QUOTE_PREFIX_OPERATION_ID: &str = "capture-line-ruff-string-quo
 /// Stable operation identity for the configured Python-keyword stream.
 pub const WHITESPACE_AROUND_KEYWORDS_OPERATION_ID: &str =
     "capture-line-ruff-python-keywords-stream-v1";
+/// Stable operation identity for anchored ASCII separated fields.
+pub const ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID: &str =
+    "capture-line-anchored-ascii-separated-fields-v1";
 
 /// Construction limits for an exact line-capture plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +130,8 @@ pub enum LineCapturePlanKind {
     StringQuotePrefix,
     /// The exact finite Python-keyword set between Unicode word boundaries.
     WhitespaceAroundKeywords,
+    /// Start/end-anchored ASCII literals separated by two nonempty byte fields.
+    AnchoredAsciiSeparatedFields,
 }
 
 /// Bounded scanner configuration selected by exact source identity.
@@ -127,6 +145,8 @@ pub enum LineCaptureConfiguration {
     AnchoredAsciiPrefixQuotedTail,
     /// A finite ASCII keyword set delimited by Unicode word boundaries.
     UnicodeWordKeywordSet,
+    /// Anchored ASCII literals with nonempty fields separated by `(` and `)`.
+    AnchoredAsciiSeparatedFields,
 }
 
 /// Immutable execution identity derived from one registered configuration.
@@ -357,6 +377,7 @@ struct LineCaptureRegistration {
     literal_bytes: usize,
     inspection_work: usize,
     explicit_captures: usize,
+    unicode: bool,
 }
 
 impl LineCaptureRegistration {
@@ -378,6 +399,7 @@ impl LineCaptureRegistration {
                 literal_bytes: SPACE_AROUND_OPERATOR_LITERAL_BYTES,
                 inspection_work: SPACE_AROUND_OPERATOR_INSPECTION_WORK,
                 explicit_captures: 2,
+                unicode: true,
             },
             LineCapturePlanKind::Shebang => Self {
                 source: SHEBANG_CAPTURE_PATTERN,
@@ -395,6 +417,7 @@ impl LineCaptureRegistration {
                 literal_bytes: SHEBANG_LITERAL_BYTES,
                 inspection_work: SHEBANG_INSPECTION_WORK,
                 explicit_captures: 2,
+                unicode: true,
             },
             LineCapturePlanKind::StringQuotePrefix => Self {
                 source: STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
@@ -412,6 +435,7 @@ impl LineCaptureRegistration {
                 literal_bytes: STRING_QUOTE_PREFIX_LITERAL_BYTES,
                 inspection_work: STRING_QUOTE_PREFIX_INSPECTION_WORK,
                 explicit_captures: 1,
+                unicode: true,
             },
             LineCapturePlanKind::WhitespaceAroundKeywords => Self {
                 source: WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
@@ -429,6 +453,26 @@ impl LineCaptureRegistration {
                 literal_bytes: WHITESPACE_AROUND_KEYWORDS_LITERAL_BYTES,
                 inspection_work: WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
                 explicit_captures: 2,
+                unicode: true,
+            },
+            LineCapturePlanKind::AnchoredAsciiSeparatedFields => Self {
+                source: ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+                plan,
+                operation: LineCaptureOperationIdentity {
+                    operation_id: ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
+                    configuration: LineCaptureConfiguration::AnchoredAsciiSeparatedFields,
+                    work_per_input_byte: ANCHORED_ASCII_SEPARATED_FIELDS_WORK_PER_INPUT_BYTE,
+                    unit_work: ANCHORED_ASCII_SEPARATED_FIELDS_UNIT_WORK,
+                    minimum_match_bytes: ANCHORED_ASCII_SEPARATED_FIELDS_MINIMUM_BYTES,
+                    participating_groups_per_match:
+                        ANCHORED_ASCII_SEPARATED_FIELDS_PARTICIPATING_GROUPS,
+                },
+                hir_nodes: ANCHORED_ASCII_SEPARATED_FIELDS_HIR_NODES,
+                class_ranges: ANCHORED_ASCII_SEPARATED_FIELDS_CLASS_RANGES,
+                literal_bytes: ANCHORED_ASCII_SEPARATED_FIELDS_LITERAL_BYTES,
+                inspection_work: ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK,
+                explicit_captures: 3,
+                unicode: false,
             },
         }
     }
@@ -440,6 +484,9 @@ impl LineCaptureRegistration {
             STRING_QUOTE_PREFIX_CAPTURE_PATTERN => LineCapturePlanKind::StringQuotePrefix,
             WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN => {
                 LineCapturePlanKind::WhitespaceAroundKeywords
+            }
+            ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN => {
+                LineCapturePlanKind::AnchoredAsciiSeparatedFields
             }
             _ => return None,
         };
@@ -470,6 +517,13 @@ impl<'a> LineCaptureBuilder<'a> {
     #[must_use]
     pub fn profile(mut self, profile: RustProfile) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// Select byte (`false`) or Unicode (`true`) character classes.
+    #[must_use]
+    pub fn unicode(mut self, enabled: bool) -> Self {
+        self.profile.options.unicode = enabled;
         self
     }
 
@@ -512,7 +566,9 @@ impl<'a> LineCaptureBuilder<'a> {
             peak_bytes,
             self.limits.max_peak_bytes,
         )?;
-        if self.profile != RustProfile::rebar_1_12_4() {
+        let mut expected_profile = RustProfile::rebar_1_12_4();
+        expected_profile.options.unicode = registration.unicode;
+        if self.profile != expected_profile {
             return Err(LineCaptureBuildError::Unsupported("Rust profile identity"));
         }
         // This mechanism is not a generic parser fallback. Exact source and
@@ -834,6 +890,138 @@ struct StringQuoteState {
     phase: StringQuotePhase,
 }
 
+const ANCHORED_ASCII_SEPARATED_FIELDS_SUFFIX: &[u8] = b") -> bool {";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnchoredAsciiClass {
+    Whitespace,
+    Not(u8),
+}
+
+impl AnchoredAsciiClass {
+    fn contains(self, byte: Option<u8>) -> bool {
+        match self {
+            Self::Whitespace => byte.is_some_and(|byte| matches!(byte, b'\t'..=b'\r' | b' ')),
+            Self::Not(excluded) => byte != Some(excluded),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnchoredAsciiAtom {
+    Literal(&'static [u8]),
+    Class {
+        class: AnchoredAsciiClass,
+        minimum: usize,
+    },
+}
+
+// This is data, not an fn-predicate control flow graph: the same bounded
+// interpreter consumes an anchored sequence of literals and byte classes.
+// Exact registered HIR identity proves this eight-atom configuration before
+// execution; the interpreter never parses, allocates, rewinds, or rereads.
+const ANCHORED_ASCII_SEPARATED_FIELDS_ATOMS: [AnchoredAsciiAtom; 8] = [
+    AnchoredAsciiAtom::Class {
+        class: AnchoredAsciiClass::Whitespace,
+        minimum: 0,
+    },
+    AnchoredAsciiAtom::Literal(b"fn"),
+    AnchoredAsciiAtom::Class {
+        class: AnchoredAsciiClass::Whitespace,
+        minimum: 1,
+    },
+    AnchoredAsciiAtom::Literal(b"is_"),
+    AnchoredAsciiAtom::Class {
+        class: AnchoredAsciiClass::Not(b'('),
+        minimum: 1,
+    },
+    AnchoredAsciiAtom::Literal(b"("),
+    AnchoredAsciiAtom::Class {
+        class: AnchoredAsciiClass::Not(b')'),
+        minimum: 1,
+    },
+    AnchoredAsciiAtom::Literal(ANCHORED_ASCII_SEPARATED_FIELDS_SUFFIX),
+];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AnchoredAsciiSeparatedFieldsState {
+    atom: usize,
+    offset: usize,
+    class_matched: bool,
+    failed: bool,
+}
+
+impl AnchoredAsciiSeparatedFieldsState {
+    fn push_scalar(&mut self, scalar: char) {
+        self.push_byte(u8::try_from(u32::from(scalar)).ok());
+    }
+
+    fn push_invalid(&mut self) {
+        self.push_byte(None);
+    }
+
+    fn push_byte(&mut self, byte: Option<u8>) {
+        if self.failed || self.atom == ANCHORED_ASCII_SEPARATED_FIELDS_ATOMS.len() {
+            self.failed = true;
+            return;
+        }
+        loop {
+            let Some(atom) = ANCHORED_ASCII_SEPARATED_FIELDS_ATOMS
+                .get(self.atom)
+                .copied()
+            else {
+                self.failed = true;
+                return;
+            };
+            match atom {
+                AnchoredAsciiAtom::Literal(literal) => {
+                    if literal.get(self.offset).copied() != byte {
+                        self.failed = true;
+                        return;
+                    }
+                    self.offset = self
+                        .offset
+                        .checked_add(1)
+                        .expect("literal offset is bounded by the static atom");
+                    if self.offset == literal.len() {
+                        self.atom = self
+                            .atom
+                            .checked_add(1)
+                            .expect("atom index is bounded by the static grammar");
+                        self.offset = 0;
+                        self.class_matched = false;
+                    }
+                    return;
+                }
+                AnchoredAsciiAtom::Class { class, minimum: _ } if class.contains(byte) => {
+                    self.class_matched = true;
+                    return;
+                }
+                AnchoredAsciiAtom::Class { minimum, .. }
+                    if usize::from(self.class_matched) >= minimum =>
+                {
+                    self.atom = self
+                        .atom
+                        .checked_add(1)
+                        .expect("atom index is bounded by the static grammar");
+                    self.offset = 0;
+                    self.class_matched = false;
+                    // The byte that terminated a class is consumed by the next
+                    // atom by value; the input slice is never touched again.
+                }
+                AnchoredAsciiAtom::Class { .. } => {
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    const fn matched(self) -> bool {
+        !self.failed && self.atom == ANCHORED_ASCII_SEPARATED_FIELDS_ATOMS.len()
+    }
+}
+
 impl StringQuoteState {
     fn push_scalar(&mut self, scalar: char) {
         self.phase = match self.phase {
@@ -983,6 +1171,7 @@ enum LineCaptureMachine {
     Shebang(ShebangState),
     StringQuote(StringQuoteState),
     Keywords(KeywordState),
+    AnchoredAsciiSeparatedFields(AnchoredAsciiSeparatedFieldsState),
 }
 
 impl LineCaptureMachine {
@@ -1009,6 +1198,14 @@ impl LineCaptureMachine {
                 in_word: false,
                 viable: true,
             }),
+            LineCaptureConfiguration::AnchoredAsciiSeparatedFields => {
+                Self::AnchoredAsciiSeparatedFields(AnchoredAsciiSeparatedFieldsState {
+                    atom: 0,
+                    offset: 0,
+                    class_matched: false,
+                    failed: false,
+                })
+            }
         }
     }
 
@@ -1024,6 +1221,10 @@ impl LineCaptureMachine {
                 (false, 0)
             }
             Self::Keywords(state) => state.push_scalar(scalar),
+            Self::AnchoredAsciiSeparatedFields(state) => {
+                state.push_scalar(scalar);
+                (false, 0)
+            }
         }
     }
 
@@ -1039,6 +1240,10 @@ impl LineCaptureMachine {
                 (false, 0)
             }
             Self::Keywords(state) => state.push_invalid(),
+            Self::AnchoredAsciiSeparatedFields(state) => {
+                state.push_invalid();
+                (false, 0)
+            }
         }
     }
 
@@ -1048,6 +1253,7 @@ impl LineCaptureMachine {
             Self::Shebang(state) => (state.matched(), 0),
             Self::StringQuote(state) => (state.matched(), 0),
             Self::Keywords(state) => state.finish_word(),
+            Self::AnchoredAsciiSeparatedFields(state) => (state.matched(), 0),
         };
         *self = Self::new(configuration);
         result

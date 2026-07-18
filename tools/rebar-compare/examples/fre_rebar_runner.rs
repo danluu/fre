@@ -71,7 +71,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=20 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v21-required-literal-v1-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-structural-quota-v8 report={REPORT_SCHEMA} aggregate-explain=20 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -1237,53 +1237,70 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct RuffCaptureFixture {
+    struct LineCaptureFixture {
         name: &'static str,
         pattern: &'static str,
         haystack: &'static [u8],
         expected: u64,
         plan: &'static str,
+        unicode: bool,
     }
 
-    fn ruff_capture_fixtures() -> [RuffCaptureFixture; 4] {
+    fn line_capture_fixtures() -> [LineCaptureFixture; 5] {
         [
-            RuffCaptureFixture {
+            LineCaptureFixture {
                 name: "wild/ruff/space-around-operator",
                 pattern: fre::SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
                 haystack: b"x+\n\xFF++\r\nx + ",
                 expected: 9,
                 plan: rebar_compare::CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN,
+                unicode: true,
             },
-            RuffCaptureFixture {
+            LineCaptureFixture {
                 name: "wild/ruff/shebang",
                 pattern: fre::SHEBANG_CAPTURE_PATTERN,
                 haystack: b"#!x\nx#!\n \t#!z",
                 expected: 6,
                 plan: fre::SHEBANG_OPERATION_ID,
+                unicode: true,
             },
-            RuffCaptureFixture {
+            LineCaptureFixture {
                 name: "wild/ruff/string-quote-prefix",
                 pattern: fre::STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
                 haystack: b"''\nr\"x\"\nno\n",
                 expected: 4,
                 plan: fre::STRING_QUOTE_PREFIX_OPERATION_ID,
+                unicode: true,
             },
-            RuffCaptureFixture {
+            LineCaptureFixture {
                 name: "wild/ruff/whitespace-around-keywords",
                 pattern: fre::WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
                 haystack: b"if else\nif_\n",
                 expected: 6,
                 plan: fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+                unicode: true,
+            },
+            LineCaptureFixture {
+                name: "opt/onepass/fn-predicate",
+                pattern: fre::ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+                haystack: b"fn is_a(x) -> bool {\r\nno\n",
+                expected: 4,
+                plan: rebar_compare::CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN,
+                unicode: false,
             },
         ]
     }
 
-    fn ruff_capture_klv(fixture: RuffCaptureFixture) -> Vec<u8> {
+    fn line_capture_klv(fixture: LineCaptureFixture) -> Vec<u8> {
         let mut output = Vec::new();
         field(&mut output, "name", fixture.name.as_bytes());
         field(&mut output, "model", b"grep-captures");
         field(&mut output, "case-insensitive", b"false");
-        field(&mut output, "unicode", b"true");
+        field(
+            &mut output,
+            "unicode",
+            if fixture.unicode { b"true" } else { b"false" },
+        );
         field(&mut output, "max-iters", b"1");
         field(&mut output, "max-warmup-iters", b"0");
         field(&mut output, "max-time", b"1000");
@@ -1905,12 +1922,13 @@ mod tests {
     }
 
     #[test]
-    fn ruff_formal_klv_binds_each_plan_to_first_steady_and_performance_capture_paths() {
-        for fixture in ruff_capture_fixtures() {
-            let benchmark = Benchmark::parse(&ruff_capture_klv(fixture)).expect("exact Ruff KLV");
+    fn line_capture_formal_klv_binds_each_plan_to_first_steady_and_performance_capture_paths() {
+        for fixture in line_capture_fixtures() {
+            let benchmark =
+                Benchmark::parse(&line_capture_klv(fixture)).expect("exact line-capture KLV");
             assert_eq!(benchmark.name, fixture.name);
             assert_eq!(benchmark.model, "grep-captures");
-            assert!(benchmark.unicode);
+            assert_eq!(benchmark.unicode, fixture.unicode);
             assert!(!benchmark.case_insensitive);
             assert_eq!(benchmark.pattern(), fixture.pattern);
 

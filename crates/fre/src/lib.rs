@@ -211,6 +211,8 @@ use fre_syntax::{
 
 pub use fre_syntax::{CompatibilityProfile, RustProfile};
 pub use line_capture::{
+    ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
+    ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
     LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildReport,
     LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration,
     LineCaptureOperationIdentity, LineCapturePlan, LineCapturePlanIdentity, LineCapturePlanKind,
