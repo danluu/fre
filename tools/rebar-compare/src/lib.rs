@@ -7574,6 +7574,84 @@ mod tests {
         );
     }
 
+    const CONTINUATION_FAMILY_SCREEN_JOB_IDS: [&str; 7] = [
+        "curated/03-date/ascii@rust/regex",
+        "curated/03-date/unicode@rust/regex",
+        "curated/13-noseyparker/single@rust/regex",
+        "curated/13-noseyparker/multi@rust/regex",
+        "imported/leipzig/quotes-bounded@rust/regex",
+        "imported/mariomka/uri@rust/regex",
+        "wild/url/search@rust/regex",
+    ];
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_continuation_family_seven_row_screen() {
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let candidate = CurrentFreAdapter;
+        let mut remaining: BTreeSet<&str> =
+            CONTINUATION_FAMILY_SCREEN_JOB_IDS.into_iter().collect();
+        let mut receipts = Vec::with_capacity(CONTINUATION_FAMILY_SCREEN_JOB_IDS.len());
+        for job in &manifest.jobs {
+            if !remaining.remove(job.id.as_str()) {
+                continue;
+            }
+            let input = loader.load(job);
+            let receipt = execute_receipt(job, candidate.adapter(), &input, &limits, |loaded| {
+                candidate_reducer(&candidate, job, loaded, &limits)
+            });
+            assert!(
+                matches!(receipt.status, Status::Pass | Status::Unsupported),
+                "{} returned {:?}: {:?}",
+                receipt.job_id,
+                receipt.status,
+                receipt.reason
+            );
+            println!(
+                "continuation-family-screen job={} status={:?} actual={} plan={} reason={}",
+                receipt.job_id,
+                receipt.status,
+                receipt
+                    .actual
+                    .map_or_else(|| "-".to_string(), |actual| actual.to_string()),
+                receipt.candidate_plan.as_deref().unwrap_or("-"),
+                receipt.reason.as_deref().unwrap_or("-"),
+            );
+            receipts.push(receipt);
+        }
+        assert!(remaining.is_empty(), "missing family rows: {remaining:?}");
+        assert_eq!(receipts.len(), CONTINUATION_FAMILY_SCREEN_JOB_IDS.len());
+        receipts.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        let receipt_bytes = serde_json::to_vec(&receipts).expect("serialize family receipts");
+        println!(
+            "continuation-family-screen manifest_sha256={manifest_hash} receipts_sha256={} rows={}",
+            sha256(&receipt_bytes),
+            receipts.len()
+        );
+    }
+
     fn retained_ruff_lifecycle(
         haystack_len: usize,
         limits: RunLimits,
