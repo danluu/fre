@@ -31,7 +31,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v13-single-set-compile";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v14-utf8-bytes-text-delegate";
 
 const LIMITATIONS: [&str; 2] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -165,6 +165,8 @@ fn execute_case(
         AdapterSurface::RustBytesSetIsMatch => execute_bytes_set_is_match(case, input),
         AdapterSurface::RustBytesSetWhich => execute_bytes_set_which(case, input),
         AdapterSurface::RustBytesCompile => execute_bytes_compile(case, input),
+        AdapterSurface::RustBytesIsMatch if case.utf8 => execute_text_is_match(case, input),
+        AdapterSurface::RustBytesFindIter if case.utf8 => execute_text_find(case, input),
         AdapterSurface::RustBytesIsMatch => execute_bytes_is_match(case, input),
         AdapterSurface::RustBytesFindIter => execute_bytes_find(case, input),
     }
@@ -1584,8 +1586,18 @@ fn single_applicability(
     {
         return Err(NotApplicableReason::ProfileCannotRepresentBounds);
     }
-    if case.utf8 != text && surface != AdapterSurface::RustBytesCompile {
-        return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+    if case.utf8 != text {
+        let utf8_bytes_text_delegate = case.utf8
+            && matches!(
+                surface,
+                AdapterSurface::RustBytesIsMatch | AdapterSurface::RustBytesFindIter
+            );
+        if utf8_bytes_text_delegate && std::str::from_utf8(&input.haystack).is_err() {
+            return Err(NotApplicableReason::InvalidUtf8Haystack);
+        }
+        if surface != AdapterSurface::RustBytesCompile && !utf8_bytes_text_delegate {
+            return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+        }
     }
     if text && std::str::from_utf8(&input.haystack).is_err() {
         return Err(NotApplicableReason::InvalidUtf8Haystack);
@@ -2561,6 +2573,48 @@ mod tests {
                 &rejected_input,
             ),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+    }
+
+    #[test]
+    fn utf8_bytes_search_delegates_only_through_valid_text_equivalence() {
+        let case = fixture_case(true, true, None);
+        let input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }]);
+        for surface in [
+            AdapterSurface::RustBytesIsMatch,
+            AdapterSurface::RustBytesFindIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesCapturesIter, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut invalid = input.clone();
+        invalid.haystack = vec![0xFF];
+        invalid.bounds = SearchBounds { start: 0, end: 1 };
+        for surface in [
+            AdapterSurface::RustBytesIsMatch,
+            AdapterSurface::RustBytesFindIter,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &case, &invalid),
+                Err(NotApplicableReason::InvalidUtf8Haystack)
+            );
+        }
+
+        let rejected_case = fixture_case(false, true, None);
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesIsMatch, &rejected_case, &input,),
+            Err(NotApplicableReason::CompileOnlyCase)
         );
     }
 
