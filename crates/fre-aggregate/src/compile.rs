@@ -1311,7 +1311,7 @@ enum CapturePolicy {
     EraseForWholeMatch,
 }
 
-struct CompileBudget {
+pub(crate) struct CompileBudget {
     limits: CompileLimits,
     accounting: CompileAccounting,
     current_temporary_states: usize,
@@ -1319,7 +1319,7 @@ struct CompileBudget {
 }
 
 impl CompileBudget {
-    const fn new(limits: CompileLimits) -> Self {
+    pub(crate) const fn new(limits: CompileLimits) -> Self {
         Self {
             limits,
             accounting: CompileAccounting {
@@ -1362,7 +1362,7 @@ impl CompileBudget {
         }
     }
 
-    fn charge(&mut self, amount: usize) -> Result<(), Error> {
+    pub(crate) fn charge(&mut self, amount: usize) -> Result<(), Error> {
         let required = add(self.accounting.work, amount, Resource::CompileWork)?;
         enforce(required, self.limits.max_work, Resource::CompileWork)?;
         self.accounting.work = required;
@@ -1382,7 +1382,24 @@ impl CompileBudget {
         Ok(())
     }
 
-    fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
+    pub(crate) fn acquire_checked_construction_bytes(
+        &mut self,
+        amount: usize,
+    ) -> Result<(), Error> {
+        let required = add(
+            self.current_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            required,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+        self.acquire_construction_bytes(amount)
+    }
+
+    pub(crate) fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = self
             .current_construction_bytes
             .checked_sub(amount)
@@ -1390,6 +1407,11 @@ impl CompileBudget {
                 "compiler construction-byte accounting underflow",
             ))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn current_construction_bytes(&self) -> usize {
+        self.current_construction_bytes
     }
 
     fn acquire_state(&mut self) -> Result<(), Error> {

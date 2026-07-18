@@ -12,6 +12,7 @@ use core::mem::size_of;
 use fre_exact_alloc::{CopyError, ExactVec};
 use regex_syntax::hir::{Class, Hir, HirKind};
 
+use crate::compile::CompileBudget;
 use crate::program::ByteSet;
 use crate::{Error, Resource};
 
@@ -23,14 +24,12 @@ const MIN_ANCHOR_WORD_BYTES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Limits {
-    pub(crate) max_work: usize,
     pub(crate) max_scratch_bytes: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_work: 16 << 20,
             max_scratch_bytes: 16 << 20,
         }
     }
@@ -40,6 +39,8 @@ impl Default for Limits {
 pub(crate) struct Accounting {
     pub(crate) work: usize,
     pub(crate) scratch_peak_bytes: usize,
+    pub(crate) retained_bytes: usize,
+    pub(crate) retained_allocations: usize,
     pub(crate) branches: usize,
     pub(crate) anchor_patterns: usize,
     pub(crate) anchor_pattern_bytes: usize,
@@ -103,6 +104,12 @@ impl Certificate<'_> {
     pub(crate) const fn accounting(&self) -> Accounting {
         self.accounting
     }
+
+    pub(crate) fn release(self, budget: &mut CompileBudget) -> Result<(), Error> {
+        let retained_bytes = self.accounting.retained_bytes;
+        drop(self);
+        budget.release_construction_bytes(retained_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,17 +156,19 @@ struct ConsumableFacts {
     nullable: bool,
 }
 
-struct Meter {
-    limits: Limits,
+struct Meter<'a> {
+    budget: &'a mut CompileBudget,
+    max_scratch_bytes: usize,
     work: usize,
     scratch: usize,
     scratch_peak: usize,
 }
 
-impl Meter {
-    const fn new(limits: Limits) -> Self {
+impl<'a> Meter<'a> {
+    const fn new(limits: Limits, budget: &'a mut CompileBudget) -> Self {
         Self {
-            limits,
+            budget,
+            max_scratch_bytes: limits.max_scratch_bytes,
             work: 0,
             scratch: 0,
             scratch_peak: 0,
@@ -167,13 +176,14 @@ impl Meter {
     }
 
     fn charge(&mut self, amount: usize) -> Result<(), Error> {
+        self.budget.charge(amount)?;
         self.work = self
             .work
             .checked_add(amount)
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::CompileWork,
             })?;
-        enforce(self.work, self.limits.max_work, Resource::CompileWork)
+        Ok(())
     }
 
     fn acquire(&mut self, bytes: usize) -> Result<(), Error> {
@@ -183,60 +193,99 @@ impl Meter {
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::ProgramBytes,
             })?;
-        enforce(
-            required,
-            self.limits.max_scratch_bytes,
-            Resource::ProgramBytes,
-        )?;
+        enforce(required, self.max_scratch_bytes, Resource::ProgramBytes)?;
+        self.budget.acquire_checked_construction_bytes(bytes)?;
         self.scratch = required;
         self.scratch_peak = self.scratch_peak.max(required);
         Ok(())
     }
 
     fn release(&mut self, bytes: usize) -> Result<(), Error> {
-        self.scratch = self
+        let remaining = self
             .scratch
             .checked_sub(bytes)
             .ok_or(Error::InternalInvariant(
                 "finite-anchor scratch release underflowed",
             ))?;
+        self.budget.release_construction_bytes(bytes)?;
+        self.scratch = remaining;
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<(), Error> {
+        let bytes = self.scratch;
+        self.budget.release_construction_bytes(bytes)?;
+        self.scratch = 0;
         Ok(())
     }
 }
 
-pub(crate) fn certify(hir: &Hir, limits: Limits) -> Result<Option<Certificate<'_>>, Error> {
-    let mut meter = Meter::new(limits);
-    let Some(consumable) = consumable_facts(hir, &mut meter)? else {
+pub(crate) fn certify<'a>(
+    hir: &'a Hir,
+    limits: Limits,
+    budget: &mut CompileBudget,
+) -> Result<Option<Certificate<'a>>, Error> {
+    let mut meter = Meter::new(limits, budget);
+    let result = certify_inner(hir, &mut meter);
+    match result {
+        Ok(Some(certificate)) => Ok(Some(certificate)),
+        Ok(None) => {
+            meter.release_all()?;
+            Ok(None)
+        }
+        Err(error) => {
+            meter.release_all()?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the finite-anchor transaction keeps retained-allocation and authoritative-budget accounting adjacent"
+)]
+fn certify_inner<'a>(
+    hir: &'a Hir,
+    meter: &mut Meter<'_>,
+) -> Result<Option<Certificate<'a>>, Error> {
+    let Some(consumable) = consumable_facts(hir, meter)? else {
         return Ok(None);
     };
     if consumable.nullable {
         return Ok(None);
     }
+    meter.charge(consumable.bytes.0.len())?;
     let delimiters = complement(consumable.bytes);
+    meter.charge(delimiters.0.len())?;
     if is_empty(delimiters) {
         return Ok(None);
     }
 
-    let outer_count = flattened_count(hir, &mut meter)?;
-    let (mut outer, outer_bytes) = exact_vec(outer_count, &mut meter)?;
-    flatten(hir, &mut outer, &mut meter)?;
+    let outer_count = flattened_count(hir, meter)?;
+    let (mut outer, outer_bytes) = exact_vec(outer_count, meter)?;
+    flatten(hir, &mut outer, meter)?;
     if outer.len() != outer_count {
         return Err(Error::InternalInvariant(
             "finite-anchor outer flatten census changed",
         ));
     }
 
-    let root_alternation = outer.iter().position(|part| {
-        matches!(
-            part.kind(),
-            HirKind::Alternation(branches) if (2..=MAX_ROOT_BRANCHES).contains(&branches.len())
-        )
-    });
+    let mut root_alternation = None;
+    for (index, part) in outer.iter().enumerate() {
+        meter.charge(1)?;
+        if let HirKind::Alternation(alternatives) = part.kind() {
+            if !(2..=MAX_ROOT_BRANCHES).contains(&alternatives.len()) {
+                return Ok(None);
+            }
+            root_alternation = Some(index);
+            break;
+        }
+    }
     let branch_count = root_alternation.map_or(1, |index| match outer[index].kind() {
         HirKind::Alternation(branches) => branches.len(),
         _ => 1,
     });
-    let (mut branches, _branch_slots_bytes) = exact_vec(branch_count, &mut meter)?;
+    let (mut branches, _branch_slots_bytes) = exact_vec(branch_count, meter)?;
 
     if let Some(alternation_index) = root_alternation {
         let HirKind::Alternation(alternatives) = outer[alternation_index].kind() else {
@@ -255,19 +304,21 @@ pub(crate) fn certify(hir: &Hir, limits: Limits) -> Result<Option<Certificate<'_
                 &outer[..alternation_index],
                 Some(alternative),
                 &outer[suffix_start..],
-                &mut meter,
+                meter,
             )?
             else {
                 return Ok(None);
             };
+            meter.charge(1)?;
             branches
                 .try_push(branch)
                 .map_err(|_| Error::InternalInvariant("finite-anchor branch census changed"))?;
         }
     } else {
-        let Some(branch) = build_branch(&outer, None, &[], &mut meter)? else {
+        let Some(branch) = build_branch(&outer, None, &[], meter)? else {
             return Ok(None);
         };
+        meter.charge(1)?;
         branches
             .try_push(branch)
             .map_err(|_| Error::InternalInvariant("finite-anchor branch census changed"))?;
@@ -275,26 +326,60 @@ pub(crate) fn certify(hir: &Hir, limits: Limits) -> Result<Option<Certificate<'_
     meter.release(outer_bytes)?;
     drop(outer);
 
-    let anchor_patterns = branches.iter().try_fold(0_usize, |total, branch| {
-        total
-            .checked_add(branch.words.len())
-            .ok_or(Error::ArithmeticOverflow {
-                resource: Resource::TemporaryStates,
-            })
-    })?;
-    let anchor_pattern_bytes = branches.iter().try_fold(0_usize, |total, branch| {
-        branch.words.iter().try_fold(total, |subtotal, word| {
-            subtotal
-                .checked_add(word.bytes().len())
-                .ok_or(Error::ArithmeticOverflow {
-                    resource: Resource::LiteralBytes,
-                })
-        })
-    })?;
+    let mut anchor_patterns = 0_usize;
+    let mut anchor_pattern_bytes = 0_usize;
+    let mut retained_bytes = checked_mul(
+        branches.len(),
+        size_of::<Branch<'_>>(),
+        Resource::ProgramBytes,
+    )?;
+    let mut retained_allocations = 1_usize;
+    for branch in &branches {
+        meter.charge(3)?; // branch visit and its two retained-vector censuses
+        retained_bytes = checked_add(
+            retained_bytes,
+            checked_mul(
+                branch.parts.len(),
+                size_of::<&Hir>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )?;
+        retained_bytes = checked_add(
+            retained_bytes,
+            checked_mul(
+                branch.words.len(),
+                size_of::<Word>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )?;
+        retained_allocations = checked_add(retained_allocations, 2, Resource::TemporaryStates)?;
+        anchor_patterns = checked_add(
+            anchor_patterns,
+            branch.words.len(),
+            Resource::TemporaryStates,
+        )?;
+        for word in &branch.words {
+            meter.charge(checked_add(1, word.bytes().len(), Resource::CompileWork)?)?;
+            anchor_pattern_bytes = checked_add(
+                anchor_pattern_bytes,
+                word.bytes().len(),
+                Resource::LiteralBytes,
+            )?;
+        }
+    }
+    if retained_bytes != meter.scratch {
+        return Err(Error::InternalInvariant(
+            "finite-anchor retained allocation census differs from construction bytes",
+        ));
+    }
     Ok(Some(Certificate {
         accounting: Accounting {
             work: meter.work,
             scratch_peak_bytes: meter.scratch_peak,
+            retained_bytes,
+            retained_allocations,
             branches: branches.len(),
             anchor_patterns,
             anchor_pattern_bytes,
@@ -308,7 +393,7 @@ fn build_branch<'a>(
     before: &[&'a Hir],
     alternative: Option<&'a Hir>,
     after: &[&'a Hir],
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<Option<Branch<'a>>, Error> {
     let alternative_count = if let Some(hir) = alternative {
         flattened_count(hir, meter)?
@@ -351,11 +436,13 @@ fn build_branch<'a>(
         return Ok(None);
     };
     let words = materialize_parts(&parts[anchor_start..anchor_end], facts, meter)?;
-    if words.values.len() != facts.count
-        || words.values.iter().any(|word| {
-            word.bytes().len() < MIN_ANCHOR_WORD_BYTES || word.bytes().len() > MAX_ANCHOR_WORD_BYTES
-        })
-    {
+    let mut malformed_word = words.values.len() != facts.count;
+    for word in &words.values {
+        meter.charge(1)?;
+        malformed_word |= word.bytes().len() < MIN_ANCHOR_WORD_BYTES
+            || word.bytes().len() > MAX_ANCHOR_WORD_BYTES;
+    }
+    if malformed_word {
         return Err(Error::InternalInvariant(
             "finite-anchor materialization differs from census",
         ));
@@ -370,7 +457,7 @@ fn build_branch<'a>(
 
 fn best_anchor(
     parts: &[&Hir],
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<Option<(usize, usize, LanguageFacts)>, Error> {
     let mut best = None;
     for start in 0..parts.len() {
@@ -394,6 +481,7 @@ fn best_anchor(
                 })?,
                 combined,
             );
+            meter.charge(1)?;
             if best.is_none_or(|(_, _, current): (_, _, LanguageFacts)| {
                 candidate.2.min_bytes > current.min_bytes
                     || (candidate.2.min_bytes == current.min_bytes
@@ -410,7 +498,7 @@ fn best_anchor(
     clippy::too_many_lines,
     reason = "the finite-language census keeps each accepted HIR form and its checked arithmetic together"
 )]
-fn language_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<LanguageFacts>, Error> {
+fn language_facts(hir: &Hir, meter: &mut Meter<'_>) -> Result<Option<LanguageFacts>, Error> {
     meter.charge(1)?;
     match hir.kind() {
         HirKind::Empty => Ok(Some(LanguageFacts::EMPTY)),
@@ -429,10 +517,9 @@ fn language_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<LanguageFacts>,
             }))
         }
         HirKind::Class(Class::Bytes(class)) => {
-            let count = normalized_class(class, meter)?
-                .iter()
-                .filter(|&&set| set)
-                .count();
+            let normalized = normalized_class(class, meter)?;
+            meter.charge(normalized.len())?;
+            let count = normalized.iter().filter(|&&set| set).count();
             if count == 0 {
                 return Ok(None);
             }
@@ -487,6 +574,14 @@ fn language_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<LanguageFacts>,
             let Some(maximum) = repetition.max else {
                 return Ok(None);
             };
+            if maximum < repetition.min
+                || maximum
+                    > u32::try_from(MAX_ANCHOR_WORD_BYTES).map_err(|_| {
+                        Error::InternalInvariant("inline anchor word bound exceeds u32")
+                    })?
+            {
+                return Ok(None);
+            }
             let Some(child) = language_facts(&repetition.sub, meter)? else {
                 return Ok(None);
             };
@@ -525,7 +620,7 @@ fn language_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<LanguageFacts>,
 fn concat_facts(
     left: LanguageFacts,
     right: LanguageFacts,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<Option<LanguageFacts>, Error> {
     meter.charge(1)?;
     let count = checked_mul(left.count, right.count, Resource::TemporaryStates)?;
@@ -552,7 +647,7 @@ fn facts_within_limits(facts: LanguageFacts) -> bool {
 fn materialize_parts(
     parts: &[&Hir],
     facts: LanguageFacts,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<Words, Error> {
     let mut accumulated = singleton_words(Word::EMPTY, meter)?;
     for part in parts {
@@ -561,8 +656,8 @@ fn materialize_parts(
         ))?;
         let child = materialize_hir(part, child_facts, meter)?;
         let combined_facts = concat_facts(
-            words_facts(&accumulated.values)?,
-            words_facts(&child.values)?,
+            words_facts(&accumulated.values, meter)?,
+            words_facts(&child.values, meter)?,
             meter,
         )?
         .ok_or(Error::InternalInvariant(
@@ -572,8 +667,12 @@ fn materialize_parts(
         for &left in &*accumulated.values {
             for &right in &*child.values {
                 meter.charge(checked_add(
-                    left.bytes().len(),
-                    right.bytes().len(),
+                    1,
+                    checked_add(
+                        left.bytes().len(),
+                        right.bytes().len(),
+                        Resource::CompileWork,
+                    )?,
                     Resource::CompileWork,
                 )?)?;
                 let word = left.concat(right).ok_or(Error::InternalInvariant(
@@ -598,7 +697,7 @@ fn materialize_parts(
     Ok(accumulated)
 }
 
-fn materialize_hir(hir: &Hir, facts: LanguageFacts, meter: &mut Meter) -> Result<Words, Error> {
+fn materialize_hir(hir: &Hir, facts: LanguageFacts, meter: &mut Meter<'_>) -> Result<Words, Error> {
     meter.charge(1)?;
     match hir.kind() {
         HirKind::Empty => singleton_words(Word::EMPTY, meter),
@@ -617,6 +716,7 @@ fn materialize_hir(hir: &Hir, facts: LanguageFacts, meter: &mut Meter) -> Result
         HirKind::Class(Class::Bytes(class)) => {
             let normalized = normalized_class(class, meter)?;
             let mut output = allocate_words(facts.count, meter)?;
+            meter.charge(normalized.len())?;
             for (byte, &present) in normalized.iter().enumerate() {
                 if present {
                     meter.charge(1)?;
@@ -646,7 +746,7 @@ fn materialize_hir(hir: &Hir, facts: LanguageFacts, meter: &mut Meter) -> Result
                 )?;
                 let words = materialize_hir(branch, branch_facts, meter)?;
                 for &word in &*words.values {
-                    meter.charge(word.bytes().len())?;
+                    meter.charge(checked_add(1, word.bytes().len(), Resource::CompileWork)?)?;
                     push(
                         &mut output.values,
                         word,
@@ -689,14 +789,14 @@ fn emit_power(
     remaining: u32,
     prefix: Word,
     output: &mut ExactVec<Word>,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<(), Error> {
     meter.charge(1)?;
     if remaining == 0 {
         return push(output, prefix, "finite-anchor repetition exceeded census");
     }
     for &word in words {
-        meter.charge(word.bytes().len())?;
+        meter.charge(checked_add(1, word.bytes().len(), Resource::CompileWork)?)?;
         let combined = prefix.concat(word).ok_or(Error::InternalInvariant(
             "finite-anchor repetition exceeded inline word",
         ))?;
@@ -716,7 +816,7 @@ fn emit_power(
 fn materialize_concat(
     parts: &[Hir],
     facts: LanguageFacts,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<Words, Error> {
     let mut accumulated = singleton_words(Word::EMPTY, meter)?;
     for part in parts {
@@ -725,8 +825,8 @@ fn materialize_concat(
         ))?;
         let child = materialize_hir(part, child_facts, meter)?;
         let combined_facts = concat_facts(
-            words_facts(&accumulated.values)?,
-            words_facts(&child.values)?,
+            words_facts(&accumulated.values, meter)?,
+            words_facts(&child.values, meter)?,
             meter,
         )?
         .ok_or(Error::InternalInvariant(
@@ -736,8 +836,12 @@ fn materialize_concat(
         for &left in &*accumulated.values {
             for &right in &*child.values {
                 meter.charge(checked_add(
-                    left.bytes().len(),
-                    right.bytes().len(),
+                    1,
+                    checked_add(
+                        left.bytes().len(),
+                        right.bytes().len(),
+                        Resource::CompileWork,
+                    )?,
                     Resource::CompileWork,
                 )?)?;
                 let word = left.concat(right).ok_or(Error::InternalInvariant(
@@ -762,8 +866,9 @@ fn materialize_concat(
     Ok(accumulated)
 }
 
-fn singleton_words(word: Word, meter: &mut Meter) -> Result<Words, Error> {
+fn singleton_words(word: Word, meter: &mut Meter<'_>) -> Result<Words, Error> {
     let mut words = allocate_words(1, meter)?;
+    meter.charge(1)?;
     push(
         &mut words.values,
         word,
@@ -772,7 +877,7 @@ fn singleton_words(word: Word, meter: &mut Meter) -> Result<Words, Error> {
     Ok(words)
 }
 
-fn allocate_words(count: usize, meter: &mut Meter) -> Result<Words, Error> {
+fn allocate_words(count: usize, meter: &mut Meter<'_>) -> Result<Words, Error> {
     let (values, allocated_bytes) = exact_vec(count, meter)?;
     Ok(Words {
         values,
@@ -780,26 +885,26 @@ fn allocate_words(count: usize, meter: &mut Meter) -> Result<Words, Error> {
     })
 }
 
-fn release_words(words: Words, meter: &mut Meter) -> Result<(), Error> {
+fn release_words(words: Words, meter: &mut Meter<'_>) -> Result<(), Error> {
     let bytes = words.allocated_bytes;
+    meter.charge(1)?;
     drop(words);
     meter.release(bytes)
 }
 
-fn words_facts(words: &[Word]) -> Result<LanguageFacts, Error> {
-    let min_bytes = words
-        .iter()
-        .map(|word| word.bytes().len())
-        .min()
-        .unwrap_or(0);
-    let max_bytes = words
-        .iter()
-        .map(|word| word.bytes().len())
-        .max()
-        .unwrap_or(0);
-    let total_bytes = words.iter().try_fold(0_usize, |total, word| {
-        checked_add(total, word.bytes().len(), Resource::LiteralBytes)
-    })?;
+fn words_facts(words: &[Word], meter: &mut Meter<'_>) -> Result<LanguageFacts, Error> {
+    let mut min_bytes = usize::MAX;
+    let mut max_bytes = 0_usize;
+    let mut total_bytes = 0_usize;
+    for word in words {
+        meter.charge(checked_add(1, word.bytes().len(), Resource::CompileWork)?)?;
+        min_bytes = min_bytes.min(word.bytes().len());
+        max_bytes = max_bytes.max(word.bytes().len());
+        total_bytes = checked_add(total_bytes, word.bytes().len(), Resource::LiteralBytes)?;
+    }
+    if words.is_empty() {
+        min_bytes = 0;
+    }
     Ok(LanguageFacts {
         count: words.len(),
         total_bytes,
@@ -810,7 +915,7 @@ fn words_facts(words: &[Word]) -> Result<LanguageFacts, Error> {
 
 fn normalized_class(
     class: &regex_syntax::hir::ClassBytes,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<[bool; 256], Error> {
     let mut normalized = [false; 256];
     for range in class.ranges() {
@@ -825,7 +930,7 @@ fn normalized_class(
     Ok(normalized)
 }
 
-fn consumable_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<ConsumableFacts>, Error> {
+fn consumable_facts(hir: &Hir, meter: &mut Meter<'_>) -> Result<Option<ConsumableFacts>, Error> {
     meter.charge(1)?;
     match hir.kind() {
         HirKind::Empty => Ok(Some(ConsumableFacts {
@@ -867,6 +972,7 @@ fn consumable_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<ConsumableFac
                 let Some(child) = consumable_facts(part, meter)? else {
                     return Ok(None);
                 };
+                meter.charge(facts.bytes.0.len())?;
                 facts.bytes = union(facts.bytes, child.bytes);
                 facts.nullable &= child.nullable;
             }
@@ -883,6 +989,7 @@ fn consumable_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<ConsumableFac
                 let Some(child) = consumable_facts(branch, meter)? else {
                     return Ok(None);
                 };
+                meter.charge(facts.bytes.0.len())?;
                 facts.bytes = union(facts.bytes, child.bytes);
                 facts.nullable |= child.nullable;
             }
@@ -900,7 +1007,7 @@ fn consumable_facts(hir: &Hir, meter: &mut Meter) -> Result<Option<ConsumableFac
     }
 }
 
-fn flattened_count(hir: &Hir, meter: &mut Meter) -> Result<usize, Error> {
+fn flattened_count(hir: &Hir, meter: &mut Meter<'_>) -> Result<usize, Error> {
     meter.charge(1)?;
     match hir.kind() {
         HirKind::Capture(capture) => flattened_count(&capture.sub, meter),
@@ -918,7 +1025,7 @@ fn flattened_count(hir: &Hir, meter: &mut Meter) -> Result<usize, Error> {
 fn flatten<'a>(
     hir: &'a Hir,
     output: &mut ExactVec<&'a Hir>,
-    meter: &mut Meter,
+    meter: &mut Meter<'_>,
 ) -> Result<(), Error> {
     meter.charge(1)?;
     match hir.kind() {
@@ -933,8 +1040,12 @@ fn flatten<'a>(
     }
 }
 
-fn exact_vec<T>(count: usize, meter: &mut Meter) -> Result<(ExactVec<T>, usize), Error> {
+fn exact_vec<T>(count: usize, meter: &mut Meter<'_>) -> Result<(ExactVec<T>, usize), Error> {
     let bytes = checked_mul(count, size_of::<T>(), Resource::ProgramBytes)?;
+    // Prepay the allocator call, the exact-capacity census and the eventual
+    // deallocation so both successful retention and every failed transaction
+    // remain inside the authoritative compile-work limit.
+    meter.charge(checked_add(2, count, Resource::CompileWork)?)?;
     meter.acquire(bytes)?;
     let values = ExactVec::try_with_capacity(count).map_err(|error| match error {
         CopyError::LayoutOverflow => Error::ArithmeticOverflow {
@@ -992,6 +1103,7 @@ mod tests {
     use regex_syntax::ParserBuilder;
 
     use super::*;
+    use crate::CompileLimits;
 
     fn parsed(pattern: &str, case_insensitive: bool, unicode: bool) -> Hir {
         ParserBuilder::new()
@@ -1003,6 +1115,13 @@ mod tests {
             .unwrap()
     }
 
+    fn certify_default(hir: &Hir) -> Certificate<'_> {
+        let mut budget = CompileBudget::new(CompileLimits::default());
+        certify(hir, Limits::default(), &mut budget)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn ordered_url_shape_certifies_per_branch_folded_anchors_and_whitespace_delimiters() {
         let hir = parsed(
@@ -1010,7 +1129,7 @@ mod tests {
             true,
             false,
         );
-        let certificate = certify(&hir, Limits::default()).unwrap().unwrap();
+        let certificate = certify_default(&hir);
         assert_eq!(certificate.branches().len(), 2);
         let first = certificate.branches()[0]
             .words()
@@ -1048,7 +1167,7 @@ mod tests {
     #[test]
     fn branch_order_and_greedy_optional_word_order_are_retained() {
         let hir = parsed(r"(?:https?|ftp)://x|(?:AB|A)\.COM", true, false);
-        let certificate = certify(&hir, Limits::default()).unwrap().unwrap();
+        let certificate = certify_default(&hir);
         let words = certificate
             .branches()
             .iter()
@@ -1075,52 +1194,97 @@ mod tests {
             parsed(r"[a-z]+", false, false),
             parsed(r"\pL+", false, true),
         ] {
-            assert!(certify(&hir, Limits::default()).unwrap().is_none());
+            let mut budget = CompileBudget::new(CompileLimits::default());
+            assert!(
+                certify(&hir, Limits::default(), &mut budget)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(budget.current_construction_bytes(), 0);
         }
     }
 
     #[test]
     fn exact_work_and_scratch_limits_accept_exact_and_refuse_one_below() {
         let hir = parsed(r"(?:https?|ftp)://x|(?:AB|A)\.COM", true, false);
-        let exact = certify(&hir, Limits::default()).unwrap().unwrap();
-        let accounting = exact.accounting();
-        assert!(
-            certify(
-                &hir,
-                Limits {
-                    max_work: accounting.work,
-                    max_scratch_bytes: accounting.scratch_peak_bytes,
-                },
-            )
+        let mut baseline_budget = CompileBudget::new(CompileLimits::default());
+        let exact = certify(&hir, Limits::default(), &mut baseline_budget)
             .unwrap()
-            .is_some()
+            .unwrap();
+        let accounting = exact.accounting();
+        exact.release(&mut baseline_budget).unwrap();
+        assert_eq!(baseline_budget.current_construction_bytes(), 0);
+        let mut exact_budget = CompileBudget::new(CompileLimits {
+            max_work: accounting.work,
+            max_program_bytes: accounting.scratch_peak_bytes,
+            ..CompileLimits::default()
+        });
+        let retained_at_exact = certify(
+            &hir,
+            Limits {
+                max_scratch_bytes: accounting.scratch_peak_bytes,
+            },
+            &mut exact_budget,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            exact_budget.current_construction_bytes(),
+            accounting.retained_bytes
         );
+        retained_at_exact.release(&mut exact_budget).unwrap();
+        assert_eq!(exact_budget.current_construction_bytes(), 0);
+        let mut work_one_below = CompileBudget::new(CompileLimits {
+            max_work: accounting.work - 1,
+            ..CompileLimits::default()
+        });
         assert!(matches!(
             certify(
                 &hir,
                 Limits {
-                    max_work: accounting.work - 1,
                     max_scratch_bytes: accounting.scratch_peak_bytes,
                 },
+                &mut work_one_below,
             ),
             Err(Error::ResourceLimit {
                 resource: Resource::CompileWork,
                 ..
             })
         ));
+        assert_eq!(work_one_below.current_construction_bytes(), 0);
+        let mut scratch_one_below = CompileBudget::new(CompileLimits::default());
         assert!(matches!(
             certify(
                 &hir,
                 Limits {
-                    max_work: accounting.work,
                     max_scratch_bytes: accounting.scratch_peak_bytes - 1,
                 },
+                &mut scratch_one_below,
             ),
             Err(Error::ResourceLimit {
                 resource: Resource::ProgramBytes,
                 ..
             })
         ));
+        assert_eq!(scratch_one_below.current_construction_bytes(), 0);
+        let mut construction_one_below = CompileBudget::new(CompileLimits {
+            max_program_bytes: accounting.scratch_peak_bytes - 1,
+            ..CompileLimits::default()
+        });
+        assert!(matches!(
+            certify(
+                &hir,
+                Limits {
+                    max_scratch_bytes: accounting.scratch_peak_bytes,
+                },
+                &mut construction_one_below,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                ..
+            })
+        ));
+        assert_eq!(construction_one_below.current_construction_bytes(), 0);
     }
 
     #[test]
@@ -1130,12 +1294,17 @@ mod tests {
             .expect("FRE_TEST_URL_PATTERN must name wild/url.txt");
         let source = std::fs::read_to_string(path).unwrap();
         let hir = parsed(source.trim_end(), true, false);
+        let mut budget = CompileBudget::new(CompileLimits {
+            max_work: 64 << 20,
+            max_program_bytes: 64 << 20,
+            ..CompileLimits::default()
+        });
         let certificate = certify(
             &hir,
             Limits {
-                max_work: 64 << 20,
                 max_scratch_bytes: 64 << 20,
             },
+            &mut budget,
         )
         .unwrap()
         .unwrap();
@@ -1168,5 +1337,7 @@ mod tests {
         }
         assert_eq!(certificate.accounting().branches, 2);
         assert_eq!(certificate.accounting().anchor_patterns, 1_501);
+        certificate.release(&mut budget).unwrap();
+        assert_eq!(budget.current_construction_bytes(), 0);
     }
 }
