@@ -1825,6 +1825,7 @@ impl AggregateBuilder {
             Some(PrefixClassInspection::Ineligible { work }) => work,
             None => 0,
         };
+        let bounded_affix_planner_work;
         if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
@@ -1846,78 +1847,86 @@ impl AggregateBuilder {
                     detail: "bounded-affix inspection accounting overflow",
                 },
             })?;
-            if let BoundedAffixInspection::Eligible {
-                left,
-                middle,
-                right,
-                literal,
-                middle_max,
-                work,
-                hir_nodes,
-            } = affix
-            {
-                if hir_nodes != expected_nodes || expected_captures != 0 {
-                    return Err(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "syntax summary differs from bounded-affix inspection",
-                    });
-                }
-                let engine = BoundedContextPlan::build_bounded_affix(
-                    left.ranges()
-                        .iter()
-                        .map(|range| (range.start(), range.end())),
-                    middle
-                        .ranges()
-                        .iter()
-                        .map(|range| (range.start(), range.end())),
-                    right
-                        .ranges()
-                        .iter()
-                        .map(|range| (range.start(), range.end())),
+            match affix {
+                BoundedAffixInspection::Eligible {
+                    left,
+                    middle,
+                    right,
                     literal,
                     middle_max,
-                    limits.bounded_context,
-                )
-                .map_err(|source| AggregateBuildError::BoundedContextBuild {
-                    operation,
-                    selection,
-                    source,
-                })?;
-                let build = engine.build_accounting();
-                let report = AggregateBuildReport {
-                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                    syntax_key,
-                    admission,
-                    syntax,
-                    operation,
-                    selection,
-                    plan: AggregatePlanKind::BoundedContext,
-                    continuation_strategy: None,
-                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
-                    planner_work,
-                    unicode_scalar_planner_work,
-                    fixed_class_sandwich_planner_work,
-                    bounded_class_sequence_planner_work,
-                    prefix_class_alternation_planner_work,
-                    bounded_context_planner_work: work,
-                    finite_planner_work: 0,
-                    capture_erasure_work: 0,
-                    captures_erased: 0,
-                    build: AggregateBuildAccounting::BoundedContext(build),
-                    plan_identity: AggregatePlanIdentity::BoundedContext(
-                        AggregateBoundedContextIdentity {
-                            kernel: engine.count_identity(),
-                        },
-                    ),
-                    retained_capacity_bytes: build.persistent_bytes,
-                };
-                return Ok(AggregatePlan {
-                    engine: AggregateEngine::BoundedContext(engine),
-                    limits,
-                    report,
-                });
+                    work,
+                    hir_nodes,
+                } => {
+                    if hir_nodes != expected_nodes || expected_captures != 0 {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "syntax summary differs from bounded-affix inspection",
+                        });
+                    }
+                    let engine = BoundedContextPlan::build_bounded_affix(
+                        left.ranges()
+                            .iter()
+                            .map(|range| (range.start(), range.end())),
+                        middle
+                            .ranges()
+                            .iter()
+                            .map(|range| (range.start(), range.end())),
+                        right
+                            .ranges()
+                            .iter()
+                            .map(|range| (range.start(), range.end())),
+                        literal,
+                        middle_max,
+                        limits.bounded_context,
+                    )
+                    .map_err(|source| {
+                        AggregateBuildError::BoundedContextBuild {
+                            operation,
+                            selection,
+                            source,
+                        }
+                    })?;
+                    let build = engine.build_accounting();
+                    let report = AggregateBuildReport {
+                        schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        syntax_key,
+                        admission,
+                        syntax,
+                        operation,
+                        selection,
+                        plan: AggregatePlanKind::BoundedContext,
+                        continuation_strategy: None,
+                        capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                        planner_work,
+                        unicode_scalar_planner_work,
+                        fixed_class_sandwich_planner_work,
+                        bounded_class_sequence_planner_work,
+                        prefix_class_alternation_planner_work,
+                        bounded_context_planner_work: work,
+                        finite_planner_work: 0,
+                        capture_erasure_work: 0,
+                        captures_erased: 0,
+                        build: AggregateBuildAccounting::BoundedContext(build),
+                        plan_identity: AggregatePlanIdentity::BoundedContext(
+                            AggregateBoundedContextIdentity {
+                                kernel: engine.count_identity(),
+                            },
+                        ),
+                        retained_capacity_bytes: build.persistent_bytes,
+                    };
+                    return Ok(AggregatePlan {
+                        engine: AggregateEngine::BoundedContext(engine),
+                        limits,
+                        report,
+                    });
+                }
+                BoundedAffixInspection::Ineligible { work } => {
+                    bounded_affix_planner_work = work;
+                }
             }
+        } else {
+            bounded_affix_planner_work = 0;
         }
         let bounded_context_inspection = if !unicode
             && !case_insensitive
@@ -1927,24 +1936,28 @@ impl AggregateBuilder {
                 AggregateOperation::Compile | AggregateOperation::Count
             ) {
             Some(
-                inspect_bounded_context(&rust.hir, limits.max_bounded_context_planner_work)
-                    .map_err(|error| match error {
-                        BoundedContextInspectionError::WorkLimit { needed, limit } => {
-                            AggregateBuildError::BoundedContextPlannerWorkLimit {
-                                operation,
-                                selection,
-                                needed,
-                                limit,
-                            }
+                inspect_bounded_context(
+                    &rust.hir,
+                    bounded_affix_planner_work,
+                    limits.max_bounded_context_planner_work,
+                )
+                .map_err(|error| match error {
+                    BoundedContextInspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::BoundedContextPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
                         }
-                        BoundedContextInspectionError::Overflow => {
-                            AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "bounded-context inspection accounting overflow",
-                            }
+                    }
+                    BoundedContextInspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded-context inspection accounting overflow",
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
@@ -3016,7 +3029,9 @@ enum BoundedAffixInspection<'a> {
         work: usize,
         hir_nodes: usize,
     },
-    Ineligible,
+    Ineligible {
+        work: usize,
+    },
 }
 
 enum BoundedContextInspectionError {
@@ -3039,43 +3054,43 @@ fn inspect_bounded_affix(
     };
     charge()?;
     let HirKind::Concat(parts) = hir.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     let [left, repeated, literal, right] = parts.as_slice() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     charge()?;
     let HirKind::Class(Class::Bytes(left)) = left.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     charge()?;
     let HirKind::Repetition(repeated) = repeated.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     let Some(middle_max) = repeated.max else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     if repeated.min != 0 || !repeated.greedy {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     }
     charge()?;
     let HirKind::Class(Class::Bytes(middle)) = repeated.sub.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     charge()?;
     let HirKind::Literal(literal) = literal.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     charge()?;
     let HirKind::Class(Class::Bytes(right)) = right.kind() else {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     };
     if left.ranges().is_empty()
         || middle.ranges().is_empty()
         || right.ranges().is_empty()
         || literal.0.is_empty()
     {
-        return Ok(BoundedAffixInspection::Ineligible);
+        return Ok(BoundedAffixInspection::Ineligible { work });
     }
     for _ in left
         .ranges()
@@ -3088,6 +3103,16 @@ fn inspect_bounded_affix(
     for _ in &literal.0 {
         charge_bounded_context_work(&mut work, limit)?;
     }
+    if bounded_affix_classes_overlap(left, middle, &mut work, limit)?
+        || bounded_affix_classes_overlap(right, middle, &mut work, limit)?
+    {
+        return Ok(BoundedAffixInspection::Ineligible { work });
+    }
+    for &byte in &literal.0 {
+        if !bounded_affix_class_contains(middle, byte, &mut work, limit)? {
+            return Ok(BoundedAffixInspection::Ineligible { work });
+        }
+    }
     Ok(BoundedAffixInspection::Eligible {
         left,
         middle,
@@ -3099,15 +3124,48 @@ fn inspect_bounded_affix(
     })
 }
 
+fn bounded_affix_classes_overlap(
+    left: &ClassBytes,
+    right: &ClassBytes,
+    work: &mut usize,
+    limit: usize,
+) -> Result<bool, BoundedContextInspectionError> {
+    for left_range in left.ranges() {
+        for right_range in right.ranges() {
+            charge_bounded_context_work(work, limit)?;
+            if left_range.start() <= right_range.end() && right_range.start() <= left_range.end() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn bounded_affix_class_contains(
+    class: &ClassBytes,
+    byte: u8,
+    work: &mut usize,
+    limit: usize,
+) -> Result<bool, BoundedContextInspectionError> {
+    for range in class.ranges() {
+        charge_bounded_context_work(work, limit)?;
+        if range.start() <= byte && byte <= range.end() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the eligibility proof walks the fixed seven-part HIR in semantic order and keeps all charged early refusals together"
 )]
 fn inspect_bounded_context(
     hir: &Hir,
+    initial_work: usize,
     limit: usize,
 ) -> Result<BoundedContextInspection<'_>, BoundedContextInspectionError> {
-    let mut work = 0_usize;
+    let mut work = initial_work;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
     let hir = peel_bounded_context_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;

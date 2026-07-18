@@ -1532,6 +1532,17 @@ fn build_current_fre_span_sum_lifecycle(
 }
 
 fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'static str {
+    if matches!(
+        report.plan_identity,
+        AggregatePlanIdentity::BoundedContext(identity)
+            if identity.kernel.plan_id == fre::BOUNDED_AFFIX_PLAN_ID
+    ) {
+        return if model == "compile" {
+            "compile-aggregate-bounded-affix"
+        } else {
+            "aggregate-bounded-affix"
+        };
+    }
     let sparse = matches!(
         report.build,
         AggregateBuildAccounting::SparseFiniteLiteral(_)
@@ -6961,6 +6972,22 @@ mod tests {
                 actual: expected,
                 plan: plan.to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn current_fre_bounded_affix_receipt_label_binds_kernel_route() {
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &[r"\s[A-Za-z]{0,12}ing\s".to_string()],
+                b" ing  walking\t",
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            2,
+            "aggregate-bounded-affix",
         );
     }
 

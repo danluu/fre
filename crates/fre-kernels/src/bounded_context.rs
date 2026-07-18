@@ -216,7 +216,13 @@ pub struct ReduceUpperBounds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub suffix_intervals: usize,
-    pub literal_occurrences: usize,
+    /// Literal candidates whose bytes were tested by this plan.
+    ///
+    /// The interval-stream plan obtains these candidates from its literal
+    /// finder. The bounded-affix plan obtains them from suffixes immediately
+    /// before a right endpoint. The counter deliberately describes attempts,
+    /// not successful equality tests.
+    pub literal_attempts: usize,
     pub successful_literals: usize,
     pub prefix_candidates: usize,
     pub match_events: usize,
@@ -898,7 +904,7 @@ impl BoundedContextPlan {
                 upper_bounds,
                 actual: ReduceActualCounters {
                     suffix_intervals: 0,
-                    literal_occurrences: literal_attempts,
+                    literal_attempts,
                     successful_literals,
                     prefix_candidates,
                     match_events: events,
@@ -1196,17 +1202,17 @@ impl BoundedContextPlan {
         let mut prefix_scanner = PrefixScanner::default();
         let mut pending_prefix = self.next_prefix(haystack, &mut prefix_scanner)?;
         let mut latest_good: Option<GoodLiteral> = None;
-        let mut literal_occurrences = 0_usize;
+        let mut literal_attempts = 0_usize;
         let mut successful_literals = 0_usize;
         let mut prefix_candidates = usize::from(pending_prefix.is_some());
         let mut match_events = 0_usize;
 
         for literal_start in self.finder.find_iter(haystack) {
-            literal_occurrences =
-                literal_occurrences
+            literal_attempts =
+                literal_attempts
                     .checked_add(1)
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "literal occurrence count",
+                        computation: "literal attempt count",
                     })?;
             let literal_end = literal_start
                 .checked_add(self.finder.needle().len())
@@ -1303,7 +1309,7 @@ impl BoundedContextPlan {
         })?;
         Ok(ReduceActualCounters {
             suffix_intervals: interval_count,
-            literal_occurrences,
+            literal_attempts,
             successful_literals,
             prefix_candidates,
             match_events,
@@ -1861,12 +1867,12 @@ mod tests {
             shared.count,
             u64::try_from(oracle.find_iter(shared_delimiter).count()).unwrap()
         );
-        assert_eq!(shared.accounting.actual.literal_occurrences, 2);
+        assert_eq!(shared.accounting.actual.literal_attempts, 2);
         assert_eq!(shared.accounting.actual.successful_literals, 2);
         assert_eq!(shared.accounting.actual.prefix_candidates, 2);
         assert_eq!(shared.accounting.actual.match_events, 1);
         assert!(
-            default.accounting.actual.literal_occurrences
+            default.accounting.actual.literal_attempts
                 >= default.accounting.actual.successful_literals
         );
         assert!(
@@ -1876,6 +1882,10 @@ mod tests {
         assert!(
             default.accounting.actual.prefix_candidates >= default.accounting.actual.match_events
         );
+        let failed_suffix = plan.count(b" abc ", ReduceLimits::default()).unwrap();
+        assert_eq!(failed_suffix.count, 0);
+        assert_eq!(failed_suffix.accounting.actual.literal_attempts, 1);
+        assert_eq!(failed_suffix.accounting.actual.successful_literals, 0);
         assert_ne!(
             default.accounting.upper_bounds.inspections,
             default.accounting.upper_bounds.branches

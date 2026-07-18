@@ -4,7 +4,7 @@ use fre::{
     AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID,
     BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
     LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
     LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
@@ -33,7 +33,7 @@ fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
     let AggregatePlanIdentity::BoundedContext(identity) = regex.build_report().plan_identity else {
         panic!("bounded-affix identity");
     };
-    assert_eq!(identity.kernel.plan_id, "bounded-affix-count.direct.v1");
+    assert_eq!(identity.kernel.plan_id, BOUNDED_AFFIX_PLAN_ID);
     assert_eq!(
         regex
             .count_value(haystack, AggregateRunLimits::default())
@@ -46,6 +46,89 @@ fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn bounded_affix_generalizes_to_classes_shared_endpoints_and_malformed_bytes() {
+    for (pattern, haystack) in [
+        (r"[ab][cd]{0,2}dc[ab]", b"adcaaaddabdcba".as_slice()),
+        (
+            r"[\xFE-\xFF][ab]{0,2}ab[\xFE-\xFF]",
+            b"\xFFab\xFE\x80\xFEaab\xFF".as_slice(),
+        ),
+    ] {
+        let expected = upstream(pattern, haystack, false).len();
+        let regex = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .build_count()
+            .unwrap();
+        let AggregatePlanIdentity::BoundedContext(identity) = regex.build_report().plan_identity
+        else {
+            panic!("bounded-affix route for {pattern:?}");
+        };
+        assert_eq!(identity.kernel.plan_id, BOUNDED_AFFIX_PLAN_ID);
+        assert_eq!(
+            regex
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(expected).unwrap()
+        );
+    }
+}
+
+#[test]
+fn bounded_affix_noneligible_shapes_fall_through_with_one_shared_work_budget() {
+    for pattern in [r"[ab][bc]{0,2}bc[xy]", r"[ab][cd]{0,2}xy[ab]"] {
+        let haystack = b"abcdxyabcbcx";
+        let expected = upstream(pattern, haystack, false).len();
+        let regex = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .build_count()
+            .expect("noneligible affix must retain the general fallback");
+        assert_ne!(regex.build_report().plan, AggregatePlanKind::BoundedContext);
+        assert_eq!(
+            regex
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(expected).unwrap()
+        );
+
+        let exact_work = regex.build_report().bounded_context_planner_work;
+        assert!(exact_work > 0);
+        let exact_limits = AggregateBuildLimits {
+            max_bounded_context_planner_work: exact_work,
+            ..AggregateBuildLimits::default()
+        };
+        let exact = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(exact_limits)
+            .build_count()
+            .expect("exact combined affix/fallback inspection quota");
+        assert_eq!(
+            exact.build_report().bounded_context_planner_work,
+            exact_work
+        );
+
+        let below_limits = AggregateBuildLimits {
+            max_bounded_context_planner_work: exact_work - 1,
+            ..AggregateBuildLimits::default()
+        };
+        assert!(matches!(
+            aggregate_builder(pattern)
+                .unicode(false)
+                .case_insensitive(false)
+                .limits(below_limits)
+                .build_count(),
+            Err(AggregateBuildError::BoundedContextPlannerWorkLimit {
+                needed,
+                limit,
+                ..
+            }) if needed == exact_work && limit == exact_work - 1
+        ));
+    }
 }
 
 #[test]
