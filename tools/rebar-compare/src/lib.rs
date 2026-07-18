@@ -7511,6 +7511,69 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_quotes_bounded_terminal_class_real_row_canary() {
+        const JOB_ID: &str = "imported/leipzig/quotes-bounded@rust/regex";
+        const PATTERN_SHA256: &str =
+            "68764d7810d256b15dbb4ee7a6a7d7d282bce027da056b4c77a04ae9f9f05c78";
+        const HAYSTACK_SHA256: &str =
+            "f2aa28234e7a8212c9e009fa9c67d1960d2d063d076765de46b0faed5fe44ad8";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact quotes-bounded hard row");
+        assert!(matching.next().is_none(), "duplicate quotes-bounded row");
+        assert_eq!(job.model, "count");
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 8_886);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader
+            .load(job)
+            .expect("load authenticated quotes-bounded row");
+        assert_eq!(input.patterns.len(), 1);
+        assert_eq!(sha256(input.patterns[0].as_bytes()), PATTERN_SHA256);
+        assert_eq!(input.haystack.len(), 16_013_977);
+        assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
+
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE bounded terminal-class result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some("aggregate-continuation-program")
+        );
+        println!(
+            "quotes-bounded-terminal-class-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan")
+        );
+    }
+
     fn retained_ruff_lifecycle(
         haystack_len: usize,
         limits: RunLimits,
