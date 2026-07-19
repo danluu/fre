@@ -523,7 +523,9 @@ fn case_family(harness: RegexAutomataHarnessKind, case_id: &str) -> Result<Strin
         }
         RegexAutomataHarnessKind::Doctest => case_id
             .strip_prefix("src/")
-            .and_then(|rest| rest.split('/').next()),
+            .and_then(|rest| rest.split(" - ").next())
+            .and_then(|source_path| source_path.split('/').next())
+            .map(|component| component.strip_suffix(".rs").unwrap_or(component)),
     }
     .ok_or_else(|| InventoryError::new("cannot classify regex-automata case family"))?;
     if component.is_empty()
@@ -868,6 +870,10 @@ mod tests {
             )
             .unwrap(),
             "doctest-meta",
+        );
+        assert_eq!(
+            case_family(RegexAutomataHarnessKind::Doctest, "src/lib.rs - (line 124)").unwrap(),
+            "doctest-lib",
         );
         assert!(case_family(RegexAutomataHarnessKind::Unit, "bad family::x").is_err());
         assert!(validate_candidate(&candidate('a', 'b')).is_ok());
