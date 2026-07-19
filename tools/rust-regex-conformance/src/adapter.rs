@@ -32,10 +32,9 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v32-utf8-off-direct-and-set-observation-proofs";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v33-utf8-off-find-iteration-proof";
 
-const LIMITATIONS: [&str; 10] = [
+const LIMITATIONS: [&str; 11] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; certified text and bytes persistent-history captures preserve original-haystack assertion context across bounded search windows",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
@@ -46,6 +45,7 @@ const LIMITATIONS: [&str; 10] = [
     "UTF-8-off singleton text-set pattern-ID observation executes only for the same unanchored, unlimited, full-haystack text/bytes compiler proof after both engines return the same ID set; multi-pattern set-which and every inexact search domain remain excluded",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first, earliest-end and leftmost/all search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
     "UTF-8-off bytes-profile cases may execute on text compile, text set compile, and text match-existence surfaces only after candidate-independent expected values are ignored and FRE proves matching text/bytes compiler outcomes; match existence additionally requires a valid UTF-8 haystack and exact scalar-boundary search bounds",
+    "UTF-8-off bytes-profile find iteration may execute on the text surface only for leftmost-first search after independently configured text and bytes matchers both compile and produce identical complete span sequences over an exact scalar-boundary search domain; expected spans are not inspected by this admission proof",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -165,6 +165,9 @@ fn execute_case(
     match surface {
         AdapterSurface::RustTextCompile => execute_text_compile(case, input),
         AdapterSurface::RustTextIsMatch => execute_text_is_match(case, input),
+        AdapterSurface::RustTextFindIter if !case.utf8 => {
+            execute_utf8_off_text_find_iter_equivalence(case, input)
+        }
         AdapterSurface::RustTextFindIter => execute_text_find(case, input),
         AdapterSurface::RustTextCapturesIter => execute_text_captures(case, input),
         AdapterSurface::RustBytesCapturesIter if case.utf8 => execute_text_captures(case, input),
@@ -734,6 +737,22 @@ fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDispo
             "search.portable-execution-refused",
         ),
     }
+}
+
+fn execute_utf8_off_text_find_iter_equivalence(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let Ok(expected_spans) = expected_spans(input) else {
+        return fault("adapter.expected-group-zero-missing");
+    };
+    let Ok(observed) = utf8_off_text_find_iter_equivalent_spans(case, input) else {
+        return fault("adapter.utf8-off-text-find-proof-drift");
+    };
+    compare(
+        &SemanticValue::Matches(expected_spans),
+        &SemanticValue::Matches(observed),
+    )
 }
 
 fn execute_text_capture_find(
@@ -2772,6 +2791,9 @@ fn utf8_off_text_single_equivalence_applicability(
                     (TextBuildAttempt::Built(_), BuildAttempt::Built(_))
                 )
         }
+        AdapterSurface::RustTextFindIter => {
+            utf8_off_text_find_iter_equivalent_spans(case, input).is_ok()
+        }
         _ => false,
     };
     if equivalent {
@@ -2779,6 +2801,61 @@ fn utf8_off_text_single_equivalence_applicability(
     } else {
         Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
     }
+}
+
+/// Prove one UTF-8-off text find-iteration observation by executing both
+/// independently configured facade profiles without consulting the expected
+/// corpus spans. UTF-8 changes empty-match progress and can expose byte-only
+/// pattern semantics even on an otherwise valid text haystack, so compiler
+/// agreement alone is insufficient: the complete observed span sequences
+/// must agree exactly.
+fn utf8_off_text_find_iter_equivalent_spans(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<Vec<ExpectedSpan>, ()> {
+    if case.utf8
+        || !case.compiles
+        || case.pattern_count != 1
+        || input.patterns.len() != 1
+        || case.search_kind != SearchKind::Leftmost
+        || case.match_kind != MatchKind::LeftmostFirst
+    {
+        return Err(());
+    }
+    let haystack = std::str::from_utf8(&input.haystack).map_err(|_| ())?;
+    if input.bounds.start > input.bounds.end
+        || input.bounds.end > haystack.len()
+        || !haystack.is_char_boundary(input.bounds.start)
+        || !haystack.is_char_boundary(input.bounds.end)
+    {
+        return Err(());
+    }
+    let TextBuildAttempt::Built(text) = build_text(case, input) else {
+        return Err(());
+    };
+    let BuildAttempt::Built(bytes) = build_bytes(case, input) else {
+        return Err(());
+    };
+    let text_spans = collect_text_matches(
+        &text,
+        haystack,
+        input.bounds,
+        case.match_limit,
+        case.anchored,
+    )
+    .map_err(|_| ())?;
+    let byte_spans = collect_byte_matches(
+        &bytes,
+        &input.haystack,
+        input.bounds,
+        case.match_limit,
+        case.anchored,
+    )
+    .map_err(|_| ())?;
+    if text_spans != byte_spans {
+        return Err(());
+    }
+    Ok(text_spans)
 }
 
 /// Prove exact text/bytes compiler agreement for one UTF-8-off set. Search
@@ -5474,6 +5551,92 @@ mod tests {
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextSetCompile, &set_case, &set_input),
             Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+        );
+    }
+
+    #[test]
+    fn utf8_off_text_find_requires_dual_complete_iteration_agreement() {
+        let case = fixture_case(true, false, None);
+        let matched = |start, end| ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start, end })],
+        };
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["é".to_owned()],
+            haystack: "xéé".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 5 },
+            line_terminator: b'\n',
+            expected: vec![matched(1, 3), matched(3, 5)],
+        };
+        assert_eq!(
+            utf8_off_text_find_iter_equivalent_spans(&case, &input),
+            Ok(vec![
+                ExpectedSpan { start: 1, end: 3 },
+                ExpectedSpan { start: 3, end: 5 },
+            ])
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextFindIter, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        // Admission is independent of the authenticated expected spans. A
+        // false expected value remains eligible and is reported as mismatch.
+        let mut false_expected = input.clone();
+        false_expected.expected.clear();
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &false_expected,),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextFindIter, &case, &false_expected,),
+            AdapterDisposition::Mismatch { .. }
+        ));
+
+        let mut inconsistent_count = case.clone();
+        inconsistent_count.pattern_count = 2;
+        assert!(utf8_off_text_find_iter_equivalent_spans(&inconsistent_count, &input).is_err());
+
+        // Empty byte iteration visits UTF-8 continuation offsets. Text
+        // iteration cannot, so valid UTF-8 alone does not establish proof.
+        let mut empty = input.clone();
+        empty.patterns = vec![String::new()];
+        empty.expected.clear();
+        assert!(utf8_off_text_find_iter_equivalent_spans(&case, &empty).is_err());
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &empty),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut split_bound = input.clone();
+        split_bound.bounds.start = 2;
+        assert!(utf8_off_text_find_iter_equivalent_spans(&case, &split_bound).is_err());
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &split_bound),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut invalid_haystack = input.clone();
+        invalid_haystack.haystack = vec![0xFF];
+        invalid_haystack.bounds = SearchBounds { start: 0, end: 1 };
+        assert!(utf8_off_text_find_iter_equivalent_spans(&case, &invalid_haystack).is_err());
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &invalid_haystack,),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut byte_only_pattern = input;
+        byte_only_pattern.patterns = vec![r"(?-u:\xFF)".to_owned()];
+        byte_only_pattern.expected.clear();
+        assert!(utf8_off_text_find_iter_equivalent_spans(&case, &byte_only_pattern).is_err());
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextFindIter, &case, &byte_only_pattern,),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
         );
     }
 
