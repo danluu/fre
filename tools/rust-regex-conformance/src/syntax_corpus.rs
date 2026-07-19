@@ -2518,9 +2518,9 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_comments, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 4 private AST parser identities remain explicit Unsupported dispositions.",
-    "Ten exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor state or constructor-only AST/HIR shape is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
-    "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
+    "The FRE AST adapter executes 25 of the 29 authenticated ast::parse unit identities; the four explicit Unsupported receipts are maybe_parse_ascii_class, parse_decimal, parse_primitive_non_escape, and parse_set_class_open, whose asserted private cursor or partial-parser state is not observable through a complete-pattern AST adapter.",
+    "Ten unit receipts are the complete Unsupported set: the four private ast::parse helper identities plus six constructor-only AST/HIR shapes that cannot be produced by complete-pattern parsing. No addressable receipt remains Unsupported.",
+    "All 48 authenticated Rustdoc identities execute through explicit FRE semantic adapters and pass. These adapters replay the pinned examples against FRE; Cargo/rustdoc execution of the upstream documentation remains separately labelled upstream-oracle evidence, not candidate FRE rustdoc execution.",
 ];
 
 /// One file in the complete published package tree.
