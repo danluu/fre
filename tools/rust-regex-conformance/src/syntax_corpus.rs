@@ -348,7 +348,7 @@ enum TestOutcome {
 
 /// Authenticate the complete package, inventory both feature-mode harnesses,
 /// and execute the AST parser family as separately labelled upstream-oracle
-/// evidence. One exact AST obligation additionally executes through FRE.
+/// evidence. Four exact AST obligations additionally execute through FRE.
 #[allow(
     clippy::too_many_lines,
     reason = "the transaction keeps package authentication, four harness lists, the oracle execution, and sealed report assembly adjacent"
@@ -2321,6 +2321,10 @@ mod tests {
         let mut wrong_category = observed.clone();
         wrong_category.category = ErrorCategory::InvalidConfiguration;
         mutations.push(wrong_category);
+        let mut wrong_profile = observed.clone();
+        wrong_profile.profile =
+            Box::new(CompatibilityProfile::RustBytes(RustProfile::regex_1_12_4()));
+        mutations.push(wrong_profile);
         let mut wrong_span = observed.clone();
         wrong_span.span = Some(SourceSpan { start: 0, end: 3 });
         mutations.push(wrong_span);
