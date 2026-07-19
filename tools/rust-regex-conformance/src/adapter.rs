@@ -31,12 +31,14 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v16-singleton-set-single-delegate";
+pub const ADAPTER_ID: &str =
+    "fre-portable-rust-facade-v17-singleton-set-and-utf8-bytes-capture-delegates";
 
-const LIMITATIONS: [&str; 3] = [
+const LIMITATIONS: [&str; 4] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
+    "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -158,6 +160,7 @@ fn execute_case(
         AdapterSurface::RustTextIsMatch => execute_text_is_match(case, input),
         AdapterSurface::RustTextFindIter => execute_text_find(case, input),
         AdapterSurface::RustTextCapturesIter => execute_text_captures(case, input),
+        AdapterSurface::RustBytesCapturesIter if case.utf8 => execute_text_captures(case, input),
         AdapterSurface::RustBytesCapturesIter => execute_bytes_captures(case, input),
         AdapterSurface::RustTextSetCompile => execute_text_set_compile(case, input),
         surface @ (AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich)
@@ -1754,7 +1757,9 @@ fn single_applicability(
         let utf8_bytes_text_delegate = case.utf8
             && matches!(
                 surface,
-                AdapterSurface::RustBytesIsMatch | AdapterSurface::RustBytesFindIter
+                AdapterSurface::RustBytesIsMatch
+                    | AdapterSurface::RustBytesFindIter
+                    | AdapterSurface::RustBytesCapturesIter
             );
         if utf8_bytes_text_delegate && std::str::from_utf8(&input.haystack).is_err() {
             return Err(NotApplicableReason::InvalidUtf8Haystack);
@@ -2885,6 +2890,7 @@ mod tests {
         for surface in [
             AdapterSurface::RustBytesIsMatch,
             AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
         ] {
             assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
             assert!(matches!(
@@ -2892,17 +2898,13 @@ mod tests {
                 AdapterDisposition::Pass { .. }
             ));
         }
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustBytesCapturesIter, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
-        );
-
         let mut invalid = input.clone();
         invalid.haystack = vec![0xFF];
         invalid.bounds = SearchBounds { start: 0, end: 1 };
         for surface in [
             AdapterSurface::RustBytesIsMatch,
             AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
         ] {
             assert_eq!(
                 surface_applicability(surface, &case, &invalid),
@@ -2911,10 +2913,113 @@ mod tests {
         }
 
         let rejected_case = fixture_case(false, true, None);
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustBytesIsMatch, &rejected_case, &input,),
-            Err(NotApplicableReason::CompileOnlyCase)
-        );
+        for surface in [
+            AdapterSurface::RustBytesIsMatch,
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &rejected_case, &input),
+                Err(NotApplicableReason::CompileOnlyCase)
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_bytes_captures_preserve_multibyte_groups_and_empty_progress() {
+        let mut case = fixture_case(true, true, None);
+        case.unicode = true;
+        case.maximum_expected_capture_slots = 3;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["(é)(a)?".to_owned()],
+            haystack: "é éa".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 6 },
+            line_terminator: b'\n',
+            expected: vec![
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![
+                        Some(ExpectedSpan { start: 0, end: 2 }),
+                        Some(ExpectedSpan { start: 0, end: 2 }),
+                        None,
+                    ],
+                },
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![
+                        Some(ExpectedSpan { start: 3, end: 6 }),
+                        Some(ExpectedSpan { start: 3, end: 5 }),
+                        Some(ExpectedSpan { start: 5, end: 6 }),
+                    ],
+                },
+            ],
+        };
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        case.maximum_expected_capture_slots = 2;
+        let empty = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["()".to_owned()],
+            haystack: "éa".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 3 },
+            line_terminator: b'\n',
+            expected: [0, 2, 3]
+                .into_iter()
+                .map(|offset| ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![
+                        Some(ExpectedSpan {
+                            start: offset,
+                            end: offset,
+                        }),
+                        Some(ExpectedSpan {
+                            start: offset,
+                            end: offset,
+                        }),
+                    ],
+                })
+                .collect(),
+        };
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &case, &empty),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        case.anchored = true;
+        let anchored_empty = ExecutableCase {
+            expected: vec![ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![
+                    Some(ExpectedSpan { start: 0, end: 0 }),
+                    Some(ExpectedSpan { start: 0, end: 0 }),
+                ],
+            }],
+            ..empty
+        };
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &case, &anchored_empty),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
     }
 
     #[test]
@@ -2945,6 +3050,10 @@ mod tests {
         }
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextCapturesIter, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesCapturesIter, &case, &input),
             Err(NotApplicableReason::ProfileCannotRepresentBounds)
         );
         assert_eq!(
