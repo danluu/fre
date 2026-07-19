@@ -8,17 +8,17 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchConfig, SearchError,
-    SearchLimits, Span, Window,
+    GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind, Program, ResourceKind,
+    SearchConfig, SearchError, SearchLimits, Span, Window,
 };
 use regex::bytes::Regex;
-use regex_automata::{Input, MatchKind, meta, util::syntax};
+use regex_automata::{Anchored, Input, MatchKind, meta, util::syntax};
 
-fn bounded_reference(pattern: &str) -> meta::Regex {
+fn bounded_reference_with_match_kind(pattern: &str, match_kind: MatchKind) -> meta::Regex {
     meta::Regex::builder()
         .configure(
             meta::Regex::config()
-                .match_kind(MatchKind::LeftmostFirst)
+                .match_kind(match_kind)
                 .utf8_empty(false),
         )
         .syntax(syntax::Config::default().utf8(false))
@@ -35,15 +35,32 @@ fn pair(ast: &Ast) -> (InlineRegex, HistoryRegex) {
 }
 
 fn reference(pattern: &str, haystack: &[u8], window: Window) -> Option<CaptureRecord> {
+    reference_with_match_kind(pattern, haystack, window, MatchKind::LeftmostFirst, false)
+}
+
+fn reference_with_match_kind(
+    pattern: &str,
+    haystack: &[u8],
+    window: Window,
+    match_kind: MatchKind,
+    anchored: bool,
+) -> Option<CaptureRecord> {
     let names = Regex::new(pattern)
         .unwrap()
         .capture_names()
         .map(|name| name.map(str::to_owned))
         .collect::<Vec<_>>();
-    let re = bounded_reference(pattern);
+    let re = bounded_reference_with_match_kind(pattern, match_kind);
     let mut captures = re.create_captures();
+    let anchored = if anchored {
+        Anchored::Yes
+    } else {
+        Anchored::No
+    };
     re.captures(
-        Input::new(haystack).span(window.start..window.end),
+        Input::new(haystack)
+            .span(window.start..window.end)
+            .anchored(anchored),
         &mut captures,
     );
     captures.is_match().then(|| {
@@ -65,28 +82,47 @@ fn reference(pattern: &str, haystack: &[u8], window: Window) -> Option<CaptureRe
 }
 
 fn reference_iter(pattern: &str, haystack: &[u8], window: Window) -> Vec<CaptureRecord> {
+    reference_iter_with_match_kind(pattern, haystack, window, MatchKind::LeftmostFirst, false)
+}
+
+fn reference_iter_with_match_kind(
+    pattern: &str,
+    haystack: &[u8],
+    window: Window,
+    match_kind: MatchKind,
+    anchored: bool,
+) -> Vec<CaptureRecord> {
     let names = Regex::new(pattern)
         .unwrap()
         .capture_names()
         .map(|name| name.map(str::to_owned))
         .collect::<Vec<_>>();
-    let re = bounded_reference(pattern);
-    re.captures_iter(Input::new(haystack).span(window.start..window.end))
-        .map(|captures| CaptureRecord {
-            groups: names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| GroupRecord {
-                    index: u32::try_from(index).unwrap(),
-                    name: name.clone(),
-                    span: captures.get_group(index).map(|matched| Span {
-                        start: matched.start,
-                        end: matched.end,
-                    }),
-                })
-                .collect(),
-        })
-        .collect()
+    let re = bounded_reference_with_match_kind(pattern, match_kind);
+    let anchored = if anchored {
+        Anchored::Yes
+    } else {
+        Anchored::No
+    };
+    re.captures_iter(
+        Input::new(haystack)
+            .span(window.start..window.end)
+            .anchored(anchored),
+    )
+    .map(|captures| CaptureRecord {
+        groups: names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| GroupRecord {
+                index: u32::try_from(index).unwrap(),
+                name: name.clone(),
+                span: captures.get_group(index).map(|matched| Span {
+                    start: matched.start,
+                    end: matched.end,
+                }),
+            })
+            .collect(),
+    })
+    .collect()
 }
 
 fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
@@ -343,6 +379,132 @@ fn earliest_end_selects_first_priority_history_at_accepting_boundary() {
             .captures,
         Some(expected)
     );
+}
+
+fn assert_all_match_kind(
+    ast: &Ast,
+    haystack: &[u8],
+    overall: Span,
+    group_one: Option<Span>,
+    group_two: Option<Span>,
+    anchored: bool,
+) {
+    let config = SearchConfig::LEFTMOST
+        .match_kind(CaptureMatchKind::All)
+        .anchored(anchored);
+    let (inline, history) = pair(ast);
+    let pattern = render(ast);
+    let expected = reference_with_match_kind(
+        &pattern,
+        haystack,
+        Window::all(haystack),
+        MatchKind::All,
+        anchored,
+    )
+    .unwrap();
+    for observed in [
+        inline
+            .captures_with_config(
+                haystack,
+                Window::all(haystack),
+                config,
+                SearchLimits::default(),
+            )
+            .unwrap()
+            .captures
+            .unwrap(),
+        history
+            .captures_with_config(
+                haystack,
+                Window::all(haystack),
+                config,
+                SearchLimits::default(),
+            )
+            .unwrap()
+            .captures
+            .unwrap(),
+    ] {
+        assert_eq!(observed, expected);
+        assert_eq!(observed.overall(), Some(overall));
+        assert_eq!(observed.groups[1].span, group_one);
+        if let Some(group) = observed.groups.get(2) {
+            assert_eq!(group.span, group_two);
+        }
+    }
+    let expected = reference_iter_with_match_kind(
+        &pattern,
+        haystack,
+        Window::all(haystack),
+        MatchKind::All,
+        anchored,
+    );
+    assert_eq!(
+        inline
+            .captures_iter_with_config(
+                haystack,
+                Window::all(haystack),
+                config,
+                AggregateLimits::default(),
+            )
+            .unwrap()
+            .captures,
+        expected
+    );
+    assert_eq!(
+        history
+            .captures_iter_with_config(
+                haystack,
+                Window::all(haystack),
+                config,
+                AggregateLimits::default(),
+            )
+            .unwrap()
+            .captures,
+        expected
+    );
+}
+
+#[test]
+fn all_match_kind_selects_last_end_without_losing_equal_end_priority() {
+    for (ast, haystack, overall, group_one, group_two, anchored) in [
+        (
+            Ast::alt([
+                Ast::Byte(b'a').capture(1),
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'a')]).capture(2),
+            ]),
+            b"aa".as_slice(),
+            Span { start: 0, end: 2 },
+            None,
+            Some(Span { start: 0, end: 2 }),
+            false,
+        ),
+        (
+            Ast::alt([Ast::Byte(b'a').capture(1), Ast::Byte(b'a').capture(2)]),
+            b"a".as_slice(),
+            Span { start: 0, end: 1 },
+            Some(Span { start: 0, end: 1 }),
+            None,
+            false,
+        ),
+        (
+            Ast::Byte(b'a').capture(1),
+            b"aba".as_slice(),
+            Span { start: 2, end: 3 },
+            Some(Span { start: 2, end: 3 }),
+            None,
+            false,
+        ),
+        (
+            Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Lazy),
+            b"aaa".as_slice(),
+            Span { start: 0, end: 3 },
+            Some(Span { start: 2, end: 3 }),
+            None,
+            true,
+        ),
+    ] {
+        assert_all_match_kind(&ast, haystack, overall, group_one, group_two, anchored);
+    }
 }
 
 #[test]

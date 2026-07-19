@@ -1,9 +1,9 @@
 //! Bounded engines for exact regular-expression capture semantics.
 //!
 //! This crate implements the small capture-aware AST and tagged execution core
-//! for the pinned Rust byte-regex leftmost-first profile. The production `fre`
-//! facade owns syntax/profile admission and exposes only its qualified HIR
-//! subset. [`InlineRegex`] remains a comparative formulation, while
+//! for the pinned Rust byte-regex leftmost-first and `All` match-priority
+//! profiles. The production `fre` facade owns syntax/profile admission and
+//! exposes only its qualified HIR subset. [`InlineRegex`] remains a comparative formulation, while
 //! [`HistoryRegex`] supplies the persistent-history production plan. Neither
 //! executor uses recursive backtracking or silently falls back to another
 //! engine.
@@ -34,7 +34,7 @@ pub use history::HistoryRegex;
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
 pub use model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord, RunReport,
-    SearchConfig, SearchKind, SearchOutcome, Span, Window,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord, MatchKind,
+    RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;

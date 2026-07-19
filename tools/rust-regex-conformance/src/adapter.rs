@@ -9,8 +9,8 @@ use std::{
 
 use bstr::ByteVec;
 use fre::{
-    BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    CaptureSearchConfig, CaptureSearchLimits, CaptureSpan, CaptureWindow, PlanKind,
+    BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureMatchKind,
+    CaptureRegex, CaptureSearchConfig, CaptureSearchLimits, CaptureSpan, CaptureWindow, PlanKind,
     PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
     PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
     PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
@@ -32,7 +32,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v28-overlapping-iteration";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v29-overlapping-leftmost-all";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -41,7 +41,7 @@ const LIMITATIONS: [&str; 7] = [
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; selection-sensitive multi-pattern set which uses an adapter-only repeated constituent-search correctness fallback (up to O(patterns × haystack positions) facade search calls, each over a remaining window) for leftmost-first ordered-union and exact-literal leftmost/all selection, not a native or fast production RegexSet engine; UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
-    "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first and earliest-end search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
+    "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first, earliest-end and leftmost/all search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -684,8 +684,8 @@ fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDispo
     if case.search_kind == SearchKind::Overlapping {
         return execute_text_overlapping(case, input, &expected, true);
     }
-    if case.search_kind == SearchKind::Earliest {
-        return execute_text_earliest_find(case, input, &expected);
+    if case.search_kind == SearchKind::Earliest || case.match_kind == MatchKind::All {
+        return execute_text_capture_find(case, input, &expected);
     }
     let regex = match build_text(case, input) {
         TextBuildAttempt::Built(regex) => regex,
@@ -718,7 +718,7 @@ fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDispo
     }
 }
 
-fn execute_text_earliest_find(
+fn execute_text_capture_find(
     case: &CaseReceipt,
     input: &ExecutableCase,
     expected: &SemanticValue,
@@ -741,7 +741,10 @@ fn execute_text_earliest_find(
     let Some(bounds) = text_search_bounds(haystack, input.bounds) else {
         return compare(expected, &SemanticValue::Matches(Vec::new()));
     };
-    let config = CaptureSearchConfig::EARLIEST.anchored(case.anchored);
+    let config = match capture_search_config(case) {
+        Ok(config) => config,
+        Err(disposition) => return disposition,
+    };
     let Ok(report) = regex.captures_iter_window_with_config(
         haystack,
         CaptureWindow {
@@ -753,7 +756,7 @@ fn execute_text_earliest_find(
     ) else {
         return unsupported(
             CapabilityId::CaptureIteration,
-            "search.text-earliest-execution-refused",
+            "search.text-configured-execution-refused",
         );
     };
     let Ok(mut observed) = capture_records(&report.captures, input.haystack.len()) else {
@@ -1726,8 +1729,8 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
     if case.search_kind == SearchKind::Overlapping {
         return execute_bytes_overlapping(case, input, &expected, true);
     }
-    if case.search_kind == SearchKind::Earliest {
-        return execute_bytes_earliest_find(case, input, &expected);
+    if case.search_kind == SearchKind::Earliest || case.match_kind == MatchKind::All {
+        return execute_bytes_capture_find(case, input, &expected);
     }
     let regex = match build_bytes(case, input) {
         BuildAttempt::Built(regex) => regex,
@@ -1757,7 +1760,7 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
     }
 }
 
-fn execute_bytes_earliest_find(
+fn execute_bytes_capture_find(
     case: &CaseReceipt,
     input: &ExecutableCase,
     expected: &SemanticValue,
@@ -1775,7 +1778,10 @@ fn execute_bytes_earliest_find(
             return disposition;
         }
     };
-    let config = CaptureSearchConfig::EARLIEST.anchored(case.anchored);
+    let config = match capture_search_config(case) {
+        Ok(config) => config,
+        Err(disposition) => return disposition,
+    };
     let Ok(report) = regex.captures_iter_window_with_config(
         &input.haystack,
         CaptureWindow {
@@ -1787,7 +1793,7 @@ fn execute_bytes_earliest_find(
     ) else {
         return unsupported(
             CapabilityId::CaptureIteration,
-            "search.bytes-earliest-execution-refused",
+            "search.bytes-configured-execution-refused",
         );
     };
     let Ok(mut observed) = capture_records(&report.captures, input.haystack.len()) else {
@@ -2280,7 +2286,7 @@ fn execute_capture_free_text_captures(
     expected: &SemanticValue,
     original: AdapterDisposition,
 ) -> AdapterDisposition {
-    if case.search_kind == SearchKind::Earliest {
+    if case.search_kind != SearchKind::Leftmost || case.match_kind != MatchKind::LeftmostFirst {
         return original;
     }
     let regex = match build_text(case, input) {
@@ -2420,7 +2426,14 @@ fn capture_search_config(case: &CaseReceipt) -> Result<CaptureSearchConfig, Adap
             return Err(fault("adapter.capture-search-policy-invariant"));
         }
     };
-    Ok(config.anchored(case.anchored))
+    let match_kind = match case.match_kind {
+        MatchKind::All => CaptureMatchKind::All,
+        MatchKind::LeftmostFirst => CaptureMatchKind::LeftmostFirst,
+        MatchKind::LeftmostLongest => {
+            return Err(fault("adapter.capture-match-policy-invariant"));
+        }
+    };
+    Ok(config.match_kind(match_kind).anchored(case.anchored))
 }
 
 fn build_captures(case: &CaseReceipt, input: &ExecutableCase) -> CaptureBuildAttempt {
@@ -2712,12 +2725,9 @@ fn single_applicability(
         if !matches!(
             (case.search_kind, case.match_kind),
             (
-                SearchKind::Leftmost | SearchKind::Earliest,
-                MatchKind::LeftmostFirst,
-            ) | (
-                SearchKind::Overlapping,
-                MatchKind::LeftmostFirst | MatchKind::All,
-            )
+                SearchKind::Leftmost | SearchKind::Overlapping,
+                MatchKind::LeftmostFirst | MatchKind::All
+            ) | (SearchKind::Earliest, MatchKind::LeftmostFirst)
         ) {
             return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
         }
@@ -4808,6 +4818,55 @@ mod tests {
             ),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
         );
+    }
+
+    #[test]
+    fn leftmost_all_single_surfaces_preserve_longest_and_capture_priority() {
+        let span = |start, end| Some(ExpectedSpan { start, end });
+        let cases = [
+            ExecutableCase {
+                id: "fixture/longest".to_owned(),
+                patterns: vec!["(a)|(aa)".to_owned()],
+                haystack: b"aa".to_vec(),
+                bounds: SearchBounds { start: 0, end: 2 },
+                line_terminator: b'\n',
+                expected: vec![ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![span(0, 2), None, span(0, 2)],
+                }],
+            },
+            ExecutableCase {
+                id: "fixture/equal-end-priority".to_owned(),
+                patterns: vec!["(a)|(a)".to_owned()],
+                haystack: b"a".to_vec(),
+                bounds: SearchBounds { start: 0, end: 1 },
+                line_terminator: b'\n',
+                expected: vec![ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![span(0, 1), span(0, 1), None],
+                }],
+            },
+        ];
+
+        for input in &cases {
+            let mut text_case = fixture_case(true, true, None);
+            text_case.match_kind = MatchKind::All;
+            text_case.maximum_expected_capture_slots = 3;
+            let mut bytes_case = text_case.clone();
+            bytes_case.utf8 = false;
+            for (surface, case) in [
+                (AdapterSurface::RustTextFindIter, &text_case),
+                (AdapterSurface::RustTextCapturesIter, &text_case),
+                (AdapterSurface::RustBytesFindIter, &bytes_case),
+                (AdapterSurface::RustBytesCapturesIter, &bytes_case),
+            ] {
+                assert_eq!(surface_applicability(surface, case, input), Ok(()));
+                assert!(matches!(
+                    execute_case(surface, case, input),
+                    AdapterDisposition::Pass { .. }
+                ));
+            }
+        }
     }
 
     #[test]

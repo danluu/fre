@@ -814,8 +814,8 @@ impl PortableTextCaptureRegex {
         self.captures_with_config(haystack, CaptureSearchConfig::LEFTMOST, limits)
     }
 
-    /// Return one capture record under an explicit match-end selection and
-    /// start-injection policy.
+    /// Return one capture record under explicit match-end, match-priority and
+    /// start-injection policies.
     pub fn captures_with_config<'h>(
         &self,
         haystack: &'h str,
@@ -916,8 +916,8 @@ impl PortableTextCaptureRegex {
         )
     }
 
-    /// Materialize complete text captures under an explicit match-end
-    /// selection and start-injection policy.
+    /// Materialize complete text captures under explicit match-end,
+    /// match-priority and start-injection policies.
     pub fn captures_iter_window_with_config(
         &self,
         haystack: &str,
@@ -1283,8 +1283,8 @@ impl CaptureRegex {
         self.captures_with_config(haystack, CaptureSearchConfig::LEFTMOST, limits)
     }
 
-    /// Return the first capture record under an explicit match-end selection
-    /// and start-injection policy.
+    /// Return the first capture record under explicit match-end,
+    /// match-priority and start-injection policies.
     pub fn captures_with_config(
         &self,
         haystack: &[u8],
@@ -1358,8 +1358,8 @@ impl CaptureRegex {
         )
     }
 
-    /// Collect every match under an explicit match-end selection and
-    /// start-injection policy.
+    /// Collect every match under explicit match-end, match-priority and
+    /// start-injection policies.
     pub fn captures_iter_window_with_config(
         &self,
         haystack: &[u8],

@@ -42,11 +42,22 @@ pub enum SearchKind {
     Earliest,
 }
 
+/// Match-priority policy for one capture search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MatchKind {
+    /// Report the last accepting match, ignoring match-end priority.
+    All,
+    /// Preserve ordered alternation and greediness priority.
+    LeftmostFirst,
+}
+
 /// Explicit selection and start-injection policy for one capture search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchConfig {
     /// End-boundary selection policy.
     pub kind: SearchKind,
+    /// Match-priority policy.
+    pub match_kind: MatchKind,
     /// When true, inject a start only at the requested search offset.
     pub anchored: bool,
 }
@@ -55,14 +66,23 @@ impl SearchConfig {
     /// Ordinary unanchored leftmost-first search.
     pub const LEFTMOST: Self = Self {
         kind: SearchKind::Leftmost,
+        match_kind: MatchKind::LeftmostFirst,
         anchored: false,
     };
 
     /// Unanchored earliest-end search.
     pub const EARLIEST: Self = Self {
         kind: SearchKind::Earliest,
+        match_kind: MatchKind::LeftmostFirst,
         anchored: false,
     };
+
+    /// Return this policy with the requested match-priority semantics.
+    #[must_use]
+    pub const fn match_kind(mut self, match_kind: MatchKind) -> Self {
+        self.match_kind = match_kind;
+        self
+    }
 
     /// Return this policy with start injection restricted to the search offset.
     #[must_use]

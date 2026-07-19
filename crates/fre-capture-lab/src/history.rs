@@ -7,8 +7,8 @@ use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, RunReport, SearchConfig, SearchKind,
-    SearchOutcome, Span, Window,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, MatchKind, RunReport, SearchConfig,
+    SearchKind, SearchOutcome, Span, Window,
 };
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
 use crate::runtime::{
@@ -536,8 +536,10 @@ impl HistoryRegex {
         let mut winner = None;
         let mut pos = from;
 
+        let all_matches = config.match_kind == MatchKind::All;
+        let continue_after_match = all_matches && config.kind == SearchKind::Leftmost;
         loop {
-            if winner.is_none() && (!config.anchored || pos == from) {
+            if (winner.is_none() || continue_after_match) && (!config.anchored || pos == from) {
                 counters.starts_injected =
                     checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
                 add_thread(
@@ -559,19 +561,25 @@ impl HistoryRegex {
                 )?;
             }
 
-            if let Some(index) = current
-                .iter()
-                .position(|thread| matches!(self.program.states[thread.pc], State::Match))
-            {
+            let accepting = if all_matches {
+                current
+                    .iter()
+                    .rposition(|thread| matches!(self.program.states[thread.pc], State::Match))
+            } else {
+                current
+                    .iter()
+                    .position(|thread| matches!(self.program.states[thread.pc], State::Match))
+            };
+            if let Some(index) = accepting {
                 winner = Some(current[index].history.ok_or(SearchError::InvalidProgram)?);
                 if config.kind == SearchKind::Earliest {
                     current.clear();
-                } else {
+                } else if !all_matches {
                     current.truncate(index);
                 }
             }
             counters.peak_threads = counters.peak_threads.max(current.len());
-            if winner.is_some() && current.is_empty() {
+            if winner.is_some() && current.is_empty() && !continue_after_match {
                 break;
             }
             if pos == window.end {
@@ -587,15 +595,19 @@ impl HistoryRegex {
                 .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
             let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
             for thread in current.drain(..) {
-                let State::Byte {
-                    ranges,
-                    next: target,
-                } = self
+                let state = self
                     .program
                     .states
                     .get(thread.pc)
-                    .ok_or(SearchError::InvalidProgram)?
+                    .ok_or(SearchError::InvalidProgram)?;
+                let State::Byte {
+                    ranges,
+                    next: target,
+                } = state
                 else {
+                    if all_matches && matches!(state, State::Match) {
+                        continue;
+                    }
                     return Err(SearchError::InvalidProgram);
                 };
                 if ranges
