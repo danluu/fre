@@ -159,6 +159,11 @@ const HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID: &str = "hir::tests::class_range_c
 const HIR_LOOK_SET_ITER_CASE_ID: &str = "hir::tests::look_set_iter";
 const HIR_LOOK_SET_DEBUG_CASE_ID: &str = "hir::tests::look_set_debug";
 const HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID: &str = "hir::tests::no_stack_overflow_on_drop";
+const UTF8_BMP_CASE_ID: &str = "utf8::tests::bmp";
+const UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID: &str = "utf8::tests::codepoints_no_surrogates";
+const UTF8_REVERSE_CASE_ID: &str = "utf8::tests::reverse";
+const UTF8_SINGLE_CODEPOINT_CASE_ID: &str = "utf8::tests::single_codepoint_one_sequence";
+const UTF8_DOCTEST_SEQUENCES_CASE_ID: &str = "src/utf8.rs - utf8::Utf8Sequences (line 263)";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -3509,6 +3514,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
         };
     }
+    if is_supported_utf8_case(&obligation.case_id) {
+        return execute_utf8_case(&obligation.case_id);
+    }
     if is_supported_hir_misc_case(&obligation.case_id) {
         return execute_hir_misc_case(&obligation.case_id);
     }
@@ -3877,6 +3885,16 @@ fn is_supported_hir_misc_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_utf8_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        UTF8_BMP_CASE_ID
+            | UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID
+            | UTF8_REVERSE_CASE_ID
+            | UTF8_SINGLE_CODEPOINT_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -3893,7 +3911,8 @@ fn is_supported_hir_doctest_case(case_id: &str) -> bool {
             | HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID
-    ) || is_supported_hir_seq_doctest_case(case_id)
+    ) || case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID
+        || is_supported_hir_seq_doctest_case(case_id)
         || is_supported_hir_constructor_doctest_case(case_id)
 }
 
@@ -4150,6 +4169,28 @@ fn execute_hir_misc_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-hir-misc-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_utf8_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_utf8_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: utf8_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: utf8_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-utf8-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -5456,7 +5497,151 @@ fn run_hir_misc_case(case_id: &str) -> Result<(), AstMismatch> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors four unit tests and one public UTF-8 doctest"
+)]
+fn run_utf8_case(case_id: &str) -> Result<(), AstMismatch> {
+    use regex_syntax::utf8::{Utf8Range, Utf8Sequence, Utf8Sequences};
+
+    let rutf8 = |start, end| Utf8Range { start, end };
+    match case_id {
+        UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID => {
+            let ranges = [
+                ('\0', '\u{FFFF}'),
+                ('\0', '\u{10FFFF}'),
+                ('\0', '\u{10FFFE}'),
+                ('\u{80}', '\u{10FFFF}'),
+                ('\u{D7FF}', '\u{E000}'),
+            ];
+            for (index, (start, end)) in ranges.into_iter().enumerate() {
+                let seqs = Utf8Sequences::new(start, end).collect::<Vec<_>>();
+                for codepoint in 0xD800..0xE000 {
+                    let bytes = encode_surrogate_codepoint(codepoint);
+                    if seqs.iter().any(|sequence| sequence.matches(&bytes)) {
+                        return Err(AstMismatch {
+                            expected: format!("{case_id}-{index}: no encoded surrogate matches"),
+                            observed: format!(
+                                "{case_id}-{index}: U+{codepoint:04X} matched by {seqs:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+            let _ = exact_text_hir_pair(r"[\x{D7FF}-\x{E000}]", case_id)?;
+        }
+        UTF8_SINGLE_CODEPOINT_CASE_ID => {
+            for codepoint in 0..=0x10_FFFF {
+                let Some(c) = char::from_u32(codepoint) else {
+                    continue;
+                };
+                let count = Utf8Sequences::new(c, c).count();
+                if count != 1 {
+                    return Err(AstMismatch {
+                        expected: format!("{case_id}: U+{codepoint:04X} has one sequence"),
+                        observed: format!("{case_id}: {count}"),
+                    });
+                }
+            }
+            for pattern in [r"\x{0}", r"\x{80}", r"\x{10FFFF}"] {
+                let _ = exact_text_hir_pair(pattern, case_id)?;
+            }
+        }
+        UTF8_BMP_CASE_ID => {
+            use Utf8Sequence::{One, Three, Two};
+            let observed = Utf8Sequences::new('\0', '\u{FFFF}').collect::<Vec<_>>();
+            let expected = vec![
+                One(rutf8(0x00, 0x7F)),
+                Two([rutf8(0xC2, 0xDF), rutf8(0x80, 0xBF)]),
+                Three([rutf8(0xE0, 0xE0), rutf8(0xA0, 0xBF), rutf8(0x80, 0xBF)]),
+                Three([rutf8(0xE1, 0xEC), rutf8(0x80, 0xBF), rutf8(0x80, 0xBF)]),
+                Three([rutf8(0xED, 0xED), rutf8(0x80, 0x9F), rutf8(0x80, 0xBF)]),
+                Three([rutf8(0xEE, 0xEF), rutf8(0x80, 0xBF), rutf8(0x80, 0xBF)]),
+            ];
+            hir_doctest_assert_eq(case_id, "bmp-sequences", &expected, &observed)?;
+            let _ = exact_text_hir_pair(r"[\x{0}-\x{FFFF}]", case_id)?;
+        }
+        UTF8_REVERSE_CASE_ID => {
+            use Utf8Sequence::{Four, One, Three, Two};
+            let mut one = One(rutf8(0xA, 0xB));
+            one.reverse();
+            hir_doctest_assert_eq(case_id, "one", &[rutf8(0xA, 0xB)][..], one.as_slice())?;
+            let mut two = Two([rutf8(0xA, 0xB), rutf8(0xB, 0xC)]);
+            two.reverse();
+            hir_doctest_assert_eq(
+                case_id,
+                "two",
+                &[rutf8(0xB, 0xC), rutf8(0xA, 0xB)][..],
+                two.as_slice(),
+            )?;
+            let mut three = Three([rutf8(0xA, 0xB), rutf8(0xB, 0xC), rutf8(0xC, 0xD)]);
+            three.reverse();
+            hir_doctest_assert_eq(
+                case_id,
+                "three",
+                &[rutf8(0xC, 0xD), rutf8(0xB, 0xC), rutf8(0xA, 0xB)][..],
+                three.as_slice(),
+            )?;
+            let mut four = Four([
+                rutf8(0xA, 0xB),
+                rutf8(0xB, 0xC),
+                rutf8(0xC, 0xD),
+                rutf8(0xD, 0xE),
+            ]);
+            four.reverse();
+            hir_doctest_assert_eq(
+                case_id,
+                "four",
+                &[
+                    rutf8(0xD, 0xE),
+                    rutf8(0xC, 0xD),
+                    rutf8(0xB, 0xC),
+                    rutf8(0xA, 0xB),
+                ][..],
+                four.as_slice(),
+            )?;
+            let _ = exact_text_hir_pair("☃", case_id)?;
+        }
+        UTF8_DOCTEST_SEQUENCES_CASE_ID => {
+            let sequences = Utf8Sequences::new('\0', '\u{FFFF}').collect::<Vec<_>>();
+            for (index, (bytes, expected)) in [
+                (&[0x61][..], true),
+                (&[0xE2, 0x98, 0x83][..], true),
+                (&[0xF0, 0x90, 0x8D, 0x88][..], false),
+                (&[0xED, 0xA0, 0x80][..], false),
+                (&[0xFF, 0xFF][..], false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let observed = sequences.iter().any(|sequence| sequence.matches(bytes));
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed,
+                )?;
+            }
+            let _ = exact_text_hir_pair(r"[\x{0}-\x{FFFF}]", case_id)?;
+        }
+        _ => unreachable!("caller checked supported UTF-8 case"),
+    }
+    Ok(())
+}
+
+fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
+    debug_assert!((0xD800..0xE000).contains(&codepoint));
+    [
+        u8::try_from(codepoint >> 12 & 0x0F).expect("surrogate prefix nibble fits") | 0b1110_0000,
+        u8::try_from(codepoint >> 6 & 0x3F).expect("surrogate middle bits fit") | 0b1000_0000,
+        u8::try_from(codepoint & 0x3F).expect("surrogate suffix bits fit") | 0b1000_0000,
+    ]
+}
+
 fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    if case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID {
+        return run_utf8_case(case_id);
+    }
     if is_supported_hir_constructor_doctest_case(case_id) {
         return run_hir_constructor_doctest_case(case_id);
     }
@@ -5503,7 +5688,7 @@ fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
     }
 }
 
-fn hir_doctest_assert_eq<T: std::fmt::Debug + PartialEq>(
+fn hir_doctest_assert_eq<T: std::fmt::Debug + PartialEq + ?Sized>(
     case_id: &str,
     label: &str,
     expected: &T,
@@ -7130,6 +7315,23 @@ fn hir_misc_pass_evidence(case_id: &str) -> String {
     sha256(contract.as_bytes())
 }
 
+fn utf8_pass_evidence(case_id: &str) -> String {
+    let assertions = match case_id {
+        UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID => "five-ranges-times-2048-surrogate-encodings",
+        UTF8_SINGLE_CODEPOINT_CASE_ID => "every-valid-scalar-has-one-sequence",
+        UTF8_BMP_CASE_ID => "exact-six-sequence-bmp-decomposition",
+        UTF8_REVERSE_CASE_ID => "one-two-three-four-byte-sequence-reversal",
+        UTF8_DOCTEST_SEQUENCES_CASE_ID => "five-public-bmp-membership-examples",
+        _ => unreachable!("caller checked supported UTF-8 case"),
+    };
+    sha256(
+        format!(
+            "fre.regex-syntax.utf8-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertions={assertions}\nexpected=exact-public-utf8-sequence-semantics\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -7149,6 +7351,9 @@ fn write_hir_class_operation_evidence(
 }
 
 fn hir_doctest_pass_evidence(case_id: &str) -> String {
+    if case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID {
+        return utf8_pass_evidence(case_id);
+    }
     let mut contract = format!(
         "fre.regex-syntax.hir-doctest-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nexpected=exact-public-doctest-semantics\n"
     );
@@ -7520,6 +7725,15 @@ fn hir_misc_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> 
     )
 }
 
+fn utf8_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.utf8-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -7543,6 +7757,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_ast_print_case(case_id)
         || is_supported_hir_print_case(case_id)
         || is_supported_hir_literal_case(case_id)
+        || is_supported_utf8_case(case_id)
         || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
@@ -7557,6 +7772,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         hir_print_pass_evidence(case_id)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_pass_evidence(case_id)
+    } else if is_supported_utf8_case(case_id) {
+        utf8_pass_evidence(case_id)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -7575,6 +7792,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         hir_print_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_utf8_case(case_id) {
+        utf8_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -7593,6 +7812,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-hir-print-adapter"
     } else if is_supported_hir_literal_case(case_id) {
         "fre-hir-literal-adapter"
+    } else if is_supported_utf8_case(case_id) {
+        "fre-utf8-adapter"
     } else if is_supported_hir_misc_case(case_id) {
         "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8411,6 +8632,57 @@ mod tests {
             })
             .expect("supported HIR misc receipt");
         }
+    }
+
+    #[test]
+    fn authenticated_utf8_cases_execute_all_5_public_identities() {
+        for case_id in [
+            UTF8_BMP_CASE_ID,
+            UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID,
+            UTF8_REVERSE_CASE_ID,
+            UTF8_SINGLE_CODEPOINT_CASE_ID,
+        ] {
+            let disposition = execute_utf8_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: utf8_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/utf8.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported UTF-8 unit receipt");
+        }
+        let disposition = execute_hir_doctest_case(UTF8_DOCTEST_SEQUENCES_CASE_ID);
+        assert_eq!(
+            disposition,
+            RegexSyntaxCorpusDisposition::Pass {
+                evidence_sha256: utf8_pass_evidence(UTF8_DOCTEST_SEQUENCES_CASE_ID),
+            },
+        );
+        validate_disposition(&RegexSyntaxCorpusReceipt {
+            obligation: RegexSyntaxCorpusObligation {
+                case_id: UTF8_DOCTEST_SEQUENCES_CASE_ID.to_owned(),
+                kind: RegexSyntaxCorpusCaseKind::Doctest,
+                source_path: "src/utf8.rs".to_owned(),
+                source_line: 1,
+                source_sha256: "0".repeat(64),
+                default_harness_member: true,
+                no_default_harness_member: true,
+            },
+            disposition,
+        })
+        .expect("supported UTF-8 doctest receipt");
     }
 
     #[test]
