@@ -322,6 +322,13 @@ enum ClassAnalysisNode<'a> {
     Item(&'a ast::ClassSetItem),
 }
 
+#[derive(Clone, Copy)]
+enum UnicodePerlTable {
+    Decimal,
+    Space,
+    Word,
+}
+
 const UNICODE_CASE_CODEPOINTS: u64 = 0x11_0000;
 const UNICODE_CASE_TABLE_KEYS: u64 = 2_938;
 const UNICODE_CASE_MAX_FOLDS_PER_KEY: u64 = 3;
@@ -331,6 +338,30 @@ const UNICODE_GENCAT_MAX_TABLE_RANGES: u64 = 736;
 const UNICODE_GENCAT_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
 const UNICODE_GENCAT_CLASS_WORK_PER_RANGE: u64 = 24;
 const UNICODE_GENCAT_SET_WORK_PER_RANGE_SITE: u64 = 128;
+// regex-syntax 0.8.11 / Unicode 16.0.0 singleton `unicode-perl` tables.
+// The source files have SHA-256
+// 6a59143db81a0bcaf0e8d0af265e711d1a6472e1f091ee9ee4377da5d5d0cd1f
+// (decimal, 71 ranges),
+// ec9bb22ed7e99feef292249c7e6f4673ee0af9635d4d158f93923494c14cd5ed
+// (space, 10 ranges) and
+// 30f073baae28ea34c373c7778c00f20c1621c3e644404eff031f7d1cc8e9c9e2
+// (word, 796 ranges).
+const UNICODE_PERL_DECIMAL_RANGES: u64 = 71;
+const UNICODE_PERL_SPACE_RANGES: u64 = 10;
+const UNICODE_PERL_WORD_RANGES: u64 = 796;
+const UNICODE_PERL_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
+const UNICODE_PERL_CLASS_WORK_PER_RANGE: u64 = 24;
+const UNICODE_PERL_SET_WORK_PER_RANGE_SITE: u64 = 128;
+
+impl UnicodePerlTable {
+    const fn ranges(self) -> u64 {
+        match self {
+            Self::Decimal => UNICODE_PERL_DECIMAL_RANGES,
+            Self::Space => UNICODE_PERL_SPACE_RANGES,
+            Self::Word => UNICODE_PERL_WORD_RANGES,
+        }
+    }
+}
 
 impl UnicodeAvailabilityVisitor<'_> {
     fn charge(&mut self, amount: u64) -> Result<(), ParseError> {
@@ -611,7 +642,94 @@ impl UnicodeAvailabilityVisitor<'_> {
         )
     }
 
-    fn normalize_gencat_symbol(
+    fn charge_perl_class_set(&mut self, class: &ast::ClassBracketed) -> Result<(), ParseError> {
+        // Reserve the Unicode flag and both `has_perl` comparisons before
+        // selecting this prospective analysis.
+        self.charge(3)?;
+        if !self.flags.unicode || !self.features.has_perl() {
+            return Ok(());
+        }
+
+        // Perl range vectors are allocated, copied, canonicalized and
+        // combined at every enclosing bracket/binary-set site. Analyze the
+        // exact AST topology before regex-syntax can allocate any of those
+        // vectors. A Unicode-property leaf is conservatively assigned the
+        // largest singleton table; the later classifier either authenticates
+        // it as Decimal_Number/White_Space or rejects it before translation.
+        let mut stack = Vec::new();
+        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&class.kind))?;
+        let mut range_ceiling = 0_u64;
+        let mut translation_sites = 1_u64;
+        let mut perl_sources = 0_u64;
+        loop {
+            self.charge(1)?;
+            let Some(node) = stack.pop() else {
+                break;
+            };
+            self.charge(7)?;
+            match node {
+                ClassAnalysisNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                }
+                ClassAnalysisNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                    translation_sites = translation_sites.saturating_add(5);
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.lhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.rhs))?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Empty(_)) => {}
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Literal(_) | ast::ClassSetItem::Range(_),
+                ) => {
+                    range_ceiling = range_ceiling.saturating_add(1);
+                    translation_sites = translation_sites.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(128);
+                    translation_sites = translation_sites.saturating_add(2);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Unicode(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(UNICODE_PERL_WORD_RANGES);
+                    translation_sites = translation_sites.saturating_add(2);
+                    perl_sources = perl_sources.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Perl(perl)) => {
+                    let table = match perl.kind {
+                        ast::ClassPerlKind::Digit => UnicodePerlTable::Decimal,
+                        ast::ClassPerlKind::Space => UnicodePerlTable::Space,
+                        ast::ClassPerlKind::Word => UnicodePerlTable::Word,
+                    };
+                    range_ceiling = range_ceiling.saturating_add(table.ranges());
+                    translation_sites = translation_sites.saturating_add(2);
+                    perl_sources = perl_sources.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                    translation_sites = translation_sites.saturating_add(2);
+                    self.push_class_analysis_node(
+                        &mut stack,
+                        ClassAnalysisNode::Set(&nested.kind),
+                    )?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Union(union)) => {
+                    translation_sites = translation_sites
+                        .saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
+                    for item in &union.items {
+                        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                    }
+                }
+            }
+            range_ceiling = range_ceiling.min(UNICODE_PERL_SCALAR_RANGE_CEILING);
+        }
+        if perl_sources == 0 {
+            return Ok(());
+        }
+        self.charge(
+            range_ceiling
+                .saturating_mul(translation_sites)
+                .saturating_mul(UNICODE_PERL_SET_WORK_PER_RANGE_SITE),
+        )
+    }
+
+    fn normalize_unicode_symbol(
         &mut self,
         raw: &str,
         normalized: &mut [u8; MAX_UNICODE_GENCAT_ALIAS_BYTES],
@@ -724,7 +842,7 @@ impl UnicodeAvailabilityVisitor<'_> {
             ast::ClassUnicodeKind::OneLetter(value) => {
                 let mut encoded = [0_u8; 4];
                 let raw = value.encode_utf8(&mut encoded);
-                let Some(len) = self.normalize_gencat_symbol(raw, &mut value_buf)? else {
+                let Some(len) = self.normalize_unicode_symbol(raw, &mut value_buf)? else {
                     return Ok(false);
                 };
                 (
@@ -733,7 +851,7 @@ impl UnicodeAvailabilityVisitor<'_> {
                 )
             }
             ast::ClassUnicodeKind::Named(value) => {
-                let Some(len) = self.normalize_gencat_symbol(value, &mut value_buf)? else {
+                let Some(len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
                     return Ok(false);
                 };
                 (
@@ -742,10 +860,10 @@ impl UnicodeAvailabilityVisitor<'_> {
                 )
             }
             ast::ClassUnicodeKind::NamedValue { name, value, .. } => {
-                let Some(name_len) = self.normalize_gencat_symbol(name, &mut name_buf)? else {
+                let Some(name_len) = self.normalize_unicode_symbol(name, &mut name_buf)? else {
                     return Ok(false);
                 };
-                let Some(value_len) = self.normalize_gencat_symbol(value, &mut value_buf)? else {
+                let Some(value_len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
                     return Ok(false);
                 };
                 let name_matches =
@@ -766,9 +884,142 @@ impl UnicodeAvailabilityVisitor<'_> {
         Ok(accepted)
     }
 
+    fn normalized_matches(
+        &mut self,
+        normalized: &[u8],
+        aliases: &[&[u8]],
+    ) -> Result<bool, ParseError> {
+        for &alias in aliases {
+            self.charge(1)?;
+            if alias.len() != normalized.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(alias) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn charge_perl_class_translation(&mut self, table: UnicodePerlTable) -> Result<(), ParseError> {
+        // Covers source-table iteration, Vec allocation/copy, canonical-order
+        // validation/deduplication and the possible negation allocation.
+        self.charge(
+            table
+                .ranges()
+                .saturating_mul(UNICODE_PERL_CLASS_WORK_PER_RANGE),
+        )
+    }
+
+    fn charge_perl_property_translation(
+        &mut self,
+        table: UnicodePerlTable,
+        query_bytes: u64,
+    ) -> Result<(), ParseError> {
+        // Any Unicode feature compiles the 271-name/seven-family property
+        // index. Thirty-two whole-query comparisons conservatively cover its
+        // binary searches plus the 80-value General_Category search.
+        self.charge(query_bytes.saturating_mul(32).saturating_add(512))?;
+        self.charge_perl_class_translation(table)
+    }
+
+    fn is_unicode_perl_class(
+        &mut self,
+        class: &ast::ClassUnicode,
+    ) -> Result<Option<UnicodePerlTable>, ParseError> {
+        self.charge(3)?;
+        if !self.features.has_perl() {
+            return Ok(None);
+        }
+        let mut name_buf = [0_u8; MAX_UNICODE_GENCAT_ALIAS_BYTES];
+        let mut value_buf = [0_u8; MAX_UNICODE_GENCAT_ALIAS_BYTES];
+        let (table, query_bytes) = match &class.kind {
+            ast::ClassUnicodeKind::OneLetter(value) => {
+                let mut encoded = [0_u8; 4];
+                let raw = value.encode_utf8(&mut encoded);
+                let Some(len) = self.normalize_unicode_symbol(raw, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let value = &value_buf[..len];
+                let table = if self
+                    .normalized_matches(value, &[b"space", b"whitespace", b"wspace"])?
+                {
+                    Some(UnicodePerlTable::Space)
+                } else if self.normalized_matches(value, &[b"decimalnumber", b"digit", b"nd"])? {
+                    Some(UnicodePerlTable::Decimal)
+                } else {
+                    None
+                };
+                (table, u64::try_from(raw.len()).unwrap_or(u64::MAX))
+            }
+            ast::ClassUnicodeKind::Named(value) => {
+                let Some(len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let value_normalized = &value_buf[..len];
+                let table = if self
+                    .normalized_matches(value_normalized, &[b"space", b"whitespace", b"wspace"])?
+                {
+                    Some(UnicodePerlTable::Space)
+                } else if self
+                    .normalized_matches(value_normalized, &[b"decimalnumber", b"digit", b"nd"])?
+                {
+                    Some(UnicodePerlTable::Decimal)
+                } else {
+                    None
+                };
+                (table, u64::try_from(value.len()).unwrap_or(u64::MAX))
+            }
+            ast::ClassUnicodeKind::NamedValue { name, value, .. } => {
+                let Some(name_len) = self.normalize_unicode_symbol(name, &mut name_buf)? else {
+                    return Ok(None);
+                };
+                let Some(value_len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let name_matches =
+                    self.normalized_matches(&name_buf[..name_len], &[b"gc", b"generalcategory"])?;
+                let value_matches = self.normalized_matches(
+                    &value_buf[..value_len],
+                    &[b"decimalnumber", b"digit", b"nd"],
+                )?;
+                self.charge(1)?;
+                let table = (name_matches && value_matches).then_some(UnicodePerlTable::Decimal);
+                (
+                    table,
+                    u64::try_from(name.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                )
+            }
+        };
+        if let Some(table) = table {
+            self.charge_perl_property_translation(table, query_bytes)?;
+        }
+        Ok(table)
+    }
+
     fn class_perl(&mut self, class: &ast::ClassPerl) -> Result<(), ParseError> {
         self.charge(3)?;
         if !self.flags.unicode {
+            return Ok(());
+        }
+        self.charge(2)?;
+        if self.features.has_perl() {
+            let table = match class.kind {
+                ast::ClassPerlKind::Digit => UnicodePerlTable::Decimal,
+                ast::ClassPerlKind::Space => UnicodePerlTable::Space,
+                ast::ClassPerlKind::Word => UnicodePerlTable::Word,
+            };
+            self.charge_perl_class_translation(table)?;
             return Ok(());
         }
         if self.features.has_bool() && matches!(class.kind, ast::ClassPerlKind::Space) {
@@ -811,6 +1062,10 @@ impl UnicodeAvailabilityVisitor<'_> {
                 }
             }
             _ if self.is_unicode_gencat_class(class)? => {
+                self.require_case(&class.span)?;
+                return Ok(());
+            }
+            _ if self.is_unicode_perl_class(class)?.is_some() => {
                 self.require_case(&class.span)?;
                 return Ok(());
             }
@@ -929,6 +1184,7 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
             }
             Ast::ClassBracketed(class) => {
                 self.charge_gencat_class_set(class)?;
+                self.charge_perl_class_set(class)?;
                 if self.require_case(&class.span)? {
                     self.charge_case_fold_class(class)?;
                 }
@@ -948,10 +1204,18 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
                             | ast::AssertionKind::WordBoundaryEndHalf
                     ) =>
             {
-                self.reject(
-                    &assertion.span,
-                    "Unicode word-boundary data is unavailable in this Rust profile",
-                )
+                // Reserve both feature comparisons and HIR look-kind
+                // selection before allowing regex-automata to consume the
+                // singleton profile's Unicode-word classifier.
+                self.charge(4)?;
+                if self.features.has_perl() {
+                    Ok(())
+                } else {
+                    self.reject(
+                        &assertion.span,
+                        "Unicode word-boundary data is unavailable in this Rust profile",
+                    )
+                }
             }
             Ast::ClassPerl(class) => self.class_perl(class),
             Ast::ClassUnicode(class) => self.class_unicode(class),
@@ -1435,6 +1699,33 @@ fn charge_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_perl_range_bounds_match_pinned_regex_syntax_tables() {
+        fn ranges(pattern: &str) -> usize {
+            let hir = ParserBuilder::new()
+                .build()
+                .parse(pattern)
+                .expect("pinned Unicode Perl class");
+            let HirKind::Class(Class::Unicode(class)) = hir.kind() else {
+                panic!("Perl pattern did not translate to one Unicode class")
+            };
+            class.ranges().len()
+        }
+
+        assert_eq!(
+            u64::try_from(ranges(r"\d")).expect("range count fits u64"),
+            UNICODE_PERL_DECIMAL_RANGES
+        );
+        assert_eq!(
+            u64::try_from(ranges(r"\s")).expect("range count fits u64"),
+            UNICODE_PERL_SPACE_RANGES
+        );
+        assert_eq!(
+            u64::try_from(ranges(r"\w")).expect("range count fits u64"),
+            UNICODE_PERL_WORD_RANGES
+        );
+    }
 
     #[test]
     fn ast_node_upper_bound_covers_empty_alternations_and_overflow() {

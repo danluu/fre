@@ -559,6 +559,91 @@ fn unicode_gencat_profile_accepts_only_materialized_general_categories() {
 }
 
 #[test]
+fn unicode_perl_profile_accepts_only_singleton_perl_data() {
+    let mut perl = RustProfile::regex_1_12_4();
+    perl.unicode_features = RustUnicodeFeatures::PERL;
+    let perl_profile = CompatibilityProfile::RustText(perl.clone());
+    let full_profile = CompatibilityProfile::rust_text();
+
+    // The singleton feature owns the three direct tables, every Unicode
+    // boundary look kind and only the White_Space/Decimal_Number named-query
+    // aliases that regex-syntax routes back to those same tables.
+    for pattern in [
+        r"\d",
+        r"\D",
+        r"\s",
+        r"\S",
+        r"\w",
+        r"\W",
+        r"\b",
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        r"\b{start-half}",
+        r"\b{end-half}",
+        r"\<",
+        r"\>",
+        r"\p{White_Space}",
+        r"\p{IsWhite_Space}",
+        r"\p{wspace}",
+        r"\p{Nd}",
+        r"\p{IsDigit}",
+        r"\p{gc=Nd}",
+        r"\p{Is_G-C=D_e-cimal Number}",
+        r"[\w&&[\s&&\d]]",
+        r"(?i:\d\s\w)",
+    ] {
+        let partial = parse(ParseRequest::rust(pattern, perl_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-perl rejected {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "unicode-perl HIR for {pattern}");
+    }
+
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"\p{Alphabetic}",
+        r"(?i:a)",
+        r"\pL",
+        r"\p{Letter}",
+        r"\p{gc=Number}",
+        r"\p{White_Space=Yes}",
+        r"(?i:\p{Nd})",
+        r"(?i:[\w])",
+        r"\p{Greek}",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+    ] {
+        let error = parse(ParseRequest::rust(pattern, perl_profile.clone()))
+            .expect_err("unicode-perl must not borrow another Unicode family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    let mut perl_set = RustProfile::regex_set_1_12_4();
+    perl_set.unicode_features = RustUnicodeFeatures::PERL;
+    fre_syntax::validate_rust_regex_set_admission(
+        &[r"\b\w+\b", r"\p{gc=Nd}+", r"\s+"],
+        &CompatibilityProfile::RustText(perl_set.clone()),
+    )
+    .expect("unicode-perl set admission");
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &[r"\w+", r"\p{Alphabetic}"],
+        &CompatibilityProfile::RustText(perl_set),
+    )
+    .expect_err("unicode-perl set cannot borrow unicode-bool");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -619,6 +704,20 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     assert_ne!(boolean.key, gencat.key);
     assert_ne!(case.key, gencat.key);
     assert_ne!(gencat.key, full.key);
+
+    let mut perl = RustProfile::regex_1_12_4();
+    perl.unicode_features = RustUnicodeFeatures::PERL;
+    let perl = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(perl),
+    ))
+    .expect("table-free syntax under perl profile");
+    assert_ne!(partial.key, perl.key);
+    assert_ne!(age.key, perl.key);
+    assert_ne!(boolean.key, perl.key);
+    assert_ne!(case.key, perl.key);
+    assert_ne!(gencat.key, perl.key);
+    assert_ne!(perl.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -1046,6 +1145,130 @@ fn unicode_gencat_analysis_stack_has_a_hand_derived_exact_limit() {
         }),
     ))
     .expect_err("one below general-category analysis stack must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::TraversalStack,
+            limit,
+            observed,
+        } if limit == EXPECTED_MAX_STACK - 1 && observed == EXPECTED_MAX_STACK
+    ));
+}
+
+#[test]
+fn unicode_perl_classifier_and_table_work_obey_exact_parse_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::PERL;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"\P{Is_G-e n e r a l _ Category != D_e-cimal Number}";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("normalized unicode-perl Decimal_Number query");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 2_000,
+        "property search, class allocation and negation must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    let exact_record = parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact unicode-perl classifier/table limit must pass");
+    assert_eq!(exact_record.summary.parse_work, exact);
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below unicode-perl classifier/table limit must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_perl_nested_set_work_is_prospectively_bounded() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::PERL;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[[\W~~\w]--[[\S&&\s]~~[\D&&\d]]]";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("nested unicode-perl set operations");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 1_000_000,
+        "nested Perl-table allocation, set and dedup work must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact nested unicode-perl set-work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below nested unicode-perl set-work limit must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_perl_analysis_stack_has_a_hand_derived_exact_limit() {
+    const EXPECTED_MAX_STACK: u64 = 5;
+
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::PERL;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[\w&&[\s&&[\d&&[\W&&\D]]]]";
+
+    let exact_quotas = SyntaxQuotas {
+        max_parse_work: 64_000_000,
+        max_traversal_stack: EXPECTED_MAX_STACK,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone()).with_admission(AdmissionPolicy::Quota(
+            QuotaBounded {
+                syntax: exact_quotas,
+            },
+        )),
+    )
+    .expect("exact unicode-perl analysis stack must pass");
+
+    let below_quotas = SyntaxQuotas {
+        max_traversal_stack: EXPECTED_MAX_STACK - 1,
+        ..exact_quotas
+    };
+    let error = parse(ParseRequest::rust(pattern, compatibility).with_admission(
+        AdmissionPolicy::Quota(QuotaBounded {
+            syntax: below_quotas,
+        }),
+    ))
+    .expect_err("one below unicode-perl analysis stack must fail prospectively");
     assert!(matches!(
         error.category,
         ErrorCategory::FreResourceLimit {

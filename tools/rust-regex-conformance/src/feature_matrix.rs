@@ -192,6 +192,7 @@ enum SemanticContract {
     BoolUnicode,
     CaseUnicode,
     GencatUnicode,
+    PerlUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -212,6 +213,7 @@ struct QualifiedSemanticEvidence {
     bool_unicode: String,
     case_unicode: String,
     gencat_unicode: String,
+    perl_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -339,7 +341,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-perl",
         default_features: false,
         features: &["std", "unicode-perl"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::PerlUnicode,
     },
     ConfigurationSpec {
         id: "unicode-script",
@@ -494,6 +496,7 @@ pub fn build_feature_matrix_report(
         bool_unicode: run_bool_unicode_contract()?,
         case_unicode: run_case_unicode_contract()?,
         gencat_unicode: run_gencat_unicode_contract()?,
+        perl_unicode: run_perl_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -736,6 +739,9 @@ fn run_configuration(
                 },
                 SemanticContract::GencatUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.gencat_unicode.clone(),
+                },
+                SemanticContract::PerlUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.perl_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -1189,6 +1195,101 @@ fn expected_gencat_unicode_evidence() -> String {
     sha256(evidence.as_bytes())
 }
 
+fn run_perl_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::PERL;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-perl profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for pattern in [
+        r"\d",
+        r"\s",
+        r"\w",
+        r"\b",
+        r"\B",
+        r"\b{start}",
+        r"\b{end}",
+        r"\p{White_Space}",
+        r"\p{gc=Nd}",
+    ] {
+        let parsed = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| {
+            InventoryError::new(format!(
+                "unicode-perl profile rejected its singleton witness {pattern}: {error}"
+            ))
+        })?;
+        if !pattern.starts_with(r"\b") && pattern != r"\B" && parsed.summary.class_ranges == 0 {
+            return Err(InventoryError::new(format!(
+                "unicode-perl witness {pattern} produced no class ranges"
+            )));
+        }
+    }
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "perl" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-perl profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-perl {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+
+    // Exercise the full FRE lowering/search path, not just regex-syntax HIR.
+    // Greek beta is a Unicode word scalar and occupies byte span 1..3.
+    let regex = PortableBuilder::new(r"\b\w+\b")
+        .profile(profile)
+        .build()
+        .map_err(|error| InventoryError::new(format!("unicode-perl build failed: {error}")))?;
+    let (found, _) = regex
+        .find(b" \xCE\xB2 ", SearchLimits::default())
+        .map_err(|error| InventoryError::new(format!("unicode-perl search failed: {error}")))?;
+    let found =
+        found.ok_or_else(|| InventoryError::new("unicode-perl search found no Unicode word"))?;
+    if found.start() != 1 || found.end() != 3 {
+        return Err(InventoryError::new(
+            "unicode-perl search returned wrong Unicode word span",
+        ));
+    }
+    Ok(expected_perl_unicode_evidence())
+}
+
+fn expected_perl_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-perl;ascii=parsed;perl=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        if family == "perl" {
+            continue;
+        }
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    evidence.push_str(";word-span=1..3");
+    sha256(evidence.as_bytes())
+}
+
 fn authenticate_upstream_package(
     root: &Path,
 ) -> Result<FeatureMatrixSourceIdentity, InventoryError> {
@@ -1547,6 +1648,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_gencat_unicode_evidence() => Ok(()),
         (
+            SemanticContract::PerlUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_perl_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1592,11 +1700,15 @@ fn validate_disposition(
         {
             Ok(())
         }
-        _ => Err(InventoryError::new(format!(
-            "invalid feature matrix disposition for {}",
-            spec.id
-        ))),
+        _ => invalid_disposition(spec),
     }
+}
+
+fn invalid_disposition(spec: &ConfigurationSpec) -> Result<(), InventoryError> {
+    Err(InventoryError::new(format!(
+        "invalid feature matrix disposition for {}",
+        spec.id
+    )))
 }
 
 fn expected_semantic_evidence(contract: SemanticContract) -> String {
@@ -1612,6 +1724,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::BoolUnicode => return expected_bool_unicode_evidence(),
         SemanticContract::CaseUnicode => return expected_case_unicode_evidence(),
         SemanticContract::GencatUnicode => return expected_gencat_unicode_evidence(),
+        SemanticContract::PerlUnicode => return expected_perl_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1686,12 +1799,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::PerlUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(
                     spec.semantic,
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            3
+            2
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1730,6 +1850,9 @@ mod tests {
         let gencat_unicode = run_gencat_unicode_contract().expect("unicode-gencat semantic gate");
         assert_eq!(gencat_unicode, expected_gencat_unicode_evidence());
         assert!(is_sha256(&gencat_unicode));
+        let perl_unicode = run_perl_unicode_contract().expect("unicode-perl semantic gate");
+        assert_eq!(perl_unicode, expected_perl_unicode_evidence());
+        assert!(is_sha256(&perl_unicode));
     }
 
     #[test]
