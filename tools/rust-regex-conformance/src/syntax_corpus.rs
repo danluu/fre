@@ -69,6 +69,11 @@ const AST_GROUP_CASE_ID: &str = "ast::parse::tests::parse_group";
 const AST_CAPTURE_NAME_CASE_ID: &str = "ast::parse::tests::parse_capture_name";
 const AST_FLAGS_CASE_ID: &str = "ast::parse::tests::parse_flags";
 const AST_FLAG_CASE_ID: &str = "ast::parse::tests::parse_flag";
+const AST_SET_CLASS_CASE_ID: &str = "ast::parse::tests::parse_set_class";
+#[cfg(test)]
+const AST_SET_CLASS_OPEN_CASE_ID: &str = "ast::parse::tests::parse_set_class_open";
+#[cfg(test)]
+const AST_MAYBE_ASCII_CLASS_CASE_ID: &str = "ast::parse::tests::maybe_parse_ascii_class";
 #[cfg(test)]
 const AST_COUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_counted_repetition";
 #[cfg(test)]
@@ -252,6 +257,44 @@ const FLAG_CONTEXT_PROBES: [(&str, &str); 9] = [
     ("a", "(?a)"),
     ("☃", "(?☃)"),
 ];
+const SET_CLASS_DEFAULT_PROBES: [&str; 35] = [
+    "[[:alnum:]]",
+    "[[[:alnum:]]]",
+    "[[:alnum:]&&[:lower:]]",
+    "[[:alnum:]--[:lower:]]",
+    "[[:alnum:]~~[:lower:]]",
+    "[a]",
+    r"[a\]]",
+    r"[a\-z]",
+    "[ab]",
+    "[a-]",
+    "[-a]",
+    r"[\pL]",
+    r"[\w]",
+    r"[a\wz]",
+    "[a-z]",
+    "[a-cx-z]",
+    r"[\w&&a-cx-z]",
+    r"[a-cx-z&&\w]",
+    "[a--b--c]",
+    "[a~~b~~c]",
+    r"[\^&&^]",
+    r"[\&&&&]",
+    "[&&&&]",
+    "[☃-⛄]",
+    "[]]",
+    r"[]\[]",
+    r"[\[]]",
+    "[",
+    "[[",
+    "[[-]",
+    "[[[:alnum:]",
+    r"[\b]",
+    r"[\w-a]",
+    r"[a-\w]",
+    "[z-a]",
+];
+const SET_CLASS_IGNORE_WHITESPACE_PROBES: [&str; 2] = ["[a ", "[a- "];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
     r"\a",
@@ -1994,6 +2037,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
             | AST_CAPTURE_NAME_CASE_ID
             | AST_FLAGS_CASE_ID
             | AST_FLAG_CASE_ID
+            | AST_SET_CLASS_CASE_ID
             | AST_ESCAPE_CASE_ID
             | AST_HEX_BRACE_CASE_ID
             | AST_OCTAL_CASE_ID
@@ -2021,6 +2065,7 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         AST_CAPTURE_NAME_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_capture_name)),
         AST_FLAGS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_flags)),
         AST_FLAG_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_flag)),
+        AST_SET_CLASS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_set_class)),
         AST_ESCAPE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_escape)),
         AST_HEX_BRACE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_brace)),
         AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
@@ -2317,6 +2362,20 @@ fn run_ast_flags() -> Result<(), AstMismatch> {
 
 fn run_ast_flag() -> Result<(), AstMismatch> {
     run_ast_context_equivalence_set(&FLAG_CONTEXT_PROBES, "flag")
+}
+
+fn run_ast_set_class() -> Result<(), AstMismatch> {
+    run_ast_equivalence_set(&SET_CLASS_DEFAULT_PROBES, "set-class-default")?;
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.options.ignore_whitespace = true;
+    for (index, pattern) in SET_CLASS_IGNORE_WHITESPACE_PROBES.into_iter().enumerate() {
+        execute_ast_profile_equivalence_probe(
+            pattern,
+            &profile,
+            &format!("set-class-ignore-whitespace-{index}"),
+        )?;
+    }
+    Ok(())
 }
 
 fn run_ast_equivalence_set(probes: &[&str], label: &str) -> Result<(), AstMismatch> {
@@ -2653,9 +2712,8 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         AST_GROUP_CASE_ID | AST_CAPTURE_NAME_CASE_ID | AST_FLAGS_CASE_ID | AST_FLAG_CASE_ID => {
             write_ast_group_family_evidence(&mut contract, case_id);
         }
-        AST_UNCOUNTED_REPETITION_CASE_ID => {
-            write_ast_uncounted_repetition_evidence(&mut contract);
-        }
+        AST_SET_CLASS_CASE_ID => write_ast_set_class_evidence(&mut contract),
+        AST_UNCOUNTED_REPETITION_CASE_ID => write_ast_uncounted_repetition_evidence(&mut contract),
         AST_ESCAPE_CASE_ID => {
             write_ast_equivalence_evidence(
                 &mut contract,
@@ -2740,6 +2798,19 @@ fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expect
         writeln!(
             contract,
             "probe-{index}=sha256:{},bytes:{},expected:{expected}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn write_ast_set_class_evidence(contract: &mut String) {
+    write_ast_equivalence_evidence(contract, &SET_CLASS_DEFAULT_PROBES, "upstream-exact-result");
+    for (index, pattern) in SET_CLASS_IGNORE_WHITESPACE_PROBES.into_iter().enumerate() {
+        writeln!(
+            contract,
+            "ignore-whitespace-{index}=sha256:{},bytes:{},expected:upstream-exact-error",
             sha256(pattern.as_bytes()),
             pattern.len(),
         )
@@ -3363,6 +3434,7 @@ mod tests {
             AST_CAPTURE_NAME_CASE_ID,
             AST_FLAGS_CASE_ID,
             AST_FLAG_CASE_ID,
+            AST_SET_CLASS_CASE_ID,
             AST_ESCAPE_CASE_ID,
             AST_HEX_BRACE_CASE_ID,
             AST_OCTAL_CASE_ID,
@@ -3397,6 +3469,51 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn set_class_covers_every_public_outcome_and_private_helpers_stay_intrinsic() {
+        assert_eq!(SET_CLASS_DEFAULT_PROBES.len(), 35);
+        assert_eq!(SET_CLASS_IGNORE_WHITESPACE_PROBES.len(), 2);
+        run_ast_set_class().expect("all 37 pinned class-set outcomes match exactly");
+
+        let open_source = "[a]";
+        let public_open = regex_syntax::ast::parse::Parser::new()
+            .parse(open_source)
+            .expect("the complete public class parses");
+        let private_open_projection = Ast::class_bracketed(regex_syntax::ast::ClassBracketed {
+            span: ast_span(0, 1),
+            negated: false,
+            kind: regex_syntax::ast::ClassSet::union(regex_syntax::ast::ClassSetUnion {
+                span: ast_span(1, 1),
+                items: vec![],
+            }),
+        });
+        assert_ne!(public_open, private_open_projection);
+        assert!(!is_supported_ast_case(AST_SET_CLASS_OPEN_CASE_ID));
+
+        let ascii_source = "[:alnum:]";
+        let public_ascii = regex_syntax::ast::parse::Parser::new()
+            .parse(ascii_source)
+            .expect("the unwrapped private ASCII-class source parses as literals");
+        let wrapped_ascii = regex_syntax::ast::parse::Parser::new()
+            .parse("[[:alnum:]]")
+            .expect("the wrapped ASCII class parses");
+        let private_ascii_span_projection =
+            Ast::class_bracketed(regex_syntax::ast::ClassBracketed {
+                span: ast_span(0, 11),
+                negated: false,
+                kind: regex_syntax::ast::ClassSet::Item(regex_syntax::ast::ClassSetItem::Ascii(
+                    regex_syntax::ast::ClassAscii {
+                        span: ast_span(0, 9),
+                        kind: regex_syntax::ast::ClassAsciiKind::Alnum,
+                        negated: false,
+                    },
+                )),
+            });
+        assert_ne!(public_ascii, wrapped_ascii);
+        assert_ne!(wrapped_ascii, private_ascii_span_projection);
+        assert!(!is_supported_ast_case(AST_MAYBE_ASCII_CLASS_CASE_ID));
     }
 
     #[test]
