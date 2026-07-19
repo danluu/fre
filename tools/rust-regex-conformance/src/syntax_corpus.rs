@@ -64,6 +64,10 @@ const AST_PARSE_IDS_SHA256: &str =
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
 const AST_NEWLINES_CASE_ID: &str = "ast::parse::tests::parse_newlines";
 const AST_ALTERNATE_CASE_ID: &str = "ast::parse::tests::parse_alternate";
+#[cfg(test)]
+const AST_PRIMITIVE_NON_ESCAPE_CASE_ID: &str = "ast::parse::tests::parse_primitive_non_escape";
+const AST_ESCAPE_CASE_ID: &str = "ast::parse::tests::parse_escape";
+const AST_HEX_BRACE_CASE_ID: &str = "ast::parse::tests::parse_hex_brace";
 const AST_PERL_CLASS_CASE_ID: &str = "ast::parse::tests::parse_perl_class";
 const AST_UNICODE_CLASS_CASE_ID: &str = "ast::parse::tests::parse_unicode_class";
 const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
@@ -170,6 +174,126 @@ const ALTERNATE_PROBES: [&str; 15] = [
     r"a|b)",
     r"(a|b",
 ];
+const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
+    r"\|",
+    r"\a",
+    r"\f",
+    r"\t",
+    r"\n",
+    r"\r",
+    r"\v",
+    r"\A",
+    r"\z",
+    r"\b",
+    r"\b{start}",
+    r"\b{end}",
+    r"\b{start-half}",
+    r"\b{end-half}",
+    r"\<",
+    r"\>",
+    r"\B",
+    r"\!",
+    r"\@",
+    r"\%",
+    "\\\"",
+    r"\'",
+    r"\/",
+    r"\ ",
+];
+const ESCAPE_ERROR_PROBES: [AstFixedErrorProbe; 9] = [
+    AstFixedErrorProbe::new(r"\e", false, AstFixedErrorKind::EscapeUnrecognized, 0, 2),
+    AstFixedErrorProbe::new(r"\y", false, AstFixedErrorKind::EscapeUnrecognized, 0, 2),
+    AstFixedErrorProbe::new(
+        r"\b{",
+        false,
+        AstFixedErrorKind::SpecialWordOrRepetitionUnexpectedEof,
+        0,
+        3,
+    ),
+    AstFixedErrorProbe::new(
+        r"\b{ ",
+        true,
+        AstFixedErrorKind::SpecialWordOrRepetitionUnexpectedEof,
+        0,
+        4,
+    ),
+    AstFixedErrorProbe::new(
+        r"\b{ ",
+        false,
+        AstFixedErrorKind::RepetitionCountUnclosed,
+        2,
+        4,
+    ),
+    AstFixedErrorProbe::new(
+        r"\b{foo",
+        false,
+        AstFixedErrorKind::SpecialWordBoundaryUnclosed,
+        2,
+        6,
+    ),
+    AstFixedErrorProbe::new(
+        r"\b{foo!}",
+        false,
+        AstFixedErrorKind::SpecialWordBoundaryUnclosed,
+        2,
+        6,
+    ),
+    AstFixedErrorProbe::new(
+        r"\b{foo}",
+        false,
+        AstFixedErrorKind::SpecialWordBoundaryUnrecognized,
+        3,
+        6,
+    ),
+    AstFixedErrorProbe::new(r"\", false, AstFixedErrorKind::EscapeUnexpectedEof, 0, 1),
+];
+const HEX_BRACE_SUCCESS_PROBES: [&str; 5] = [
+    r"\u{26c4}",
+    r"\U{26c4}",
+    r"\x{26c4}",
+    r"\x{26C4}",
+    r"\x{10fFfF}",
+];
+const HEX_BRACE_ERROR_PROBES: [AstFixedErrorProbe; 8] = [
+    AstFixedErrorProbe::new(r"\x", false, AstFixedErrorKind::EscapeUnexpectedEof, 2, 2),
+    AstFixedErrorProbe::new(r"\x{", false, AstFixedErrorKind::EscapeUnexpectedEof, 2, 3),
+    AstFixedErrorProbe::new(
+        r"\x{FF",
+        false,
+        AstFixedErrorKind::EscapeUnexpectedEof,
+        2,
+        5,
+    ),
+    AstFixedErrorProbe::new(r"\x{}", false, AstFixedErrorKind::EscapeHexEmpty, 2, 4),
+    AstFixedErrorProbe::new(
+        r"\x{FGF}",
+        false,
+        AstFixedErrorKind::EscapeHexInvalidDigit,
+        4,
+        5,
+    ),
+    AstFixedErrorProbe::new(
+        r"\x{FFFFFF}",
+        false,
+        AstFixedErrorKind::EscapeHexInvalid,
+        3,
+        9,
+    ),
+    AstFixedErrorProbe::new(
+        r"\x{D800}",
+        false,
+        AstFixedErrorKind::EscapeHexInvalid,
+        3,
+        7,
+    ),
+    AstFixedErrorProbe::new(
+        r"\x{FFFFFFFFF}",
+        false,
+        AstFixedErrorKind::EscapeHexInvalid,
+        3,
+        12,
+    ),
+];
 const PERL_CLASS_PROBES: [&str; 8] = [r"\d", r"\D", r"\s", r"\S", r"\w", r"\W", r"\d", r"\dz"];
 const UNICODE_CLASS_PROBES: [&str; 19] = [
     r"\pN",
@@ -233,7 +357,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_alternate, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 16 AST parser identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_alternate, parse_escape, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 14 AST parser identities remain explicit Unsupported dispositions.",
     "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
@@ -1585,6 +1709,82 @@ struct AstMismatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AstFixedErrorKind {
+    EscapeUnrecognized,
+    SpecialWordOrRepetitionUnexpectedEof,
+    RepetitionCountUnclosed,
+    SpecialWordBoundaryUnclosed,
+    SpecialWordBoundaryUnrecognized,
+    EscapeUnexpectedEof,
+    EscapeHexEmpty,
+    EscapeHexInvalidDigit,
+    EscapeHexInvalid,
+}
+
+impl AstFixedErrorKind {
+    fn upstream(self) -> regex_syntax::ast::ErrorKind {
+        match self {
+            Self::EscapeUnrecognized => regex_syntax::ast::ErrorKind::EscapeUnrecognized,
+            Self::SpecialWordOrRepetitionUnexpectedEof => {
+                regex_syntax::ast::ErrorKind::SpecialWordOrRepetitionUnexpectedEof
+            }
+            Self::RepetitionCountUnclosed => regex_syntax::ast::ErrorKind::RepetitionCountUnclosed,
+            Self::SpecialWordBoundaryUnclosed => {
+                regex_syntax::ast::ErrorKind::SpecialWordBoundaryUnclosed
+            }
+            Self::SpecialWordBoundaryUnrecognized => {
+                regex_syntax::ast::ErrorKind::SpecialWordBoundaryUnrecognized
+            }
+            Self::EscapeUnexpectedEof => regex_syntax::ast::ErrorKind::EscapeUnexpectedEof,
+            Self::EscapeHexEmpty => regex_syntax::ast::ErrorKind::EscapeHexEmpty,
+            Self::EscapeHexInvalidDigit => regex_syntax::ast::ErrorKind::EscapeHexInvalidDigit,
+            Self::EscapeHexInvalid => regex_syntax::ast::ErrorKind::EscapeHexInvalid,
+        }
+    }
+
+    fn evidence_label(self) -> &'static str {
+        match self {
+            Self::EscapeUnrecognized => "EscapeUnrecognized",
+            Self::SpecialWordOrRepetitionUnexpectedEof => "SpecialWordOrRepetitionUnexpectedEof",
+            Self::RepetitionCountUnclosed => "RepetitionCountUnclosed",
+            Self::SpecialWordBoundaryUnclosed => "SpecialWordBoundaryUnclosed",
+            Self::SpecialWordBoundaryUnrecognized => "SpecialWordBoundaryUnrecognized",
+            Self::EscapeUnexpectedEof => "EscapeUnexpectedEof",
+            Self::EscapeHexEmpty => "EscapeHexEmpty",
+            Self::EscapeHexInvalidDigit => "EscapeHexInvalidDigit",
+            Self::EscapeHexInvalid => "EscapeHexInvalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AstFixedErrorProbe {
+    pattern: &'static str,
+    ignore_whitespace: bool,
+    kind: AstFixedErrorKind,
+    span_start: usize,
+    span_end: usize,
+}
+
+impl AstFixedErrorProbe {
+    const fn new(
+        pattern: &'static str,
+        ignore_whitespace: bool,
+        kind: AstFixedErrorKind,
+        span_start: usize,
+        span_end: usize,
+    ) -> Self {
+        Self {
+            pattern,
+            ignore_whitespace,
+            kind,
+            span_start,
+            span_end,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AstHexCase {
     Two,
     Four,
@@ -1708,6 +1908,8 @@ fn is_supported_ast_case(case_id: &str) -> bool {
         AST_HOLISTIC_CASE_ID
             | AST_NEWLINES_CASE_ID
             | AST_ALTERNATE_CASE_ID
+            | AST_ESCAPE_CASE_ID
+            | AST_HEX_BRACE_CASE_ID
             | AST_OCTAL_CASE_ID
             | AST_HEX_TWO_CASE_ID
             | AST_HEX_FOUR_CASE_ID
@@ -1726,6 +1928,8 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
         AST_NEWLINES_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_newlines)),
         AST_ALTERNATE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_alternate)),
+        AST_ESCAPE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_escape)),
+        AST_HEX_BRACE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_brace)),
         AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
         AST_HEX_TWO_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_two)),
         AST_HEX_FOUR_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_four)),
@@ -1996,6 +2200,26 @@ fn run_ast_alternate() -> Result<(), AstMismatch> {
     Ok(())
 }
 
+fn run_ast_escape() -> Result<(), AstMismatch> {
+    for (index, pattern) in ESCAPE_SUCCESS_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("escape-success-{index}"))?;
+    }
+    for (index, probe) in ESCAPE_ERROR_PROBES.into_iter().enumerate() {
+        execute_ast_fixed_error_probe(probe, &format!("escape-error-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_hex_brace() -> Result<(), AstMismatch> {
+    for (index, pattern) in HEX_BRACE_SUCCESS_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("hex-brace-success-{index}"))?;
+    }
+    for (index, probe) in HEX_BRACE_ERROR_PROBES.into_iter().enumerate() {
+        execute_ast_fixed_error_probe(probe, &format!("hex-brace-error-{index}"))?;
+    }
+    Ok(())
+}
+
 fn run_ast_unicode_class() -> Result<(), AstMismatch> {
     for (index, pattern) in UNICODE_CLASS_PROBES.into_iter().enumerate() {
         execute_ast_equivalence_probe(pattern, &format!("unicode-class-probe-{index}"))?;
@@ -2004,13 +2228,22 @@ fn run_ast_unicode_class() -> Result<(), AstMismatch> {
 }
 
 fn execute_ast_equivalence_probe(pattern: &str, assertion: &str) -> Result<(), AstMismatch> {
-    let rust_profile = RustProfile::regex_1_12_4();
+    execute_ast_profile_equivalence_probe(pattern, &RustProfile::regex_1_12_4(), assertion)
+}
+
+fn execute_ast_profile_equivalence_probe(
+    pattern: &str,
+    rust_profile: &RustProfile,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
     let profile = CompatibilityProfile::RustText(rust_profile.clone());
-    let expected = regex_syntax::ast::parse::Parser::new().parse(pattern);
+    let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
+    builder.ignore_whitespace(rust_profile.options.ignore_whitespace);
+    let expected = builder.build().parse(pattern);
     let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()));
     match (expected, observed) {
         (Ok(expected_ast), Ok(record)) => {
-            validate_ast_success(&record, &expected_ast, pattern, &rust_profile, assertion)
+            validate_ast_success(&record, &expected_ast, pattern, rust_profile, assertion)
         }
         (Err(expected_error), Err(observed_error)) => validate_ast_error(
             &observed_error,
@@ -2028,6 +2261,59 @@ fn execute_ast_equivalence_probe(pattern: &str, assertion: &str) -> Result<(), A
             observed: format!("{assertion}: Ok({:?})", record.ast),
         }),
     }
+}
+
+fn execute_ast_fixed_error_probe(
+    probe: AstFixedErrorProbe,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let mut rust_profile = RustProfile::regex_1_12_4();
+    rust_profile.options.ignore_whitespace = probe.ignore_whitespace;
+    let profile = CompatibilityProfile::RustText(rust_profile);
+    let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
+    builder.ignore_whitespace(probe.ignore_whitespace);
+    let expected = match builder.build().parse(probe.pattern) {
+        Err(error) => error,
+        Ok(ast) => {
+            return Err(AstMismatch {
+                expected: format!(
+                    "{assertion}: authenticated upstream Err({}, span={}..{})",
+                    probe.kind.evidence_label(),
+                    probe.span_start,
+                    probe.span_end,
+                ),
+                observed: format!("{assertion}: authenticated upstream Ok({ast:?})"),
+            });
+        }
+    };
+    if !ast_fixed_error_matches(&expected, probe) {
+        return Err(AstMismatch {
+            expected: format!(
+                "{assertion}: authenticated upstream Err({}, span={}..{}, pattern={:?})",
+                probe.kind.evidence_label(),
+                probe.span_start,
+                probe.span_end,
+                probe.pattern,
+            ),
+            observed: format!("{assertion}: authenticated upstream Err({expected:?})"),
+        });
+    }
+    let observed = match parse_rust_ast(ParseRequest::rust(probe.pattern, profile.clone())) {
+        Err(error) => error,
+        Ok(record) => {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: Err({expected:?})"),
+                observed: format!("{assertion}: Ok({:?})", record.ast),
+            });
+        }
+    };
+    validate_ast_error(&observed, &expected, probe.pattern, &profile, assertion)
+}
+
+fn ast_fixed_error_matches(error: &regex_syntax::ast::Error, probe: AstFixedErrorProbe) -> bool {
+    error.kind() == &probe.kind.upstream()
+        && error.span() == &ast_span(probe.span_start, probe.span_end)
+        && error.pattern() == probe.pattern
 }
 
 fn run_ast_unsupported_lookaround() -> Result<(), AstMismatch> {
@@ -2228,6 +2514,22 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
             &ALTERNATE_PROBES,
             "upstream-exact-result",
         ),
+        AST_ESCAPE_CASE_ID => {
+            write_ast_equivalence_evidence(
+                &mut contract,
+                &ESCAPE_SUCCESS_PROBES,
+                "upstream-exact-success",
+            );
+            write_ast_fixed_error_evidence(&mut contract, &ESCAPE_ERROR_PROBES);
+        }
+        AST_HEX_BRACE_CASE_ID => {
+            write_ast_equivalence_evidence(
+                &mut contract,
+                &HEX_BRACE_SUCCESS_PROBES,
+                "upstream-exact-success",
+            );
+            write_ast_fixed_error_evidence(&mut contract, &HEX_BRACE_ERROR_PROBES);
+        }
         AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
             for (index, pattern) in UNSUPPORTED_BACKREFERENCE_PROBES.into_iter().enumerate() {
                 writeln!(
@@ -2261,28 +2563,7 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
             &UNICODE_CLASS_PROBES,
             "upstream-exact-result",
         ),
-        AST_OCTAL_CASE_ID => {
-            for value in 0..511 {
-                let pattern = format!(r"\{value:o}");
-                writeln!(
-                    contract,
-                    "probe-{value}=sha256:{},bytes:{},octal:true,expected:ok",
-                    sha256(pattern.as_bytes()),
-                    pattern.len(),
-                )
-                .expect("writing to a String cannot fail");
-            }
-            for (index, pattern) in [r"\778", r"\7777", r"\8"].into_iter().enumerate() {
-                writeln!(
-                    contract,
-                    "edge-probe-{index}=sha256:{},bytes:{},octal:true,expected:{}",
-                    sha256(pattern.as_bytes()),
-                    pattern.len(),
-                    if pattern == r"\8" { "err" } else { "ok" },
-                )
-                .expect("writing to a String cannot fail");
-            }
-        }
+        AST_OCTAL_CASE_ID => write_ast_octal_evidence(&mut contract),
         AST_HEX_TWO_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Two),
         AST_HEX_FOUR_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Four),
         AST_HEX_EIGHT_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Eight),
@@ -2319,6 +2600,45 @@ fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expect
             "probe-{index}=sha256:{},bytes:{},expected:{expected}",
             sha256(pattern.as_bytes()),
             pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn write_ast_octal_evidence(contract: &mut String) {
+    for value in 0..511 {
+        let pattern = format!(r"\{value:o}");
+        writeln!(
+            contract,
+            "probe-{value}=sha256:{},bytes:{},octal:true,expected:ok",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, pattern) in [r"\778", r"\7777", r"\8"].into_iter().enumerate() {
+        writeln!(
+            contract,
+            "edge-probe-{index}=sha256:{},bytes:{},octal:true,expected:{}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+            if pattern == r"\8" { "err" } else { "ok" },
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn write_ast_fixed_error_evidence(contract: &mut String, probes: &[AstFixedErrorProbe]) {
+    for (index, probe) in probes.iter().copied().enumerate() {
+        writeln!(
+            contract,
+            "error-probe-{index}=sha256:{},bytes:{},ignore-whitespace:{},expected:error:{},span:{}..{}",
+            sha256(probe.pattern.as_bytes()),
+            probe.pattern.len(),
+            probe.ignore_whitespace,
+            probe.kind.evidence_label(),
+            probe.span_start,
+            probe.span_end,
         )
         .expect("writing to a String cannot fail");
     }
@@ -2855,6 +3175,8 @@ mod tests {
         for case_id in [
             AST_NEWLINES_CASE_ID,
             AST_ALTERNATE_CASE_ID,
+            AST_ESCAPE_CASE_ID,
+            AST_HEX_BRACE_CASE_ID,
             AST_OCTAL_CASE_ID,
             AST_HEX_TWO_CASE_ID,
             AST_HEX_FOUR_CASE_ID,
@@ -2887,6 +3209,80 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn escape_family_covers_all_pinned_outcomes_and_rejects_semantic_drift() {
+        assert_eq!(ESCAPE_SUCCESS_PROBES.len(), 24);
+        assert_eq!(ESCAPE_ERROR_PROBES.len(), 9);
+        assert_eq!(HEX_BRACE_SUCCESS_PROBES.len(), 5);
+        assert_eq!(HEX_BRACE_ERROR_PROBES.len(), 8);
+        run_ast_escape().expect("all 33 pinned escape outcomes match exactly");
+        run_ast_hex_brace().expect("all 13 pinned braced-hex outcomes match exactly");
+
+        let success_pattern = HEX_BRACE_SUCCESS_PROBES[4];
+        let profile = RustProfile::regex_1_12_4();
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(success_pattern)
+            .expect("maximum scalar braced hex parses");
+        let mut observed = parse_rust_ast(ParseRequest::rust(
+            success_pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .expect("FRE parses maximum scalar braced hex");
+        validate_ast_success(&observed, &expected, success_pattern, &profile, "unaltered")
+            .expect("exact braced-hex AST semantics");
+        observed.ast = Ast::empty(ast_span(0, 0));
+        assert!(
+            validate_ast_success(
+                &observed,
+                &expected,
+                success_pattern,
+                &profile,
+                "mutated-ast",
+            )
+            .is_err()
+        );
+
+        let probe = ESCAPE_ERROR_PROBES[3];
+        let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
+        builder.ignore_whitespace(probe.ignore_whitespace);
+        let error = builder
+            .build()
+            .parse(probe.pattern)
+            .expect_err("ignore-whitespace boundary probe is rejected");
+        assert!(ast_fixed_error_matches(&error, probe));
+        let mut wrong_kind = probe;
+        wrong_kind.kind = AstFixedErrorKind::EscapeUnexpectedEof;
+        assert!(!ast_fixed_error_matches(&error, wrong_kind));
+        let mut wrong_span = probe;
+        wrong_span.span_end = wrong_span.span_end.saturating_sub(1);
+        assert!(!ast_fixed_error_matches(&error, wrong_span));
+        let mut wrong_pattern = probe;
+        wrong_pattern.pattern = r"\b{";
+        assert!(!ast_fixed_error_matches(&error, wrong_pattern));
+    }
+
+    #[test]
+    fn primitive_vertical_bar_internal_outcome_is_not_falsely_admitted() {
+        let pattern = "|";
+        let internal_test_expected = Ast::literal(Literal {
+            span: ast_span(0, 1),
+            kind: LiteralKind::Verbatim,
+            c: '|',
+        });
+        let upstream_public = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect("a bare alternation parses through the public surface");
+        assert_ne!(upstream_public, internal_test_expected);
+        let observed = parse_rust_ast(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
+        ))
+        .expect("FRE delegates the public parser surface");
+        assert_eq!(observed.ast, upstream_public);
+        assert_ne!(observed.ast, internal_test_expected);
+        assert!(!is_supported_ast_case(AST_PRIMITIVE_NON_ESCAPE_CASE_ID));
     }
 
     #[test]
