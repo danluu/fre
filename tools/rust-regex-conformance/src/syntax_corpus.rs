@@ -152,6 +152,13 @@ const HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_CASE_ID: &str =
     "hir::tests::class_symmetric_difference_unicode";
 const HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_CASE_ID: &str =
     "hir::tests::class_symmetric_difference_bytes";
+const HIR_CLASS_CANONICALIZE_UNICODE_CASE_ID: &str = "hir::tests::class_canonicalize_unicode";
+const HIR_CLASS_CANONICALIZE_BYTES_CASE_ID: &str = "hir::tests::class_canonicalize_bytes";
+const HIR_CLASS_RANGE_CANONICAL_UNICODE_CASE_ID: &str = "hir::tests::class_range_canonical_unicode";
+const HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID: &str = "hir::tests::class_range_canonical_bytes";
+const HIR_LOOK_SET_ITER_CASE_ID: &str = "hir::tests::look_set_iter";
+const HIR_LOOK_SET_DEBUG_CASE_ID: &str = "hir::tests::look_set_debug";
+const HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID: &str = "hir::tests::no_stack_overflow_on_drop";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -1520,6 +1527,52 @@ const HIR_DOCTEST_CLASS_MAXIMUM_LEN_PROBES: [&str; 6] =
     [r"", r"^$\b\B", r"[a&&b]", r"x{2,10}", r"x{2,}", r"\w"];
 const HIR_DOCTEST_PROPERTIES_UNION_NEVER_PROBES: [&str; 3] = [r"ab?c?", r"[a&&b]", r"wxy?z?"];
 const HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_PROBES: [&str; 3] = [r"ab?c?", r"a+", r"wxy?z?"];
+type UnicodeClassCanonicalizeProbe = (&'static [(char, char)], &'static [(char, char)]);
+type BytesClassCanonicalizeProbe = (&'static [(u8, u8)], &'static [(u8, u8)]);
+
+const HIR_CLASS_CANONICALIZE_UNICODE_PROBES: &[UnicodeClassCanonicalizeProbe] = &[
+    (&[('a', 'c'), ('x', 'z')], &[('a', 'c'), ('x', 'z')]),
+    (&[('x', 'z'), ('a', 'c')], &[('a', 'c'), ('x', 'z')]),
+    (&[('x', 'z'), ('w', 'y')], &[('w', 'z')]),
+    (
+        &[
+            ('c', 'f'),
+            ('a', 'g'),
+            ('d', 'j'),
+            ('a', 'c'),
+            ('m', 'p'),
+            ('l', 's'),
+        ],
+        &[('a', 'j'), ('l', 's')],
+    ),
+    (&[('x', 'z'), ('u', 'w')], &[('u', 'z')]),
+    (
+        &[('\0', '\u{10FFFF}'), ('\0', '\u{10FFFF}')],
+        &[('\0', '\u{10FFFF}')],
+    ),
+    (&[('a', 'a'), ('b', 'b')], &[('a', 'b')]),
+];
+const HIR_CLASS_CANONICALIZE_BYTES_PROBES: &[BytesClassCanonicalizeProbe] = &[
+    (&[(b'a', b'c'), (b'x', b'z')], &[(b'a', b'c'), (b'x', b'z')]),
+    (&[(b'x', b'z'), (b'a', b'c')], &[(b'a', b'c'), (b'x', b'z')]),
+    (&[(b'x', b'z'), (b'w', b'y')], &[(b'w', b'z')]),
+    (
+        &[
+            (b'c', b'f'),
+            (b'a', b'g'),
+            (b'd', b'j'),
+            (b'a', b'c'),
+            (b'm', b'p'),
+            (b'l', b's'),
+        ],
+        &[(b'a', b'j'), (b'l', b's')],
+    ),
+    (&[(b'x', b'z'), (b'u', b'w')], &[(b'u', b'z')]),
+    (&[(b'\0', b'\xFF'), (b'\0', b'\xFF')], &[(b'\0', b'\xFF')]),
+    // The pinned source intentionally repeats this assertion.
+    (&[(b'\0', b'\xFF'), (b'\0', b'\xFF')], &[(b'\0', b'\xFF')]),
+    (&[(b'a', b'a'), (b'b', b'b')], &[(b'a', b'b')]),
+];
 const HIR_LITERAL_LITERAL_PROBES: [&str; 17] = [
     "a",
     "aaaaa",
@@ -3456,6 +3509,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
         };
     }
+    if is_supported_hir_misc_case(&obligation.case_id) {
+        return execute_hir_misc_case(&obligation.case_id);
+    }
     if is_supported_hir_class_operation_case(&obligation.case_id) {
         return execute_hir_class_operation_case(&obligation.case_id);
     }
@@ -3808,6 +3864,19 @@ fn is_supported_hir_class_operation_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_hir_misc_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_CLASS_CANONICALIZE_UNICODE_CASE_ID
+            | HIR_CLASS_CANONICALIZE_BYTES_CASE_ID
+            | HIR_CLASS_RANGE_CANONICAL_UNICODE_CASE_ID
+            | HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID
+            | HIR_LOOK_SET_ITER_CASE_ID
+            | HIR_LOOK_SET_DEBUG_CASE_ID
+            | HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -4059,6 +4128,28 @@ fn execute_hir_class_operation_case(case_id: &str) -> RegexSyntaxCorpusDispositi
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-hir-class-operation-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_hir_misc_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_hir_misc_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: hir_misc_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: hir_misc_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-hir-misc-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -5198,6 +5289,171 @@ fn apply_bytes_class_operation(
             unreachable!("unary class operation handled by caller")
         }
     }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors seven independently identified public HIR unit tests"
+)]
+fn run_hir_misc_case(case_id: &str) -> Result<(), AstMismatch> {
+    use regex_syntax::hir::{
+        Capture, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look,
+        LookSet, Repetition,
+    };
+
+    match case_id {
+        HIR_CLASS_RANGE_CANONICAL_UNICODE_CASE_ID => {
+            let range = ClassUnicodeRange::new('\u{00FF}', '\0');
+            hir_doctest_assert_eq(case_id, "start", &'\0', &range.start())?;
+            hir_doctest_assert_eq(case_id, "end", &'\u{00FF}', &range.end())?;
+            let (_, observed) = exact_text_hir_pair(r"[\x{0}-\x{FF}]", case_id)?;
+            let observed = unicode_class_from_hir(&observed, case_id)?;
+            hir_doctest_assert_eq(
+                case_id,
+                "fre-hir-binding",
+                &ClassUnicode::new([range]),
+                &observed,
+            )?;
+        }
+        HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID => {
+            let range = ClassBytesRange::new(b'\xFF', b'\0');
+            hir_doctest_assert_eq(case_id, "start", &b'\0', &range.start())?;
+            hir_doctest_assert_eq(case_id, "end", &b'\xFF', &range.end())?;
+            let (_, observed) = exact_hir_pair(r"(?-u:[\x00-\xFF])", case_id)?;
+            let observed = bytes_class_from_hir(&observed, case_id)?;
+            hir_doctest_assert_eq(
+                case_id,
+                "fre-hir-binding",
+                &ClassBytes::new([range]),
+                &observed,
+            )?;
+        }
+        HIR_CLASS_CANONICALIZE_UNICODE_CASE_ID => {
+            for (index, &(input, expected)) in
+                HIR_CLASS_CANONICALIZE_UNICODE_PROBES.iter().enumerate()
+            {
+                let class = ClassUnicode::new(
+                    input
+                        .iter()
+                        .copied()
+                        .map(|(start, end)| ClassUnicodeRange::new(start, end)),
+                );
+                let observed_ranges = class
+                    .iter()
+                    .map(|range| (range.start(), range.end()))
+                    .collect::<Vec<_>>();
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed_ranges.as_slice(),
+                )?;
+                let pattern = unicode_class_pattern(input);
+                let (_, observed_hir) =
+                    exact_text_hir_pair(&pattern, &format!("{case_id}-{index}"))?;
+                let observed_class = unicode_class_from_hir(&observed_hir, case_id)?;
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("fre-hir-binding-{index}"),
+                    &class,
+                    &observed_class,
+                )?;
+            }
+        }
+        HIR_CLASS_CANONICALIZE_BYTES_CASE_ID => {
+            for (index, &(input, expected)) in
+                HIR_CLASS_CANONICALIZE_BYTES_PROBES.iter().enumerate()
+            {
+                let class = ClassBytes::new(
+                    input
+                        .iter()
+                        .copied()
+                        .map(|(start, end)| ClassBytesRange::new(start, end)),
+                );
+                let observed_ranges = class
+                    .iter()
+                    .map(|range| (range.start(), range.end()))
+                    .collect::<Vec<_>>();
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed_ranges.as_slice(),
+                )?;
+                let pattern = bytes_class_pattern(input);
+                let (_, observed_hir) = exact_hir_pair(&pattern, &format!("{case_id}-{index}"))?;
+                let observed_class = bytes_class_from_hir(&observed_hir, case_id)?;
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("fre-hir-binding-{index}"),
+                    &class,
+                    &observed_class,
+                )?;
+            }
+        }
+        HIR_LOOK_SET_ITER_CASE_ID => {
+            hir_doctest_assert_eq(case_id, "empty", &0, &LookSet::empty().iter().count())?;
+            hir_doctest_assert_eq(case_id, "full", &18, &LookSet::full().iter().count())?;
+            let set = LookSet::empty()
+                .insert(Look::StartLF)
+                .insert(Look::WordUnicode);
+            hir_doctest_assert_eq(case_id, "two", &2, &set.iter().count())?;
+            let set = LookSet::empty().insert(Look::StartLF);
+            hir_doctest_assert_eq(case_id, "one-start", &1, &set.iter().count())?;
+            let set = LookSet::empty().insert(Look::WordAsciiNegate);
+            hir_doctest_assert_eq(case_id, "one-word", &1, &set.iter().count())?;
+            let _ = exact_text_hir_pair(r"(?m:^)|\b", case_id)?;
+        }
+        HIR_LOOK_SET_DEBUG_CASE_ID => {
+            hir_doctest_assert_eq(
+                case_id,
+                "empty",
+                &"∅".to_owned(),
+                &format!("{:?}", LookSet::empty()),
+            )?;
+            hir_doctest_assert_eq(
+                case_id,
+                "full",
+                &"Az^$rRbB𝛃𝚩<>〈〉◁▷◀▶".to_owned(),
+                &format!("{:?}", LookSet::full()),
+            )?;
+            let _ = exact_text_hir_pair(r"(?m:^)|\b", case_id)?;
+        }
+        HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID => {
+            let (_, seed) = exact_text_hir_pair("a", case_id)?;
+            let joined = std::thread::Builder::new()
+                .stack_size(16 << 10)
+                .spawn(move || {
+                    let mut expr = seed;
+                    for _ in 0..100 {
+                        expr = Hir::capture(Capture {
+                            index: 1,
+                            name: None,
+                            sub: Box::new(expr),
+                        });
+                        expr = Hir::repetition(Repetition {
+                            min: 0,
+                            max: Some(1),
+                            greedy: true,
+                            sub: Box::new(expr),
+                        });
+                    }
+                    !matches!(*expr.kind(), HirKind::Empty)
+                })
+                .map_err(|error| AstMismatch {
+                    expected: format!("{case_id}: 16KiB-stack worker starts"),
+                    observed: format!("{case_id}: {error:?}"),
+                })?
+                .join()
+                .map_err(|_| AstMismatch {
+                    expected: format!("{case_id}: bounded public HIR drops without stack overflow"),
+                    observed: format!("{case_id}: worker panicked"),
+                })?;
+            hir_doctest_assert_eq(case_id, "non-empty", &true, &joined)?;
+        }
+        _ => unreachable!("caller checked supported HIR misc case"),
+    }
+    Ok(())
 }
 
 fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
@@ -6819,6 +7075,61 @@ fn hir_class_operation_pass_evidence(case_id: &str) -> String {
     sha256(contract.as_bytes())
 }
 
+fn hir_misc_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.hir-misc-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nexpected=exact-public-hir-unit-semantics\n"
+    );
+    match case_id {
+        HIR_CLASS_CANONICALIZE_UNICODE_CASE_ID => {
+            for (index, &(input, expected)) in
+                HIR_CLASS_CANONICALIZE_UNICODE_PROBES.iter().enumerate()
+            {
+                let pattern = unicode_class_pattern(input);
+                writeln!(
+                    contract,
+                    "probe-{index}=pattern-sha256:{},pattern-bytes:{},expected:{expected:?}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        HIR_CLASS_CANONICALIZE_BYTES_CASE_ID => {
+            for (index, &(input, expected)) in
+                HIR_CLASS_CANONICALIZE_BYTES_PROBES.iter().enumerate()
+            {
+                let pattern = bytes_class_pattern(input);
+                writeln!(
+                    contract,
+                    "probe-{index}=pattern-sha256:{},pattern-bytes:{},expected:{expected:?}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        HIR_CLASS_RANGE_CANONICAL_UNICODE_CASE_ID => {
+            contract.push_str("input=U+00FF..U+0000\nexpected=U+0000..U+00FF\n");
+        }
+        HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID => {
+            contract.push_str("input=FF..00\nexpected=00..FF\n");
+        }
+        HIR_LOOK_SET_ITER_CASE_ID => {
+            contract.push_str(
+                "assertions=empty:0,full:18,startlf+wordunicode:2,startlf:1,word-ascii-negate:1\n",
+            );
+        }
+        HIR_LOOK_SET_DEBUG_CASE_ID => {
+            contract.push_str("assertions=empty:∅,full:Az^$rRbB𝛃𝚩<>〈〉◁▷◀▶\n");
+        }
+        HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID => {
+            contract.push_str("seed=exact-fre-hir:a\npublic-depth=200\nworker-stack=16384\n");
+        }
+        _ => unreachable!("caller checked supported HIR misc case"),
+    }
+    sha256(contract.as_bytes())
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -7200,6 +7511,15 @@ fn hir_class_operation_mismatch_evidence(case_id: &str, expected: &str, observed
     )
 }
 
+fn hir_misc_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.hir-misc-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -7223,6 +7543,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_ast_print_case(case_id)
         || is_supported_hir_print_case(case_id)
         || is_supported_hir_literal_case(case_id)
+        || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
 }
@@ -7236,6 +7557,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         hir_print_pass_evidence(case_id)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_pass_evidence(case_id)
+    } else if is_supported_hir_misc_case(case_id) {
+        hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
         hir_class_operation_pass_evidence(case_id)
     } else {
@@ -7252,6 +7575,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         hir_print_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_hir_misc_case(case_id) {
+        hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
         hir_class_operation_mismatch_evidence(case_id, expected, observed)
     } else {
@@ -7268,6 +7593,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-hir-print-adapter"
     } else if is_supported_hir_literal_case(case_id) {
         "fre-hir-literal-adapter"
+    } else if is_supported_hir_misc_case(case_id) {
+        "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
         "fre-hir-class-operation-adapter"
     } else {
@@ -8035,6 +8362,54 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR class-operation receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_misc_cases_execute_all_27_public_assertions() {
+        let cases = [
+            (HIR_CLASS_RANGE_CANONICAL_UNICODE_CASE_ID, 2),
+            (HIR_CLASS_RANGE_CANONICAL_BYTES_CASE_ID, 2),
+            (
+                HIR_CLASS_CANONICALIZE_UNICODE_CASE_ID,
+                HIR_CLASS_CANONICALIZE_UNICODE_PROBES.len(),
+            ),
+            (
+                HIR_CLASS_CANONICALIZE_BYTES_CASE_ID,
+                HIR_CLASS_CANONICALIZE_BYTES_PROBES.len(),
+            ),
+            (HIR_LOOK_SET_ITER_CASE_ID, 5),
+            (HIR_LOOK_SET_DEBUG_CASE_ID, 2),
+            (HIR_NO_STACK_OVERFLOW_ON_DROP_CASE_ID, 1),
+        ];
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(_, assertions)| assertions)
+                .sum::<usize>(),
+            27,
+        );
+        for (case_id, _) in cases {
+            let disposition = execute_hir_misc_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_misc_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/mod.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR misc receipt");
         }
     }
 
