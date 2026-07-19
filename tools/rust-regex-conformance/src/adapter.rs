@@ -1384,9 +1384,7 @@ fn selected_text_last_literal(
                 start: matched.start(),
                 end: matched.end(),
             };
-            if winner.is_none_or(|current: SelectedPatternMatch| {
-                (candidate.end, candidate.id) > (current.end, current.id)
-            }) {
+            if winner.is_none_or(|current| last_literal_candidate_wins(candidate, current)) {
                 winner = Some(candidate);
             }
             let Some(next) = advance_text_scalar(haystack, matched.start()) else {
@@ -1425,9 +1423,7 @@ fn selected_bytes_last_literal(
                 start: matched.start(),
                 end: matched.end(),
             };
-            if winner.is_none_or(|current: SelectedPatternMatch| {
-                (candidate.end, candidate.id) > (current.end, current.id)
-            }) {
+            if winner.is_none_or(|current| last_literal_candidate_wins(candidate, current)) {
                 winner = Some(candidate);
             }
             if matched.start() == haystack.len() {
@@ -1440,6 +1436,13 @@ fn selected_bytes_last_literal(
         }
     }
     Ok(winner.into_iter().map(|matched| matched.id).collect())
+}
+
+fn last_literal_candidate_wins(
+    candidate: SelectedPatternMatch,
+    current: SelectedPatternMatch,
+) -> bool {
+    candidate.end > current.end || (candidate.end == current.end && candidate.id < current.id)
 }
 
 fn advance_text_scalar(haystack: &str, start: usize) -> Option<usize> {
@@ -3868,6 +3871,74 @@ mod tests {
             execute_case(AdapterSurface::RustTextSetWhich, &case, &unsupported),
             AdapterDisposition::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn leftmost_all_multi_which_preserves_declaration_priority_at_equal_end() {
+        let fixtures = [
+            (
+                "duplicate-nonempty",
+                vec!["a".to_owned(), "a".to_owned()],
+                b"a".to_vec(),
+                1,
+            ),
+            (
+                "duplicate-empty",
+                vec![String::new(), String::new()],
+                Vec::new(),
+                0,
+            ),
+        ];
+        for (name, patterns, haystack, expected_end) in fixtures {
+            let mut text_case = fixture_case(true, true, None);
+            text_case.id = format!("fixture/{name}");
+            text_case.upstream_name.clone_from(&text_case.id);
+            text_case.pattern_count = patterns.len();
+            text_case.match_kind = MatchKind::All;
+            let input = ExecutableCase {
+                id: text_case.id.clone(),
+                patterns,
+                bounds: SearchBounds {
+                    start: 0,
+                    end: haystack.len(),
+                },
+                haystack,
+                line_terminator: b'\n',
+                expected: vec![ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![Some(ExpectedSpan {
+                        start: 0,
+                        end: expected_end,
+                    })],
+                }],
+            };
+
+            assert_eq!(
+                surface_applicability(AdapterSurface::RustTextSetWhich, &text_case, &input),
+                Ok(())
+            );
+            assert!(
+                matches!(
+                    execute_case(AdapterSurface::RustTextSetWhich, &text_case, &input),
+                    AdapterDisposition::Pass { .. }
+                ),
+                "text selector lost declaration priority for {name}"
+            );
+
+            let mut bytes_case = text_case;
+            bytes_case.utf8 = false;
+            assert_eq!(
+                surface_applicability(AdapterSurface::RustBytesSetWhich, &bytes_case, &input),
+                Ok(())
+            );
+            assert!(
+                matches!(
+                    execute_case(AdapterSurface::RustBytesSetWhich, &bytes_case, &input),
+                    AdapterDisposition::Pass { .. }
+                ),
+                "byte selector lost declaration priority for {name}"
+            );
+        }
     }
 
     #[test]
