@@ -65,6 +65,10 @@ const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
 const AST_NEWLINES_CASE_ID: &str = "ast::parse::tests::parse_newlines";
 const AST_ALTERNATE_CASE_ID: &str = "ast::parse::tests::parse_alternate";
 const AST_UNCOUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_uncounted_repetition";
+const AST_GROUP_CASE_ID: &str = "ast::parse::tests::parse_group";
+const AST_CAPTURE_NAME_CASE_ID: &str = "ast::parse::tests::parse_capture_name";
+const AST_FLAGS_CASE_ID: &str = "ast::parse::tests::parse_flags";
+const AST_FLAG_CASE_ID: &str = "ast::parse::tests::parse_flag";
 #[cfg(test)]
 const AST_COUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_counted_repetition";
 #[cfg(test)]
@@ -193,6 +197,60 @@ const UNCOUNTED_REPETITION_ERROR_PROBES: [AstFixedErrorProbe; 10] = [
     AstFixedErrorProbe::new(r"|*", false, AstFixedErrorKind::RepetitionMissing, 1, 1),
     AstFixedErrorProbe::new(r"|+", false, AstFixedErrorKind::RepetitionMissing, 1, 1),
     AstFixedErrorProbe::new(r"|?", false, AstFixedErrorKind::RepetitionMissing, 1, 1),
+];
+const GROUP_PROBES: [&str; 17] = [
+    "(?i)", "(?iU)", "(?i-U)", "()", "(a)", "(())", "(?:a)", "(?i:a)", "(?i-U:a)", "(", "(?",
+    "(?P", "(?P<", "(a", "(()", ")", "a)",
+];
+const CAPTURE_NAME_PROBES: [&str; 22] = [
+    "(?<a>z)",
+    "(?P<a>z)",
+    "(?P<abc>z)",
+    "(?P<a_1>z)",
+    "(?P<a.1>z)",
+    "(?P<a[1]>z)",
+    "(?P<a¾>)",
+    "(?P<名字>)",
+    "(?P<",
+    "(?P<>z)",
+    "(?P<a",
+    "(?P<ab",
+    "(?P<0a",
+    "(?P<~",
+    "(?P<abc~",
+    "(?P<a>y)(?P<a>z)",
+    "(?P<5>)",
+    "(?P<5a>)",
+    "(?P<¾>)",
+    "(?P<¾a>)",
+    "(?P<☃>)",
+    "(?P<a☃>)",
+];
+const FLAGS_CONTEXT_PROBES: [(&str, &str); 13] = [
+    ("i:", "(?i:a)"),
+    ("i)", "(?i)"),
+    ("isU:", "(?isU:a)"),
+    ("-isU:", "(?-isU:a)"),
+    ("i-sU:", "(?i-sU:a)"),
+    ("i-sR:", "(?i-sR:a)"),
+    ("isU", "(?isU"),
+    ("isUa:", "(?isUa:a)"),
+    ("isUi:", "(?isUi:a)"),
+    ("i-sU-i:", "(?i-sU-i:a)"),
+    ("-)", "(?-)"),
+    ("i-)", "(?i-)"),
+    ("iU-)", "(?iU-)"),
+];
+const FLAG_CONTEXT_PROBES: [(&str, &str); 9] = [
+    ("i", "(?i)"),
+    ("m", "(?m)"),
+    ("s", "(?s)"),
+    ("U", "(?U)"),
+    ("u", "(?u)"),
+    ("R", "(?R)"),
+    ("x", "(?x)"),
+    ("a", "(?a)"),
+    ("☃", "(?☃)"),
 ];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
@@ -377,7 +435,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_alternate, parse_escape, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 13 AST parser identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 9 AST parser identities remain explicit Unsupported dispositions.",
     "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
@@ -1932,6 +1990,10 @@ fn is_supported_ast_case(case_id: &str) -> bool {
             | AST_NEWLINES_CASE_ID
             | AST_ALTERNATE_CASE_ID
             | AST_UNCOUNTED_REPETITION_CASE_ID
+            | AST_GROUP_CASE_ID
+            | AST_CAPTURE_NAME_CASE_ID
+            | AST_FLAGS_CASE_ID
+            | AST_FLAG_CASE_ID
             | AST_ESCAPE_CASE_ID
             | AST_HEX_BRACE_CASE_ID
             | AST_OCTAL_CASE_ID
@@ -1955,6 +2017,10 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         AST_UNCOUNTED_REPETITION_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_uncounted_repetition))
         }
+        AST_GROUP_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_group)),
+        AST_CAPTURE_NAME_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_capture_name)),
+        AST_FLAGS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_flags)),
+        AST_FLAG_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_flag)),
         AST_ESCAPE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_escape)),
         AST_HEX_BRACE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_brace)),
         AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
@@ -2233,6 +2299,39 @@ fn run_ast_uncounted_repetition() -> Result<(), AstMismatch> {
     }
     for (index, probe) in UNCOUNTED_REPETITION_ERROR_PROBES.into_iter().enumerate() {
         execute_ast_fixed_error_probe(probe, &format!("uncounted-repetition-error-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_group() -> Result<(), AstMismatch> {
+    run_ast_equivalence_set(&GROUP_PROBES, "group")
+}
+
+fn run_ast_capture_name() -> Result<(), AstMismatch> {
+    run_ast_equivalence_set(&CAPTURE_NAME_PROBES, "capture-name")
+}
+
+fn run_ast_flags() -> Result<(), AstMismatch> {
+    run_ast_context_equivalence_set(&FLAGS_CONTEXT_PROBES, "flags")
+}
+
+fn run_ast_flag() -> Result<(), AstMismatch> {
+    run_ast_context_equivalence_set(&FLAG_CONTEXT_PROBES, "flag")
+}
+
+fn run_ast_equivalence_set(probes: &[&str], label: &str) -> Result<(), AstMismatch> {
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("{label}-probe-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_context_equivalence_set(
+    probes: &[(&str, &str)],
+    label: &str,
+) -> Result<(), AstMismatch> {
+    for (index, (_, public_pattern)) in probes.iter().copied().enumerate() {
+        execute_ast_equivalence_probe(public_pattern, &format!("{label}-context-{index}"))?;
     }
     Ok(())
 }
@@ -2551,6 +2650,9 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
             &ALTERNATE_PROBES,
             "upstream-exact-result",
         ),
+        AST_GROUP_CASE_ID | AST_CAPTURE_NAME_CASE_ID | AST_FLAGS_CASE_ID | AST_FLAG_CASE_ID => {
+            write_ast_group_family_evidence(&mut contract, case_id);
+        }
         AST_UNCOUNTED_REPETITION_CASE_ID => {
             write_ast_uncounted_repetition_evidence(&mut contract);
         }
@@ -2652,6 +2754,38 @@ fn write_ast_uncounted_repetition_evidence(contract: &mut String) {
         "upstream-exact-success",
     );
     write_ast_fixed_error_evidence(contract, &UNCOUNTED_REPETITION_ERROR_PROBES);
+}
+
+fn write_ast_group_family_evidence(contract: &mut String, case_id: &str) {
+    match case_id {
+        AST_GROUP_CASE_ID => {
+            write_ast_equivalence_evidence(contract, &GROUP_PROBES, "upstream-exact-result");
+        }
+        AST_CAPTURE_NAME_CASE_ID => {
+            write_ast_equivalence_evidence(contract, &CAPTURE_NAME_PROBES, "upstream-exact-result");
+        }
+        AST_FLAGS_CASE_ID => {
+            write_ast_context_evidence(contract, &FLAGS_CONTEXT_PROBES);
+        }
+        AST_FLAG_CASE_ID => {
+            write_ast_context_evidence(contract, &FLAG_CONTEXT_PROBES);
+        }
+        _ => unreachable!("caller selected a group-family case"),
+    }
+}
+
+fn write_ast_context_evidence(contract: &mut String, probes: &[(&str, &str)]) {
+    for (index, (source_pattern, public_pattern)) in probes.iter().copied().enumerate() {
+        writeln!(
+            contract,
+            "context-{index}=source-sha256:{},source-bytes:{},public-sha256:{},public-bytes:{},source-offset:2,expected:upstream-exact-result",
+            sha256(source_pattern.as_bytes()),
+            source_pattern.len(),
+            sha256(public_pattern.as_bytes()),
+            public_pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 fn write_ast_octal_evidence(contract: &mut String) {
@@ -3225,6 +3359,10 @@ mod tests {
             AST_NEWLINES_CASE_ID,
             AST_ALTERNATE_CASE_ID,
             AST_UNCOUNTED_REPETITION_CASE_ID,
+            AST_GROUP_CASE_ID,
+            AST_CAPTURE_NAME_CASE_ID,
+            AST_FLAGS_CASE_ID,
+            AST_FLAG_CASE_ID,
             AST_ESCAPE_CASE_ID,
             AST_HEX_BRACE_CASE_ID,
             AST_OCTAL_CASE_ID,
@@ -3259,6 +3397,116 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn group_family_covers_every_pinned_outcome_and_context_mapping() {
+        assert_eq!(GROUP_PROBES.len(), 17);
+        assert_eq!(CAPTURE_NAME_PROBES.len(), 22);
+        assert_eq!(FLAGS_CONTEXT_PROBES.len(), 13);
+        assert_eq!(FLAG_CONTEXT_PROBES.len(), 9);
+        run_ast_group().expect("all 17 pinned group outcomes match exactly");
+        run_ast_capture_name().expect("all 22 pinned capture-name outcomes match exactly");
+        run_ast_flags().expect("all 13 pinned private flags outcomes match in public contexts");
+        run_ast_flag().expect("all 9 pinned private flag outcomes match in public contexts");
+
+        for (source_pattern, public_pattern) in FLAGS_CONTEXT_PROBES {
+            let expected = if source_pattern.ends_with(':') {
+                format!("(?{source_pattern}a)")
+            } else {
+                format!("(?{source_pattern}")
+            };
+            assert_eq!(public_pattern, expected);
+        }
+        for (source_pattern, public_pattern) in FLAG_CONTEXT_PROBES {
+            assert_eq!(public_pattern, format!("(?{source_pattern})"));
+        }
+
+        let duplicate = regex_syntax::ast::parse::Parser::new()
+            .parse("(?isUi:a)")
+            .expect_err("duplicate flag is rejected in the public context");
+        assert_eq!(duplicate.span(), &ast_span(5, 6));
+        assert_eq!(
+            duplicate.kind(),
+            &regex_syntax::ast::ErrorKind::FlagDuplicate {
+                original: ast_span(2, 3),
+            }
+        );
+        let repeated_negation = regex_syntax::ast::parse::Parser::new()
+            .parse("(?i-sU-i:a)")
+            .expect_err("repeated flag negation is rejected in the public context");
+        assert_eq!(repeated_negation.span(), &ast_span(6, 7));
+        assert_eq!(
+            repeated_negation.kind(),
+            &regex_syntax::ast::ErrorKind::FlagRepeatedNegation {
+                original: ast_span(3, 4),
+            }
+        );
+        let unicode_flag = regex_syntax::ast::parse::Parser::new()
+            .parse("(?☃)")
+            .expect_err("a multibyte unknown flag is rejected");
+        assert_eq!(
+            unicode_flag.span(),
+            &Span::new(Position::new(2, 1, 3), Position::new(5, 1, 4))
+        );
+        assert_eq!(
+            unicode_flag.kind(),
+            &regex_syntax::ast::ErrorKind::FlagUnrecognized
+        );
+    }
+
+    #[test]
+    fn group_family_rejects_ast_and_error_semantic_drift() {
+        let success_pattern = CAPTURE_NAME_PROBES[7];
+        let profile = RustProfile::regex_1_12_4();
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(success_pattern)
+            .expect("Unicode capture name parses");
+        let mut observed = parse_rust_ast(ParseRequest::rust(
+            success_pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .expect("FRE parses the Unicode capture name");
+        validate_ast_success(&observed, &expected, success_pattern, &profile, "unaltered")
+            .expect("exact Unicode capture AST and byte/column spans");
+        observed.ast = Ast::empty(ast_span(0, 0));
+        assert!(
+            validate_ast_success(
+                &observed,
+                &expected,
+                success_pattern,
+                &profile,
+                "mutated-ast",
+            )
+            .is_err()
+        );
+
+        let error_pattern = CAPTURE_NAME_PROBES[15];
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(error_pattern)
+            .expect_err("duplicate capture name is rejected");
+        let compatibility = CompatibilityProfile::RustText(profile);
+        let mut observed = parse_rust_ast(ParseRequest::rust(error_pattern, compatibility.clone()))
+            .expect_err("FRE rejects duplicate capture names");
+        validate_ast_error(
+            &observed,
+            &expected,
+            error_pattern,
+            &compatibility,
+            "unaltered",
+        )
+        .expect("exact duplicate-name error/original-span semantics");
+        observed.message.push('!');
+        assert!(
+            validate_ast_error(
+                &observed,
+                &expected,
+                error_pattern,
+                &compatibility,
+                "mutated-message",
+            )
+            .is_err()
+        );
     }
 
     #[test]
