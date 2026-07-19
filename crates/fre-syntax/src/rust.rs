@@ -9,6 +9,8 @@ const UNICODE_BOOL_PROPERTY_ALIASES: &[&str] = include!("unicode_bool_aliases.in
 const MAX_UNICODE_BOOL_ALIAS_BYTES: usize = 30;
 const UNICODE_GENCAT_ALIASES: &[&str] = include!("unicode_gencat_aliases.in");
 const MAX_UNICODE_GENCAT_ALIAS_BYTES: usize = 20;
+const UNICODE_SCRIPT_ALIASES: &[&str] = include!("unicode_script_aliases.in");
+const MAX_UNICODE_SCRIPT_ALIAS_BYTES: usize = 21;
 
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -329,6 +331,12 @@ enum UnicodePerlTable {
     Word,
 }
 
+#[derive(Clone, Copy)]
+enum UnicodeScriptTable {
+    Script,
+    ScriptExtension,
+}
+
 const UNICODE_CASE_CODEPOINTS: u64 = 0x11_0000;
 const UNICODE_CASE_TABLE_KEYS: u64 = 2_938;
 const UNICODE_CASE_MAX_FOLDS_PER_KEY: u64 = 3;
@@ -352,6 +360,22 @@ const UNICODE_PERL_WORD_RANGES: u64 = 796;
 const UNICODE_PERL_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
 const UNICODE_PERL_CLASS_WORK_PER_RANGE: u64 = 24;
 const UNICODE_PERL_SET_WORK_PER_RANGE_SITE: u64 = 128;
+// regex-syntax 0.8.11 / Unicode 16.0.0 singleton `unicode-script`
+// closure. `property_names.rs` and `property_values.rs` have SHA-256
+// 8c93985d1bcb01735667a3c4cb92f7e260d267326bde9d7f048bc77cd7e07855 and
+// ef9131ce0a575c7327ec6d466aafd8b7c25600d80c232b5a4110bbf0a5a59136.
+// `script.rs` has SHA-256
+// 41bd424f1e3a03290cf4995ced678dcf24c94b38c905c62f6819bf67e098a2ec,
+// 170 materialized families, 845 total ranges and at most 174 ranges in one
+// family. `script_extension.rs` has SHA-256
+// a314099ddbf50a07fe350bb0835bf2fe494ed5ad278b30e171e21506eb557906,
+// 170 materialized families, 1,234 total ranges and at most 159 ranges in one
+// family. Both property-value indexes contain the same 338 normalized aliases.
+const UNICODE_SCRIPT_RANGES: u64 = 174;
+const UNICODE_SCRIPT_EXTENSION_RANGES: u64 = 159;
+const UNICODE_SCRIPT_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
+const UNICODE_SCRIPT_CLASS_WORK_PER_RANGE: u64 = 24;
+const UNICODE_SCRIPT_SET_WORK_PER_RANGE_SITE: u64 = 128;
 
 impl UnicodePerlTable {
     const fn ranges(self) -> u64 {
@@ -359,6 +383,15 @@ impl UnicodePerlTable {
             Self::Decimal => UNICODE_PERL_DECIMAL_RANGES,
             Self::Space => UNICODE_PERL_SPACE_RANGES,
             Self::Word => UNICODE_PERL_WORD_RANGES,
+        }
+    }
+}
+
+impl UnicodeScriptTable {
+    const fn ranges(self) -> u64 {
+        match self {
+            Self::Script => UNICODE_SCRIPT_RANGES,
+            Self::ScriptExtension => UNICODE_SCRIPT_EXTENSION_RANGES,
         }
     }
 }
@@ -729,10 +762,92 @@ impl UnicodeAvailabilityVisitor<'_> {
         )
     }
 
-    fn normalize_unicode_symbol(
+    fn charge_script_class_set(&mut self, class: &ast::ClassBracketed) -> Result<(), ParseError> {
+        // Reserve the Unicode flag and both `has_script` comparisons before
+        // selecting this prospective analysis.
+        self.charge(3)?;
+        if !self.flags.unicode || !self.features.has_script() {
+            return Ok(());
+        }
+
+        // Script and Script_Extensions range vectors are allocated, copied,
+        // canonicalized and combined at every enclosing bracket/binary-set
+        // site. Analyze the exact AST topology before regex-syntax can do any
+        // of that work. An arbitrary Unicode leaf is conservatively assigned
+        // the largest singleton script table; the exact classifier below
+        // either authenticates its family or rejects it before translation.
+        let mut stack = Vec::new();
+        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&class.kind))?;
+        let mut range_ceiling = 0_u64;
+        let mut translation_sites = 1_u64;
+        let mut script_sources = 0_u64;
+        loop {
+            self.charge(1)?;
+            let Some(node) = stack.pop() else {
+                break;
+            };
+            self.charge(7)?;
+            match node {
+                ClassAnalysisNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                }
+                ClassAnalysisNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                    translation_sites = translation_sites.saturating_add(5);
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.lhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.rhs))?;
+                }
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Empty(_) | ast::ClassSetItem::Perl(_),
+                ) => {
+                    // Empty has no source table. A script-only profile rejects
+                    // every Unicode Perl class before HIR translation.
+                }
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Literal(_) | ast::ClassSetItem::Range(_),
+                ) => {
+                    range_ceiling = range_ceiling.saturating_add(1);
+                    translation_sites = translation_sites.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(128);
+                    translation_sites = translation_sites.saturating_add(2);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Unicode(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(UNICODE_SCRIPT_RANGES);
+                    translation_sites = translation_sites.saturating_add(2);
+                    script_sources = script_sources.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                    translation_sites = translation_sites.saturating_add(2);
+                    self.push_class_analysis_node(
+                        &mut stack,
+                        ClassAnalysisNode::Set(&nested.kind),
+                    )?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Union(union)) => {
+                    translation_sites = translation_sites
+                        .saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
+                    for item in &union.items {
+                        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                    }
+                }
+            }
+            range_ceiling = range_ceiling.min(UNICODE_SCRIPT_SCALAR_RANGE_CEILING);
+        }
+        if script_sources == 0 {
+            return Ok(());
+        }
+        self.charge(
+            range_ceiling
+                .saturating_mul(translation_sites)
+                .saturating_mul(UNICODE_SCRIPT_SET_WORK_PER_RANGE_SITE),
+        )
+    }
+
+    fn normalize_unicode_symbol<const N: usize>(
         &mut self,
         raw: &str,
-        normalized: &mut [u8; MAX_UNICODE_GENCAT_ALIAS_BYTES],
+        normalized: &mut [u8; N],
     ) -> Result<Option<usize>, ParseError> {
         let raw_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
         // Reserve our classifier scan plus regex-syntax's Vec allocation,
@@ -909,6 +1024,116 @@ impl UnicodeAvailabilityVisitor<'_> {
         Ok(false)
     }
 
+    fn normalized_is_script_alias(&mut self, normalized: &[u8]) -> Result<bool, ParseError> {
+        for &alias in UNICODE_SCRIPT_ALIASES {
+            self.charge(1)?;
+            if alias.len() != normalized.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(alias.as_bytes()) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn normalized_script_table(
+        &mut self,
+        normalized: &[u8],
+    ) -> Result<Option<UnicodeScriptTable>, ParseError> {
+        if self.normalized_matches(normalized, &[b"sc", b"script"])? {
+            return Ok(Some(UnicodeScriptTable::Script));
+        }
+        if self.normalized_matches(normalized, &[b"scx", b"scriptextensions"])? {
+            return Ok(Some(UnicodeScriptTable::ScriptExtension));
+        }
+        Ok(None)
+    }
+
+    fn charge_script_table_translation(
+        &mut self,
+        table: UnicodeScriptTable,
+        query_bytes: u64,
+    ) -> Result<(), ParseError> {
+        // The pinned lookup visits the 271-name property index, one of seven
+        // value families, up to 338 aliases and one of 170 source tables.
+        // Sixty-four whole-query comparisons conservatively cover every
+        // binary search and special implicit-script branch. The range term
+        // reserves source iteration, Vec allocation/copy, canonical-order
+        // validation/deduplication and possible negation before translation.
+        self.charge(query_bytes.saturating_mul(64).saturating_add(1_024))?;
+        self.charge(
+            table
+                .ranges()
+                .saturating_mul(UNICODE_SCRIPT_CLASS_WORK_PER_RANGE),
+        )
+    }
+
+    fn is_unicode_script_class(
+        &mut self,
+        class: &ast::ClassUnicode,
+    ) -> Result<Option<UnicodeScriptTable>, ParseError> {
+        // Reserve the AST-kind branch and both feature comparisons before
+        // inspecting the query.
+        self.charge(3)?;
+        if !self.features.has_script() {
+            return Ok(None);
+        }
+        let mut name_buf = [0_u8; MAX_UNICODE_SCRIPT_ALIAS_BYTES];
+        let mut value_buf = [0_u8; MAX_UNICODE_SCRIPT_ALIAS_BYTES];
+        let (table, query_bytes) = match &class.kind {
+            ast::ClassUnicodeKind::OneLetter(value) => {
+                let mut encoded = [0_u8; 4];
+                let raw = value.encode_utf8(&mut encoded);
+                let Some(len) = self.normalize_unicode_symbol(raw, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let table = self
+                    .normalized_is_script_alias(&value_buf[..len])?
+                    .then_some(UnicodeScriptTable::Script);
+                (table, u64::try_from(raw.len()).unwrap_or(u64::MAX))
+            }
+            ast::ClassUnicodeKind::Named(value) => {
+                let Some(len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let table = self
+                    .normalized_is_script_alias(&value_buf[..len])?
+                    .then_some(UnicodeScriptTable::Script);
+                (table, u64::try_from(value.len()).unwrap_or(u64::MAX))
+            }
+            ast::ClassUnicodeKind::NamedValue { name, value, .. } => {
+                let Some(name_len) = self.normalize_unicode_symbol(name, &mut name_buf)? else {
+                    return Ok(None);
+                };
+                let Some(value_len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
+                    return Ok(None);
+                };
+                let family = self.normalized_script_table(&name_buf[..name_len])?;
+                let value_matches = self.normalized_is_script_alias(&value_buf[..value_len])?;
+                self.charge(1)?;
+                (
+                    family.filter(|_| value_matches),
+                    u64::try_from(name.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                )
+            }
+        };
+        if let Some(table) = table {
+            self.charge_script_table_translation(table, query_bytes)?;
+        }
+        Ok(table)
+    }
+
     fn charge_perl_class_translation(&mut self, table: UnicodePerlTable) -> Result<(), ParseError> {
         // Covers source-table iteration, Vec allocation/copy, canonical-order
         // validation/deduplication and the possible negation allocation.
@@ -1069,6 +1294,10 @@ impl UnicodeAvailabilityVisitor<'_> {
                 self.require_case(&class.span)?;
                 return Ok(());
             }
+            _ if self.is_unicode_script_class(class)?.is_some() => {
+                self.require_case(&class.span)?;
+                return Ok(());
+            }
             _ => {}
         }
         self.reject(
@@ -1185,6 +1414,7 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
             Ast::ClassBracketed(class) => {
                 self.charge_gencat_class_set(class)?;
                 self.charge_perl_class_set(class)?;
+                self.charge_script_class_set(class)?;
                 if self.require_case(&class.span)? {
                     self.charge_case_fold_class(class)?;
                 }
@@ -1724,6 +1954,85 @@ mod tests {
         assert_eq!(
             u64::try_from(ranges(r"\w")).expect("range count fits u64"),
             UNICODE_PERL_WORD_RANGES
+        );
+    }
+
+    #[test]
+    fn unicode_script_range_bounds_match_pinned_regex_syntax_tables() {
+        fn ranges(pattern: &str) -> Option<usize> {
+            let hir = ParserBuilder::new().build().parse(pattern).ok()?;
+            let HirKind::Class(Class::Unicode(class)) = hir.kind() else {
+                panic!("script pattern did not translate to one Unicode class")
+            };
+            Some(class.ranges().len())
+        }
+
+        assert_eq!(
+            u64::try_from(ranges(r"\p{Common}").expect("Common script table"))
+                .expect("range count fits u64"),
+            UNICODE_SCRIPT_RANGES
+        );
+        assert_eq!(
+            u64::try_from(ranges(r"\p{scx=Common}").expect("Common script-extension table"))
+                .expect("range count fits u64"),
+            UNICODE_SCRIPT_EXTENSION_RANGES
+        );
+        assert_eq!(UNICODE_SCRIPT_ALIASES.len(), 338);
+        assert!(
+            UNICODE_SCRIPT_ALIASES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(
+            UNICODE_SCRIPT_ALIASES.iter().map(|alias| alias.len()).max(),
+            Some(MAX_UNICODE_SCRIPT_ALIAS_BYTES)
+        );
+
+        let mut script_max = (0_usize, "");
+        let mut extension_max = (0_usize, "");
+        let mut script_rejected = Vec::new();
+        let mut extension_rejected = Vec::new();
+        for &alias in UNICODE_SCRIPT_ALIASES {
+            let script_pattern = format!(r"\p{{{alias}}}");
+            if let Some(script_ranges) = ranges(&script_pattern) {
+                if script_ranges > script_max.0 {
+                    script_max = (script_ranges, alias);
+                }
+            } else {
+                script_rejected.push(alias);
+            }
+            let extension_pattern = format!(r"\p{{scx={alias}}}");
+            if let Some(extension_ranges) = ranges(&extension_pattern) {
+                if extension_ranges > extension_max.0 {
+                    extension_max = (extension_ranges, alias);
+                }
+            } else {
+                extension_rejected.push(alias);
+            }
+        }
+        // Both property-value maps know this Unicode compatibility value, but
+        // neither pinned range table publishes it as an individual class.
+        assert_eq!(
+            script_rejected,
+            ["hrkt", "katakanaorhiragana", "unknown", "zzzz"]
+        );
+        assert_eq!(
+            extension_rejected,
+            ["hrkt", "katakanaorhiragana", "unknown", "zzzz"]
+        );
+        assert_eq!(
+            script_max,
+            (
+                usize::try_from(UNICODE_SCRIPT_RANGES).expect("bound fits usize"),
+                "common"
+            )
+        );
+        assert_eq!(
+            extension_max,
+            (
+                usize::try_from(UNICODE_SCRIPT_EXTENSION_RANGES).expect("bound fits usize"),
+                "common"
+            )
         );
     }
 

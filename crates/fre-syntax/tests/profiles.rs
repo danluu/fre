@@ -9,6 +9,7 @@ use fre_syntax::{
 };
 
 const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
+const SCRIPT_ALIASES: &[&str] = include!("../src/unicode_script_aliases.in");
 
 fn re2_literal_profile() -> CompatibilityProfile {
     let mut profile = Re2Profile::default();
@@ -644,6 +645,87 @@ fn unicode_perl_profile_accepts_only_singleton_perl_data() {
 }
 
 #[test]
+fn unicode_script_profile_accepts_only_singleton_script_data() {
+    assert_eq!(SCRIPT_ALIASES.len(), 338);
+    assert!(SCRIPT_ALIASES.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        SCRIPT_ALIASES.iter().map(|alias| alias.len()).max(),
+        Some(21)
+    );
+
+    let mut script = RustProfile::regex_1_12_4();
+    script.unicode_features = RustUnicodeFeatures::SCRIPT;
+    let script_profile = CompatibilityProfile::RustText(script.clone());
+    let full_profile = CompatibilityProfile::rust_text();
+
+    for pattern in [
+        r"\p{Greek}",
+        r"\p{IsGreek}",
+        r"\p{grek}",
+        r"\P{Common}",
+        r"\p{Script=Greek}",
+        r"\p{Is_S-c r i p t=G_r-e e k}",
+        r"\p{sc=Grek}",
+        r"\p{Script_Extensions=Hiragana}",
+        r"\p{Is_S-c x=H_i-r a}",
+        r"\p{scx=Kana}",
+        r"[\p{sc=Greek}&&[\p{scx=Common}--\p{Latin}]]",
+    ] {
+        let partial = parse(ParseRequest::rust(pattern, script_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-script rejected {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "unicode-script HIR for {pattern}");
+    }
+
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"\p{Alphabetic}",
+        r"(?i:a)",
+        r"\pL",
+        r"\p{gc=Letter}",
+        r"\d",
+        r"\s",
+        r"\w",
+        r"\b",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"\p{sc}",
+        r"\p{Script}",
+        r"\p{Script=Letter}",
+        r"\p{scx=definitely-invalid}",
+        r"(?i:\p{Greek})",
+    ] {
+        let error = parse(ParseRequest::rust(pattern, script_profile.clone()))
+            .expect_err("unicode-script must not borrow another or invalid Unicode family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    let mut script_set = RustProfile::regex_set_1_12_4();
+    script_set.unicode_features = RustUnicodeFeatures::SCRIPT;
+    fre_syntax::validate_rust_regex_set_admission(
+        &[r"\p{Greek}+", r"\p{scx=Latin}+"],
+        &CompatibilityProfile::RustText(script_set.clone()),
+    )
+    .expect("unicode-script set admission");
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &[r"\p{Greek}+", r"\p{gcb=Extend}"],
+        &CompatibilityProfile::RustText(script_set),
+    )
+    .expect_err("unicode-script set cannot borrow unicode-segment");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -718,6 +800,21 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     assert_ne!(case.key, perl.key);
     assert_ne!(gencat.key, perl.key);
     assert_ne!(perl.key, full.key);
+
+    let mut script = RustProfile::regex_1_12_4();
+    script.unicode_features = RustUnicodeFeatures::SCRIPT;
+    let script = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(script),
+    ))
+    .expect("table-free syntax under script profile");
+    assert_ne!(partial.key, script.key);
+    assert_ne!(age.key, script.key);
+    assert_ne!(boolean.key, script.key);
+    assert_ne!(case.key, script.key);
+    assert_ne!(gencat.key, script.key);
+    assert_ne!(perl.key, script.key);
+    assert_ne!(script.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -1269,6 +1366,130 @@ fn unicode_perl_analysis_stack_has_a_hand_derived_exact_limit() {
         }),
     ))
     .expect_err("one below unicode-perl analysis stack must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::TraversalStack,
+            limit,
+            observed,
+        } if limit == EXPECTED_MAX_STACK - 1 && observed == EXPECTED_MAX_STACK
+    ));
+}
+
+#[test]
+fn unicode_script_classifier_and_table_work_obey_exact_parse_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SCRIPT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"\P{Is_S-c r i p t _ Extensions=K_a-t a k-a n a}";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("normalized unicode-script named-value query");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 5_000,
+        "alias search, property lookup, table allocation and negation must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    let exact_record = parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact unicode-script classifier/table limit must pass");
+    assert_eq!(exact_record.summary.parse_work, exact);
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below unicode-script classifier/table limit must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_script_nested_set_work_is_prospectively_bounded() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SCRIPT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[[\p{Common}~~\p{Greek}]--[\p{scx=Latin}&&[\p{scx=Arabic}~~\p{Inherited}]]]";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("nested unicode-script set operations");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 500_000,
+        "nested script-table allocation, set and dedup work must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact nested unicode-script set-work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below nested unicode-script set-work limit must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_script_analysis_stack_has_a_hand_derived_exact_limit() {
+    const EXPECTED_MAX_STACK: u64 = 5;
+
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SCRIPT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[\p{Greek}&&[\p{Latin}&&[\p{Arabic}&&[\p{Han}&&\p{Common}]]]]";
+
+    let exact_quotas = SyntaxQuotas {
+        max_parse_work: 64_000_000,
+        max_traversal_stack: EXPECTED_MAX_STACK,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone()).with_admission(AdmissionPolicy::Quota(
+            QuotaBounded {
+                syntax: exact_quotas,
+            },
+        )),
+    )
+    .expect("exact unicode-script analysis stack must pass");
+
+    let below_quotas = SyntaxQuotas {
+        max_traversal_stack: EXPECTED_MAX_STACK - 1,
+        ..exact_quotas
+    };
+    let error = parse(ParseRequest::rust(pattern, compatibility).with_admission(
+        AdmissionPolicy::Quota(QuotaBounded {
+            syntax: below_quotas,
+        }),
+    ))
+    .expect_err("one below unicode-script analysis stack must fail prospectively");
     assert!(matches!(
         error.category,
         ErrorCategory::FreResourceLimit {

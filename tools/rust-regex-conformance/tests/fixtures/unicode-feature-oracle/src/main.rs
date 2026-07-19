@@ -4,6 +4,8 @@ const BOOL_PROPERTY_ALIASES: &[&str] =
     include!("../../../../../../crates/fre-syntax/src/unicode_bool_aliases.in");
 const GENCAT_ALIASES: &[&str] =
     include!("../../../../../../crates/fre-syntax/src/unicode_gencat_aliases.in");
+const SCRIPT_ALIASES: &[&str] =
+    include!("../../../../../../crates/fre-syntax/src/unicode_script_aliases.in");
 
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
@@ -83,6 +85,16 @@ const PROBES: &[(&str, &str)] = &[
     ("perl-binary-named-value", r"\p{White_Space=Yes}"),
     ("perl-set", r"[\w&&[\s&&\d]]"),
     ("script", r"\p{Greek}"),
+    ("script-short", r"\p{Grek}"),
+    ("script-is-prefix", r"\p{IsGreek}"),
+    ("script-named-value", r"\p{Script=Greek}"),
+    ("script-named-short", r"\p{sc=Grek}"),
+    ("script-extension", r"\p{Script_Extensions=Hiragana}"),
+    ("script-extension-short", r"\p{scx=Hira}"),
+    ("script-normalized", r"\p{Is_S-c r i p t=G_r-e e k}"),
+    ("script-invalid-value", r"\p{sc=definitely-invalid}"),
+    ("script-bare-property", r"\p{Script}"),
+    ("script-set", r"[\p{Greek}&&[\p{scx=Common}--\p{Latin}]]"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
     ("white-space", r"\p{White_Space}"),
     ("decimal-number", r"\p{Nd}"),
@@ -121,5 +133,18 @@ fn main() {
         let pattern = format!(r"\p{{{alias}}}");
         let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
         println!("gencat-alias-{index}:{alias}\t{}", u8::from(passed));
+    }
+    for (index, &alias) in SCRIPT_ALIASES.iter().enumerate() {
+        for (kind, pattern) in [
+            ("bare", format!(r"\p{{{alias}}}")),
+            ("sc", format!(r"\p{{sc={alias}}}")),
+            ("scx", format!(r"\p{{scx={alias}}}")),
+        ] {
+            let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
+            println!(
+                "script-alias-{index}:{kind}:{alias}\t{}",
+                u8::from(passed)
+            );
+        }
     }
 }

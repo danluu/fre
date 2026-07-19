@@ -193,6 +193,7 @@ enum SemanticContract {
     CaseUnicode,
     GencatUnicode,
     PerlUnicode,
+    ScriptUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -214,6 +215,7 @@ struct QualifiedSemanticEvidence {
     case_unicode: String,
     gencat_unicode: String,
     perl_unicode: String,
+    script_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -347,7 +349,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-script",
         default_features: false,
         features: &["std", "unicode-script"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::ScriptUnicode,
     },
     ConfigurationSpec {
         id: "unicode-segment",
@@ -497,6 +499,7 @@ pub fn build_feature_matrix_report(
         case_unicode: run_case_unicode_contract()?,
         gencat_unicode: run_gencat_unicode_contract()?,
         perl_unicode: run_perl_unicode_contract()?,
+        script_unicode: run_script_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -742,6 +745,9 @@ fn run_configuration(
                 },
                 SemanticContract::PerlUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.perl_unicode.clone(),
+                },
+                SemanticContract::ScriptUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.script_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -1290,6 +1296,82 @@ fn expected_perl_unicode_evidence() -> String {
     sha256(evidence.as_bytes())
 }
 
+fn run_script_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SCRIPT;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-script profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for pattern in [
+        r"\p{Greek}",
+        r"\p{Grek}",
+        r"\p{IsGreek}",
+        r"\p{Script=Greek}",
+        r"\p{sc=Grek}",
+        r"\p{Script_Extensions=Hiragana}",
+        r"\p{scx=Hira}",
+        r"[\p{Greek}&&\p{scx=Greek}]",
+    ] {
+        let parsed = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| {
+            InventoryError::new(format!(
+                "unicode-script profile rejected its singleton witness {pattern}: {error}"
+            ))
+        })?;
+        if parsed.summary.class_ranges == 0 {
+            return Err(InventoryError::new(format!(
+                "unicode-script witness {pattern} produced no class ranges"
+            )));
+        }
+    }
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "script" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-script profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-script {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_script_unicode_evidence())
+}
+
+fn expected_script_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-script;ascii=parsed;script=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        if family == "script" {
+            continue;
+        }
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    sha256(evidence.as_bytes())
+}
+
 fn authenticate_upstream_package(
     root: &Path,
 ) -> Result<FeatureMatrixSourceIdentity, InventoryError> {
@@ -1606,54 +1688,20 @@ fn validate_disposition(
 ) -> Result<(), InventoryError> {
     match (spec.semantic, toolchain.nightly, disposition) {
         (
-            SemanticContract::HighLevelUnicode | SemanticContract::RebarUnicode,
+            SemanticContract::HighLevelUnicode
+            | SemanticContract::RebarUnicode
+            | SemanticContract::NoUnicode
+            | SemanticContract::AgeUnicode
+            | SemanticContract::BoolUnicode
+            | SemanticContract::CaseUnicode
+            | SemanticContract::GencatUnicode
+            | SemanticContract::PerlUnicode
+            | SemanticContract::ScriptUnicode,
             _,
             FeatureMatrixDisposition::Pass {
                 semantic_evidence_sha256,
             },
         ) if semantic_evidence_sha256 == &expected_semantic_evidence(spec.semantic) => Ok(()),
-        (
-            SemanticContract::NoUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_no_unicode_evidence() => Ok(()),
-        (
-            SemanticContract::AgeUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_age_unicode_evidence() => Ok(()),
-        (
-            SemanticContract::BoolUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_bool_unicode_evidence() => Ok(()),
-        (
-            SemanticContract::CaseUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_case_unicode_evidence() => Ok(()),
-        (
-            SemanticContract::GencatUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_gencat_unicode_evidence() => Ok(()),
-        (
-            SemanticContract::PerlUnicode,
-            _,
-            FeatureMatrixDisposition::Pass {
-                semantic_evidence_sha256,
-            },
-        ) if semantic_evidence_sha256 == &expected_perl_unicode_evidence() => Ok(()),
         (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
@@ -1725,6 +1773,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::CaseUnicode => return expected_case_unicode_evidence(),
         SemanticContract::GencatUnicode => return expected_gencat_unicode_evidence(),
         SemanticContract::PerlUnicode => return expected_perl_unicode_evidence(),
+        SemanticContract::ScriptUnicode => return expected_script_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1806,12 +1855,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::ScriptUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(
                     spec.semantic,
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            2
+            1
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1853,6 +1909,9 @@ mod tests {
         let perl_unicode = run_perl_unicode_contract().expect("unicode-perl semantic gate");
         assert_eq!(perl_unicode, expected_perl_unicode_evidence());
         assert!(is_sha256(&perl_unicode));
+        let script_unicode = run_script_unicode_contract().expect("unicode-script semantic gate");
+        assert_eq!(script_unicode, expected_script_unicode_evidence());
+        assert!(is_sha256(&script_unicode));
     }
 
     #[test]

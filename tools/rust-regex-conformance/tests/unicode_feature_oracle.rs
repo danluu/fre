@@ -16,6 +16,7 @@ const CONFIGURATIONS: &[(&str, &str, RustUnicodeFeatures)] = &[
     ("case", "unicode-case", RustUnicodeFeatures::CASE),
     ("gencat", "unicode-gencat", RustUnicodeFeatures::GENCAT),
     ("perl", "unicode-perl", RustUnicodeFeatures::PERL),
+    ("script", "unicode-script", RustUnicodeFeatures::SCRIPT),
     (
         "all",
         "unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment",
@@ -31,6 +32,28 @@ const GENCAT_ALIASES: &[&str] =
     include!("../../../crates/fre-syntax/src/unicode_gencat_aliases.in");
 const GENCAT_ALIAS_SET_SHA256: &str =
     "88e48d3f8c7b4e5ad2d25d32d8d7f17a136c0ac1dc42b6ee6f761e8412cbdc61";
+const SCRIPT_ALIASES: &[&str] =
+    include!("../../../crates/fre-syntax/src/unicode_script_aliases.in");
+const SCRIPT_ALIAS_SET_SHA256: &str =
+    "8f0e49dddba24d9809bcda8d5915b199062c4bbe828e77711c541fa0d21d8bf7";
+const SCRIPT_SOURCE_HASHES: &[(&str, &str)] = &[
+    (
+        "src/unicode_tables/property_names.rs",
+        "8c93985d1bcb01735667a3c4cb92f7e260d267326bde9d7f048bc77cd7e07855",
+    ),
+    (
+        "src/unicode_tables/property_values.rs",
+        "ef9131ce0a575c7327ec6d466aafd8b7c25600d80c232b5a4110bbf0a5a59136",
+    ),
+    (
+        "src/unicode_tables/script.rs",
+        "41bd424f1e3a03290cf4995ced678dcf24c94b38c905c62f6819bf67e098a2ec",
+    ),
+    (
+        "src/unicode_tables/script_extension.rs",
+        "a314099ddbf50a07fe350bb0835bf2fe494ed5ad278b30e171e21506eb557906",
+    ),
+];
 
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
@@ -101,6 +124,16 @@ const PROBES: &[(&str, &str)] = &[
     ("perl-binary-named-value", r"\p{White_Space=Yes}"),
     ("perl-set", r"[\w&&[\s&&\d]]"),
     ("script", r"\p{Greek}"),
+    ("script-short", r"\p{Grek}"),
+    ("script-is-prefix", r"\p{IsGreek}"),
+    ("script-named-value", r"\p{Script=Greek}"),
+    ("script-named-short", r"\p{sc=Grek}"),
+    ("script-extension", r"\p{Script_Extensions=Hiragana}"),
+    ("script-extension-short", r"\p{scx=Hira}"),
+    ("script-normalized", r"\p{Is_S-c r i p t=G_r-e e k}"),
+    ("script-invalid-value", r"\p{sc=definitely-invalid}"),
+    ("script-bare-property", r"\p{Script}"),
+    ("script-set", r"[\p{Greek}&&[\p{scx=Common}--\p{Latin}]]"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
     ("white-space", r"\p{White_Space}"),
     ("decimal-number", r"\p{Nd}"),
@@ -125,38 +158,32 @@ const PROBES: &[(&str, &str)] = &[
     ("nested-case-scope", r"(?i:(?-i:\u{03B4})a)"),
 ];
 
+fn authenticate_alias_sets() {
+    fn authenticate(aliases: &[&str], count: usize, max_len: usize, expected_sha256: &str) {
+        assert_eq!(aliases.len(), count);
+        assert!(aliases.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(aliases.iter().map(|alias| alias.len()).max(), Some(max_len));
+        let mut bytes = aliases.join("\n").into_bytes();
+        bytes.push(b'\n');
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected_sha256);
+    }
+
+    authenticate(
+        BOOL_PROPERTY_ALIASES,
+        121,
+        30,
+        BOOL_PROPERTY_ALIAS_SET_SHA256,
+    );
+    authenticate(GENCAT_ALIASES, 81, 20, GENCAT_ALIAS_SET_SHA256);
+    authenticate(SCRIPT_ALIASES, 338, 21, SCRIPT_ALIAS_SET_SHA256);
+}
+
 #[test]
 fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
-    assert_eq!(BOOL_PROPERTY_ALIASES.len(), 121);
-    assert!(
-        BOOL_PROPERTY_ALIASES
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    );
-    assert_eq!(
-        BOOL_PROPERTY_ALIASES.iter().map(|alias| alias.len()).max(),
-        Some(30)
-    );
-    let mut alias_bytes = BOOL_PROPERTY_ALIASES.join("\n").into_bytes();
-    alias_bytes.push(b'\n');
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&alias_bytes)),
-        BOOL_PROPERTY_ALIAS_SET_SHA256
-    );
-    assert_eq!(GENCAT_ALIASES.len(), 81);
-    assert!(GENCAT_ALIASES.windows(2).all(|pair| pair[0] < pair[1]));
-    assert_eq!(
-        GENCAT_ALIASES.iter().map(|alias| alias.len()).max(),
-        Some(20)
-    );
-    let mut gencat_alias_bytes = GENCAT_ALIASES.join("\n").into_bytes();
-    gencat_alias_bytes.push(b'\n');
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&gencat_alias_bytes)),
-        GENCAT_ALIAS_SET_SHA256
-    );
+    authenticate_alias_sets();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/unicode-feature-oracle/Cargo.toml");
+    authenticate_script_sources(&fixture);
     let target_root = unique_target_root();
     fs::create_dir(&target_root).expect("create private oracle target root");
 
@@ -201,8 +228,73 @@ fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
                 "configuration={name} alias={alias} pattern={pattern}",
             );
         }
+        for (index, &alias) in SCRIPT_ALIASES.iter().enumerate() {
+            for (kind, pattern) in [
+                ("bare", format!(r"\p{{{alias}}}")),
+                ("sc", format!(r"\p{{sc={alias}}}")),
+                ("scx", format!(r"\p{{scx={alias}}}")),
+            ] {
+                let actual = parse(ParseRequest::rust(
+                    &pattern,
+                    CompatibilityProfile::RustText(profile.clone()),
+                ))
+                .is_ok();
+                let id = format!("script-alias-{index}:{kind}:{alias}");
+                assert_eq!(
+                    actual, oracle[&id],
+                    "configuration={name} alias={alias} kind={kind} pattern={pattern}",
+                );
+            }
+        }
     }
     fs::remove_dir_all(&target_root).expect("remove private oracle target root");
+}
+
+fn authenticate_script_sources(fixture: &Path) {
+    let output = Command::new(env!("CARGO"))
+        .arg("metadata")
+        .arg("--offline")
+        .arg("--locked")
+        .arg("--format-version=1")
+        .arg("--manifest-path")
+        .arg(fixture)
+        .output()
+        .expect("read isolated regex-syntax metadata");
+    assert!(
+        output.status.success(),
+        "metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata is JSON");
+    let manifest = metadata["packages"]
+        .as_array()
+        .expect("metadata packages")
+        .iter()
+        .find(|package| {
+            package["name"].as_str() == Some("regex-syntax")
+                && package["version"].as_str() == Some("0.8.11")
+        })
+        .and_then(|package| package["manifest_path"].as_str())
+        .map(PathBuf::from)
+        .expect("pinned regex-syntax manifest");
+    let root = manifest.parent().expect("regex-syntax package root");
+    let root_metadata = fs::symlink_metadata(root).expect("stat regex-syntax package root");
+    assert!(root_metadata.file_type().is_dir());
+    assert!(!root_metadata.file_type().is_symlink());
+    for &(relative, expected) in SCRIPT_SOURCE_HASHES {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).expect("stat pinned Unicode source");
+        assert!(metadata.file_type().is_file(), "{}", path.display());
+        assert!(!metadata.file_type().is_symlink(), "{}", path.display());
+        let bytes = fs::read(&path).expect("read pinned Unicode source");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            expected,
+            "{}",
+            path.display()
+        );
+    }
 }
 
 fn run_oracle(manifest: &Path, target: &Path, features: &str) -> BTreeMap<String, bool> {
@@ -245,6 +337,7 @@ fn run_oracle(manifest: &Path, target: &Path, features: &str) -> BTreeMap<String
         .len()
         .checked_add(BOOL_PROPERTY_ALIASES.len())
         .and_then(|count| count.checked_add(GENCAT_ALIASES.len()))
+        .and_then(|count| count.checked_add(SCRIPT_ALIASES.len().checked_mul(3)?))
         .expect("oracle probe cardinality fits usize");
     assert_eq!(parsed.len(), expected);
     parsed
