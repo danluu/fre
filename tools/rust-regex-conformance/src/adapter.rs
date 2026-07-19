@@ -10,7 +10,7 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    CaptureSearchConfig, CaptureWindow, PortableBuilder, PortableRegex, PortableRegexSet,
+    CaptureSearchConfig, CaptureWindow, PlanKind, PortableBuilder, PortableRegex, PortableRegexSet,
     PortableRegexSetBuildError, PortableRegexSetBuilder, PortableRegexSetRunLimits,
     PortableTextBuildError, PortableTextBuilder, PortableTextCaptureBuildError,
     PortableTextCaptureBuilder, PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
@@ -31,8 +31,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v26-earliest-end-and-qualified-set-delegation";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v27-multi-pattern-set-selection";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -40,7 +39,7 @@ const LIMITATIONS: [&str; 7] = [
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
-    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence, while set which does so for zero or one pattern and for UTF-8 bytes overlapping/all multi-pattern rows over the full unbounded haystack; delegated UTF-8 bytes rows do not claim native bytes-set execution",
+    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; set which additionally supports generic multi-pattern leftmost-first ordered-union selection and exact-literal leftmost/all selection, while UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact leftmost-first and earliest-end search and reject all other policies",
 ];
 
@@ -171,6 +170,11 @@ fn execute_case(
         {
             execute_text_singleton_set_observation(surface, case, input)
         }
+        AdapterSurface::RustTextSetWhich
+            if multi_pattern_set_selection_applicability(case, input, true).is_ok() =>
+        {
+            execute_text_selected_set_which(case, input)
+        }
         AdapterSurface::RustTextSetIsMatch => execute_text_set_is_match(case, input),
         AdapterSurface::RustTextSetWhich => execute_text_set_which(case, input),
         AdapterSurface::RustBytesSetCompile if case.utf8 => execute_text_set_compile(case, input),
@@ -184,6 +188,17 @@ fn execute_case(
             if singleton_set_delegate_applicability(surface, case, input).is_ok() =>
         {
             execute_bytes_singleton_set_observation(surface, case, input)
+        }
+        AdapterSurface::RustBytesSetWhich
+            if case.utf8
+                && multi_pattern_set_selection_applicability(case, input, false).is_ok() =>
+        {
+            execute_text_selected_set_which(case, input)
+        }
+        AdapterSurface::RustBytesSetWhich
+            if multi_pattern_set_selection_applicability(case, input, false).is_ok() =>
+        {
+            execute_bytes_selected_set_which(case, input)
         }
         AdapterSurface::RustBytesSetIsMatch
             if case.utf8
@@ -759,11 +774,19 @@ fn build_text(case: &CaseReceipt, input: &ExecutableCase) -> TextBuildAttempt {
     let Some(pattern) = input.patterns.first() else {
         return TextBuildAttempt::Fault(fault("adapter.single-pattern-missing"));
     };
+    build_text_pattern(case, input, pattern)
+}
+
+fn build_text_pattern(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    pattern: &str,
+) -> TextBuildAttempt {
     let mut profile = RustProfile::default();
     profile.options.case_insensitive = case.case_insensitive;
     profile.options.unicode = case.unicode;
     profile.options.line_terminator = input.line_terminator;
-    match PortableTextBuilder::new(pattern.clone())
+    match PortableTextBuilder::new(pattern.to_owned())
         .profile(profile)
         .build()
     {
@@ -1040,6 +1063,388 @@ fn execute_text_set_which(case: &CaseReceipt, input: &ExecutableCase) -> Adapter
             "search.text-set-execution-refused",
         ),
     }
+}
+
+/// Execute the selection-sensitive ordered-union modes that ordinary
+/// `RegexSet` membership deliberately does not expose. This first proves the
+/// complete set constructor, then builds the same patterns independently and
+/// selects winners using only FRE match spans and declaration order.
+fn execute_text_selected_set_which(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let expected = SemanticValue::PatternIds(expected_pattern_ids(input));
+    match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(_) => {}
+        TextSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    }
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    let mut regexes = Vec::new();
+    if regexes.try_reserve_exact(input.patterns.len()).is_err() {
+        return fault("adapter.text-selected-set-allocation-failed");
+    }
+    for pattern in &input.patterns {
+        match build_text_pattern(case, input, pattern) {
+            TextBuildAttempt::Built(regex) => regexes.push(regex),
+            TextBuildAttempt::Rejected => {
+                return mismatch(
+                    &expected,
+                    &SemanticValue::CompileAccepted(false),
+                    "compile.unexpected-rejection",
+                );
+            }
+            TextBuildAttempt::Unsupported(disposition) | TextBuildAttempt::Fault(disposition) => {
+                return disposition;
+            }
+        }
+    }
+    let observed =
+        match selected_text_pattern_ids(&regexes, haystack, case.search_kind, case.match_kind) {
+            Ok(observed) => observed,
+            Err(SelectedSetError::UnsupportedPlan) => {
+                return unsupported(
+                    CapabilityId::RustTextSetFacade,
+                    "search.text-set-selection-plan-gap",
+                );
+            }
+            Err(SelectedSetError::Search) => {
+                return unsupported(
+                    CapabilityId::RustTextSetFacade,
+                    "search.text-set-selection-refused",
+                );
+            }
+        };
+    compare(&expected, &SemanticValue::PatternIds(observed))
+}
+
+fn execute_bytes_selected_set_which(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let expected = SemanticValue::PatternIds(expected_pattern_ids(input));
+    match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(_) => {}
+        BytesSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        BytesSetBuildAttempt::Unsupported(disposition)
+        | BytesSetBuildAttempt::Fault(disposition) => return disposition,
+    }
+    let mut regexes = Vec::new();
+    if regexes.try_reserve_exact(input.patterns.len()).is_err() {
+        return fault("adapter.bytes-selected-set-allocation-failed");
+    }
+    for pattern in &input.patterns {
+        match build_bytes_pattern(case, input, pattern) {
+            BuildAttempt::Built(regex) => regexes.push(regex),
+            BuildAttempt::Rejected => {
+                return mismatch(
+                    &expected,
+                    &SemanticValue::CompileAccepted(false),
+                    "compile.unexpected-rejection",
+                );
+            }
+            BuildAttempt::Unsupported(disposition) | BuildAttempt::Fault(disposition) => {
+                return disposition;
+            }
+        }
+    }
+    let observed = match selected_byte_pattern_ids(
+        &regexes,
+        &input.haystack,
+        case.search_kind,
+        case.match_kind,
+    ) {
+        Ok(observed) => observed,
+        Err(SelectedSetError::UnsupportedPlan) => {
+            return unsupported(
+                CapabilityId::RustBytesSetFacade,
+                "search.bytes-set-selection-plan-gap",
+            );
+        }
+        Err(SelectedSetError::Search) => {
+            return unsupported(
+                CapabilityId::RustBytesSetFacade,
+                "search.bytes-set-selection-refused",
+            );
+        }
+    };
+    compare(&expected, &SemanticValue::PatternIds(observed))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedSetError {
+    UnsupportedPlan,
+    Search,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectedPatternMatch {
+    id: usize,
+    start: usize,
+    end: usize,
+}
+
+fn selected_text_pattern_ids(
+    regexes: &[Box<PortableTextRegex>],
+    haystack: &str,
+    search_kind: SearchKind,
+    match_kind: MatchKind,
+) -> Result<Vec<usize>, SelectedSetError> {
+    match (search_kind, match_kind) {
+        (SearchKind::Leftmost, MatchKind::LeftmostFirst) => {
+            selected_text_leftmost_first(regexes, haystack, true)
+        }
+        (SearchKind::Overlapping, MatchKind::LeftmostFirst) => {
+            selected_text_leftmost_first(regexes, haystack, false)
+        }
+        (SearchKind::Leftmost, MatchKind::All) => selected_text_last_literal(regexes, haystack),
+        _ => Err(SelectedSetError::UnsupportedPlan),
+    }
+}
+
+fn selected_byte_pattern_ids(
+    regexes: &[Box<PortableRegex>],
+    haystack: &[u8],
+    search_kind: SearchKind,
+    match_kind: MatchKind,
+) -> Result<Vec<usize>, SelectedSetError> {
+    match (search_kind, match_kind) {
+        (SearchKind::Leftmost, MatchKind::LeftmostFirst) => {
+            selected_bytes_leftmost_first(regexes, haystack, true)
+        }
+        (SearchKind::Overlapping, MatchKind::LeftmostFirst) => {
+            selected_bytes_leftmost_first(regexes, haystack, false)
+        }
+        (SearchKind::Leftmost, MatchKind::All) => selected_bytes_last_literal(regexes, haystack),
+        _ => Err(SelectedSetError::UnsupportedPlan),
+    }
+}
+
+fn selected_text_leftmost_first(
+    regexes: &[Box<PortableTextRegex>],
+    haystack: &str,
+    iterate: bool,
+) -> Result<Vec<usize>, SelectedSetError> {
+    let mut selected = BTreeSet::new();
+    let mut start = 0_usize;
+    let mut last_match_end = None;
+    loop {
+        let Some(matched) = text_leftmost_first_at(regexes, haystack, start)? else {
+            break;
+        };
+        if matched.start == matched.end && last_match_end == Some(matched.end) {
+            let Some(next) = advance_text_scalar(haystack, start) else {
+                break;
+            };
+            start = next;
+            continue;
+        }
+        selected.insert(matched.id);
+        if !iterate || selected.len() == regexes.len() {
+            break;
+        }
+        start = matched.end;
+        last_match_end = Some(matched.end);
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn selected_bytes_leftmost_first(
+    regexes: &[Box<PortableRegex>],
+    haystack: &[u8],
+    iterate: bool,
+) -> Result<Vec<usize>, SelectedSetError> {
+    let mut selected = BTreeSet::new();
+    let mut start = 0_usize;
+    let mut last_match_end = None;
+    loop {
+        let Some(matched) = bytes_leftmost_first_at(regexes, haystack, start)? else {
+            break;
+        };
+        if matched.start == matched.end && last_match_end == Some(matched.end) {
+            if start == haystack.len() {
+                break;
+            }
+            start = start.checked_add(1).ok_or(SelectedSetError::Search)?;
+            continue;
+        }
+        selected.insert(matched.id);
+        if !iterate || selected.len() == regexes.len() {
+            break;
+        }
+        start = matched.end;
+        last_match_end = Some(matched.end);
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn text_leftmost_first_at(
+    regexes: &[Box<PortableTextRegex>],
+    haystack: &str,
+    start: usize,
+) -> Result<Option<SelectedPatternMatch>, SelectedSetError> {
+    let mut winner: Option<SelectedPatternMatch> = None;
+    for (id, regex) in regexes.iter().enumerate() {
+        let (matched, _) = regex
+            .find_window(
+                haystack,
+                SearchWindow::new(start, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .map_err(|_| SelectedSetError::Search)?;
+        let Some(matched) = matched else { continue };
+        let candidate = SelectedPatternMatch {
+            id,
+            start: matched.start(),
+            end: matched.end(),
+        };
+        if winner
+            .is_none_or(|current| (candidate.start, candidate.id) < (current.start, current.id))
+        {
+            winner = Some(candidate);
+        }
+    }
+    Ok(winner)
+}
+
+fn bytes_leftmost_first_at(
+    regexes: &[Box<PortableRegex>],
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<SelectedPatternMatch>, SelectedSetError> {
+    let mut winner: Option<SelectedPatternMatch> = None;
+    for (id, regex) in regexes.iter().enumerate() {
+        let (matched, _) = regex
+            .find_window(
+                haystack,
+                SearchWindow::new(start, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .map_err(|_| SelectedSetError::Search)?;
+        let Some(matched) = matched else { continue };
+        let candidate = SelectedPatternMatch {
+            id,
+            start: matched.start(),
+            end: matched.end(),
+        };
+        if winner
+            .is_none_or(|current| (candidate.start, candidate.id) < (current.start, current.id))
+        {
+            winner = Some(candidate);
+        }
+    }
+    Ok(winner)
+}
+
+fn selected_text_last_literal(
+    regexes: &[Box<PortableTextRegex>],
+    haystack: &str,
+) -> Result<Vec<usize>, SelectedSetError> {
+    if regexes
+        .iter()
+        .any(|regex| regex.build_report().portable.plan != PlanKind::ExactLiteral)
+    {
+        return Err(SelectedSetError::UnsupportedPlan);
+    }
+    let mut winner = None;
+    for (id, regex) in regexes.iter().enumerate() {
+        let mut start = 0_usize;
+        loop {
+            let (matched, _) = regex
+                .find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(|_| SelectedSetError::Search)?;
+            let Some(matched) = matched else { break };
+            let candidate = SelectedPatternMatch {
+                id,
+                start: matched.start(),
+                end: matched.end(),
+            };
+            if winner.is_none_or(|current: SelectedPatternMatch| {
+                (candidate.end, candidate.id) > (current.end, current.id)
+            }) {
+                winner = Some(candidate);
+            }
+            let Some(next) = advance_text_scalar(haystack, matched.start()) else {
+                break;
+            };
+            start = next;
+        }
+    }
+    Ok(winner.into_iter().map(|matched| matched.id).collect())
+}
+
+fn selected_bytes_last_literal(
+    regexes: &[Box<PortableRegex>],
+    haystack: &[u8],
+) -> Result<Vec<usize>, SelectedSetError> {
+    if regexes
+        .iter()
+        .any(|regex| regex.build_report().plan != PlanKind::ExactLiteral)
+    {
+        return Err(SelectedSetError::UnsupportedPlan);
+    }
+    let mut winner = None;
+    for (id, regex) in regexes.iter().enumerate() {
+        let mut start = 0_usize;
+        loop {
+            let (matched, _) = regex
+                .find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(|_| SelectedSetError::Search)?;
+            let Some(matched) = matched else { break };
+            let candidate = SelectedPatternMatch {
+                id,
+                start: matched.start(),
+                end: matched.end(),
+            };
+            if winner.is_none_or(|current: SelectedPatternMatch| {
+                (candidate.end, candidate.id) > (current.end, current.id)
+            }) {
+                winner = Some(candidate);
+            }
+            if matched.start() == haystack.len() {
+                break;
+            }
+            start = matched
+                .start()
+                .checked_add(1)
+                .ok_or(SelectedSetError::Search)?;
+        }
+    }
+    Ok(winner.into_iter().map(|matched| matched.id).collect())
+}
+
+fn advance_text_scalar(haystack: &str, start: usize) -> Option<usize> {
+    if start == haystack.len() {
+        return None;
+    }
+    haystack[start..]
+        .chars()
+        .next()
+        .map(|scalar| start.saturating_add(scalar.len_utf8()))
 }
 
 fn expected_pattern_ids(input: &ExecutableCase) -> Vec<usize> {
@@ -1853,11 +2258,15 @@ fn build_bytes(case: &CaseReceipt, input: &ExecutableCase) -> BuildAttempt {
     let Some(pattern) = input.patterns.first() else {
         return BuildAttempt::Fault(fault("adapter.single-pattern-missing"));
     };
+    build_bytes_pattern(case, input, pattern)
+}
+
+fn build_bytes_pattern(case: &CaseReceipt, input: &ExecutableCase, pattern: &str) -> BuildAttempt {
     let mut profile = RustProfile::default();
     profile.options.case_insensitive = case.case_insensitive;
     profile.options.unicode = case.unicode;
     profile.options.line_terminator = input.line_terminator;
-    match PortableBuilder::new(pattern.clone())
+    match PortableBuilder::new(pattern.to_owned())
         .profile(profile)
         .build()
     {
@@ -1909,19 +2318,80 @@ fn surface_applicability(
         }
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
-        | AdapterSurface::RustTextSetWhich => set_applicability(surface, case, input, true)?,
+        | AdapterSurface::RustTextSetWhich => {
+            if surface != AdapterSurface::RustTextSetWhich
+                || multi_pattern_set_selection_applicability(case, input, true).is_err()
+            {
+                set_applicability(surface, case, input, true)?;
+            }
+        }
         AdapterSurface::RustBytesSetCompile if case.utf8 => {
             set_applicability(surface, case, input, true)?;
         }
         AdapterSurface::RustBytesSetWhich if case.utf8 && input.patterns.len() > 1 => {
-            utf8_bytes_overlapping_all_set_which_applicability(case, input)?;
+            if multi_pattern_set_selection_applicability(case, input, false).is_err() {
+                utf8_bytes_overlapping_all_set_which_applicability(case, input)?;
+            }
         }
         AdapterSurface::RustBytesSetCompile
         | AdapterSurface::RustBytesSetIsMatch
-        | AdapterSurface::RustBytesSetWhich => set_applicability(surface, case, input, false)?,
+        | AdapterSurface::RustBytesSetWhich => {
+            if surface != AdapterSurface::RustBytesSetWhich
+                || multi_pattern_set_selection_applicability(case, input, false).is_err()
+            {
+                set_applicability(surface, case, input, false)?;
+            }
+        }
     }
     if !is_compile_surface(surface) && !case.compiles {
         return Err(NotApplicableReason::CompileOnlyCase);
+    }
+    Ok(())
+}
+
+/// Selection-sensitive multi-pattern observations are evaluated as an
+/// ordered union of the already-qualified constituent matchers. Keep this
+/// exact domain separate from ordinary `RegexSet` membership: no anchoring,
+/// bounds or match-limit approximation is permitted, and text execution still
+/// requires the case's UTF-8 profile.
+fn multi_pattern_set_selection_applicability(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    text: bool,
+) -> Result<(), NotApplicableReason> {
+    if input.patterns.len() <= 1 {
+        return Err(NotApplicableReason::PatternMultiplicity);
+    }
+    if !matches!(
+        (case.search_kind, case.match_kind),
+        (
+            SearchKind::Leftmost,
+            MatchKind::LeftmostFirst | MatchKind::All
+        ) | (SearchKind::Overlapping, MatchKind::LeftmostFirst)
+    ) {
+        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
+    }
+    if case.anchored {
+        return Err(NotApplicableReason::ProfileCannotRepresentAnchoring);
+    }
+    if input.bounds
+        != (SearchBounds {
+            start: 0,
+            end: input.haystack.len(),
+        })
+        || case.match_limit.is_some()
+    {
+        return Err(NotApplicableReason::ProfileCannotRepresentBounds);
+    }
+    if text {
+        if !case.utf8 {
+            return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+        }
+        if std::str::from_utf8(&input.haystack).is_err() {
+            return Err(NotApplicableReason::InvalidUtf8Haystack);
+        }
+    } else if case.utf8 && std::str::from_utf8(&input.haystack).is_err() {
+        return Err(NotApplicableReason::InvalidUtf8Haystack);
     }
     Ok(())
 }
@@ -2874,14 +3344,24 @@ mod tests {
 
         let mut selection_sensitive = case.clone();
         selection_sensitive.match_kind = MatchKind::LeftmostFirst;
+        let mut selected_input = input.clone();
+        selected_input.expected.truncate(1);
         assert_eq!(
             surface_applicability(
                 AdapterSurface::RustBytesSetWhich,
                 &selection_sensitive,
-                &input,
+                &selected_input,
             ),
-            Err(NotApplicableReason::ProfileCannotRepresentMatchMode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustBytesSetWhich,
+                &selection_sensitive,
+                &selected_input,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
 
         let mut anchored = case.clone();
         anchored.anchored = true;
@@ -3261,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_match_existence_is_selection_invariant_but_multi_which_is_not() {
+    fn overlapping_leftmost_first_multi_which_selects_the_ordered_union_winner() {
         let mut case = fixture_case(true, true, None);
         case.pattern_count = 2;
         case.search_kind = SearchKind::Overlapping;
@@ -3290,17 +3770,99 @@ mod tests {
             AdapterSurface::RustTextSetWhich,
             AdapterSurface::RustBytesSetWhich,
         ] {
-            assert_eq!(
-                surface_applicability(surface, &case, &input),
-                Err(NotApplicableReason::ProfileCannotRepresentMatchMode)
-            );
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
             assert!(matches!(
                 execute_case(surface, &case, &input),
-                AdapterDisposition::NotApplicable {
-                    reason: NotApplicableReason::ProfileCannotRepresentMatchMode
-                }
+                AdapterDisposition::Pass { .. }
             ));
         }
+    }
+
+    #[test]
+    fn leftmost_first_multi_which_preserves_priority_iteration_and_empty_progress() {
+        let mut case = fixture_case(true, true, None);
+        case.pattern_count = 2;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["a".to_owned(), String::new()],
+            haystack: b"abc".to_vec(),
+            bounds: SearchBounds { start: 0, end: 3 },
+            line_terminator: b'\n',
+            expected: vec![
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![Some(ExpectedSpan { start: 0, end: 1 })],
+                },
+                ExpectedCaptures {
+                    pattern_id: 1,
+                    groups: vec![Some(ExpectedSpan { start: 2, end: 2 })],
+                },
+            ],
+        };
+        for surface in [
+            AdapterSurface::RustTextSetWhich,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        let mut arbitrary_bytes_case = case;
+        arbitrary_bytes_case.utf8 = false;
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &arbitrary_bytes_case,
+                &input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+        );
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustBytesSetWhich,
+                &arbitrary_bytes_case,
+                &input,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn leftmost_all_multi_which_selects_the_last_exact_literal_match() {
+        let mut case = fixture_case(true, true, None);
+        case.pattern_count = 2;
+        case.match_kind = MatchKind::All;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["foo".to_owned(), "foobar".to_owned()],
+            haystack: b"foobar".to_vec(),
+            bounds: SearchBounds { start: 0, end: 6 },
+            line_terminator: b'\n',
+            expected: vec![ExpectedCaptures {
+                pattern_id: 1,
+                groups: vec![Some(ExpectedSpan { start: 0, end: 6 })],
+            }],
+        };
+        for surface in [
+            AdapterSurface::RustTextSetWhich,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        let mut unsupported = input;
+        unsupported.patterns = vec!["f+".to_owned(), "foobar".to_owned()];
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &case, &unsupported),
+            AdapterDisposition::Unsupported { .. }
+        ));
     }
 
     #[test]
