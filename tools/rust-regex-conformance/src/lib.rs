@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 mod adapter;
 mod automata_corpus;
+mod automata_progress;
 mod doctest_api;
 mod doctest_builder_remaining;
 mod doctest_byte_captures;
@@ -43,6 +44,15 @@ pub use automata_corpus::{
     RegexAutomataObligation, RegexAutomataPackageFile, RegexAutomataSourceIdentity,
     RegexAutomataVcsSupportFile, build_regex_automata_corpus_report,
     read_regex_automata_corpus_report, write_regex_automata_corpus_report,
+};
+pub use automata_progress::{
+    REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA, REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA,
+    RegexAutomataAdapterCounts, RegexAutomataAdapterDisposition, RegexAutomataAdapterReceipt,
+    RegexAutomataAdapterReport, RegexAutomataAdapterReportPayload, RegexAutomataGapAssignment,
+    RegexAutomataGapTarget, RegexAutomataStrictGain, build_regex_automata_adapter_report,
+    read_regex_automata_adapter_report, read_regex_automata_gap_assignment,
+    schedule_regex_automata_gap, validate_regex_automata_strict_gain,
+    write_regex_automata_adapter_report, write_regex_automata_gap_assignment,
 };
 pub use doctest_api::{
     DOCTEST_API_CASES, DOCTEST_API_REPORT_SCHEMA, DoctestCapability, DoctestCounts,
