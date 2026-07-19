@@ -62,6 +62,8 @@ const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_NEWLINES_CASE_ID: &str = "ast::parse::tests::parse_newlines";
+const AST_ALTERNATE_CASE_ID: &str = "ast::parse::tests::parse_alternate";
 const AST_PERL_CLASS_CASE_ID: &str = "ast::parse::tests::parse_perl_class";
 const AST_UNICODE_CLASS_CASE_ID: &str = "ast::parse::tests::parse_unicode_class";
 const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
@@ -150,6 +152,24 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
 const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
     [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
 const UNSUPPORTED_BACKREFERENCE_PROBES: [&str; 2] = [r"\0", r"\9"];
+const NEWLINE_PROBES: [&str; 2] = [".\n.", "foobar\nbaz\nquux\n"];
+const ALTERNATE_PROBES: [&str; 15] = [
+    r"a|b",
+    r"(a|b)",
+    r"a|b|c",
+    r"ax|by|cz",
+    r"(ax|by|cz)",
+    r"(ax|(by|(cz)))",
+    r"|",
+    r"||",
+    r"a|",
+    r"|a",
+    r"(|)",
+    r"(a|)",
+    r"(|a)",
+    r"a|b)",
+    r"(a|b",
+];
 const PERL_CLASS_PROBES: [&str; 8] = [r"\d", r"\D", r"\s", r"\S", r"\w", r"\W", r"\d", r"\dz"];
 const UNICODE_CLASS_PROBES: [&str; 19] = [
     r"\pN",
@@ -213,7 +233,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_octal, parse_perl_class, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 18 AST parser identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_alternate, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 16 AST parser identities remain explicit Unsupported dispositions.",
     "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
@@ -1686,6 +1706,8 @@ fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
         AST_HOLISTIC_CASE_ID
+            | AST_NEWLINES_CASE_ID
+            | AST_ALTERNATE_CASE_ID
             | AST_OCTAL_CASE_ID
             | AST_HEX_TWO_CASE_ID
             | AST_HEX_FOUR_CASE_ID
@@ -1702,6 +1724,8 @@ fn is_supported_ast_case(case_id: &str) -> bool {
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_NEWLINES_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_newlines)),
+        AST_ALTERNATE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_alternate)),
         AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
         AST_HEX_TWO_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_two)),
         AST_HEX_FOUR_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_four)),
@@ -1958,6 +1982,20 @@ fn run_ast_perl_class() -> Result<(), AstMismatch> {
     Ok(())
 }
 
+fn run_ast_newlines() -> Result<(), AstMismatch> {
+    for (index, pattern) in NEWLINE_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("newlines-probe-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_alternate() -> Result<(), AstMismatch> {
+    for (index, pattern) in ALTERNATE_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("alternate-probe-{index}"))?;
+    }
+    Ok(())
+}
+
 fn run_ast_unicode_class() -> Result<(), AstMismatch> {
     for (index, pattern) in UNICODE_CLASS_PROBES.into_iter().enumerate() {
         execute_ast_equivalence_probe(pattern, &format!("unicode-class-probe-{index}"))?;
@@ -2179,6 +2217,16 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
     match case_id {
         AST_HOLISTIC_CASE_ID => contract.push_str(
             "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
+        ),
+        AST_NEWLINES_CASE_ID => write_ast_equivalence_evidence(
+            &mut contract,
+            &NEWLINE_PROBES,
+            "upstream-exact-success",
+        ),
+        AST_ALTERNATE_CASE_ID => write_ast_equivalence_evidence(
+            &mut contract,
+            &ALTERNATE_PROBES,
+            "upstream-exact-result",
         ),
         AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
             for (index, pattern) in UNSUPPORTED_BACKREFERENCE_PROBES.into_iter().enumerate() {
@@ -2805,6 +2853,8 @@ mod tests {
     #[test]
     fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
         for case_id in [
+            AST_NEWLINES_CASE_ID,
+            AST_ALTERNATE_CASE_ID,
             AST_OCTAL_CASE_ID,
             AST_HEX_TWO_CASE_ID,
             AST_HEX_FOUR_CASE_ID,
@@ -2837,6 +2887,71 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn structural_composition_adapters_cover_exact_upstream_outcome_sets_and_reject_drift() {
+        assert_eq!(NEWLINE_PROBES, [".\n.", "foobar\nbaz\nquux\n"]);
+        assert_eq!(
+            ALTERNATE_PROBES,
+            [
+                r"a|b",
+                r"(a|b)",
+                r"a|b|c",
+                r"ax|by|cz",
+                r"(ax|by|cz)",
+                r"(ax|(by|(cz)))",
+                r"|",
+                r"||",
+                r"a|",
+                r"|a",
+                r"(|)",
+                r"(a|)",
+                r"(|a)",
+                r"a|b)",
+                r"(a|b",
+            ]
+        );
+        run_ast_newlines().expect("all pinned newline outcomes match exactly");
+        run_ast_alternate().expect("all pinned alternation outcomes match exactly");
+
+        let profile = RustProfile::regex_1_12_4();
+        let pattern = NEWLINE_PROBES[0];
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect("pinned newline probe parses");
+        let mut observed = parse_rust_ast(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .expect("FRE newline probe parses");
+        validate_ast_success(&observed, &expected, pattern, &profile, "unaltered")
+            .expect("exact newline AST and position semantics");
+        observed.ast = Ast::empty(ast_span(0, 0));
+        assert!(
+            validate_ast_success(&observed, &expected, pattern, &profile, "mutated-ast").is_err()
+        );
+
+        let pattern = ALTERNATE_PROBES[13];
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect_err("pinned unmatched-closing-group probe is rejected");
+        let compatibility = CompatibilityProfile::RustText(profile);
+        let mut observed = parse_rust_ast(ParseRequest::rust(pattern, compatibility.clone()))
+            .expect_err("FRE rejects the unmatched-closing-group probe");
+        validate_ast_error(&observed, &expected, pattern, &compatibility, "unaltered")
+            .expect("exact alternation error semantics");
+        observed.span = Some(SourceSpan { start: 0, end: 1 });
+        assert!(
+            validate_ast_error(
+                &observed,
+                &expected,
+                pattern,
+                &compatibility,
+                "mutated-span"
+            )
+            .is_err()
+        );
     }
 
     #[test]
