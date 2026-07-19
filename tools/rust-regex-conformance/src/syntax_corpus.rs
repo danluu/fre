@@ -13,8 +13,9 @@ use std::{
 };
 
 use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CompatibilityProfile, ParseRequest, RustAstRecord,
-    RustProfile, SCHEMA_VERSION, SafetyEnvelope, parse_rust_ast,
+    AdmissionPolicy, AdmissionStatus, CompatibilityProfile, ErrorCategory, ParseError,
+    ParseRequest, RustAstRecord, RustProfile, SCHEMA_VERSION, SafetyEnvelope, SourceSpan,
+    parse_rust_ast,
 };
 use regex_syntax::ast::{Ast, Concat, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,7 @@ const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_UNSUPPORTED_LOOKAROUND_CASE_ID: &str = "ast::parse::tests::parse_unsupported_lookaround";
 const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
 const AST_REGRESSION_455_CASE_ID: &str =
     "ast::parse::tests::regression_455_trailing_dash_ignore_whitespace";
@@ -131,6 +133,8 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
         false,
     ),
 ];
+const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
+    [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
 const MAX_PACKAGE_FILE_BYTES: u64 = 2 * 1_048_576;
 
 const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
@@ -148,8 +152,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_holistic and regressions 454/455; the other 26 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 155 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_holistic, parse_unsupported_lookaround, and regressions 454/455; the other 25 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 154 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -1502,13 +1506,19 @@ struct AstMismatch {
 fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
-        AST_HOLISTIC_CASE_ID | AST_REGRESSION_454_CASE_ID | AST_REGRESSION_455_CASE_ID
+        AST_HOLISTIC_CASE_ID
+            | AST_UNSUPPORTED_LOOKAROUND_CASE_ID
+            | AST_REGRESSION_454_CASE_ID
+            | AST_REGRESSION_455_CASE_ID
     )
 }
 
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_UNSUPPORTED_LOOKAROUND_CASE_ID => {
+            catch_unwind(AssertUnwindSafe(run_ast_unsupported_lookaround))
+        }
         AST_REGRESSION_454_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_regression_454)),
         AST_REGRESSION_455_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_regression_455)),
         _ => unreachable!("caller checked supported AST case"),
@@ -1569,6 +1579,67 @@ fn run_ast_holistic() -> Result<(), AstMismatch> {
         "escaped-metacharacters-with-exact-spans",
     )?;
     validate_ast_record(&second, second_pattern, &RustProfile::regex_1_12_4())
+}
+
+fn run_ast_unsupported_lookaround() -> Result<(), AstMismatch> {
+    for (index, (pattern, end)) in UNSUPPORTED_LOOKAROUND_PROBES.into_iter().enumerate() {
+        let expected_upstream = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect_err("authenticated look-around probe must be rejected upstream");
+        if expected_upstream.kind() != &regex_syntax::ast::ErrorKind::UnsupportedLookAround
+            || expected_upstream.span() != &ast_span(0, end)
+            || expected_upstream.pattern() != pattern
+        {
+            return Err(AstMismatch {
+                expected: format!(
+                    "lookaround-probe-{index}: upstream UnsupportedLookAround span=0..{end} pattern={pattern:?}"
+                ),
+                observed: format!("lookaround-probe-{index}: {expected_upstream:?}"),
+            });
+        }
+
+        let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+        let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+            .expect_err("FRE must reject authenticated look-around probe");
+        validate_ast_error(
+            &observed,
+            &expected_upstream,
+            pattern,
+            &profile,
+            &format!("lookaround-probe-{index}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_ast_error(
+    observed: &ParseError,
+    expected_upstream: &regex_syntax::ast::Error,
+    pattern: &str,
+    profile: &CompatibilityProfile,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let expected_span = SourceSpan {
+        start: u64::try_from(expected_upstream.span().start.offset).unwrap_or(u64::MAX),
+        end: u64::try_from(expected_upstream.span().end.offset).unwrap_or(u64::MAX),
+    };
+    let valid = observed.schema_version == SCHEMA_VERSION
+        && observed.profile.as_ref() == profile
+        && observed.category == ErrorCategory::UpstreamRustSyntax
+        && observed.span == Some(expected_span)
+        && observed.message == expected_upstream.to_string()
+        && expected_upstream.pattern() == pattern;
+    if valid {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!(
+                "{assertion}: schema={SCHEMA_VERSION} profile={profile:?} category=UpstreamRustSyntax span={expected_span:?} message={:?}",
+                expected_upstream.to_string(),
+            ),
+            observed: format!("{assertion}: {observed:?}"),
+        })
+    }
 }
 
 fn run_ast_regression_454() -> Result<(), AstMismatch> {
@@ -1682,6 +1753,17 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         AST_HOLISTIC_CASE_ID => contract.push_str(
             "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
         ),
+        AST_UNSUPPORTED_LOOKAROUND_CASE_ID => {
+            for (index, (pattern, end)) in UNSUPPORTED_LOOKAROUND_PROBES.into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "probe-{index}=sha256:{},bytes:{},expected:error:UnsupportedLookAround,span:0..{end}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
         AST_REGRESSION_454_CASE_ID => {
             writeln!(
                 contract,
@@ -2185,8 +2267,12 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_ast_regressions_execute_their_complete_outcome_sets() {
-        for case_id in [AST_REGRESSION_454_CASE_ID, AST_REGRESSION_455_CASE_ID] {
+    fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
+        for case_id in [
+            AST_UNSUPPORTED_LOOKAROUND_CASE_ID,
+            AST_REGRESSION_454_CASE_ID,
+            AST_REGRESSION_455_CASE_ID,
+        ] {
             let disposition = execute_ast_case(case_id);
             assert_eq!(
                 disposition,
@@ -2207,6 +2293,47 @@ mod tests {
                 disposition,
             })
             .expect("supported AST regression receipt");
+        }
+    }
+
+    #[test]
+    fn lookaround_adapter_rejects_error_semantic_drift() {
+        let pattern = "(?<=a)";
+        let expected_upstream = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect_err("look-around must be rejected");
+        let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+        let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+            .expect_err("FRE must reject look-around");
+        validate_ast_error(
+            &observed,
+            &expected_upstream,
+            pattern,
+            &profile,
+            "unaltered",
+        )
+        .expect("exact FRE error must match pinned upstream semantics");
+
+        let mut mutations = Vec::new();
+        let mut wrong_schema = observed.clone();
+        wrong_schema.schema_version = wrong_schema.schema_version.saturating_add(1);
+        mutations.push(wrong_schema);
+        let mut wrong_category = observed.clone();
+        wrong_category.category = ErrorCategory::InvalidConfiguration;
+        mutations.push(wrong_category);
+        let mut wrong_span = observed.clone();
+        wrong_span.span = Some(SourceSpan { start: 0, end: 3 });
+        mutations.push(wrong_span);
+        let mut wrong_message = observed.clone();
+        wrong_message.message.push('!');
+        mutations.push(wrong_message);
+
+        for mutation in mutations {
+            assert!(
+                validate_ast_error(&mutation, &expected_upstream, pattern, &profile, "mutated",)
+                    .is_err(),
+                "semantic drift must not qualify: {mutation:?}",
+            );
         }
     }
 
