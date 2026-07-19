@@ -31,11 +31,12 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v15-singleton-set-observation";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v16-singleton-set-single-delegate";
 
-const LIMITATIONS: [&str; 2] = [
+const LIMITATIONS: [&str; 3] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
+    "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -159,9 +160,24 @@ fn execute_case(
         AdapterSurface::RustTextCapturesIter => execute_text_captures(case, input),
         AdapterSurface::RustBytesCapturesIter => execute_bytes_captures(case, input),
         AdapterSurface::RustTextSetCompile => execute_text_set_compile(case, input),
+        surface @ (AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich)
+            if singleton_set_delegate_applicability(surface, case, input).is_ok() =>
+        {
+            execute_text_singleton_set_observation(surface, case, input)
+        }
         AdapterSurface::RustTextSetIsMatch => execute_text_set_is_match(case, input),
         AdapterSurface::RustTextSetWhich => execute_text_set_which(case, input),
         AdapterSurface::RustBytesSetCompile => execute_bytes_set_compile(case, input),
+        surface @ (AdapterSurface::RustBytesSetIsMatch | AdapterSurface::RustBytesSetWhich)
+            if case.utf8 && singleton_set_delegate_applicability(surface, case, input).is_ok() =>
+        {
+            execute_text_singleton_set_observation(surface, case, input)
+        }
+        surface @ (AdapterSurface::RustBytesSetIsMatch | AdapterSurface::RustBytesSetWhich)
+            if singleton_set_delegate_applicability(surface, case, input).is_ok() =>
+        {
+            execute_bytes_singleton_set_observation(surface, case, input)
+        }
         AdapterSurface::RustBytesSetIsMatch => execute_bytes_set_is_match(case, input),
         AdapterSurface::RustBytesSetWhich => execute_bytes_set_which(case, input),
         AdapterSurface::RustBytesCompile => execute_bytes_compile(case, input),
@@ -723,6 +739,154 @@ fn execute_text_set_compile(case: &CaseReceipt, input: &ExecutableCase) -> Adapt
         TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
             disposition
         }
+    }
+}
+
+fn singleton_set_expected(
+    surface: AdapterSurface,
+    input: &ExecutableCase,
+) -> Result<SemanticValue, AdapterDisposition> {
+    if input.patterns.len() != 1 {
+        return Err(fault("adapter.singleton-set-pattern-count"));
+    }
+    match surface {
+        AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustBytesSetIsMatch => {
+            Ok(SemanticValue::IsMatch(!input.expected.is_empty()))
+        }
+        AdapterSurface::RustTextSetWhich | AdapterSurface::RustBytesSetWhich => {
+            let ids = expected_pattern_ids(input);
+            if ids.iter().any(|&id| id != 0) {
+                return Err(fault("adapter.singleton-set-pattern-id"));
+            }
+            Ok(SemanticValue::PatternIds(ids))
+        }
+        _ => Err(fault("adapter.singleton-set-surface")),
+    }
+}
+
+fn singleton_set_observed(surface: AdapterSurface, matched: bool) -> SemanticValue {
+    match surface {
+        AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustBytesSetIsMatch => {
+            SemanticValue::IsMatch(matched)
+        }
+        AdapterSurface::RustTextSetWhich | AdapterSurface::RustBytesSetWhich => {
+            SemanticValue::PatternIds(if matched { vec![0] } else { Vec::new() })
+        }
+        _ => unreachable!("singleton set helper receives only observation surfaces"),
+    }
+}
+
+/// Prove native text-set compilation, then delegate its singleton observation
+/// to the already-qualified single-pattern text facade. The delegation is
+/// needed when anchoring or bounded search is not exposed by the native set.
+fn execute_text_singleton_set_observation(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let expected = match singleton_set_expected(surface, input) {
+        Ok(expected) => expected,
+        Err(disposition) => return disposition,
+    };
+    match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(_) => {}
+        TextSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextSetBuildAttempt::Unsupported(disposition) | TextSetBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    }
+    let regex = match build_text(case, input) {
+        TextBuildAttempt::Built(regex) => regex,
+        TextBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextBuildAttempt::Unsupported(disposition) | TextBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    let Some(bounds) = text_search_bounds(haystack, input.bounds) else {
+        return compare(&expected, &singleton_set_observed(surface, false));
+    };
+    match regex.find_window(
+        haystack,
+        SearchWindow::new(bounds.start, bounds.end),
+        SearchLimits::unlimited(),
+    ) {
+        Ok((observed, _)) => {
+            let matched = observed
+                .is_some_and(|matched| !case.anchored || matched.start() == input.bounds.start);
+            compare(&expected, &singleton_set_observed(surface, matched))
+        }
+        Err(_) => unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.text-singleton-set-delegate-refused",
+        ),
+    }
+}
+
+/// Prove native bytes-set compilation, then delegate its singleton observation
+/// to the already-qualified single-pattern bytes facade.
+fn execute_bytes_singleton_set_observation(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let expected = match singleton_set_expected(surface, input) {
+        Ok(expected) => expected,
+        Err(disposition) => return disposition,
+    };
+    match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(_) => {}
+        BytesSetBuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        BytesSetBuildAttempt::Unsupported(disposition)
+        | BytesSetBuildAttempt::Fault(disposition) => return disposition,
+    }
+    let regex = match build_bytes(case, input) {
+        BuildAttempt::Built(regex) => regex,
+        BuildAttempt::Rejected => {
+            return mismatch(
+                &expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        BuildAttempt::Unsupported(disposition) | BuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    match regex.find_window(
+        &input.haystack,
+        SearchWindow::new(input.bounds.start, input.bounds.end),
+        SearchLimits::unlimited(),
+    ) {
+        Ok((observed, _)) => {
+            let matched = observed
+                .is_some_and(|matched| !case.anchored || matched.start() == input.bounds.start);
+            compare(&expected, &singleton_set_observed(surface, matched))
+        }
+        Err(_) => unsupported(
+            CapabilityId::RustBytesSetFacade,
+            "search.bytes-singleton-set-delegate-refused",
+        ),
     }
 }
 
@@ -1621,28 +1785,17 @@ fn set_applicability(
         return Ok(());
     }
     // A singleton set exposes only match existence and the sole pattern ID.
-    // Search and match selection policies can change a selected span, but that
-    // span is unobservable through these set surfaces. Anchoring and bounds can
-    // change existence, so they remain strict proof preconditions.
+    // Delegate applicability to the corresponding already-qualified single
+    // facade so its search policy, anchoring, bounds, and UTF-8 proof remain
+    // exact. The execution path separately proves native set compilation.
     if input.patterns.len() == 1 {
-        if case.anchored {
-            return Err(NotApplicableReason::ProfileCannotRepresentAnchoring);
+        match singleton_set_delegate_applicability(surface, case, input) {
+            Ok(()) => return Ok(()),
+            Err(NotApplicableReason::InvalidUtf8Haystack) => {
+                return Err(NotApplicableReason::InvalidUtf8Haystack);
+            }
+            Err(_) => {}
         }
-        if input.bounds
-            != (SearchBounds {
-                start: 0,
-                end: input.haystack.len(),
-            })
-        {
-            return Err(NotApplicableReason::ProfileCannotRepresentBounds);
-        }
-        if case.utf8 != text {
-            return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
-        }
-        if text && std::str::from_utf8(&input.haystack).is_err() {
-            return Err(NotApplicableReason::InvalidUtf8Haystack);
-        }
-        return Ok(());
     }
     if case.search_kind != SearchKind::Overlapping {
         return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
@@ -1668,6 +1821,26 @@ fn set_applicability(
         return Err(NotApplicableReason::InvalidUtf8Haystack);
     }
     Ok(())
+}
+
+fn singleton_set_delegate_applicability(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<(), NotApplicableReason> {
+    if input.patterns.len() != 1 {
+        return Err(NotApplicableReason::PatternMultiplicity);
+    }
+    let (delegate, text) = match surface {
+        AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich => {
+            (AdapterSurface::RustTextIsMatch, true)
+        }
+        AdapterSurface::RustBytesSetIsMatch | AdapterSurface::RustBytesSetWhich => {
+            (AdapterSurface::RustBytesIsMatch, false)
+        }
+        _ => return Err(NotApplicableReason::PatternMultiplicity),
+    };
+    single_applicability(delegate, case, input, text)
 }
 
 const fn is_compile_surface(surface: AdapterSurface) -> bool {
@@ -2319,7 +2492,82 @@ mod tests {
             ),
             AdapterDisposition::Pass { .. }
         ));
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustBytesSetIsMatch,
+                &bytes_case,
+                &text_input,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetWhich, &bytes_case, &text_input,),
+            AdapterDisposition::Pass { .. }
+        ));
 
+        // UTF-8 bytes observations use the same exact text-equivalence proof as
+        // the already-qualified bytes is-match facade.
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetIsMatch, &text_case, &text_input,),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetWhich, &text_case, &text_input,),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut no_match = text_input.clone();
+        no_match.patterns = vec!["z".to_owned()];
+        no_match.expected.clear();
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetIsMatch, &text_case, &no_match,),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &text_case, &no_match,),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn singleton_set_delegation_preserves_anchoring_and_bounds() {
+        let text_case = fixture_case(true, true, None);
+        let text_input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }]);
+        let mut anchored = text_case.clone();
+        anchored.anchored = true;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetIsMatch, &anchored, &text_input),
+            Ok(())
+        );
+        let mut anchored_input = text_input.clone();
+        anchored_input.expected.clear();
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &anchored, &anchored_input,),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut bounded = text_input;
+        bounded.bounds.start = 1;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetWhich, &text_case, &bounded),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &text_case, &bounded),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn singleton_set_delegation_rejects_unproved_inputs() {
+        let text_case = fixture_case(true, true, None);
+        let text_input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }]);
         let mut multiple = text_input.clone();
         multiple.patterns.push("b".to_owned());
         assert_eq!(
@@ -2327,18 +2575,11 @@ mod tests {
             Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
         );
 
-        let mut anchored = text_case.clone();
-        anchored.anchored = true;
+        let mut zero = text_input.clone();
+        zero.patterns.clear();
         assert_eq!(
-            surface_applicability(AdapterSurface::RustTextSetIsMatch, &anchored, &text_input),
-            Err(NotApplicableReason::ProfileCannotRepresentAnchoring)
-        );
-
-        let mut bounded = text_input.clone();
-        bounded.bounds.start = 1;
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustTextSetWhich, &text_case, &bounded),
-            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+            surface_applicability(AdapterSurface::RustTextSetIsMatch, &text_case, &zero),
+            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
         );
 
         let rejected_case = fixture_case(false, true, None);
@@ -2352,6 +2593,14 @@ mod tests {
             ),
             AdapterDisposition::Pass { .. }
         ));
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustTextSetIsMatch,
+                &rejected_case,
+                &text_input,
+            ),
+            Err(NotApplicableReason::CompileOnlyCase)
+        );
 
         let mut invalid_text = text_input;
         invalid_text.haystack = vec![0xFF];
@@ -2362,6 +2611,10 @@ mod tests {
                 &text_case,
                 &invalid_text,
             ),
+            Err(NotApplicableReason::InvalidUtf8Haystack)
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetWhich, &text_case, &invalid_text,),
             Err(NotApplicableReason::InvalidUtf8Haystack)
         );
     }
