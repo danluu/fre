@@ -32,9 +32,9 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v29-overlapping-leftmost-all";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v30-utf8-off-compile-existence-proof";
 
-const LIMITATIONS: [&str; 7] = [
+const LIMITATIONS: [&str; 8] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; certified text and bytes persistent-history captures preserve original-haystack assertion context across bounded search windows",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
@@ -42,6 +42,7 @@ const LIMITATIONS: [&str; 7] = [
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; selection-sensitive multi-pattern set which uses an adapter-only repeated constituent-search correctness fallback (up to O(patterns × haystack positions) facade search calls, each over a remaining window) for leftmost-first ordered-union and exact-literal leftmost/all selection, not a native or fast production RegexSet engine; UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first, earliest-end and leftmost/all search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
+    "UTF-8-off bytes-profile cases may execute on text compile, text set compile, and text match-existence surfaces only after candidate-independent expected values are ignored and FRE proves matching text/bytes compiler outcomes; match existence additionally requires a valid UTF-8 haystack and exact scalar-boundary search bounds",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -2608,6 +2609,81 @@ fn build_bytes_pattern(case: &CaseReceipt, input: &ExecutableCase, pattern: &str
     }
 }
 
+/// Prove that one bytes-profile compile or match-existence obligation has an
+/// exact representation on the text facade. This proof never inspects the
+/// expected result. Both candidate compilers must independently agree, and a
+/// search additionally requires the byte domain to equal a valid UTF-8 scalar
+/// domain without endpoint normalization.
+fn utf8_off_text_single_equivalence_applicability(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<(), NotApplicableReason> {
+    if case.utf8 || input.patterns.len() != 1 {
+        return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+    }
+    let equivalent = match surface {
+        AdapterSurface::RustTextCompile => {
+            std::str::from_utf8(&input.haystack).is_ok()
+                && matches!(
+                    (build_text(case, input), build_bytes(case, input)),
+                    (TextBuildAttempt::Built(_), BuildAttempt::Built(_))
+                        | (TextBuildAttempt::Rejected, BuildAttempt::Rejected)
+                )
+        }
+        AdapterSurface::RustTextIsMatch => {
+            let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+                return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+            };
+            let bounds_are_exact = input.bounds.start <= input.bounds.end
+                && input.bounds.end <= haystack.len()
+                && haystack.is_char_boundary(input.bounds.start)
+                && haystack.is_char_boundary(input.bounds.end);
+            bounds_are_exact
+                && case.match_limit.is_none()
+                && matches!(
+                    (build_text(case, input), build_bytes(case, input)),
+                    (TextBuildAttempt::Built(_), BuildAttempt::Built(_))
+                )
+        }
+        _ => false,
+    };
+    if equivalent {
+        Ok(())
+    } else {
+        Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+    }
+}
+
+/// Prove exact text/bytes compiler agreement for one UTF-8-off set. Search
+/// policy and haystack contents cannot affect this compile-only obligation.
+fn utf8_off_text_set_compile_equivalence_applicability(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<(), NotApplicableReason> {
+    if surface != AdapterSurface::RustTextSetCompile
+        || case.utf8
+        || std::str::from_utf8(&input.haystack).is_err()
+    {
+        return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+    }
+    if matches!(
+        (build_text_set(case, input), build_bytes_set(case, input)),
+        (
+            TextSetBuildAttempt::Built(_),
+            BytesSetBuildAttempt::Built(_)
+        ) | (
+            TextSetBuildAttempt::Rejected,
+            BytesSetBuildAttempt::Rejected
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+    }
+}
+
 fn surface_applicability(
     surface: AdapterSurface,
     case: &CaseReceipt,
@@ -2753,10 +2829,16 @@ fn single_applicability(
                     | AdapterSurface::RustBytesFindIter
                     | AdapterSurface::RustBytesCapturesIter
             );
+        let utf8_off_text_equivalent = text
+            && !case.utf8
+            && utf8_off_text_single_equivalence_applicability(surface, case, input).is_ok();
         if utf8_bytes_text_delegate && std::str::from_utf8(&input.haystack).is_err() {
             return Err(NotApplicableReason::InvalidUtf8Haystack);
         }
-        if surface != AdapterSurface::RustBytesCompile && !utf8_bytes_text_delegate {
+        if surface != AdapterSurface::RustBytesCompile
+            && !utf8_bytes_text_delegate
+            && !utf8_off_text_equivalent
+        {
             return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
         }
     }
@@ -2782,6 +2864,12 @@ fn set_applicability(
     input: &ExecutableCase,
     text: bool,
 ) -> Result<(), NotApplicableReason> {
+    if text
+        && !case.utf8
+        && utf8_off_text_set_compile_equivalence_applicability(surface, case, input).is_ok()
+    {
+        return Ok(());
+    }
     // Compilation does not observe search or match-selection policy. Preserve
     // the canonical singleton rejection precedence, and admit larger/empty
     // sets only when the selected compiler profile exactly matches the case.
@@ -3256,8 +3344,16 @@ mod tests {
         ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextCompile, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
 
         let text_case = fixture_case(true, true, None);
         assert!(matches!(
@@ -3581,8 +3677,12 @@ mod tests {
         );
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextSetCompile, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
 
         case.utf8 = true;
         case.pattern_count = 0;
@@ -4765,11 +4865,121 @@ mod tests {
         case.utf8 = false;
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextCompile, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn utf8_off_text_compile_and_existence_require_exact_profile_proofs() {
+        let case = fixture_case(true, false, None);
+        let expected = ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 3 })],
+        };
+        let mut input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["é".to_owned()],
+            haystack: "xé".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 3 },
+            line_terminator: b'\n',
+            expected: vec![expected],
+        };
+        for surface in [
+            AdapterSurface::RustTextCompile,
+            AdapterSurface::RustTextIsMatch,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        let mut false_compile_expectation = case.clone();
+        false_compile_expectation.compiles = false;
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustTextCompile,
+                &false_compile_expectation,
+                &input,
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustTextCompile,
+                &false_compile_expectation,
+                &input,
+            ),
+            AdapterDisposition::Mismatch { .. }
+        ));
+        let expected_matches = std::mem::take(&mut input.expected);
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextIsMatch, &case, &input),
+            AdapterDisposition::Mismatch { .. }
+        ));
+        input.expected = expected_matches;
+
+        let mut interior_bound = input.clone();
+        interior_bound.bounds.start = 2;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextIsMatch, &case, &interior_bound),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+        let mut invalid_haystack = input.clone();
+        invalid_haystack.haystack = vec![0xFF];
+        invalid_haystack.bounds = SearchBounds { start: 0, end: 1 };
+        for surface in [
+            AdapterSurface::RustTextCompile,
+            AdapterSurface::RustTextIsMatch,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &case, &invalid_haystack),
+                Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            );
+        }
+
+        let mut byte_only = input.clone();
+        byte_only.patterns = vec![r"(?-u:\xFF)".to_owned()];
+        byte_only.expected.clear();
+        for surface in [
+            AdapterSurface::RustTextCompile,
+            AdapterSurface::RustTextIsMatch,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &case, &byte_only),
+                Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            );
+        }
+
+        let mut set_case = case.clone();
+        set_case.pattern_count = 2;
+        let mut set_input = input;
+        set_input.patterns = vec!["x".to_owned(), "é".to_owned()];
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetCompile, &set_case, &set_input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetCompile, &set_case, &set_input),
+            AdapterDisposition::Pass { .. }
+        ));
+        set_input.patterns[1] = r"(?-u:\xFF)".to_owned();
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetCompile, &set_case, &set_input),
+            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
         );
     }
 
