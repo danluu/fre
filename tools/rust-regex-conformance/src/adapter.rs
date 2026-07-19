@@ -2788,6 +2788,16 @@ fn single_applicability(
     input: &ExecutableCase,
     text: bool,
 ) -> Result<(), NotApplicableReason> {
+    single_applicability_inner(surface, case, input, text, true)
+}
+
+fn single_applicability_inner(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    text: bool,
+    allow_utf8_off_text_equivalence: bool,
+) -> Result<(), NotApplicableReason> {
     if input.patterns.len() != 1 {
         return Err(NotApplicableReason::PatternMultiplicity);
     }
@@ -2829,7 +2839,8 @@ fn single_applicability(
                     | AdapterSurface::RustBytesFindIter
                     | AdapterSurface::RustBytesCapturesIter
             );
-        let utf8_off_text_equivalent = text
+        let utf8_off_text_equivalent = allow_utf8_off_text_equivalence
+            && text
             && !case.utf8
             && utf8_off_text_single_equivalence_applicability(surface, case, input).is_ok();
         if utf8_bytes_text_delegate && std::str::from_utf8(&input.haystack).is_err() {
@@ -2956,7 +2967,10 @@ fn singleton_set_delegate_applicability(
         }
         _ => return Err(NotApplicableReason::PatternMultiplicity),
     };
-    single_applicability(delegate, case, input, text)
+    // The new UTF-8-off theorem is deliberately scoped to direct text
+    // compile and existence obligations. Do not let an internal singleton-set
+    // delegation silently reclassify set search/anchoring obligations.
+    single_applicability_inner(delegate, case, input, text, false)
 }
 
 /// Match existence is invariant across leftmost, earliest, overlapping, and
