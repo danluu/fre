@@ -235,6 +235,55 @@ const HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID: &str =
     "src/hir/literal.rs - hir::literal::Extractor::limit_literal_len (line 311)";
 const HIR_DOCTEST_LIMIT_TOTAL_CASE_ID: &str =
     "src/hir/literal.rs - hir::literal::Extractor::limit_total (line 353)";
+const HIR_DOCTEST_SEQ_CASE_ID: &str = "src/hir/literal.rs - hir::literal::Seq (line 707)";
+const HIR_DOCTEST_SEQ_CROSS_FORWARD_BASIC_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_forward (line 875)";
+const HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_OTHER_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_forward (line 902)";
+const HIR_DOCTEST_SEQ_CROSS_FORWARD_EMPTY_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_forward (line 926)";
+const HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_SELF_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_forward (line 943)";
+const HIR_DOCTEST_SEQ_CROSS_REVERSE_BASIC_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_reverse (line 1014)";
+const HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_OTHER_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_reverse (line 1041)";
+const HIR_DOCTEST_SEQ_CROSS_REVERSE_EMPTY_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_reverse (line 1065)";
+const HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_SELF_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::cross_reverse (line 1082)";
+const HIR_DOCTEST_SEQ_UNION_BASIC_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::union (line 1187)";
+const HIR_DOCTEST_SEQ_UNION_INFINITE_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::union (line 1204)";
+const HIR_DOCTEST_SEQ_UNION_EMPTY_BASIC_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::union_into_empty (line 1258)";
+const HIR_DOCTEST_SEQ_UNION_EMPTY_NO_SPLICE_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::union_into_empty (line 1274)";
+const HIR_DOCTEST_SEQ_DEDUP_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::dedup (line 1329)";
+const HIR_DOCTEST_SEQ_SORT_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::sort (line 1369)";
+const HIR_DOCTEST_SEQ_REVERSE_LITERALS_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::reverse_literals (line 1392)";
+const HIR_DOCTEST_SEQ_MINIMIZE_PREFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::minimize_by_preference (line 1423)";
+const HIR_DOCTEST_SEQ_MINIMIZE_EMPTY_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::minimize_by_preference (line 1442)";
+const HIR_DOCTEST_SEQ_KEEP_FIRST_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::keep_first_bytes (line 1475)";
+const HIR_DOCTEST_SEQ_KEEP_LAST_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::keep_last_bytes (line 1503)";
+const HIR_DOCTEST_SEQ_COMMON_PREFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::longest_common_prefix (line 1611)";
+const HIR_DOCTEST_SEQ_COMMON_SUFFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::longest_common_suffix (line 1664)";
+const HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::optimize_for_prefix_by_preference (line 1752)";
+const HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::optimize_for_prefix_by_preference (line 1778)";
+const HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Seq::optimize_for_prefix_by_preference (line 1806)";
 const HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID: &str =
     "src/hir/mod.rs - hir::Class::minimum_len (line 926)";
 const HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID: &str =
@@ -3767,6 +3816,37 @@ fn is_supported_hir_doctest_case(case_id: &str) -> bool {
             | HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID
+    ) || is_supported_hir_seq_doctest_case(case_id)
+}
+
+fn is_supported_hir_seq_doctest_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_DOCTEST_SEQ_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_FORWARD_BASIC_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_OTHER_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_FORWARD_EMPTY_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_SELF_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_REVERSE_BASIC_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_OTHER_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_REVERSE_EMPTY_CASE_ID
+            | HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_SELF_CASE_ID
+            | HIR_DOCTEST_SEQ_UNION_BASIC_CASE_ID
+            | HIR_DOCTEST_SEQ_UNION_INFINITE_CASE_ID
+            | HIR_DOCTEST_SEQ_UNION_EMPTY_BASIC_CASE_ID
+            | HIR_DOCTEST_SEQ_UNION_EMPTY_NO_SPLICE_CASE_ID
+            | HIR_DOCTEST_SEQ_DEDUP_CASE_ID
+            | HIR_DOCTEST_SEQ_SORT_CASE_ID
+            | HIR_DOCTEST_SEQ_REVERSE_LITERALS_CASE_ID
+            | HIR_DOCTEST_SEQ_MINIMIZE_PREFIX_CASE_ID
+            | HIR_DOCTEST_SEQ_MINIMIZE_EMPTY_CASE_ID
+            | HIR_DOCTEST_SEQ_KEEP_FIRST_CASE_ID
+            | HIR_DOCTEST_SEQ_KEEP_LAST_CASE_ID
+            | HIR_DOCTEST_SEQ_COMMON_PREFIX_CASE_ID
+            | HIR_DOCTEST_SEQ_COMMON_SUFFIX_CASE_ID
+            | HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID
+            | HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID
+            | HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID
     )
 }
 
@@ -5100,6 +5180,9 @@ fn apply_bytes_class_operation(
 }
 
 fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    if is_supported_hir_seq_doctest_case(case_id) {
+        return run_hir_seq_doctest_case(case_id);
+    }
     if let Some(pattern) = hir_extractor_doctest_pattern(case_id) {
         let (expected_hir, observed_hir) = exact_text_hir_pair(pattern, case_id)?;
         let expected = hir_extractor_doctest_sequences(case_id, &expected_hir);
@@ -5137,6 +5220,348 @@ fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
             case_id,
         ),
         _ => unreachable!("caller checked supported HIR doctest case"),
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors 25 small, independently identified public doctests"
+)]
+fn run_hir_seq_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    use regex_syntax::hir::literal::{Literal, Seq};
+
+    let pattern = hir_seq_doctest_binding_pattern(case_id);
+    let _ = exact_text_hir_pair(pattern, case_id)?;
+
+    macro_rules! require_eq {
+        ($label:literal, $expected:expr, $observed:expr) => {{
+            let expected = $expected;
+            let observed = $observed;
+            if observed != expected {
+                return Err(AstMismatch {
+                    expected: format!("{case_id}/{}: {expected:?}", $label),
+                    observed: format!("{case_id}/{}: {observed:?}", $label),
+                });
+            }
+        }};
+    }
+
+    match case_id {
+        HIR_DOCTEST_SEQ_CASE_ID => {
+            let mut seq = Seq::new([
+                "farm",
+                "appliance",
+                "faraway",
+                "apple",
+                "fare",
+                "gap",
+                "applicant",
+                "applaud",
+            ]);
+            seq.keep_first_bytes(3);
+            seq.minimize_by_preference();
+            let expected = Seq::from_iter([
+                Literal::inexact("far"),
+                Literal::inexact("app"),
+                Literal::exact("gap"),
+            ]);
+            require_eq!("simplified-sequence", expected, seq);
+        }
+        HIR_DOCTEST_SEQ_CROSS_FORWARD_BASIC_CASE_ID => {
+            let mut seq1 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            let mut seq2 = Seq::from_iter([Literal::inexact("quux"), Literal::exact("baz")]);
+            seq1.cross_forward(&mut seq2);
+            require_eq!("other-drained", Some(0), seq2.len());
+            require_eq!(
+                "cross-product",
+                Seq::from_iter([
+                    Literal::inexact("fooquux"),
+                    Literal::exact("foobaz"),
+                    Literal::inexact("bar"),
+                ]),
+                seq1
+            );
+        }
+        HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_OTHER_CASE_ID => {
+            let mut seq1 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            let mut seq2 = Seq::infinite();
+            seq1.cross_forward(&mut seq2);
+            require_eq!(
+                "infinite-other-makes-inexact",
+                Seq::from_iter([Literal::inexact("foo"), Literal::inexact("bar"),]),
+                seq1
+            );
+        }
+        HIR_DOCTEST_SEQ_CROSS_FORWARD_EMPTY_CASE_ID => {
+            let mut seq1 = Seq::from_iter([
+                Literal::exact("foo"),
+                Literal::exact(""),
+                Literal::inexact("bar"),
+            ]);
+            let mut seq2 = Seq::infinite();
+            seq1.cross_forward(&mut seq2);
+            require_eq!("empty-infected", false, seq1.is_finite());
+        }
+        HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_SELF_CASE_ID => {
+            let mut seq1 = Seq::infinite();
+            let mut seq2 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            seq1.cross_forward(&mut seq2);
+            require_eq!("self-remains-infinite", false, seq1.is_finite());
+            require_eq!("other-drained", Some(0), seq2.len());
+        }
+        HIR_DOCTEST_SEQ_CROSS_REVERSE_BASIC_CASE_ID => {
+            let mut seq1 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            let mut seq2 = Seq::from_iter([Literal::inexact("quux"), Literal::exact("baz")]);
+            seq1.cross_reverse(&mut seq2);
+            require_eq!("other-drained", Some(0), seq2.len());
+            require_eq!(
+                "cross-product",
+                Seq::from_iter([
+                    Literal::inexact("quuxfoo"),
+                    Literal::inexact("bar"),
+                    Literal::exact("bazfoo"),
+                ]),
+                seq1
+            );
+        }
+        HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_OTHER_CASE_ID => {
+            let mut seq1 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            let mut seq2 = Seq::infinite();
+            seq1.cross_reverse(&mut seq2);
+            require_eq!(
+                "infinite-other-makes-inexact",
+                Seq::from_iter([Literal::inexact("foo"), Literal::inexact("bar"),]),
+                seq1
+            );
+        }
+        HIR_DOCTEST_SEQ_CROSS_REVERSE_EMPTY_CASE_ID => {
+            let mut seq1 = Seq::from_iter([
+                Literal::exact("foo"),
+                Literal::exact(""),
+                Literal::inexact("bar"),
+            ]);
+            let mut seq2 = Seq::infinite();
+            seq1.cross_reverse(&mut seq2);
+            require_eq!("empty-infected", false, seq1.is_finite());
+        }
+        HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_SELF_CASE_ID => {
+            let mut seq1 = Seq::infinite();
+            let mut seq2 = Seq::from_iter([Literal::exact("foo"), Literal::inexact("bar")]);
+            seq1.cross_reverse(&mut seq2);
+            require_eq!("self-remains-infinite", false, seq1.is_finite());
+            require_eq!("other-drained", Some(0), seq2.len());
+        }
+        HIR_DOCTEST_SEQ_UNION_BASIC_CASE_ID => {
+            let mut seq1 = Seq::new(["foo", "bar"]);
+            let mut seq2 = Seq::new(["bar", "quux", "foo"]);
+            seq1.union(&mut seq2);
+            require_eq!("other-drained", Some(0), seq2.len());
+            require_eq!(
+                "preference-order-union",
+                Seq::new(["foo", "bar", "quux", "foo"]),
+                seq1
+            );
+        }
+        HIR_DOCTEST_SEQ_UNION_INFINITE_CASE_ID => {
+            let mut seq1 = Seq::infinite();
+            require_eq!("initial-infinite", None, seq1.len());
+            let mut seq2 = Seq::new(["bar", "quux", "foo"]);
+            seq1.union(&mut seq2);
+            require_eq!("remains-infinite", None, seq1.len());
+            require_eq!("other-drained", Some(0), seq2.len());
+        }
+        HIR_DOCTEST_SEQ_UNION_EMPTY_BASIC_CASE_ID => {
+            let mut seq1 = Seq::new(["a", "", "f", ""]);
+            let mut seq2 = Seq::new(["foo"]);
+            seq1.union_into_empty(&mut seq2);
+            require_eq!("other-drained", Some(0), seq2.len());
+            require_eq!("first-empty-splice", Seq::new(["a", "foo", "f"]), seq1);
+        }
+        HIR_DOCTEST_SEQ_UNION_EMPTY_NO_SPLICE_CASE_ID => {
+            let mut seq1 = Seq::new(["foo", "bar"]);
+            let mut seq2 = Seq::new(["bar", "quux", "foo"]);
+            seq1.union_into_empty(&mut seq2);
+            require_eq!("no-empty-no-splice", Seq::new(["foo", "bar"]), seq1);
+            require_eq!("other-drained", Some(0), seq2.len());
+        }
+        HIR_DOCTEST_SEQ_DEDUP_CASE_ID => {
+            let mut seq = Seq::from_iter([Literal::exact("foo"), Literal::inexact("foo")]);
+            seq.dedup();
+            require_eq!(
+                "inexact-wins",
+                Seq::from_iter([Literal::inexact("foo")]),
+                seq
+            );
+        }
+        HIR_DOCTEST_SEQ_SORT_CASE_ID => {
+            let mut seq = Seq::new(["foo", "quux", "bar"]);
+            seq.sort();
+            require_eq!("lexicographic", Seq::new(["bar", "foo", "quux"]), seq);
+        }
+        HIR_DOCTEST_SEQ_REVERSE_LITERALS_CASE_ID => {
+            let mut seq = Seq::new(["oof", "rab"]);
+            seq.reverse_literals();
+            require_eq!("reversed", Seq::new(["foo", "bar"]), seq);
+        }
+        HIR_DOCTEST_SEQ_MINIMIZE_PREFIX_CASE_ID => {
+            let mut seq = Seq::new(["sam", "samwise"]);
+            seq.minimize_by_preference();
+            require_eq!(
+                "short-first",
+                Seq::from_iter([Literal::inexact("sam")]),
+                seq
+            );
+            let mut seq = Seq::new(["samwise", "sam"]);
+            seq.minimize_by_preference();
+            require_eq!("long-first", Seq::new(["samwise", "sam"]), seq);
+        }
+        HIR_DOCTEST_SEQ_MINIMIZE_EMPTY_CASE_ID => {
+            let mut seq = Seq::new(["foo", "bar", "", "quux", "fox"]);
+            seq.minimize_by_preference();
+            require_eq!(
+                "middle-empty",
+                Seq::from_iter([
+                    Literal::exact("foo"),
+                    Literal::exact("bar"),
+                    Literal::inexact(""),
+                ]),
+                seq
+            );
+            let mut seq = Seq::new(["", "foo", "quux", "fox"]);
+            seq.minimize_by_preference();
+            require_eq!("leading-empty", Seq::from_iter([Literal::inexact("")]), seq);
+        }
+        HIR_DOCTEST_SEQ_KEEP_FIRST_CASE_ID => {
+            let mut seq = Seq::new(["a", "foo", "quux"]);
+            seq.keep_first_bytes(2);
+            require_eq!(
+                "first-two",
+                Seq::from_iter([
+                    Literal::exact("a"),
+                    Literal::inexact("fo"),
+                    Literal::inexact("qu"),
+                ]),
+                seq
+            );
+        }
+        HIR_DOCTEST_SEQ_KEEP_LAST_CASE_ID => {
+            let mut seq = Seq::new(["a", "foo", "quux"]);
+            seq.keep_last_bytes(2);
+            require_eq!(
+                "last-two",
+                Seq::from_iter([
+                    Literal::exact("a"),
+                    Literal::inexact("oo"),
+                    Literal::inexact("ux"),
+                ]),
+                seq
+            );
+        }
+        HIR_DOCTEST_SEQ_COMMON_PREFIX_CASE_ID => {
+            let prefix = |seq: Seq| seq.longest_common_prefix().map(<[u8]>::to_vec);
+            require_eq!(
+                "fo",
+                Some(b"fo".to_vec()),
+                prefix(Seq::new(["foo", "foobar", "fo"]))
+            );
+            require_eq!(
+                "foo",
+                Some(b"foo".to_vec()),
+                prefix(Seq::new(["foo", "foo"]))
+            );
+            require_eq!(
+                "none-shared",
+                Some(Vec::<u8>::new()),
+                prefix(Seq::new(["foo", "bar"]))
+            );
+            require_eq!(
+                "empty-literal",
+                Some(Vec::<u8>::new()),
+                prefix(Seq::new([""]))
+            );
+            require_eq!("infinite", None, prefix(Seq::infinite()));
+            require_eq!("empty", None, prefix(Seq::empty()));
+        }
+        HIR_DOCTEST_SEQ_COMMON_SUFFIX_CASE_ID => {
+            let suffix = |seq: Seq| seq.longest_common_suffix().map(<[u8]>::to_vec);
+            require_eq!(
+                "of",
+                Some(b"of".to_vec()),
+                suffix(Seq::new(["oof", "raboof", "of"]))
+            );
+            require_eq!(
+                "foo",
+                Some(b"foo".to_vec()),
+                suffix(Seq::new(["foo", "foo"]))
+            );
+            require_eq!(
+                "none-shared",
+                Some(Vec::<u8>::new()),
+                suffix(Seq::new(["foo", "bar"]))
+            );
+            require_eq!(
+                "empty-literal",
+                Some(Vec::<u8>::new()),
+                suffix(Seq::new([""]))
+            );
+            require_eq!("infinite", None, suffix(Seq::infinite()));
+            require_eq!("empty", None, suffix(Seq::empty()));
+        }
+        HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID => {
+            let mut seq = Seq::new(["samantha", "sam", "samwise", "frodo"]);
+            seq.optimize_for_prefix_by_preference();
+            require_eq!(
+                "optimized",
+                Seq::from_iter([
+                    Literal::exact("samantha"),
+                    Literal::exact("sam"),
+                    Literal::exact("frodo"),
+                ]),
+                seq
+            );
+        }
+        HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID => {
+            let mut seq = Seq::new(["samantha", "", "sam", "samwise", "frodo"]);
+            seq.optimize_for_prefix_by_preference();
+            require_eq!("empty-disables-prefilter", false, seq.is_finite());
+        }
+        HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID => {
+            let mut seq = Seq::new(["samantha", " ", "sam", "frodo"]);
+            seq.optimize_for_prefix_by_preference();
+            require_eq!("space-can-remain-finite", true, seq.is_finite());
+        }
+        _ => unreachable!("caller checked supported HIR Seq doctest case"),
+    }
+    Ok(())
+}
+
+fn hir_seq_doctest_binding_pattern(case_id: &str) -> &'static str {
+    match case_id {
+        HIR_DOCTEST_SEQ_CASE_ID => r"(?:farm|appliance|faraway|apple|fare|gap|applicant|applaud)",
+        HIR_DOCTEST_SEQ_CROSS_FORWARD_BASIC_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_OTHER_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_FORWARD_EMPTY_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_SELF_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_REVERSE_BASIC_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_OTHER_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_REVERSE_EMPTY_CASE_ID
+        | HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_SELF_CASE_ID => r"(?:foo|bar|quux|baz)",
+        HIR_DOCTEST_SEQ_UNION_BASIC_CASE_ID
+        | HIR_DOCTEST_SEQ_UNION_INFINITE_CASE_ID
+        | HIR_DOCTEST_SEQ_UNION_EMPTY_NO_SPLICE_CASE_ID => r"(?:foo|bar|quux)",
+        HIR_DOCTEST_SEQ_UNION_EMPTY_BASIC_CASE_ID => r"(?:a||f|foo)",
+        HIR_DOCTEST_SEQ_DEDUP_CASE_ID => r"(?:foo|foo)",
+        HIR_DOCTEST_SEQ_SORT_CASE_ID => r"(?:foo|quux|bar)",
+        HIR_DOCTEST_SEQ_REVERSE_LITERALS_CASE_ID => r"(?:oof|rab)",
+        HIR_DOCTEST_SEQ_MINIMIZE_PREFIX_CASE_ID => r"(?:sam|samwise)",
+        HIR_DOCTEST_SEQ_MINIMIZE_EMPTY_CASE_ID => r"(?:foo|bar||quux|fox)",
+        HIR_DOCTEST_SEQ_KEEP_FIRST_CASE_ID | HIR_DOCTEST_SEQ_KEEP_LAST_CASE_ID => r"(?:a|foo|quux)",
+        HIR_DOCTEST_SEQ_COMMON_PREFIX_CASE_ID => r"(?:foo|foobar|fo|bar)",
+        HIR_DOCTEST_SEQ_COMMON_SUFFIX_CASE_ID => r"(?:oof|raboof|of|foo|bar)",
+        HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID
+        | HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID
+        | HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID => r"(?:samantha|sam|samwise|frodo| )",
+        _ => unreachable!("caller checked supported HIR Seq doctest case"),
     }
 }
 
@@ -6259,6 +6684,15 @@ fn hir_doctest_pass_evidence(case_id: &str) -> String {
         writeln!(
             contract,
             "pattern=sha256:{},bytes:{}\nadapter=literal-extractor",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    } else if is_supported_hir_seq_doctest_case(case_id) {
+        let pattern = hir_seq_doctest_binding_pattern(case_id);
+        writeln!(
+            contract,
+            "pattern=sha256:{},bytes:{}\nadapter=literal-seq-public-operation",
             sha256(pattern.as_bytes()),
             pattern.len(),
         )
@@ -7547,6 +7981,60 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR doctest receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_seq_doctests_execute_all_25_public_examples() {
+        let cases = [
+            HIR_DOCTEST_SEQ_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_FORWARD_BASIC_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_OTHER_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_FORWARD_EMPTY_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_FORWARD_INFINITE_SELF_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_REVERSE_BASIC_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_OTHER_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_REVERSE_EMPTY_CASE_ID,
+            HIR_DOCTEST_SEQ_CROSS_REVERSE_INFINITE_SELF_CASE_ID,
+            HIR_DOCTEST_SEQ_UNION_BASIC_CASE_ID,
+            HIR_DOCTEST_SEQ_UNION_INFINITE_CASE_ID,
+            HIR_DOCTEST_SEQ_UNION_EMPTY_BASIC_CASE_ID,
+            HIR_DOCTEST_SEQ_UNION_EMPTY_NO_SPLICE_CASE_ID,
+            HIR_DOCTEST_SEQ_DEDUP_CASE_ID,
+            HIR_DOCTEST_SEQ_SORT_CASE_ID,
+            HIR_DOCTEST_SEQ_REVERSE_LITERALS_CASE_ID,
+            HIR_DOCTEST_SEQ_MINIMIZE_PREFIX_CASE_ID,
+            HIR_DOCTEST_SEQ_MINIMIZE_EMPTY_CASE_ID,
+            HIR_DOCTEST_SEQ_KEEP_FIRST_CASE_ID,
+            HIR_DOCTEST_SEQ_KEEP_LAST_CASE_ID,
+            HIR_DOCTEST_SEQ_COMMON_PREFIX_CASE_ID,
+            HIR_DOCTEST_SEQ_COMMON_SUFFIX_CASE_ID,
+            HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID,
+            HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID,
+            HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID,
+        ];
+        assert_eq!(cases.len(), 25);
+        for case_id in cases {
+            let disposition = execute_hir_doctest_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_doctest_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Doctest,
+                    source_path: "src/hir/literal.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR Seq doctest receipt");
         }
     }
 
