@@ -157,6 +157,21 @@ const HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID: &str =
     "hir::translate::tests::analysis_is_literal";
 const HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID: &str =
     "hir::translate::tests::analysis_is_alternation_literal";
+const HIR_TRANSLATE_CAT_CLASS_FLATTENED_CASE_ID: &str =
+    "hir::translate::tests::cat_class_flattened";
+const HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID: &str = "hir::translate::tests::class_bracketed";
+const HIR_TRANSLATE_CLASS_BRACKETED_UNION_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_union";
+const HIR_TRANSLATE_CLASS_BRACKETED_NESTED_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_nested";
+const HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_intersect";
+const HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_intersect_negate";
+const HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_difference";
+const HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID: &str =
+    "hir::translate::tests::class_bracketed_symmetric_difference";
 const HIR_TRANSLATE_REGRESSION_ALT_EMPTY_CONCAT_CASE_ID: &str =
     "hir::translate::tests::regression_alt_empty_concat";
 const HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID: &str =
@@ -1058,6 +1073,153 @@ const HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_PROBES: [HirTranslateProbe; 
     (r"(?:a)|b", false),
     (r"a|(?:b)", false),
     (r"(?:z|xx)@|xx", false),
+];
+const HIR_TRANSLATE_CAT_CLASS_FLATTENED_PROBES: [HirTranslateProbe; 4] = [
+    (r"[a-z]|[A-Z]", false),
+    (
+        r"(?x)
+                \p{Lowercase_Letter}
+                |\p{Uppercase_Letter}
+                |\p{Titlecase_Letter}
+                |\p{Modifier_Letter}
+                |\p{Other_Letter}
+            ",
+        false,
+    ),
+    (r"[Δδ]|(?-u:[\x90-\xFF])|[Λλ]", true),
+    (r"[a-z]|(?-u:[\x90-\xFF])|[A-Z]", true),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_PROBES: [HirTranslateProbe; 50] = [
+    ("[a]", false),
+    ("[ab]", false),
+    ("[^[a]]", false),
+    ("[a-z]", false),
+    ("[a-fd-h]", false),
+    ("[a-fg-m]", false),
+    (r"[\x00]", false),
+    (r"[\n]", false),
+    ("[\n]", false),
+    (r"[\d]", false),
+    (r"[\pZ]", false),
+    (r"[\p{separator}]", false),
+    (r"[^\D]", false),
+    (r"[^\PZ]", false),
+    (r"[^\P{separator}]", false),
+    (r"(?i)[^\D]", false),
+    (r"(?i)[^\P{greek}]", false),
+    ("(?-u)[a]", false),
+    (r"(?-u)[\x00]", false),
+    (r"(?-u)[\xFF]", true),
+    ("(?i)[a]", false),
+    ("(?i)[k]", false),
+    ("(?i)[β]", false),
+    ("(?i-u)[k]", false),
+    ("[^a]", false),
+    (r"[^\x00]", false),
+    ("(?-u)[^a]", true),
+    (r"[^\d]", false),
+    (r"[^\pZ]", false),
+    (r"[^\p{separator}]", false),
+    (r"(?i)[^\p{greek}]", false),
+    (r"(?i)[\P{greek}]", false),
+    (r"[\[]", false),
+    (r"[&]", false),
+    (r"[\&]", false),
+    (r"[\&\&]", false),
+    (r"[\x00-&]", false),
+    (r"[&-\xFF]", false),
+    (r"[~]", false),
+    (r"[\~]", false),
+    (r"[\~\~]", false),
+    (r"[\x00-~]", false),
+    (r"[~-\xFF]", false),
+    (r"[-]", false),
+    (r"[\-]", false),
+    (r"[\-\-]", false),
+    (r"[\x00-\-]", false),
+    (r"[\--\xFF]", false),
+    (r"[^\s\S]", false),
+    (r"(?-u)[^\s\S]", true),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_ERROR_PROBES: [HirTranslateProbe; 1] = [("(?-u)[^a]", false)];
+const HIR_TRANSLATE_CLASS_BRACKETED_UNION_PROBES: [HirTranslateProbe; 8] = [
+    (r"[a-zA-Z]", false),
+    (r"[a\pZb]", false),
+    (r"[\pZ\p{Greek}]", false),
+    (r"[\p{age:3.0}\pZ\p{Greek}]", false),
+    (r"[[[\p{age:3.0}\pZ]\p{Greek}][\p{Cyrillic}]]", false),
+    (r"(?i)[\p{age:3.0}\pZ\p{Greek}]", false),
+    (r"[^\p{age:3.0}\pZ\p{Greek}]", false),
+    (r"(?i)[^\p{age:3.0}\pZ\p{Greek}]", false),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_NESTED_PROBES: [HirTranslateProbe; 11] = [
+    (r"[a[^c]]", false),
+    (r"[a-b[^c]]", false),
+    (r"[a-c[^c]]", false),
+    (r"[^a[^c]]", false),
+    (r"[^a-b[^c]]", false),
+    (r"(?i)[a[^c]]", false),
+    (r"(?i)[a-b[^c]]", false),
+    (r"(?i)[^a[^c]]", false),
+    (r"(?i)[^a-b[^c]]", false),
+    (r"[^a-c[^c]]", false),
+    (r"(?i)[^a-c[^c]]", false),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_PROBES: [HirTranslateProbe; 33] = [
+    ("[abc&&b-c]", false),
+    ("[abc&&[b-c]]", false),
+    ("[[abc]&&[b-c]]", false),
+    ("[a-z&&b-y&&c-x]", false),
+    ("[c-da-b&&a-d]", false),
+    ("[a-d&&c-da-b]", false),
+    (r"[a-z&&a-c]", false),
+    (r"[[a-z&&a-c]]", false),
+    (r"[^[a-z&&a-c]]", false),
+    ("(?-u)[abc&&b-c]", false),
+    ("(?-u)[abc&&[b-c]]", false),
+    ("(?-u)[[abc]&&[b-c]]", false),
+    ("(?-u)[a-z&&b-y&&c-x]", false),
+    ("(?-u)[c-da-b&&a-d]", false),
+    ("(?-u)[a-d&&c-da-b]", false),
+    ("(?i)[abc&&b-c]", false),
+    ("(?i)[abc&&[b-c]]", false),
+    ("(?i)[[abc]&&[b-c]]", false),
+    ("(?i)[a-z&&b-y&&c-x]", false),
+    ("(?i)[c-da-b&&a-d]", false),
+    ("(?i)[a-d&&c-da-b]", false),
+    ("(?i-u)[abc&&b-c]", false),
+    ("(?i-u)[abc&&[b-c]]", false),
+    ("(?i-u)[[abc]&&[b-c]]", false),
+    ("(?i-u)[a-z&&b-y&&c-x]", false),
+    ("(?i-u)[c-da-b&&a-d]", false),
+    ("(?i-u)[a-d&&c-da-b]", false),
+    (r"[\^&&^]", false),
+    (r"[]&&\]]", false),
+    (r"[-&&-]", false),
+    (r"[\&&&&]", false),
+    (r"[\&&&\&]", false),
+    (r"[a-w&&[^c-g]z]", false),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_PROBES: [HirTranslateProbe; 10] = [
+    (r"[^\w&&\d]", false),
+    (r"[^[a-z&&a-c]]", false),
+    (r"[^[\w&&\d]]", false),
+    (r"[^[^\w&&\d]]", false),
+    (r"[[[^\w]&&[^\d]]]", false),
+    (r"(?-u)[^\w&&\d]", true),
+    (r"(?-u)[^[a-z&&a-c]]", true),
+    (r"(?-u)[^[\w&&\d]]", true),
+    (r"(?-u)[^[^\w&&\d]]", true),
+    (r"(?-u)[[[^\w]&&[^\d]]]", true),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_PROBES: [HirTranslateProbe; 2] = [
+    (r"[\pL--[:ascii:]]", false),
+    (r"(?-u)[[:alpha:]--[:lower:]]", false),
+];
+const HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_PROBES: [HirTranslateProbe; 3] = [
+    (r"[\p{sc:Greek}~~\p{scx:Greek}]", false),
+    (r"[a-g~~c-j]", false),
+    (r"(?-u)[a-g~~c-j]", false),
 ];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
@@ -2910,6 +3072,14 @@ fn is_supported_hir_translate_case(case_id: &str) -> bool {
             | HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_CASE_ID
             | HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID
             | HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID
+            | HIR_TRANSLATE_CAT_CLASS_FLATTENED_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_UNION_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_NESTED_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID
+            | HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID
     )
 }
 
@@ -3539,10 +3709,20 @@ fn run_hir_translate_case(case_id: &str) -> Result<(), AstMismatch> {
     for (index, (pattern, bytes)) in probes.iter().copied().enumerate() {
         execute_hir_translate_probe(pattern, bytes, &format!("{label}-{index}"))?;
     }
+    for (index, (pattern, bytes)) in hir_translate_error_probes(case_id)
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        execute_hir_translate_error_probe(pattern, bytes, &format!("{label}-error-{index}"))?;
+    }
     Ok(())
 }
 
 fn hir_translate_probes(case_id: &str) -> (&'static [HirTranslateProbe], &'static str) {
+    if let Some(probes) = hir_translate_class_probes(case_id) {
+        return probes;
+    }
     match case_id {
         HIR_TRANSLATE_EMPTY_CASE_ID => (&HIR_TRANSLATE_EMPTY_PROBES, "hir-translate-empty"),
         HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID => (
@@ -3627,11 +3807,54 @@ fn hir_translate_probes(case_id: &str) -> (&'static [HirTranslateProbe], &'stati
     }
 }
 
-fn execute_hir_translate_probe(
-    pattern: &str,
-    bytes: bool,
-    assertion: &str,
-) -> Result<(), AstMismatch> {
+fn hir_translate_class_probes(
+    case_id: &str,
+) -> Option<(&'static [HirTranslateProbe], &'static str)> {
+    match case_id {
+        HIR_TRANSLATE_CAT_CLASS_FLATTENED_CASE_ID => Some((
+            &HIR_TRANSLATE_CAT_CLASS_FLATTENED_PROBES,
+            "hir-translate-cat-class-flattened",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_PROBES,
+            "hir-translate-class-bracketed",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_UNION_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_UNION_PROBES,
+            "hir-translate-class-bracketed-union",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_NESTED_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_NESTED_PROBES,
+            "hir-translate-class-bracketed-nested",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_PROBES,
+            "hir-translate-class-bracketed-intersect",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_PROBES,
+            "hir-translate-class-bracketed-intersect-negate",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_PROBES,
+            "hir-translate-class-bracketed-difference",
+        )),
+        HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_PROBES,
+            "hir-translate-class-bracketed-symmetric-difference",
+        )),
+        _ => None,
+    }
+}
+
+fn hir_translate_error_probes(case_id: &str) -> &'static [HirTranslateProbe] {
+    match case_id {
+        HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID => &HIR_TRANSLATE_CLASS_BRACKETED_ERROR_PROBES,
+        _ => &[],
+    }
+}
+
+fn hir_translate_context(bytes: bool) -> (RustProfile, CompatibilityProfile) {
     let mut rust_profile = RustProfile::regex_1_12_4();
     rust_profile.options.octal = true;
     let compatibility = if bytes {
@@ -3639,6 +3862,10 @@ fn execute_hir_translate_probe(
     } else {
         CompatibilityProfile::RustText(rust_profile.clone())
     };
+    (rust_profile, compatibility)
+}
+
+fn hir_translate_builder(rust_profile: &RustProfile, bytes: bool) -> regex_syntax::ParserBuilder {
     let mut builder = regex_syntax::ParserBuilder::new();
     builder
         .nest_limit(rust_profile.options.nest_limit)
@@ -3652,6 +3879,16 @@ fn execute_hir_translate_probe(
         .line_terminator(rust_profile.options.line_terminator)
         .swap_greed(rust_profile.options.swap_greed)
         .unicode(rust_profile.options.unicode);
+    builder
+}
+
+fn execute_hir_translate_probe(
+    pattern: &str,
+    bytes: bool,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let (rust_profile, compatibility) = hir_translate_context(bytes);
+    let builder = hir_translate_builder(&rust_profile, bytes);
     let expected_hir = builder
         .build()
         .parse(pattern)
@@ -3683,6 +3920,66 @@ fn execute_hir_translate_probe(
         Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
             observed: format!("{assertion}: {record:?}"),
+        })
+    }
+}
+
+fn execute_hir_translate_error_probe(
+    pattern: &str,
+    bytes: bool,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let (rust_profile, compatibility) = hir_translate_context(bytes);
+    let expected = match hir_translate_builder(&rust_profile, bytes)
+        .build()
+        .parse(pattern)
+    {
+        Err(error) => error,
+        Ok(hir) => {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: authenticated upstream translation error"),
+                observed: format!("{assertion}: upstream translated to {hir:?}"),
+            });
+        }
+    };
+    let observed = match parse(ParseRequest::rust(pattern, compatibility.clone())) {
+        Err(error) => error,
+        Ok(record) => {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: FRE translation error matching {expected:?}"),
+                observed: format!("{assertion}: FRE parsed {record:?}"),
+            });
+        }
+    };
+    let (expected_pattern, span) = match &expected {
+        regex_syntax::Error::Parse(error) => (error.pattern(), error.span()),
+        regex_syntax::Error::Translate(error) => (error.pattern(), error.span()),
+        _ => {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: pinned parse or translate error"),
+                observed: format!("{assertion}: {expected:?}"),
+            });
+        }
+    };
+    let expected_span = SourceSpan {
+        start: u64::try_from(span.start.offset).unwrap_or(u64::MAX),
+        end: u64::try_from(span.end.offset).unwrap_or(u64::MAX),
+    };
+    let valid = expected_pattern == pattern
+        && observed.schema_version == SCHEMA_VERSION
+        && observed.profile.as_ref() == &compatibility
+        && observed.category == ErrorCategory::UpstreamRustSyntax
+        && observed.span == Some(expected_span)
+        && observed.message == expected.to_string();
+    if valid {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!(
+                "{assertion}: schema={SCHEMA_VERSION} profile={compatibility:?} category=UpstreamRustSyntax span={expected_span:?} message={:?}",
+                expected.to_string(),
+            ),
+            observed: format!("{assertion}: {observed:?}"),
         })
     }
 }
@@ -4223,6 +4520,19 @@ fn hir_translate_pass_evidence(case_id: &str) -> String {
         writeln!(
             contract,
             "probe-{index}=sha256:{},bytes:{},bytes-profile:{bytes},expected:exact-hir",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, (pattern, bytes)) in hir_translate_error_probes(case_id)
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        writeln!(
+            contract,
+            "error-probe-{index}=sha256:{},bytes:{},bytes-profile:{bytes},expected:exact-upstream-error",
             sha256(pattern.as_bytes()),
             pattern.len(),
         )
@@ -5290,6 +5600,71 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR property receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_class_algebra_cases_execute_all_122_public_outcomes() {
+        let cases = [
+            (
+                HIR_TRANSLATE_CAT_CLASS_FLATTENED_CASE_ID,
+                HIR_TRANSLATE_CAT_CLASS_FLATTENED_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_PROBES.len()
+                    + HIR_TRANSLATE_CLASS_BRACKETED_ERROR_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_UNION_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_UNION_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_NESTED_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_NESTED_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID,
+                HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_PROBES.len(),
+            ),
+        ];
+        assert_eq!(
+            cases.iter().map(|(_, outcomes)| outcomes).sum::<usize>(),
+            122,
+        );
+        for (case_id, _) in cases {
+            let disposition = execute_hir_translate_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_translate_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/translate.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR class-algebra receipt");
         }
     }
 
