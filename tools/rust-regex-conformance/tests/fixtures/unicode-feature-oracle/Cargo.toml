@@ -1,0 +1,20 @@
+[package]
+name = "regex-syntax-unicode-feature-oracle"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+unicode-age = ["regex-syntax/unicode-age"]
+unicode-bool = ["regex-syntax/unicode-bool"]
+unicode-case = ["regex-syntax/unicode-case"]
+unicode-gencat = ["regex-syntax/unicode-gencat"]
+unicode-perl = ["regex-syntax/unicode-perl"]
+unicode-script = ["regex-syntax/unicode-script"]
+unicode-segment = ["regex-syntax/unicode-segment"]
+
+[dependencies]
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["std"] }

@@ -4,8 +4,8 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ErrorCategory,
     PackageIdentity, ParseRequest, QuotaBounded, Re2CapabilityStatus, Re2Encoding, Re2Options,
     Re2Profile, Re2Surface, ResourceKind, RustConstructor, RustMatchKind, RustProfile,
-    SafetyEnvelope, StrictAdmission, SyntaxQuotas, UnicodeVersion, UpstreamRevision, parse,
-    re2_surface_inventory,
+    RustUnicodeFeatures, SafetyEnvelope, StrictAdmission, SyntaxQuotas, UnicodeVersion,
+    UpstreamRevision, parse, re2_surface_inventory,
 };
 
 fn re2_literal_profile() -> CompatibilityProfile {
@@ -21,6 +21,7 @@ fn pinned_defaults_are_explicit() {
         regex_automata,
         regex_syntax,
         unicode,
+        unicode_features,
         constructor,
         options,
     } = RustProfile::default();
@@ -55,6 +56,7 @@ fn pinned_defaults_are_explicit() {
         "140167995737fa11dfe11b8af8b9aa143b790b4e"
     );
     assert_eq!(unicode, UnicodeVersion::RUST_16_0_0);
+    assert_eq!(unicode_features, RustUnicodeFeatures::ALL);
     assert!(options.unicode);
     assert_eq!(options.nest_limit, 250);
     assert_eq!(
@@ -107,6 +109,167 @@ fn pinned_defaults_are_explicit() {
     assert!(re2.options.log_errors);
     assert!(re2.options.case_sensitive);
     assert!(!re2.options.posix_syntax);
+}
+
+#[test]
+fn partial_unicode_feature_profiles_enforce_positive_and_negative_availability() {
+    let witnesses = [
+        r"\p{Age:6.0}",
+        r"\p{Alphabetic}",
+        r"(?i:\u{03B4})",
+        r"\pL",
+        r"\w",
+        r"\p{Greek}",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+    ];
+
+    let mut none = RustProfile::regex_1_12_4();
+    none.unicode_features = RustUnicodeFeatures::NONE;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(none.clone()),
+    ))
+    .expect("profiles with no Unicode tables still accept table-free syntax");
+    for pattern in witnesses {
+        let error = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(none.clone()),
+        ))
+        .expect_err("a no-table profile must reject every Unicode data family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    let full = RustProfile::regex_1_12_4();
+    for pattern in witnesses {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(full.clone()),
+        ))
+        .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+    }
+}
+
+#[test]
+fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
+    let mut none = RustProfile::regex_1_12_4();
+    none.unicode_features = RustUnicodeFeatures::NONE;
+    let partial = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(none),
+    ))
+    .expect("table-free syntax under partial profile");
+    let full = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::rust_text(),
+    ))
+    .expect("table-free syntax under full profile");
+    assert_ne!(partial.key, full.key);
+
+    let mut forged_rebar = RustProfile::rebar_1_12_4();
+    forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
+    let error = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustBytes(forged_rebar),
+    ))
+    .expect_err("Rebar's default-feature receipt requires all Unicode tables");
+    assert_eq!(error.category, ErrorCategory::InvalidConfiguration);
+}
+
+#[test]
+fn partial_unicode_profiles_cover_aliases_overlaps_nested_classes_and_sets() {
+    let full = RustProfile::regex_1_12_4();
+    for pattern in [
+        r"[\p{Alphabetic}\s]",
+        r"[\p{sc=Greek}\p{scx=Latin}]",
+        r"\p{gcb=Extend}",
+        r"\b\d\s\w\b",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(full.clone()),
+        ))
+        .unwrap_or_else(|error| panic!("all-table nested pattern {pattern}: {error:?}"));
+    }
+
+    let mut none_set = RustProfile::regex_set_1_12_4();
+    none_set.unicode_features = RustUnicodeFeatures::NONE;
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &["literal", r"\p{Greek}"],
+        &CompatibilityProfile::RustText(none_set),
+    )
+    .expect_err("set admission must enforce constituent feature availability");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
+fn partial_unicode_profiles_follow_active_unicode_and_case_flag_scope() {
+    let mut none = RustProfile::regex_1_12_4();
+    none.unicode_features = RustUnicodeFeatures::NONE;
+    for pattern in [
+        r"(?i)",
+        r"(?i:.)",
+        r"(?i:^$)",
+        r"(?i-u:a)",
+        r"(?-u:\d\s\w\b)",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(none.clone()),
+        ))
+        .unwrap_or_else(|error| panic!("table-free scoped pattern {pattern}: {error:?}"));
+    }
+    parse(ParseRequest::rust(
+        r"(?i)(?-u:a)(?-i:\u{03B4})",
+        CompatibilityProfile::RustText(none.clone()),
+    ))
+    .expect("group-local i/u changes restore in traversal order");
+    parse(ParseRequest::rust(
+        r"(?i:a)",
+        CompatibilityProfile::RustText(none),
+    ))
+    .expect_err("an i+u literal requires Unicode case data");
+}
+
+#[test]
+fn partial_unicode_analysis_obeys_exact_parse_work_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::NONE;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"(?-u:[a-z]+)|(?-u:\d+)";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("baseline partial analysis");
+    let exact = baseline.summary.parse_work;
+    assert!(exact > 0);
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact availability-analysis work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below availability-analysis work must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
 }
 
 #[test]

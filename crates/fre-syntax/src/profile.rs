@@ -90,6 +90,24 @@ pub struct UnicodeVersion {
     pub patch: u16,
 }
 
+/// Exact all-or-none availability of Unicode data in `regex-syntax` 0.8.11.
+///
+/// This is distinct from [`RustOptions::unicode`], which controls the `u`
+/// syntax flag. Singleton data-family profiles remain outside this type until
+/// their complete alias classifier is bounded and oracle-qualified.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RustUnicodeFeatures(u8);
+
+impl RustUnicodeFeatures {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self(1);
+
+    #[must_use]
+    pub const fn is_all(self) -> bool {
+        self.0 == 1
+    }
+}
+
 impl UnicodeVersion {
     pub const RUST_16_0_0: Self = Self {
         major: 16,
@@ -202,6 +220,7 @@ pub struct RustProfile {
     pub regex_automata: PackageIdentity,
     pub regex_syntax: PackageIdentity,
     pub unicode: UnicodeVersion,
+    pub unicode_features: RustUnicodeFeatures,
     pub constructor: RustConstructor,
     pub options: RustOptions,
 }
@@ -221,6 +240,7 @@ impl RustProfile {
             regex_automata: PackageIdentity::REGEX_AUTOMATA_0_4_14,
             regex_syntax: PackageIdentity::REGEX_SYNTAX_0_8_11,
             unicode: UnicodeVersion::RUST_16_0_0,
+            unicode_features: RustUnicodeFeatures::ALL,
             constructor: RustConstructor::RegexBuilder {
                 size_limit: 10 * (1 << 20),
                 dfa_size_limit: 2 * (1 << 20),
@@ -308,6 +328,7 @@ impl RustProfile {
             regex_automata: PackageIdentity::REGEX_AUTOMATA_0_4_14,
             regex_syntax: PackageIdentity::REGEX_SYNTAX_0_8_11,
             unicode: UnicodeVersion::RUST_16_0_0,
+            unicode_features: RustUnicodeFeatures::ALL,
             constructor: RustConstructor::RebarMeta {
                 rebar_revision: UpstreamRevision::Rebar463d00f,
                 regex_default_features: true,
@@ -329,7 +350,7 @@ impl RustProfile {
     #[must_use]
     pub fn identity_string(&self) -> String {
         format!(
-            "regex={}@{}#{}; regex-automata={}@{}#{}; regex-syntax={}@{}#{}; unicode={}; constructor={:?}; options={:?}",
+            "regex={}@{}#{}; regex-automata={}@{}#{}; regex-syntax={}@{}#{}; unicode={}; unicode-features={:?}; constructor={:?}; options={:?}",
             self.regex.version,
             self.regex.vcs_revision.commit(),
             self.regex.checksum,
@@ -340,6 +361,7 @@ impl RustProfile {
             self.regex_syntax.vcs_revision.commit(),
             self.regex_syntax.checksum,
             self.unicode,
+            self.unicode_features,
             self.constructor,
             self.options,
         )

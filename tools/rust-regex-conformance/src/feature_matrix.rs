@@ -9,7 +9,7 @@ use std::{
 };
 
 use fre::{PortableBuilder, RustProfile, SearchLimits};
-use fre_syntax::{CompatibilityProfile, ParseRequest, parse};
+use fre_syntax::{CompatibilityProfile, ErrorCategory, ParseRequest, RustUnicodeFeatures, parse};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -187,6 +187,7 @@ const EXPECTED_FEATURES: &[(&str, &[&str])] = &[
 enum SemanticContract {
     HighLevelUnicode,
     RebarUnicode,
+    NoUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -210,19 +211,19 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "no-default",
         default_features: false,
         features: &[],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::NoUnicode,
     },
     ConfigurationSpec {
         id: "std-only",
         default_features: false,
         features: &["std"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::NoUnicode,
     },
     ConfigurationSpec {
         id: "std-perf",
         default_features: false,
         features: &["std", "perf"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::NoUnicode,
     },
     ConfigurationSpec {
         id: "std-unicode",
@@ -473,6 +474,7 @@ pub fn build_feature_matrix_report(
     validate_target_dir(target_dir)?;
     let high_level_evidence = run_semantic_contract(RustProfile::regex_1_12_4())?;
     let rebar_evidence = run_semantic_contract(RustProfile::rebar_1_12_4())?;
+    let no_unicode_evidence = run_no_unicode_contract()?;
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
         receipts.push(run_configuration(
@@ -482,6 +484,7 @@ pub fn build_feature_matrix_report(
             &toolchain,
             &high_level_evidence,
             &rebar_evidence,
+            &no_unicode_evidence,
         ));
     }
     let counts = FeatureMatrixCounts::from_receipts(&receipts)?;
@@ -685,6 +688,7 @@ fn run_configuration(
     toolchain: &FeatureMatrixToolchain,
     high_level_evidence: &str,
     rebar_evidence: &str,
+    no_unicode_evidence: &str,
 ) -> FeatureMatrixReceipt {
     let disposition = if spec.semantic == SemanticContract::NightlyPatternApi && !toolchain.nightly
     {
@@ -701,6 +705,9 @@ fn run_configuration(
                 },
                 SemanticContract::RebarUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: rebar_evidence.to_owned(),
+                },
+                SemanticContract::NoUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: no_unicode_evidence.to_owned(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -848,6 +855,56 @@ fn run_semantic_contract(profile: RustProfile) -> Result<String, InventoryError>
         b"regex-1.12.4-high-level-unicode;greek-class=parsed;literal-span=2..8".as_slice()
     };
     Ok(sha256(evidence))
+}
+
+const NO_UNICODE_WITNESSES: &[(&str, &str)] = &[
+    ("age", r"\p{Age:6.0}"),
+    ("bool", r"\p{Alphabetic}"),
+    ("case", r"(?i:\u{03B4})"),
+    ("gencat", r"\pL"),
+    ("perl", r"\b\w\b"),
+    ("script", r"\p{Greek}"),
+    ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
+];
+
+fn run_no_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::NONE;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "no-Unicode profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        let error = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .expect_err("every Unicode data-family witness must be refused");
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "no-Unicode {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_no_unicode_evidence())
+}
+
+fn expected_no_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-no-unicode;ascii=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    sha256(evidence.as_bytes())
 }
 
 fn authenticate_upstream_package(
@@ -1173,6 +1230,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_semantic_evidence(spec.semantic) => Ok(()),
         (
+            SemanticContract::NoUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_no_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1233,6 +1297,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::RebarUnicode => {
             b"regex-1.12.4-rebar-unicode;greek-class=parsed;literal-span=2..8".as_slice()
         }
+        SemanticContract::NoUnicode => return expected_no_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1272,14 +1337,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
-                .filter(|spec| {
-                    matches!(
-                        spec.semantic,
-                        SemanticContract::MissingUnicodeAvailabilityProfile
-                    )
-                })
+                .filter(|spec| matches!(spec.semantic, SemanticContract::NoUnicode))
                 .count(),
-            10
+            3
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
+                .filter(|spec| matches!(
+                    spec.semantic,
+                    SemanticContract::MissingUnicodeAvailabilityProfile
+                ))
+                .count(),
+            7
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1299,6 +1369,10 @@ mod tests {
         assert!(is_sha256(&high_level));
         assert!(is_sha256(&rebar));
         assert_ne!(high_level, rebar);
+
+        let no_unicode = run_no_unicode_contract().expect("no-Unicode semantic gate");
+        assert_eq!(no_unicode, expected_no_unicode_evidence());
+        assert!(is_sha256(&no_unicode));
     }
 
     #[test]

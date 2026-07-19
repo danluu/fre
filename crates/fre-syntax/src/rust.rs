@@ -1,6 +1,7 @@
 use regex_automata::{MatchKind, meta, nfa::thompson::WhichCaptures, util::syntax};
 use regex_syntax::{
     ParserBuilder,
+    ast::{self, Ast},
     hir::{Class, Hir, HirKind},
 };
 
@@ -30,6 +31,42 @@ pub(crate) fn parse_rust(
     };
     validate_rust_configuration(&profile, options)?;
 
+    let features = match &profile {
+        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => {
+            rust.unicode_features
+        }
+        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+    };
+    let (hir, parse_work) = if features.is_all() {
+        (
+            configured_parser(options, utf8)
+                .build()
+                .parse(source)
+                .map_err(|error| map_regex_syntax_error(&profile, &error))?,
+            u64::try_from(source.len()).unwrap_or(u64::MAX),
+        )
+    } else {
+        parse_with_unicode_availability(source, &profile, options, utf8, admission, safety)?
+    };
+    if enforce_single_size_limit {
+        enforce_high_level_size_limit(&hir, &profile, options)?;
+    }
+    let summary = summarize_hir(&hir, parse_work, &profile, admission, safety)?;
+    Ok(ParseRecord {
+        key: CacheKey {
+            schema_version: SCHEMA_VERSION,
+            pattern,
+            profile,
+            admission,
+            safety,
+        },
+        admission_status: AdmissionStatus::from_policy(admission),
+        summary,
+        pattern: CanonicalPattern::Rust(RustParsed { hir }),
+    })
+}
+
+fn configured_parser(options: &RustOptions, utf8: bool) -> ParserBuilder {
     let mut builder = ParserBuilder::new();
     builder
         .nest_limit(options.nest_limit)
@@ -43,43 +80,259 @@ pub(crate) fn parse_rust(
         .line_terminator(options.line_terminator)
         .swap_greed(options.swap_greed)
         .unicode(options.unicode);
-    let hir = builder.build().parse(source).map_err(|error| {
-        let span = match &error {
-            regex_syntax::Error::Parse(error) => Some(error.span()),
-            regex_syntax::Error::Translate(error) => Some(error.span()),
-            _ => None,
-        };
-        let record = ParseError::new(
-            profile.clone(),
-            ErrorCategory::UpstreamRustSyntax,
-            error.to_string(),
-        );
-        if let Some(span) = span {
-            record.with_span(crate::SourceSpan {
-                start: u64::try_from(span.start.offset).unwrap_or(u64::MAX),
-                end: u64::try_from(span.end.offset).unwrap_or(u64::MAX),
-            })
-        } else {
-            record
-        }
-    })?;
-    if enforce_single_size_limit {
-        enforce_high_level_size_limit(&hir, &profile, options)?;
+    builder
+}
+
+fn map_regex_syntax_error(
+    profile: &CompatibilityProfile,
+    error: &regex_syntax::Error,
+) -> ParseError {
+    let span = match error {
+        regex_syntax::Error::Parse(error) => Some(error.span()),
+        regex_syntax::Error::Translate(error) => Some(error.span()),
+        _ => None,
+    };
+    let record = ParseError::new(
+        profile.clone(),
+        ErrorCategory::UpstreamRustSyntax,
+        error.to_string(),
+    );
+    with_regex_span(record, span)
+}
+
+fn with_regex_span(record: ParseError, span: Option<&ast::Span>) -> ParseError {
+    if let Some(span) = span {
+        record.with_span(crate::SourceSpan {
+            start: u64::try_from(span.start.offset).unwrap_or(u64::MAX),
+            end: u64::try_from(span.end.offset).unwrap_or(u64::MAX),
+        })
+    } else {
+        record
     }
-    let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
-    let summary = summarize_hir(&hir, source_bytes, &profile, admission, safety)?;
-    Ok(ParseRecord {
-        key: CacheKey {
-            schema_version: SCHEMA_VERSION,
-            pattern,
-            profile,
-            admission,
-            safety,
+}
+
+fn parse_with_unicode_availability(
+    source: &str,
+    profile: &CompatibilityProfile,
+    options: &RustOptions,
+    utf8: bool,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+) -> Result<(Hir, u64), ParseError> {
+    // `ParseRequest::validate_and_charge_source` checked the initial source
+    // byte charge before this single AST allocation. The availability walk
+    // charges every visited AST/class node. The walk only rejects constructs
+    // that require unavailable data; it performs no Unicode table expansion,
+    // alias normalization or second parse.
+    let mut ast_builder = ast::parse::ParserBuilder::new();
+    ast_builder
+        .nest_limit(options.nest_limit)
+        .octal(options.octal)
+        .ignore_whitespace(options.ignore_whitespace);
+    let ast = ast_builder.build().parse(source).map_err(|error| {
+        with_regex_span(
+            ParseError::new(
+                profile.clone(),
+                ErrorCategory::UpstreamRustSyntax,
+                error.to_string(),
+            ),
+            Some(error.span()),
+        )
+    })?;
+    let initial_work = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let visitor = UnicodeAvailabilityVisitor {
+        profile,
+        admission,
+        safety,
+        work: initial_work,
+        flags: ActiveUnicodeFlags {
+            case_insensitive: options.case_insensitive,
+            unicode: options.unicode,
         },
-        admission_status: AdmissionStatus::from_policy(admission),
-        summary,
-        pattern: CanonicalPattern::Rust(RustParsed { hir }),
-    })
+        group_flags: Vec::new(),
+    };
+    let work = ast::visit(&ast, visitor)?;
+
+    let mut translator = regex_syntax::hir::translate::TranslatorBuilder::new();
+    translator
+        .utf8(utf8)
+        .line_terminator(options.line_terminator)
+        .case_insensitive(options.case_insensitive)
+        .multi_line(options.multi_line)
+        .dot_matches_new_line(options.dot_matches_new_line)
+        .crlf(options.crlf)
+        .swap_greed(options.swap_greed)
+        .unicode(options.unicode);
+    let hir = translator
+        .build()
+        .translate(source, &ast)
+        .map_err(|error| {
+            with_regex_span(
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::UpstreamRustSyntax,
+                    error.to_string(),
+                ),
+                Some(error.span()),
+            )
+        })?;
+    Ok((hir, work))
+}
+
+struct UnicodeAvailabilityVisitor<'a> {
+    profile: &'a CompatibilityProfile,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+    work: u64,
+    flags: ActiveUnicodeFlags,
+    group_flags: Vec<ActiveUnicodeFlags>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveUnicodeFlags {
+    case_insensitive: bool,
+    unicode: bool,
+}
+
+impl UnicodeAvailabilityVisitor<'_> {
+    fn charge(&mut self, amount: u64) -> Result<(), ParseError> {
+        checked_add(
+            &mut self.work,
+            amount,
+            self.profile,
+            self.admission,
+            self.safety,
+            ResourceKind::ParseWork,
+        )
+    }
+
+    fn reject(&self, span: &ast::Span, message: &'static str) -> Result<(), ParseError> {
+        Err(with_regex_span(
+            ParseError::new(
+                self.profile.clone(),
+                ErrorCategory::UpstreamRustSyntax,
+                message,
+            ),
+            Some(span),
+        ))
+    }
+
+    fn apply_flags(&mut self, flags: &ast::Flags) {
+        if let Some(case_insensitive) = flags.flag_state(ast::Flag::CaseInsensitive) {
+            self.flags.case_insensitive = case_insensitive;
+        }
+        if let Some(unicode) = flags.flag_state(ast::Flag::Unicode) {
+            self.flags.unicode = unicode;
+        }
+    }
+
+    fn require_case(&self, span: &ast::Span) -> Result<(), ParseError> {
+        if !self.flags.case_insensitive || !self.flags.unicode {
+            return Ok(());
+        }
+        self.reject(
+            span,
+            "Unicode case-folding data is unavailable in this Rust profile",
+        )
+    }
+
+    fn class_perl(&self, class: &ast::ClassPerl) -> Result<(), ParseError> {
+        if !self.flags.unicode {
+            return Ok(());
+        }
+        self.reject(
+            &class.span,
+            "Unicode Perl-class data is unavailable in this Rust profile",
+        )
+    }
+
+    fn class_unicode(&self, class: &ast::ClassUnicode) -> Result<(), ParseError> {
+        if !self.flags.unicode {
+            return Ok(());
+        }
+        self.reject(
+            &class.span,
+            "Unicode property data is unavailable in this Rust profile",
+        )
+    }
+}
+
+impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
+    type Output = u64;
+    type Err = ParseError;
+
+    fn finish(self) -> Result<Self::Output, Self::Err> {
+        Ok(self.work)
+    }
+
+    fn visit_pre(&mut self, node: &Ast) -> Result<(), Self::Err> {
+        self.charge(1)?;
+        if let Ast::Group(group) = node {
+            self.group_flags.push(self.flags);
+            if let Some(flags) = group.flags() {
+                self.apply_flags(flags);
+            }
+        }
+        match node {
+            Ast::Literal(literal) => self.require_case(&literal.span),
+            Ast::ClassBracketed(class) => self.require_case(&class.span),
+            Ast::Assertion(assertion)
+                if self.flags.unicode
+                    && matches!(
+                        assertion.kind,
+                        ast::AssertionKind::WordBoundary
+                            | ast::AssertionKind::NotWordBoundary
+                            | ast::AssertionKind::WordBoundaryStart
+                            | ast::AssertionKind::WordBoundaryEnd
+                            | ast::AssertionKind::WordBoundaryStartAngle
+                            | ast::AssertionKind::WordBoundaryEndAngle
+                            | ast::AssertionKind::WordBoundaryStartHalf
+                            | ast::AssertionKind::WordBoundaryEndHalf
+                    ) =>
+            {
+                self.reject(
+                    &assertion.span,
+                    "Unicode word-boundary data is unavailable in this Rust profile",
+                )
+            }
+            Ast::ClassPerl(class) => self.class_perl(class),
+            Ast::ClassUnicode(class) => self.class_unicode(class),
+            _ => Ok(()),
+        }
+    }
+
+    fn visit_post(&mut self, node: &Ast) -> Result<(), Self::Err> {
+        match node {
+            Ast::Flags(flags) => self.apply_flags(&flags.flags),
+            Ast::Group(_) => {
+                self.flags = self.group_flags.pop().ok_or_else(|| {
+                    ParseError::new(
+                        self.profile.clone(),
+                        ErrorCategory::InvalidConfiguration,
+                        "Unicode availability traversal lost group flag state",
+                    )
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn visit_class_set_item_pre(&mut self, item: &ast::ClassSetItem) -> Result<(), Self::Err> {
+        self.charge(1)?;
+        match item {
+            ast::ClassSetItem::Perl(class) => self.class_perl(class),
+            ast::ClassSetItem::Unicode(class) => self.class_unicode(class),
+            _ => Ok(()),
+        }
+    }
+
+    fn visit_class_set_binary_op_pre(
+        &mut self,
+        _op: &ast::ClassSetBinaryOp,
+    ) -> Result<(), Self::Err> {
+        self.charge(1)
+    }
 }
 
 pub(crate) fn validate_regex_set_admission<P: AsRef<str>>(
@@ -106,6 +359,18 @@ pub(crate) fn validate_regex_set_admission<P: AsRef<str>>(
             source,
         }
     })?;
+    if !rust.unicode_features.is_all() {
+        for (index, pattern) in patterns.iter().enumerate() {
+            let request = ParseRequest::rust(pattern.as_ref(), profile.clone());
+            request
+                .validate_and_charge_source()
+                .and_then(|()| parse_rust(request, false).map(|_| ()))
+                .map_err(|source| RustRegexSetAdmissionError {
+                    pattern: Some(index),
+                    source,
+                })?;
+        }
+    }
     let (size_limit, dfa_size_limit) = match rust.constructor {
         RustConstructor::RegexBuilder {
             size_limit,
@@ -345,6 +610,7 @@ fn validate_rust_configuration(
                 && !*utf8_empty
                 && *build_many_ordered
                 && *thompson_nfa_size_limit == 100 * 1_048_576
+                && rust.unicode_features.is_all()
                 && rebar_options_match_runner_surface(options)
         }
         (
