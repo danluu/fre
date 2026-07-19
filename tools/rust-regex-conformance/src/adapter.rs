@@ -32,14 +32,14 @@ use crate::{
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
 pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v21-selection-invariant-single-and-overlapping-set-observations";
+    "fre-portable-rust-facade-v22-selection-invariant-observations-and-set-compilation";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
-    "UTF-8 bytes RegexSet compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof; this does not expose native bytes-set execution",
+    "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence, while set which does so only for zero or one pattern; UTF-8 bytes rows delegate to the text set and do not claim native bytes-set execution",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations remain gated on exact policy support",
 ];
@@ -1823,7 +1823,10 @@ fn set_applicability(
     input: &ExecutableCase,
     text: bool,
 ) -> Result<(), NotApplicableReason> {
-    if is_compile_surface(surface) && input.patterns.len() == 1 {
+    // Compilation does not observe search or match-selection policy. Preserve
+    // the canonical singleton rejection precedence, and admit larger/empty
+    // sets only when the selected compiler profile exactly matches the case.
+    if is_compile_surface(surface) && (input.patterns.len() == 1 || case.utf8 == text) {
         if case.utf8 != text {
             return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
         }
@@ -2541,6 +2544,75 @@ mod tests {
     }
 
     #[test]
+    fn set_compile_is_selection_policy_invariant_for_every_pattern_count() {
+        let mut case = fixture_case(true, true, None);
+        case.pattern_count = 2;
+        let mut input = fixture_input(Vec::new());
+        input.patterns = vec!["a".to_owned(), "b".to_owned()];
+
+        for surface in [
+            AdapterSurface::RustTextSetCompile,
+            AdapterSurface::RustBytesSetCompile,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        case.search_kind = SearchKind::Overlapping;
+        case.match_kind = MatchKind::LeftmostFirst;
+        for surface in [
+            AdapterSurface::RustTextSetCompile,
+            AdapterSurface::RustBytesSetCompile,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        case.search_kind = SearchKind::Leftmost;
+        case.utf8 = false;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetCompile, &case, &input),
+            Ok(())
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetCompile, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+        );
+
+        case.utf8 = true;
+        case.pattern_count = 0;
+        input.patterns.clear();
+        for surface in [
+            AdapterSurface::RustTextSetCompile,
+            AdapterSurface::RustBytesSetCompile,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        case.compiles = false;
+        case.pattern_count = 2;
+        input.patterns = vec!["a".to_owned(), "(".to_owned()];
+        for surface in [
+            AdapterSurface::RustTextSetCompile,
+            AdapterSurface::RustBytesSetCompile,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn utf8_bytes_set_compile_and_invariant_observations_delegate_to_text_proof() {
         let mut case = fixture_case(true, true, None);
         case.pattern_count = 2;
@@ -2731,7 +2803,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_set_delegation_rejects_unproved_inputs() {
+    fn set_delegation_rejects_unproved_observations_not_compilation() {
         let text_case = fixture_case(true, true, None);
         let text_input = fixture_input(vec![ExpectedCaptures {
             pattern_id: 0,
@@ -2739,10 +2811,24 @@ mod tests {
         }]);
         let mut multiple = text_input.clone();
         multiple.patterns.push("b".to_owned());
+        let mut multiple_case = text_case.clone();
+        multiple_case.pattern_count = 2;
         assert_eq!(
-            surface_applicability(AdapterSurface::RustTextSetCompile, &text_case, &multiple),
-            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+            surface_applicability(
+                AdapterSurface::RustTextSetCompile,
+                &multiple_case,
+                &multiple,
+            ),
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustTextSetCompile,
+                &multiple_case,
+                &multiple,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
 
         let mut zero = text_input.clone();
         zero.patterns.clear();
