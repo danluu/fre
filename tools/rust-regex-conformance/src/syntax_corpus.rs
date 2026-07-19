@@ -122,17 +122,23 @@ const HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID: &str =
     "hir::print::tests::regression_repetition_alternation";
 const HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID: &str =
     "hir::print::tests::regression_alternation_concat";
+const HIR_TRANSLATE_REGRESSION_ALT_EMPTY_CONCAT_CASE_ID: &str =
+    "hir::translate::tests::regression_alt_empty_concat";
+const HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID: &str =
+    "hir::translate::tests::regression_empty_alt";
+const HIR_TRANSLATE_REGRESSION_SINGLETON_ALT_CASE_ID: &str =
+    "hir::translate::tests::regression_singleton_alt";
 const INTRINSIC_UNOBSERVABLE_REASON_CODE: &str = "fre-adapter.intrinsic-unobservable";
 #[cfg(test)]
 const INTRINSIC_UNOBSERVABLE_IDS_SHA256: &str =
-    "ad134df1ff6d486229b00edfc56039943df5af7a358ad5a192e4995996e4d1e8";
+    "2ae7e12c554b73dfd74c13f7e20b859f0615f6a2d00523ce0e027e66eec7225d";
 /// Exact upstream unit receipts whose asserted state cannot be produced or
 /// observed through any current FRE public or hidden syntax adapter.
 ///
 /// This registry is deliberately conservative. Publicly addressable work
 /// remains in the normal unsupported backlog even when its adapter has not
 /// been implemented yet.
-const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 8] = [
+const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 11] = [
     (
         AST_COMMENTS_CASE_ID,
         "private parse_with_comments comment side channel is absent from RustAstRecord",
@@ -164,6 +170,18 @@ const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 8] = [
     (
         HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID,
         "constructor-only concat-over-alternation HIR cannot be produced by FRE pattern parsing",
+    ),
+    (
+        HIR_TRANSLATE_REGRESSION_ALT_EMPTY_CONCAT_CASE_ID,
+        "constructor-only empty concat AST child cannot be produced by FRE pattern parsing",
+    ),
+    (
+        HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID,
+        "constructor-only zero-branch alternation AST cannot be produced by FRE pattern parsing",
+    ),
+    (
+        HIR_TRANSLATE_REGRESSION_SINGLETON_ALT_CASE_ID,
+        "constructor-only singleton alternation AST cannot be produced by FRE pattern parsing",
     ),
 ];
 const REGRESSION_454_PATTERN: &str = r"
@@ -787,7 +805,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 
 const LIMITATIONS: [&str; 3] = [
     "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 5 AST parser identities remain explicit Unsupported dispositions.",
-    "Eight exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor/side-channel or constructor-only HIR state is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
+    "Eleven exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor/side-channel or constructor-only AST/HIR state is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -4467,8 +4485,10 @@ mod tests {
             assert!(!is_supported_syntax_adapter_case(case_id));
             let source_path = if case_id.starts_with(AST_PARSE_PREFIX) {
                 "src/ast/parse.rs"
-            } else {
+            } else if case_id.starts_with(HIR_PRINT_PREFIX) {
                 "src/hir/print.rs"
+            } else {
+                "src/hir/translate.rs"
             };
             let obligation = RegexSyntaxCorpusObligation {
                 case_id: case_id.to_owned(),
