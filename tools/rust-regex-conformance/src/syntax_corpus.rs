@@ -61,6 +61,7 @@ const OBLIGATION_INVENTORY_SHA256: &str =
 const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PRINT_PREFIX: &str = "ast::print::tests::";
 const HIR_PRINT_PREFIX: &str = "hir::print::tests::";
+const HIR_LITERAL_PREFIX: &str = "hir::literal::tests::";
 const HIR_TRANSLATE_PREFIX: &str = "hir::translate::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
@@ -123,6 +124,18 @@ const HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID: &str =
     "hir::print::tests::regression_repetition_alternation";
 const HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID: &str =
     "hir::print::tests::regression_alternation_concat";
+const HIR_LITERAL_LITERAL_CASE_ID: &str = "hir::literal::tests::literal";
+const HIR_LITERAL_CLASS_CASE_ID: &str = "hir::literal::tests::class";
+const HIR_LITERAL_LOOK_CASE_ID: &str = "hir::literal::tests::look";
+const HIR_LITERAL_REPETITION_CASE_ID: &str = "hir::literal::tests::repetition";
+const HIR_LITERAL_CONCAT_CASE_ID: &str = "hir::literal::tests::concat";
+const HIR_LITERAL_ALTERNATION_CASE_ID: &str = "hir::literal::tests::alternation";
+const HIR_LITERAL_IMPOSSIBLE_CASE_ID: &str = "hir::literal::tests::impossible";
+const HIR_LITERAL_ANYTHING_CASE_ID: &str = "hir::literal::tests::anything";
+const HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID: &str =
+    "hir::literal::tests::anything_small_limits";
+const HIR_LITERAL_EMPTY_CASE_ID: &str = "hir::literal::tests::empty";
+const HIR_LITERAL_ODDS_AND_ENDS_CASE_ID: &str = "hir::literal::tests::odds_and_ends";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -1357,6 +1370,173 @@ const HIR_TRANSLATE_CLASS_UNICODE_AGE_PROBES: [HirTranslateProbe; 0] = [];
 const HIR_TRANSLATE_CLASS_UNICODE_AGE_ERROR_PROBES: [HirTranslateProbe; 1] =
     [(r"\p{age:Foo}", false)];
 const HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_PROBES: [HirTranslateProbe; 1] = [(r"\P{any}", false)];
+const HIR_LITERAL_LITERAL_PROBES: [&str; 17] = [
+    "a",
+    "aaaaa",
+    "(?i-u)a",
+    "(?i-u)ab",
+    "ab(?i-u)c",
+    r"(?-u:\xFF)",
+    "☃",
+    "(?i)☃",
+    "☃☃☃☃☃",
+    "Δ",
+    "δ",
+    "(?i)Δ",
+    "(?i)δ",
+    "(?i)S",
+    "(?i)s",
+    "(?i)ſ",
+    "ͱͳͷΐάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋ",
+];
+const HIR_LITERAL_CLASS_PROBES: [&str; 4] = ["[abc]", "a[123]b", "[εδ]", r"(?i)[εδ]"];
+const HIR_LITERAL_LOOK_PROBES: [&str; 25] = [
+    r"a\Ab",
+    r"a\zb",
+    r"a(?m:^)b",
+    r"a(?m:$)b",
+    r"a\bb",
+    r"a\Bb",
+    r"a(?-u:\b)b",
+    r"a(?-u:\B)b",
+    r"^ab",
+    r"$ab",
+    r"(?m:^)ab",
+    r"(?m:$)ab",
+    r"\bab",
+    r"\Bab",
+    r"(?-u:\b)ab",
+    r"(?-u:\B)ab",
+    r"ab^",
+    r"ab$",
+    r"ab(?m:^)",
+    r"ab(?m:$)",
+    r"ab\b",
+    r"ab\B",
+    r"ab(?-u:\b)",
+    r"ab(?-u:\B)",
+    r"^aZ*b",
+];
+const HIR_LITERAL_REPETITION_PROBES: [&str; 35] = [
+    r"a?",
+    r"a??",
+    r"a*",
+    r"a*?",
+    r"a+",
+    r"(a+)+",
+    r"aZ{0}b",
+    r"aZ?b",
+    r"aZ??b",
+    r"aZ*b",
+    r"aZ*?b",
+    r"aZ+b",
+    r"aZ+?b",
+    r"aZ{2}b",
+    r"aZ{2,3}b",
+    r"(abc)?",
+    r"(abc)??",
+    r"a*b",
+    r"a*?b",
+    r"ab+",
+    r"a*b+",
+    r"a*b*c",
+    r"(a+)?(b+)?c",
+    r"(a+|)(b+|)c",
+    r"a*b*c*",
+    r"a*b*c+",
+    r"a*b+c",
+    r"a*b+c*",
+    r"ab*",
+    r"ab*c",
+    r"ab+",
+    r"ab+c",
+    r"z*azb",
+    r"[ab]{3}",
+    r"[ab]{3,4}",
+];
+const HIR_LITERAL_CONCAT_PROBES: [&str; 5] = [
+    r"abc()xyz",
+    r"(abc)(xyz)",
+    r"abc()mno()xyz",
+    r"abc[a&&b]xyz",
+    r"abc[a&&b]*xyz",
+];
+const HIR_LITERAL_ALTERNATION_PROBES: [&str; 17] = [
+    r"abc|mno|xyz",
+    r"abc|mZ*o|xyz",
+    r"abc|M[a&&b]N|xyz",
+    r"abc|M[a&&b]*N|xyz",
+    r"(?:|aa)aaa",
+    r"(?:|aa)(?:aaa)*",
+    r"(?:|aa)(?:aaa)*?",
+    r"a|b*",
+    r"a|b+",
+    r"a*b|c",
+    r"a|(?:b|c*)",
+    r"(a|b)*c|(a|ab)*c",
+    r"(ab|cd)(ef|gh)",
+    r"(ab|cd)(ef|gh)(ij|kl)",
+    r"(ab){2}",
+    r"(ab){2,3}",
+    r"(ab){2,}",
+];
+const HIR_LITERAL_IMPOSSIBLE_PROBES: [&str; 10] = [
+    r"[a&&b]",
+    r"a[a&&b]",
+    r"[a&&b]b",
+    r"a[a&&b]b",
+    r"a|[a&&b]|b",
+    r"a|c[a&&b]|b",
+    r"a|[a&&b]d|b",
+    r"a|c[a&&b]d|b",
+    r"[a&&b]*",
+    r"M[a&&b]*N",
+];
+const HIR_LITERAL_ANYTHING_PROBES: [&str; 18] = [
+    r".",
+    r"(?s).",
+    r"[A-Za-z]",
+    r"[A-Z]",
+    r"[A-Z]{0}",
+    r"[A-Z]?",
+    r"[A-Z]*",
+    r"[A-Z]+",
+    r"1[A-Z]",
+    r"1[A-Z]2",
+    r"[A-Z]+123",
+    r"[A-Z]+123[A-Z]+",
+    r"1|[A-Z]|3",
+    r"1|2[A-Z]|3",
+    r"1|[A-Z]2|3",
+    r"1|2[A-Z]3|4",
+    r"(?:|1)[A-Z]2",
+    r"a.z",
+];
+const HIR_LITERAL_ANYTHING_SMALL_LIMITS_PROBES: [&str; 2] =
+    [r"[ab]{3}{3}", r"ab|cd|ef|gh|ij|kl|mn|op|qr|st|uv|wx|yz"];
+const HIR_LITERAL_EMPTY_PROBES: [&str; 9] = [
+    r"",
+    r"^",
+    r"$",
+    r"(?m:^)",
+    r"(?m:$)",
+    r"\b",
+    r"\B",
+    r"(?-u:\b)",
+    r"(?-u:\B)",
+];
+const HIR_LITERAL_ODDS_AND_ENDS_PROBES: [&str; 10] = [
+    r".a",
+    r"a.",
+    r"a|.",
+    r".|a",
+    r"M[ou]'?am+[ae]r .*([AEae]l[- ])?[GKQ]h?[aeu]+([dtz][dhz]?)+af[iy]",
+    r"fn is_([A-Z]+)|fn as_([A-Z]+)",
+    r"foo[A-Z]+bar[A-Z]+quux",
+    r"[A-Z]+bar[A-Z]+",
+    r"(?m)^Sherlock Holmes|Sherlock Holmes$",
+    r"\bs(?:[ab])",
+];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
     r"\a",
@@ -2901,6 +3081,14 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: "fre-adapter.hir-print-not-implemented".to_owned(),
         };
     }
+    if obligation.case_id.starts_with(HIR_LITERAL_PREFIX) {
+        if is_supported_hir_literal_case(&obligation.case_id) {
+            return execute_hir_literal_case(&obligation.case_id);
+        }
+        return RegexSyntaxCorpusDisposition::Unsupported {
+            reason_code: "fre-adapter.hir-literal-not-implemented".to_owned(),
+        };
+    }
     if obligation.case_id.starts_with(HIR_TRANSLATE_PREFIX) {
         if is_supported_hir_translate_case(&obligation.case_id) {
             return execute_hir_translate_case(&obligation.case_id);
@@ -3181,6 +3369,23 @@ fn is_supported_hir_print_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_hir_literal_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_LITERAL_LITERAL_CASE_ID
+            | HIR_LITERAL_CLASS_CASE_ID
+            | HIR_LITERAL_LOOK_CASE_ID
+            | HIR_LITERAL_REPETITION_CASE_ID
+            | HIR_LITERAL_CONCAT_CASE_ID
+            | HIR_LITERAL_ALTERNATION_CASE_ID
+            | HIR_LITERAL_IMPOSSIBLE_CASE_ID
+            | HIR_LITERAL_ANYTHING_CASE_ID
+            | HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID
+            | HIR_LITERAL_EMPTY_CASE_ID
+            | HIR_LITERAL_ODDS_AND_ENDS_CASE_ID
+    )
+}
+
 fn is_supported_hir_translate_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -3323,6 +3528,28 @@ fn execute_hir_print_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-hir-print-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_hir_literal_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_hir_literal_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: hir_literal_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: hir_literal_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-hir-literal-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -3846,6 +4073,117 @@ fn execute_hir_print_probe(
             expected: format!("{assertion}: printed HIR reparses"),
             observed: format!("{assertion}: reparse error {error:?}"),
         })?;
+    Ok(())
+}
+
+fn run_hir_literal_case(case_id: &str) -> Result<(), AstMismatch> {
+    let (probes, label, limit_total) = hir_literal_probes(case_id);
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        execute_hir_literal_probe(pattern, limit_total, &format!("{label}-{index}"))?;
+    }
+    Ok(())
+}
+
+fn hir_literal_probes(case_id: &str) -> (&'static [&'static str], &'static str, Option<usize>) {
+    match case_id {
+        HIR_LITERAL_LITERAL_CASE_ID => (&HIR_LITERAL_LITERAL_PROBES, "hir-literal-literal", None),
+        HIR_LITERAL_CLASS_CASE_ID => (&HIR_LITERAL_CLASS_PROBES, "hir-literal-class", None),
+        HIR_LITERAL_LOOK_CASE_ID => (&HIR_LITERAL_LOOK_PROBES, "hir-literal-look", None),
+        HIR_LITERAL_REPETITION_CASE_ID => (
+            &HIR_LITERAL_REPETITION_PROBES,
+            "hir-literal-repetition",
+            None,
+        ),
+        HIR_LITERAL_CONCAT_CASE_ID => (&HIR_LITERAL_CONCAT_PROBES, "hir-literal-concat", None),
+        HIR_LITERAL_ALTERNATION_CASE_ID => (
+            &HIR_LITERAL_ALTERNATION_PROBES,
+            "hir-literal-alternation",
+            None,
+        ),
+        HIR_LITERAL_IMPOSSIBLE_CASE_ID => (
+            &HIR_LITERAL_IMPOSSIBLE_PROBES,
+            "hir-literal-impossible",
+            None,
+        ),
+        HIR_LITERAL_ANYTHING_CASE_ID => {
+            (&HIR_LITERAL_ANYTHING_PROBES, "hir-literal-anything", None)
+        }
+        HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID => (
+            &HIR_LITERAL_ANYTHING_SMALL_LIMITS_PROBES,
+            "hir-literal-anything-small-limits",
+            Some(10),
+        ),
+        HIR_LITERAL_EMPTY_CASE_ID => (&HIR_LITERAL_EMPTY_PROBES, "hir-literal-empty", None),
+        HIR_LITERAL_ODDS_AND_ENDS_CASE_ID => (
+            &HIR_LITERAL_ODDS_AND_ENDS_PROBES,
+            "hir-literal-odds-and-ends",
+            None,
+        ),
+        _ => unreachable!("caller checked supported HIR literal case"),
+    }
+}
+
+fn execute_hir_literal_probe(
+    pattern: &str,
+    limit_total: Option<usize>,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let rust_profile = RustProfile::regex_1_12_4();
+    let compatibility = CompatibilityProfile::RustBytes(rust_profile);
+    let expected_hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: authenticated upstream HIR parse succeeds"),
+            observed: format!("{assertion}: upstream HIR parse error {error:?}"),
+        })?;
+    let record =
+        parse(ParseRequest::rust(pattern, compatibility.clone())).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: FRE HIR parse succeeds"),
+            observed: format!("{assertion}: FRE HIR parse error {error:?}"),
+        })?;
+    let CanonicalPattern::Rust(parsed) = &record.pattern else {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: FRE Rust canonical HIR"),
+            observed: format!("{assertion}: {:?}", record.pattern),
+        });
+    };
+    let identity_valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == pattern.as_bytes()
+        && record.key.profile == compatibility
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+    if !identity_valid || parsed.hir != expected_hir {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
+            observed: format!("{assertion}: {record:?}"),
+        });
+    }
+    for (kind, kind_label) in [
+        (regex_syntax::hir::literal::ExtractKind::Prefix, "prefix"),
+        (regex_syntax::hir::literal::ExtractKind::Suffix, "suffix"),
+    ] {
+        let mut expected_extractor = regex_syntax::hir::literal::Extractor::new();
+        expected_extractor.kind(kind.clone());
+        if let Some(limit) = limit_total {
+            expected_extractor.limit_total(limit);
+        }
+        let expected = expected_extractor.extract(&expected_hir);
+        let mut observed_extractor = regex_syntax::hir::literal::Extractor::new();
+        observed_extractor.kind(kind);
+        if let Some(limit) = limit_total {
+            observed_extractor.limit_total(limit);
+        }
+        let observed = observed_extractor.extract(&parsed.hir);
+        if observed != expected {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: {kind_label} extraction {expected:?}"),
+                observed: format!("{assertion}: {kind_label} extraction {observed:?}"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -4710,6 +5048,24 @@ fn hir_print_pass_evidence(case_id: &str) -> String {
     sha256(contract.as_bytes())
 }
 
+fn hir_literal_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.hir-literal-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nprofile=rust-bytes\nextract=prefix+suffix\n"
+    );
+    let (probes, _, limit_total) = hir_literal_probes(case_id);
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        writeln!(
+            contract,
+            "probe-{index}=sha256:{},bytes:{},limit-total:{},expected:exact-hir-and-literal-sequences",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+            limit_total.map_or_else(|| "default".to_owned(), |limit| limit.to_string()),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    sha256(contract.as_bytes())
+}
+
 fn hir_translate_pass_evidence(case_id: &str) -> String {
     let mut contract = format!(
         "fre.regex-syntax.hir-translate-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nast-octal=true\n"
@@ -4969,6 +5325,15 @@ fn hir_print_mismatch_evidence(case_id: &str, expected: &str, observed: &str) ->
     )
 }
 
+fn hir_literal_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.hir-literal-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_translate_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -4982,6 +5347,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
     is_supported_ast_case(case_id)
         || is_supported_ast_print_case(case_id)
         || is_supported_hir_print_case(case_id)
+        || is_supported_hir_literal_case(case_id)
         || is_supported_hir_translate_case(case_id)
 }
 
@@ -4992,6 +5358,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         ast_print_pass_evidence(case_id)
     } else if is_supported_hir_print_case(case_id) {
         hir_print_pass_evidence(case_id)
+    } else if is_supported_hir_literal_case(case_id) {
+        hir_literal_pass_evidence(case_id)
     } else {
         hir_translate_pass_evidence(case_id)
     }
@@ -5004,6 +5372,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         ast_print_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_print_case(case_id) {
         hir_print_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_hir_literal_case(case_id) {
+        hir_literal_mismatch_evidence(case_id, expected, observed)
     } else {
         hir_translate_mismatch_evidence(case_id, expected, observed)
     }
@@ -5016,6 +5386,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-ast-print-adapter"
     } else if is_supported_hir_print_case(case_id) {
         "fre-hir-print-adapter"
+    } else if is_supported_hir_literal_case(case_id) {
+        "fre-hir-literal-adapter"
     } else {
         "fre-hir-translate-adapter"
     }
@@ -5043,6 +5415,10 @@ fn valid_unsupported_unit_disposition(
         return !is_supported_hir_print_case(case_id)
             && obligation.default_harness_member
             && reason_code == "fre-adapter.hir-print-not-implemented";
+    }
+    if case_id.starts_with(HIR_LITERAL_PREFIX) {
+        return !is_supported_hir_literal_case(case_id)
+            && reason_code == "fre-adapter.hir-literal-not-implemented";
     }
     if case_id.starts_with(HIR_TRANSLATE_PREFIX) {
         return !is_supported_hir_translate_case(case_id)
@@ -5650,6 +6026,70 @@ mod tests {
             HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID,
         ] {
             assert!(!is_supported_hir_print_case(intrinsic));
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_literal_cases_execute_all_152_public_outcomes() {
+        let cases = [
+            (
+                HIR_LITERAL_LITERAL_CASE_ID,
+                HIR_LITERAL_LITERAL_PROBES.len(),
+            ),
+            (HIR_LITERAL_CLASS_CASE_ID, HIR_LITERAL_CLASS_PROBES.len()),
+            (HIR_LITERAL_LOOK_CASE_ID, HIR_LITERAL_LOOK_PROBES.len()),
+            (
+                HIR_LITERAL_REPETITION_CASE_ID,
+                HIR_LITERAL_REPETITION_PROBES.len(),
+            ),
+            (HIR_LITERAL_CONCAT_CASE_ID, HIR_LITERAL_CONCAT_PROBES.len()),
+            (
+                HIR_LITERAL_ALTERNATION_CASE_ID,
+                HIR_LITERAL_ALTERNATION_PROBES.len(),
+            ),
+            (
+                HIR_LITERAL_IMPOSSIBLE_CASE_ID,
+                HIR_LITERAL_IMPOSSIBLE_PROBES.len(),
+            ),
+            (
+                HIR_LITERAL_ANYTHING_CASE_ID,
+                HIR_LITERAL_ANYTHING_PROBES.len(),
+            ),
+            (
+                HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID,
+                HIR_LITERAL_ANYTHING_SMALL_LIMITS_PROBES.len(),
+            ),
+            (HIR_LITERAL_EMPTY_CASE_ID, HIR_LITERAL_EMPTY_PROBES.len()),
+            (
+                HIR_LITERAL_ODDS_AND_ENDS_CASE_ID,
+                HIR_LITERAL_ODDS_AND_ENDS_PROBES.len(),
+            ),
+        ];
+        assert_eq!(
+            cases.iter().map(|(_, outcomes)| outcomes).sum::<usize>(),
+            152,
+        );
+        for (case_id, _) in cases {
+            let disposition = execute_hir_literal_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_literal_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/literal.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR literal receipt");
         }
     }
 
