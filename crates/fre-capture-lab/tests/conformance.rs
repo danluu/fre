@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchError, SearchLimits, Span,
-    Window,
+    GroupRecord, HistoryRegex, InlineRegex, Program, ResourceKind, SearchConfig, SearchError,
+    SearchLimits, Span, Window,
 };
 use regex::bytes::Regex;
 use regex_automata::{Input, MatchKind, meta, util::syntax};
@@ -167,6 +167,152 @@ fn directed_rust_capture_semantics() {
     for (ast, haystack) in cases {
         assert_case(&ast, haystack, Window::all(haystack));
     }
+}
+
+#[test]
+fn earliest_end_preserves_priority_capture_history() {
+    let cases = [
+        (
+            Ast::Byte(b'a').repeat(1, None, Greed::Greedy).capture(1),
+            b"aaa".as_slice(),
+            SearchConfig::EARLIEST,
+            vec![
+                (Span { start: 0, end: 1 }, Some(Span { start: 0, end: 1 })),
+                (Span { start: 1, end: 2 }, Some(Span { start: 1, end: 2 })),
+                (Span { start: 2, end: 3 }, Some(Span { start: 2, end: 3 })),
+            ],
+        ),
+        (
+            Ast::alt([
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                Ast::Byte(b'a'),
+            ])
+            .capture(1),
+            b"abc".as_slice(),
+            SearchConfig::EARLIEST,
+            vec![(Span { start: 0, end: 1 }, Some(Span { start: 0, end: 1 }))],
+        ),
+        (
+            Ast::concat([
+                Ast::Start,
+                Ast::alt([
+                    Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                    Ast::Byte(b'a'),
+                ])
+                .capture(1),
+            ]),
+            b"abc".as_slice(),
+            SearchConfig::EARLIEST,
+            vec![(Span { start: 0, end: 1 }, Some(Span { start: 0, end: 1 }))],
+        ),
+        (
+            Ast::concat([
+                Ast::alt([
+                    Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                    Ast::Byte(b'a'),
+                ])
+                .capture(1),
+                Ast::End,
+            ]),
+            b"abc".as_slice(),
+            SearchConfig::EARLIEST,
+            vec![(Span { start: 0, end: 3 }, Some(Span { start: 0, end: 3 }))],
+        ),
+        (
+            Ast::alt([
+                Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b'), Ast::Byte(b'c')]),
+                Ast::Byte(b'b'),
+            ])
+            .capture(1),
+            b"abc".as_slice(),
+            SearchConfig::EARLIEST.anchored(true),
+            vec![(Span { start: 0, end: 3 }, Some(Span { start: 0, end: 3 }))],
+        ),
+    ];
+
+    for (ast, haystack, config, expected) in cases {
+        let (inline, history) = pair(&ast);
+        for observed in [
+            inline
+                .captures_iter_with_config(
+                    haystack,
+                    Window::all(haystack),
+                    config,
+                    AggregateLimits::default(),
+                )
+                .unwrap()
+                .captures,
+            history
+                .captures_iter_with_config(
+                    haystack,
+                    Window::all(haystack),
+                    config,
+                    AggregateLimits::default(),
+                )
+                .unwrap()
+                .captures,
+        ] {
+            let spans = observed
+                .iter()
+                .map(|record| {
+                    (
+                        record.overall().unwrap(),
+                        record.groups.get(1).and_then(|group| group.span),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(spans, expected);
+        }
+    }
+}
+
+#[test]
+fn earliest_end_selects_first_priority_history_at_accepting_boundary() {
+    let ast = Ast::alt([Ast::Byte(b'a').capture(1), Ast::Byte(b'a').capture(2)]);
+    let expected = CaptureRecord {
+        groups: vec![
+            GroupRecord {
+                index: 0,
+                name: None,
+                span: Some(Span { start: 0, end: 1 }),
+            },
+            GroupRecord {
+                index: 1,
+                name: None,
+                span: Some(Span { start: 0, end: 1 }),
+            },
+            GroupRecord {
+                index: 2,
+                name: None,
+                span: None,
+            },
+        ],
+    };
+    let (inline, history) = pair(&ast);
+    assert_eq!(
+        inline
+            .captures_with_config(
+                b"a",
+                Window::all(b"a"),
+                SearchConfig::EARLIEST,
+                SearchLimits::default(),
+            )
+            .unwrap()
+            .captures,
+        Some(expected.clone())
+    );
+    assert_eq!(
+        history
+            .captures_with_config(
+                b"a",
+                Window::all(b"a"),
+                SearchConfig::EARLIEST,
+                SearchLimits::default(),
+            )
+            .unwrap()
+            .captures,
+        Some(expected)
+    );
 }
 
 #[test]

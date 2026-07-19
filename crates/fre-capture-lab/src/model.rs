@@ -33,6 +33,51 @@ impl Window {
     }
 }
 
+/// Match-selection policy for one capture search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchKind {
+    /// Preserve the highest-priority leftmost match until it is irrevocable.
+    Leftmost,
+    /// Stop at the first input boundary with any accepting thread.
+    Earliest,
+}
+
+/// Explicit selection and start-injection policy for one capture search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchConfig {
+    /// End-boundary selection policy.
+    pub kind: SearchKind,
+    /// When true, inject a start only at the requested search offset.
+    pub anchored: bool,
+}
+
+impl SearchConfig {
+    /// Ordinary unanchored leftmost-first search.
+    pub const LEFTMOST: Self = Self {
+        kind: SearchKind::Leftmost,
+        anchored: false,
+    };
+
+    /// Unanchored earliest-end search.
+    pub const EARLIEST: Self = Self {
+        kind: SearchKind::Earliest,
+        anchored: false,
+    };
+
+    /// Return this policy with start injection restricted to the search offset.
+    #[must_use]
+    pub const fn anchored(mut self, anchored: bool) -> Self {
+        self.anchored = anchored;
+        self
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self::LEFTMOST
+    }
+}
+
 /// One canonical group entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupRecord {

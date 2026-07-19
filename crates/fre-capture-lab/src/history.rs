@@ -7,7 +7,8 @@ use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, RunReport, SearchOutcome, Span, Window,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, RunReport, SearchConfig, SearchKind,
+    SearchOutcome, Span, Window,
 };
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
 use crate::runtime::{
@@ -131,7 +132,19 @@ impl HistoryRegex {
         window: Window,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
-        self.search_from(haystack, window, window.start, limits)
+        self.captures_with_config(haystack, window, SearchConfig::LEFTMOST, limits)
+    }
+
+    /// Find the first capture record under an explicit selection and
+    /// anchoring policy.
+    pub fn captures_with_config(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        config: SearchConfig,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from(haystack, window, window.start, config, limits)
     }
 
     /// Replay one selector-certified exact span while preserving assertion
@@ -282,6 +295,18 @@ impl HistoryRegex {
         window: Window,
         limits: AggregateLimits,
     ) -> Result<AggregateOutcome, SearchError> {
+        self.captures_iter_with_config(haystack, window, SearchConfig::LEFTMOST, limits)
+    }
+
+    /// Bounded repeated search under an explicit selection and anchoring
+    /// policy, with Rust byte-regex empty-match progression.
+    pub fn captures_iter_with_config(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        config: SearchConfig,
+        limits: AggregateLimits,
+    ) -> Result<AggregateOutcome, SearchError> {
         validate_window(haystack, window, window.start)?;
         let mut records = Vec::new();
         let mut searches = 0_usize;
@@ -310,7 +335,7 @@ impl HistoryRegex {
                 ))?;
             per_search.max_history_nodes = per_search.max_history_nodes.min(history_remaining);
 
-            let outcome = self.search_from(haystack, window, cursor, per_search)?;
+            let outcome = self.search_from(haystack, window, cursor, config, per_search)?;
             total_state_visits = checked_add(
                 total_state_visits,
                 outcome.report.state_visits,
@@ -416,7 +441,8 @@ impl HistoryRegex {
                     ))?,
             );
 
-            let outcome = self.search_from(haystack, window, cursor, per_search)?;
+            let outcome =
+                self.search_from(haystack, window, cursor, SearchConfig::LEFTMOST, per_search)?;
             total_state_visits = checked_add(
                 total_state_visits,
                 outcome.report.state_visits,
@@ -477,6 +503,7 @@ impl HistoryRegex {
         haystack: &[u8],
         window: Window,
         from: usize,
+        config: SearchConfig,
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
         validate_window(haystack, window, from)?;
@@ -502,7 +529,7 @@ impl HistoryRegex {
         let mut pos = from;
 
         loop {
-            if winner.is_none() {
+            if winner.is_none() && (!config.anchored || pos == from) {
                 counters.starts_injected =
                     checked_add(counters.starts_injected, 1, ResourceKind::StateVisits)?;
                 add_thread(
@@ -528,8 +555,12 @@ impl HistoryRegex {
                 .iter()
                 .position(|thread| matches!(self.program.states[thread.pc], State::Match))
             {
-                winner = current[index].history;
-                current.truncate(index);
+                winner = Some(current[index].history.ok_or(SearchError::InvalidProgram)?);
+                if config.kind == SearchKind::Earliest {
+                    current.clear();
+                } else {
+                    current.truncate(index);
+                }
             }
             counters.peak_threads = counters.peak_threads.max(current.len());
             if winner.is_some() && current.is_empty() {

@@ -6,15 +6,15 @@ use fre::{
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
     CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
     CaptureExecutionSource, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralRunLimits,
-    CaptureResource, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
-    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder,
-    LineCaptureConfiguration, LineCapturePlanKind, LineCaptureResource, LineCaptureRunError,
-    LineCaptureRunLimits, PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN,
-    SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-    SPACE_AROUND_OPERATOR_INSPECTION_WORK, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-    STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
-    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-    WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+    CaptureResource, CaptureRunLimits, CaptureSearchConfig, CaptureSearchError, CaptureSearchKind,
+    CaptureSearchLimits, CaptureWindow, LineCaptureBuildError, LineCaptureBuildLimits,
+    LineCaptureBuildResource, LineCaptureBuilder, LineCaptureConfiguration, LineCapturePlanKind,
+    LineCaptureResource, LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder,
+    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID,
+    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+    STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK,
+    STRING_QUOTE_PREFIX_OPERATION_ID, WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+    WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK, WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
 };
 use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
@@ -1146,6 +1146,46 @@ fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
             regex.build_report().plan_identity.syntax
         );
     }
+}
+
+#[test]
+fn materialized_capture_iteration_exposes_earliest_end_identity() {
+    let limits = CaptureAggregateLimits::default();
+    let config = CaptureSearchConfig::EARLIEST;
+    assert_eq!(config.kind, CaptureSearchKind::Earliest);
+
+    let bytes = CaptureBuilder::new(r"(abc|a)")
+        .unicode(false)
+        .build()
+        .expect("byte capture build");
+    let report = bytes
+        .captures_iter_window_with_config(b"abc", CaptureWindow::all(b"abc"), config, limits)
+        .expect("byte earliest capture iteration");
+    assert_eq!(report.identity.search, config);
+    assert_eq!(
+        report.captures[0]
+            .groups
+            .iter()
+            .map(|group| group.span.map(|span| (span.start, span.end)))
+            .collect::<Vec<_>>(),
+        vec![Some((0, 1)), Some((0, 1))]
+    );
+
+    let text = PortableTextCaptureBuilder::new(r"^(abc|a)")
+        .build()
+        .expect("text capture build");
+    let report = text
+        .captures_iter_window_with_config("abc", CaptureWindow::all(b"abc"), config, limits)
+        .expect("text earliest capture iteration");
+    assert_eq!(report.identity.search, config);
+    assert_eq!(
+        report.captures[0]
+            .groups
+            .iter()
+            .map(|group| group.span.map(|span| (span.start, span.end)))
+            .collect::<Vec<_>>(),
+        vec![Some((0, 1)), Some((0, 1))]
+    );
 }
 
 fn reference_text_records(pattern: &str, haystack: &str) -> Vec<CaptureFixture> {

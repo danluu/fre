@@ -16,8 +16,9 @@ use fre_capture_lab::{
     BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
     BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, CaptureRecord, Greed,
     HistoryRegex, Program, ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
-    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
-    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
+    SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
+    SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
+    Window,
 };
 use fre_kernels::LiteralSetError;
 use fre_syntax::{
@@ -375,6 +376,8 @@ pub struct CaptureIterationIdentity {
     pub capture_profile: CaptureProfile,
     /// Exact materializing iterator formulation.
     pub plan: CaptureIterationPlanKind,
+    /// Match-end selection and start-injection policy.
+    pub search: CaptureSearchConfig,
     /// Construction limits used to publish the immutable tagged program.
     pub build_limits: CaptureBuildLimits,
     /// Aggregate limits used for this repeated-search invocation.
@@ -808,9 +811,23 @@ impl PortableTextCaptureRegex {
         (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
         PortableTextCaptureSearchError,
     > {
+        self.captures_with_config(haystack, CaptureSearchConfig::LEFTMOST, limits)
+    }
+
+    /// Return one capture record under an explicit match-end selection and
+    /// start-injection policy.
+    pub fn captures_with_config<'h>(
+        &self,
+        haystack: &'h str,
+        config: CaptureSearchConfig,
+        limits: EngineSearchLimits,
+    ) -> Result<
+        (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
+        PortableTextCaptureSearchError,
+    > {
         let outcome = self
             .inner
-            .captures(haystack.as_bytes(), limits)
+            .captures_with_config(haystack.as_bytes(), config, limits)
             .map_err(PortableTextCaptureSearchError::Capture)?;
         let accounting = outcome.report;
         let Some(record) = outcome.captures else {
@@ -852,7 +869,12 @@ impl PortableTextCaptureRegex {
         haystack: &str,
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
-        self.captures_iter_window(haystack, Window::all(haystack.as_bytes()), limits)
+        self.captures_iter_window_with_config(
+            haystack,
+            Window::all(haystack.as_bytes()),
+            CaptureSearchConfig::LEFTMOST,
+            limits,
+        )
     }
 
     /// Materialize complete text captures whose whole-match spans are
@@ -862,6 +884,23 @@ impl PortableTextCaptureRegex {
         &self,
         haystack: &str,
         window: Window,
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
+        self.captures_iter_window_with_config(
+            haystack,
+            window,
+            CaptureSearchConfig::LEFTMOST,
+            limits,
+        )
+    }
+
+    /// Materialize complete text captures under an explicit match-end
+    /// selection and start-injection policy.
+    pub fn captures_iter_window_with_config(
+        &self,
+        haystack: &str,
+        window: Window,
+        config: CaptureSearchConfig,
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
         if window.start > window.end
@@ -876,7 +915,7 @@ impl PortableTextCaptureRegex {
         }
         let mut report = self
             .inner
-            .captures_iter_window(haystack.as_bytes(), window, limits)
+            .captures_iter_window_with_config(haystack.as_bytes(), window, config, limits)
             .map_err(PortableTextCaptureIterationError::Capture)?;
         for (match_index, record) in report.captures.iter().enumerate() {
             if record.overall().is_none() {
@@ -1145,10 +1184,22 @@ impl CaptureRegex {
     /// Complete identity for one bounded capture-iteration invocation.
     #[must_use]
     pub fn iteration_identity(&self, run_limits: AggregateLimits) -> CaptureIterationIdentity {
+        self.iteration_identity_with_config(run_limits, CaptureSearchConfig::LEFTMOST)
+    }
+
+    /// Complete identity for one bounded capture-iteration invocation under
+    /// an explicit search policy.
+    #[must_use]
+    pub fn iteration_identity_with_config(
+        &self,
+        run_limits: AggregateLimits,
+        search: CaptureSearchConfig,
+    ) -> CaptureIterationIdentity {
         CaptureIterationIdentity {
             syntax: Arc::clone(&self.report.plan_identity.syntax),
             capture_profile: self.report.plan_identity.capture_profile,
             plan: CaptureIterationPlanKind::RestartedPersistentHistory,
+            search,
             build_limits: self.build_limits,
             run_limits,
         }
@@ -1161,8 +1212,19 @@ impl CaptureRegex {
         haystack: &[u8],
         limits: EngineSearchLimits,
     ) -> Result<EngineSearchOutcome, EngineSearchError> {
+        self.captures_with_config(haystack, CaptureSearchConfig::LEFTMOST, limits)
+    }
+
+    /// Return the first capture record under an explicit match-end selection
+    /// and start-injection policy.
+    pub fn captures_with_config(
+        &self,
+        haystack: &[u8],
+        config: CaptureSearchConfig,
+        limits: EngineSearchLimits,
+    ) -> Result<EngineSearchOutcome, EngineSearchError> {
         self.engine
-            .captures(haystack, Window::all(haystack), limits)
+            .captures_with_config(haystack, Window::all(haystack), config, limits)
     }
 
     /// Collect every non-overlapping leftmost-first match and every capture
@@ -1177,7 +1239,12 @@ impl CaptureRegex {
         haystack: &[u8],
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, CaptureIterationError> {
-        self.captures_iter_window(haystack, Window::all(haystack), limits)
+        self.captures_iter_window_with_config(
+            haystack,
+            Window::all(haystack),
+            CaptureSearchConfig::LEFTMOST,
+            limits,
+        )
     }
 
     /// Collect every match wholly inside `window` while retaining assertion
@@ -1188,7 +1255,24 @@ impl CaptureRegex {
         window: Window,
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, CaptureIterationError> {
-        let identity = self.iteration_identity(limits);
+        self.captures_iter_window_with_config(
+            haystack,
+            window,
+            CaptureSearchConfig::LEFTMOST,
+            limits,
+        )
+    }
+
+    /// Collect every match under an explicit match-end selection and
+    /// start-injection policy.
+    pub fn captures_iter_window_with_config(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        config: CaptureSearchConfig,
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, CaptureIterationError> {
+        let identity = self.iteration_identity_with_config(limits, config);
         let AggregateOutcome {
             captures,
             searches,
@@ -1197,7 +1281,7 @@ impl CaptureRegex {
             total_history_nodes,
         } = self
             .engine
-            .captures_iter(haystack, window, limits)
+            .captures_iter_with_config(haystack, window, config, limits)
             .map_err(|source| CaptureIterationError {
                 identity: Box::new(identity.clone()),
                 source,

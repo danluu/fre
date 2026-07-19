@@ -35,6 +35,6 @@ pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
 pub use model::{
     AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord, RunReport,
-    SearchOutcome, Span, Window,
+    SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;
