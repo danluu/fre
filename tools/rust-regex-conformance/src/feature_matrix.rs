@@ -191,6 +191,7 @@ enum SemanticContract {
     AgeUnicode,
     BoolUnicode,
     CaseUnicode,
+    GencatUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -210,6 +211,7 @@ struct QualifiedSemanticEvidence {
     age_unicode: String,
     bool_unicode: String,
     case_unicode: String,
+    gencat_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -331,7 +333,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-gencat",
         default_features: false,
         features: &["std", "unicode-gencat"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::GencatUnicode,
     },
     ConfigurationSpec {
         id: "unicode-perl",
@@ -491,6 +493,7 @@ pub fn build_feature_matrix_report(
         age_unicode: run_age_unicode_contract()?,
         bool_unicode: run_bool_unicode_contract()?,
         case_unicode: run_case_unicode_contract()?,
+        gencat_unicode: run_gencat_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -730,6 +733,9 @@ fn run_configuration(
                 },
                 SemanticContract::CaseUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.case_unicode.clone(),
+                },
+                SemanticContract::GencatUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.gencat_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -1109,6 +1115,80 @@ fn expected_case_unicode_evidence() -> String {
     sha256(evidence.as_bytes())
 }
 
+fn run_gencat_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::GENCAT;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-gencat profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for pattern in [
+        r"\pL",
+        r"\p{gc=Uppercase_Letter}",
+        r"\p{Any}",
+        r"\p{Assigned}",
+        r"\p{cf}",
+        r"\d",
+    ] {
+        let category = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| {
+            InventoryError::new(format!(
+                "unicode-gencat profile rejected its category witness {pattern}: {error}"
+            ))
+        })?;
+        if category.summary.class_ranges == 0 && pattern != r"\P{Any}" {
+            return Err(InventoryError::new(format!(
+                "unicode-gencat witness {pattern} produced no class ranges"
+            )));
+        }
+    }
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "gencat" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-gencat profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-gencat {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_gencat_unicode_evidence())
+}
+
+fn expected_gencat_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-gencat;ascii=parsed;gencat=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        if family == "gencat" {
+            continue;
+        }
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    sha256(evidence.as_bytes())
+}
+
 fn authenticate_upstream_package(
     root: &Path,
 ) -> Result<FeatureMatrixSourceIdentity, InventoryError> {
@@ -1460,6 +1540,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_case_unicode_evidence() => Ok(()),
         (
+            SemanticContract::GencatUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_gencat_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1524,6 +1611,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::AgeUnicode => return expected_age_unicode_evidence(),
         SemanticContract::BoolUnicode => return expected_bool_unicode_evidence(),
         SemanticContract::CaseUnicode => return expected_case_unicode_evidence(),
+        SemanticContract::GencatUnicode => return expected_gencat_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1591,12 +1679,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::GencatUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(
                     spec.semantic,
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            4
+            3
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1632,6 +1727,9 @@ mod tests {
         let case_unicode = run_case_unicode_contract().expect("unicode-case semantic gate");
         assert_eq!(case_unicode, expected_case_unicode_evidence());
         assert!(is_sha256(&case_unicode));
+        let gencat_unicode = run_gencat_unicode_contract().expect("unicode-gencat semantic gate");
+        assert_eq!(gencat_unicode, expected_gencat_unicode_evidence());
+        assert!(is_sha256(&gencat_unicode));
     }
 
     #[test]

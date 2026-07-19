@@ -2,6 +2,8 @@ use regex_syntax::ParserBuilder;
 
 const BOOL_PROPERTY_ALIASES: &[&str] =
     include!("../../../../../../crates/fre-syntax/src/unicode_bool_aliases.in");
+const GENCAT_ALIASES: &[&str] =
+    include!("../../../../../../crates/fre-syntax/src/unicode_gencat_aliases.in");
 
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
@@ -55,6 +57,18 @@ const PROBES: &[(&str, &str)] = &[
     ("case-class", r"(?i:[a-z\u{03B4}])"),
     ("case-negated-class", r"(?i:[^\u{03B4}])"),
     ("gencat", r"\pL"),
+    ("gencat-normalized", r"\p{se PaRa ToR}"),
+    ("gencat-named-value", r"\p{General_Category=Uppercase_Letter}"),
+    ("gencat-is-property", r"\p{Is_G-C=Letter}"),
+    ("gencat-not-equal", r"\P{gc!=Separator}"),
+    ("gencat-surrogate-short", r"\p{cs}"),
+    ("gencat-surrogate-long", r"\p{Surrogate}"),
+    ("gencat-is-c-collision", r"\p{IsC}"),
+    ("gencat-is-cf-collision", r"\p{IsCf}"),
+    ("gencat-digit", r"\d"),
+    ("gencat-digit-casefold", r"(?i:\d)"),
+    ("gencat-bracket-digit-casefold", r"(?i:[\d])"),
+    ("gencat-property-casefold", r"(?i:\pL)"),
     ("perl", r"\b\w\b"),
     ("script", r"\p{Greek}"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
@@ -89,5 +103,10 @@ fn main() {
         let pattern = format!(r"\p{{{alias}}}");
         let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
         println!("bool-alias-{index}:{alias}\t{}", u8::from(passed));
+    }
+    for (index, &alias) in GENCAT_ALIASES.iter().enumerate() {
+        let pattern = format!(r"\p{{{alias}}}");
+        let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
+        println!("gencat-alias-{index}:{alias}\t{}", u8::from(passed));
     }
 }

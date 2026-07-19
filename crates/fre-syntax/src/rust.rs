@@ -7,6 +7,8 @@ use regex_syntax::{
 
 const UNICODE_BOOL_PROPERTY_ALIASES: &[&str] = include!("unicode_bool_aliases.in");
 const MAX_UNICODE_BOOL_ALIAS_BYTES: usize = 30;
+const UNICODE_GENCAT_ALIASES: &[&str] = include!("unicode_gencat_aliases.in");
+const MAX_UNICODE_GENCAT_ALIAS_BYTES: usize = 20;
 
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -202,7 +204,7 @@ struct ActiveUnicodeFlags {
     unicode: bool,
 }
 
-enum CaseClassNode<'a> {
+enum ClassAnalysisNode<'a> {
     Set(&'a ast::ClassSet),
     Item(&'a ast::ClassSetItem),
 }
@@ -212,6 +214,10 @@ const UNICODE_CASE_TABLE_KEYS: u64 = 2_938;
 const UNICODE_CASE_MAX_FOLDS_PER_KEY: u64 = 3;
 const UNICODE_CASE_MAPPING_WORK_PER_CODEPOINT: u64 = 20;
 const UNICODE_CASE_CANONICALIZE_WORK_PER_RANGE: u64 = 256;
+const UNICODE_GENCAT_MAX_TABLE_RANGES: u64 = 736;
+const UNICODE_GENCAT_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
+const UNICODE_GENCAT_CLASS_WORK_PER_RANGE: u64 = 24;
+const UNICODE_GENCAT_SET_WORK_PER_RANGE_SITE: u64 = 128;
 
 impl UnicodeAvailabilityVisitor<'_> {
     fn charge(&mut self, amount: u64) -> Result<(), ParseError> {
@@ -285,7 +291,7 @@ impl UnicodeAvailabilityVisitor<'_> {
         // derive conservative scalar/range upper bounds from this exact AST,
         // charging the auxiliary analysis itself as it runs.
         let mut stack = Vec::new();
-        self.push_case_class_node(&mut stack, CaseClassNode::Set(&class.kind))?;
+        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&class.kind))?;
         let mut codepoints = 0_u64;
         let mut ranges = 0_u64;
         // The root bracket is folded once. ASCII items and nested brackets
@@ -302,15 +308,15 @@ impl UnicodeAvailabilityVisitor<'_> {
             };
             self.charge(7)?;
             match node {
-                CaseClassNode::Set(ast::ClassSet::Item(item)) => {
-                    self.push_case_class_node(&mut stack, CaseClassNode::Item(item))?;
+                ClassAnalysisNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
                 }
-                CaseClassNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                ClassAnalysisNode::Set(ast::ClassSet::BinaryOp(op)) => {
                     fold_sites = fold_sites.saturating_add(2);
-                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&op.lhs))?;
-                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&op.rhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.lhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.rhs))?;
                 }
-                CaseClassNode::Item(
+                ClassAnalysisNode::Item(
                     ast::ClassSetItem::Empty(_)
                     | ast::ClassSetItem::Unicode(_)
                     | ast::ClassSetItem::Perl(_),
@@ -319,11 +325,11 @@ impl UnicodeAvailabilityVisitor<'_> {
                     // in this same walk, before translation can fold them.
                     // An empty set likewise requires no table work.
                 }
-                CaseClassNode::Item(ast::ClassSetItem::Literal(_)) => {
+                ClassAnalysisNode::Item(ast::ClassSetItem::Literal(_)) => {
                     codepoints = codepoints.saturating_add(1).min(UNICODE_CASE_CODEPOINTS);
                     ranges = ranges.saturating_add(1);
                 }
-                CaseClassNode::Item(ast::ClassSetItem::Range(range)) => {
+                ClassAnalysisNode::Item(ast::ClassSetItem::Range(range)) => {
                     let width = u64::from(u32::from(range.end.c))
                         .saturating_sub(u64::from(u32::from(range.start.c)))
                         .saturating_add(1);
@@ -332,26 +338,29 @@ impl UnicodeAvailabilityVisitor<'_> {
                         .min(UNICODE_CASE_CODEPOINTS);
                     ranges = ranges.saturating_add(1);
                 }
-                CaseClassNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                ClassAnalysisNode::Item(ast::ClassSetItem::Ascii(_)) => {
                     // Every POSIX ASCII class is a subset of the 128 ASCII
                     // scalars and has at most that many singleton ranges.
                     codepoints = codepoints.saturating_add(128).min(UNICODE_CASE_CODEPOINTS);
                     ranges = ranges.saturating_add(128);
                     fold_sites = fold_sites.saturating_add(1);
                 }
-                CaseClassNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                ClassAnalysisNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
                     fold_sites = fold_sites.saturating_add(1);
                     // regex-syntax folds the positive nested class before
                     // negation and preserves the folded marker through that
                     // negation. Therefore only the nested positive operands,
                     // visited below, contribute table lookups.
-                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&nested.kind))?;
+                    self.push_class_analysis_node(
+                        &mut stack,
+                        ClassAnalysisNode::Set(&nested.kind),
+                    )?;
                 }
-                CaseClassNode::Item(ast::ClassSetItem::Union(union)) => {
+                ClassAnalysisNode::Item(ast::ClassSetItem::Union(union)) => {
                     ranges =
                         ranges.saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
                     for item in &union.items {
-                        self.push_case_class_node(&mut stack, CaseClassNode::Item(item))?;
+                        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
                     }
                 }
             }
@@ -372,10 +381,10 @@ impl UnicodeAvailabilityVisitor<'_> {
         self.charge(canonicalize_work)
     }
 
-    fn push_case_class_node<'a>(
+    fn push_class_analysis_node<'a>(
         &mut self,
-        stack: &mut Vec<CaseClassNode<'a>>,
-        node: CaseClassNode<'a>,
+        stack: &mut Vec<ClassAnalysisNode<'a>>,
+        node: ClassAnalysisNode<'a>,
     ) -> Result<(), ParseError> {
         // Reserve the length conversion, checked increment and limit
         // comparison before observing or mutating the auxiliary stack.
@@ -398,7 +407,254 @@ impl UnicodeAvailabilityVisitor<'_> {
         Ok(())
     }
 
-    fn class_perl(&self, class: &ast::ClassPerl) -> Result<(), ParseError> {
+    fn charge_gencat_class_set(&mut self, class: &ast::ClassBracketed) -> Result<(), ParseError> {
+        // Charge the Unicode-flag branch and both comparisons in `has_gencat`
+        // before selecting this analysis. Profiles without the table never
+        // reach translation.
+        self.charge(3)?;
+        if !self.flags.unicode || !self.features.has_gencat() {
+            return Ok(());
+        }
+
+        // A general-category range vector can be copied, canonicalized and
+        // combined again at every nested bracket or binary-set site. Analyze
+        // the exact class topology prospectively. The range ceiling is the
+        // number of Rust Unicode scalar values; the table ceiling is the 736
+        // ranges in regex-syntax 0.8.11's largest category (`Other`). The
+        // per-site multiplier covers Vec allocation/copy, sorting,
+        // comparison, deduplication, union/intersection/difference and the
+        // extra clone/three set operations used by symmetric difference.
+        let mut stack = Vec::new();
+        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&class.kind))?;
+        let mut range_ceiling = 0_u64;
+        let mut translation_sites = 1_u64;
+        let mut gencat_sources = 0_u64;
+        loop {
+            self.charge(1)?;
+            let Some(node) = stack.pop() else {
+                break;
+            };
+            self.charge(7)?;
+            match node {
+                ClassAnalysisNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                }
+                ClassAnalysisNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                    // The worst operation is symmetric difference: clone,
+                    // intersect, union and difference, followed by union into
+                    // the enclosing frame.
+                    translation_sites = translation_sites.saturating_add(5);
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.lhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.rhs))?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Empty(_)) => {}
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Literal(_) | ast::ClassSetItem::Range(_),
+                ) => {
+                    range_ceiling = range_ceiling.saturating_add(1);
+                    translation_sites = translation_sites.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(128);
+                    translation_sites = translation_sites.saturating_add(2);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Unicode(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(UNICODE_GENCAT_MAX_TABLE_RANGES);
+                    translation_sites = translation_sites.saturating_add(2);
+                    gencat_sources = gencat_sources.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Perl(perl)) => {
+                    if matches!(perl.kind, ast::ClassPerlKind::Digit) {
+                        range_ceiling =
+                            range_ceiling.saturating_add(UNICODE_GENCAT_MAX_TABLE_RANGES);
+                        translation_sites = translation_sites.saturating_add(2);
+                        gencat_sources = gencat_sources.saturating_add(1);
+                    }
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                    translation_sites = translation_sites.saturating_add(2);
+                    self.push_class_analysis_node(
+                        &mut stack,
+                        ClassAnalysisNode::Set(&nested.kind),
+                    )?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Union(union)) => {
+                    translation_sites = translation_sites
+                        .saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
+                    for item in &union.items {
+                        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                    }
+                }
+            }
+            range_ceiling = range_ceiling.min(UNICODE_GENCAT_SCALAR_RANGE_CEILING);
+        }
+        if gencat_sources == 0 {
+            return Ok(());
+        }
+        self.charge(
+            range_ceiling
+                .saturating_mul(translation_sites)
+                .saturating_mul(UNICODE_GENCAT_SET_WORK_PER_RANGE_SITE),
+        )
+    }
+
+    fn normalize_gencat_symbol(
+        &mut self,
+        raw: &str,
+        normalized: &mut [u8; MAX_UNICODE_GENCAT_ALIAS_BYTES],
+    ) -> Result<Option<usize>, ParseError> {
+        let raw_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+        // Reserve our classifier scan plus regex-syntax's Vec allocation,
+        // source copy, in-place normalization and UTF-8 validation before
+        // examining the bytes.
+        self.charge(raw_len.saturating_mul(4).saturating_add(4))?;
+        let bytes = raw.as_bytes();
+        let starts_with_is = bytes.len() >= 2
+            && bytes[0].eq_ignore_ascii_case(&b'i')
+            && bytes[1].eq_ignore_ascii_case(&b's');
+        let start = if starts_with_is { 2 } else { 0 };
+        let mut len = 0_usize;
+        for &byte in &bytes[start..] {
+            let Some(byte) = (match byte {
+                b' ' | b'_' | b'-' => None,
+                0x00..=0x7F => Some(byte.to_ascii_lowercase()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if len == normalized.len() {
+                return Ok(None);
+            }
+            normalized[len] = byte;
+            len = len.saturating_add(1);
+        }
+        // Match regex-syntax's ISO_Comment collision exception: `IsC`
+        // normalizes to `isc`, not the general category alias `c`.
+        if starts_with_is && len == 1 && normalized[0] == b'c' {
+            normalized[0] = b'i';
+            normalized[1] = b's';
+            normalized[2] = b'c';
+            len = 3;
+        }
+        Ok(Some(len))
+    }
+
+    fn normalized_is_gencat_alias(&mut self, normalized: &[u8]) -> Result<bool, ParseError> {
+        for &alias in UNICODE_GENCAT_ALIASES {
+            self.charge(1)?;
+            if alias.len() != normalized.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(alias.as_bytes()) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn normalized_is_gencat_property_name(
+        &mut self,
+        normalized: &[u8],
+    ) -> Result<bool, ParseError> {
+        for expected in [b"gc".as_slice(), b"generalcategory".as_slice()] {
+            self.charge(1)?;
+            if normalized.len() != expected.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(expected) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn charge_gencat_table_translation(&mut self, query_bytes: u64) -> Result<(), ParseError> {
+        // The exact pinned tables contain 271 property-name aliases, seven
+        // property-value families, 80 General_Category value aliases and 37
+        // materialized category sets. Thirty-two full-query comparisons are
+        // a conservative ceiling for all binary searches and collision
+        // branches. The range term reserves the largest source table, its
+        // Vec allocation/copy, canonical-order scan/dedup and a possible
+        // negation allocation before translation begins.
+        self.charge(query_bytes.saturating_mul(32).saturating_add(512))?;
+        self.charge(
+            UNICODE_GENCAT_MAX_TABLE_RANGES.saturating_mul(UNICODE_GENCAT_CLASS_WORK_PER_RANGE),
+        )
+    }
+
+    fn is_unicode_gencat_class(&mut self, class: &ast::ClassUnicode) -> Result<bool, ParseError> {
+        // Reserve the AST-kind branch and both feature comparisons before
+        // classifying the query.
+        self.charge(3)?;
+        if !self.features.has_gencat() {
+            return Ok(false);
+        }
+        let mut name_buf = [0_u8; MAX_UNICODE_GENCAT_ALIAS_BYTES];
+        let mut value_buf = [0_u8; MAX_UNICODE_GENCAT_ALIAS_BYTES];
+        let (accepted, query_bytes) = match &class.kind {
+            ast::ClassUnicodeKind::OneLetter(value) => {
+                let mut encoded = [0_u8; 4];
+                let raw = value.encode_utf8(&mut encoded);
+                let Some(len) = self.normalize_gencat_symbol(raw, &mut value_buf)? else {
+                    return Ok(false);
+                };
+                (
+                    self.normalized_is_gencat_alias(&value_buf[..len])?,
+                    u64::try_from(raw.len()).unwrap_or(u64::MAX),
+                )
+            }
+            ast::ClassUnicodeKind::Named(value) => {
+                let Some(len) = self.normalize_gencat_symbol(value, &mut value_buf)? else {
+                    return Ok(false);
+                };
+                (
+                    self.normalized_is_gencat_alias(&value_buf[..len])?,
+                    u64::try_from(value.len()).unwrap_or(u64::MAX),
+                )
+            }
+            ast::ClassUnicodeKind::NamedValue { name, value, .. } => {
+                let Some(name_len) = self.normalize_gencat_symbol(name, &mut name_buf)? else {
+                    return Ok(false);
+                };
+                let Some(value_len) = self.normalize_gencat_symbol(value, &mut value_buf)? else {
+                    return Ok(false);
+                };
+                let name_matches =
+                    self.normalized_is_gencat_property_name(&name_buf[..name_len])?;
+                let value_matches = self.normalized_is_gencat_alias(&value_buf[..value_len])?;
+                self.charge(1)?;
+                (
+                    name_matches && value_matches,
+                    u64::try_from(name.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                )
+            }
+        };
+        if accepted {
+            self.charge_gencat_table_translation(query_bytes)?;
+        }
+        Ok(accepted)
+    }
+
+    fn class_perl(&mut self, class: &ast::ClassPerl) -> Result<(), ParseError> {
+        self.charge(3)?;
         if !self.flags.unicode {
             return Ok(());
         }
@@ -408,6 +664,11 @@ impl UnicodeAvailabilityVisitor<'_> {
             // checked separately.)
             return Ok(());
         }
+        self.charge(2)?;
+        if self.features.has_gencat() && matches!(class.kind, ast::ClassPerlKind::Digit) {
+            self.charge_gencat_table_translation(1)?;
+            return Ok(());
+        }
         self.reject(
             &class.span,
             "Unicode Perl-class data is unavailable in this Rust profile",
@@ -415,6 +676,10 @@ impl UnicodeAvailabilityVisitor<'_> {
     }
 
     fn class_unicode(&mut self, class: &ast::ClassUnicode) -> Result<(), ParseError> {
+        // Reserve the Unicode-flag branch plus the AGE and BOOL feature
+        // guards before any family-specific classifier executes. GENCAT's
+        // own feature/class-kind branches are charged in its helper.
+        self.charge(5)?;
         if !self.flags.unicode {
             return Ok(());
         }
@@ -431,6 +696,10 @@ impl UnicodeAvailabilityVisitor<'_> {
                     self.require_case(&class.span)?;
                     return Ok(());
                 }
+            }
+            _ if self.is_unicode_gencat_class(class)? => {
+                self.require_case(&class.span)?;
+                return Ok(());
             }
             _ => {}
         }
@@ -546,6 +815,7 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
                 Ok(())
             }
             Ast::ClassBracketed(class) => {
+                self.charge_gencat_class_set(class)?;
                 if self.require_case(&class.span)? {
                     self.charge_case_fold_class(class)?;
                 }

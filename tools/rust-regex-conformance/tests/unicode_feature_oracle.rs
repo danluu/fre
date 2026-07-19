@@ -14,6 +14,7 @@ const CONFIGURATIONS: &[(&str, &str, RustUnicodeFeatures)] = &[
     ("age", "unicode-age", RustUnicodeFeatures::AGE),
     ("bool", "unicode-bool", RustUnicodeFeatures::BOOL),
     ("case", "unicode-case", RustUnicodeFeatures::CASE),
+    ("gencat", "unicode-gencat", RustUnicodeFeatures::GENCAT),
     (
         "all",
         "unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment",
@@ -25,6 +26,10 @@ const BOOL_PROPERTY_ALIASES: &[&str] =
     include!("../../../crates/fre-syntax/src/unicode_bool_aliases.in");
 const BOOL_PROPERTY_ALIAS_SET_SHA256: &str =
     "5842f13e797cbf08ec527894fb76f1502522dc10b8bd5ec89f02a0a3fbdf9caf";
+const GENCAT_ALIASES: &[&str] =
+    include!("../../../crates/fre-syntax/src/unicode_gencat_aliases.in");
+const GENCAT_ALIAS_SET_SHA256: &str =
+    "88e48d3f8c7b4e5ad2d25d32d8d7f17a136c0ac1dc42b6ee6f761e8412cbdc61";
 
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
@@ -66,6 +71,21 @@ const PROBES: &[(&str, &str)] = &[
     ("case-class", r"(?i:[a-z\u{03B4}])"),
     ("case-negated-class", r"(?i:[^\u{03B4}])"),
     ("gencat", r"\pL"),
+    ("gencat-normalized", r"\p{se PaRa ToR}"),
+    (
+        "gencat-named-value",
+        r"\p{General_Category=Uppercase_Letter}",
+    ),
+    ("gencat-is-property", r"\p{Is_G-C=Letter}"),
+    ("gencat-not-equal", r"\P{gc!=Separator}"),
+    ("gencat-surrogate-short", r"\p{cs}"),
+    ("gencat-surrogate-long", r"\p{Surrogate}"),
+    ("gencat-is-c-collision", r"\p{IsC}"),
+    ("gencat-is-cf-collision", r"\p{IsCf}"),
+    ("gencat-digit", r"\d"),
+    ("gencat-digit-casefold", r"(?i:\d)"),
+    ("gencat-bracket-digit-casefold", r"(?i:[\d])"),
+    ("gencat-property-casefold", r"(?i:\pL)"),
     ("perl", r"\b\w\b"),
     ("script", r"\p{Greek}"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
@@ -109,6 +129,18 @@ fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
         format!("{:x}", Sha256::digest(&alias_bytes)),
         BOOL_PROPERTY_ALIAS_SET_SHA256
     );
+    assert_eq!(GENCAT_ALIASES.len(), 81);
+    assert!(GENCAT_ALIASES.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        GENCAT_ALIASES.iter().map(|alias| alias.len()).max(),
+        Some(20)
+    );
+    let mut gencat_alias_bytes = GENCAT_ALIASES.join("\n").into_bytes();
+    gencat_alias_bytes.push(b'\n');
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&gencat_alias_bytes)),
+        GENCAT_ALIAS_SET_SHA256
+    );
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/unicode-feature-oracle/Cargo.toml");
     let target_root = unique_target_root();
@@ -137,6 +169,19 @@ fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
             ))
             .is_ok();
             let id = format!("bool-alias-{index}:{alias}");
+            assert_eq!(
+                actual, oracle[&id],
+                "configuration={name} alias={alias} pattern={pattern}",
+            );
+        }
+        for (index, &alias) in GENCAT_ALIASES.iter().enumerate() {
+            let pattern = format!(r"\p{{{alias}}}");
+            let actual = parse(ParseRequest::rust(
+                &pattern,
+                CompatibilityProfile::RustText(profile.clone()),
+            ))
+            .is_ok();
+            let id = format!("gencat-alias-{index}:{alias}");
             assert_eq!(
                 actual, oracle[&id],
                 "configuration={name} alias={alias} pattern={pattern}",
@@ -185,6 +230,7 @@ fn run_oracle(manifest: &Path, target: &Path, features: &str) -> BTreeMap<String
     let expected = PROBES
         .len()
         .checked_add(BOOL_PROPERTY_ALIASES.len())
+        .and_then(|count| count.checked_add(GENCAT_ALIASES.len()))
         .expect("oracle probe cardinality fits usize");
     assert_eq!(parsed.len(), expected);
     parsed

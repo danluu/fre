@@ -8,6 +8,8 @@ use fre_syntax::{
     UpstreamRevision, parse, re2_surface_inventory,
 };
 
+const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
+
 fn re2_literal_profile() -> CompatibilityProfile {
     let mut profile = Re2Profile::default();
     profile.options.literal = true;
@@ -345,6 +347,110 @@ fn unicode_case_profile_accepts_only_unicode_simple_case_folding() {
 }
 
 #[test]
+fn unicode_gencat_profile_accepts_only_materialized_general_categories() {
+    assert_eq!(GENCAT_ALIASES.len(), 81);
+    assert!(GENCAT_ALIASES.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        GENCAT_ALIASES.iter().map(|alias| alias.len()).max(),
+        Some(20)
+    );
+
+    let mut gencat = RustProfile::regex_1_12_4();
+    gencat.unicode_features = RustUnicodeFeatures::GENCAT;
+    let gencat_profile = CompatibilityProfile::RustText(gencat.clone());
+    let full_profile = CompatibilityProfile::rust_text();
+
+    // Authenticate every direct normalized alias against the all-table HIR.
+    // This includes the cf/sc/lc property-name collisions and the synthetic
+    // Any/ASCII/Assigned classes.
+    for alias in GENCAT_ALIASES {
+        let pattern = format!(r"\p{{{alias}}}");
+        let partial = parse(ParseRequest::rust(&pattern, gencat_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-gencat alias {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(&pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table alias {pattern}: {error:?}"));
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "general-category HIR for {pattern}");
+    }
+
+    for pattern in [
+        r"\pL",
+        r"\pz",
+        r"\P{Separator}",
+        r"\p{se PaRa ToR}",
+        r"\p{IsCf}",
+        r"\p{gc:Lu}",
+        r"\p{General_Category=Uppercase_Letter}",
+        r"\p{Is_G-C=Letter}",
+        r"\P{gc!=Separator}",
+        r"\p{Any}",
+        r"\P{Any}",
+        r"\p{Assigned}",
+        r"\p{ASCII}",
+        r"\d",
+        r"\D",
+        r"(?i:\d)",
+        r"[\pL&&\P{Lu}]",
+        r"[\d--\p{ASCII}]",
+    ] {
+        let partial = parse(ParseRequest::rust(pattern, gencat_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-gencat rejected {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "general-category HIR for {pattern}");
+    }
+
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"\p{Alphabetic}",
+        r"(?i:\pL)",
+        r"\s",
+        r"\w",
+        r"\b",
+        r"\p{Greek}",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"\p{cs}",
+        r"\p{Surrogate}",
+        r"\p{IsC}",
+        r"\p{gc}",
+        r"\p{gc=definitely-invalid}",
+        r"\p{Script=Letter}",
+    ] {
+        let error = parse(ParseRequest::rust(pattern, gencat_profile.clone()))
+            .expect_err("unicode-gencat must not borrow another or unmaterialized family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    let mut gencat_set = RustProfile::regex_set_1_12_4();
+    gencat_set.unicode_features = RustUnicodeFeatures::GENCAT;
+    fre_syntax::validate_rust_regex_set_admission(
+        &[r"\pL", r"\p{gc=Nd}", r"\d"],
+        &CompatibilityProfile::RustText(gencat_set.clone()),
+    )
+    .expect("unicode-gencat set admission");
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &[r"\pL", r"\p{Alphabetic}"],
+        &CompatibilityProfile::RustText(gencat_set),
+    )
+    .expect_err("unicode-gencat set cannot borrow unicode-bool");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -392,6 +498,19 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     assert_ne!(age.key, case.key);
     assert_ne!(boolean.key, case.key);
     assert_ne!(case.key, full.key);
+
+    let mut gencat = RustProfile::regex_1_12_4();
+    gencat.unicode_features = RustUnicodeFeatures::GENCAT;
+    let gencat = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(gencat),
+    ))
+    .expect("table-free syntax under gencat profile");
+    assert_ne!(partial.key, gencat.key);
+    assert_ne!(age.key, gencat.key);
+    assert_ne!(boolean.key, gencat.key);
+    assert_ne!(case.key, gencat.key);
+    assert_ne!(gencat.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -691,6 +810,134 @@ fn unicode_case_auxiliary_stack_has_an_exact_prospective_limit() {
         }),
     ))
     .expect_err("one below auxiliary traversal-stack limit must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::TraversalStack,
+            limit,
+            observed,
+        } if limit == EXPECTED_MAX_STACK - 1 && observed == EXPECTED_MAX_STACK
+    ));
+}
+
+#[test]
+fn unicode_gencat_classifier_and_table_work_obey_exact_parse_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::GENCAT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"\P{G_e-n e r a l _ Category != Connector_Punctuation}";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("normalized unicode-gencat named-value query");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 10_000,
+        "table search, class allocation and canonicalization must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    let exact_record = parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact general-category classifier/table limit must pass");
+    assert_eq!(exact_record.summary.parse_work, exact);
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below general-category classifier/table limit must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_gencat_nested_set_dedup_work_is_prospectively_bounded() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::GENCAT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[[\p{Other}]~~[\p{Letter}--[\p{Mark}&&\p{Number}]]]";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("nested general-category set operations");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 1_000_000,
+        "nested allocation, sort and dedup work must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact nested general-category set-work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below nested set-work limit must fail before translation");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_gencat_analysis_stack_has_a_hand_derived_exact_limit() {
+    const EXPECTED_MAX_STACK: u64 = 5;
+
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::GENCAT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"[\pL&&[\pN&&[\pM&&[\pS&&\pZ]]]]";
+
+    // Each binary node pushes lhs and then rhs. LIFO traversal retains one
+    // lhs while descending the right-nested operand: the root peaks at two
+    // pending nodes and the next three binary nodes raise the peak to exactly
+    // three, four and five. Bracket wrappers replace their pending item.
+    let exact_quotas = SyntaxQuotas {
+        max_parse_work: 64_000_000,
+        max_traversal_stack: EXPECTED_MAX_STACK,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone()).with_admission(AdmissionPolicy::Quota(
+            QuotaBounded {
+                syntax: exact_quotas,
+            },
+        )),
+    )
+    .expect("exact general-category analysis stack must pass");
+
+    let below_quotas = SyntaxQuotas {
+        max_traversal_stack: EXPECTED_MAX_STACK - 1,
+        ..exact_quotas
+    };
+    let error = parse(ParseRequest::rust(pattern, compatibility).with_admission(
+        AdmissionPolicy::Quota(QuotaBounded {
+            syntax: below_quotas,
+        }),
+    ))
+    .expect_err("one below general-category analysis stack must fail prospectively");
     assert!(matches!(
         error.category,
         ErrorCategory::FreResourceLimit {

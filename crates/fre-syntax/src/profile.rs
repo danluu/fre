@@ -95,9 +95,9 @@ pub struct UnicodeVersion {
 ///
 /// This is distinct from [`RustOptions::unicode`], which controls the `u`
 /// syntax flag. The all-features, no-features, `unicode-age`, `unicode-bool`
-/// and `unicode-case` profiles are represented. Other singleton data-family
-/// profiles remain outside this type until their classifiers are bounded and
-/// oracle-qualified.
+/// `unicode-case` and `unicode-gencat` profiles are represented. Other
+/// singleton data-family profiles remain outside this type until their
+/// classifiers are bounded and oracle-qualified.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RustUnicodeFeatures(u8);
 
@@ -107,6 +107,7 @@ impl RustUnicodeFeatures {
     pub const AGE: Self = Self(2);
     pub const BOOL: Self = Self(3);
     pub const CASE: Self = Self(4);
+    pub const GENCAT: Self = Self(5);
 
     #[must_use]
     pub const fn is_all(self) -> bool {
@@ -126,6 +127,11 @@ impl RustUnicodeFeatures {
     #[must_use]
     pub(crate) const fn has_case(self) -> bool {
         self.is_all() || self.0 == Self::CASE.0
+    }
+
+    #[must_use]
+    pub(crate) const fn has_gencat(self) -> bool {
+        self.is_all() || self.0 == Self::GENCAT.0
     }
 }
 
