@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 const KERNEL_PACKAGE: &str = "fre-kernels";
 const KERNEL_LIBRARY: &str = "fre_kernels";
@@ -18,6 +19,10 @@ const EXACT_ALLOC_PACKAGE: &str = "fre-exact-alloc";
 const EXACT_ALLOC_LIBRARY: &str = "fre_exact_alloc";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
+const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
+    0xe3, 0x49, 0xb8, 0xae, 0x70, 0x47, 0xd9, 0x31, 0x72, 0x6b, 0x6a, 0xf3, 0xe4, 0xb5, 0x5c, 0xbc,
+    0xfb, 0x20, 0xd4, 0xdb, 0x60, 0x2b, 0x64, 0x77, 0x4f, 0x9b, 0x68, 0x16, 0x58, 0x0f, 0xbd, 0xa2,
+];
 const EXACT_VEC_REVIEWED_BLOCK: &str = r#"#[allow(
     unsafe_code,
     reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
@@ -554,8 +559,17 @@ fn audit_exact_allocator(
 }
 
 fn audit_exact_allocator_source(source_path: &Path) -> Result<(), String> {
-    let source = fs::read_to_string(source_path)
-        .map_err(|error| format!("read exact allocator source: {error}"))?;
+    let source_bytes =
+        fs::read(source_path).map_err(|error| format!("read exact allocator source: {error}"))?;
+    if Sha256::digest(&source_bytes)[..] != EXACT_ALLOC_SOURCE_SHA256 {
+        return Err("exact allocator complete source digest drifted".to_owned());
+    }
+    let source = std::str::from_utf8(&source_bytes)
+        .map_err(|error| format!("exact allocator source is not UTF-8: {error}"))?;
+    audit_exact_allocator_source_text(source)
+}
+
+fn audit_exact_allocator_source_text(source: &str) -> Result<(), String> {
     if source.matches(DENY_ATTRIBUTE).count() != 1
         || source
             .lines()
@@ -676,7 +690,8 @@ mod tests {
     use super::{
         COPY_EXACT_REVIEWED_BLOCK, DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_VEC_REVIEWED_BLOCK,
         Package, Target, WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
-        audit_exact_allocator_source, audit_kernel_targets, require_exact_lints,
+        audit_exact_allocator_source, audit_exact_allocator_source_text, audit_kernel_targets,
+        require_exact_lints,
     };
     use std::{
         collections::BTreeMap,
@@ -766,14 +781,19 @@ mod tests {
         )
     }
 
+    fn canonical_exact_source() -> &'static str {
+        include_str!("../../../crates/fre-exact-alloc/src/lib.rs")
+    }
+
     fn assert_exact_source_rejected(source: &str) {
-        let tree = TestTree::new();
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", source);
-        assert!(audit_exact_allocator_source(&path).is_err());
+        assert!(audit_exact_allocator_source_text(source).is_err());
     }
 
     fn exact_package(tree: &TestTree, additional: Vec<Target>) -> Package {
-        let source = tree.write("crates/fre-exact-alloc/src/lib.rs", &exact_source());
+        let source = tree.write(
+            "crates/fre-exact-alloc/src/lib.rs",
+            canonical_exact_source(),
+        );
         let manifest = tree.write(
             "crates/fre-exact-alloc/Cargo.toml",
             "[package]\nname='fre-exact-alloc'\n",
@@ -842,21 +862,72 @@ mod tests {
 
     #[test]
     fn additional_unsafe_lowering_is_rejected() {
-        let tree = TestTree::new();
         let source = format!(
             "{}\n#[allow(unsafe_code)]\nunsafe fn escaped() {{}}\n",
             exact_source()
         );
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
-        let error = audit_exact_allocator_source(&path).unwrap_err();
+        let error = audit_exact_allocator_source_text(&source).unwrap_err();
         assert!(error.contains("lowering inventory drifted"));
     }
 
     #[test]
     fn exactly_three_reviewed_unsafe_blocks_in_order_are_accepted() {
+        assert_eq!(audit_exact_allocator_source_text(&exact_source()), Ok(()));
+    }
+
+    #[test]
+    fn canonical_complete_source_digest_is_accepted() {
         let tree = TestTree::new();
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &exact_source());
+        let path = tree.write(
+            "crates/fre-exact-alloc/src/lib.rs",
+            canonical_exact_source(),
+        );
         assert_eq!(audit_exact_allocator_source(&path), Ok(()));
+    }
+
+    #[test]
+    fn inactive_or_replaced_reviewed_blocks_fail_complete_digest() {
+        let tree = TestTree::new();
+        let cfg_test = canonical_exact_source().replace(
+            "#[allow(\n    unsafe_code,",
+            "#[cfg(test)]\n#[allow(\n    unsafe_code,",
+        );
+        let cfg_pair = format!(
+            "{cfg_test}\n\
+             #[cfg(not(test))]\nfn exact_vec_with_capacity<T>(_: usize, _: bool) -> Result<ExactVec<T>, CopyError> {{ unreachable!() }}\n\
+             #[cfg(not(test))]\nfn zeroed_exact_with(_: usize, _: bool) -> Result<Vec<u8>, CopyError> {{ unreachable!() }}\n\
+             #[cfg(not(test))]\nfn copy_exact_with(_: &[u8], _: bool) -> Result<Vec<u8>, CopyError> {{ unreachable!() }}\n"
+        );
+        let cfg_attr = canonical_exact_source().replace(
+            "#[allow(\n    unsafe_code,",
+            "#[cfg_attr(not(test), cfg(any()))]\n#[allow(\n    unsafe_code,",
+        );
+        let commented = canonical_exact_source().replacen(
+            EXACT_VEC_REVIEWED_BLOCK,
+            &format!("/*\n{EXACT_VEC_REVIEWED_BLOCK}\n*/"),
+            1,
+        );
+        let string_inert = canonical_exact_source().replacen(
+            EXACT_VEC_REVIEWED_BLOCK,
+            &format!(
+                "const INERT_REVIEWED_BLOCK: &str = r###\"{EXACT_VEC_REVIEWED_BLOCK}\"###;\n\
+                 fn exact_vec_with_capacity<T>(_: usize, _: bool) -> Result<ExactVec<T>, CopyError> {{ unreachable!() }}"
+            ),
+            1,
+        );
+        for (name, source) in [
+            ("cfg-test-and-active-replacement.rs", cfg_pair),
+            ("cfg-attr.rs", cfg_attr),
+            ("comment-inert.rs", commented),
+            ("string-inert-and-active-replacement.rs", string_inert),
+        ] {
+            let path = tree.write(name, &source);
+            assert!(
+                audit_exact_allocator_source(&path)
+                    .unwrap_err()
+                    .contains("complete source digest")
+            );
+        }
     }
 
     #[test]
@@ -956,32 +1027,26 @@ mod tests {
 
     #[test]
     fn missing_reviewed_unsafe_lowering_is_rejected() {
-        let tree = TestTree::new();
         let source = exact_source().replace(ZEROED_EXACT_REVIEWED_BLOCK, "");
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
-        let error = audit_exact_allocator_source(&path).unwrap_err();
+        let error = audit_exact_allocator_source_text(&source).unwrap_err();
         assert!(error.contains("lowering inventory drifted"));
     }
 
     #[test]
     fn reviewed_unsafe_lowering_reason_drift_is_rejected() {
-        let tree = TestTree::new();
         let source = exact_source().replace(
             "exact-layout zero-initialization boundary",
             "changed boundary",
         );
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
-        let error = audit_exact_allocator_source(&path).unwrap_err();
+        let error = audit_exact_allocator_source_text(&source).unwrap_err();
         assert!(error.contains("reviewed unsafe site binding drifted"));
     }
 
     #[test]
     fn reviewed_unsafe_lowering_function_binding_drift_is_rejected() {
-        let tree = TestTree::new();
         let source =
             exact_source().replace("fn zeroed_exact_with(", "fn renamed_zeroed_exact_with(");
-        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
-        let error = audit_exact_allocator_source(&path).unwrap_err();
+        let error = audit_exact_allocator_source_text(&source).unwrap_err();
         assert!(error.contains("reviewed unsafe site binding drifted"));
     }
 
@@ -1063,13 +1128,9 @@ mod tests {
 
     #[test]
     fn include_and_macro_expansion_paths_are_rejected() {
-        let tree = TestTree::new();
-        let path = tree.write(
-            "crates/fre-exact-alloc/src/lib.rs",
-            &format!("{}\ninclude!(\"generated.rs\");\n", exact_source()),
-        );
+        let source = format!("{}\ninclude!(\"generated.rs\");\n", exact_source());
         assert!(
-            audit_exact_allocator_source(&path)
+            audit_exact_allocator_source_text(&source)
                 .unwrap_err()
                 .contains("expansion path")
         );
