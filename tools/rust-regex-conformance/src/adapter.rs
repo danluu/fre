@@ -39,7 +39,7 @@ const LIMITATIONS: [&str; 7] = [
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
-    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; set which additionally supports generic multi-pattern leftmost-first ordered-union selection and exact-literal leftmost/all selection, while UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
+    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; selection-sensitive multi-pattern set which uses an adapter-only repeated constituent-search correctness fallback (up to O(patterns × haystack positions) facade search calls, each over a remaining window) for leftmost-first ordered-union and exact-literal leftmost/all selection, not a native or fast production RegexSet engine; UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact leftmost-first and earliest-end search and reject all other policies",
 ];
 
@@ -1200,6 +1200,11 @@ struct SelectedPatternMatch {
     end: usize,
 }
 
+/// Adapter-only correctness fallback for selection-sensitive set observations.
+/// With `P` patterns and `H` searchable positions, the implementation can
+/// issue `O(P * H)` independent constituent facade searches, each over a
+/// remaining haystack window. It deliberately makes no native `RegexSet` or
+/// production-throughput claim.
 fn selected_text_pattern_ids(
     regexes: &[Box<PortableTextRegex>],
     haystack: &str,
