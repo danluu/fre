@@ -59,6 +59,7 @@ const DOCTEST_LIST_SHA256: &str =
 const OBLIGATION_INVENTORY_SHA256: &str =
     "e6e416c78915b9f339d3dd165d44a0896e2519eac07961c762e3212874609dbe";
 const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
+const AST_PRINT_PREFIX: &str = "ast::print::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_NEST_LIMIT_CASE_ID: &str = "ast::parse::tests::parse_nest_limit";
@@ -103,6 +104,15 @@ const AST_HEX_EIGHT_PASS_EVIDENCE_SHA256: &str =
 const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
 const AST_REGRESSION_455_CASE_ID: &str =
     "ast::parse::tests::regression_455_trailing_dash_ignore_whitespace";
+const AST_PRINT_LITERAL_CASE_ID: &str = "ast::print::tests::print_literal";
+const AST_PRINT_DOT_CASE_ID: &str = "ast::print::tests::print_dot";
+const AST_PRINT_CONCAT_CASE_ID: &str = "ast::print::tests::print_concat";
+const AST_PRINT_ALTERNATION_CASE_ID: &str = "ast::print::tests::print_alternation";
+const AST_PRINT_ASSERTION_CASE_ID: &str = "ast::print::tests::print_assertion";
+const AST_PRINT_REPETITION_CASE_ID: &str = "ast::print::tests::print_repetition";
+const AST_PRINT_FLAGS_CASE_ID: &str = "ast::print::tests::print_flags";
+const AST_PRINT_GROUP_CASE_ID: &str = "ast::print::tests::print_group";
+const AST_PRINT_CLASS_CASE_ID: &str = "ast::print::tests::print_class";
 const REGRESSION_454_PATTERN: &str = r"
         2(?:
           [45]\d{3}|
@@ -359,6 +369,101 @@ const SET_CLASS_DEFAULT_PROBES: [&str; 35] = [
     "[z-a]",
 ];
 const SET_CLASS_IGNORE_WHITESPACE_PROBES: [&str; 2] = ["[a ", "[a- "];
+const PRINT_LITERAL_PROBES: [(&str, bool); 18] = [
+    ("a", false),
+    (r"\[", false),
+    (r"\141", true),
+    (r"\x61", false),
+    (r"\x7F", false),
+    (r"\u0061", false),
+    (r"\U00000061", false),
+    (r"\x{61}", false),
+    (r"\x{7F}", false),
+    (r"\u{61}", false),
+    (r"\U{61}", false),
+    (r"\a", false),
+    (r"\f", false),
+    (r"\t", false),
+    (r"\n", false),
+    (r"\r", false),
+    (r"\v", false),
+    (r"(?x)\ ", false),
+];
+const PRINT_DOT_PROBES: [&str; 1] = ["."];
+const PRINT_CONCAT_PROBES: [&str; 3] = ["ab", "abcde", "a(bcd)ef"];
+const PRINT_ALTERNATION_PROBES: [&str; 5] = [
+    "a|b",
+    "a|b|c|d|e",
+    "|a|b|c|d|e",
+    "|a|b|c|d|e|",
+    "a(b|c|d)|e|f",
+];
+const PRINT_ASSERTION_PROBES: [&str; 6] = [r"^", r"$", r"\A", r"\z", r"\b", r"\B"];
+const PRINT_REPETITION_PROBES: [&str; 12] = [
+    "a?", "a??", "a*", "a*?", "a+", "a+?", "a{5}", "a{5}?", "a{5,}", "a{5,}?", "a{5,10}",
+    "a{5,10}?",
+];
+const PRINT_FLAGS_PROBES: [&str; 5] = ["(?i)", "(?-i)", "(?s-i)", "(?-si)", "(?siUmux)"];
+const PRINT_GROUP_PROBES: [&str; 4] = ["(?i:a)", "(?P<foo>a)", "(?<foo>a)", "(a)"];
+const PRINT_CLASS_PROBES: [&str; 57] = [
+    r"[abc]",
+    r"[a-z]",
+    r"[^a-z]",
+    r"[a-z0-9]",
+    r"[-a-z0-9]",
+    r"[-a-z0-9]",
+    r"[a-z0-9---]",
+    r"[a-z&&m-n]",
+    r"[[a-z&&m-n]]",
+    r"[a-z--m-n]",
+    r"[a-z~~m-n]",
+    r"[a-z[0-9]]",
+    r"[a-z[^0-9]]",
+    r"\d",
+    r"\D",
+    r"\s",
+    r"\S",
+    r"\w",
+    r"\W",
+    r"[[:alnum:]]",
+    r"[[:^alnum:]]",
+    r"[[:alpha:]]",
+    r"[[:^alpha:]]",
+    r"[[:ascii:]]",
+    r"[[:^ascii:]]",
+    r"[[:blank:]]",
+    r"[[:^blank:]]",
+    r"[[:cntrl:]]",
+    r"[[:^cntrl:]]",
+    r"[[:digit:]]",
+    r"[[:^digit:]]",
+    r"[[:graph:]]",
+    r"[[:^graph:]]",
+    r"[[:lower:]]",
+    r"[[:^lower:]]",
+    r"[[:print:]]",
+    r"[[:^print:]]",
+    r"[[:punct:]]",
+    r"[[:^punct:]]",
+    r"[[:space:]]",
+    r"[[:^space:]]",
+    r"[[:upper:]]",
+    r"[[:^upper:]]",
+    r"[[:word:]]",
+    r"[[:^word:]]",
+    r"[[:xdigit:]]",
+    r"[[:^xdigit:]]",
+    r"\pL",
+    r"\PL",
+    r"\p{L}",
+    r"\P{L}",
+    r"\p{X=Y}",
+    r"\P{X=Y}",
+    r"\p{X:Y}",
+    r"\P{X:Y}",
+    r"\p{X!=Y}",
+    r"\P{X!=Y}",
+];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
     r"\a",
@@ -1882,6 +1987,14 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: "fre-adapter.ast-parse-not-implemented".to_owned(),
         };
     }
+    if obligation.case_id.starts_with(AST_PRINT_PREFIX) {
+        if is_supported_ast_print_case(&obligation.case_id) {
+            return execute_ast_print_case(&obligation.case_id);
+        }
+        return RegexSyntaxCorpusDisposition::Unsupported {
+            reason_code: "fre-adapter.ast-print-not-implemented".to_owned(),
+        };
+    }
     RegexSyntaxCorpusDisposition::Unsupported {
         reason_code: "fre-adapter.unit-family-not-implemented".to_owned(),
     }
@@ -2120,6 +2233,21 @@ fn is_supported_ast_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_ast_print_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        AST_PRINT_LITERAL_CASE_ID
+            | AST_PRINT_DOT_CASE_ID
+            | AST_PRINT_CONCAT_CASE_ID
+            | AST_PRINT_ALTERNATION_CASE_ID
+            | AST_PRINT_ASSERTION_CASE_ID
+            | AST_PRINT_REPETITION_CASE_ID
+            | AST_PRINT_FLAGS_CASE_ID
+            | AST_PRINT_GROUP_CASE_ID
+            | AST_PRINT_CLASS_CASE_ID
+    )
+}
+
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_NEST_LIMIT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_nest_limit)),
@@ -2171,6 +2299,28 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         }
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-ast-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_ast_print_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_ast_print_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: ast_print_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: ast_print_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-ast-print-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -2484,6 +2634,94 @@ fn run_ast_set_class() -> Result<(), AstMismatch> {
         )?;
     }
     Ok(())
+}
+
+fn run_ast_print_case(case_id: &str) -> Result<(), AstMismatch> {
+    match case_id {
+        AST_PRINT_LITERAL_CASE_ID => {
+            for (index, (pattern, octal)) in PRINT_LITERAL_PROBES.into_iter().enumerate() {
+                execute_ast_print_probe(pattern, octal, &format!("print-literal-{index}"))?;
+            }
+            Ok(())
+        }
+        AST_PRINT_DOT_CASE_ID => run_ast_print_equivalence_set(&PRINT_DOT_PROBES, "print-dot"),
+        AST_PRINT_CONCAT_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_CONCAT_PROBES, "print-concat")
+        }
+        AST_PRINT_ALTERNATION_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_ALTERNATION_PROBES, "print-alternation")
+        }
+        AST_PRINT_ASSERTION_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_ASSERTION_PROBES, "print-assertion")
+        }
+        AST_PRINT_REPETITION_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_REPETITION_PROBES, "print-repetition")
+        }
+        AST_PRINT_FLAGS_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_FLAGS_PROBES, "print-flags")
+        }
+        AST_PRINT_GROUP_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_GROUP_PROBES, "print-group")
+        }
+        AST_PRINT_CLASS_CASE_ID => {
+            run_ast_print_equivalence_set(&PRINT_CLASS_PROBES, "print-class")
+        }
+        _ => unreachable!("caller checked supported AST print case"),
+    }
+}
+
+fn run_ast_print_equivalence_set(probes: &[&str], label: &str) -> Result<(), AstMismatch> {
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        execute_ast_print_probe(pattern, false, &format!("{label}-{index}"))?;
+    }
+    Ok(())
+}
+
+fn execute_ast_print_probe(pattern: &str, octal: bool, assertion: &str) -> Result<(), AstMismatch> {
+    let mut rust_profile = RustProfile::regex_1_12_4();
+    rust_profile.options.octal = octal;
+    let compatibility = CompatibilityProfile::RustText(rust_profile.clone());
+    let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
+    builder
+        .nest_limit(rust_profile.options.nest_limit)
+        .octal(octal)
+        .ignore_whitespace(rust_profile.options.ignore_whitespace);
+    let expected = builder
+        .build()
+        .parse(pattern)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: authenticated upstream parse succeeds"),
+            observed: format!("{assertion}: upstream parse error {error:?}"),
+        })?;
+    let record = parse_rust_ast(ParseRequest::rust(pattern, compatibility)).map_err(|error| {
+        AstMismatch {
+            expected: format!("{assertion}: FRE parse succeeds with exact upstream AST"),
+            observed: format!("{assertion}: FRE parse error {error:?}"),
+        }
+    })?;
+    validate_ast_success_with_options(
+        &record,
+        &expected,
+        pattern,
+        &rust_profile,
+        RustAstOptions::default(),
+        assertion,
+    )?;
+    let mut printed = String::new();
+    regex_syntax::ast::print::Printer::new()
+        .print(&record.ast, &mut printed)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: printer succeeds with {pattern:?}"),
+            observed: format!("{assertion}: printer error {error:?}"),
+        })?;
+    if printed == pattern {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: {pattern:?}"),
+            observed: format!("{assertion}: {printed:?}"),
+        })
+    }
 }
 
 fn run_ast_equivalence_set(probes: &[&str], label: &str) -> Result<(), AstMismatch> {
@@ -2953,6 +3191,47 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
     sha256(contract.as_bytes())
 }
 
+fn ast_print_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.ast-print-adapter.v1\ncase={case_id}\nparser=fre-syntax\nprinter=pinned-regex-syntax-0.8.11\n"
+    );
+    if case_id == AST_PRINT_LITERAL_CASE_ID {
+        for (index, (pattern, octal)) in PRINT_LITERAL_PROBES.into_iter().enumerate() {
+            write_ast_print_probe_evidence(&mut contract, index, pattern, octal);
+        }
+    } else {
+        let probes = ast_print_default_probes(case_id);
+        for (index, pattern) in probes.iter().copied().enumerate() {
+            write_ast_print_probe_evidence(&mut contract, index, pattern, false);
+        }
+    }
+    sha256(contract.as_bytes())
+}
+
+fn ast_print_default_probes(case_id: &str) -> &'static [&'static str] {
+    match case_id {
+        AST_PRINT_DOT_CASE_ID => &PRINT_DOT_PROBES,
+        AST_PRINT_CONCAT_CASE_ID => &PRINT_CONCAT_PROBES,
+        AST_PRINT_ALTERNATION_CASE_ID => &PRINT_ALTERNATION_PROBES,
+        AST_PRINT_ASSERTION_CASE_ID => &PRINT_ASSERTION_PROBES,
+        AST_PRINT_REPETITION_CASE_ID => &PRINT_REPETITION_PROBES,
+        AST_PRINT_FLAGS_CASE_ID => &PRINT_FLAGS_PROBES,
+        AST_PRINT_GROUP_CASE_ID => &PRINT_GROUP_PROBES,
+        AST_PRINT_CLASS_CASE_ID => &PRINT_CLASS_PROBES,
+        _ => unreachable!("caller selected a default-profile AST print case"),
+    }
+}
+
+fn write_ast_print_probe_evidence(contract: &mut String, index: usize, pattern: &str, octal: bool) {
+    writeln!(
+        contract,
+        "probe-{index}=sha256:{},bytes:{},octal:{octal},expected:exact-roundtrip",
+        sha256(pattern.as_bytes()),
+        pattern.len(),
+    )
+    .expect("writing to a String cannot fail");
+}
+
 fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expected: &str) {
     for (index, pattern) in probes.iter().copied().enumerate() {
         writeln!(
@@ -3164,6 +3443,43 @@ fn ast_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> Strin
     )
 }
 
+fn ast_print_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.ast-print-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
+fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
+    is_supported_ast_case(case_id) || is_supported_ast_print_case(case_id)
+}
+
+fn syntax_case_pass_evidence(case_id: &str) -> String {
+    if is_supported_ast_case(case_id) {
+        ast_case_pass_evidence(case_id)
+    } else {
+        ast_print_pass_evidence(case_id)
+    }
+}
+
+fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    if is_supported_ast_case(case_id) {
+        ast_mismatch_evidence(case_id, expected, observed)
+    } else {
+        ast_print_mismatch_evidence(case_id, expected, observed)
+    }
+}
+
+fn syntax_case_fault_stage(case_id: &str) -> &'static str {
+    if is_supported_ast_case(case_id) {
+        "fre-ast-adapter"
+    } else {
+        "fre-ast-print-adapter"
+    }
+}
+
 fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), InventoryError> {
     let obligation = &receipt.obligation;
     if obligation.case_id.is_empty()
@@ -3189,10 +3505,10 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
-        ) if is_supported_ast_case(&obligation.case_id) => {
+        ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
             obligation.default_harness_member
                 && obligation.no_default_harness_member
-                && evidence_sha256 == &ast_case_pass_evidence(&obligation.case_id)
+                && evidence_sha256 == &syntax_case_pass_evidence(&obligation.case_id)
                 && fixed_ast_hex_pass_evidence(&obligation.case_id)
                     .is_none_or(|fixed| evidence_sha256 == fixed)
         }
@@ -3203,19 +3519,20 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
                 observed,
                 evidence_sha256,
             },
-        ) if is_supported_ast_case(&obligation.case_id) => {
+        ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
             !expected.is_empty()
                 && !observed.is_empty()
                 && expected.len() <= 65_536
                 && observed.len() <= 65_536
                 && evidence_sha256
-                    == &ast_mismatch_evidence(&obligation.case_id, expected, observed)
+                    == &syntax_case_mismatch_evidence(&obligation.case_id, expected, observed)
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Fault { stage, reason_code },
-        ) if is_supported_ast_case(&obligation.case_id) => {
-            stage == "fre-ast-adapter" && reason_code == "candidate.adapter-panicked"
+        ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
+            stage == syntax_case_fault_stage(&obligation.case_id)
+                && reason_code == "candidate.adapter-panicked"
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
@@ -3228,8 +3545,17 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
+        ) if obligation.case_id.starts_with(AST_PRINT_PREFIX) => {
+            !is_supported_ast_print_case(&obligation.case_id)
+                && obligation.default_harness_member
+                && reason_code == "fre-adapter.ast-print-not-implemented"
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) => {
             !obligation.case_id.starts_with(AST_PARSE_PREFIX)
+                && !obligation.case_id.starts_with(AST_PRINT_PREFIX)
                 && reason_code == "fre-adapter.unit-family-not-implemented"
         }
         _ => false,
@@ -3680,6 +4006,51 @@ mod tests {
                 disposition,
             })
             .expect("supported AST regression receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_ast_print_cases_execute_all_111_public_roundtrips() {
+        assert_eq!(PRINT_LITERAL_PROBES.len(), 18);
+        assert_eq!(PRINT_DOT_PROBES.len(), 1);
+        assert_eq!(PRINT_CONCAT_PROBES.len(), 3);
+        assert_eq!(PRINT_ALTERNATION_PROBES.len(), 5);
+        assert_eq!(PRINT_ASSERTION_PROBES.len(), 6);
+        assert_eq!(PRINT_REPETITION_PROBES.len(), 12);
+        assert_eq!(PRINT_FLAGS_PROBES.len(), 5);
+        assert_eq!(PRINT_GROUP_PROBES.len(), 4);
+        assert_eq!(PRINT_CLASS_PROBES.len(), 57);
+        for case_id in [
+            AST_PRINT_LITERAL_CASE_ID,
+            AST_PRINT_DOT_CASE_ID,
+            AST_PRINT_CONCAT_CASE_ID,
+            AST_PRINT_ALTERNATION_CASE_ID,
+            AST_PRINT_ASSERTION_CASE_ID,
+            AST_PRINT_REPETITION_CASE_ID,
+            AST_PRINT_FLAGS_CASE_ID,
+            AST_PRINT_GROUP_CASE_ID,
+            AST_PRINT_CLASS_CASE_ID,
+        ] {
+            let disposition = execute_ast_print_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: ast_print_pass_evidence(case_id),
+                }
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/ast/print.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported AST print receipt");
         }
     }
 
