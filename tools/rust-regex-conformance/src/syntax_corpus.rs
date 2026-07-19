@@ -14,8 +14,8 @@ use std::{
 
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ErrorCategory,
-    ParseError, ParseRequest, RustAstOptions, RustAstRecord, RustProfile, SCHEMA_VERSION,
-    SafetyEnvelope, SourceSpan, parse, parse_rust_ast, parse_rust_ast_with_options,
+    ParseError, ParseRequest, RustAstOptions, RustAstRecord, RustProfile, RustUnicodeFeatures,
+    SCHEMA_VERSION, SafetyEnvelope, SourceSpan, parse, parse_rust_ast, parse_rust_ast_with_options,
 };
 use regex_syntax::ast::{Ast, Concat, HexLiteralKind, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,10 @@ const HIR_LITERAL_CRAZY_REPEATS_CASE_ID: &str = "hir::literal::tests::crazy_repe
 const HIR_LITERAL_HUGE_CASE_ID: &str = "hir::literal::tests::huge";
 const HIR_LITERAL_OPTIMIZE_CASE_ID: &str = "hir::literal::tests::optimize";
 const HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID: &str = "hir::tests::class_case_fold_unicode";
+const HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_CASE_ID: &str =
+    "hir::tests::class_case_fold_unicode_disabled";
+const HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_PANICS_CASE_ID: &str =
+    "hir::tests::class_case_fold_unicode_disabled_panics";
 const HIR_CLASS_CASE_FOLD_BYTES_CASE_ID: &str = "hir::tests::class_case_fold_bytes";
 const HIR_CLASS_NEGATE_UNICODE_CASE_ID: &str = "hir::tests::class_negate_unicode";
 const HIR_CLASS_NEGATE_BYTES_CASE_ID: &str = "hir::tests::class_negate_bytes";
@@ -170,6 +174,8 @@ const UTF8_DOCTEST_SEQUENCES_CASE_ID: &str = "src/utf8.rs - utf8::Utf8Sequences 
 const TOP_ESCAPE_META_CASE_ID: &str = "tests::escape_meta";
 const TOP_WORD_BYTE_CASE_ID: &str = "tests::word_byte";
 const TOP_WORD_CHAR_CASE_ID: &str = "tests::word_char";
+const TOP_WORD_CHAR_DISABLED_ERROR_CASE_ID: &str = "tests::word_char_disabled_error";
+const TOP_WORD_CHAR_DISABLED_PANIC_CASE_ID: &str = "tests::word_char_disabled_panic";
 const TOP_DOCTEST_PARSE_CASE_ID: &str = "src/lib.rs - (line 39)";
 const TOP_DOCTEST_META_CASE_ID: &str = "src/lib.rs - is_meta_character (line 248)";
 const TOP_DOCTEST_ESCAPEABLE_CASE_ID: &str = "src/lib.rs - is_escapeable_character (line 291)";
@@ -179,6 +185,7 @@ const UNICODE_RANGE_CONTAINS_CASE_ID: &str = "unicode::tests::range_contains";
 const UNICODE_REGRESSION_466_CASE_ID: &str = "unicode::tests::regression_466";
 const UNICODE_SYM_NORMALIZE_CASE_ID: &str = "unicode::tests::sym_normalize";
 const UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID: &str = "unicode::tests::valid_utf8_symbolic";
+const UNICODE_SIMPLE_FOLD_DISABLED_CASE_ID: &str = "unicode::tests::simple_fold_disabled";
 const AST_SIZE_CASE_ID: &str = "ast::tests::ast_size";
 const AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID: &str = "ast::tests::no_stack_overflow_on_drop";
 const ERROR_REGRESSION_464_CASE_ID: &str = "error::tests::regression_464";
@@ -257,6 +264,18 @@ const HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID: &str =
     "hir::translate::tests::regression_fuzz_difference1";
 const HIR_TRANSLATE_REGRESSION_FUZZ_CHAR_DECREMENT_CASE_ID: &str =
     "hir::translate::tests::regression_fuzz_char_decrement1";
+const HIR_TRANSLATE_CLASS_PERL_DIGIT_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_perl_digit_disabled";
+const HIR_TRANSLATE_CLASS_PERL_SPACE_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_perl_space_disabled";
+const HIR_TRANSLATE_CLASS_PERL_WORD_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_perl_word_disabled";
+const HIR_TRANSLATE_CLASS_UNICODE_AGE_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_age_disabled";
+const HIR_TRANSLATE_CLASS_UNICODE_GENCAT_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_gencat_disabled";
+const HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_DISABLED_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_script_disabled";
 const HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID: &str =
     "src/hir/literal.rs - hir::literal::Extractor (line 103)";
 const HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID: &str =
@@ -3842,6 +3861,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
         };
     }
+    if is_supported_feature_disabled_case(&obligation.case_id) {
+        return execute_feature_disabled_case(&obligation.case_id);
+    }
     if is_supported_utf8_case(&obligation.case_id) {
         return execute_utf8_case(&obligation.case_id);
     }
@@ -4271,6 +4293,23 @@ fn is_supported_ast_robustness_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_feature_disabled_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_CASE_ID
+            | HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_PANICS_CASE_ID
+            | HIR_TRANSLATE_CLASS_PERL_DIGIT_DISABLED_CASE_ID
+            | HIR_TRANSLATE_CLASS_PERL_SPACE_DISABLED_CASE_ID
+            | HIR_TRANSLATE_CLASS_PERL_WORD_DISABLED_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_AGE_DISABLED_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_GENCAT_DISABLED_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_DISABLED_CASE_ID
+            | TOP_WORD_CHAR_DISABLED_ERROR_CASE_ID
+            | TOP_WORD_CHAR_DISABLED_PANIC_CASE_ID
+            | UNICODE_SIMPLE_FOLD_DISABLED_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -4635,6 +4674,28 @@ fn execute_ast_robustness_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-ast-robustness-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_feature_disabled_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_feature_disabled_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: feature_disabled_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: feature_disabled_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-no-default-feature-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -6673,6 +6734,141 @@ fn assert_ast_error_binding(
     validate_ast_error(&observed, &expected, pattern, &profile, case_id)
 }
 
+type FeatureDisabledProbe = (&'static str, u64, u64, &'static str, &'static str);
+
+fn run_feature_disabled_case(case_id: &str) -> Result<(), AstMismatch> {
+    let mut rust_profile = RustProfile::regex_1_12_4();
+    rust_profile.unicode_features = RustUnicodeFeatures::NONE;
+    let profile = CompatibilityProfile::RustText(rust_profile);
+    for (index, &(pattern, span_start, span_end, source_message, fre_message)) in
+        feature_disabled_probes(case_id).iter().enumerate()
+    {
+        let refusal = match parse(ParseRequest::rust(pattern, profile.clone())) {
+            Err(error) => error,
+            Ok(record) => {
+                return Err(AstMismatch {
+                    expected: format!(
+                        "{case_id}-{index}: source rejects {pattern:?} with {source_message}; FRE rejects with {fre_message}"
+                    ),
+                    observed: format!("{case_id}-{index}: accepted {record:?}"),
+                });
+            }
+        };
+        let expected_span = SourceSpan {
+            start: span_start,
+            end: span_end,
+        };
+        let valid = refusal.schema_version == SCHEMA_VERSION
+            && refusal.profile.as_ref() == &profile
+            && refusal.category == ErrorCategory::UpstreamRustSyntax
+            && refusal.span == Some(expected_span)
+            && refusal.message == fre_message;
+        if !valid {
+            return Err(AstMismatch {
+                expected: format!(
+                    "{case_id}-{index}: source-message={source_message:?}, schema={SCHEMA_VERSION}, profile={profile:?}, category=UpstreamRustSyntax, span={expected_span:?}, exact-message={fre_message:?}"
+                ),
+                observed: format!("{case_id}-{index}: {refusal:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn feature_disabled_probes(case_id: &str) -> &'static [FeatureDisabledProbe] {
+    const SOURCE_UNICODE_CASE_MESSAGE: &str = "Unicode-aware case insensitivity matching is not available (make sure the unicode-case feature is enabled)";
+    const SOURCE_UNICODE_PERL_MESSAGE: &str =
+        "Unicode-aware Perl class not found (make sure the unicode-perl feature is enabled)";
+    const SOURCE_UNICODE_PROPERTY_MESSAGE: &str = "Unicode property not found";
+    const FRE_UNICODE_CASE_MESSAGE: &str =
+        "Unicode case-folding data is unavailable in this Rust profile";
+    const FRE_UNICODE_PERL_MESSAGE: &str =
+        "Unicode Perl-class data is unavailable in this Rust profile";
+    const FRE_UNICODE_PROPERTY_MESSAGE: &str =
+        "Unicode property data is unavailable in this Rust profile";
+
+    match case_id {
+        HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_CASE_ID
+        | HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_PANICS_CASE_ID => &[(
+            r"(?i:[A-Sa-f])",
+            4,
+            12,
+            SOURCE_UNICODE_CASE_MESSAGE,
+            FRE_UNICODE_CASE_MESSAGE,
+        )],
+        HIR_TRANSLATE_CLASS_PERL_DIGIT_DISABLED_CASE_ID => &[(
+            r"\d",
+            0,
+            2,
+            SOURCE_UNICODE_PERL_MESSAGE,
+            FRE_UNICODE_PERL_MESSAGE,
+        )],
+        HIR_TRANSLATE_CLASS_PERL_SPACE_DISABLED_CASE_ID => &[(
+            r"\s",
+            0,
+            2,
+            SOURCE_UNICODE_PERL_MESSAGE,
+            FRE_UNICODE_PERL_MESSAGE,
+        )],
+        HIR_TRANSLATE_CLASS_PERL_WORD_DISABLED_CASE_ID
+        | TOP_WORD_CHAR_DISABLED_ERROR_CASE_ID
+        | TOP_WORD_CHAR_DISABLED_PANIC_CASE_ID => &[(
+            r"\w",
+            0,
+            2,
+            SOURCE_UNICODE_PERL_MESSAGE,
+            FRE_UNICODE_PERL_MESSAGE,
+        )],
+        HIR_TRANSLATE_CLASS_UNICODE_AGE_DISABLED_CASE_ID => &[(
+            r"\p{age:3.0}",
+            0,
+            11,
+            SOURCE_UNICODE_PROPERTY_MESSAGE,
+            FRE_UNICODE_PROPERTY_MESSAGE,
+        )],
+        HIR_TRANSLATE_CLASS_UNICODE_GENCAT_DISABLED_CASE_ID => &[
+            (
+                r"\p{Separator}",
+                0,
+                13,
+                SOURCE_UNICODE_PROPERTY_MESSAGE,
+                FRE_UNICODE_PROPERTY_MESSAGE,
+            ),
+            (
+                r"\p{Any}",
+                0,
+                7,
+                SOURCE_UNICODE_PROPERTY_MESSAGE,
+                FRE_UNICODE_PROPERTY_MESSAGE,
+            ),
+        ],
+        HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_DISABLED_CASE_ID => &[
+            (
+                r"\p{Greek}",
+                0,
+                9,
+                SOURCE_UNICODE_PROPERTY_MESSAGE,
+                FRE_UNICODE_PROPERTY_MESSAGE,
+            ),
+            (
+                r"\p{scx:Greek}",
+                0,
+                13,
+                SOURCE_UNICODE_PROPERTY_MESSAGE,
+                FRE_UNICODE_PROPERTY_MESSAGE,
+            ),
+        ],
+        UNICODE_SIMPLE_FOLD_DISABLED_CASE_ID => &[(
+            r"(?i:a)",
+            4,
+            5,
+            SOURCE_UNICODE_CASE_MESSAGE,
+            FRE_UNICODE_CASE_MESSAGE,
+        )],
+        _ => unreachable!("caller checked supported no-default feature case"),
+    }
+}
+
 fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
     debug_assert!((0xD800..0xE000).contains(&codepoint));
     [
@@ -8457,6 +8653,29 @@ fn ast_robustness_pass_evidence(case_id: &str) -> String {
     )
 }
 
+fn feature_disabled_pass_evidence(case_id: &str) -> String {
+    let source_outcome = match case_id {
+        HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_PANICS_CASE_ID
+        | TOP_WORD_CHAR_DISABLED_PANIC_CASE_ID => "should-panic",
+        _ => "error",
+    };
+    let mut contract = format!(
+        "fre.regex-syntax.no-default-feature-adapter.v1\ncase={case_id}\nsource=pinned-regex-syntax-0.8.11-no-default-harness\nprofile=fre-rust-text-unicode-features-none\nsource-outcome={source_outcome}\nexpected=authenticated-source-oracle-pass-plus-exact-fre-disabled-feature-refusal\n"
+    );
+    for (index, &(pattern, span_start, span_end, source_message, fre_message)) in
+        feature_disabled_probes(case_id).iter().enumerate()
+    {
+        writeln!(
+            contract,
+            "probe-{index}=sha256:{},bytes:{},span:{span_start}..{span_end},source-message:{source_message},fre-message:{fre_message}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    sha256(contract.as_bytes())
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -8889,6 +9108,15 @@ fn ast_robustness_mismatch_evidence(case_id: &str, expected: &str, observed: &st
     )
 }
 
+fn feature_disabled_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.no-default-feature-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -8916,6 +9144,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_top_level_case(case_id)
         || is_supported_unicode_case(case_id)
         || is_supported_ast_robustness_case(case_id)
+        || is_supported_feature_disabled_case(case_id)
         || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
@@ -8938,6 +9167,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         unicode_pass_evidence(case_id)
     } else if is_supported_ast_robustness_case(case_id) {
         ast_robustness_pass_evidence(case_id)
+    } else if is_supported_feature_disabled_case(case_id) {
+        feature_disabled_pass_evidence(case_id)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8964,6 +9195,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         unicode_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_ast_robustness_case(case_id) {
         ast_robustness_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_feature_disabled_case(case_id) {
+        feature_disabled_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8990,6 +9223,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-unicode-adapter"
     } else if is_supported_ast_robustness_case(case_id) {
         "fre-ast-robustness-adapter"
+    } else if is_supported_feature_disabled_case(case_id) {
+        "fre-no-default-feature-adapter"
     } else if is_supported_hir_misc_case(case_id) {
         "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -9031,6 +9266,14 @@ fn valid_unsupported_unit_disposition(
             && reason_code == "fre-adapter.hir-translate-not-implemented";
     }
     reason_code == "fre-adapter.unit-family-not-implemented"
+}
+
+fn valid_syntax_adapter_membership(obligation: &RegexSyntaxCorpusObligation) -> bool {
+    if is_supported_feature_disabled_case(&obligation.case_id) {
+        !obligation.default_harness_member && obligation.no_default_harness_member
+    } else {
+        obligation.default_harness_member || obligation.no_default_harness_member
+    }
 }
 
 fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), InventoryError> {
@@ -9089,7 +9332,7 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
         ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
-            (obligation.default_harness_member || obligation.no_default_harness_member)
+            valid_syntax_adapter_membership(obligation)
                 && evidence_sha256 == &syntax_case_pass_evidence(&obligation.case_id)
                 && fixed_ast_hex_pass_evidence(&obligation.case_id)
                     .is_none_or(|fixed| evidence_sha256 == fixed)
@@ -9104,6 +9347,7 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
             !expected.is_empty()
                 && !observed.is_empty()
+                && valid_syntax_adapter_membership(obligation)
                 && expected.len() <= 65_536
                 && observed.len() <= 65_536
                 && evidence_sha256
@@ -9115,6 +9359,7 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
             stage == syntax_case_fault_stage(&obligation.case_id)
                 && reason_code == "candidate.adapter-panicked"
+                && valid_syntax_adapter_membership(obligation)
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
@@ -9464,7 +9709,7 @@ mod tests {
     }
 
     #[test]
-    fn no_default_only_definition_remains_a_real_adapter_obligation() {
+    fn no_default_only_definition_executes_through_the_dedicated_adapter() {
         let obligation = RegexSyntaxCorpusObligation {
             case_id: "tests::word_char_disabled_error".to_owned(),
             kind: RegexSyntaxCorpusCaseKind::Unit,
@@ -9476,8 +9721,10 @@ mod tests {
         };
         assert_eq!(
             disposition_for(&obligation),
-            RegexSyntaxCorpusDisposition::Unsupported {
-                reason_code: "fre-adapter.unit-family-not-implemented".to_owned(),
+            RegexSyntaxCorpusDisposition::Pass {
+                evidence_sha256: feature_disabled_pass_evidence(
+                    TOP_WORD_CHAR_DISABLED_ERROR_CASE_ID
+                ),
             }
         );
     }
@@ -10039,6 +10286,48 @@ mod tests {
             disposition,
         })
         .expect("supported remaining HIR translate receipt");
+    }
+
+    #[test]
+    fn authenticated_no_default_adapter_executes_all_11_source_identities() {
+        for case_id in [
+            HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_CASE_ID,
+            HIR_CLASS_CASE_FOLD_UNICODE_DISABLED_PANICS_CASE_ID,
+            HIR_TRANSLATE_CLASS_PERL_DIGIT_DISABLED_CASE_ID,
+            HIR_TRANSLATE_CLASS_PERL_SPACE_DISABLED_CASE_ID,
+            HIR_TRANSLATE_CLASS_PERL_WORD_DISABLED_CASE_ID,
+            HIR_TRANSLATE_CLASS_UNICODE_AGE_DISABLED_CASE_ID,
+            HIR_TRANSLATE_CLASS_UNICODE_GENCAT_DISABLED_CASE_ID,
+            HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_DISABLED_CASE_ID,
+            TOP_WORD_CHAR_DISABLED_ERROR_CASE_ID,
+            TOP_WORD_CHAR_DISABLED_PANIC_CASE_ID,
+            UNICODE_SIMPLE_FOLD_DISABLED_CASE_ID,
+        ] {
+            let disposition = execute_feature_disabled_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: feature_disabled_pass_evidence(case_id),
+                },
+            );
+            let receipt = RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "authenticated-no-default-source.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: false,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            };
+            validate_disposition(&receipt).expect("supported no-default receipt");
+
+            let mut wrong_membership = receipt.clone();
+            wrong_membership.obligation.default_harness_member = true;
+            assert!(validate_disposition(&wrong_membership).is_err());
+        }
     }
 
     #[test]
