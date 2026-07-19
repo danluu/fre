@@ -65,6 +65,7 @@ const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
 const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
     "ast::parse::tests::parse_unsupported_backreference";
 const AST_UNSUPPORTED_LOOKAROUND_CASE_ID: &str = "ast::parse::tests::parse_unsupported_lookaround";
+const AST_OCTAL_CASE_ID: &str = "ast::parse::tests::parse_octal";
 const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
 const AST_REGRESSION_455_CASE_ID: &str =
     "ast::parse::tests::regression_455_trailing_dash_ignore_whitespace";
@@ -155,8 +156,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_holistic, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 24 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 154 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_holistic, parse_octal, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 23 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 152 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -1510,6 +1511,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
         AST_HOLISTIC_CASE_ID
+            | AST_OCTAL_CASE_ID
             | AST_UNSUPPORTED_BACKREFERENCE_CASE_ID
             | AST_UNSUPPORTED_LOOKAROUND_CASE_ID
             | AST_REGRESSION_454_CASE_ID
@@ -1520,6 +1522,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
         AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_unsupported_backreference))
         }
@@ -1616,6 +1619,53 @@ fn run_ast_unsupported_backreference() -> Result<(), AstMismatch> {
             &profile,
             &format!("backreference-probe-{index}"),
         )?;
+    }
+    Ok(())
+}
+
+fn run_ast_octal() -> Result<(), AstMismatch> {
+    let mut patterns: Vec<String> = (0..511).map(|value| format!(r"\{value:o}")).collect();
+    patterns.extend([r"\778".to_owned(), r"\7777".to_owned(), r"\8".to_owned()]);
+
+    for (index, pattern) in patterns.iter().enumerate() {
+        let expected = regex_syntax::ast::parse::ParserBuilder::new()
+            .octal(true)
+            .build()
+            .parse(pattern);
+        let mut rust_profile = RustProfile::regex_1_12_4();
+        rust_profile.options.octal = true;
+        let profile = CompatibilityProfile::RustText(rust_profile.clone());
+        let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()));
+        match (expected, observed) {
+            (Ok(expected_ast), Ok(record)) => {
+                if record.ast != expected_ast {
+                    return Err(AstMismatch {
+                        expected: format!("octal-probe-{index}: Ok({expected_ast:?})"),
+                        observed: format!("octal-probe-{index}: Ok({:?})", record.ast),
+                    });
+                }
+                validate_ast_record(&record, pattern, &rust_profile)?;
+            }
+            (Err(expected_error), Err(observed_error)) => validate_ast_error(
+                &observed_error,
+                &expected_error,
+                pattern,
+                &profile,
+                &format!("octal-probe-{index}"),
+            )?,
+            (Ok(expected_ast), Err(observed_error)) => {
+                return Err(AstMismatch {
+                    expected: format!("octal-probe-{index}: Ok({expected_ast:?})"),
+                    observed: format!("octal-probe-{index}: Err({observed_error:?})"),
+                });
+            }
+            (Err(expected_error), Ok(record)) => {
+                return Err(AstMismatch {
+                    expected: format!("octal-probe-{index}: Err({expected_error:?})"),
+                    observed: format!("octal-probe-{index}: Ok({:?})", record.ast),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1811,6 +1861,28 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
                     "probe-{index}=sha256:{},bytes:{},expected:error:UnsupportedLookAround,span:0..{end}",
                     sha256(pattern.as_bytes()),
                     pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        AST_OCTAL_CASE_ID => {
+            for value in 0..511 {
+                let pattern = format!(r"\{value:o}");
+                writeln!(
+                    contract,
+                    "probe-{value}=sha256:{},bytes:{},octal:true,expected:ok",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+            for (index, pattern) in [r"\778", r"\7777", r"\8"].into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "edge-probe-{index}=sha256:{},bytes:{},octal:true,expected:{}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                    if pattern == r"\8" { "err" } else { "ok" },
                 )
                 .expect("writing to a String cannot fail");
             }
@@ -2320,6 +2392,7 @@ mod tests {
     #[test]
     fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
         for case_id in [
+            AST_OCTAL_CASE_ID,
             AST_UNSUPPORTED_BACKREFERENCE_CASE_ID,
             AST_UNSUPPORTED_LOOKAROUND_CASE_ID,
             AST_REGRESSION_454_CASE_ID,
