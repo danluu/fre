@@ -2203,28 +2203,16 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
                 .expect("writing to a String cannot fail");
             }
         }
-        AST_PERL_CLASS_CASE_ID => {
-            for (index, pattern) in PERL_CLASS_PROBES.into_iter().enumerate() {
-                writeln!(
-                    contract,
-                    "probe-{index}=sha256:{},bytes:{},expected:upstream-exact-success",
-                    sha256(pattern.as_bytes()),
-                    pattern.len(),
-                )
-                .expect("writing to a String cannot fail");
-            }
-        }
-        AST_UNICODE_CLASS_CASE_ID => {
-            for (index, pattern) in UNICODE_CLASS_PROBES.into_iter().enumerate() {
-                writeln!(
-                    contract,
-                    "probe-{index}=sha256:{},bytes:{},expected:upstream-exact-result",
-                    sha256(pattern.as_bytes()),
-                    pattern.len(),
-                )
-                .expect("writing to a String cannot fail");
-            }
-        }
+        AST_PERL_CLASS_CASE_ID => write_ast_equivalence_evidence(
+            &mut contract,
+            &PERL_CLASS_PROBES,
+            "upstream-exact-success",
+        ),
+        AST_UNICODE_CLASS_CASE_ID => write_ast_equivalence_evidence(
+            &mut contract,
+            &UNICODE_CLASS_PROBES,
+            "upstream-exact-result",
+        ),
         AST_OCTAL_CASE_ID => {
             for value in 0..511 {
                 let pattern = format!(r"\{value:o}");
@@ -2274,6 +2262,18 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         _ => unreachable!("pass evidence requires a supported AST case"),
     }
     sha256(contract.as_bytes())
+}
+
+fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expected: &str) {
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        writeln!(
+            contract,
+            "probe-{index}=sha256:{},bytes:{},expected:{expected}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 fn write_ast_hex_evidence(contract: &mut String, case: AstHexCase) {
