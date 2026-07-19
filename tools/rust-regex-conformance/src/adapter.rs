@@ -32,13 +32,14 @@ use crate::{
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
 pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v17-singleton-set-and-utf8-bytes-capture-delegates";
+    "fre-portable-rust-facade-v18-singleton-set-utf8-bytes-capture-and-set-compile-delegates";
 
-const LIMITATIONS: [&str; 4] = [
+const LIMITATIONS: [&str; 5] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
+    "UTF-8 bytes RegexSet compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof; this does not expose native bytes-set execution",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -170,6 +171,7 @@ fn execute_case(
         }
         AdapterSurface::RustTextSetIsMatch => execute_text_set_is_match(case, input),
         AdapterSurface::RustTextSetWhich => execute_text_set_which(case, input),
+        AdapterSurface::RustBytesSetCompile if case.utf8 => execute_text_set_compile(case, input),
         AdapterSurface::RustBytesSetCompile => execute_bytes_set_compile(case, input),
         surface @ (AdapterSurface::RustBytesSetIsMatch | AdapterSurface::RustBytesSetWhich)
             if case.utf8 && singleton_set_delegate_applicability(surface, case, input).is_ok() =>
@@ -1717,6 +1719,9 @@ fn surface_applicability(
         AdapterSurface::RustTextSetCompile
         | AdapterSurface::RustTextSetIsMatch
         | AdapterSurface::RustTextSetWhich => set_applicability(surface, case, input, true)?,
+        AdapterSurface::RustBytesSetCompile if case.utf8 => {
+            set_applicability(surface, case, input, true)?;
+        }
         AdapterSurface::RustBytesSetCompile
         | AdapterSurface::RustBytesSetIsMatch
         | AdapterSurface::RustBytesSetWhich => set_applicability(surface, case, input, false)?,
@@ -2432,6 +2437,39 @@ mod tests {
     }
 
     #[test]
+    fn utf8_bytes_set_compile_delegates_only_compile_to_text_proof() {
+        let mut case = fixture_case(true, true, None);
+        case.pattern_count = 2;
+        case.match_kind = MatchKind::All;
+        case.search_kind = SearchKind::Overlapping;
+        case.unicode = true;
+        let mut input = fixture_input(Vec::new());
+        input.patterns = vec!["a".to_owned(), "é+".to_owned()];
+        input.haystack = "aé".as_bytes().to_vec();
+        input.bounds.end = input.haystack.len();
+
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetCompile, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetIsMatch, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        case.compiles = false;
+        input.patterns = vec!["a".to_owned(), "(".to_owned()];
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetCompile, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
     fn text_set_scalar_guarded_ascii_assertions_execute() {
         let mut case = fixture_case(true, true, None);
         case.match_kind = MatchKind::All;
@@ -2485,8 +2523,12 @@ mod tests {
         ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesSetCompile, &text_case, &text_input),
-            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetCompile, &text_case, &text_input,),
+            AdapterDisposition::Pass { .. }
+        ));
 
         let bytes_case = fixture_case(true, false, None);
         assert!(matches!(
