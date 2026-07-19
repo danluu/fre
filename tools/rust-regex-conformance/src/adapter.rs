@@ -31,15 +31,17 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v19-selection-invariant-set-observations";
+pub const ADAPTER_ID: &str =
+    "fre-portable-rust-facade-v20-selection-invariant-single-and-set-observations";
 
-const LIMITATIONS: [&str; 6] = [
+const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "UTF-8 bytes RegexSet compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof; this does not expose native bytes-set execution",
     "non-overlapping set is-match may ignore match-selection policy only for unanchored full-haystack existence, while set which does so only for zero or one pattern; UTF-8 bytes rows delegate to the text set and do not claim native bytes-set execution",
+    "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations remain gated on exact policy support",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -1765,11 +1767,13 @@ fn single_applicability(
     if input.patterns.len() != 1 {
         return Err(NotApplicableReason::PatternMultiplicity);
     }
-    if case.search_kind != SearchKind::Leftmost {
-        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
-    }
-    if case.match_kind != MatchKind::LeftmostFirst {
-        return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
+    if !single_selection_policy_invariant(surface) {
+        if case.search_kind != SearchKind::Leftmost {
+            return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
+        }
+        if case.match_kind != MatchKind::LeftmostFirst {
+            return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
+        }
     }
     if matches!(
         surface,
@@ -1801,6 +1805,16 @@ fn single_applicability(
         return Err(NotApplicableReason::InvalidUtf8Haystack);
     }
     Ok(())
+}
+
+const fn single_selection_policy_invariant(surface: AdapterSurface) -> bool {
+    matches!(
+        surface,
+        AdapterSurface::RustTextCompile
+            | AdapterSurface::RustTextIsMatch
+            | AdapterSurface::RustBytesCompile
+            | AdapterSurface::RustBytesIsMatch
+    )
 }
 
 fn set_applicability(
@@ -1871,6 +1885,15 @@ fn singleton_set_delegate_applicability(
 ) -> Result<(), NotApplicableReason> {
     if input.patterns.len() != 1 {
         return Err(NotApplicableReason::PatternMultiplicity);
+    }
+    // Preserve the canonical singleton-delegation envelope. Broader reviewed
+    // set observations are admitted separately below; this single-regex lane
+    // must not silently widen their cross-product.
+    if case.search_kind != SearchKind::Leftmost {
+        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
+    }
+    if case.match_kind != MatchKind::LeftmostFirst {
+        return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
     }
     let (delegate, text) = match surface {
         AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich => {
@@ -3095,6 +3118,50 @@ mod tests {
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextFindIter, &case, &input),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+    }
+
+    #[test]
+    fn compile_and_match_existence_ignore_selection_policy_only() {
+        let mut case = fixture_case(true, true, None);
+        case.search_kind = SearchKind::Earliest;
+        case.match_kind = MatchKind::All;
+        let input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }]);
+        for surface in [
+            AdapterSurface::RustTextCompile,
+            AdapterSurface::RustTextIsMatch,
+            AdapterSurface::RustBytesCompile,
+            AdapterSurface::RustBytesIsMatch,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+        for surface in [
+            AdapterSurface::RustTextFindIter,
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &case, &input),
+                Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+            );
+        }
+
+        case.utf8 = false;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextCompile, &case, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
+            Ok(())
         );
     }
 
