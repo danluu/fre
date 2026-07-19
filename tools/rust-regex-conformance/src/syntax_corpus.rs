@@ -170,6 +170,12 @@ const TOP_WORD_CHAR_CASE_ID: &str = "tests::word_char";
 const TOP_DOCTEST_PARSE_CASE_ID: &str = "src/lib.rs - (line 39)";
 const TOP_DOCTEST_META_CASE_ID: &str = "src/lib.rs - is_meta_character (line 248)";
 const TOP_DOCTEST_ESCAPEABLE_CASE_ID: &str = "src/lib.rs - is_escapeable_character (line 291)";
+const UNICODE_SIMPLE_FOLD_K_CASE_ID: &str = "unicode::tests::simple_fold_k";
+const UNICODE_SIMPLE_FOLD_A_CASE_ID: &str = "unicode::tests::simple_fold_a";
+const UNICODE_RANGE_CONTAINS_CASE_ID: &str = "unicode::tests::range_contains";
+const UNICODE_REGRESSION_466_CASE_ID: &str = "unicode::tests::regression_466";
+const UNICODE_SYM_NORMALIZE_CASE_ID: &str = "unicode::tests::sym_normalize";
+const UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID: &str = "unicode::tests::valid_utf8_symbolic";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -3526,6 +3532,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
     if is_supported_top_level_case(&obligation.case_id) {
         return execute_top_level_case(&obligation.case_id);
     }
+    if is_supported_unicode_case(&obligation.case_id) {
+        return execute_unicode_case(&obligation.case_id);
+    }
     if is_supported_hir_misc_case(&obligation.case_id) {
         return execute_hir_misc_case(&obligation.case_id);
     }
@@ -3918,6 +3927,18 @@ fn is_supported_top_level_doctest_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_unicode_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        UNICODE_SIMPLE_FOLD_K_CASE_ID
+            | UNICODE_SIMPLE_FOLD_A_CASE_ID
+            | UNICODE_RANGE_CONTAINS_CASE_ID
+            | UNICODE_REGRESSION_466_CASE_ID
+            | UNICODE_SYM_NORMALIZE_CASE_ID
+            | UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -4237,6 +4258,28 @@ fn execute_top_level_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-top-level-syntax-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_unicode_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_unicode_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: unicode_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: unicode_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-unicode-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -5814,6 +5857,235 @@ fn run_top_level_case(case_id: &str) -> Result<(), AstMismatch> {
         _ => unreachable!("caller checked supported top-level syntax case"),
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors six independently identified Unicode tests"
+)]
+fn run_unicode_case(case_id: &str) -> Result<(), AstMismatch> {
+    match case_id {
+        UNICODE_SIMPLE_FOLD_K_CASE_ID => {
+            for (index, (scalar, expected)) in [
+                ('k', &['K', '\u{212A}'][..]),
+                ('K', &['k', '\u{212A}'][..]),
+                ('\u{212A}', &['K', 'k'][..]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_unicode_simple_fold_mapping(case_id, index, scalar, expected, r"(?i:k)")?;
+            }
+        }
+        UNICODE_SIMPLE_FOLD_A_CASE_ID => {
+            for (index, (scalar, expected)) in [('a', &['A'][..]), ('A', &['a'][..])]
+                .into_iter()
+                .enumerate()
+            {
+                assert_unicode_simple_fold_mapping(case_id, index, scalar, expected, r"(?i:a)")?;
+            }
+        }
+        UNICODE_RANGE_CONTAINS_CASE_ID => {
+            for (index, (start, end, expected)) in [
+                ('A', 'A', true),
+                ('Z', 'Z', true),
+                ('A', 'Z', true),
+                ('@', 'A', true),
+                ('Z', '[', true),
+                ('☃', 'Ⰰ', true),
+                ('[', '[', false),
+                ('[', '`', false),
+                ('☃', '☃', false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_unicode_range_contains(case_id, index, start, end, expected)?;
+            }
+        }
+        UNICODE_REGRESSION_466_CASE_ID => {
+            let (_, fre_short) = exact_text_hir_pair(r"\pC", case_id)?;
+            let (_, fre_canonical) = exact_text_hir_pair(r"\p{General_Category=Other}", case_id)?;
+            hir_doctest_assert_eq(
+                case_id,
+                "one-letter-C-canonicalizes-to-general-category-Other",
+                &fre_canonical,
+                &fre_short,
+            )?;
+        }
+        UNICODE_SYM_NORMALIZE_CASE_ID => {
+            for (index, (input, expected)) in [
+                ("Line_Break", "linebreak"),
+                ("Line-break", "linebreak"),
+                ("linebreak", "linebreak"),
+                ("BA", "ba"),
+                ("ba", "ba"),
+                ("Greek", "greek"),
+                ("isGreek", "greek"),
+                ("IS_Greek", "greek"),
+                ("isc", "isc"),
+                ("is c", "isc"),
+                ("is_c", "isc"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let observed = pinned_symbolic_name_normalize(input);
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    expected,
+                    observed.as_str(),
+                )?;
+            }
+            assert_unicode_aliases_equivalent(
+                case_id,
+                "Greek-aliases",
+                &[r"\p{Greek}", r"\p{isGreek}", r"\p{IS_Greek}"],
+            )?;
+            for (index, pattern) in [
+                r"\p{Line_Break=Alphabetic}",
+                r"\p{Line-break=Alphabetic}",
+                r"\p{linebreak=Alphabetic}",
+                r"\p{isc}",
+                r"\p{is c}",
+                r"\p{is_c}",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                execute_hir_translate_error_probe(
+                    pattern,
+                    false,
+                    &format!("{case_id}-normalized-property-{index}"),
+                )?;
+            }
+        }
+        UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID => {
+            let mut input = b"abc\xFFxyz".to_vec();
+            let observed = pinned_symbolic_name_normalize_bytes(&mut input).to_vec();
+            hir_doctest_assert_eq(case_id, "source-assertion", &b"abcxyz"[..], &observed)?;
+            for (index, pattern) in [r"\p{abcÿxyz}", r"\p{abcxyz}"].into_iter().enumerate() {
+                execute_hir_translate_error_probe(
+                    pattern,
+                    false,
+                    &format!("{case_id}-non-ascii-property-{index}"),
+                )?;
+            }
+        }
+        _ => unreachable!("caller checked supported Unicode case"),
+    }
+    Ok(())
+}
+
+fn assert_unicode_simple_fold_mapping(
+    case_id: &str,
+    index: usize,
+    scalar: char,
+    expected: &[char],
+    pattern: &str,
+) -> Result<(), AstMismatch> {
+    let (upstream_hir, fre_hir) = exact_text_hir_pair(pattern, case_id)?;
+    for (implementation, hir) in [("upstream", &upstream_hir), ("fre", &fre_hir)] {
+        let class = unicode_class_from_hir(hir, case_id)?;
+        let mut observed = Vec::new();
+        for range in class.iter() {
+            if range.start() != range.end() {
+                return Err(AstMismatch {
+                    expected: format!("{case_id}/{implementation}-{index}: singleton fold ranges"),
+                    observed: format!("{case_id}/{implementation}-{index}: {range:?}"),
+                });
+            }
+            if range.start() != scalar {
+                observed.push(range.start());
+            }
+        }
+        hir_doctest_assert_eq(
+            case_id,
+            &format!("{implementation}-source-assertion-{index}"),
+            expected,
+            observed.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_unicode_range_contains(
+    case_id: &str,
+    index: usize,
+    start: char,
+    end: char,
+    expected: bool,
+) -> Result<(), AstMismatch> {
+    let plain = format!(r"[\x{{{:X}}}-\x{{{:X}}}]", u32::from(start), u32::from(end));
+    let folded = format!(
+        r"(?i:[\x{{{:X}}}-\x{{{:X}}}])",
+        u32::from(start),
+        u32::from(end),
+    );
+    let (upstream_plain, fre_plain) = exact_text_hir_pair(&plain, case_id)?;
+    let (upstream_folded, fre_folded) = exact_text_hir_pair(&folded, case_id)?;
+    let upstream_observed = upstream_plain != upstream_folded;
+    let fre_observed = fre_plain != fre_folded;
+    hir_doctest_assert_eq(
+        case_id,
+        &format!("upstream-source-assertion-{index}"),
+        &expected,
+        &upstream_observed,
+    )?;
+    hir_doctest_assert_eq(
+        case_id,
+        &format!("fre-source-assertion-{index}"),
+        &expected,
+        &fre_observed,
+    )
+}
+
+fn assert_unicode_aliases_equivalent(
+    case_id: &str,
+    label: &str,
+    patterns: &[&str],
+) -> Result<(), AstMismatch> {
+    let (_, first) = exact_text_hir_pair(patterns[0], case_id)?;
+    for (index, pattern) in patterns.iter().copied().enumerate().skip(1) {
+        let (_, observed) = exact_text_hir_pair(pattern, case_id)?;
+        hir_doctest_assert_eq(case_id, &format!("{label}-{index}"), &first, &observed)?;
+    }
+    Ok(())
+}
+
+fn pinned_symbolic_name_normalize(input: &str) -> String {
+    let mut bytes = input.as_bytes().to_vec();
+    let normalized = pinned_symbolic_name_normalize_bytes(&mut bytes);
+    String::from_utf8(normalized.to_vec()).expect("normalization retains only ASCII")
+}
+
+fn pinned_symbolic_name_normalize_bytes(bytes: &mut [u8]) -> &mut [u8] {
+    let starts_with_is = bytes.len() >= 2 && bytes[..2].eq_ignore_ascii_case(b"is");
+    let start = if starts_with_is { 2 } else { 0 };
+    let mut next_write = 0;
+    for index in start..bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b' ' | b'_' | b'-') {
+            continue;
+        }
+        if byte.is_ascii_uppercase() {
+            bytes[next_write] = byte.to_ascii_lowercase();
+            next_write = next_write
+                .checked_add(1)
+                .expect("write cursor is bounded by the input length");
+        } else if byte.is_ascii() {
+            bytes[next_write] = byte;
+            next_write = next_write
+                .checked_add(1)
+                .expect("write cursor is bounded by the input length");
+        }
+    }
+    if starts_with_is && next_write == 1 && bytes[0] == b'c' {
+        bytes[..3].copy_from_slice(b"isc");
+        next_write = 3;
+    }
+    &mut bytes[..next_write]
 }
 
 fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
@@ -7542,6 +7814,28 @@ fn top_level_pass_evidence(case_id: &str) -> String {
     )
 }
 
+fn unicode_pass_evidence(case_id: &str) -> String {
+    let assertions = match case_id {
+        UNICODE_SIMPLE_FOLD_K_CASE_ID => "three-exact-simple-fold-mappings",
+        UNICODE_SIMPLE_FOLD_A_CASE_ID => "two-exact-simple-fold-mappings",
+        UNICODE_RANGE_CONTAINS_CASE_ID => "nine-case-fold-range-overlap-outcomes",
+        UNICODE_REGRESSION_466_CASE_ID => "one-letter-C-canonical-general-category",
+        UNICODE_SYM_NORMALIZE_CASE_ID => {
+            "eleven-normalizations-plus-public-property-alias-bindings"
+        }
+        UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID => {
+            "non-ascii-byte-elision-plus-public-property-error-bindings"
+        }
+        _ => unreachable!("caller checked supported Unicode case"),
+    };
+    sha256(
+        format!(
+            "fre.regex-syntax.unicode-adapter.v1\ncase={case_id}\nsource=pinned-regex-syntax-0.8.11\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertions={assertions}\nexpected=exact-pinned-unicode-semantics-and-fre-public-hir-or-error-binding\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -7956,6 +8250,15 @@ fn top_level_mismatch_evidence(case_id: &str, expected: &str, observed: &str) ->
     )
 }
 
+fn unicode_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.unicode-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -7981,6 +8284,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_hir_literal_case(case_id)
         || is_supported_utf8_case(case_id)
         || is_supported_top_level_case(case_id)
+        || is_supported_unicode_case(case_id)
         || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
@@ -7999,6 +8303,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         utf8_pass_evidence(case_id)
     } else if is_supported_top_level_case(case_id) {
         top_level_pass_evidence(case_id)
+    } else if is_supported_unicode_case(case_id) {
+        unicode_pass_evidence(case_id)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8021,6 +8327,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         utf8_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_top_level_case(case_id) {
         top_level_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_unicode_case(case_id) {
+        unicode_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8043,6 +8351,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-utf8-adapter"
     } else if is_supported_top_level_case(case_id) {
         "fre-top-level-syntax-adapter"
+    } else if is_supported_unicode_case(case_id) {
+        "fre-unicode-adapter"
     } else if is_supported_hir_misc_case(case_id) {
         "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8967,6 +9277,43 @@ mod tests {
                 disposition,
             })
             .expect("supported top-level doctest receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_unicode_cases_execute_all_6_source_identities() {
+        for case_id in [
+            UNICODE_SIMPLE_FOLD_K_CASE_ID,
+            UNICODE_SIMPLE_FOLD_A_CASE_ID,
+            UNICODE_RANGE_CONTAINS_CASE_ID,
+            UNICODE_REGRESSION_466_CASE_ID,
+            UNICODE_SYM_NORMALIZE_CASE_ID,
+            UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID,
+        ] {
+            let disposition = execute_unicode_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: unicode_pass_evidence(case_id),
+                },
+            );
+            let both_harnesses = matches!(
+                case_id,
+                UNICODE_SYM_NORMALIZE_CASE_ID | UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/unicode.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: both_harnesses,
+                },
+                disposition,
+            })
+            .expect("supported Unicode unit receipt");
         }
     }
 
