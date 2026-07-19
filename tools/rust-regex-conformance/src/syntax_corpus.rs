@@ -284,6 +284,14 @@ const HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID: &str =
     "src/hir/literal.rs - hir::literal::Seq::optimize_for_prefix_by_preference (line 1778)";
 const HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID: &str =
     "src/hir/literal.rs - hir::literal::Seq::optimize_for_prefix_by_preference (line 1806)";
+const HIR_DOCTEST_HIR_LITERAL_BYTES_CASE_ID: &str = "src/hir/mod.rs - hir::Hir::literal (line 305)";
+const HIR_DOCTEST_HIR_LITERAL_CHAR_CASE_ID: &str = "src/hir/mod.rs - hir::Hir::literal (line 332)";
+const HIR_DOCTEST_HIR_CONCAT_CASE_ID: &str = "src/hir/mod.rs - hir::Hir::concat (line 421)";
+const HIR_DOCTEST_HIR_ALTERNATION_CLASS_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Hir::alternation (line 520)";
+const HIR_DOCTEST_HIR_ALTERNATION_PREFIX_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Hir::alternation (line 540)";
+const HIR_DOCTEST_HIR_DOT_CASE_ID: &str = "src/hir/mod.rs - hir::Hir::dot (line 649)";
 const HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID: &str =
     "src/hir/mod.rs - hir::Class::minimum_len (line 926)";
 const HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID: &str =
@@ -3817,6 +3825,7 @@ fn is_supported_hir_doctest_case(case_id: &str) -> bool {
             | HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID
     ) || is_supported_hir_seq_doctest_case(case_id)
+        || is_supported_hir_constructor_doctest_case(case_id)
 }
 
 fn is_supported_hir_seq_doctest_case(case_id: &str) -> bool {
@@ -3847,6 +3856,18 @@ fn is_supported_hir_seq_doctest_case(case_id: &str) -> bool {
             | HIR_DOCTEST_SEQ_OPTIMIZE_PREFIX_CASE_ID
             | HIR_DOCTEST_SEQ_OPTIMIZE_INFINITE_CASE_ID
             | HIR_DOCTEST_SEQ_OPTIMIZE_SPACE_CASE_ID
+    )
+}
+
+fn is_supported_hir_constructor_doctest_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_DOCTEST_HIR_LITERAL_BYTES_CASE_ID
+            | HIR_DOCTEST_HIR_LITERAL_CHAR_CASE_ID
+            | HIR_DOCTEST_HIR_CONCAT_CASE_ID
+            | HIR_DOCTEST_HIR_ALTERNATION_CLASS_CASE_ID
+            | HIR_DOCTEST_HIR_ALTERNATION_PREFIX_CASE_ID
+            | HIR_DOCTEST_HIR_DOT_CASE_ID
     )
 }
 
@@ -5180,6 +5201,9 @@ fn apply_bytes_class_operation(
 }
 
 fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    if is_supported_hir_constructor_doctest_case(case_id) {
+        return run_hir_constructor_doctest_case(case_id);
+    }
     if is_supported_hir_seq_doctest_case(case_id) {
         return run_hir_seq_doctest_case(case_id);
     }
@@ -5220,6 +5244,143 @@ fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
             case_id,
         ),
         _ => unreachable!("caller checked supported HIR doctest case"),
+    }
+}
+
+fn hir_doctest_assert_eq<T: std::fmt::Debug + PartialEq>(
+    case_id: &str,
+    label: &str,
+    expected: &T,
+    observed: &T,
+) -> Result<(), AstMismatch> {
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{case_id}/{label}: {expected:?}"),
+            observed: format!("{case_id}/{label}: {observed:?}"),
+        })
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors six independently identified public doctests"
+)]
+fn run_hir_constructor_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    use regex_syntax::hir::{
+        Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Dot, Hir, HirKind,
+        Literal,
+    };
+
+    match case_id {
+        HIR_DOCTEST_HIR_LITERAL_BYTES_CASE_ID => {
+            let (_, observed) = exact_text_hir_pair("☃", case_id)?;
+            let literals = vec![
+                Hir::literal([0xE2]),
+                Hir::literal([0x98]),
+                Hir::literal([0x83]),
+            ];
+            hir_doctest_assert_eq(
+                case_id,
+                "individual-literals-not-utf8",
+                &true,
+                &literals.iter().all(|hir| !hir.properties().is_utf8()),
+            )?;
+            let concat = Hir::concat(literals);
+            hir_doctest_assert_eq(
+                case_id,
+                "concat-is-utf8",
+                &true,
+                &concat.properties().is_utf8(),
+            )?;
+            let expected = HirKind::Literal(Literal(Box::from("☃".as_bytes())));
+            hir_doctest_assert_eq(case_id, "literal-kind", &expected, concat.kind())?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &concat)?;
+        }
+        HIR_DOCTEST_HIR_LITERAL_CHAR_CASE_ID => {
+            let (_, observed) = exact_text_hir_pair("☃", case_id)?;
+            let ch = '☃';
+            let got = Hir::literal(ch.encode_utf8(&mut [0; 4]).as_bytes());
+            let expected = HirKind::Literal(Literal(Box::from("☃".as_bytes())));
+            hir_doctest_assert_eq(case_id, "literal-kind", &expected, got.kind())?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &got)?;
+        }
+        HIR_DOCTEST_HIR_CONCAT_CASE_ID => {
+            let (_, observed) = exact_text_hir_pair("abcxyz", case_id)?;
+            let hir = Hir::concat(vec![
+                Hir::concat(vec![
+                    Hir::literal([b'a']),
+                    Hir::literal([b'b']),
+                    Hir::literal([b'c']),
+                ]),
+                Hir::concat(vec![
+                    Hir::literal([b'x']),
+                    Hir::literal([b'y']),
+                    Hir::literal([b'z']),
+                ]),
+            ]);
+            let expected = Hir::literal("abcxyz".as_bytes());
+            hir_doctest_assert_eq(case_id, "flattened-concat", &expected, &hir)?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &hir)?;
+        }
+        HIR_DOCTEST_HIR_ALTERNATION_CLASS_CASE_ID => {
+            let (_, observed) = exact_text_hir_pair("[a-f]", case_id)?;
+            let hir = Hir::alternation(vec![
+                Hir::literal([b'a']),
+                Hir::literal([b'b']),
+                Hir::literal([b'c']),
+                Hir::literal([b'd']),
+                Hir::literal([b'e']),
+                Hir::literal([b'f']),
+            ]);
+            let expected = Hir::class(Class::Unicode(ClassUnicode::new([ClassUnicodeRange::new(
+                'a', 'f',
+            )])));
+            hir_doctest_assert_eq(case_id, "class-simplification", &expected, &hir)?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &hir)?;
+        }
+        HIR_DOCTEST_HIR_ALTERNATION_PREFIX_CASE_ID => {
+            let (_, observed) = exact_text_hir_pair(r"abc(?:[A-Z]|[a-z])", case_id)?;
+            let upper = Hir::class(Class::Unicode(ClassUnicode::new([ClassUnicodeRange::new(
+                'A', 'Z',
+            )])));
+            let lower = Hir::class(Class::Unicode(ClassUnicode::new([ClassUnicodeRange::new(
+                'a', 'z',
+            )])));
+            let hir = Hir::alternation(vec![
+                Hir::concat(vec![Hir::literal("abc".as_bytes()), upper.clone()]),
+                Hir::concat(vec![Hir::literal("abc".as_bytes()), lower.clone()]),
+            ]);
+            let expected = Hir::concat(vec![
+                Hir::literal("abc".as_bytes()),
+                Hir::alternation(vec![upper, lower]),
+            ]);
+            hir_doctest_assert_eq(case_id, "common-prefix", &expected, &hir)?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &hir)?;
+        }
+        HIR_DOCTEST_HIR_DOT_CASE_ID => {
+            let (_, observed) = exact_hir_pair(r"(?s-u:.)", case_id)?;
+            let hir = Hir::dot(Dot::AnyByte);
+            let expected = Hir::class(Class::Bytes(ClassBytes::new([ClassBytesRange::new(
+                0x00, 0xFF,
+            )])));
+            hir_doctest_assert_eq(case_id, "any-byte-class", &expected, &hir)?;
+            hir_doctest_assert_eq(case_id, "fre-hir-binding", &observed, &hir)?;
+        }
+        _ => unreachable!("caller checked supported HIR constructor doctest case"),
+    }
+    Ok(())
+}
+
+fn hir_constructor_doctest_binding_pattern(case_id: &str) -> &'static str {
+    match case_id {
+        HIR_DOCTEST_HIR_LITERAL_BYTES_CASE_ID | HIR_DOCTEST_HIR_LITERAL_CHAR_CASE_ID => "☃",
+        HIR_DOCTEST_HIR_CONCAT_CASE_ID => "abcxyz",
+        HIR_DOCTEST_HIR_ALTERNATION_CLASS_CASE_ID => "[a-f]",
+        HIR_DOCTEST_HIR_ALTERNATION_PREFIX_CASE_ID => r"abc(?:[A-Z]|[a-z])",
+        HIR_DOCTEST_HIR_DOT_CASE_ID => r"(?s-u:.)",
+        _ => unreachable!("caller checked supported HIR constructor doctest case"),
     }
 }
 
@@ -6688,6 +6849,15 @@ fn hir_doctest_pass_evidence(case_id: &str) -> String {
             pattern.len(),
         )
         .expect("writing to a String cannot fail");
+    } else if is_supported_hir_constructor_doctest_case(case_id) {
+        let pattern = hir_constructor_doctest_binding_pattern(case_id);
+        writeln!(
+            contract,
+            "pattern=sha256:{},bytes:{}\nadapter=hir-smart-constructor",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
     } else if is_supported_hir_seq_doctest_case(case_id) {
         let pattern = hir_seq_doctest_binding_pattern(case_id);
         writeln!(
@@ -8035,6 +8205,41 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR Seq doctest receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_constructor_doctests_execute_all_6_public_examples() {
+        let cases = [
+            HIR_DOCTEST_HIR_LITERAL_BYTES_CASE_ID,
+            HIR_DOCTEST_HIR_LITERAL_CHAR_CASE_ID,
+            HIR_DOCTEST_HIR_CONCAT_CASE_ID,
+            HIR_DOCTEST_HIR_ALTERNATION_CLASS_CASE_ID,
+            HIR_DOCTEST_HIR_ALTERNATION_PREFIX_CASE_ID,
+            HIR_DOCTEST_HIR_DOT_CASE_ID,
+        ];
+        assert_eq!(cases.len(), 6);
+        for case_id in cases {
+            let disposition = execute_hir_doctest_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_doctest_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Doctest,
+                    source_path: "src/hir/mod.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR constructor doctest receipt");
         }
     }
 
