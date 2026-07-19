@@ -10,6 +10,7 @@ use fre_syntax::{CompatibilityProfile, ParseRequest, RustProfile, RustUnicodeFea
 
 const CONFIGURATIONS: &[(&str, &str, RustUnicodeFeatures)] = &[
     ("none", "", RustUnicodeFeatures::NONE),
+    ("age", "unicode-age", RustUnicodeFeatures::AGE),
     (
         "all",
         "unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment",
@@ -20,6 +21,19 @@ const CONFIGURATIONS: &[(&str, &str, RustUnicodeFeatures)] = &[
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
     ("age", r"\p{Age:6.0}"),
+    ("age-equal", r"\p{age=V6_0}"),
+    ("age-not-equal", r"\p{Age!=6.0}"),
+    ("age-negated", r"\P{Age=6.0}"),
+    ("age-normalized-name", r"\p{A_g-e = 6.0}"),
+    ("age-normalized-is-name", r"\p{iS_A-g e=6.0}"),
+    ("age-is-prefix", r"\p{IsAge=6.0}"),
+    ("age-unassigned", r"\p{Age=Unassigned}"),
+    ("age-non-ascii-name", r"\p{A💥ge=6.0}"),
+    ("age-invalid-value", r"\p{Age=definitely-invalid}"),
+    ("age-bare-name", r"\p{Age}"),
+    ("age-extra-name", r"\p{Ageish=6.0}"),
+    ("age-casefold", r"(?i:\p{Age=6.0})"),
+    ("age-set-subtraction", r"[\p{Age=6.0}--\p{Age=5.0}]"),
     ("bool", r"\p{Alphabetic}"),
     ("case", r"(?i:\u{03B4})"),
     ("gencat", r"\pL"),

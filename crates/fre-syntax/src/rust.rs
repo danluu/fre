@@ -8,8 +8,8 @@ use regex_syntax::{
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError, SCHEMA_VERSION,
-    SafetyEnvelope, UnicodeVersion,
+    RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError, RustUnicodeFeatures,
+    SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
 };
 
 pub(crate) fn parse_rust(
@@ -46,7 +46,9 @@ pub(crate) fn parse_rust(
             u64::try_from(source.len()).unwrap_or(u64::MAX),
         )
     } else {
-        parse_with_unicode_availability(source, &profile, options, utf8, admission, safety)?
+        parse_with_unicode_availability(
+            source, &profile, options, utf8, features, admission, safety,
+        )?
     };
     if enforce_single_size_limit {
         enforce_high_level_size_limit(&hir, &profile, options)?;
@@ -116,6 +118,7 @@ fn parse_with_unicode_availability(
     profile: &CompatibilityProfile,
     options: &RustOptions,
     utf8: bool,
+    features: RustUnicodeFeatures,
     admission: AdmissionPolicy,
     safety: SafetyEnvelope,
 ) -> Result<(Hir, u64), ParseError> {
@@ -144,6 +147,7 @@ fn parse_with_unicode_availability(
         profile,
         admission,
         safety,
+        features,
         work: initial_work,
         flags: ActiveUnicodeFlags {
             case_insensitive: options.case_insensitive,
@@ -183,6 +187,7 @@ struct UnicodeAvailabilityVisitor<'a> {
     profile: &'a CompatibilityProfile,
     admission: AdmissionPolicy,
     safety: SafetyEnvelope,
+    features: RustUnicodeFeatures,
     work: u64,
     flags: ActiveUnicodeFlags,
     group_flags: Vec<ActiveUnicodeFlags>,
@@ -246,15 +251,49 @@ impl UnicodeAvailabilityVisitor<'_> {
         )
     }
 
-    fn class_unicode(&self, class: &ast::ClassUnicode) -> Result<(), ParseError> {
+    fn class_unicode(&mut self, class: &ast::ClassUnicode) -> Result<(), ParseError> {
         if !self.flags.unicode {
             return Ok(());
+        }
+        let ast::ClassUnicodeKind::NamedValue { name, .. } = &class.kind else {
+            return self.reject(
+                &class.span,
+                "Unicode property data is unavailable in this Rust profile",
+            );
+        };
+        if self.features.has_age() {
+            self.charge(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
+            if is_unicode_age_property_name(name) {
+                self.require_case(&class.span)?;
+                return Ok(());
+            }
         }
         self.reject(
             &class.span,
             "Unicode property data is unavailable in this Rust profile",
         )
     }
+}
+
+fn is_unicode_age_property_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let bytes = if bytes.len() >= 2
+        && bytes[0].eq_ignore_ascii_case(&b'i')
+        && bytes[1].eq_ignore_ascii_case(&b's')
+    {
+        &bytes[2..]
+    } else {
+        bytes
+    };
+    bytes
+        .iter()
+        .copied()
+        .filter_map(|byte| match byte {
+            b' ' | b'_' | b'-' => None,
+            0x00..=0x7F => Some(byte.to_ascii_lowercase()),
+            _ => None,
+        })
+        .eq(b"age".iter().copied())
 }
 
 impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {

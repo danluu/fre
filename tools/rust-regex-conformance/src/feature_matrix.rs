@@ -188,6 +188,7 @@ enum SemanticContract {
     HighLevelUnicode,
     RebarUnicode,
     NoUnicode,
+    AgeUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -198,6 +199,13 @@ struct ConfigurationSpec {
     default_features: bool,
     features: &'static [&'static str],
     semantic: SemanticContract,
+}
+
+struct QualifiedSemanticEvidence {
+    high_level: String,
+    rebar: String,
+    no_unicode: String,
+    age_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -301,7 +309,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-age",
         default_features: false,
         features: &["std", "unicode-age"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::AgeUnicode,
     },
     ConfigurationSpec {
         id: "unicode-bool",
@@ -472,9 +480,12 @@ pub fn build_feature_matrix_report(
     let candidate = authenticate_candidate_source(candidate_path)?;
     let toolchain = authenticate_toolchain()?;
     validate_target_dir(target_dir)?;
-    let high_level_evidence = run_semantic_contract(RustProfile::regex_1_12_4())?;
-    let rebar_evidence = run_semantic_contract(RustProfile::rebar_1_12_4())?;
-    let no_unicode_evidence = run_no_unicode_contract()?;
+    let evidence = QualifiedSemanticEvidence {
+        high_level: run_semantic_contract(RustProfile::regex_1_12_4())?,
+        rebar: run_semantic_contract(RustProfile::rebar_1_12_4())?,
+        no_unicode: run_no_unicode_contract()?,
+        age_unicode: run_age_unicode_contract()?,
+    };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
         receipts.push(run_configuration(
@@ -482,9 +493,7 @@ pub fn build_feature_matrix_report(
             upstream_package,
             target_dir,
             &toolchain,
-            &high_level_evidence,
-            &rebar_evidence,
-            &no_unicode_evidence,
+            &evidence,
         ));
     }
     let counts = FeatureMatrixCounts::from_receipts(&receipts)?;
@@ -686,9 +695,7 @@ fn run_configuration(
     upstream: &Path,
     target_root: &Path,
     toolchain: &FeatureMatrixToolchain,
-    high_level_evidence: &str,
-    rebar_evidence: &str,
-    no_unicode_evidence: &str,
+    evidence: &QualifiedSemanticEvidence,
 ) -> FeatureMatrixReceipt {
     let disposition = if spec.semantic == SemanticContract::NightlyPatternApi && !toolchain.nightly
     {
@@ -701,13 +708,16 @@ fn run_configuration(
         match cargo_check_configuration(spec, upstream, target_root) {
             Ok(()) => match spec.semantic {
                 SemanticContract::HighLevelUnicode => FeatureMatrixDisposition::Pass {
-                    semantic_evidence_sha256: high_level_evidence.to_owned(),
+                    semantic_evidence_sha256: evidence.high_level.clone(),
                 },
                 SemanticContract::RebarUnicode => FeatureMatrixDisposition::Pass {
-                    semantic_evidence_sha256: rebar_evidence.to_owned(),
+                    semantic_evidence_sha256: evidence.rebar.clone(),
                 },
                 SemanticContract::NoUnicode => FeatureMatrixDisposition::Pass {
-                    semantic_evidence_sha256: no_unicode_evidence.to_owned(),
+                    semantic_evidence_sha256: evidence.no_unicode.clone(),
+                },
+                SemanticContract::AgeUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.age_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -900,6 +910,63 @@ fn run_no_unicode_contract() -> Result<String, InventoryError> {
 fn expected_no_unicode_evidence() -> String {
     let mut evidence = "regex-1.12.4-no-unicode;ascii=parsed".to_owned();
     for &(family, _) in NO_UNICODE_WITNESSES {
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    sha256(evidence.as_bytes())
+}
+
+fn run_age_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::AGE;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-age profile rejected table-free syntax: {error}"
+        ))
+    })?;
+    let age = parse(ParseRequest::rust(
+        r"\p{Age:6.0}",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-age profile rejected its Age witness: {error}"
+        ))
+    })?;
+    if age.summary.class_ranges == 0 {
+        return Err(InventoryError::new(
+            "unicode-age witness produced no class ranges",
+        ));
+    }
+    for &(family, pattern) in &NO_UNICODE_WITNESSES[1..] {
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-age profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-age {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_age_unicode_evidence())
+}
+
+fn expected_age_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-age;ascii=parsed;age=parsed".to_owned();
+    for &(family, _) in &NO_UNICODE_WITNESSES[1..] {
         evidence.push(';');
         evidence.push_str(family);
         evidence.push_str("=refused");
@@ -1237,6 +1304,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_no_unicode_evidence() => Ok(()),
         (
+            SemanticContract::AgeUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_age_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1298,6 +1372,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
             b"regex-1.12.4-rebar-unicode;greek-class=parsed;literal-span=2..8".as_slice()
         }
         SemanticContract::NoUnicode => return expected_no_unicode_evidence(),
+        SemanticContract::AgeUnicode => return expected_age_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1344,12 +1419,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::AgeUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(
                     spec.semantic,
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            7
+            6
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1373,6 +1455,9 @@ mod tests {
         let no_unicode = run_no_unicode_contract().expect("no-Unicode semantic gate");
         assert_eq!(no_unicode, expected_no_unicode_evidence());
         assert!(is_sha256(&no_unicode));
+        let age_unicode = run_age_unicode_contract().expect("unicode-age semantic gate");
+        assert_eq!(age_unicode, expected_age_unicode_evidence());
+        assert!(is_sha256(&age_unicode));
     }
 
     #[test]
@@ -1392,8 +1477,8 @@ mod tests {
         };
         let unsupported = CONFIGURATIONS
             .iter()
-            .find(|spec| spec.id == "unicode-age")
-            .expect("unicode-age configuration");
+            .find(|spec| spec.id == "unicode-bool")
+            .expect("unicode-bool configuration");
         let forged = FeatureMatrixDisposition::Pass {
             semantic_evidence_sha256: "0".repeat(64),
         };

@@ -154,6 +154,43 @@ fn partial_unicode_feature_profiles_enforce_positive_and_negative_availability()
 }
 
 #[test]
+fn unicode_age_profile_accepts_only_age_named_value_properties() {
+    let mut age = RustProfile::regex_1_12_4();
+    age.unicode_features = RustUnicodeFeatures::AGE;
+    for pattern in [
+        r"\p{Age:6.0}",
+        r"\P{age=V6_0}",
+        r"\p{A_g-e = 6.0}",
+        r"\p{IsAge=6.0}",
+        r"\p{A💥ge=6.0}",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(age.clone()),
+        ))
+        .unwrap_or_else(|error| panic!("unicode-age alias {pattern}: {error:?}"));
+    }
+    for pattern in [
+        r"\p{Age}",
+        r"\p{Ageish=6.0}",
+        r"\p{Age=definitely-invalid}",
+        r"\p{Age=Unassigned}",
+        r"\p{Alphabetic}",
+        r"\p{gc=Letter}",
+        r"\p{sc=Greek}",
+        r"\p{gcb=Extend}",
+        r"\w",
+        r"(?i:\p{Age=6.0})",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(age.clone()),
+        ))
+        .expect_err("unicode-age must not borrow another data family");
+    }
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -168,6 +205,16 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     ))
     .expect("table-free syntax under full profile");
     assert_ne!(partial.key, full.key);
+
+    let mut age = RustProfile::regex_1_12_4();
+    age.unicode_features = RustUnicodeFeatures::AGE;
+    let age = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(age),
+    ))
+    .expect("table-free syntax under age profile");
+    assert_ne!(partial.key, age.key);
+    assert_ne!(age.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -262,6 +309,45 @@ fn partial_unicode_analysis_obeys_exact_parse_work_limit() {
             .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
     )
     .expect_err("one below availability-analysis work must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_age_name_analysis_obeys_exact_parse_work_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::AGE;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let short = parse(ParseRequest::rust(r"\p{Age=6.0}", compatibility.clone()))
+        .expect("short unicode-age property");
+    let pattern = r"\p{A_g-e=6.0}";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("normalized unicode-age property");
+    assert_eq!(baseline.summary.parse_work - short.summary.parse_work, 4);
+    let exact = baseline.summary.parse_work;
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact Unicode property-name analysis limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below Unicode property-name analysis must fail");
     assert!(matches!(
         error.category,
         ErrorCategory::FreResourceLimit {
