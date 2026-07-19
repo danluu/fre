@@ -6,6 +6,8 @@ const GENCAT_ALIASES: &[&str] =
     include!("../../../../../../crates/fre-syntax/src/unicode_gencat_aliases.in");
 const SCRIPT_ALIASES: &[&str] =
     include!("../../../../../../crates/fre-syntax/src/unicode_script_aliases.in");
+const SEGMENT_ALIASES: &[(&[&str], &[&str])] =
+    include!("../../../../../../crates/fre-syntax/src/unicode_segment_aliases.in");
 
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
@@ -96,6 +98,18 @@ const PROBES: &[(&str, &str)] = &[
     ("script-bare-property", r"\p{Script}"),
     ("script-set", r"[\p{Greek}&&[\p{scx=Common}--\p{Latin}]]"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
+    ("segment-normalized", r"\p{Is_G-r a p h e m e _ Cluster _ Break=EX}"),
+    ("segment-sentence", r"\p{Sentence_Break=Lower}"),
+    ("segment-sentence-short", r"\p{sb=AT}"),
+    ("segment-word", r"\p{Word_Break=ALetter}"),
+    ("segment-word-short", r"\p{wb=ExtendNumLet}"),
+    ("segment-invalid-value", r"\p{gcb=definitely-invalid}"),
+    ("segment-unmaterialized-gcb", r"\p{gcb=E_Base}"),
+    ("segment-unmaterialized-sb", r"\p{sb=Other}"),
+    ("segment-unmaterialized-wb", r"\p{wb=E_Base}"),
+    ("segment-bare-property", r"\p{Grapheme_Cluster_Break}"),
+    ("segment-cross-family", r"\p{gcb=ALetter}"),
+    ("segment-set", r"[\p{gcb=Extend}~~[\p{sb=Lower}--\p{wb=ALetter}]]"),
     ("white-space", r"\p{White_Space}"),
     ("decimal-number", r"\p{Nd}"),
     ("any", r"\p{Any}"),
@@ -145,6 +159,20 @@ fn main() {
                 "script-alias-{index}:{kind}:{alias}\t{}",
                 u8::from(passed)
             );
+        }
+    }
+    for (name_family, &(names, _)) in SEGMENT_ALIASES.iter().enumerate() {
+        for (name_index, &property_name) in names.iter().enumerate() {
+            for (value_family, &(_, values)) in SEGMENT_ALIASES.iter().enumerate() {
+                for (value_index, &property_value) in values.iter().enumerate() {
+                    let pattern = format!(r"\p{{{property_name}={property_value}}}");
+                    let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
+                    println!(
+                        "segment-alias-{name_family}:{name_index}:{value_family}:{value_index}:{property_name}:{property_value}\t{}",
+                        u8::from(passed)
+                    );
+                }
+            }
         }
     }
 }

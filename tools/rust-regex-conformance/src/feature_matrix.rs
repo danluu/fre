@@ -194,7 +194,7 @@ enum SemanticContract {
     GencatUnicode,
     PerlUnicode,
     ScriptUnicode,
-    MissingUnicodeAvailabilityProfile,
+    SegmentUnicode,
     NightlyPatternApi,
 }
 
@@ -216,6 +216,7 @@ struct QualifiedSemanticEvidence {
     gencat_unicode: String,
     perl_unicode: String,
     script_unicode: String,
+    segment_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -355,7 +356,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-segment",
         default_features: false,
         features: &["std", "unicode-segment"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::SegmentUnicode,
     },
     ConfigurationSpec {
         id: "pattern",
@@ -500,6 +501,7 @@ pub fn build_feature_matrix_report(
         gencat_unicode: run_gencat_unicode_contract()?,
         perl_unicode: run_perl_unicode_contract()?,
         script_unicode: run_script_unicode_contract()?,
+        segment_unicode: run_segment_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -749,14 +751,9 @@ fn run_configuration(
                 SemanticContract::ScriptUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.script_unicode.clone(),
                 },
-                SemanticContract::MissingUnicodeAvailabilityProfile => {
-                    FeatureMatrixDisposition::Unsupported {
-                        kind: FeatureMatrixUnsupportedKind::FreProfileGranularity,
-                        cargo_check_passed: true,
-                        reason_code: "fre-profile.unicode-feature-availability-unrepresented"
-                            .to_owned(),
-                    }
-                }
+                SemanticContract::SegmentUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.segment_unicode.clone(),
+                },
                 SemanticContract::NightlyPatternApi => FeatureMatrixDisposition::Unsupported {
                     kind: FeatureMatrixUnsupportedKind::FreApiSurface,
                     cargo_check_passed: true,
@@ -1372,6 +1369,99 @@ fn expected_script_unicode_evidence() -> String {
     sha256(evidence.as_bytes())
 }
 
+fn run_segment_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SEGMENT;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-segment profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for pattern in [
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"\p{gcb=EX}",
+        r"\p{Sentence_Break=Lower}",
+        r"\p{sb=AT}",
+        r"\p{Word_Break=ALetter}",
+        r"\p{wb=ExtendNumLet}",
+        r"[\p{gcb=Extend}\p{sb=Lower}\p{wb=ALetter}]",
+    ] {
+        let parsed = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| {
+            InventoryError::new(format!(
+                "unicode-segment profile rejected its singleton witness {pattern}: {error}"
+            ))
+        })?;
+        if parsed.summary.class_ranges == 0 {
+            return Err(InventoryError::new(format!(
+                "unicode-segment witness {pattern} produced no class ranges"
+            )));
+        }
+    }
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "segment" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-segment profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-segment {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+
+    // Exercise the full lowering/search path. U+0301 has GCB=Extend and
+    // occupies byte span 1..3 in this haystack.
+    let regex = PortableBuilder::new(r"\p{gcb=Extend}+")
+        .profile(profile)
+        .build()
+        .map_err(|error| InventoryError::new(format!("unicode-segment build failed: {error}")))?;
+    let (found, _) = regex
+        .find(b"a\xCC\x81b", SearchLimits::default())
+        .map_err(|error| InventoryError::new(format!("unicode-segment search failed: {error}")))?;
+    let found = found
+        .ok_or_else(|| InventoryError::new("unicode-segment search found no Extend scalar"))?;
+    if found.start() != 1 || found.end() != 3 {
+        return Err(InventoryError::new(
+            "unicode-segment search returned wrong Extend span",
+        ));
+    }
+    Ok(expected_segment_unicode_evidence())
+}
+
+fn expected_segment_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-segment;ascii=parsed;segment=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        if family == "segment" {
+            continue;
+        }
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    evidence.push_str(";extend-span=1..3");
+    sha256(evidence.as_bytes())
+}
+
 fn authenticate_upstream_package(
     root: &Path,
 ) -> Result<FeatureMatrixSourceIdentity, InventoryError> {
@@ -1696,21 +1786,13 @@ fn validate_disposition(
             | SemanticContract::CaseUnicode
             | SemanticContract::GencatUnicode
             | SemanticContract::PerlUnicode
-            | SemanticContract::ScriptUnicode,
+            | SemanticContract::ScriptUnicode
+            | SemanticContract::SegmentUnicode,
             _,
             FeatureMatrixDisposition::Pass {
                 semantic_evidence_sha256,
             },
         ) if semantic_evidence_sha256 == &expected_semantic_evidence(spec.semantic) => Ok(()),
-        (
-            SemanticContract::MissingUnicodeAvailabilityProfile,
-            _,
-            FeatureMatrixDisposition::Unsupported {
-                kind: FeatureMatrixUnsupportedKind::FreProfileGranularity,
-                cargo_check_passed: true,
-                reason_code,
-            },
-        ) if reason_code == "fre-profile.unicode-feature-availability-unrepresented" => Ok(()),
         (
             SemanticContract::NightlyPatternApi,
             false,
@@ -1774,8 +1856,8 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::GencatUnicode => return expected_gencat_unicode_evidence(),
         SemanticContract::PerlUnicode => return expected_perl_unicode_evidence(),
         SemanticContract::ScriptUnicode => return expected_script_unicode_evidence(),
-        SemanticContract::MissingUnicodeAvailabilityProfile
-        | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
+        SemanticContract::SegmentUnicode => return expected_segment_unicode_evidence(),
+        SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
     sha256(evidence)
 }
@@ -1862,10 +1944,7 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
-                .filter(|spec| matches!(
-                    spec.semantic,
-                    SemanticContract::MissingUnicodeAvailabilityProfile
-                ))
+                .filter(|spec| matches!(spec.semantic, SemanticContract::SegmentUnicode))
                 .count(),
             1
         );
@@ -1912,6 +1991,10 @@ mod tests {
         let script_unicode = run_script_unicode_contract().expect("unicode-script semantic gate");
         assert_eq!(script_unicode, expected_script_unicode_evidence());
         assert!(is_sha256(&script_unicode));
+        let segment_unicode =
+            run_segment_unicode_contract().expect("unicode-segment semantic gate");
+        assert_eq!(segment_unicode, expected_segment_unicode_evidence());
+        assert!(is_sha256(&segment_unicode));
     }
 
     #[test]

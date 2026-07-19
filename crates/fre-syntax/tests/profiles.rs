@@ -10,6 +10,7 @@ use fre_syntax::{
 
 const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
 const SCRIPT_ALIASES: &[&str] = include!("../src/unicode_script_aliases.in");
+const SEGMENT_ALIASES: &[(&[&str], &[&str])] = include!("../src/unicode_segment_aliases.in");
 
 fn re2_literal_profile() -> CompatibilityProfile {
     let mut profile = Re2Profile::default();
@@ -726,6 +727,124 @@ fn unicode_script_profile_accepts_only_singleton_script_data() {
 }
 
 #[test]
+fn unicode_segment_alias_inventory_is_exact_and_sorted() {
+    assert_eq!(SEGMENT_ALIASES.len(), 3);
+    assert_eq!(SEGMENT_ALIASES[0].0, ["gcb", "graphemeclusterbreak"]);
+    assert_eq!(SEGMENT_ALIASES[1].0, ["sb", "sentencebreak"]);
+    assert_eq!(SEGMENT_ALIASES[2].0, ["wb", "wordbreak"]);
+    assert_eq!(SEGMENT_ALIASES[0].1.len(), 18);
+    assert_eq!(SEGMENT_ALIASES[1].1.len(), 25);
+    assert_eq!(SEGMENT_ALIASES[2].1.len(), 31);
+    for &(names, values) in SEGMENT_ALIASES {
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    assert_eq!(
+        SEGMENT_ALIASES
+            .iter()
+            .flat_map(|(names, values)| names.iter().chain(values.iter()))
+            .map(|alias| alias.len())
+            .max(),
+        Some(20)
+    );
+}
+
+#[test]
+fn unicode_segment_profile_accepts_only_singleton_segmentation_data() {
+    let mut segment = RustProfile::regex_1_12_4();
+    segment.unicode_features = RustUnicodeFeatures::SEGMENT;
+    let segment_profile = CompatibilityProfile::RustText(segment.clone());
+    let full_profile = CompatibilityProfile::rust_text();
+
+    for pattern in [
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"\p{gcb=EX}",
+        r"\P{Is_G-c b=Regional_Indicator}",
+        r"\p{Sentence_Break=Lower}",
+        r"\p{sb=AT}",
+        r"\p{Word_Break=ALetter}",
+        r"\p{wb=ExtendNumLet}",
+        r"[\p{gcb=Extend}&&[\p{sb=Lower}--\p{wb=ALetter}]]",
+    ] {
+        let partial = parse(ParseRequest::rust(pattern, segment_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-segment rejected {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "unicode-segment HIR for {pattern}");
+    }
+
+    for &(names, values) in SEGMENT_ALIASES {
+        for &name in names {
+            for &value in values {
+                let pattern = format!(r"\p{{{name}={value}}}");
+                let partial = parse(ParseRequest::rust(&pattern, segment_profile.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("unicode-segment rejected {pattern}: {error:?}")
+                    });
+                let full = parse(ParseRequest::rust(&pattern, full_profile.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("all-table profile rejected {pattern}: {error:?}")
+                    });
+                let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+                    (partial.pattern, full.pattern)
+                else {
+                    panic!("Rust request returned another syntax family")
+                };
+                assert_eq!(partial.hir, full.hir, "unicode-segment HIR for {pattern}");
+            }
+        }
+    }
+
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"\p{Alphabetic}",
+        r"(?i:a)",
+        r"\pL",
+        r"\d",
+        r"\s",
+        r"\w",
+        r"\b",
+        r"\p{Greek}",
+        r"\p{Extend}",
+        r"\p{gcb}",
+        r"\p{gcb=Other}",
+        r"\p{gcb=E_Base}",
+        r"\p{sb=Other}",
+        r"\p{wb=E_Base}",
+        r"\p{gcb=definitely-invalid}",
+        r"(?i:\p{gcb=Extend})",
+    ] {
+        let error = parse(ParseRequest::rust(pattern, segment_profile.clone()))
+            .expect_err("unicode-segment must not borrow another or invalid Unicode family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    let mut segment_set = RustProfile::regex_set_1_12_4();
+    segment_set.unicode_features = RustUnicodeFeatures::SEGMENT;
+    fre_syntax::validate_rust_regex_set_admission(
+        &[r"\p{gcb=Extend}+", r"\p{wb=ALetter}+"],
+        &CompatibilityProfile::RustText(segment_set.clone()),
+    )
+    .expect("unicode-segment set admission");
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &[r"\p{gcb=Extend}+", r"\p{Greek}"],
+        &CompatibilityProfile::RustText(segment_set),
+    )
+    .expect_err("unicode-segment set cannot borrow unicode-script");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -824,6 +943,36 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     ))
     .expect_err("Rebar's default-feature receipt requires all Unicode tables");
     assert_eq!(error.category, ErrorCategory::InvalidConfiguration);
+}
+
+#[test]
+fn unicode_segment_availability_has_distinct_cache_identity() {
+    let mut segment = RustProfile::regex_1_12_4();
+    segment.unicode_features = RustUnicodeFeatures::SEGMENT;
+    let segment = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(segment),
+    ))
+    .expect("table-free syntax under segment profile");
+    for features in [
+        RustUnicodeFeatures::NONE,
+        RustUnicodeFeatures::AGE,
+        RustUnicodeFeatures::BOOL,
+        RustUnicodeFeatures::CASE,
+        RustUnicodeFeatures::GENCAT,
+        RustUnicodeFeatures::PERL,
+        RustUnicodeFeatures::SCRIPT,
+        RustUnicodeFeatures::ALL,
+    ] {
+        let mut other = RustProfile::regex_1_12_4();
+        other.unicode_features = features;
+        let other = parse(ParseRequest::rust(
+            "ascii",
+            CompatibilityProfile::RustText(other),
+        ))
+        .expect("table-free syntax under another Unicode profile");
+        assert_ne!(segment.key, other.key);
+    }
 }
 
 #[test]
@@ -1490,6 +1639,132 @@ fn unicode_script_analysis_stack_has_a_hand_derived_exact_limit() {
         }),
     ))
     .expect_err("one below unicode-script analysis stack must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::TraversalStack,
+            limit,
+            observed,
+        } if limit == EXPECTED_MAX_STACK - 1 && observed == EXPECTED_MAX_STACK
+    ));
+}
+
+#[test]
+fn unicode_segment_classifier_and_table_work_obey_exact_parse_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SEGMENT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"\P{Is_G-r a p h e m e _ Cluster _ Break=Regional _ Indicator}";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("normalized unicode-segment named-value query");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 5_000,
+        "property/value lookup, table allocation and negation must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    let exact_record = parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact unicode-segment classifier/table limit must pass");
+    assert_eq!(exact_record.summary.parse_work, exact);
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below unicode-segment classifier/table limit must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_segment_nested_set_work_is_prospectively_bounded() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SEGMENT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern =
+        r"[[\p{gcb=LV}~~\p{sb=Lower}]--[\p{wb=ALetter}&&[\p{gcb=Extend}~~\p{wb=Numeric}]]]";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("nested unicode-segment set operations");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 500_000,
+        "nested segment-table allocation, set and dedup work must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact nested unicode-segment set-work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below nested unicode-segment set-work limit must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_segment_analysis_stack_has_a_hand_derived_exact_limit() {
+    const EXPECTED_MAX_STACK: u64 = 5;
+
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::SEGMENT;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern =
+        r"[\p{gcb=Extend}&&[\p{sb=Lower}&&[\p{wb=ALetter}&&[\p{gcb=LV}&&\p{wb=Numeric}]]]]";
+
+    let exact_quotas = SyntaxQuotas {
+        max_parse_work: 64_000_000,
+        max_traversal_stack: EXPECTED_MAX_STACK,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone()).with_admission(AdmissionPolicy::Quota(
+            QuotaBounded {
+                syntax: exact_quotas,
+            },
+        )),
+    )
+    .expect("exact unicode-segment analysis stack must pass");
+
+    let below_quotas = SyntaxQuotas {
+        max_traversal_stack: EXPECTED_MAX_STACK - 1,
+        ..exact_quotas
+    };
+    let error = parse(ParseRequest::rust(pattern, compatibility).with_admission(
+        AdmissionPolicy::Quota(QuotaBounded {
+            syntax: below_quotas,
+        }),
+    ))
+    .expect_err("one below unicode-segment analysis stack must fail prospectively");
     assert!(matches!(
         error.category,
         ErrorCategory::FreResourceLimit {

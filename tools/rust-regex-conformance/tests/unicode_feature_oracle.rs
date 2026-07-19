@@ -17,6 +17,7 @@ const CONFIGURATIONS: &[(&str, &str, RustUnicodeFeatures)] = &[
     ("gencat", "unicode-gencat", RustUnicodeFeatures::GENCAT),
     ("perl", "unicode-perl", RustUnicodeFeatures::PERL),
     ("script", "unicode-script", RustUnicodeFeatures::SCRIPT),
+    ("segment", "unicode-segment", RustUnicodeFeatures::SEGMENT),
     (
         "all",
         "unicode-age,unicode-bool,unicode-case,unicode-gencat,unicode-perl,unicode-script,unicode-segment",
@@ -36,6 +37,12 @@ const SCRIPT_ALIASES: &[&str] =
     include!("../../../crates/fre-syntax/src/unicode_script_aliases.in");
 const SCRIPT_ALIAS_SET_SHA256: &str =
     "8f0e49dddba24d9809bcda8d5915b199062c4bbe828e77711c541fa0d21d8bf7";
+const SEGMENT_ALIASES: &[(&[&str], &[&str])] =
+    include!("../../../crates/fre-syntax/src/unicode_segment_aliases.in");
+const SEGMENT_ALIAS_SOURCE: &[u8] =
+    include_bytes!("../../../crates/fre-syntax/src/unicode_segment_aliases.in");
+const SEGMENT_ALIAS_SOURCE_SHA256: &str =
+    "d6f79b87c29e23e664028331e2fc84084bd1413a9167b4ca3d85e82cb3601470";
 const SCRIPT_SOURCE_HASHES: &[(&str, &str)] = &[
     (
         "src/unicode_tables/property_names.rs",
@@ -52,6 +59,20 @@ const SCRIPT_SOURCE_HASHES: &[(&str, &str)] = &[
     (
         "src/unicode_tables/script_extension.rs",
         "a314099ddbf50a07fe350bb0835bf2fe494ed5ad278b30e171e21506eb557906",
+    ),
+];
+const SEGMENT_SOURCE_HASHES: &[(&str, &str)] = &[
+    (
+        "src/unicode_tables/grapheme_cluster_break.rs",
+        "0dd9d66bad598f4ec3451b6699f05c17c52079e37d463baf6385bbe51aa218f1",
+    ),
+    (
+        "src/unicode_tables/sentence_break.rs",
+        "be84fbe8c5c67e761b16fe6c27f16664dbb145357835cd6b92bc2a4a4c52ee79",
+    ),
+    (
+        "src/unicode_tables/word_break.rs",
+        "c551681ad49ec28c7ae32bab1371945821c736ca8f0de410cb89f28066ec2ecf",
     ),
 ];
 
@@ -135,6 +156,24 @@ const PROBES: &[(&str, &str)] = &[
     ("script-bare-property", r"\p{Script}"),
     ("script-set", r"[\p{Greek}&&[\p{scx=Common}--\p{Latin}]]"),
     ("segment", r"\p{Grapheme_Cluster_Break=Extend}"),
+    (
+        "segment-normalized",
+        r"\p{Is_G-r a p h e m e _ Cluster _ Break=EX}",
+    ),
+    ("segment-sentence", r"\p{Sentence_Break=Lower}"),
+    ("segment-sentence-short", r"\p{sb=AT}"),
+    ("segment-word", r"\p{Word_Break=ALetter}"),
+    ("segment-word-short", r"\p{wb=ExtendNumLet}"),
+    ("segment-invalid-value", r"\p{gcb=definitely-invalid}"),
+    ("segment-unmaterialized-gcb", r"\p{gcb=E_Base}"),
+    ("segment-unmaterialized-sb", r"\p{sb=Other}"),
+    ("segment-unmaterialized-wb", r"\p{wb=E_Base}"),
+    ("segment-bare-property", r"\p{Grapheme_Cluster_Break}"),
+    ("segment-cross-family", r"\p{gcb=ALetter}"),
+    (
+        "segment-set",
+        r"[\p{gcb=Extend}~~[\p{sb=Lower}--\p{wb=ALetter}]]",
+    ),
     ("white-space", r"\p{White_Space}"),
     ("decimal-number", r"\p{Nd}"),
     ("any", r"\p{Any}"),
@@ -176,6 +215,18 @@ fn authenticate_alias_sets() {
     );
     authenticate(GENCAT_ALIASES, 81, 20, GENCAT_ALIAS_SET_SHA256);
     authenticate(SCRIPT_ALIASES, 338, 21, SCRIPT_ALIAS_SET_SHA256);
+    assert_eq!(SEGMENT_ALIASES.len(), 3);
+    assert_eq!(SEGMENT_ALIASES[0].1.len(), 18);
+    assert_eq!(SEGMENT_ALIASES[1].1.len(), 25);
+    assert_eq!(SEGMENT_ALIASES[2].1.len(), 31);
+    for &(names, values) in SEGMENT_ALIASES {
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    assert_eq!(
+        format!("{:x}", Sha256::digest(SEGMENT_ALIAS_SOURCE)),
+        SEGMENT_ALIAS_SOURCE_SHA256
+    );
 }
 
 #[test]
@@ -183,7 +234,7 @@ fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
     authenticate_alias_sets();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/unicode-feature-oracle/Cargo.toml");
-    authenticate_script_sources(&fixture);
+    authenticate_unicode_sources(&fixture);
     let target_root = unique_target_root();
     fs::create_dir(&target_root).expect("create private oracle target root");
 
@@ -246,11 +297,32 @@ fn typed_profiles_match_feature_isolated_regex_syntax_0_8_11() {
                 );
             }
         }
+        for (name_family, &(names, _)) in SEGMENT_ALIASES.iter().enumerate() {
+            for (name_index, &property_name) in names.iter().enumerate() {
+                for (value_family, &(_, values)) in SEGMENT_ALIASES.iter().enumerate() {
+                    for (value_index, &property_value) in values.iter().enumerate() {
+                        let pattern = format!(r"\p{{{property_name}={property_value}}}");
+                        let actual = parse(ParseRequest::rust(
+                            &pattern,
+                            CompatibilityProfile::RustText(profile.clone()),
+                        ))
+                        .is_ok();
+                        let id = format!(
+                            "segment-alias-{name_family}:{name_index}:{value_family}:{value_index}:{property_name}:{property_value}"
+                        );
+                        assert_eq!(
+                            actual, oracle[&id],
+                            "configuration={name} property={property_name} value={property_value} pattern={pattern}",
+                        );
+                    }
+                }
+            }
+        }
     }
     fs::remove_dir_all(&target_root).expect("remove private oracle target root");
 }
 
-fn authenticate_script_sources(fixture: &Path) {
+fn authenticate_unicode_sources(fixture: &Path) {
     let output = Command::new(env!("CARGO"))
         .arg("metadata")
         .arg("--offline")
@@ -282,7 +354,7 @@ fn authenticate_script_sources(fixture: &Path) {
     let root_metadata = fs::symlink_metadata(root).expect("stat regex-syntax package root");
     assert!(root_metadata.file_type().is_dir());
     assert!(!root_metadata.file_type().is_symlink());
-    for &(relative, expected) in SCRIPT_SOURCE_HASHES {
+    for &(relative, expected) in SCRIPT_SOURCE_HASHES.iter().chain(SEGMENT_SOURCE_HASHES) {
         let path = root.join(relative);
         let metadata = fs::symlink_metadata(&path).expect("stat pinned Unicode source");
         assert!(metadata.file_type().is_file(), "{}", path.display());
@@ -338,6 +410,15 @@ fn run_oracle(manifest: &Path, target: &Path, features: &str) -> BTreeMap<String
         .checked_add(BOOL_PROPERTY_ALIASES.len())
         .and_then(|count| count.checked_add(GENCAT_ALIASES.len()))
         .and_then(|count| count.checked_add(SCRIPT_ALIASES.len().checked_mul(3)?))
+        .and_then(|count| {
+            let names = SEGMENT_ALIASES
+                .iter()
+                .try_fold(0_usize, |sum, (names, _)| sum.checked_add(names.len()))?;
+            let values = SEGMENT_ALIASES
+                .iter()
+                .try_fold(0_usize, |sum, (_, values)| sum.checked_add(values.len()))?;
+            count.checked_add(names.checked_mul(values)?)
+        })
         .expect("oracle probe cardinality fits usize");
     assert_eq!(parsed.len(), expected);
     parsed

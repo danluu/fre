@@ -11,6 +11,8 @@ const UNICODE_GENCAT_ALIASES: &[&str] = include!("unicode_gencat_aliases.in");
 const MAX_UNICODE_GENCAT_ALIAS_BYTES: usize = 20;
 const UNICODE_SCRIPT_ALIASES: &[&str] = include!("unicode_script_aliases.in");
 const MAX_UNICODE_SCRIPT_ALIAS_BYTES: usize = 21;
+const UNICODE_SEGMENT_ALIASES: &[(&[&str], &[&str])] = include!("unicode_segment_aliases.in");
+const MAX_UNICODE_SEGMENT_ALIAS_BYTES: usize = 20;
 
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -337,6 +339,13 @@ enum UnicodeScriptTable {
     ScriptExtension,
 }
 
+#[derive(Clone, Copy)]
+enum UnicodeSegmentTable {
+    Grapheme,
+    Sentence,
+    Word,
+}
+
 const UNICODE_CASE_CODEPOINTS: u64 = 0x11_0000;
 const UNICODE_CASE_TABLE_KEYS: u64 = 2_938;
 const UNICODE_CASE_MAX_FOLDS_PER_KEY: u64 = 3;
@@ -376,6 +385,23 @@ const UNICODE_SCRIPT_EXTENSION_RANGES: u64 = 159;
 const UNICODE_SCRIPT_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
 const UNICODE_SCRIPT_CLASS_WORK_PER_RANGE: u64 = 24;
 const UNICODE_SCRIPT_SET_WORK_PER_RANGE_SITE: u64 = 128;
+// regex-syntax 0.8.11 / Unicode 16.0.0 singleton `unicode-segment`
+// closure. The shared property-name/value indexes have the authenticated
+// hashes above. `grapheme_cluster_break.rs` has SHA-256
+// 0dd9d66bad598f4ec3451b6699f05c17c52079e37d463baf6385bbe51aa218f1
+// and at most 399 ranges in one materialized value (`LV` and `LVT`).
+// `sentence_break.rs` has SHA-256
+// be84fbe8c5c67e761b16fe6c27f16664dbb145357835cd6b92bc2a4a4c52ee79
+// and at most 673 ranges (`Lower`). `word_break.rs` has SHA-256
+// c551681ad49ec28c7ae32bab1371945821c736ca8f0de410cb89f28066ec2ecf
+// and at most 595 ranges (`ALetter`). Only aliases whose canonical value has
+// a materialized range table are admitted.
+const UNICODE_SEGMENT_GCB_RANGES: u64 = 399;
+const UNICODE_SEGMENT_SB_RANGES: u64 = 673;
+const UNICODE_SEGMENT_WB_RANGES: u64 = 595;
+const UNICODE_SEGMENT_SCALAR_RANGE_CEILING: u64 = 0x10_F800;
+const UNICODE_SEGMENT_CLASS_WORK_PER_RANGE: u64 = 24;
+const UNICODE_SEGMENT_SET_WORK_PER_RANGE_SITE: u64 = 128;
 
 impl UnicodePerlTable {
     const fn ranges(self) -> u64 {
@@ -392,6 +418,16 @@ impl UnicodeScriptTable {
         match self {
             Self::Script => UNICODE_SCRIPT_RANGES,
             Self::ScriptExtension => UNICODE_SCRIPT_EXTENSION_RANGES,
+        }
+    }
+}
+
+impl UnicodeSegmentTable {
+    const fn ranges(self) -> u64 {
+        match self {
+            Self::Grapheme => UNICODE_SEGMENT_GCB_RANGES,
+            Self::Sentence => UNICODE_SEGMENT_SB_RANGES,
+            Self::Word => UNICODE_SEGMENT_WB_RANGES,
         }
     }
 }
@@ -844,6 +880,87 @@ impl UnicodeAvailabilityVisitor<'_> {
         )
     }
 
+    fn charge_segment_class_set(&mut self, class: &ast::ClassBracketed) -> Result<(), ParseError> {
+        // Reserve the Unicode flag and both `has_segment` comparisons before
+        // selecting this prospective analysis.
+        self.charge(3)?;
+        if !self.flags.unicode || !self.features.has_segment() {
+            return Ok(());
+        }
+
+        // Segmentation range vectors are allocated, copied, canonicalized and
+        // combined at every enclosing bracket/binary-set site. Analyze the
+        // exact AST topology before translation. An arbitrary Unicode leaf is
+        // assigned the largest singleton segment table; the exact classifier
+        // later either authenticates its name/value family or rejects it.
+        let mut stack = Vec::new();
+        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&class.kind))?;
+        let mut range_ceiling = 0_u64;
+        let mut translation_sites = 1_u64;
+        let mut segment_sources = 0_u64;
+        loop {
+            self.charge(1)?;
+            let Some(node) = stack.pop() else {
+                break;
+            };
+            self.charge(7)?;
+            match node {
+                ClassAnalysisNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                }
+                ClassAnalysisNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                    translation_sites = translation_sites.saturating_add(5);
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.lhs))?;
+                    self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Set(&op.rhs))?;
+                }
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Empty(_) | ast::ClassSetItem::Perl(_),
+                ) => {
+                    // Empty has no source table. A segment-only profile
+                    // rejects every Unicode Perl class before translation.
+                }
+                ClassAnalysisNode::Item(
+                    ast::ClassSetItem::Literal(_) | ast::ClassSetItem::Range(_),
+                ) => {
+                    range_ceiling = range_ceiling.saturating_add(1);
+                    translation_sites = translation_sites.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(128);
+                    translation_sites = translation_sites.saturating_add(2);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Unicode(_)) => {
+                    range_ceiling = range_ceiling.saturating_add(UNICODE_SEGMENT_SB_RANGES);
+                    translation_sites = translation_sites.saturating_add(2);
+                    segment_sources = segment_sources.saturating_add(1);
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                    translation_sites = translation_sites.saturating_add(2);
+                    self.push_class_analysis_node(
+                        &mut stack,
+                        ClassAnalysisNode::Set(&nested.kind),
+                    )?;
+                }
+                ClassAnalysisNode::Item(ast::ClassSetItem::Union(union)) => {
+                    translation_sites = translation_sites
+                        .saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
+                    for item in &union.items {
+                        self.push_class_analysis_node(&mut stack, ClassAnalysisNode::Item(item))?;
+                    }
+                }
+            }
+            range_ceiling = range_ceiling.min(UNICODE_SEGMENT_SCALAR_RANGE_CEILING);
+        }
+        if segment_sources == 0 {
+            return Ok(());
+        }
+        self.charge(
+            range_ceiling
+                .saturating_mul(translation_sites)
+                .saturating_mul(UNICODE_SEGMENT_SET_WORK_PER_RANGE_SITE),
+        )
+    }
+
     fn normalize_unicode_symbol<const N: usize>(
         &mut self,
         raw: &str,
@@ -1024,6 +1141,31 @@ impl UnicodeAvailabilityVisitor<'_> {
         Ok(false)
     }
 
+    fn normalized_matches_strs(
+        &mut self,
+        normalized: &[u8],
+        aliases: &[&str],
+    ) -> Result<bool, ParseError> {
+        for &alias in aliases {
+            self.charge(1)?;
+            if alias.len() != normalized.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(alias.as_bytes()) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn normalized_is_script_alias(&mut self, normalized: &[u8]) -> Result<bool, ParseError> {
         for &alias in UNICODE_SCRIPT_ALIASES {
             self.charge(1)?;
@@ -1130,6 +1272,85 @@ impl UnicodeAvailabilityVisitor<'_> {
         };
         if let Some(table) = table {
             self.charge_script_table_translation(table, query_bytes)?;
+        }
+        Ok(table)
+    }
+
+    fn normalized_segment_table(
+        &mut self,
+        normalized_name: &[u8],
+        normalized_value: &[u8],
+    ) -> Result<Option<UnicodeSegmentTable>, ParseError> {
+        for (index, &(name_aliases, value_aliases)) in UNICODE_SEGMENT_ALIASES.iter().enumerate() {
+            let name_matches = self.normalized_matches_strs(normalized_name, name_aliases)?;
+            let value_matches = self.normalized_matches_strs(normalized_value, value_aliases)?;
+            self.charge(1)?;
+            if name_matches && value_matches {
+                return Ok(Some(match index {
+                    0 => UnicodeSegmentTable::Grapheme,
+                    1 => UnicodeSegmentTable::Sentence,
+                    2 => UnicodeSegmentTable::Word,
+                    _ => {
+                        return Err(ParseError::new(
+                            self.profile.clone(),
+                            ErrorCategory::InvalidConfiguration,
+                            "Unicode segment alias inventory has an unknown family",
+                        ));
+                    }
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn charge_segment_table_translation(
+        &mut self,
+        table: UnicodeSegmentTable,
+        query_bytes: u64,
+    ) -> Result<(), ParseError> {
+        // The pinned lookup visits the 271-name property index, one of seven
+        // value families, at most 39 published aliases and one of 45 source
+        // tables. Thirty-two whole-query comparisons conservatively cover
+        // every binary search. The range term reserves source iteration, Vec
+        // allocation/copy, canonical-order validation/deduplication and a
+        // possible negation before translation.
+        self.charge(query_bytes.saturating_mul(32).saturating_add(512))?;
+        self.charge(
+            table
+                .ranges()
+                .saturating_mul(UNICODE_SEGMENT_CLASS_WORK_PER_RANGE),
+        )
+    }
+
+    fn is_unicode_segment_class(
+        &mut self,
+        class: &ast::ClassUnicode,
+    ) -> Result<Option<UnicodeSegmentTable>, ParseError> {
+        // Reserve the AST-kind branch and both feature comparisons before
+        // inspecting the query. Segment data is only addressable through a
+        // property-name/value pair in regex-syntax 0.8.11.
+        self.charge(3)?;
+        if !self.features.has_segment() {
+            return Ok(None);
+        }
+        let ast::ClassUnicodeKind::NamedValue { name, value, .. } = &class.kind else {
+            return Ok(None);
+        };
+        let mut name_buf = [0_u8; MAX_UNICODE_SEGMENT_ALIAS_BYTES];
+        let mut value_buf = [0_u8; MAX_UNICODE_SEGMENT_ALIAS_BYTES];
+        let Some(name_len) = self.normalize_unicode_symbol(name, &mut name_buf)? else {
+            return Ok(None);
+        };
+        let Some(value_len) = self.normalize_unicode_symbol(value, &mut value_buf)? else {
+            return Ok(None);
+        };
+        let table =
+            self.normalized_segment_table(&name_buf[..name_len], &value_buf[..value_len])?;
+        if let Some(table) = table {
+            let query_bytes = u64::try_from(name.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+            self.charge_segment_table_translation(table, query_bytes)?;
         }
         Ok(table)
     }
@@ -1298,6 +1519,10 @@ impl UnicodeAvailabilityVisitor<'_> {
                 self.require_case(&class.span)?;
                 return Ok(());
             }
+            _ if self.is_unicode_segment_class(class)?.is_some() => {
+                self.require_case(&class.span)?;
+                return Ok(());
+            }
             _ => {}
         }
         self.reject(
@@ -1415,6 +1640,7 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
                 self.charge_gencat_class_set(class)?;
                 self.charge_perl_class_set(class)?;
                 self.charge_script_class_set(class)?;
+                self.charge_segment_class_set(class)?;
                 if self.require_case(&class.span)? {
                     self.charge_case_fold_class(class)?;
                 }
@@ -2034,6 +2260,67 @@ mod tests {
                 "common"
             )
         );
+    }
+
+    #[test]
+    fn unicode_segment_range_bounds_match_pinned_regex_syntax_tables() {
+        fn ranges(pattern: &str) -> Option<usize> {
+            let hir = ParserBuilder::new().build().parse(pattern).ok()?;
+            match hir.kind() {
+                HirKind::Class(Class::Unicode(class)) => Some(class.ranges().len()),
+                // The translator canonicalizes a one-scalar class to a
+                // literal. It still came from one source-table range.
+                HirKind::Literal(_) => Some(1),
+                _ => panic!("segment pattern did not translate to one Unicode class"),
+            }
+        }
+
+        assert_eq!(UNICODE_SEGMENT_ALIASES.len(), 3);
+        assert_eq!(UNICODE_SEGMENT_ALIASES[0].1.len(), 18);
+        assert_eq!(UNICODE_SEGMENT_ALIASES[1].1.len(), 25);
+        assert_eq!(UNICODE_SEGMENT_ALIASES[2].1.len(), 31);
+        assert_eq!(
+            UNICODE_SEGMENT_ALIASES
+                .iter()
+                .flat_map(|(names, values)| names.iter().chain(values.iter()))
+                .map(|alias| alias.len())
+                .max(),
+            Some(MAX_UNICODE_SEGMENT_ALIAS_BYTES)
+        );
+        for &(names, values) in UNICODE_SEGMENT_ALIASES {
+            assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+
+        let mut maxima = [0_usize; 3];
+        for (family, &(names, aliases)) in UNICODE_SEGMENT_ALIASES.iter().enumerate() {
+            for &name in names {
+                for &alias in aliases {
+                    let pattern = format!(r"\p{{{name}={alias}}}");
+                    maxima[family] = maxima[family].max(
+                        ranges(&pattern)
+                            .unwrap_or_else(|| panic!("materialized segment alias {pattern}")),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            maxima,
+            [
+                usize::try_from(UNICODE_SEGMENT_GCB_RANGES).expect("bound fits usize"),
+                usize::try_from(UNICODE_SEGMENT_SB_RANGES).expect("bound fits usize"),
+                usize::try_from(UNICODE_SEGMENT_WB_RANGES).expect("bound fits usize"),
+            ]
+        );
+
+        for pattern in [
+            r"\p{gcb=Other}",
+            r"\p{gcb=E_Base}",
+            r"\p{sb=Other}",
+            r"\p{wb=E_Base}",
+        ] {
+            assert_eq!(ranges(pattern), None, "unmaterialized value {pattern}");
+        }
     }
 
     #[test]
