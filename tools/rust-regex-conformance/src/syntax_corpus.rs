@@ -62,6 +62,8 @@ const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
+    "ast::parse::tests::parse_unsupported_backreference";
 const AST_UNSUPPORTED_LOOKAROUND_CASE_ID: &str = "ast::parse::tests::parse_unsupported_lookaround";
 const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
 const AST_REGRESSION_455_CASE_ID: &str =
@@ -135,6 +137,7 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
 ];
 const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
     [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
+const UNSUPPORTED_BACKREFERENCE_PROBES: [&str; 2] = [r"\0", r"\9"];
 const MAX_PACKAGE_FILE_BYTES: u64 = 2 * 1_048_576;
 
 const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
@@ -152,7 +155,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_holistic, parse_unsupported_lookaround, and regressions 454/455; the other 25 AST parser identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_holistic, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 24 AST parser identities remain explicit Unsupported dispositions.",
     "The other 154 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
@@ -1507,6 +1510,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
         AST_HOLISTIC_CASE_ID
+            | AST_UNSUPPORTED_BACKREFERENCE_CASE_ID
             | AST_UNSUPPORTED_LOOKAROUND_CASE_ID
             | AST_REGRESSION_454_CASE_ID
             | AST_REGRESSION_455_CASE_ID
@@ -1516,6 +1520,9 @@ fn is_supported_ast_case(case_id: &str) -> bool {
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
+            catch_unwind(AssertUnwindSafe(run_ast_unsupported_backreference))
+        }
         AST_UNSUPPORTED_LOOKAROUND_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_unsupported_lookaround))
         }
@@ -1579,6 +1586,38 @@ fn run_ast_holistic() -> Result<(), AstMismatch> {
         "escaped-metacharacters-with-exact-spans",
     )?;
     validate_ast_record(&second, second_pattern, &RustProfile::regex_1_12_4())
+}
+
+fn run_ast_unsupported_backreference() -> Result<(), AstMismatch> {
+    for (index, pattern) in UNSUPPORTED_BACKREFERENCE_PROBES.into_iter().enumerate() {
+        let expected_upstream = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect_err("authenticated backreference probe must be rejected upstream");
+        if expected_upstream.kind() != &regex_syntax::ast::ErrorKind::UnsupportedBackreference
+            || expected_upstream.span() != &ast_span(0, pattern.len())
+            || expected_upstream.pattern() != pattern
+        {
+            return Err(AstMismatch {
+                expected: format!(
+                    "backreference-probe-{index}: upstream UnsupportedBackreference span=0..{} pattern={pattern:?}",
+                    pattern.len(),
+                ),
+                observed: format!("backreference-probe-{index}: {expected_upstream:?}"),
+            });
+        }
+
+        let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+        let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+            .expect_err("FRE must reject authenticated backreference probe");
+        validate_ast_error(
+            &observed,
+            &expected_upstream,
+            pattern,
+            &profile,
+            &format!("backreference-probe-{index}"),
+        )?;
+    }
+    Ok(())
 }
 
 fn run_ast_unsupported_lookaround() -> Result<(), AstMismatch> {
@@ -1753,6 +1792,18 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         AST_HOLISTIC_CASE_ID => contract.push_str(
             "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
         ),
+        AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
+            for (index, pattern) in UNSUPPORTED_BACKREFERENCE_PROBES.into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "probe-{index}=sha256:{},bytes:{},expected:error:UnsupportedBackreference,span:0..{}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
         AST_UNSUPPORTED_LOOKAROUND_CASE_ID => {
             for (index, (pattern, end)) in UNSUPPORTED_LOOKAROUND_PROBES.into_iter().enumerate() {
                 writeln!(
@@ -2269,6 +2320,7 @@ mod tests {
     #[test]
     fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
         for case_id in [
+            AST_UNSUPPORTED_BACKREFERENCE_CASE_ID,
             AST_UNSUPPORTED_LOOKAROUND_CASE_ID,
             AST_REGRESSION_454_CASE_ID,
             AST_REGRESSION_455_CASE_ID,
