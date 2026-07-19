@@ -17,7 +17,7 @@ use fre_syntax::{
     ParseRequest, RustAstRecord, RustProfile, SCHEMA_VERSION, SafetyEnvelope, SourceSpan,
     parse_rust_ast,
 };
-use regex_syntax::ast::{Ast, Concat, Literal, LiteralKind, Position, Span};
+use regex_syntax::ast::{Ast, Concat, HexLiteralKind, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::{CandidateIdentity, InventoryError, authenticate_candidate_source, sha256};
@@ -66,6 +66,15 @@ const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
     "ast::parse::tests::parse_unsupported_backreference";
 const AST_UNSUPPORTED_LOOKAROUND_CASE_ID: &str = "ast::parse::tests::parse_unsupported_lookaround";
 const AST_OCTAL_CASE_ID: &str = "ast::parse::tests::parse_octal";
+const AST_HEX_TWO_CASE_ID: &str = "ast::parse::tests::parse_hex_two";
+const AST_HEX_FOUR_CASE_ID: &str = "ast::parse::tests::parse_hex_four";
+const AST_HEX_EIGHT_CASE_ID: &str = "ast::parse::tests::parse_hex_eight";
+const AST_HEX_TWO_PASS_EVIDENCE_SHA256: &str =
+    "20dcfdb7f815b856f1d9dea92692790fbe327d4f90f266d77d0b44c1f794eef4";
+const AST_HEX_FOUR_PASS_EVIDENCE_SHA256: &str =
+    "6fcca07ecca25303f991f46cbe535033758fc7e5dbd0b1510b1d3e24c7c2a95a";
+const AST_HEX_EIGHT_PASS_EVIDENCE_SHA256: &str =
+    "b32686f62b009bdc721c80058eef0b3b128e6094154edf1bd4f3387c7746319d";
 const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
 const AST_REGRESSION_455_CASE_ID: &str =
     "ast::parse::tests::regression_455_trailing_dash_ignore_whitespace";
@@ -139,6 +148,30 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
 const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
     [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
 const UNSUPPORTED_BACKREFERENCE_PROBES: [&str; 2] = [r"\0", r"\9"];
+const HEX_TWO_ERROR_PROBES: [AstHexErrorProbe; 3] = [
+    AstHexErrorProbe::unexpected_eof(r"\xF", 3, 3),
+    AstHexErrorProbe::invalid_digit(r"\xG", 2, 3),
+    AstHexErrorProbe::invalid_digit(r"\xFG", 3, 4),
+];
+const HEX_FOUR_ERROR_PROBES: [AstHexErrorProbe; 6] = [
+    AstHexErrorProbe::unexpected_eof(r"\uF", 3, 3),
+    AstHexErrorProbe::invalid_digit(r"\uG", 2, 3),
+    AstHexErrorProbe::invalid_digit(r"\uFG", 3, 4),
+    AstHexErrorProbe::invalid_digit(r"\uFFG", 4, 5),
+    AstHexErrorProbe::invalid_digit(r"\uFFFG", 5, 6),
+    AstHexErrorProbe::invalid_scalar(r"\uD800", 2, 6),
+];
+const HEX_EIGHT_ERROR_PROBES: [AstHexErrorProbe; 9] = [
+    AstHexErrorProbe::unexpected_eof(r"\UF", 3, 3),
+    AstHexErrorProbe::invalid_digit(r"\UG", 2, 3),
+    AstHexErrorProbe::invalid_digit(r"\UFG", 3, 4),
+    AstHexErrorProbe::invalid_digit(r"\UFFG", 4, 5),
+    AstHexErrorProbe::invalid_digit(r"\UFFFG", 5, 6),
+    AstHexErrorProbe::invalid_digit(r"\UFFFFG", 6, 7),
+    AstHexErrorProbe::invalid_digit(r"\UFFFFFG", 7, 8),
+    AstHexErrorProbe::invalid_digit(r"\UFFFFFFG", 8, 9),
+    AstHexErrorProbe::invalid_digit(r"\UFFFFFFFG", 9, 10),
+];
 const MAX_PACKAGE_FILE_BYTES: u64 = 2 * 1_048_576;
 
 const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
@@ -156,8 +189,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_holistic, parse_octal, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 23 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 152 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_octal, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 20 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 149 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -1507,11 +1540,132 @@ struct AstMismatch {
     observed: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AstHexCase {
+    Two,
+    Four,
+    Eight,
+}
+
+impl AstHexCase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Two => "hex-two",
+            Self::Four => "hex-four",
+            Self::Eight => "hex-eight",
+        }
+    }
+
+    fn success_limit(self) -> u32 {
+        match self {
+            Self::Two => 256,
+            Self::Four | Self::Eight => 65_536,
+        }
+    }
+
+    fn success_pattern(self, value: u32) -> String {
+        match self {
+            Self::Two => format!(r"\x{value:02x}"),
+            Self::Four => format!(r"\u{value:04x}"),
+            Self::Eight => format!(r"\U{value:08x}"),
+        }
+    }
+
+    fn literal_kind(self) -> HexLiteralKind {
+        match self {
+            Self::Two => HexLiteralKind::X,
+            Self::Four => HexLiteralKind::UnicodeShort,
+            Self::Eight => HexLiteralKind::UnicodeLong,
+        }
+    }
+
+    fn literal_evidence_label(self) -> &'static str {
+        match self {
+            Self::Two => "HexFixed(X)",
+            Self::Four => "HexFixed(UnicodeShort)",
+            Self::Eight => "HexFixed(UnicodeLong)",
+        }
+    }
+
+    fn error_probes(self) -> &'static [AstHexErrorProbe] {
+        match self {
+            Self::Two => &HEX_TWO_ERROR_PROBES,
+            Self::Four => &HEX_FOUR_ERROR_PROBES,
+            Self::Eight => &HEX_EIGHT_ERROR_PROBES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AstHexErrorKind {
+    UnexpectedEof,
+    InvalidDigit,
+    InvalidScalar,
+}
+
+impl AstHexErrorKind {
+    fn upstream(self) -> regex_syntax::ast::ErrorKind {
+        match self {
+            Self::UnexpectedEof => regex_syntax::ast::ErrorKind::EscapeUnexpectedEof,
+            Self::InvalidDigit => regex_syntax::ast::ErrorKind::EscapeHexInvalidDigit,
+            Self::InvalidScalar => regex_syntax::ast::ErrorKind::EscapeHexInvalid,
+        }
+    }
+
+    fn evidence_label(self) -> &'static str {
+        match self {
+            Self::UnexpectedEof => "EscapeUnexpectedEof",
+            Self::InvalidDigit => "EscapeHexInvalidDigit",
+            Self::InvalidScalar => "EscapeHexInvalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AstHexErrorProbe {
+    pattern: &'static str,
+    kind: AstHexErrorKind,
+    span_start: usize,
+    span_end: usize,
+}
+
+impl AstHexErrorProbe {
+    const fn unexpected_eof(pattern: &'static str, span_start: usize, span_end: usize) -> Self {
+        Self {
+            pattern,
+            kind: AstHexErrorKind::UnexpectedEof,
+            span_start,
+            span_end,
+        }
+    }
+
+    const fn invalid_digit(pattern: &'static str, span_start: usize, span_end: usize) -> Self {
+        Self {
+            pattern,
+            kind: AstHexErrorKind::InvalidDigit,
+            span_start,
+            span_end,
+        }
+    }
+
+    const fn invalid_scalar(pattern: &'static str, span_start: usize, span_end: usize) -> Self {
+        Self {
+            pattern,
+            kind: AstHexErrorKind::InvalidScalar,
+            span_start,
+            span_end,
+        }
+    }
+}
+
 fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
         AST_HOLISTIC_CASE_ID
             | AST_OCTAL_CASE_ID
+            | AST_HEX_TWO_CASE_ID
+            | AST_HEX_FOUR_CASE_ID
+            | AST_HEX_EIGHT_CASE_ID
             | AST_UNSUPPORTED_BACKREFERENCE_CASE_ID
             | AST_UNSUPPORTED_LOOKAROUND_CASE_ID
             | AST_REGRESSION_454_CASE_ID
@@ -1523,6 +1677,9 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
         AST_OCTAL_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_octal)),
+        AST_HEX_TWO_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_two)),
+        AST_HEX_FOUR_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_four)),
+        AST_HEX_EIGHT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_eight)),
         AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_unsupported_backreference))
         }
@@ -1668,6 +1825,102 @@ fn run_ast_octal() -> Result<(), AstMismatch> {
         }
     }
     Ok(())
+}
+
+fn run_ast_hex_two() -> Result<(), AstMismatch> {
+    run_ast_hex_case(AstHexCase::Two)
+}
+
+fn run_ast_hex_four() -> Result<(), AstMismatch> {
+    run_ast_hex_case(AstHexCase::Four)
+}
+
+fn run_ast_hex_eight() -> Result<(), AstMismatch> {
+    run_ast_hex_case(AstHexCase::Eight)
+}
+
+fn run_ast_hex_case(case: AstHexCase) -> Result<(), AstMismatch> {
+    for value in 0..case.success_limit() {
+        let Some(c) = char::from_u32(value) else {
+            continue;
+        };
+        let pattern = case.success_pattern(value);
+        let expected = Ast::literal(Literal {
+            span: ast_span(0, pattern.len()),
+            kind: LiteralKind::HexFixed(case.literal_kind()),
+            c,
+        });
+        let assertion = format!("{}-success-{value}", case.label());
+
+        match regex_syntax::ast::parse::Parser::new().parse(&pattern) {
+            Ok(upstream_ast) if upstream_ast == expected => {}
+            Ok(upstream_ast) => {
+                return Err(AstMismatch {
+                    expected: format!("{assertion}: authenticated upstream Ok({expected:?})"),
+                    observed: format!("{assertion}: authenticated upstream Ok({upstream_ast:?})"),
+                });
+            }
+            Err(upstream_error) => {
+                return Err(AstMismatch {
+                    expected: format!("{assertion}: authenticated upstream Ok({expected:?})"),
+                    observed: format!(
+                        "{assertion}: authenticated upstream Err({upstream_error:?})"
+                    ),
+                });
+            }
+        }
+
+        let record = execute_ast_assertion(&pattern, &expected, &assertion)?;
+        validate_ast_record(&record, &pattern, &RustProfile::regex_1_12_4())?;
+    }
+
+    for (index, probe) in case.error_probes().iter().enumerate() {
+        run_ast_hex_error_probe(case, index, *probe)?;
+    }
+    Ok(())
+}
+
+fn run_ast_hex_error_probe(
+    case: AstHexCase,
+    index: usize,
+    probe: AstHexErrorProbe,
+) -> Result<(), AstMismatch> {
+    let assertion = format!("{}-error-{index}", case.label());
+    let expected_kind = probe.kind.upstream();
+    let expected_span = ast_span(probe.span_start, probe.span_end);
+    let expected_upstream = match regex_syntax::ast::parse::Parser::new().parse(probe.pattern) {
+        Err(error) if ast_hex_error_matches(&error, probe) => error,
+        outcome => {
+            return Err(AstMismatch {
+                expected: format!(
+                    "{assertion}: authenticated upstream Err(kind={expected_kind:?}, span={expected_span:?}, pattern={:?})",
+                    probe.pattern,
+                ),
+                observed: format!("{assertion}: authenticated upstream {outcome:?}"),
+            });
+        }
+    };
+
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    match parse_rust_ast(ParseRequest::rust(probe.pattern, profile.clone())) {
+        Err(observed) => validate_ast_error(
+            &observed,
+            &expected_upstream,
+            probe.pattern,
+            &profile,
+            &assertion,
+        ),
+        Ok(record) => Err(AstMismatch {
+            expected: format!("{assertion}: Err({expected_upstream:?})"),
+            observed: format!("{assertion}: Ok({:?})", record.ast),
+        }),
+    }
+}
+
+fn ast_hex_error_matches(error: &regex_syntax::ast::Error, probe: AstHexErrorProbe) -> bool {
+    error.kind() == &probe.kind.upstream()
+        && error.span() == &ast_span(probe.span_start, probe.span_end)
+        && error.pattern() == probe.pattern
 }
 
 fn run_ast_unsupported_lookaround() -> Result<(), AstMismatch> {
@@ -1887,6 +2140,9 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
                 .expect("writing to a String cannot fail");
             }
         }
+        AST_HEX_TWO_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Two),
+        AST_HEX_FOUR_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Four),
+        AST_HEX_EIGHT_CASE_ID => write_ast_hex_evidence(&mut contract, AstHexCase::Eight),
         AST_REGRESSION_454_CASE_ID => {
             writeln!(
                 contract,
@@ -1911,6 +2167,54 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         _ => unreachable!("pass evidence requires a supported AST case"),
     }
     sha256(contract.as_bytes())
+}
+
+fn write_ast_hex_evidence(contract: &mut String, case: AstHexCase) {
+    writeln!(
+        contract,
+        "authenticated-generator={},range:0..{},skip:non-Rust-char,success-kind:{}",
+        case.label(),
+        case.success_limit(),
+        case.literal_evidence_label(),
+    )
+    .expect("writing to a String cannot fail");
+    for value in 0..case.success_limit() {
+        let Some(c) = char::from_u32(value) else {
+            continue;
+        };
+        let pattern = case.success_pattern(value);
+        writeln!(
+            contract,
+            "success-{value}=sha256:{},bytes:{},span:0..{},kind:{},scalar:U+{:04X}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+            pattern.len(),
+            case.literal_evidence_label(),
+            u32::from(c),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    for (index, probe) in case.error_probes().iter().enumerate() {
+        writeln!(
+            contract,
+            "error-{index}=sha256:{},bytes:{},expected:error:{},span:{}..{}",
+            sha256(probe.pattern.as_bytes()),
+            probe.pattern.len(),
+            probe.kind.evidence_label(),
+            probe.span_start,
+            probe.span_end,
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn fixed_ast_hex_pass_evidence(case_id: &str) -> Option<&'static str> {
+    match case_id {
+        AST_HEX_TWO_CASE_ID => Some(AST_HEX_TWO_PASS_EVIDENCE_SHA256),
+        AST_HEX_FOUR_CASE_ID => Some(AST_HEX_FOUR_PASS_EVIDENCE_SHA256),
+        AST_HEX_EIGHT_CASE_ID => Some(AST_HEX_EIGHT_PASS_EVIDENCE_SHA256),
+        _ => None,
+    }
 }
 
 fn ast_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
@@ -1951,6 +2255,8 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
             obligation.default_harness_member
                 && obligation.no_default_harness_member
                 && evidence_sha256 == &ast_case_pass_evidence(&obligation.case_id)
+                && fixed_ast_hex_pass_evidence(&obligation.case_id)
+                    .is_none_or(|fixed| evidence_sha256 == fixed)
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
@@ -2393,6 +2699,9 @@ mod tests {
     fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
         for case_id in [
             AST_OCTAL_CASE_ID,
+            AST_HEX_TWO_CASE_ID,
+            AST_HEX_FOUR_CASE_ID,
+            AST_HEX_EIGHT_CASE_ID,
             AST_UNSUPPORTED_BACKREFERENCE_CASE_ID,
             AST_UNSUPPORTED_LOOKAROUND_CASE_ID,
             AST_REGRESSION_454_CASE_ID,
@@ -2419,6 +2728,88 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn hex_probe_inventories_and_evidence_are_fixed() {
+        for (case_id, case, successes, errors, fixed_evidence) in [
+            (
+                AST_HEX_TWO_CASE_ID,
+                AstHexCase::Two,
+                256,
+                3,
+                AST_HEX_TWO_PASS_EVIDENCE_SHA256,
+            ),
+            (
+                AST_HEX_FOUR_CASE_ID,
+                AstHexCase::Four,
+                63_488,
+                6,
+                AST_HEX_FOUR_PASS_EVIDENCE_SHA256,
+            ),
+            (
+                AST_HEX_EIGHT_CASE_ID,
+                AstHexCase::Eight,
+                63_488,
+                9,
+                AST_HEX_EIGHT_PASS_EVIDENCE_SHA256,
+            ),
+        ] {
+            assert_eq!(
+                (0..case.success_limit()).filter_map(char::from_u32).count(),
+                successes,
+            );
+            assert_eq!(case.error_probes().len(), errors);
+            assert_eq!(ast_case_pass_evidence(case_id), fixed_evidence);
+            assert_eq!(fixed_ast_hex_pass_evidence(case_id), Some(fixed_evidence));
+        }
+    }
+
+    #[test]
+    fn hex_adapter_rejects_ast_and_source_error_semantic_drift() {
+        let pattern = r"\U00000041";
+        let expected = Ast::literal(Literal {
+            span: ast_span(0, pattern.len()),
+            kind: LiteralKind::HexFixed(HexLiteralKind::UnicodeLong),
+            c: 'A',
+        });
+        let record = execute_ast_assertion(pattern, &expected, "exact-long-hex")
+            .expect("exact long-hex AST");
+        for mutation in [
+            Ast::literal(Literal {
+                span: ast_span(0, pattern.len()),
+                kind: LiteralKind::HexFixed(HexLiteralKind::UnicodeLong),
+                c: 'B',
+            }),
+            Ast::literal(Literal {
+                span: ast_span(0, pattern.len().saturating_sub(1)),
+                kind: LiteralKind::HexFixed(HexLiteralKind::UnicodeLong),
+                c: 'A',
+            }),
+            Ast::literal(Literal {
+                span: ast_span(0, pattern.len()),
+                kind: LiteralKind::HexFixed(HexLiteralKind::UnicodeShort),
+                c: 'A',
+            }),
+        ] {
+            assert_ne!(record.ast, mutation, "AST semantic drift must not qualify");
+        }
+
+        let probe = HEX_FOUR_ERROR_PROBES[5];
+        let error = regex_syntax::ast::parse::Parser::new()
+            .parse(probe.pattern)
+            .expect_err("surrogate escape must be rejected");
+        assert!(ast_hex_error_matches(&error, probe));
+
+        let mut wrong_kind = probe;
+        wrong_kind.kind = AstHexErrorKind::InvalidDigit;
+        assert!(!ast_hex_error_matches(&error, wrong_kind));
+        let mut wrong_span = probe;
+        wrong_span.span_start = wrong_span.span_start.saturating_add(1);
+        assert!(!ast_hex_error_matches(&error, wrong_span));
+        let mut wrong_pattern = probe;
+        wrong_pattern.pattern = r"\uD801";
+        assert!(!ast_hex_error_matches(&error, wrong_pattern));
     }
 
     #[test]
