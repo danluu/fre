@@ -27,6 +27,7 @@ mod feature_matrix;
 mod misc_regression_api;
 mod replacement_api;
 mod searcher_api;
+mod syntax_corpus;
 
 pub use adapter::{
     ADAPTER_ID, ADAPTER_REPORT_SCHEMA, AdapterDispositionCounts, AdapterReport,
@@ -62,6 +63,17 @@ pub use searcher_api::{
     SearcherApiReceipt, SearcherApiReport, SearcherApiReportPayload, SearcherCapability,
     SearcherSourceIdentity, SearcherStep, build_searcher_api_report, read_searcher_api_report,
     write_searcher_api_report,
+};
+pub use syntax_corpus::{
+    REGEX_SYNTAX_AST_PARSE_TESTS, REGEX_SYNTAX_CORPUS_OBLIGATIONS,
+    REGEX_SYNTAX_CORPUS_REPORT_SCHEMA, REGEX_SYNTAX_DEFAULT_UNIT_TESTS, REGEX_SYNTAX_DOCTESTS,
+    REGEX_SYNTAX_NO_DEFAULT_UNIT_TESTS, REGEX_SYNTAX_UNIT_DEFINITIONS, RegexSyntaxCorpusCaseKind,
+    RegexSyntaxCorpusCounts, RegexSyntaxCorpusDisposition, RegexSyntaxCorpusObligation,
+    RegexSyntaxCorpusReceipt, RegexSyntaxCorpusReport, RegexSyntaxCorpusReportPayload,
+    RegexSyntaxCorpusSourceIdentity, RegexSyntaxHarnessIdentity, RegexSyntaxOracleCounts,
+    RegexSyntaxOracleDisposition, RegexSyntaxOracleEvidence, RegexSyntaxOracleReceipt,
+    RegexSyntaxPackageFile, build_regex_syntax_corpus_report, read_regex_syntax_corpus_report,
+    write_regex_syntax_corpus_report,
 };
 
 /// Checked-in manifest schema.
