@@ -139,6 +139,24 @@ const HIR_TRANSLATE_IGNORE_WHITESPACE_CASE_ID: &str = "hir::translate::tests::ig
 const HIR_TRANSLATE_SMART_REPETITION_CASE_ID: &str = "hir::translate::tests::smart_repetition";
 const HIR_TRANSLATE_SMART_CONCAT_CASE_ID: &str = "hir::translate::tests::smart_concat";
 const HIR_TRANSLATE_SMART_ALTERNATION_CASE_ID: &str = "hir::translate::tests::smart_alternation";
+const HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID: &str = "hir::translate::tests::analysis_is_utf8";
+const HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID: &str =
+    "hir::translate::tests::analysis_captures_len";
+const HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID: &str =
+    "hir::translate::tests::analysis_static_captures_len";
+const HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_CASE_ID: &str =
+    "hir::translate::tests::analysis_is_all_assertions";
+const HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_CASE_ID: &str =
+    "hir::translate::tests::analysis_look_set_prefix_any";
+const HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_CASE_ID: &str =
+    "hir::translate::tests::analysis_is_anchored";
+const HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_CASE_ID: &str =
+    "hir::translate::tests::analysis_is_any_anchored";
+const HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_CASE_ID: &str = "hir::translate::tests::analysis_can_empty";
+const HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID: &str =
+    "hir::translate::tests::analysis_is_literal";
+const HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID: &str =
+    "hir::translate::tests::analysis_is_alternation_literal";
 const HIR_TRANSLATE_REGRESSION_ALT_EMPTY_CONCAT_CASE_ID: &str =
     "hir::translate::tests::regression_alt_empty_concat";
 const HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID: &str =
@@ -816,6 +834,230 @@ const HIR_TRANSLATE_SMART_ALTERNATION_PROBES: [HirTranslateProbe; 8] = [
     ("[A-Z][A-Z]|[A-Z]quux", false),
     ("[A-Z][A-Z]|[A-Z][A-Z]quux", false),
     ("[A-Z]foo|[A-Z]foobar", false),
+];
+const HIR_TRANSLATE_ANALYSIS_IS_UTF8_PROBES: [HirTranslateProbe; 16] = [
+    (r"a", true),
+    (r"ab", true),
+    (r"(?-u)a", true),
+    (r"(?-u)ab", true),
+    (r"\xFF", true),
+    (r"\xFF\xFF", true),
+    (r"[^a]", true),
+    (r"[^a][^a]", true),
+    (r"\b", true),
+    (r"\B", true),
+    (r"(?-u)\b", true),
+    (r"(?-u)\B", true),
+    (r"(?-u)\xFF", true),
+    (r"(?-u)\xFF\xFF", true),
+    (r"(?-u)[^a]", true),
+    (r"(?-u)[^a][^a]", true),
+];
+const HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_PROBES: [HirTranslateProbe; 13] = [
+    (r"a", false),
+    (r"(?:a)", false),
+    (r"(?i-u:a)", false),
+    (r"(?i-u)a", false),
+    (r"(a)", false),
+    (r"(?P<foo>a)", false),
+    (r"()", false),
+    (r"()a", false),
+    (r"(a)+", false),
+    (r"(a)(b)", false),
+    (r"(a)|(b)", false),
+    (r"((a))", false),
+    (r"([a&&b])", false),
+];
+const HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_PROBES: [HirTranslateProbe; 27] = [
+    (r"", false),
+    (r"foo|bar", false),
+    (r"(foo)|bar", false),
+    (r"foo|(bar)", false),
+    (r"(foo|bar)", false),
+    (r"(a|b|c|d|e|f)", false),
+    (r"(a)|(b)|(c)|(d)|(e)|(f)", false),
+    (r"(a)(b)|(c)(d)|(e)(f)", false),
+    (r"(a)(b)(c)(d)(e)(f)", false),
+    (r"(a)(b)(extra)|(a)(b)()", false),
+    (r"(a)(b)((?:extra)?)", false),
+    (r"(a)(b)(extra)?", false),
+    (r"(foo)|(bar)", false),
+    (r"(foo)(bar)", false),
+    (r"(foo)+(bar)", false),
+    (r"(foo)*(bar)", false),
+    (r"(foo)?{0}", false),
+    (r"(foo)?{1}", false),
+    (r"(foo){1}", false),
+    (r"(foo){1,}", false),
+    (r"(foo){1,}?", false),
+    (r"(foo){1,}??", false),
+    (r"(foo){0,}", false),
+    (r"(foo)(?:bar)", false),
+    (r"(foo(?:bar)+)(?:baz(boo))", false),
+    (r"(?P<bar>foo)(?:bar)(bal|loon)", false),
+    (r#"<(a)[^>]+href="([^"]+)"|<(img)[^>]+src="([^"]+)""#, false),
+];
+const HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_PROBES: [HirTranslateProbe; 11] = [
+    (r"\b", false),
+    (r"\B", false),
+    (r"^", false),
+    (r"$", false),
+    (r"\A", false),
+    (r"\z", false),
+    (r"$^\z\A\b\B", false),
+    (r"$|^|\z|\A|\b|\B", false),
+    (r"^$|$^", false),
+    (r"((\b)+())*^", false),
+    (r"^a", false),
+];
+const HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_PROBES: [HirTranslateProbe; 1] =
+    [(r"(?-u)(?i:(?:\b|_)win(?:32|64|dows)?(?:\b|_))", false)];
+const HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_PROBES: [HirTranslateProbe; 48] = [
+    (r"^", false),
+    (r"$", false),
+    (r"^^", false),
+    (r"$$", false),
+    (r"^$", false),
+    (r"^$", false),
+    (r"^foo", false),
+    (r"foo$", false),
+    (r"^foo|^bar", false),
+    (r"foo$|bar$", false),
+    (r"^(foo|bar)", false),
+    (r"(foo|bar)$", false),
+    (r"^+", false),
+    (r"$+", false),
+    (r"^++", false),
+    (r"$++", false),
+    (r"(^)+", false),
+    (r"($)+", false),
+    (r"$^", false),
+    (r"$^", false),
+    (r"$^|^$", false),
+    (r"$^|^$", false),
+    (r"\b^", false),
+    (r"$\b", false),
+    (r"^(?m:^)", false),
+    (r"(?m:$)$", false),
+    (r"(?m:^)^", false),
+    (r"$(?m:$)", false),
+    (r"(?m)^", false),
+    (r"(?m)$", false),
+    (r"(?m:^$)|$^", false),
+    (r"(?m:^$)|$^", false),
+    (r"$^|(?m:^$)", false),
+    (r"$^|(?m:^$)", false),
+    (r"a^", false),
+    (r"$a", false),
+    (r"a^", false),
+    (r"$a", false),
+    (r"^foo|bar", false),
+    (r"foo|bar$", false),
+    (r"^*", false),
+    (r"$*", false),
+    (r"^*+", false),
+    (r"$*+", false),
+    (r"^+*", false),
+    (r"$+*", false),
+    (r"(^)*", false),
+    (r"($)*", false),
+];
+const HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_PROBES: [HirTranslateProbe; 8] = [
+    (r"^", false),
+    (r"$", false),
+    (r"\A", false),
+    (r"\z", false),
+    (r"(?m)^", false),
+    (r"(?m)$", false),
+    (r"$", false),
+    (r"^", false),
+];
+const HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_PROBES: [HirTranslateProbe; 38] = [
+    (r"", true),
+    (r"()", true),
+    (r"()*", true),
+    (r"()+", true),
+    (r"()?", true),
+    (r"a*", true),
+    (r"a?", true),
+    (r"a{0}", true),
+    (r"a{0,}", true),
+    (r"a{0,1}", true),
+    (r"a{0,10}", true),
+    (r"\pL*", true),
+    (r"a*|b", true),
+    (r"b|a*", true),
+    (r"a|", true),
+    (r"|a", true),
+    (r"a||b", true),
+    (r"a*a?(abcd)*", true),
+    (r"^", true),
+    (r"$", true),
+    (r"(?m)^", true),
+    (r"(?m)$", true),
+    (r"\A", true),
+    (r"\z", true),
+    (r"\B", true),
+    (r"(?-u)\B", true),
+    (r"\b", true),
+    (r"(?-u)\b", true),
+    (r"a+", true),
+    (r"a{1}", true),
+    (r"a{1,}", true),
+    (r"a{1,2}", true),
+    (r"a{1,10}", true),
+    (r"b|a", true),
+    (r"a*a+(abcd)*", true),
+    (r"\P{any}", true),
+    (r"[a--a]", true),
+    (r"[a&&b]", true),
+];
+const HIR_TRANSLATE_ANALYSIS_IS_LITERAL_PROBES: [HirTranslateProbe; 16] = [
+    (r"a", false),
+    (r"ab", false),
+    (r"abc", false),
+    (r"(?m)abc", false),
+    (r"(?:a)", false),
+    (r"foo(?:a)", false),
+    (r"(?:a)foo", false),
+    (r"[a]", false),
+    (r"", false),
+    (r"^", false),
+    (r"a|b", false),
+    (r"(a)", false),
+    (r"a+", false),
+    (r"foo(a)", false),
+    (r"(a)foo", false),
+    (r"[ab]", false),
+];
+const HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_PROBES: [HirTranslateProbe; 27] = [
+    (r"a", false),
+    (r"ab", false),
+    (r"abc", false),
+    (r"(?m)abc", false),
+    (r"foo|bar", false),
+    (r"foo|bar|baz", false),
+    (r"[a]", false),
+    (r"(?:ab)|cd", false),
+    (r"ab|(?:cd)", false),
+    (r"", false),
+    (r"^", false),
+    (r"(a)", false),
+    (r"a+", false),
+    (r"foo(a)", false),
+    (r"(a)foo", false),
+    (r"[ab]", false),
+    (r"[ab]|b", false),
+    (r"a|[ab]", false),
+    (r"(a)|b", false),
+    (r"a|(b)", false),
+    (r"a|b", false),
+    (r"a|b|c", false),
+    (r"[a]|b", false),
+    (r"a|[b]", false),
+    (r"(?:a)|b", false),
+    (r"a|(?:b)", false),
+    (r"(?:z|xx)@|xx", false),
 ];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
@@ -2658,6 +2900,16 @@ fn is_supported_hir_translate_case(case_id: &str) -> bool {
             | HIR_TRANSLATE_SMART_REPETITION_CASE_ID
             | HIR_TRANSLATE_SMART_CONCAT_CASE_ID
             | HIR_TRANSLATE_SMART_ALTERNATION_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID
+            | HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID
     )
 }
 
@@ -3331,6 +3583,46 @@ fn hir_translate_probes(case_id: &str) -> (&'static [HirTranslateProbe], &'stati
             &HIR_TRANSLATE_SMART_ALTERNATION_PROBES,
             "hir-translate-smart-alternation",
         ),
+        HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_UTF8_PROBES,
+            "hir-translate-analysis-is-utf8",
+        ),
+        HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_PROBES,
+            "hir-translate-analysis-captures-len",
+        ),
+        HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_PROBES,
+            "hir-translate-analysis-static-captures-len",
+        ),
+        HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_PROBES,
+            "hir-translate-analysis-is-all-assertions",
+        ),
+        HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_PROBES,
+            "hir-translate-analysis-look-set-prefix-any",
+        ),
+        HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_PROBES,
+            "hir-translate-analysis-is-anchored",
+        ),
+        HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_PROBES,
+            "hir-translate-analysis-is-any-anchored",
+        ),
+        HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_PROBES,
+            "hir-translate-analysis-can-empty",
+        ),
+        HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_LITERAL_PROBES,
+            "hir-translate-analysis-is-literal",
+        ),
+        HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID => (
+            &HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_PROBES,
+            "hir-translate-analysis-is-alternation-literal",
+        ),
         _ => unreachable!("caller checked supported HIR translate case"),
     }
 }
@@ -3384,7 +3676,8 @@ fn execute_hir_translate_probe(
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
         && record.admission_status == AdmissionStatus::UpstreamOraclePending;
-    if identity_valid && parsed.hir == expected_hir {
+    let properties_match = parsed.hir.properties() == expected_hir.properties();
+    if identity_valid && parsed.hir == expected_hir && properties_match {
         Ok(())
     } else {
         Err(AstMismatch {
@@ -4925,6 +5218,78 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR translate receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_property_cases_execute_all_205_public_outcomes() {
+        let cases = [
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_UTF8_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_ALL_ASSERTIONS_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_LOOK_SET_PREFIX_ANY_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_ANCHORED_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_ANY_ANCHORED_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_CAN_EMPTY_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_LITERAL_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_LITERAL_PROBES.len(),
+            ),
+            (
+                HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID,
+                HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_PROBES.len(),
+            ),
+        ];
+        assert_eq!(
+            cases.iter().map(|(_, outcomes)| outcomes).sum::<usize>(),
+            205,
+        );
+        for (case_id, _) in cases {
+            let disposition = execute_hir_translate_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_translate_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/translate.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR property receipt");
         }
     }
 
