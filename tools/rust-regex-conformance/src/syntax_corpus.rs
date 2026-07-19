@@ -61,7 +61,11 @@ const OBLIGATION_INVENTORY_SHA256: &str =
 const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
+const AST_NEST_LIMIT_CASE_ID: &str = "ast::parse::tests::parse_nest_limit";
+#[cfg(test)]
+const AST_COMMENTS_CASE_ID: &str = "ast::parse::tests::parse_comments";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_IGNORE_WHITESPACE_CASE_ID: &str = "ast::parse::tests::parse_ignore_whitespace";
 const AST_NEWLINES_CASE_ID: &str = "ast::parse::tests::parse_newlines";
 const AST_ALTERNATE_CASE_ID: &str = "ast::parse::tests::parse_alternate";
 const AST_UNCOUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_uncounted_repetition";
@@ -170,6 +174,38 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
 const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
     [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
 const UNSUPPORTED_BACKREFERENCE_PROBES: [&str; 2] = [r"\0", r"\9"];
+const NEST_LIMIT_PROBES: [(&str, u32); 20] = [
+    ("", 0),
+    ("a", 0),
+    ("a+", 0),
+    ("a+", 1),
+    ("(a)+", 1),
+    ("a+*", 1),
+    ("a+*", 2),
+    ("ab", 0),
+    ("ab", 1),
+    ("abc", 1),
+    ("a|b", 0),
+    ("a|b", 1),
+    ("a|b|c", 1),
+    ("[a]", 0),
+    ("[a]", 1),
+    ("[ab]", 1),
+    ("[ab[cd]]", 2),
+    ("[ab[cd]]", 3),
+    ("[a--b]", 1),
+    ("[a--bc]", 2),
+];
+const IGNORE_WHITESPACE_PROBES: [&str; 8] = [
+    "(?x)a b",
+    "(?x)a b(?-x)a b",
+    "a (?x:a )a ",
+    "(?x)( ?P<foo> a )",
+    "(?x)(  a )",
+    "(?x)(  ?:  a )",
+    r"(?x)\x { 53 }",
+    r"(?x)\ ",
+];
 const NEWLINE_PROBES: [&str; 2] = [".\n.", "foobar\nbaz\nquux\n"];
 const ALTERNATE_PROBES: [&str; 15] = [
     r"a|b",
@@ -2029,7 +2065,9 @@ impl AstHexErrorProbe {
 fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
-        AST_HOLISTIC_CASE_ID
+        AST_NEST_LIMIT_CASE_ID
+            | AST_HOLISTIC_CASE_ID
+            | AST_IGNORE_WHITESPACE_CASE_ID
             | AST_NEWLINES_CASE_ID
             | AST_ALTERNATE_CASE_ID
             | AST_UNCOUNTED_REPETITION_CASE_ID
@@ -2055,7 +2093,9 @@ fn is_supported_ast_case(case_id: &str) -> bool {
 
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
+        AST_NEST_LIMIT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_nest_limit)),
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_IGNORE_WHITESPACE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_ignore_whitespace)),
         AST_NEWLINES_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_newlines)),
         AST_ALTERNATE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_alternate)),
         AST_UNCOUNTED_REPETITION_CASE_ID => {
@@ -2140,6 +2180,19 @@ fn run_ast_holistic() -> Result<(), AstMismatch> {
         "escaped-metacharacters-with-exact-spans",
     )?;
     validate_ast_record(&second, second_pattern, &RustProfile::regex_1_12_4())
+}
+
+fn run_ast_nest_limit() -> Result<(), AstMismatch> {
+    for (index, (pattern, nest_limit)) in NEST_LIMIT_PROBES.into_iter().enumerate() {
+        let mut profile = RustProfile::regex_1_12_4();
+        profile.options.nest_limit = nest_limit;
+        execute_ast_profile_equivalence_probe(pattern, &profile, &format!("nest-limit-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_ignore_whitespace() -> Result<(), AstMismatch> {
+    run_ast_equivalence_set(&IGNORE_WHITESPACE_PROBES, "ignore-whitespace")
 }
 
 fn run_ast_unsupported_backreference() -> Result<(), AstMismatch> {
@@ -2433,7 +2486,10 @@ fn execute_ast_profile_equivalence_probe(
 ) -> Result<(), AstMismatch> {
     let profile = CompatibilityProfile::RustText(rust_profile.clone());
     let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
-    builder.ignore_whitespace(rust_profile.options.ignore_whitespace);
+    builder
+        .nest_limit(rust_profile.options.nest_limit)
+        .octal(rust_profile.options.octal)
+        .ignore_whitespace(rust_profile.options.ignore_whitespace);
     let expected = builder.build().parse(pattern);
     let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()));
     match (expected, observed) {
@@ -2696,13 +2752,11 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         "fre.regex-syntax.ast-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\n"
     );
     match case_id {
+        AST_NEST_LIMIT_CASE_ID | AST_IGNORE_WHITESPACE_CASE_ID | AST_NEWLINES_CASE_ID => {
+            write_ast_frontend_profile_evidence(&mut contract, case_id);
+        }
         AST_HOLISTIC_CASE_ID => contract.push_str(
             "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
-        ),
-        AST_NEWLINES_CASE_ID => write_ast_equivalence_evidence(
-            &mut contract,
-            &NEWLINE_PROBES,
-            "upstream-exact-success",
         ),
         AST_ALTERNATE_CASE_ID => write_ast_equivalence_evidence(
             &mut contract,
@@ -2798,6 +2852,33 @@ fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expect
         writeln!(
             contract,
             "probe-{index}=sha256:{},bytes:{},expected:{expected}",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn write_ast_frontend_profile_evidence(contract: &mut String, case_id: &str) {
+    match case_id {
+        AST_NEST_LIMIT_CASE_ID => write_ast_nest_limit_evidence(contract),
+        AST_IGNORE_WHITESPACE_CASE_ID => write_ast_equivalence_evidence(
+            contract,
+            &IGNORE_WHITESPACE_PROBES,
+            "upstream-exact-success",
+        ),
+        AST_NEWLINES_CASE_ID => {
+            write_ast_equivalence_evidence(contract, &NEWLINE_PROBES, "upstream-exact-success");
+        }
+        _ => unreachable!("caller selected a frontend-profile case"),
+    }
+}
+
+fn write_ast_nest_limit_evidence(contract: &mut String) {
+    for (index, (pattern, nest_limit)) in NEST_LIMIT_PROBES.into_iter().enumerate() {
+        writeln!(
+            contract,
+            "probe-{index}=sha256:{},bytes:{},nest-limit:{nest_limit},expected:upstream-exact-result",
             sha256(pattern.as_bytes()),
             pattern.len(),
         )
@@ -3427,7 +3508,9 @@ mod tests {
     #[test]
     fn authenticated_ast_added_cases_execute_their_complete_outcome_sets() {
         for case_id in [
+            AST_NEST_LIMIT_CASE_ID,
             AST_NEWLINES_CASE_ID,
+            AST_IGNORE_WHITESPACE_CASE_ID,
             AST_ALTERNATE_CASE_ID,
             AST_UNCOUNTED_REPETITION_CASE_ID,
             AST_GROUP_CASE_ID,
@@ -3469,6 +3552,27 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn parser_option_family_covers_public_outcomes_but_not_comment_side_channel() {
+        assert_eq!(NEST_LIMIT_PROBES.len(), 20);
+        assert_eq!(IGNORE_WHITESPACE_PROBES.len(), 8);
+        run_ast_nest_limit().expect("all 20 pinned nest-limit outcomes match exactly");
+        run_ast_ignore_whitespace().expect("all 8 pinned ignore-whitespace outcomes match exactly");
+
+        let comments_pattern = "(?x)\n# This is comment 1.\nfoo # This is comment 2.\n  # This is comment 3.\nbar\n# This is comment 4.";
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse_with_comments(comments_pattern)
+            .expect("the pinned comment pattern parses with comments");
+        let observed = parse_rust_ast(ParseRequest::rust(
+            comments_pattern,
+            CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
+        ))
+        .expect("FRE parses the AST portion of the comment pattern");
+        assert_eq!(expected.ast, observed.ast);
+        assert_eq!(expected.comments.len(), 4);
+        assert!(!is_supported_ast_case(AST_COMMENTS_CASE_ID));
     }
 
     #[test]
