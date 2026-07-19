@@ -62,6 +62,8 @@ const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_PERL_CLASS_CASE_ID: &str = "ast::parse::tests::parse_perl_class";
+const AST_UNICODE_CLASS_CASE_ID: &str = "ast::parse::tests::parse_unicode_class";
 const AST_UNSUPPORTED_BACKREFERENCE_CASE_ID: &str =
     "ast::parse::tests::parse_unsupported_backreference";
 const AST_UNSUPPORTED_LOOKAROUND_CASE_ID: &str = "ast::parse::tests::parse_unsupported_lookaround";
@@ -148,6 +150,28 @@ const REGRESSION_455_PROBES: [(&str, bool); 8] = [
 const UNSUPPORTED_LOOKAROUND_PROBES: [(&str, usize); 4] =
     [("(?=a)", 3), ("(?!a)", 3), ("(?<=a)", 4), ("(?<!a)", 4)];
 const UNSUPPORTED_BACKREFERENCE_PROBES: [&str; 2] = [r"\0", r"\9"];
+const PERL_CLASS_PROBES: [&str; 8] = [r"\d", r"\D", r"\s", r"\S", r"\w", r"\W", r"\d", r"\dz"];
+const UNICODE_CLASS_PROBES: [&str; 19] = [
+    r"\pN",
+    r"\PN",
+    r"\p{N}",
+    r"\P{N}",
+    r"\p{Greek}",
+    r"\p{scx:Katakana}",
+    r"\p{scx=Katakana}",
+    r"\p{scx!=Katakana}",
+    r"\p{:}",
+    r"\p{=}",
+    r"\p{!=}",
+    r"\p",
+    r"\p{",
+    r"\p{N",
+    r"\p{Greek",
+    r"\pNz",
+    r"\p{Greek}z",
+    r"\p\{",
+    r"\P\{",
+];
 const HEX_TWO_ERROR_PROBES: [AstHexErrorProbe; 3] = [
     AstHexErrorProbe::unexpected_eof(r"\xF", 3, 3),
     AstHexErrorProbe::invalid_digit(r"\xG", 2, 3),
@@ -189,8 +213,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_octal, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 20 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 149 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_octal, parse_perl_class, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 18 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -385,7 +409,7 @@ enum TestOutcome {
 
 /// Authenticate the complete package, inventory both feature-mode harnesses,
 /// and execute the AST parser family as separately labelled upstream-oracle
-/// evidence. Four exact AST obligations additionally execute through FRE.
+/// evidence. Eleven exact AST obligations additionally execute through FRE.
 #[allow(
     clippy::too_many_lines,
     reason = "the transaction keeps package authentication, four harness lists, the oracle execution, and sealed report assembly adjacent"
@@ -1666,6 +1690,8 @@ fn is_supported_ast_case(case_id: &str) -> bool {
             | AST_HEX_TWO_CASE_ID
             | AST_HEX_FOUR_CASE_ID
             | AST_HEX_EIGHT_CASE_ID
+            | AST_PERL_CLASS_CASE_ID
+            | AST_UNICODE_CLASS_CASE_ID
             | AST_UNSUPPORTED_BACKREFERENCE_CASE_ID
             | AST_UNSUPPORTED_LOOKAROUND_CASE_ID
             | AST_REGRESSION_454_CASE_ID
@@ -1680,6 +1706,8 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         AST_HEX_TWO_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_two)),
         AST_HEX_FOUR_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_four)),
         AST_HEX_EIGHT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_hex_eight)),
+        AST_PERL_CLASS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_perl_class)),
+        AST_UNICODE_CLASS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_unicode_class)),
         AST_UNSUPPORTED_BACKREFERENCE_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_unsupported_backreference))
         }
@@ -1923,6 +1951,47 @@ fn ast_hex_error_matches(error: &regex_syntax::ast::Error, probe: AstHexErrorPro
         && error.pattern() == probe.pattern
 }
 
+fn run_ast_perl_class() -> Result<(), AstMismatch> {
+    for (index, pattern) in PERL_CLASS_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("perl-class-probe-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_unicode_class() -> Result<(), AstMismatch> {
+    for (index, pattern) in UNICODE_CLASS_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("unicode-class-probe-{index}"))?;
+    }
+    Ok(())
+}
+
+fn execute_ast_equivalence_probe(pattern: &str, assertion: &str) -> Result<(), AstMismatch> {
+    let rust_profile = RustProfile::regex_1_12_4();
+    let profile = CompatibilityProfile::RustText(rust_profile.clone());
+    let expected = regex_syntax::ast::parse::Parser::new().parse(pattern);
+    let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()));
+    match (expected, observed) {
+        (Ok(expected_ast), Ok(record)) => {
+            validate_ast_success(&record, &expected_ast, pattern, &rust_profile, assertion)
+        }
+        (Err(expected_error), Err(observed_error)) => validate_ast_error(
+            &observed_error,
+            &expected_error,
+            pattern,
+            &profile,
+            assertion,
+        ),
+        (Ok(expected_ast), Err(observed_error)) => Err(AstMismatch {
+            expected: format!("{assertion}: Ok({expected_ast:?})"),
+            observed: format!("{assertion}: Err({observed_error:?})"),
+        }),
+        (Err(expected_error), Ok(record)) => Err(AstMismatch {
+            expected: format!("{assertion}: Err({expected_error:?})"),
+            observed: format!("{assertion}: Ok({:?})", record.ast),
+        }),
+    }
+}
+
 fn run_ast_unsupported_lookaround() -> Result<(), AstMismatch> {
     for (index, (pattern, end)) in UNSUPPORTED_LOOKAROUND_PROBES.into_iter().enumerate() {
         let expected_upstream = regex_syntax::ast::parse::Parser::new()
@@ -2043,6 +2112,22 @@ fn execute_ast_assertion(
     Ok(record)
 }
 
+fn validate_ast_success(
+    record: &RustAstRecord,
+    expected: &Ast,
+    pattern: &str,
+    rust_profile: &RustProfile,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    if &record.ast != expected {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: Ok({expected:?})"),
+            observed: format!("{assertion}: Ok({:?})", record.ast),
+        });
+    }
+    validate_ast_record(record, pattern, rust_profile)
+}
+
 fn validate_ast_record(
     record: &RustAstRecord,
     pattern: &str,
@@ -2112,6 +2197,28 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
                 writeln!(
                     contract,
                     "probe-{index}=sha256:{},bytes:{},expected:error:UnsupportedLookAround,span:0..{end}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        AST_PERL_CLASS_CASE_ID => {
+            for (index, pattern) in PERL_CLASS_PROBES.into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "probe-{index}=sha256:{},bytes:{},expected:upstream-exact-success",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        AST_UNICODE_CLASS_CASE_ID => {
+            for (index, pattern) in UNICODE_CLASS_PROBES.into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "probe-{index}=sha256:{},bytes:{},expected:upstream-exact-result",
                     sha256(pattern.as_bytes()),
                     pattern.len(),
                 )
@@ -2702,6 +2809,8 @@ mod tests {
             AST_HEX_TWO_CASE_ID,
             AST_HEX_FOUR_CASE_ID,
             AST_HEX_EIGHT_CASE_ID,
+            AST_PERL_CLASS_CASE_ID,
+            AST_UNICODE_CLASS_CASE_ID,
             AST_UNSUPPORTED_BACKREFERENCE_CASE_ID,
             AST_UNSUPPORTED_LOOKAROUND_CASE_ID,
             AST_REGRESSION_454_CASE_ID,
@@ -2728,6 +2837,47 @@ mod tests {
             })
             .expect("supported AST regression receipt");
         }
+    }
+
+    #[test]
+    fn class_escape_adapters_reject_success_and_error_semantic_drift() {
+        let profile = RustProfile::regex_1_12_4();
+        let pattern = r"\d";
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect("Perl class probe parses");
+        let mut observed = parse_rust_ast(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .expect("FRE Perl class probe parses");
+        validate_ast_success(&observed, &expected, pattern, &profile, "unaltered")
+            .expect("exact success semantics");
+        observed.ast = Ast::empty(ast_span(0, 0));
+        assert!(
+            validate_ast_success(&observed, &expected, pattern, &profile, "mutated-ast").is_err()
+        );
+
+        let pattern = r"\p{";
+        let expected = regex_syntax::ast::parse::Parser::new()
+            .parse(pattern)
+            .expect_err("unterminated Unicode class is rejected");
+        let rust_profile = CompatibilityProfile::RustText(profile);
+        let mut observed = parse_rust_ast(ParseRequest::rust(pattern, rust_profile.clone()))
+            .expect_err("FRE rejects unterminated Unicode class");
+        validate_ast_error(&observed, &expected, pattern, &rust_profile, "unaltered")
+            .expect("exact error semantics");
+        observed.message.push('!');
+        assert!(
+            validate_ast_error(
+                &observed,
+                &expected,
+                pattern,
+                &rust_profile,
+                "mutated-error"
+            )
+            .is_err()
+        );
     }
 
     #[test]
