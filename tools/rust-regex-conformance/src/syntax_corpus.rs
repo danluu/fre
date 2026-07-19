@@ -136,6 +136,20 @@ const HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID: &str =
     "hir::literal::tests::anything_small_limits";
 const HIR_LITERAL_EMPTY_CASE_ID: &str = "hir::literal::tests::empty";
 const HIR_LITERAL_ODDS_AND_ENDS_CASE_ID: &str = "hir::literal::tests::odds_and_ends";
+const HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID: &str = "hir::tests::class_case_fold_unicode";
+const HIR_CLASS_CASE_FOLD_BYTES_CASE_ID: &str = "hir::tests::class_case_fold_bytes";
+const HIR_CLASS_NEGATE_UNICODE_CASE_ID: &str = "hir::tests::class_negate_unicode";
+const HIR_CLASS_NEGATE_BYTES_CASE_ID: &str = "hir::tests::class_negate_bytes";
+const HIR_CLASS_UNION_UNICODE_CASE_ID: &str = "hir::tests::class_union_unicode";
+const HIR_CLASS_UNION_BYTES_CASE_ID: &str = "hir::tests::class_union_bytes";
+const HIR_CLASS_INTERSECT_UNICODE_CASE_ID: &str = "hir::tests::class_intersect_unicode";
+const HIR_CLASS_INTERSECT_BYTES_CASE_ID: &str = "hir::tests::class_intersect_bytes";
+const HIR_CLASS_DIFFERENCE_UNICODE_CASE_ID: &str = "hir::tests::class_difference_unicode";
+const HIR_CLASS_DIFFERENCE_BYTES_CASE_ID: &str = "hir::tests::class_difference_bytes";
+const HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_CASE_ID: &str =
+    "hir::tests::class_symmetric_difference_unicode";
+const HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_CASE_ID: &str =
+    "hir::tests::class_symmetric_difference_bytes";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -697,6 +711,40 @@ const HIR_PRINT_ALTERNATION_PROBES: [HirPrintProbe; 7] = [
     ("foo|bar|quux", "(?:(?:foo)|(?:bar)|(?:quux))", false),
 ];
 type HirTranslateProbe = (&'static str, bool);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HirClassOperation {
+    CaseFold,
+    Negate,
+    Union,
+    Intersect,
+    Difference,
+    SymmetricDifference,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HirUnicodeClassProbe {
+    left: &'static [(char, char)],
+    right: &'static [(char, char)],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HirBytesClassProbe {
+    left: &'static [(u8, u8)],
+    right: &'static [(u8, u8)],
+}
+
+impl HirUnicodeClassProbe {
+    const fn new(left: &'static [(char, char)], right: &'static [(char, char)]) -> Self {
+        Self { left, right }
+    }
+}
+
+impl HirBytesClassProbe {
+    const fn new(left: &'static [(u8, u8)], right: &'static [(u8, u8)]) -> Self {
+        Self { left, right }
+    }
+}
 const HIR_TRANSLATE_EMPTY_PROBES: [HirTranslateProbe; 11] = [
     ("", false),
     ("(?i)", false),
@@ -1536,6 +1584,249 @@ const HIR_LITERAL_ODDS_AND_ENDS_PROBES: [&str; 10] = [
     r"[A-Z]+bar[A-Z]+",
     r"(?m)^Sherlock Holmes|Sherlock Holmes$",
     r"\bs(?:[ab])",
+];
+const HIR_CLASS_CASE_FOLD_UNICODE_PROBES: [HirUnicodeClassProbe; 8] = [
+    HirUnicodeClassProbe::new(
+        &[
+            ('C', 'F'),
+            ('A', 'G'),
+            ('D', 'J'),
+            ('A', 'C'),
+            ('M', 'P'),
+            ('L', 'S'),
+            ('c', 'f'),
+        ],
+        &[],
+    ),
+    HirUnicodeClassProbe::new(&[('A', 'Z')], &[]),
+    HirUnicodeClassProbe::new(&[('a', 'z')], &[]),
+    HirUnicodeClassProbe::new(&[('A', 'A'), ('_', '_')], &[]),
+    HirUnicodeClassProbe::new(&[('A', 'A'), ('=', '=')], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', '\x10')], &[]),
+    HirUnicodeClassProbe::new(&[('k', 'k')], &[]),
+    HirUnicodeClassProbe::new(&[('@', '@')], &[]),
+];
+const HIR_CLASS_CASE_FOLD_BYTES_PROBES: [HirBytesClassProbe; 8] = [
+    HirBytesClassProbe::new(
+        &[
+            (b'C', b'F'),
+            (b'A', b'G'),
+            (b'D', b'J'),
+            (b'A', b'C'),
+            (b'M', b'P'),
+            (b'L', b'S'),
+            (b'c', b'f'),
+        ],
+        &[],
+    ),
+    HirBytesClassProbe::new(&[(b'A', b'Z')], &[]),
+    HirBytesClassProbe::new(&[(b'a', b'z')], &[]),
+    HirBytesClassProbe::new(&[(b'A', b'A'), (b'_', b'_')], &[]),
+    HirBytesClassProbe::new(&[(b'A', b'A'), (b'=', b'=')], &[]),
+    HirBytesClassProbe::new(&[(b'\x00', b'\x10')], &[]),
+    HirBytesClassProbe::new(&[(b'k', b'k')], &[]),
+    HirBytesClassProbe::new(&[(b'@', b'@')], &[]),
+];
+const HIR_CLASS_NEGATE_UNICODE_PROBES: [HirUnicodeClassProbe; 12] = [
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[]),
+    HirUnicodeClassProbe::new(&[('a', 'a'), ('b', 'b')], &[]),
+    HirUnicodeClassProbe::new(&[('a', 'c'), ('x', 'z')], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', 'a')], &[]),
+    HirUnicodeClassProbe::new(&[('a', '\u{10FFFF}')], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', '\u{10FFFF}')], &[]),
+    HirUnicodeClassProbe::new(&[], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', '\u{10FFFD}'), ('\u{10FFFF}', '\u{10FFFF}')], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', '\u{D7FF}')], &[]),
+    HirUnicodeClassProbe::new(&[('\x00', '\u{D7FE}')], &[]),
+    HirUnicodeClassProbe::new(&[('\u{E000}', '\u{10FFFF}')], &[]),
+    HirUnicodeClassProbe::new(&[('\u{E001}', '\u{10FFFF}')], &[]),
+];
+const HIR_CLASS_NEGATE_BYTES_PROBES: [HirBytesClassProbe; 8] = [
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[]),
+    HirBytesClassProbe::new(&[(b'a', b'a'), (b'b', b'b')], &[]),
+    HirBytesClassProbe::new(&[(b'a', b'c'), (b'x', b'z')], &[]),
+    HirBytesClassProbe::new(&[(b'\x00', b'a')], &[]),
+    HirBytesClassProbe::new(&[(b'a', b'\xFF')], &[]),
+    HirBytesClassProbe::new(&[(b'\x00', b'\xFF')], &[]),
+    HirBytesClassProbe::new(&[], &[]),
+    HirBytesClassProbe::new(&[(b'\x00', b'\xFD'), (b'\xFF', b'\xFF')], &[]),
+];
+const HIR_CLASS_UNION_UNICODE_PROBES: [HirUnicodeClassProbe; 1] = [HirUnicodeClassProbe::new(
+    &[('a', 'g'), ('m', 't'), ('A', 'C')],
+    &[('a', 'z')],
+)];
+const HIR_CLASS_UNION_BYTES_PROBES: [HirBytesClassProbe; 1] = [HirBytesClassProbe::new(
+    &[(b'a', b'g'), (b'm', b't'), (b'A', b'C')],
+    &[(b'a', b'z')],
+)];
+const HIR_CLASS_INTERSECT_UNICODE_PROBES: [HirUnicodeClassProbe; 14] = [
+    HirUnicodeClassProbe::new(&[], &[('a', 'a')]),
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[('a', 'a')]),
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[('b', 'b')]),
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[('a', 'c')]),
+    HirUnicodeClassProbe::new(&[('a', 'b')], &[('a', 'c')]),
+    HirUnicodeClassProbe::new(&[('a', 'b')], &[('b', 'c')]),
+    HirUnicodeClassProbe::new(&[('a', 'b')], &[('c', 'd')]),
+    HirUnicodeClassProbe::new(&[('b', 'c')], &[('a', 'd')]),
+    HirUnicodeClassProbe::new(&[('a', 'b'), ('d', 'e'), ('g', 'h')], &[('a', 'h')]),
+    HirUnicodeClassProbe::new(
+        &[('a', 'b'), ('d', 'e'), ('g', 'h')],
+        &[('a', 'b'), ('d', 'e'), ('g', 'h')],
+    ),
+    HirUnicodeClassProbe::new(&[('a', 'b'), ('g', 'h')], &[('d', 'e'), ('k', 'l')]),
+    HirUnicodeClassProbe::new(&[('a', 'b'), ('d', 'e'), ('g', 'h')], &[('h', 'h')]),
+    HirUnicodeClassProbe::new(
+        &[('a', 'b'), ('e', 'f'), ('i', 'j')],
+        &[('c', 'd'), ('g', 'h'), ('k', 'l')],
+    ),
+    HirUnicodeClassProbe::new(
+        &[('a', 'b'), ('c', 'd'), ('e', 'f')],
+        &[('b', 'c'), ('d', 'e'), ('f', 'g')],
+    ),
+];
+const HIR_CLASS_INTERSECT_BYTES_PROBES: [HirBytesClassProbe; 14] = [
+    HirBytesClassProbe::new(&[], &[(b'a', b'a')]),
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[(b'a', b'a')]),
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[(b'b', b'b')]),
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[(b'a', b'c')]),
+    HirBytesClassProbe::new(&[(b'a', b'b')], &[(b'a', b'c')]),
+    HirBytesClassProbe::new(&[(b'a', b'b')], &[(b'b', b'c')]),
+    HirBytesClassProbe::new(&[(b'a', b'b')], &[(b'c', b'd')]),
+    HirBytesClassProbe::new(&[(b'b', b'c')], &[(b'a', b'd')]),
+    HirBytesClassProbe::new(&[(b'a', b'b'), (b'd', b'e'), (b'g', b'h')], &[(b'a', b'h')]),
+    HirBytesClassProbe::new(
+        &[(b'a', b'b'), (b'd', b'e'), (b'g', b'h')],
+        &[(b'a', b'b'), (b'd', b'e'), (b'g', b'h')],
+    ),
+    HirBytesClassProbe::new(&[(b'a', b'b'), (b'g', b'h')], &[(b'd', b'e'), (b'k', b'l')]),
+    HirBytesClassProbe::new(&[(b'a', b'b'), (b'd', b'e'), (b'g', b'h')], &[(b'h', b'h')]),
+    HirBytesClassProbe::new(
+        &[(b'a', b'b'), (b'e', b'f'), (b'i', b'j')],
+        &[(b'c', b'd'), (b'g', b'h'), (b'k', b'l')],
+    ),
+    HirBytesClassProbe::new(
+        &[(b'a', b'b'), (b'c', b'd'), (b'e', b'f')],
+        &[(b'b', b'c'), (b'd', b'e'), (b'f', b'g')],
+    ),
+];
+const HIR_CLASS_DIFFERENCE_UNICODE_PROBES: [HirUnicodeClassProbe; 12] = [
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[('a', 'a')]),
+    HirUnicodeClassProbe::new(&[('a', 'a')], &[]),
+    HirUnicodeClassProbe::new(&[], &[('a', 'a')]),
+    HirUnicodeClassProbe::new(&[('a', 'z')], &[('a', 'a')]),
+    HirUnicodeClassProbe::new(&[('a', 'z')], &[('z', 'z')]),
+    HirUnicodeClassProbe::new(&[('a', 'z')], &[('m', 'm')]),
+    HirUnicodeClassProbe::new(&[('a', 'c'), ('g', 'i'), ('r', 't')], &[('a', 'z')]),
+    HirUnicodeClassProbe::new(&[('a', 'c'), ('g', 'i'), ('r', 't')], &[('d', 'v')]),
+    HirUnicodeClassProbe::new(
+        &[('a', 'c'), ('g', 'i'), ('r', 't')],
+        &[('b', 'g'), ('s', 'u')],
+    ),
+    HirUnicodeClassProbe::new(
+        &[('a', 'c'), ('g', 'i'), ('r', 't')],
+        &[('b', 'd'), ('e', 'g'), ('s', 'u')],
+    ),
+    HirUnicodeClassProbe::new(&[('x', 'z')], &[('a', 'c'), ('e', 'g'), ('s', 'u')]),
+    HirUnicodeClassProbe::new(&[('a', 'z')], &[('a', 'c'), ('e', 'g'), ('s', 'u')]),
+];
+const HIR_CLASS_DIFFERENCE_BYTES_PROBES: [HirBytesClassProbe; 12] = [
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[(b'a', b'a')]),
+    HirBytesClassProbe::new(&[(b'a', b'a')], &[]),
+    HirBytesClassProbe::new(&[], &[(b'a', b'a')]),
+    HirBytesClassProbe::new(&[(b'a', b'z')], &[(b'a', b'a')]),
+    HirBytesClassProbe::new(&[(b'a', b'z')], &[(b'z', b'z')]),
+    HirBytesClassProbe::new(&[(b'a', b'z')], &[(b'm', b'm')]),
+    HirBytesClassProbe::new(&[(b'a', b'c'), (b'g', b'i'), (b'r', b't')], &[(b'a', b'z')]),
+    HirBytesClassProbe::new(&[(b'a', b'c'), (b'g', b'i'), (b'r', b't')], &[(b'd', b'v')]),
+    HirBytesClassProbe::new(
+        &[(b'a', b'c'), (b'g', b'i'), (b'r', b't')],
+        &[(b'b', b'g'), (b's', b'u')],
+    ),
+    HirBytesClassProbe::new(
+        &[(b'a', b'c'), (b'g', b'i'), (b'r', b't')],
+        &[(b'b', b'd'), (b'e', b'g'), (b's', b'u')],
+    ),
+    HirBytesClassProbe::new(&[(b'x', b'z')], &[(b'a', b'c'), (b'e', b'g'), (b's', b'u')]),
+    HirBytesClassProbe::new(&[(b'a', b'z')], &[(b'a', b'c'), (b'e', b'g'), (b's', b'u')]),
+];
+const HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_PROBES: [HirUnicodeClassProbe; 1] =
+    [HirUnicodeClassProbe::new(&[('a', 'm')], &[('g', 't')])];
+const HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_PROBES: [HirBytesClassProbe; 1] =
+    [HirBytesClassProbe::new(&[(b'a', b'm')], &[(b'g', b't')])];
+#[cfg(test)]
+const HIR_CLASS_OPERATION_CASES: [(&str, usize, bool, bool); 12] = [
+    (
+        HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID,
+        HIR_CLASS_CASE_FOLD_UNICODE_PROBES.len(),
+        true,
+        false,
+    ),
+    (
+        HIR_CLASS_CASE_FOLD_BYTES_CASE_ID,
+        HIR_CLASS_CASE_FOLD_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_NEGATE_UNICODE_CASE_ID,
+        HIR_CLASS_NEGATE_UNICODE_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_NEGATE_BYTES_CASE_ID,
+        HIR_CLASS_NEGATE_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_UNION_UNICODE_CASE_ID,
+        HIR_CLASS_UNION_UNICODE_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_UNION_BYTES_CASE_ID,
+        HIR_CLASS_UNION_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_INTERSECT_UNICODE_CASE_ID,
+        HIR_CLASS_INTERSECT_UNICODE_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_INTERSECT_BYTES_CASE_ID,
+        HIR_CLASS_INTERSECT_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_DIFFERENCE_UNICODE_CASE_ID,
+        HIR_CLASS_DIFFERENCE_UNICODE_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_DIFFERENCE_BYTES_CASE_ID,
+        HIR_CLASS_DIFFERENCE_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_CASE_ID,
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_PROBES.len(),
+        true,
+        true,
+    ),
+    (
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_CASE_ID,
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_PROBES.len(),
+        true,
+        true,
+    ),
 ];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
@@ -3057,6 +3348,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
         };
     }
+    if is_supported_hir_class_operation_case(&obligation.case_id) {
+        return execute_hir_class_operation_case(&obligation.case_id);
+    }
     if obligation.case_id.starts_with(AST_PARSE_PREFIX) {
         if is_supported_ast_case(&obligation.case_id) {
             return execute_ast_case(&obligation.case_id);
@@ -3386,6 +3680,24 @@ fn is_supported_hir_literal_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_hir_class_operation_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID
+            | HIR_CLASS_CASE_FOLD_BYTES_CASE_ID
+            | HIR_CLASS_NEGATE_UNICODE_CASE_ID
+            | HIR_CLASS_NEGATE_BYTES_CASE_ID
+            | HIR_CLASS_UNION_UNICODE_CASE_ID
+            | HIR_CLASS_UNION_BYTES_CASE_ID
+            | HIR_CLASS_INTERSECT_UNICODE_CASE_ID
+            | HIR_CLASS_INTERSECT_BYTES_CASE_ID
+            | HIR_CLASS_DIFFERENCE_UNICODE_CASE_ID
+            | HIR_CLASS_DIFFERENCE_BYTES_CASE_ID
+            | HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_CASE_ID
+            | HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_CASE_ID
+    )
+}
+
 fn is_supported_hir_translate_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -3550,6 +3862,28 @@ fn execute_hir_literal_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-hir-literal-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_hir_class_operation_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_hir_class_operation_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: hir_class_operation_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: hir_class_operation_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-hir-class-operation-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -4185,6 +4519,404 @@ fn execute_hir_literal_probe(
         }
     }
     Ok(())
+}
+
+fn run_hir_class_operation_case(case_id: &str) -> Result<(), AstMismatch> {
+    if let Some((probes, operation, label)) = hir_unicode_class_operation_probes(case_id) {
+        for (index, probe) in probes.iter().copied().enumerate() {
+            execute_hir_unicode_class_operation_probe(
+                probe,
+                operation,
+                &format!("{label}-{index}"),
+            )?;
+        }
+        return Ok(());
+    }
+    let (probes, operation, label) = hir_bytes_class_operation_probes(case_id)
+        .expect("caller checked supported HIR class operation case");
+    for (index, probe) in probes.iter().copied().enumerate() {
+        execute_hir_bytes_class_operation_probe(probe, operation, &format!("{label}-{index}"))?;
+    }
+    Ok(())
+}
+
+fn hir_unicode_class_operation_probes(
+    case_id: &str,
+) -> Option<(
+    &'static [HirUnicodeClassProbe],
+    HirClassOperation,
+    &'static str,
+)> {
+    match case_id {
+        HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_CASE_FOLD_UNICODE_PROBES,
+            HirClassOperation::CaseFold,
+            "hir-class-case-fold-unicode",
+        )),
+        HIR_CLASS_NEGATE_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_NEGATE_UNICODE_PROBES,
+            HirClassOperation::Negate,
+            "hir-class-negate-unicode",
+        )),
+        HIR_CLASS_UNION_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_UNION_UNICODE_PROBES,
+            HirClassOperation::Union,
+            "hir-class-union-unicode",
+        )),
+        HIR_CLASS_INTERSECT_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_INTERSECT_UNICODE_PROBES,
+            HirClassOperation::Intersect,
+            "hir-class-intersect-unicode",
+        )),
+        HIR_CLASS_DIFFERENCE_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_DIFFERENCE_UNICODE_PROBES,
+            HirClassOperation::Difference,
+            "hir-class-difference-unicode",
+        )),
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_CASE_ID => Some((
+            &HIR_CLASS_SYMMETRIC_DIFFERENCE_UNICODE_PROBES,
+            HirClassOperation::SymmetricDifference,
+            "hir-class-symmetric-difference-unicode",
+        )),
+        _ => None,
+    }
+}
+
+fn hir_bytes_class_operation_probes(
+    case_id: &str,
+) -> Option<(
+    &'static [HirBytesClassProbe],
+    HirClassOperation,
+    &'static str,
+)> {
+    match case_id {
+        HIR_CLASS_CASE_FOLD_BYTES_CASE_ID => Some((
+            &HIR_CLASS_CASE_FOLD_BYTES_PROBES,
+            HirClassOperation::CaseFold,
+            "hir-class-case-fold-bytes",
+        )),
+        HIR_CLASS_NEGATE_BYTES_CASE_ID => Some((
+            &HIR_CLASS_NEGATE_BYTES_PROBES,
+            HirClassOperation::Negate,
+            "hir-class-negate-bytes",
+        )),
+        HIR_CLASS_UNION_BYTES_CASE_ID => Some((
+            &HIR_CLASS_UNION_BYTES_PROBES,
+            HirClassOperation::Union,
+            "hir-class-union-bytes",
+        )),
+        HIR_CLASS_INTERSECT_BYTES_CASE_ID => Some((
+            &HIR_CLASS_INTERSECT_BYTES_PROBES,
+            HirClassOperation::Intersect,
+            "hir-class-intersect-bytes",
+        )),
+        HIR_CLASS_DIFFERENCE_BYTES_CASE_ID => Some((
+            &HIR_CLASS_DIFFERENCE_BYTES_PROBES,
+            HirClassOperation::Difference,
+            "hir-class-difference-bytes",
+        )),
+        HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_CASE_ID => Some((
+            &HIR_CLASS_SYMMETRIC_DIFFERENCE_BYTES_PROBES,
+            HirClassOperation::SymmetricDifference,
+            "hir-class-symmetric-difference-bytes",
+        )),
+        _ => None,
+    }
+}
+
+fn unicode_class_pattern(ranges: &[(char, char)]) -> String {
+    if ranges.is_empty() {
+        return r"[\p{Greek}&&\P{Greek}]".to_owned();
+    }
+    let mut pattern = String::from("[");
+    for &(start, end) in ranges {
+        write!(
+            pattern,
+            r"\x{{{:X}}}-\x{{{:X}}}",
+            u32::from(start),
+            u32::from(end)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    pattern.push(']');
+    pattern
+}
+
+fn bytes_class_pattern(ranges: &[(u8, u8)]) -> String {
+    if ranges.is_empty() {
+        return "(?-u:[a&&b])".to_owned();
+    }
+    let mut pattern = String::from("(?-u:[");
+    for &(start, end) in ranges {
+        write!(pattern, r"\x{start:02X}-\x{end:02X}").expect("writing to a String cannot fail");
+    }
+    pattern.push_str("])");
+    pattern
+}
+
+fn exact_hir_pair(
+    pattern: &str,
+    assertion: &str,
+) -> Result<(regex_syntax::hir::Hir, regex_syntax::hir::Hir), AstMismatch> {
+    let compatibility = CompatibilityProfile::RustBytes(RustProfile::regex_1_12_4());
+    let expected_hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: authenticated upstream HIR parse succeeds"),
+            observed: format!("{assertion}: upstream HIR parse error {error:?}"),
+        })?;
+    let record =
+        parse(ParseRequest::rust(pattern, compatibility.clone())).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: FRE HIR parse succeeds"),
+            observed: format!("{assertion}: FRE HIR parse error {error:?}"),
+        })?;
+    let CanonicalPattern::Rust(parsed) = &record.pattern else {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: FRE Rust canonical HIR"),
+            observed: format!("{assertion}: {:?}", record.pattern),
+        });
+    };
+    let identity_valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == pattern.as_bytes()
+        && record.key.profile == compatibility
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+    if !identity_valid || parsed.hir != expected_hir {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
+            observed: format!("{assertion}: {record:?}"),
+        });
+    }
+    Ok((expected_hir, parsed.hir.clone()))
+}
+
+fn unicode_class_from_hir(
+    hir: &regex_syntax::hir::Hir,
+    assertion: &str,
+) -> Result<regex_syntax::hir::ClassUnicode, AstMismatch> {
+    match hir.kind() {
+        regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Unicode(class)) => {
+            Ok(class.clone())
+        }
+        regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Bytes(class))
+            if class.iter().next().is_none() =>
+        {
+            Ok(regex_syntax::hir::ClassUnicode::empty())
+        }
+        regex_syntax::hir::HirKind::Literal(literal) => {
+            let text = std::str::from_utf8(&literal.0).map_err(|error| AstMismatch {
+                expected: format!("{assertion}: one Unicode literal scalar"),
+                observed: format!("{assertion}: literal UTF-8 error {error:?}"),
+            })?;
+            let mut chars = text.chars();
+            let Some(c) = chars.next() else {
+                return Err(AstMismatch {
+                    expected: format!("{assertion}: one Unicode literal scalar"),
+                    observed: format!("{assertion}: empty literal"),
+                });
+            };
+            if chars.next().is_some() {
+                return Err(AstMismatch {
+                    expected: format!("{assertion}: one Unicode literal scalar"),
+                    observed: format!("{assertion}: multi-scalar literal {text:?}"),
+                });
+            }
+            Ok(regex_syntax::hir::ClassUnicode::new([
+                regex_syntax::hir::ClassUnicodeRange::new(c, c),
+            ]))
+        }
+        kind => Err(AstMismatch {
+            expected: format!("{assertion}: Unicode class or singleton literal"),
+            observed: format!("{assertion}: {kind:?}"),
+        }),
+    }
+}
+
+fn bytes_class_from_hir(
+    hir: &regex_syntax::hir::Hir,
+    assertion: &str,
+) -> Result<regex_syntax::hir::ClassBytes, AstMismatch> {
+    match hir.kind() {
+        regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Bytes(class)) => {
+            Ok(class.clone())
+        }
+        regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Unicode(class))
+            if class.iter().next().is_none() =>
+        {
+            Ok(regex_syntax::hir::ClassBytes::empty())
+        }
+        regex_syntax::hir::HirKind::Literal(literal) if literal.0.len() == 1 => {
+            let byte = literal.0[0];
+            Ok(regex_syntax::hir::ClassBytes::new([
+                regex_syntax::hir::ClassBytesRange::new(byte, byte),
+            ]))
+        }
+        kind => Err(AstMismatch {
+            expected: format!("{assertion}: bytes class or singleton literal"),
+            observed: format!("{assertion}: {kind:?}"),
+        }),
+    }
+}
+
+fn execute_hir_unicode_class_operation_probe(
+    probe: HirUnicodeClassProbe,
+    operation: HirClassOperation,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let left_pattern = unicode_class_pattern(probe.left);
+    let (expected_left_hir, observed_left_hir) =
+        exact_hir_pair(&left_pattern, &format!("{assertion}-left"))?;
+    let direct_left = regex_syntax::hir::ClassUnicode::new(
+        probe
+            .left
+            .iter()
+            .copied()
+            .map(|(start, end)| regex_syntax::hir::ClassUnicodeRange::new(start, end)),
+    );
+    let mut expected = unicode_class_from_hir(&expected_left_hir, assertion)?;
+    let mut observed = unicode_class_from_hir(&observed_left_hir, assertion)?;
+    if expected != direct_left || observed != direct_left {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: source operand {direct_left:?}"),
+            observed: format!("{assertion}: upstream={expected:?}, FRE={observed:?}"),
+        });
+    }
+    if matches!(operation, HirClassOperation::CaseFold) {
+        expected.case_fold_simple();
+        observed.case_fold_simple();
+    } else if matches!(operation, HirClassOperation::Negate) {
+        expected.negate();
+        observed.negate();
+    } else {
+        let right_pattern = unicode_class_pattern(probe.right);
+        let (expected_right_hir, observed_right_hir) =
+            exact_hir_pair(&right_pattern, &format!("{assertion}-right"))?;
+        let direct_right = regex_syntax::hir::ClassUnicode::new(
+            probe
+                .right
+                .iter()
+                .copied()
+                .map(|(start, end)| regex_syntax::hir::ClassUnicodeRange::new(start, end)),
+        );
+        let expected_right = unicode_class_from_hir(&expected_right_hir, assertion)?;
+        let observed_right = unicode_class_from_hir(&observed_right_hir, assertion)?;
+        if expected_right != direct_right || observed_right != direct_right {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: source operand {direct_right:?}"),
+                observed: format!(
+                    "{assertion}: upstream={expected_right:?}, FRE={observed_right:?}"
+                ),
+            });
+        }
+        apply_unicode_class_operation(&mut expected, &expected_right, operation);
+        apply_unicode_class_operation(&mut observed, &observed_right, operation);
+    }
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: {operation:?} {expected:?}"),
+            observed: format!("{assertion}: {operation:?} {observed:?}"),
+        })
+    }
+}
+
+fn apply_unicode_class_operation(
+    left: &mut regex_syntax::hir::ClassUnicode,
+    right: &regex_syntax::hir::ClassUnicode,
+    operation: HirClassOperation,
+) {
+    match operation {
+        HirClassOperation::Union => left.union(right),
+        HirClassOperation::Intersect => left.intersect(right),
+        HirClassOperation::Difference => left.difference(right),
+        HirClassOperation::SymmetricDifference => left.symmetric_difference(right),
+        HirClassOperation::CaseFold | HirClassOperation::Negate => {
+            unreachable!("unary class operation handled by caller")
+        }
+    }
+}
+
+fn execute_hir_bytes_class_operation_probe(
+    probe: HirBytesClassProbe,
+    operation: HirClassOperation,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let left_pattern = bytes_class_pattern(probe.left);
+    let (expected_left_hir, observed_left_hir) =
+        exact_hir_pair(&left_pattern, &format!("{assertion}-left"))?;
+    let direct_left = regex_syntax::hir::ClassBytes::new(
+        probe
+            .left
+            .iter()
+            .copied()
+            .map(|(start, end)| regex_syntax::hir::ClassBytesRange::new(start, end)),
+    );
+    let mut expected = bytes_class_from_hir(&expected_left_hir, assertion)?;
+    let mut observed = bytes_class_from_hir(&observed_left_hir, assertion)?;
+    if expected != direct_left || observed != direct_left {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: source operand {direct_left:?}"),
+            observed: format!("{assertion}: upstream={expected:?}, FRE={observed:?}"),
+        });
+    }
+    if matches!(operation, HirClassOperation::CaseFold) {
+        expected.case_fold_simple();
+        observed.case_fold_simple();
+    } else if matches!(operation, HirClassOperation::Negate) {
+        expected.negate();
+        observed.negate();
+    } else {
+        let right_pattern = bytes_class_pattern(probe.right);
+        let (expected_right_hir, observed_right_hir) =
+            exact_hir_pair(&right_pattern, &format!("{assertion}-right"))?;
+        let direct_right = regex_syntax::hir::ClassBytes::new(
+            probe
+                .right
+                .iter()
+                .copied()
+                .map(|(start, end)| regex_syntax::hir::ClassBytesRange::new(start, end)),
+        );
+        let expected_right = bytes_class_from_hir(&expected_right_hir, assertion)?;
+        let observed_right = bytes_class_from_hir(&observed_right_hir, assertion)?;
+        if expected_right != direct_right || observed_right != direct_right {
+            return Err(AstMismatch {
+                expected: format!("{assertion}: source operand {direct_right:?}"),
+                observed: format!(
+                    "{assertion}: upstream={expected_right:?}, FRE={observed_right:?}"
+                ),
+            });
+        }
+        apply_bytes_class_operation(&mut expected, &expected_right, operation);
+        apply_bytes_class_operation(&mut observed, &observed_right, operation);
+    }
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: {operation:?} {expected:?}"),
+            observed: format!("{assertion}: {operation:?} {observed:?}"),
+        })
+    }
+}
+
+fn apply_bytes_class_operation(
+    left: &mut regex_syntax::hir::ClassBytes,
+    right: &regex_syntax::hir::ClassBytes,
+    operation: HirClassOperation,
+) {
+    match operation {
+        HirClassOperation::Union => left.union(right),
+        HirClassOperation::Intersect => left.intersect(right),
+        HirClassOperation::Difference => left.difference(right),
+        HirClassOperation::SymmetricDifference => left.symmetric_difference(right),
+        HirClassOperation::CaseFold | HirClassOperation::Negate => {
+            unreachable!("unary class operation handled by caller")
+        }
+    }
 }
 
 fn run_hir_translate_case(case_id: &str) -> Result<(), AstMismatch> {
@@ -5066,6 +5798,58 @@ fn hir_literal_pass_evidence(case_id: &str) -> String {
     sha256(contract.as_bytes())
 }
 
+fn hir_class_operation_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.hir-class-operation-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nprofile=rust-bytes\n"
+    );
+    if let Some((probes, operation, _)) = hir_unicode_class_operation_probes(case_id) {
+        writeln!(contract, "operation={operation:?}\nclass=unicode")
+            .expect("writing to a String cannot fail");
+        for (index, probe) in probes.iter().copied().enumerate() {
+            write_hir_class_operation_evidence(
+                &mut contract,
+                index,
+                &unicode_class_pattern(probe.left),
+                &unicode_class_pattern(probe.right),
+                operation,
+            );
+        }
+    } else {
+        let (probes, operation, _) = hir_bytes_class_operation_probes(case_id)
+            .expect("caller checked supported HIR class operation case");
+        writeln!(contract, "operation={operation:?}\nclass=bytes")
+            .expect("writing to a String cannot fail");
+        for (index, probe) in probes.iter().copied().enumerate() {
+            write_hir_class_operation_evidence(
+                &mut contract,
+                index,
+                &bytes_class_pattern(probe.left),
+                &bytes_class_pattern(probe.right),
+                operation,
+            );
+        }
+    }
+    sha256(contract.as_bytes())
+}
+
+fn write_hir_class_operation_evidence(
+    contract: &mut String,
+    index: usize,
+    left: &str,
+    right: &str,
+    operation: HirClassOperation,
+) {
+    writeln!(
+        contract,
+        "probe-{index}=left-sha256:{},left-bytes:{},right-sha256:{},right-bytes:{},operation:{operation:?},expected:exact-hir-source-operands-and-public-operation",
+        sha256(left.as_bytes()),
+        left.len(),
+        sha256(right.as_bytes()),
+        right.len(),
+    )
+    .expect("writing to a String cannot fail");
+}
+
 fn hir_translate_pass_evidence(case_id: &str) -> String {
     let mut contract = format!(
         "fre.regex-syntax.hir-translate-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nast-octal=true\n"
@@ -5334,6 +6118,15 @@ fn hir_literal_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
     )
 }
 
+fn hir_class_operation_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.hir-class-operation-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_translate_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -5348,6 +6141,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_ast_print_case(case_id)
         || is_supported_hir_print_case(case_id)
         || is_supported_hir_literal_case(case_id)
+        || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
 }
 
@@ -5360,6 +6154,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         hir_print_pass_evidence(case_id)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_pass_evidence(case_id)
+    } else if is_supported_hir_class_operation_case(case_id) {
+        hir_class_operation_pass_evidence(case_id)
     } else {
         hir_translate_pass_evidence(case_id)
     }
@@ -5374,6 +6170,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         hir_print_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_literal_case(case_id) {
         hir_literal_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_hir_class_operation_case(case_id) {
+        hir_class_operation_mismatch_evidence(case_id, expected, observed)
     } else {
         hir_translate_mismatch_evidence(case_id, expected, observed)
     }
@@ -5388,6 +6186,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-hir-print-adapter"
     } else if is_supported_hir_literal_case(case_id) {
         "fre-hir-literal-adapter"
+    } else if is_supported_hir_class_operation_case(case_id) {
+        "fre-hir-class-operation-adapter"
     } else {
         "fre-hir-translate-adapter"
     }
@@ -6090,6 +6890,39 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR literal receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_class_operations_execute_all_92_public_outcomes() {
+        assert_eq!(
+            HIR_CLASS_OPERATION_CASES
+                .iter()
+                .map(|(_, outcomes, _, _)| outcomes)
+                .sum::<usize>(),
+            92,
+        );
+        for (case_id, _, default_member, no_default_member) in HIR_CLASS_OPERATION_CASES {
+            let disposition = execute_hir_class_operation_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_class_operation_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/mod.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: default_member,
+                    no_default_harness_member: no_default_member,
+                },
+                disposition,
+            })
+            .expect("supported HIR class-operation receipt");
         }
     }
 
