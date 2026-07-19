@@ -102,6 +102,7 @@ const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 3] = [
     ZEROED_EXACT_REVIEWED_BLOCK,
     COPY_EXACT_REVIEWED_BLOCK,
 ];
+const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 4;
 
 const KERNEL_LINTS: &str = r#"
 [lints.rust]
@@ -566,7 +567,7 @@ fn audit_exact_allocator_source(source_path: &Path) -> Result<(), String> {
             "exact allocator source must contain exactly one {DENY_ATTRIBUTE}"
         ));
     }
-    if source.matches("unsafe_code").count() != EXACT_ALLOC_REVIEWED_BLOCKS.len() + 1 {
+    if source.matches("unsafe_code").count() != EXACT_ALLOC_UNSAFE_CODE_SPELLINGS {
         return Err("exact allocator unsafe-lint lowering inventory drifted".to_owned());
     }
     let mut prior_end = 0;
