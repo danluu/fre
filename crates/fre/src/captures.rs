@@ -825,40 +825,62 @@ impl PortableTextCaptureRegex {
         (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
         PortableTextCaptureSearchError,
     > {
+        self.captures_window_with_config(haystack, Window::all(haystack.as_bytes()), config, limits)
+    }
+
+    /// Return the first text capture record inside `window` under an explicit
+    /// match-end selection and start-injection policy.
+    pub fn captures_window_with_config<'h>(
+        &self,
+        haystack: &'h str,
+        window: Window,
+        config: CaptureSearchConfig,
+        limits: EngineSearchLimits,
+    ) -> Result<
+        (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
+        PortableTextCaptureSearchError,
+    > {
+        if !text_capture_window_is_valid(haystack, window) {
+            return Err(PortableTextCaptureSearchError::Capture(
+                EngineSearchError::InvalidWindow,
+            ));
+        }
         let outcome = self
             .inner
-            .captures_with_config(haystack.as_bytes(), config, limits)
+            .captures_window_with_config(haystack.as_bytes(), window, config, limits)
             .map_err(PortableTextCaptureSearchError::Capture)?;
-        let accounting = outcome.report;
-        let Some(record) = outcome.captures else {
-            return Ok((None, accounting));
-        };
-        if record.overall().is_none() {
-            return Err(PortableTextCaptureSearchError::MissingOverall);
+        portable_text_capture_outcome(haystack, outcome)
+    }
+
+    /// Query whether `span` is an exact UTF-8 match inside `window`, returning
+    /// its prioritized capture history when it is. An ordinary non-match is a
+    /// successful outcome with no capture record.
+    pub fn captures_exact_window<'h>(
+        &self,
+        haystack: &'h str,
+        window: Window,
+        span: EngineSpan,
+        limits: EngineSearchLimits,
+    ) -> Result<
+        (Option<PortableTextCaptures<'h>>, EngineSearchAccounting),
+        PortableTextCaptureSearchError,
+    > {
+        if !text_capture_window_is_valid(haystack, window)
+            || span.start > span.end
+            || span.start < window.start
+            || span.end > window.end
+            || !haystack.is_char_boundary(span.start)
+            || !haystack.is_char_boundary(span.end)
+        {
+            return Err(PortableTextCaptureSearchError::Capture(
+                EngineSearchError::InvalidWindow,
+            ));
         }
-        for (group_index, group) in record.groups.iter().enumerate() {
-            if usize::try_from(group.index) != Ok(group_index) {
-                return Err(PortableTextCaptureSearchError::InvalidCaptureIndex {
-                    expected: group_index,
-                    actual: group.index,
-                });
-            }
-            let Some(span) = group.span else {
-                continue;
-            };
-            if span.start > span.end
-                || span.end > haystack.len()
-                || !haystack.is_char_boundary(span.start)
-                || !haystack.is_char_boundary(span.end)
-            {
-                return Err(PortableTextCaptureSearchError::InvalidUtf8Capture {
-                    group_index,
-                    start: span.start,
-                    end: span.end,
-                });
-            }
-        }
-        Ok((Some(PortableTextCaptures { haystack, record }), accounting))
+        let outcome = self
+            .inner
+            .captures_exact_window(haystack.as_bytes(), window, span, limits)
+            .map_err(PortableTextCaptureSearchError::Capture)?;
+        portable_text_capture_outcome(haystack, outcome)
     }
 
     /// Materialize complete text captures while removing only empty records
@@ -944,6 +966,52 @@ impl PortableTextCaptureRegex {
         }
         Ok(report)
     }
+}
+
+fn text_capture_window_is_valid(haystack: &str, window: Window) -> bool {
+    window.start <= window.end
+        && window.end <= haystack.len()
+        && haystack.is_char_boundary(window.start)
+        && haystack.is_char_boundary(window.end)
+}
+
+fn portable_text_capture_outcome(
+    haystack: &str,
+    outcome: EngineSearchOutcome,
+) -> Result<
+    (Option<PortableTextCaptures<'_>>, EngineSearchAccounting),
+    PortableTextCaptureSearchError,
+> {
+    let accounting = outcome.report;
+    let Some(record) = outcome.captures else {
+        return Ok((None, accounting));
+    };
+    if record.overall().is_none() {
+        return Err(PortableTextCaptureSearchError::MissingOverall);
+    }
+    for (group_index, group) in record.groups.iter().enumerate() {
+        if usize::try_from(group.index) != Ok(group_index) {
+            return Err(PortableTextCaptureSearchError::InvalidCaptureIndex {
+                expected: group_index,
+                actual: group.index,
+            });
+        }
+        let Some(span) = group.span else {
+            continue;
+        };
+        if span.start > span.end
+            || span.end > haystack.len()
+            || !haystack.is_char_boundary(span.start)
+            || !haystack.is_char_boundary(span.end)
+        {
+            return Err(PortableTextCaptureSearchError::InvalidUtf8Capture {
+                group_index,
+                start: span.start,
+                end: span.end,
+            });
+        }
+    }
+    Ok((Some(PortableTextCaptures { haystack, record }), accounting))
 }
 
 impl fmt::Display for CaptureIterationError {
@@ -1223,8 +1291,35 @@ impl CaptureRegex {
         config: CaptureSearchConfig,
         limits: EngineSearchLimits,
     ) -> Result<EngineSearchOutcome, EngineSearchError> {
+        self.captures_window_with_config(haystack, Window::all(haystack), config, limits)
+    }
+
+    /// Return the first capture record inside `window` under an explicit
+    /// match-end selection and start-injection policy. Consuming transitions
+    /// stay inside the window while assertions retain original-haystack
+    /// context.
+    pub fn captures_window_with_config(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        config: CaptureSearchConfig,
+        limits: EngineSearchLimits,
+    ) -> Result<EngineSearchOutcome, EngineSearchError> {
         self.engine
-            .captures_with_config(haystack, Window::all(haystack), config, limits)
+            .captures_with_config(haystack, window, config, limits)
+    }
+
+    /// Query whether `span` is an exact match inside `window`, returning its
+    /// prioritized capture history when it is. An ordinary non-match is a
+    /// successful outcome with no capture record.
+    pub fn captures_exact_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        span: EngineSpan,
+        limits: EngineSearchLimits,
+    ) -> Result<EngineSearchOutcome, EngineSearchError> {
+        self.engine.captures_exact(haystack, window, span, limits)
     }
 
     /// Collect every non-overlapping leftmost-first match and every capture

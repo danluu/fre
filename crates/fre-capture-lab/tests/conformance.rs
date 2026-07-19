@@ -118,6 +118,36 @@ fn assert_case(ast: &Ast, haystack: &[u8], window: Window) {
 }
 
 #[test]
+fn exact_span_query_returns_long_nongreedy_history_and_clean_nonmatch() {
+    let ast = Ast::Byte(b'a').capture(1).repeat(1, None, Greed::Lazy);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).unwrap();
+    let haystack = b"aaa";
+    let window = Window::all(haystack);
+
+    let outcome = regex
+        .captures_exact(
+            haystack,
+            window,
+            Span { start: 0, end: 3 },
+            SearchLimits::default(),
+        )
+        .unwrap();
+    let captures = outcome.captures.unwrap();
+    assert_eq!(captures.overall(), Some(Span { start: 0, end: 3 }));
+    assert_eq!(captures.groups[1].span, Some(Span { start: 2, end: 3 }));
+
+    let nonmatch = regex
+        .captures_exact(
+            haystack,
+            window,
+            Span { start: 1, end: 1 },
+            SearchLimits::default(),
+        )
+        .unwrap();
+    assert!(nonmatch.captures.is_none());
+}
+
+#[test]
 fn directed_rust_capture_semantics() {
     let cases = [
         (

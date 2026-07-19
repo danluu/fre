@@ -10,10 +10,11 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    CaptureSearchConfig, CaptureWindow, PlanKind, PortableBuilder, PortableRegex, PortableRegexSet,
-    PortableRegexSetBuildError, PortableRegexSetBuilder, PortableRegexSetRunLimits,
-    PortableTextBuildError, PortableTextBuilder, PortableTextCaptureBuildError,
-    PortableTextCaptureBuilder, PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
+    CaptureSearchConfig, CaptureSearchLimits, CaptureSpan, CaptureWindow, PlanKind,
+    PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
+    PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
+    PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
+    PortableTextCaptureRegex, PortableTextCaptures, PortableTextRegex, PortableTextRegexSet,
     PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, PortableTextSearchError,
     RustProfile, SearchError, SearchLimits, SearchWindow,
 };
@@ -31,7 +32,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v27-multi-pattern-set-selection";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v28-overlapping-iteration";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -40,7 +41,7 @@ const LIMITATIONS: [&str; 7] = [
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; selection-sensitive multi-pattern set which uses an adapter-only repeated constituent-search correctness fallback (up to O(patterns × haystack positions) facade search calls, each over a remaining window) for leftmost-first ordered-union and exact-literal leftmost/all selection, not a native or fast production RegexSet engine; UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
-    "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact leftmost-first and earliest-end search and reject all other policies",
+    "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first and earliest-end search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
 ];
 
 /// Half-open search range decoded from one upstream case.
@@ -680,6 +681,9 @@ fn execute_text_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDispo
         return fault("adapter.expected-group-zero-missing");
     };
     let expected = SemanticValue::Matches(expected_spans);
+    if case.search_kind == SearchKind::Overlapping {
+        return execute_text_overlapping(case, input, &expected, true);
+    }
     if case.search_kind == SearchKind::Earliest {
         return execute_text_earliest_find(case, input, &expected);
     }
@@ -1719,6 +1723,9 @@ fn execute_bytes_find(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisp
         return fault("adapter.expected-group-zero-missing");
     };
     let expected = SemanticValue::Matches(expected_spans);
+    if case.search_kind == SearchKind::Overlapping {
+        return execute_bytes_overlapping(case, input, &expected, true);
+    }
     if case.search_kind == SearchKind::Earliest {
         return execute_bytes_earliest_find(case, input, &expected);
     }
@@ -1806,6 +1813,282 @@ fn group_zero_spans(records: &[ExpectedCaptures]) -> Result<Vec<ExpectedSpan>, (
         .iter()
         .map(|record| record.groups.first().copied().flatten().ok_or(()))
         .collect()
+}
+
+/// Execute Rust's low-level overlapping iterator semantics through bounded
+/// exact-span capture queries. Forward match ends are visited left-to-right;
+/// exact starts for each end are visited right-to-left. `MatchKind::All`
+/// admits every exact span. `LeftmostFirst` retains only ends that an ordinary
+/// prioritized search would select when clipped at that end, reproducing the
+/// forward automaton's preference pruning without depending on expected data.
+fn execute_text_overlapping(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    expected: &SemanticValue,
+    spans_only: bool,
+) -> AdapterDisposition {
+    let regex = match build_text_captures(case, input) {
+        TextCaptureBuildAttempt::Built(regex) => regex,
+        TextCaptureBuildAttempt::Rejected => {
+            return mismatch(
+                expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        TextCaptureBuildAttempt::Unsupported(disposition)
+        | TextCaptureBuildAttempt::Fault(disposition) => return disposition,
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.text-haystack-invalid-utf8");
+    };
+    let Ok(records) = collect_text_overlapping_captures(
+        &regex,
+        haystack,
+        input.bounds,
+        case.match_kind,
+        case.match_limit,
+        case.anchored,
+    ) else {
+        return unsupported(
+            CapabilityId::CaptureIteration,
+            "search.text-overlapping-execution-refused",
+        );
+    };
+    if spans_only {
+        let Ok(spans) = group_zero_spans(&records) else {
+            return fault("adapter.text-overlapping-group-zero-invariant");
+        };
+        compare(expected, &SemanticValue::Matches(spans))
+    } else {
+        compare(expected, &SemanticValue::Captures(records))
+    }
+}
+
+fn execute_bytes_overlapping(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+    expected: &SemanticValue,
+    spans_only: bool,
+) -> AdapterDisposition {
+    let regex = match build_captures(case, input) {
+        CaptureBuildAttempt::Built(regex) => regex,
+        CaptureBuildAttempt::Rejected => {
+            return mismatch(
+                expected,
+                &SemanticValue::CompileAccepted(false),
+                "compile.unexpected-rejection",
+            );
+        }
+        CaptureBuildAttempt::Unsupported(disposition) | CaptureBuildAttempt::Fault(disposition) => {
+            return disposition;
+        }
+    };
+    let Ok(records) = collect_byte_overlapping_captures(
+        &regex,
+        &input.haystack,
+        input.bounds,
+        case.match_kind,
+        case.match_limit,
+        case.anchored,
+    ) else {
+        return unsupported(
+            CapabilityId::CaptureIteration,
+            "search.bytes-overlapping-execution-refused",
+        );
+    };
+    if spans_only {
+        let Ok(spans) = group_zero_spans(&records) else {
+            return fault("adapter.bytes-overlapping-group-zero-invariant");
+        };
+        compare(expected, &SemanticValue::Matches(spans))
+    } else {
+        compare(expected, &SemanticValue::Captures(records))
+    }
+}
+
+fn collect_text_overlapping_captures(
+    regex: &PortableTextCaptureRegex,
+    haystack: &str,
+    bounds: SearchBounds,
+    match_kind: MatchKind,
+    match_limit: Option<usize>,
+    anchored: bool,
+) -> Result<Vec<ExpectedCaptures>, ()> {
+    let limit = match_limit.unwrap_or(usize::MAX);
+    let mut records = Vec::new();
+    if limit == 0 {
+        return Ok(records);
+    }
+    if anchored
+        && (bounds.start > bounds.end
+            || bounds.end > haystack.len()
+            || !haystack.is_char_boundary(bounds.start))
+    {
+        return Ok(records);
+    }
+    let Some(bounds) = text_search_bounds(haystack, bounds) else {
+        return Ok(records);
+    };
+    let window = CaptureWindow {
+        start: bounds.start,
+        end: bounds.end,
+    };
+    for end in bounds.start..=bounds.end {
+        if !haystack.is_char_boundary(end) {
+            continue;
+        }
+        if match_kind == MatchKind::LeftmostFirst
+            && !text_leftmost_overlapping_end(regex, haystack, bounds, end, anchored)?
+        {
+            continue;
+        }
+        for start in (bounds.start..=end).rev() {
+            if !haystack.is_char_boundary(start) {
+                continue;
+            }
+            if anchored && start != bounds.start {
+                continue;
+            }
+            let (captures, _) = regex
+                .captures_exact_window(
+                    haystack,
+                    window,
+                    CaptureSpan { start, end },
+                    CaptureSearchLimits::default(),
+                )
+                .map_err(|_| ())?;
+            let Some(captures) = captures else {
+                continue;
+            };
+            records.push(text_capture_record(&captures)?);
+            if records.len() == limit {
+                return Ok(records);
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn text_leftmost_overlapping_end(
+    regex: &PortableTextCaptureRegex,
+    haystack: &str,
+    bounds: SearchBounds,
+    end: usize,
+    anchored: bool,
+) -> Result<bool, ()> {
+    let (captures, _) = regex
+        .captures_window_with_config(
+            haystack,
+            CaptureWindow {
+                start: bounds.start,
+                end,
+            },
+            CaptureSearchConfig::LEFTMOST.anchored(anchored),
+            CaptureSearchLimits::default(),
+        )
+        .map_err(|_| ())?;
+    Ok(captures
+        .and_then(|captures| captures.get(0))
+        .is_some_and(|matched| matched.end() == end))
+}
+
+fn text_capture_record(captures: &PortableTextCaptures<'_>) -> Result<ExpectedCaptures, ()> {
+    let groups = (0..captures.len())
+        .map(|index| {
+            captures.get(index).map(|matched| ExpectedSpan {
+                start: matched.start(),
+                end: matched.end(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if groups.first().is_none_or(Option::is_none) {
+        return Err(());
+    }
+    Ok(ExpectedCaptures {
+        pattern_id: 0,
+        groups,
+    })
+}
+
+fn collect_byte_overlapping_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    bounds: SearchBounds,
+    match_kind: MatchKind,
+    match_limit: Option<usize>,
+    anchored: bool,
+) -> Result<Vec<ExpectedCaptures>, ()> {
+    let limit = match_limit.unwrap_or(usize::MAX);
+    let mut records = Vec::new();
+    if limit == 0 || bounds.start > bounds.end || bounds.end > haystack.len() {
+        return Ok(records);
+    }
+    let window = CaptureWindow {
+        start: bounds.start,
+        end: bounds.end,
+    };
+    for end in bounds.start..=bounds.end {
+        if match_kind == MatchKind::LeftmostFirst
+            && !byte_leftmost_overlapping_end(regex, haystack, bounds, end, anchored)?
+        {
+            continue;
+        }
+        for start in (bounds.start..=end).rev() {
+            if anchored && start != bounds.start {
+                continue;
+            }
+            let outcome = regex
+                .captures_exact_window(
+                    haystack,
+                    window,
+                    CaptureSpan { start, end },
+                    CaptureSearchLimits::default(),
+                )
+                .map_err(|_| ())?;
+            let Some(record) = outcome.captures else {
+                continue;
+            };
+            records.push(capture_record(&record, haystack.len())?);
+            if records.len() == limit {
+                return Ok(records);
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn byte_leftmost_overlapping_end(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    bounds: SearchBounds,
+    end: usize,
+    anchored: bool,
+) -> Result<bool, ()> {
+    let outcome = regex
+        .captures_window_with_config(
+            haystack,
+            CaptureWindow {
+                start: bounds.start,
+                end,
+            },
+            CaptureSearchConfig::LEFTMOST.anchored(anchored),
+            CaptureSearchLimits::default(),
+        )
+        .map_err(|_| ())?;
+    Ok(outcome
+        .captures
+        .and_then(|record| record.overall())
+        .is_some_and(|matched| matched.end == end))
+}
+
+fn capture_record(
+    record: &fre::CaptureRecord,
+    haystack_len: usize,
+) -> Result<ExpectedCaptures, ()> {
+    let mut records =
+        capture_records(std::slice::from_ref(record), haystack_len).map_err(|_| ())?;
+    records.pop().ok_or(())
 }
 
 fn collect_text_matches(
@@ -1930,6 +2213,9 @@ fn text_search_bounds(haystack: &str, bounds: SearchBounds) -> Option<SearchBoun
 
 fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
     let expected = SemanticValue::Captures(input.expected.clone());
+    if case.search_kind == SearchKind::Overlapping {
+        return execute_text_overlapping(case, input, &expected, false);
+    }
     let regex = match build_text_captures(case, input) {
         TextCaptureBuildAttempt::Built(regex) => regex,
         TextCaptureBuildAttempt::Rejected => {
@@ -2077,6 +2363,9 @@ fn build_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> TextCaptur
 
 fn execute_bytes_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
     let expected = SemanticValue::Captures(input.expected.clone());
+    if case.search_kind == SearchKind::Overlapping {
+        return execute_bytes_overlapping(case, input, &expected, false);
+    }
     let regex = match build_captures(case, input) {
         CaptureBuildAttempt::Built(regex) => regex,
         CaptureBuildAttempt::Rejected => {
@@ -2414,13 +2703,22 @@ fn single_applicability(
         return Err(NotApplicableReason::PatternMultiplicity);
     }
     if !single_selection_policy_invariant(surface) {
-        if !matches!(
-            case.search_kind,
-            SearchKind::Leftmost | SearchKind::Earliest
-        ) {
+        // Preserve the authenticated search-mode precedence for text surfaces
+        // whose byte-mode corpus profile remains intrinsically ineligible.
+        // Eligible overlapping rows proceed into the shared exact-span path.
+        if case.search_kind == SearchKind::Overlapping && text && !case.utf8 {
             return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
         }
-        if case.match_kind != MatchKind::LeftmostFirst {
+        if !matches!(
+            (case.search_kind, case.match_kind),
+            (
+                SearchKind::Leftmost | SearchKind::Earliest,
+                MatchKind::LeftmostFirst,
+            ) | (
+                SearchKind::Overlapping,
+                MatchKind::LeftmostFirst | MatchKind::All,
+            )
+        ) {
             return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
         }
     }
@@ -4059,6 +4357,157 @@ mod tests {
             surface_applicability(AdapterSurface::RustBytesSetIsMatch, &case, &invalid),
             Err(NotApplicableReason::InvalidUtf8Haystack)
         );
+    }
+
+    #[test]
+    fn overlapping_all_enumerates_exact_spans_and_persistent_captures() {
+        let span = |start, end| Some(ExpectedSpan { start, end });
+        let mut case = fixture_case(true, true, None);
+        case.search_kind = SearchKind::Overlapping;
+        case.match_kind = MatchKind::All;
+        case.unicode = true;
+        case.maximum_expected_capture_slots = 2;
+        let expected = [(0, 0), (1, 1), (0, 1), (2, 2), (1, 2), (0, 2)]
+            .into_iter()
+            .map(|(start, end)| ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![span(start, end), span(start, end)],
+            })
+            .collect();
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["(a*)".to_owned()],
+            haystack: b"aa".to_vec(),
+            bounds: SearchBounds { start: 0, end: 2 },
+            line_terminator: b'\n',
+            expected,
+        };
+        for surface in [
+            AdapterSurface::RustTextFindIter,
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            let disposition = execute_case(surface, &case, &input);
+            assert!(
+                matches!(disposition, AdapterDisposition::Pass { .. }),
+                "overlapping all failed on {surface:?}: {disposition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_leftmost_first_filters_forward_ends_before_reverse_starts() {
+        let span = |start, end| Some(ExpectedSpan { start, end });
+        let mut case = fixture_case(true, true, None);
+        case.search_kind = SearchKind::Overlapping;
+        case.unicode = true;
+        case.maximum_expected_capture_slots = 2;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["(abc|a)".to_owned()],
+            haystack: b"zzabcazzaabc".to_vec(),
+            bounds: SearchBounds { start: 0, end: 12 },
+            line_terminator: b'\n',
+            expected: vec![
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![span(2, 3), span(2, 3)],
+                },
+                ExpectedCaptures {
+                    pattern_id: 0,
+                    groups: vec![span(2, 5), span(2, 5)],
+                },
+            ],
+        };
+        for surface in [
+            AdapterSurface::RustTextFindIter,
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            let disposition = execute_case(surface, &case, &input);
+            assert!(
+                matches!(disposition, AdapterDisposition::Pass { .. }),
+                "overlapping leftmost-first failed on {surface:?}: {disposition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_empty_matches_respect_text_scalars_and_byte_offsets() {
+        let empty_at = |offset| ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![
+                Some(ExpectedSpan {
+                    start: offset,
+                    end: offset,
+                }),
+                Some(ExpectedSpan {
+                    start: offset,
+                    end: offset,
+                }),
+            ],
+        };
+        let mut text_case = fixture_case(true, true, None);
+        text_case.search_kind = SearchKind::Overlapping;
+        text_case.match_kind = MatchKind::All;
+        text_case.unicode = true;
+        text_case.maximum_expected_capture_slots = 2;
+        let text_input = ExecutableCase {
+            id: text_case.id.clone(),
+            patterns: vec!["()".to_owned()],
+            haystack: "é".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 2 },
+            line_terminator: b'\n',
+            expected: [0, 2].into_iter().map(empty_at).collect(),
+        };
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &text_case, &text_input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        let mut split_anchored_case = text_case.clone();
+        split_anchored_case.anchored = true;
+        split_anchored_case.bounded_search = true;
+        let split_anchored_input = ExecutableCase {
+            bounds: SearchBounds { start: 1, end: 2 },
+            expected: Vec::new(),
+            ..text_input.clone()
+        };
+        for surface in [
+            AdapterSurface::RustTextFindIter,
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &split_anchored_case, &split_anchored_input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+
+        let mut bytes_case = text_case;
+        bytes_case.utf8 = false;
+        let bytes_input = ExecutableCase {
+            expected: [0, 1, 2].into_iter().map(empty_at).collect(),
+            ..text_input
+        };
+        for surface in [
+            AdapterSurface::RustBytesFindIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &bytes_case, &bytes_input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
     }
 
     #[test]

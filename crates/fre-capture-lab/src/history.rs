@@ -147,13 +147,16 @@ impl HistoryRegex {
         self.search_from(haystack, window, window.start, config, limits)
     }
 
-    /// Replay one selector-certified exact span while preserving assertion
-    /// context from the original logical window.
+    /// Query one exact span while preserving assertion context from the
+    /// original logical window.
     ///
     /// The start thread is injected exactly once. Match states before
     /// `span.end` are ignored, and the first prioritized match at `span.end`
-    /// supplies captures. This is not a search API: the caller must first
-    /// certify the complete non-overlapping span sequence independently.
+    /// supplies captures. A span outside the pattern's language returns a
+    /// successful outcome with no captures. Callers that already certified a
+    /// span can therefore use the same operation for tagged replay, while
+    /// correctness-oriented callers may enumerate exact spans without
+    /// confusing an ordinary non-match with an invalid program.
     #[allow(
         clippy::too_many_lines,
         reason = "the exact-span tagged replay keeps its one-pass state transition auditable"
@@ -262,15 +265,20 @@ impl HistoryRegex {
         let winner = current
             .iter()
             .find(|thread| matches!(self.program.states.get(thread.pc), Some(State::Match)))
-            .and_then(|thread| thread.history)
-            .ok_or(SearchError::InvalidProgram)?;
-        let slots = materialize(&self.program, &histories, winner, &mut counters, limits)?;
-        let captures = canonicalize(&self.program, &slots)?;
-        if captures.overall() != Some(span) {
-            return Err(SearchError::InvalidProgram);
-        }
+            .map(|thread| thread.history.ok_or(SearchError::InvalidProgram))
+            .transpose()?;
+        let captures = if let Some(winner) = winner {
+            let slots = materialize(&self.program, &histories, winner, &mut counters, limits)?;
+            let captures = canonicalize(&self.program, &slots)?;
+            if captures.overall() != Some(span) {
+                return Err(SearchError::InvalidProgram);
+            }
+            Some(captures)
+        } else {
+            None
+        };
         Ok(SearchOutcome {
-            captures: Some(captures),
+            captures,
             report: RunReport {
                 candidate: CandidateKind::PersistentHistory,
                 state_visits: counters.state_visits,
