@@ -21,7 +21,7 @@ pub use error::{ErrorCategory, ParseError, RustRegexSetAdmissionError, SourceSpa
 pub use fre_re2_syntax as re2_syntax;
 pub use parsed::{
     AdmissionStatus, CacheKey, CanonicalPattern, ParseRecord, ParseRequest, ParseSummary,
-    PatternBytes, Re2Literal, Re2Parsed, RustParsed, SCHEMA_VERSION,
+    PatternBytes, Re2Literal, Re2Parsed, RustAstRecord, RustParsed, SCHEMA_VERSION,
 };
 pub use profile::{
     CompatibilityProfile, InputKind, PackageIdentity, PackageVersion, Re2Encoding, Re2Options,
@@ -48,6 +48,33 @@ pub fn parse(request: ParseRequest) -> Result<ParseRecord, ParseError> {
             rust::parse_rust(request, true)
         }
         CompatibilityProfile::Re2(_) => re2::parse_re2(request),
+    }
+}
+
+/// Parses one Rust pattern into the exact pinned `regex-syntax` 0.8.11 AST.
+///
+/// This source-addressable conformance boundary prospectively reserves
+/// conservative byte-derived bounds for every parser allocation/work
+/// dimension before invoking the upstream parser. Normal FRE compilation
+/// should use [`parse`], which additionally lowers to HIR.
+///
+/// # Errors
+///
+/// Returns a canonical [`ParseError`] for an invalid profile or pattern, or
+/// when any prospective parser reservation exceeds the selected quota/safety
+/// envelope.
+#[doc(hidden)]
+pub fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, ParseError> {
+    request.validate_and_charge_source()?;
+    match request.profile() {
+        CompatibilityProfile::RustText(_) | CompatibilityProfile::RustBytes(_) => {
+            rust::parse_rust_ast(request)
+        }
+        CompatibilityProfile::Re2(_) => Err(ParseError::new(
+            request.profile().clone(),
+            ErrorCategory::InvalidConfiguration,
+            "Rust AST parsing requires a Rust profile",
+        )),
     }
 }
 

@@ -13,9 +13,108 @@ const MAX_UNICODE_GENCAT_ALIAS_BYTES: usize = 20;
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError, RustUnicodeFeatures,
-    SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
+    RustAstRecord, RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError,
+    RustUnicodeFeatures, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
 };
+
+// The 0.8.11 AST parser is single-pass. Each input byte can create at most one
+// AST node and at most one parser-stack entry. This deliberately generous
+// per-byte work reservation covers token classification, UTF-8 decoding,
+// span maintenance, checked nesting, and collection bookkeeping before any
+// of those operations execute. Keeping the multiplier fixed and visible makes
+// the safety claim auditable and quota behavior deterministic.
+const AST_PARSE_WORK_PER_SOURCE_UNIT: u64 = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AstParseReservation {
+    nodes: u64,
+    max_nesting: u64,
+    parser_stack: u64,
+    work: u64,
+}
+
+pub(crate) fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, ParseError> {
+    let (pattern, profile, admission, safety) = request.into_parts();
+    let Some(source) = pattern.as_str() else {
+        return Err(ParseError::new(
+            profile,
+            ErrorCategory::InvalidPatternEncoding,
+            "Rust regex patterns must be valid UTF-8 strings",
+        ));
+    };
+    let options = match &profile {
+        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => {
+            &rust.options
+        }
+        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+    };
+    validate_rust_configuration(&profile, options)?;
+    let reservation = reserve_ast_parse(source, options, &profile, admission, safety)?;
+
+    let mut builder = ast::parse::ParserBuilder::new();
+    builder
+        .nest_limit(options.nest_limit)
+        .octal(options.octal)
+        .ignore_whitespace(options.ignore_whitespace);
+    let ast = builder.build().parse(source).map_err(|error| {
+        with_regex_span(
+            ParseError::new(
+                profile.clone(),
+                ErrorCategory::UpstreamRustSyntax,
+                error.to_string(),
+            ),
+            Some(error.span()),
+        )
+    })?;
+    Ok(RustAstRecord {
+        key: CacheKey {
+            schema_version: SCHEMA_VERSION,
+            pattern,
+            profile,
+            admission,
+            safety,
+        },
+        admission_status: AdmissionStatus::from_policy(admission),
+        reserved_ast_nodes: reservation.nodes,
+        reserved_max_nesting: reservation.max_nesting,
+        reserved_parser_stack: reservation.parser_stack,
+        reserved_parse_work: reservation.work,
+        ast,
+    })
+}
+
+fn reserve_ast_parse(
+    source: &str,
+    options: &RustOptions,
+    profile: &CompatibilityProfile,
+    admission: AdmissionPolicy,
+    safety: SafetyEnvelope,
+) -> Result<AstParseReservation, ParseError> {
+    let bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let nodes = bytes.saturating_add(1);
+    // No nested parser construct can begin without consuming a source byte,
+    // and the pinned parser independently refuses depth above `nest_limit`.
+    let configured_depth = u64::from(options.nest_limit).saturating_add(1);
+    let max_nesting = nodes.min(configured_depth);
+    let parser_stack = max_nesting;
+    let work = nodes.saturating_mul(AST_PARSE_WORK_PER_SOURCE_UNIT);
+    for (resource, observed) in [
+        (ResourceKind::HirNodes, nodes),
+        (ResourceKind::Nesting, max_nesting),
+        (ResourceKind::TraversalStack, parser_stack),
+        (ResourceKind::ParseWork, work),
+    ] {
+        if observed > admission.limit_for(resource, safety) {
+            return Err(admission.limit_error(profile.clone(), resource, safety, observed));
+        }
+    }
+    Ok(AstParseReservation {
+        nodes,
+        max_nesting,
+        parser_stack,
+        work,
+    })
+}
 
 pub(crate) fn parse_rust(
     request: ParseRequest,

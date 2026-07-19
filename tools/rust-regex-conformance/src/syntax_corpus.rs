@@ -6,10 +6,16 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::PermissionsExt,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
+use fre_syntax::{
+    AdmissionPolicy, AdmissionStatus, CompatibilityProfile, ParseRequest, RustAstRecord,
+    RustProfile, SCHEMA_VERSION, SafetyEnvelope, parse_rust_ast,
+};
+use regex_syntax::ast::{Ast, Concat, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::{CandidateIdentity, InventoryError, authenticate_candidate_source, sha256};
@@ -53,6 +59,8 @@ const OBLIGATION_INVENTORY_SHA256: &str =
 const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
+const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
+const AST_HOLISTIC_PASS_EVIDENCE: &str = "fre.regex-syntax.ast-adapter.v1\ncase=ast::parse::tests::parse_holistic\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n";
 const MAX_PACKAGE_FILE_BYTES: u64 = 2 * 1_048_576;
 
 const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
@@ -70,8 +78,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The AST parser execution is upstream-oracle evidence only; it does not exercise FRE and cannot produce candidate Pass dispositions.",
-    "No FRE adapter for regex-syntax unit definitions exists in this inventory-first slice, so all 158 unit identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly ast::parse::tests::parse_holistic; the other 28 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 157 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -266,7 +274,7 @@ enum TestOutcome {
 
 /// Authenticate the complete package, inventory both feature-mode harnesses,
 /// and execute the AST parser family as separately labelled upstream-oracle
-/// evidence. This inventory-first stage does not execute an FRE adapter.
+/// evidence. One exact AST obligation additionally executes through FRE.
 #[allow(
     clippy::too_many_lines,
     reason = "the transaction keeps package authentication, four harness lists, the oracle execution, and sealed report assembly adjacent"
@@ -414,11 +422,6 @@ pub fn build_regex_syntax_corpus_report(
             "regex-syntax harness tool identity changed during execution",
         ));
     }
-    if authenticate_candidate_source(candidate_path)? != candidate {
-        return Err(InventoryError::new(
-            "regex-syntax candidate changed during harness execution",
-        ));
-    }
     let receipts = obligations
         .into_iter()
         .map(|obligation| RegexSyntaxCorpusReceipt {
@@ -426,6 +429,11 @@ pub fn build_regex_syntax_corpus_report(
             obligation,
         })
         .collect::<Vec<_>>();
+    if authenticate_candidate_source(candidate_path)? != candidate {
+        return Err(InventoryError::new(
+            "regex-syntax candidate changed during harness execution",
+        ));
+    }
     let counts = RegexSyntaxCorpusCounts::from_receipts(&receipts)?;
     let unit_union = default_units.union(&no_default_units).count();
     let unit_intersection = default_units.intersection(&no_default_units).count();
@@ -1403,6 +1411,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
         };
     }
     if obligation.case_id.starts_with(AST_PARSE_PREFIX) {
+        if obligation.case_id == AST_HOLISTIC_CASE_ID {
+            return execute_ast_holistic();
+        }
         return RegexSyntaxCorpusDisposition::Unsupported {
             reason_code: "fre-adapter.ast-parse-not-implemented".to_owned(),
         };
@@ -1410,6 +1421,142 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
     RegexSyntaxCorpusDisposition::Unsupported {
         reason_code: "fre-adapter.unit-family-not-implemented".to_owned(),
     }
+}
+
+#[derive(Debug)]
+struct AstMismatch {
+    expected: String,
+    observed: String,
+}
+
+fn execute_ast_holistic() -> RegexSyntaxCorpusDisposition {
+    match catch_unwind(AssertUnwindSafe(run_ast_holistic)) {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: ast_holistic_pass_evidence(),
+        },
+        Ok(Err(mismatch)) => {
+            let evidence_sha256 =
+                ast_mismatch_evidence(AST_HOLISTIC_CASE_ID, &mismatch.expected, &mismatch.observed);
+            RegexSyntaxCorpusDisposition::Mismatch {
+                expected: mismatch.expected,
+                observed: mismatch.observed,
+                evidence_sha256,
+            }
+        }
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-ast-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn run_ast_holistic() -> Result<(), AstMismatch> {
+    let first_pattern = "]";
+    let first_expected = Ast::literal(Literal {
+        span: ast_span(0, 1),
+        kind: LiteralKind::Verbatim,
+        c: ']',
+    });
+    let first = execute_ast_assertion(first_pattern, &first_expected, "verbatim-right-bracket")?;
+    validate_ast_record(&first, first_pattern, 2, 2, 2, 1_024)?;
+
+    let second_pattern = r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~";
+    let metacharacters = [
+        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '#', '&', '-', '~',
+    ];
+    let asts = metacharacters
+        .into_iter()
+        .enumerate()
+        .map(|(index, c)| {
+            let start = index.saturating_mul(2);
+            Ast::literal(Literal {
+                span: ast_span(start, start.saturating_add(2)),
+                kind: LiteralKind::Meta,
+                c,
+            })
+        })
+        .collect();
+    let second_expected = Ast::concat(Concat {
+        span: ast_span(0, 36),
+        asts,
+    });
+    let second = execute_ast_assertion(
+        second_pattern,
+        &second_expected,
+        "escaped-metacharacters-with-exact-spans",
+    )?;
+    validate_ast_record(&second, second_pattern, 37, 37, 37, 18_944)
+}
+
+fn execute_ast_assertion(
+    pattern: &str,
+    expected: &Ast,
+    assertion: &str,
+) -> Result<RustAstRecord, AstMismatch> {
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let record =
+        parse_rust_ast(ParseRequest::rust(pattern, profile)).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: Ok({expected:?})"),
+            observed: format!("{assertion}: Err({error:?})"),
+        })?;
+    if &record.ast != expected {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: {expected:?}"),
+            observed: format!("{assertion}: {:?}", record.ast),
+        });
+    }
+    Ok(record)
+}
+
+fn validate_ast_record(
+    record: &RustAstRecord,
+    pattern: &str,
+    nodes: u64,
+    nesting: u64,
+    stack: u64,
+    work: u64,
+) -> Result<(), AstMismatch> {
+    let expected_profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == pattern.as_bytes()
+        && record.key.profile == expected_profile
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending
+        && record.reserved_ast_nodes == nodes
+        && record.reserved_max_nesting == nesting
+        && record.reserved_parser_stack == stack
+        && record.reserved_parse_work == work;
+    if valid {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!(
+                "FRE AST record schema={SCHEMA_VERSION} pattern={pattern:?} nodes={nodes} nesting={nesting} stack={stack} work={work}"
+            ),
+            observed: format!("{record:?}"),
+        })
+    }
+}
+
+fn ast_span(start: usize, end: usize) -> Span {
+    Span::new(
+        Position::new(start, 1, start.saturating_add(1)),
+        Position::new(end, 1, end.saturating_add(1)),
+    )
+}
+
+fn ast_holistic_pass_evidence() -> String {
+    sha256(AST_HOLISTIC_PASS_EVIDENCE.as_bytes())
+}
+
+fn ast_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.ast-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
 }
 
 fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), InventoryError> {
@@ -1436,9 +1583,39 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
+        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+            obligation.default_harness_member
+                && obligation.no_default_harness_member
+                && evidence_sha256 == &ast_holistic_pass_evidence()
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Mismatch {
+                expected,
+                observed,
+                evidence_sha256,
+            },
+        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+            !expected.is_empty()
+                && !observed.is_empty()
+                && expected.len() <= 65_536
+                && observed.len() <= 65_536
+                && evidence_sha256
+                    == &ast_mismatch_evidence(&obligation.case_id, expected, observed)
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Fault { stage, reason_code },
+        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+            stage == "fre-ast-adapter" && reason_code == "candidate.adapter-panicked"
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) if obligation.case_id.starts_with(AST_PARSE_PREFIX) => {
-            obligation.default_harness_member
+            obligation.case_id != AST_HOLISTIC_CASE_ID
+                && obligation.default_harness_member
                 && reason_code == "fre-adapter.ast-parse-not-implemented"
         }
         (
@@ -1811,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_oracle_success_never_becomes_a_candidate_pass() {
+    fn holistic_candidate_pass_requires_the_fre_ast_adapter() {
         let case_id = "ast::parse::tests::parse_holistic";
         let obligation = RegexSyntaxCorpusObligation {
             case_id: case_id.to_owned(),
@@ -1829,12 +2006,24 @@ mod tests {
             oracle_disposition_for(case_id, &execution),
             RegexSyntaxOracleDisposition::Pass { .. }
         ));
+        let disposition = disposition_for(&obligation);
         assert_eq!(
-            disposition_for(&obligation),
-            RegexSyntaxCorpusDisposition::Unsupported {
-                reason_code: "fre-adapter.ast-parse-not-implemented".to_owned(),
+            disposition,
+            RegexSyntaxCorpusDisposition::Pass {
+                evidence_sha256: ast_holistic_pass_evidence(),
             }
         );
+        let receipt = RegexSyntaxCorpusReceipt {
+            obligation,
+            disposition,
+        };
+        validate_disposition(&receipt).expect("exact FRE AST pass evidence");
+
+        let mut corrupt = receipt;
+        corrupt.disposition = RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: "0".repeat(64),
+        };
+        assert!(validate_disposition(&corrupt).is_err());
     }
 
     #[test]

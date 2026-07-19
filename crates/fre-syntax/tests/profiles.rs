@@ -5,7 +5,7 @@ use fre_syntax::{
     PackageIdentity, ParseRequest, QuotaBounded, Re2CapabilityStatus, Re2Encoding, Re2Options,
     Re2Profile, Re2Surface, ResourceKind, RustConstructor, RustMatchKind, RustProfile,
     RustUnicodeFeatures, SafetyEnvelope, StrictAdmission, SyntaxQuotas, UnicodeVersion,
-    UpstreamRevision, parse, re2_surface_inventory,
+    UpstreamRevision, parse, parse_rust_ast, re2_surface_inventory,
 };
 
 const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
@@ -111,6 +111,62 @@ fn pinned_defaults_are_explicit() {
     assert!(re2.options.log_errors);
     assert!(re2.options.case_sensitive);
     assert!(!re2.options.posix_syntax);
+}
+
+#[test]
+fn rust_ast_parse_reserves_work_before_parser_execution() {
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let pattern = r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~";
+    let baseline = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+        .expect("strict AST conformance parse");
+    assert_eq!(baseline.reserved_ast_nodes, 37);
+    assert_eq!(baseline.reserved_max_nesting, 37);
+    assert_eq!(baseline.reserved_parser_stack, 37);
+    assert_eq!(baseline.reserved_parse_work, 18_944);
+
+    let mut quotas = SyntaxQuotas {
+        max_hir_nodes: baseline.reserved_ast_nodes,
+        max_nesting: baseline.reserved_max_nesting,
+        max_traversal_stack: baseline.reserved_parser_stack,
+        max_parse_work: baseline.reserved_parse_work,
+        ..SyntaxQuotas::default()
+    };
+    parse_rust_ast(
+        ParseRequest::rust(pattern, profile.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact prospective AST limits must pass");
+
+    quotas.max_parse_work = baseline.reserved_parse_work - 1;
+    let error = parse_rust_ast(
+        ParseRequest::rust(pattern, profile.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below prospective AST work must fail before parsing");
+    assert_eq!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit: baseline.reserved_parse_work - 1,
+            observed: baseline.reserved_parse_work,
+        }
+    );
+
+    quotas.max_parse_work = baseline.reserved_parse_work;
+    quotas.max_hir_nodes = baseline.reserved_ast_nodes - 1;
+    let error = parse_rust_ast(
+        ParseRequest::rust(pattern, profile)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below prospective AST nodes must fail before parsing");
+    assert_eq!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::HirNodes,
+            limit: baseline.reserved_ast_nodes - 1,
+            observed: baseline.reserved_ast_nodes,
+        }
+    );
 }
 
 #[test]

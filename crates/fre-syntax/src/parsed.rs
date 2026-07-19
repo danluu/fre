@@ -1,4 +1,4 @@
-use regex_syntax::hir::Hir;
+use regex_syntax::{ast::Ast, hir::Hir};
 
 use crate::{AdmissionPolicy, CompatibilityProfile, ParseError, SafetyEnvelope};
 
@@ -167,6 +167,22 @@ pub struct ParseSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustParsed {
     pub hir: Hir,
+}
+
+/// Exact pinned `regex-syntax` AST plus the prospective resource reservation
+/// that authorized its construction.
+///
+/// This record exists for source-addressable conformance work. Normal FRE
+/// compilation consumes [`ParseRecord`] instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RustAstRecord {
+    pub key: CacheKey,
+    pub admission_status: AdmissionStatus,
+    pub reserved_ast_nodes: u64,
+    pub reserved_max_nesting: u64,
+    pub reserved_parser_stack: u64,
+    pub reserved_parse_work: u64,
+    pub ast: Ast,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

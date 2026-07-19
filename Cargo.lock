@@ -430,6 +430,7 @@ dependencies = [
  "bstr",
  "fre",
  "fre-syntax",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sha2",
