@@ -13,9 +13,9 @@ use std::{
 };
 
 use fre_syntax::{
-    AdmissionPolicy, AdmissionStatus, CompatibilityProfile, ErrorCategory, ParseError,
-    ParseRequest, RustAstOptions, RustAstRecord, RustProfile, SCHEMA_VERSION, SafetyEnvelope,
-    SourceSpan, parse_rust_ast, parse_rust_ast_with_options,
+    AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ErrorCategory,
+    ParseError, ParseRequest, RustAstOptions, RustAstRecord, RustProfile, SCHEMA_VERSION,
+    SafetyEnvelope, SourceSpan, parse, parse_rust_ast, parse_rust_ast_with_options,
 };
 use regex_syntax::ast::{Ast, Concat, HexLiteralKind, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,7 @@ const OBLIGATION_INVENTORY_SHA256: &str =
     "e6e416c78915b9f339d3dd165d44a0896e2519eac07961c762e3212874609dbe";
 const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PRINT_PREFIX: &str = "ast::print::tests::";
+const HIR_PRINT_PREFIX: &str = "hir::print::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_NEST_LIMIT_CASE_ID: &str = "ast::parse::tests::parse_nest_limit";
@@ -113,6 +114,22 @@ const AST_PRINT_REPETITION_CASE_ID: &str = "ast::print::tests::print_repetition"
 const AST_PRINT_FLAGS_CASE_ID: &str = "ast::print::tests::print_flags";
 const AST_PRINT_GROUP_CASE_ID: &str = "ast::print::tests::print_group";
 const AST_PRINT_CLASS_CASE_ID: &str = "ast::print::tests::print_class";
+const HIR_PRINT_LITERAL_CASE_ID: &str = "hir::print::tests::print_literal";
+const HIR_PRINT_CLASS_CASE_ID: &str = "hir::print::tests::print_class";
+const HIR_PRINT_ANCHOR_CASE_ID: &str = "hir::print::tests::print_anchor";
+const HIR_PRINT_WORD_BOUNDARY_CASE_ID: &str = "hir::print::tests::print_word_boundary";
+const HIR_PRINT_REPETITION_CASE_ID: &str = "hir::print::tests::print_repetition";
+const HIR_PRINT_GROUP_CASE_ID: &str = "hir::print::tests::print_group";
+const HIR_PRINT_ALTERNATION_CASE_ID: &str = "hir::print::tests::print_alternation";
+#[cfg(test)]
+const HIR_PRINT_REGRESSION_REPETITION_CONCAT_CASE_ID: &str =
+    "hir::print::tests::regression_repetition_concat";
+#[cfg(test)]
+const HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID: &str =
+    "hir::print::tests::regression_repetition_alternation";
+#[cfg(test)]
+const HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID: &str =
+    "hir::print::tests::regression_alternation_concat";
 const REGRESSION_454_PATTERN: &str = r"
         2(?:
           [45]\d{3}|
@@ -463,6 +480,92 @@ const PRINT_CLASS_PROBES: [&str; 57] = [
     r"\P{X:Y}",
     r"\p{X!=Y}",
     r"\P{X!=Y}",
+];
+type HirPrintProbe = (&'static str, &'static str, bool);
+const HIR_PRINT_LITERAL_PROBES: [HirPrintProbe; 5] = [
+    ("a", "a", false),
+    (r"\xff", "\u{FF}", false),
+    (r"\xff", "\u{FF}", true),
+    (r"(?-u)\xff", r"(?-u:\xFF)", true),
+    ("☃", "☃", false),
+];
+const HIR_PRINT_CLASS_PROBES: [HirPrintProbe; 19] = [
+    (r"[a]", "a", false),
+    (r"[ab]", r"[ab]", false),
+    (r"[a-z]", r"[a-z]", false),
+    (r"[a-z--b-c--x-y]", r"[ad-wz]", false),
+    (r"[^\x01-\u{10FFFF}]", "\u{0}", false),
+    (r"[-]", r"\-", false),
+    (r"[☃-⛄]", r"[☃-⛄]", false),
+    (r"(?-u)[a]", "a", false),
+    (r"(?-u)[ab]", r"(?-u:[ab])", false),
+    (r"(?-u)[a-z]", r"(?-u:[a-z])", false),
+    (r"(?-u)[a-\xFF]", r"(?-u:[a-\xFF])", true),
+    (r"[\[]", r"\[", false),
+    (r"[Z-_]", r"[Z-_]", false),
+    (r"[Z-_--Z]", r"[\[-_]", false),
+    (r"(?-u)[\[]", r"\[", true),
+    (r"(?-u)[Z-_]", r"(?-u:[Z-_])", true),
+    (r"(?-u)[Z-_--Z]", r"(?-u:[\[-_])", true),
+    (r"\P{any}", r"[a&&b]", false),
+    (r"(?-u)[^\x00-\xFF]", r"[a&&b]", true),
+];
+const HIR_PRINT_ANCHOR_PROBES: [HirPrintProbe; 4] = [
+    (r"^", r"\A", false),
+    (r"$", r"\z", false),
+    (r"(?m)^", r"(?m:^)", false),
+    (r"(?m)$", r"(?m:$)", false),
+];
+const HIR_PRINT_WORD_BOUNDARY_PROBES: [HirPrintProbe; 4] = [
+    (r"\b", r"\b", false),
+    (r"\B", r"\B", false),
+    (r"(?-u)\b", r"(?-u:\b)", false),
+    (r"(?-u)\B", r"(?-u:\B)", true),
+];
+const HIR_PRINT_REPETITION_PROBES: [HirPrintProbe; 25] = [
+    ("a?", "a?", false),
+    ("a??", "a??", false),
+    ("(?U)a?", "a??", false),
+    ("a*", "a*", false),
+    ("a*?", "a*?", false),
+    ("(?U)a*", "a*?", false),
+    ("a+", "a+", false),
+    ("a+?", "a+?", false),
+    ("(?U)a+", "a+?", false),
+    ("a{1}", "a", false),
+    ("a{2}", "a{2}", false),
+    ("a{1,}", "a+", false),
+    ("a{1,5}", "a{1,5}", false),
+    ("a{1}?", "a", false),
+    ("a{2}?", "a{2}", false),
+    ("a{1,}?", "a+?", false),
+    ("a{1,5}?", "a{1,5}?", false),
+    ("(?U)a{1}", "a", false),
+    ("(?U)a{2}", "a{2}", false),
+    ("(?U)a{1,}", "a+?", false),
+    ("(?U)a{1,5}", "a{1,5}?", false),
+    ("a{0}", "(?:)", false),
+    ("(?:ab){0}", "(?:)", false),
+    (r"\p{any}{0}", "(?:)", false),
+    (r"\P{any}{0}", "(?:)", false),
+];
+const HIR_PRINT_GROUP_PROBES: [HirPrintProbe; 7] = [
+    ("()", "((?:))", false),
+    ("(?P<foo>)", "(?P<foo>(?:))", false),
+    ("(?:)", "(?:)", false),
+    ("(a)", "(a)", false),
+    ("(?P<foo>a)", "(?P<foo>a)", false),
+    ("(?:a)", "a", false),
+    ("((((a))))", "((((a))))", false),
+];
+const HIR_PRINT_ALTERNATION_PROBES: [HirPrintProbe; 7] = [
+    ("|", "(?:(?:)|(?:))", false),
+    ("||", "(?:(?:)|(?:)|(?:))", false),
+    ("a|b", "[ab]", false),
+    ("ab|cd", "(?:(?:ab)|(?:cd))", false),
+    ("a|b|c", "[a-c]", false),
+    ("ab|cd|ef", "(?:(?:ab)|(?:cd)|(?:ef))", false),
+    ("foo|bar|quux", "(?:(?:foo)|(?:bar)|(?:quux))", false),
 ];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
@@ -1995,6 +2098,14 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: "fre-adapter.ast-print-not-implemented".to_owned(),
         };
     }
+    if obligation.case_id.starts_with(HIR_PRINT_PREFIX) {
+        if is_supported_hir_print_case(&obligation.case_id) {
+            return execute_hir_print_case(&obligation.case_id);
+        }
+        return RegexSyntaxCorpusDisposition::Unsupported {
+            reason_code: "fre-adapter.hir-print-not-implemented".to_owned(),
+        };
+    }
     RegexSyntaxCorpusDisposition::Unsupported {
         reason_code: "fre-adapter.unit-family-not-implemented".to_owned(),
     }
@@ -2248,6 +2359,19 @@ fn is_supported_ast_print_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_hir_print_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_PRINT_LITERAL_CASE_ID
+            | HIR_PRINT_CLASS_CASE_ID
+            | HIR_PRINT_ANCHOR_CASE_ID
+            | HIR_PRINT_WORD_BOUNDARY_CASE_ID
+            | HIR_PRINT_REPETITION_CASE_ID
+            | HIR_PRINT_GROUP_CASE_ID
+            | HIR_PRINT_ALTERNATION_CASE_ID
+    )
+}
+
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_NEST_LIMIT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_nest_limit)),
@@ -2321,6 +2445,28 @@ fn execute_ast_print_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-ast-print-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_hir_print_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_hir_print_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: hir_print_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: hir_print_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-hir-print-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -2722,6 +2868,107 @@ fn execute_ast_print_probe(pattern: &str, octal: bool, assertion: &str) -> Resul
             observed: format!("{assertion}: {printed:?}"),
         })
     }
+}
+
+fn run_hir_print_case(case_id: &str) -> Result<(), AstMismatch> {
+    let (probes, label) = hir_print_probes(case_id);
+    for (index, (given, expected, bytes)) in probes.iter().copied().enumerate() {
+        execute_hir_print_probe(given, expected, bytes, &format!("{label}-{index}"))?;
+    }
+    Ok(())
+}
+
+fn hir_print_probes(case_id: &str) -> (&'static [HirPrintProbe], &'static str) {
+    match case_id {
+        HIR_PRINT_LITERAL_CASE_ID => (&HIR_PRINT_LITERAL_PROBES[..], "hir-print-literal"),
+        HIR_PRINT_CLASS_CASE_ID => (&HIR_PRINT_CLASS_PROBES[..], "hir-print-class"),
+        HIR_PRINT_ANCHOR_CASE_ID => (&HIR_PRINT_ANCHOR_PROBES[..], "hir-print-anchor"),
+        HIR_PRINT_WORD_BOUNDARY_CASE_ID => (
+            &HIR_PRINT_WORD_BOUNDARY_PROBES[..],
+            "hir-print-word-boundary",
+        ),
+        HIR_PRINT_REPETITION_CASE_ID => (&HIR_PRINT_REPETITION_PROBES[..], "hir-print-repetition"),
+        HIR_PRINT_GROUP_CASE_ID => (&HIR_PRINT_GROUP_PROBES[..], "hir-print-group"),
+        HIR_PRINT_ALTERNATION_CASE_ID => {
+            (&HIR_PRINT_ALTERNATION_PROBES[..], "hir-print-alternation")
+        }
+        _ => unreachable!("caller checked supported HIR print case"),
+    }
+}
+
+fn execute_hir_print_probe(
+    given: &str,
+    expected_print: &str,
+    bytes: bool,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let rust_profile = RustProfile::regex_1_12_4();
+    let compatibility = if bytes {
+        CompatibilityProfile::RustBytes(rust_profile.clone())
+    } else {
+        CompatibilityProfile::RustText(rust_profile.clone())
+    };
+    let mut builder = regex_syntax::ParserBuilder::new();
+    builder
+        .nest_limit(rust_profile.options.nest_limit)
+        .octal(rust_profile.options.octal)
+        .utf8(!bytes)
+        .ignore_whitespace(rust_profile.options.ignore_whitespace)
+        .case_insensitive(rust_profile.options.case_insensitive)
+        .multi_line(rust_profile.options.multi_line)
+        .dot_matches_new_line(rust_profile.options.dot_matches_new_line)
+        .crlf(rust_profile.options.crlf)
+        .line_terminator(rust_profile.options.line_terminator)
+        .swap_greed(rust_profile.options.swap_greed)
+        .unicode(rust_profile.options.unicode);
+    let expected_hir = builder.build().parse(given).map_err(|error| AstMismatch {
+        expected: format!("{assertion}: authenticated upstream HIR parse succeeds"),
+        observed: format!("{assertion}: upstream HIR parse error {error:?}"),
+    })?;
+    let record =
+        parse(ParseRequest::rust(given, compatibility.clone())).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: FRE HIR parse succeeds"),
+            observed: format!("{assertion}: FRE HIR parse error {error:?}"),
+        })?;
+    let CanonicalPattern::Rust(parsed) = &record.pattern else {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: FRE Rust canonical HIR"),
+            observed: format!("{assertion}: {:?}", record.pattern),
+        });
+    };
+    let identity_valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == given.as_bytes()
+        && record.key.profile == compatibility
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+    if !identity_valid || parsed.hir != expected_hir {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
+            observed: format!("{assertion}: {record:?}"),
+        });
+    }
+    let mut printed = String::new();
+    regex_syntax::hir::print::Printer::new()
+        .print(&parsed.hir, &mut printed)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: HIR printer succeeds with {expected_print:?}"),
+            observed: format!("{assertion}: HIR printer error {error:?}"),
+        })?;
+    if printed != expected_print {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: {expected_print:?}"),
+            observed: format!("{assertion}: {printed:?}"),
+        });
+    }
+    builder
+        .build()
+        .parse(&printed)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: printed HIR reparses"),
+            observed: format!("{assertion}: reparse error {error:?}"),
+        })?;
+    Ok(())
 }
 
 fn run_ast_equivalence_set(probes: &[&str], label: &str) -> Result<(), AstMismatch> {
@@ -3232,6 +3479,25 @@ fn write_ast_print_probe_evidence(contract: &mut String, index: usize, pattern: 
     .expect("writing to a String cannot fail");
 }
 
+fn hir_print_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.hir-print-adapter.v1\ncase={case_id}\nparser=fre-syntax\nprinter=pinned-regex-syntax-0.8.11\n"
+    );
+    let (probes, _) = hir_print_probes(case_id);
+    for (index, (given, expected, bytes)) in probes.iter().copied().enumerate() {
+        writeln!(
+            contract,
+            "probe-{index}=given-sha256:{},given-bytes:{},expected-sha256:{},expected-bytes:{},bytes-profile:{bytes},expected:exact-hir-and-print",
+            sha256(given.as_bytes()),
+            given.len(),
+            sha256(expected.as_bytes()),
+            expected.len(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    sha256(contract.as_bytes())
+}
+
 fn write_ast_equivalence_evidence(contract: &mut String, probes: &[&str], expected: &str) {
     for (index, pattern) in probes.iter().copied().enumerate() {
         writeln!(
@@ -3452,31 +3718,48 @@ fn ast_print_mismatch_evidence(case_id: &str, expected: &str, observed: &str) ->
     )
 }
 
+fn hir_print_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.hir-print-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
-    is_supported_ast_case(case_id) || is_supported_ast_print_case(case_id)
+    is_supported_ast_case(case_id)
+        || is_supported_ast_print_case(case_id)
+        || is_supported_hir_print_case(case_id)
 }
 
 fn syntax_case_pass_evidence(case_id: &str) -> String {
     if is_supported_ast_case(case_id) {
         ast_case_pass_evidence(case_id)
-    } else {
+    } else if is_supported_ast_print_case(case_id) {
         ast_print_pass_evidence(case_id)
+    } else {
+        hir_print_pass_evidence(case_id)
     }
 }
 
 fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     if is_supported_ast_case(case_id) {
         ast_mismatch_evidence(case_id, expected, observed)
-    } else {
+    } else if is_supported_ast_print_case(case_id) {
         ast_print_mismatch_evidence(case_id, expected, observed)
+    } else {
+        hir_print_mismatch_evidence(case_id, expected, observed)
     }
 }
 
 fn syntax_case_fault_stage(case_id: &str) -> &'static str {
     if is_supported_ast_case(case_id) {
         "fre-ast-adapter"
-    } else {
+    } else if is_supported_ast_print_case(case_id) {
         "fre-ast-print-adapter"
+    } else {
+        "fre-hir-print-adapter"
     }
 }
 
@@ -3553,9 +3836,18 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
+        ) if obligation.case_id.starts_with(HIR_PRINT_PREFIX) => {
+            !is_supported_hir_print_case(&obligation.case_id)
+                && obligation.default_harness_member
+                && reason_code == "fre-adapter.hir-print-not-implemented"
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) => {
             !obligation.case_id.starts_with(AST_PARSE_PREFIX)
                 && !obligation.case_id.starts_with(AST_PRINT_PREFIX)
+                && !obligation.case_id.starts_with(HIR_PRINT_PREFIX)
                 && reason_code == "fre-adapter.unit-family-not-implemented"
         }
         _ => false,
@@ -4051,6 +4343,55 @@ mod tests {
                 disposition,
             })
             .expect("supported AST print receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_print_cases_execute_all_71_source_observable_outcomes() {
+        assert_eq!(HIR_PRINT_LITERAL_PROBES.len(), 5);
+        assert_eq!(HIR_PRINT_CLASS_PROBES.len(), 19);
+        assert_eq!(HIR_PRINT_ANCHOR_PROBES.len(), 4);
+        assert_eq!(HIR_PRINT_WORD_BOUNDARY_PROBES.len(), 4);
+        assert_eq!(HIR_PRINT_REPETITION_PROBES.len(), 25);
+        assert_eq!(HIR_PRINT_GROUP_PROBES.len(), 7);
+        assert_eq!(HIR_PRINT_ALTERNATION_PROBES.len(), 7);
+        for case_id in [
+            HIR_PRINT_LITERAL_CASE_ID,
+            HIR_PRINT_CLASS_CASE_ID,
+            HIR_PRINT_ANCHOR_CASE_ID,
+            HIR_PRINT_WORD_BOUNDARY_CASE_ID,
+            HIR_PRINT_REPETITION_CASE_ID,
+            HIR_PRINT_GROUP_CASE_ID,
+            HIR_PRINT_ALTERNATION_CASE_ID,
+        ] {
+            let disposition = execute_hir_print_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_print_pass_evidence(case_id),
+                }
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/print.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR print receipt");
+        }
+
+        for intrinsic in [
+            HIR_PRINT_REGRESSION_REPETITION_CONCAT_CASE_ID,
+            HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID,
+            HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID,
+        ] {
+            assert!(!is_supported_hir_print_case(intrinsic));
         }
     }
 
