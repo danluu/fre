@@ -31,7 +31,7 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v14-utf8-bytes-text-delegate";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v15-singleton-set-observation";
 
 const LIMITATIONS: [&str; 2] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -1620,6 +1620,30 @@ fn set_applicability(
         }
         return Ok(());
     }
+    // A singleton set exposes only match existence and the sole pattern ID.
+    // Search and match selection policies can change a selected span, but that
+    // span is unobservable through these set surfaces. Anchoring and bounds can
+    // change existence, so they remain strict proof preconditions.
+    if input.patterns.len() == 1 {
+        if case.anchored {
+            return Err(NotApplicableReason::ProfileCannotRepresentAnchoring);
+        }
+        if input.bounds
+            != (SearchBounds {
+                start: 0,
+                end: input.haystack.len(),
+            })
+        {
+            return Err(NotApplicableReason::ProfileCannotRepresentBounds);
+        }
+        if case.utf8 != text {
+            return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
+        }
+        if text && std::str::from_utf8(&input.haystack).is_err() {
+            return Err(NotApplicableReason::InvalidUtf8Haystack);
+        }
+        return Ok(());
+    }
     if case.search_kind != SearchKind::Overlapping {
         return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
     }
@@ -2255,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn one_pattern_set_compile_is_independent_of_search_policy_only() {
+    fn one_pattern_set_observations_are_independent_of_selection_policy() {
         let text_case = fixture_case(true, true, None);
         let text_input = fixture_input(vec![ExpectedCaptures {
             pattern_id: 0,
@@ -2271,8 +2295,16 @@ mod tests {
         ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextSetIsMatch, &text_case, &text_input),
-            Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+            Ok(())
         );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetIsMatch, &text_case, &text_input),
+            AdapterDisposition::Pass { .. }
+        ));
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &text_case, &text_input),
+            AdapterDisposition::Pass { .. }
+        ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesSetCompile, &text_case, &text_input),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
@@ -2293,6 +2325,20 @@ mod tests {
         assert_eq!(
             surface_applicability(AdapterSurface::RustTextSetCompile, &text_case, &multiple),
             Err(NotApplicableReason::ProfileCannotRepresentSearchMode)
+        );
+
+        let mut anchored = text_case.clone();
+        anchored.anchored = true;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetIsMatch, &anchored, &text_input),
+            Err(NotApplicableReason::ProfileCannotRepresentAnchoring)
+        );
+
+        let mut bounded = text_input.clone();
+        bounded.bounds.start = 1;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetWhich, &text_case, &bounded),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
         );
 
         let rejected_case = fixture_case(false, true, None);
