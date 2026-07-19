@@ -3,13 +3,14 @@ use std::{env, path::PathBuf, process::ExitCode};
 use rust_regex_conformance::{
     authenticate_candidate_source, build_adapter_report, build_doctest_report,
     build_feature_matrix_report, build_inventory, build_misc_regression_report,
-    build_regex_syntax_corpus_report, build_replacement_api_report, build_searcher_api_report,
-    load_executable_cases, read_adapter_report, read_doctest_report, read_feature_matrix_report,
-    read_inventory, read_misc_regression_report, read_regex_syntax_corpus_report,
-    read_replacement_api_report, read_searcher_api_report, write_adapter_report,
-    write_doctest_report, write_feature_matrix_report, write_inventory,
-    write_misc_regression_report, write_regex_syntax_corpus_report, write_replacement_api_report,
-    write_searcher_api_report,
+    build_regex_automata_corpus_report, build_regex_syntax_corpus_report,
+    build_replacement_api_report, build_searcher_api_report, load_executable_cases,
+    read_adapter_report, read_doctest_report, read_feature_matrix_report, read_inventory,
+    read_misc_regression_report, read_regex_automata_corpus_report,
+    read_regex_syntax_corpus_report, read_replacement_api_report, read_searcher_api_report,
+    write_adapter_report, write_doctest_report, write_feature_matrix_report, write_inventory,
+    write_misc_regression_report, write_regex_automata_corpus_report,
+    write_regex_syntax_corpus_report, write_replacement_api_report, write_searcher_api_report,
 };
 
 fn main() -> ExitCode {
@@ -113,9 +114,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-doctest-api-report" => verify_doctest_api_report(&mut args)?,
         "run-regex-syntax-corpus" => run_regex_syntax_corpus(&mut args)?,
         "verify-regex-syntax-corpus-report" => verify_regex_syntax_corpus_report(&mut args)?,
+        "inventory-regex-automata-corpus" => inventory_regex_automata_corpus(&mut args)?,
+        "verify-regex-automata-corpus-report" => {
+            verify_regex_automata_corpus_report(&mut args)?;
+        }
         "-h" | "--help" | "help" => println!("{}", usage()),
         _ => return Err(usage().into()),
     }
+    Ok(())
+}
+
+fn inventory_regex_automata_corpus(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let crate_archive = PathBuf::from(args.next().ok_or(usage())?);
+    let upstream_package = PathBuf::from(args.next().ok_or(usage())?);
+    let vcs_checkout = PathBuf::from(args.next().ok_or(usage())?);
+    let target_dir = PathBuf::from(args.next().ok_or(usage())?);
+    let output = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let report = build_regex_automata_corpus_report(
+        &crate_archive,
+        &upstream_package,
+        &vcs_checkout,
+        &target_dir,
+    )?;
+    write_regex_automata_corpus_report(&output, &report)?;
+    let counts = &report.payload.counts;
+    println!(
+        "regex-automata-corpus modes={} mode_members={} unique_members={} fre_pass={} unsupported={} inventory_sha256={} payload_sha256={}",
+        counts.feature_modes,
+        counts.total_mode_members,
+        counts.unique_members,
+        counts.fre_pass,
+        counts.unsupported,
+        report.payload.harness.obligation_inventory_sha256,
+        report.payload_sha256,
+    );
+    Ok(())
+}
+
+fn verify_regex_automata_corpus_report(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report_path = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let report = read_regex_automata_corpus_report(&report_path)?;
+    let counts = &report.payload.counts;
+    println!(
+        "verified regex-automata-corpus modes={} mode_members={} unique_members={} fre_pass={} unsupported={} inventory_sha256={} payload_sha256={}",
+        counts.feature_modes,
+        counts.total_mode_members,
+        counts.unique_members,
+        counts.fre_pass,
+        counts.unsupported,
+        report.payload.harness.obligation_inventory_sha256,
+        report.payload_sha256,
+    );
     Ok(())
 }
 
@@ -433,5 +488,5 @@ fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT | run-doctest-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-doctest-api-report REPORT | run-regex-syntax-corpus UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-syntax-corpus-report REPORT"
+    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT | run-doctest-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-doctest-api-report REPORT | run-regex-syntax-corpus UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-syntax-corpus-report REPORT | inventory-regex-automata-corpus CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT TARGET_DIR OUTPUT | verify-regex-automata-corpus-report REPORT"
 }

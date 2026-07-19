@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod adapter;
+mod automata_corpus;
 mod doctest_api;
 mod doctest_builder_remaining;
 mod doctest_byte_captures;
@@ -34,6 +35,14 @@ pub use adapter::{
     AdapterReportPayload, CandidateIdentity, ExecutableCase, ExpectedCaptures, ExpectedSpan,
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
+};
+pub use automata_corpus::{
+    REGEX_AUTOMATA_CORPUS_REPORT_SCHEMA, RegexAutomataCorpusReport,
+    RegexAutomataCorpusReportPayload, RegexAutomataFeatureMode, RegexAutomataHarnessIdentity,
+    RegexAutomataHarnessKind, RegexAutomataInventoryCounts, RegexAutomataInventoryDisposition,
+    RegexAutomataObligation, RegexAutomataPackageFile, RegexAutomataSourceIdentity,
+    RegexAutomataVcsSupportFile, build_regex_automata_corpus_report,
+    read_regex_automata_corpus_report, write_regex_automata_corpus_report,
 };
 pub use doctest_api::{
     DOCTEST_API_CASES, DOCTEST_API_REPORT_SCHEMA, DoctestCapability, DoctestCounts,
