@@ -17,8 +17,9 @@ const MAX_UNICODE_SEGMENT_ALIAS_BYTES: usize = 20;
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustAstRecord, RustConstructor, RustOptions, RustParsed, RustRegexSetAdmissionError,
-    RustUnicodeFeatures, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
+    RustAstOptions, RustAstRecord, RustConstructor, RustOptions, RustParsed,
+    RustRegexSetAdmissionError, RustUnicodeFeatures, SCHEMA_VERSION, SafetyEnvelope,
+    UnicodeVersion,
 };
 
 // The 0.8.11 AST parser is single-pass. Its final AST can contain synthetic
@@ -43,7 +44,10 @@ struct AstParseReservation {
     work: u64,
 }
 
-pub(crate) fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, ParseError> {
+pub(crate) fn parse_rust_ast(
+    request: ParseRequest,
+    ast_options: RustAstOptions,
+) -> Result<RustAstRecord, ParseError> {
     let (pattern, profile, admission, safety) = request.into_parts();
     let Some(source) = pattern.as_str() else {
         return Err(ParseError::new(
@@ -65,7 +69,8 @@ pub(crate) fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, Par
     builder
         .nest_limit(options.nest_limit)
         .octal(options.octal)
-        .ignore_whitespace(options.ignore_whitespace);
+        .ignore_whitespace(options.ignore_whitespace)
+        .empty_min_range(ast_options.empty_min_range);
     let ast = builder.build().parse(source).map_err(|error| {
         with_regex_span(
             ParseError::new(
@@ -84,6 +89,7 @@ pub(crate) fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, Par
             admission,
             safety,
         },
+        ast_options,
         admission_status: AdmissionStatus::from_policy(admission),
         reserved_ast_nodes: reservation.nodes,
         reserved_max_nesting: reservation.max_nesting,

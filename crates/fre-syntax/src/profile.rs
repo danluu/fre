@@ -208,6 +208,19 @@ impl Default for RustOptions {
     }
 }
 
+/// Options exposed only by the pinned `regex-syntax` AST parser.
+///
+/// These are deliberately separate from [`RustOptions`], whose fields mirror
+/// the high-level `regex::RegexBuilder` surface. They participate in the
+/// semantic identity of [`crate::RustAstRecord`] without changing normal HIR
+/// parsing through [`crate::parse`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RustAstOptions {
+    /// Accept a counted repetition with an omitted lower bound, such as
+    /// `a{,9}`, as a range bounded by zero and the written upper bound.
+    pub empty_min_range: bool,
+}
+
 /// Match selection configured by a Rust constructor profile.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RustMatchKind {

@@ -14,8 +14,8 @@ use std::{
 
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CompatibilityProfile, ErrorCategory, ParseError,
-    ParseRequest, RustAstRecord, RustProfile, SCHEMA_VERSION, SafetyEnvelope, SourceSpan,
-    parse_rust_ast,
+    ParseRequest, RustAstOptions, RustAstRecord, RustProfile, SCHEMA_VERSION, SafetyEnvelope,
+    SourceSpan, parse_rust_ast, parse_rust_ast_with_options,
 };
 use regex_syntax::ast::{Ast, Concat, HexLiteralKind, Literal, LiteralKind, Position, Span};
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,6 @@ const AST_SET_CLASS_CASE_ID: &str = "ast::parse::tests::parse_set_class";
 const AST_SET_CLASS_OPEN_CASE_ID: &str = "ast::parse::tests::parse_set_class_open";
 #[cfg(test)]
 const AST_MAYBE_ASCII_CLASS_CASE_ID: &str = "ast::parse::tests::maybe_parse_ascii_class";
-#[cfg(test)]
 const AST_COUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_counted_repetition";
 #[cfg(test)]
 const AST_DECIMAL_CASE_ID: &str = "ast::parse::tests::parse_decimal";
@@ -239,6 +238,35 @@ const UNCOUNTED_REPETITION_ERROR_PROBES: [AstFixedErrorProbe; 10] = [
     AstFixedErrorProbe::new(r"|+", false, AstFixedErrorKind::RepetitionMissing, 1, 1),
     AstFixedErrorProbe::new(r"|?", false, AstFixedErrorKind::RepetitionMissing, 1, 1),
 ];
+const COUNTED_REPETITION_DEFAULT_PROBES: [&str; 25] = [
+    r"a{5}",
+    r"a{5,}",
+    r"a{5,9}",
+    r"a{5}?",
+    r"ab{5}",
+    r"ab{5}c",
+    r"a{ 5 }",
+    r"a{ 5 , 9 }",
+    r"\b{5,9}",
+    r"(?i){0}",
+    r"(?m){1,1}",
+    r"a{]}",
+    r"a{1,]}",
+    r"a{",
+    r"a{}",
+    r"a{a",
+    r"a{9999999999}",
+    r"a{9",
+    r"a{9,a",
+    r"a{9,9999999999}",
+    r"a{9,",
+    r"a{9,11",
+    r"a{2,1}",
+    r"{5}",
+    r"|{5}",
+];
+const COUNTED_REPETITION_EMPTY_MIN_PATTERN: &str = r"a{,9}";
+const COUNTED_REPETITION_IGNORE_WHITESPACE_PATTERN: &str = r"a{5,9} ?";
 const GROUP_PROBES: [&str; 17] = [
     "(?i)", "(?iU)", "(?i-U)", "()", "(a)", "(())", "(?:a)", "(?i:a)", "(?i-U:a)", "(", "(?",
     "(?P", "(?P<", "(a", "(()", ")", "a)",
@@ -514,7 +542,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 9 AST parser identities remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 5 AST parser identities remain explicit Unsupported dispositions.",
     "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
@@ -2071,6 +2099,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
             | AST_NEWLINES_CASE_ID
             | AST_ALTERNATE_CASE_ID
             | AST_UNCOUNTED_REPETITION_CASE_ID
+            | AST_COUNTED_REPETITION_CASE_ID
             | AST_GROUP_CASE_ID
             | AST_CAPTURE_NAME_CASE_ID
             | AST_FLAGS_CASE_ID
@@ -2100,6 +2129,9 @@ fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         AST_ALTERNATE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_alternate)),
         AST_UNCOUNTED_REPETITION_CASE_ID => {
             catch_unwind(AssertUnwindSafe(run_ast_uncounted_repetition))
+        }
+        AST_COUNTED_REPETITION_CASE_ID => {
+            catch_unwind(AssertUnwindSafe(run_ast_counted_repetition))
         }
         AST_GROUP_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_group)),
         AST_CAPTURE_NAME_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_capture_name)),
@@ -2401,6 +2433,29 @@ fn run_ast_uncounted_repetition() -> Result<(), AstMismatch> {
     Ok(())
 }
 
+fn run_ast_counted_repetition() -> Result<(), AstMismatch> {
+    for (index, pattern) in COUNTED_REPETITION_DEFAULT_PROBES.into_iter().enumerate() {
+        execute_ast_equivalence_probe(pattern, &format!("counted-repetition-default-{index}"))?;
+    }
+
+    let mut whitespace_profile = RustProfile::regex_1_12_4();
+    whitespace_profile.options.ignore_whitespace = true;
+    execute_ast_profile_equivalence_probe(
+        COUNTED_REPETITION_IGNORE_WHITESPACE_PATTERN,
+        &whitespace_profile,
+        "counted-repetition-ignore-whitespace",
+    )?;
+
+    execute_ast_options_equivalence_probe(
+        COUNTED_REPETITION_EMPTY_MIN_PATTERN,
+        &RustProfile::regex_1_12_4(),
+        RustAstOptions {
+            empty_min_range: true,
+        },
+        "counted-repetition-empty-min-range",
+    )
+}
+
 fn run_ast_group() -> Result<(), AstMismatch> {
     run_ast_equivalence_set(&GROUP_PROBES, "group")
 }
@@ -2484,18 +2539,39 @@ fn execute_ast_profile_equivalence_probe(
     rust_profile: &RustProfile,
     assertion: &str,
 ) -> Result<(), AstMismatch> {
+    execute_ast_options_equivalence_probe(
+        pattern,
+        rust_profile,
+        RustAstOptions::default(),
+        assertion,
+    )
+}
+
+fn execute_ast_options_equivalence_probe(
+    pattern: &str,
+    rust_profile: &RustProfile,
+    ast_options: RustAstOptions,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
     let profile = CompatibilityProfile::RustText(rust_profile.clone());
     let mut builder = regex_syntax::ast::parse::ParserBuilder::new();
     builder
         .nest_limit(rust_profile.options.nest_limit)
         .octal(rust_profile.options.octal)
-        .ignore_whitespace(rust_profile.options.ignore_whitespace);
+        .ignore_whitespace(rust_profile.options.ignore_whitespace)
+        .empty_min_range(ast_options.empty_min_range);
     let expected = builder.build().parse(pattern);
-    let observed = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()));
+    let observed =
+        parse_rust_ast_with_options(ParseRequest::rust(pattern, profile.clone()), ast_options);
     match (expected, observed) {
-        (Ok(expected_ast), Ok(record)) => {
-            validate_ast_success(&record, &expected_ast, pattern, rust_profile, assertion)
-        }
+        (Ok(expected_ast), Ok(record)) => validate_ast_success_with_options(
+            &record,
+            &expected_ast,
+            pattern,
+            rust_profile,
+            ast_options,
+            assertion,
+        ),
         (Err(expected_error), Err(observed_error)) => validate_ast_error(
             &observed_error,
             &expected_error,
@@ -2687,11 +2763,30 @@ fn execute_ast_assertion(
     Ok(record)
 }
 
+#[cfg(test)]
 fn validate_ast_success(
     record: &RustAstRecord,
     expected: &Ast,
     pattern: &str,
     rust_profile: &RustProfile,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    validate_ast_success_with_options(
+        record,
+        expected,
+        pattern,
+        rust_profile,
+        RustAstOptions::default(),
+        assertion,
+    )
+}
+
+fn validate_ast_success_with_options(
+    record: &RustAstRecord,
+    expected: &Ast,
+    pattern: &str,
+    rust_profile: &RustProfile,
+    ast_options: RustAstOptions,
     assertion: &str,
 ) -> Result<(), AstMismatch> {
     if &record.ast != expected {
@@ -2700,13 +2795,22 @@ fn validate_ast_success(
             observed: format!("{assertion}: Ok({:?})", record.ast),
         });
     }
-    validate_ast_record(record, pattern, rust_profile)
+    validate_ast_record_with_options(record, pattern, rust_profile, ast_options)
 }
 
 fn validate_ast_record(
     record: &RustAstRecord,
     pattern: &str,
     rust_profile: &RustProfile,
+) -> Result<(), AstMismatch> {
+    validate_ast_record_with_options(record, pattern, rust_profile, RustAstOptions::default())
+}
+
+fn validate_ast_record_with_options(
+    record: &RustAstRecord,
+    pattern: &str,
+    rust_profile: &RustProfile,
+    ast_options: RustAstOptions,
 ) -> Result<(), AstMismatch> {
     let expected_profile = CompatibilityProfile::RustText(rust_profile.clone());
     let bytes = u64::try_from(pattern.len()).unwrap_or(u64::MAX);
@@ -2723,6 +2827,7 @@ fn validate_ast_record(
         && record.key.profile == expected_profile
         && record.key.admission == AdmissionPolicy::default()
         && record.key.safety == SafetyEnvelope::default()
+        && record.ast_options == ast_options
         && record.admission_status == AdmissionStatus::UpstreamOraclePending
         && record.reserved_ast_nodes == nodes
         && record.reserved_max_nesting == nesting
@@ -2733,7 +2838,7 @@ fn validate_ast_record(
     } else {
         Err(AstMismatch {
             expected: format!(
-                "FRE AST record schema={SCHEMA_VERSION} pattern={pattern:?} nodes={nodes} nesting={nesting} stack={stack} work={work}"
+                "FRE AST record schema={SCHEMA_VERSION} pattern={pattern:?} ast-options={ast_options:?} nodes={nodes} nesting={nesting} stack={stack} work={work}"
             ),
             observed: format!("{record:?}"),
         })
@@ -2768,6 +2873,7 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         }
         AST_SET_CLASS_CASE_ID => write_ast_set_class_evidence(&mut contract),
         AST_UNCOUNTED_REPETITION_CASE_ID => write_ast_uncounted_repetition_evidence(&mut contract),
+        AST_COUNTED_REPETITION_CASE_ID => write_ast_counted_repetition_evidence(&mut contract),
         AST_ESCAPE_CASE_ID => {
             write_ast_equivalence_evidence(
                 &mut contract,
@@ -2906,6 +3012,28 @@ fn write_ast_uncounted_repetition_evidence(contract: &mut String) {
         "upstream-exact-success",
     );
     write_ast_fixed_error_evidence(contract, &UNCOUNTED_REPETITION_ERROR_PROBES);
+}
+
+fn write_ast_counted_repetition_evidence(contract: &mut String) {
+    write_ast_equivalence_evidence(
+        contract,
+        &COUNTED_REPETITION_DEFAULT_PROBES,
+        "upstream-exact-result",
+    );
+    writeln!(
+        contract,
+        "empty-min-range=sha256:{},bytes:{},empty-min-range:true,expected:upstream-exact-success",
+        sha256(COUNTED_REPETITION_EMPTY_MIN_PATTERN.as_bytes()),
+        COUNTED_REPETITION_EMPTY_MIN_PATTERN.len(),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        contract,
+        "ignore-whitespace=sha256:{},bytes:{},ignore-whitespace:true,expected:upstream-exact-success",
+        sha256(COUNTED_REPETITION_IGNORE_WHITESPACE_PATTERN.as_bytes()),
+        COUNTED_REPETITION_IGNORE_WHITESPACE_PATTERN.len(),
+    )
+    .expect("writing to a String cannot fail");
 }
 
 fn write_ast_group_family_evidence(contract: &mut String, case_id: &str) {
@@ -3513,6 +3641,7 @@ mod tests {
             AST_IGNORE_WHITESPACE_CASE_ID,
             AST_ALTERNATE_CASE_ID,
             AST_UNCOUNTED_REPETITION_CASE_ID,
+            AST_COUNTED_REPETITION_CASE_ID,
             AST_GROUP_CASE_ID,
             AST_CAPTURE_NAME_CASE_ID,
             AST_FLAGS_CASE_ID,
@@ -3764,8 +3893,12 @@ mod tests {
     }
 
     #[test]
-    fn counted_and_decimal_private_gaps_are_not_falsely_admitted() {
-        let pattern = r"a{,9}";
+    fn counted_repetition_covers_ast_only_option_and_decimal_stays_intrinsic() {
+        assert_eq!(COUNTED_REPETITION_DEFAULT_PROBES.len(), 25);
+        run_ast_counted_repetition().expect("all 27 pinned counted-repetition outcomes match");
+        assert!(is_supported_ast_case(AST_COUNTED_REPETITION_CASE_ID));
+
+        let pattern = COUNTED_REPETITION_EMPTY_MIN_PATTERN;
         let expected_with_option = regex_syntax::ast::parse::ParserBuilder::new()
             .empty_min_range(true)
             .build()
@@ -3782,7 +3915,7 @@ mod tests {
             pattern,
             CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
         ))
-        .expect_err("FRE has no empty-min-range profile setting");
+        .expect_err("the FRE default AST profile also rejects an empty lower bound");
         validate_ast_error(
             &fre_error,
             &default_error,
@@ -3791,15 +3924,46 @@ mod tests {
             "default-empty-min-range",
         )
         .expect("FRE exactly matches the representable default profile");
+        let record = parse_rust_ast_with_options(
+            ParseRequest::rust(
+                pattern,
+                CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
+            ),
+            RustAstOptions {
+                empty_min_range: true,
+            },
+        )
+        .expect("the explicit AST-only profile accepts an empty lower bound");
+        assert_eq!(record.ast, expected_with_option);
+        assert_eq!(
+            record.ast_options,
+            RustAstOptions {
+                empty_min_range: true,
+            }
+        );
         assert!(matches!(
-            expected_with_option,
+            record.ast,
             Ast::Repetition(ref repetition)
                 if repetition.op.kind
                     == regex_syntax::ast::RepetitionKind::Range(
                         regex_syntax::ast::RepetitionRange::Bounded(0, 9)
                     )
         ));
-        assert!(!is_supported_ast_case(AST_COUNTED_REPETITION_CASE_ID));
+
+        let mut drifted = record;
+        drifted.ast_options = RustAstOptions::default();
+        assert!(
+            validate_ast_record_with_options(
+                &drifted,
+                pattern,
+                &RustProfile::regex_1_12_4(),
+                RustAstOptions {
+                    empty_min_range: true,
+                },
+            )
+            .is_err(),
+            "AST-only option drift must invalidate the conformance record",
+        );
 
         let decimal_context = "a{}";
         let contextual_error = regex_syntax::ast::parse::Parser::new()

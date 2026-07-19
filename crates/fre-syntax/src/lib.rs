@@ -25,8 +25,8 @@ pub use parsed::{
 };
 pub use profile::{
     CompatibilityProfile, InputKind, PackageIdentity, PackageVersion, Re2Encoding, Re2Options,
-    Re2Profile, Re2Syntax, RustConstructor, RustMatchKind, RustOptions, RustProfile,
-    RustUnicodeFeatures, UnicodeVersion, UpstreamRevision,
+    Re2Profile, Re2Syntax, RustAstOptions, RustConstructor, RustMatchKind, RustOptions,
+    RustProfile, RustUnicodeFeatures, UnicodeVersion, UpstreamRevision,
 };
 pub use re2::{Re2Capability, Re2CapabilityStatus, Re2Surface, re2_surface_inventory};
 
@@ -65,10 +65,27 @@ pub fn parse(request: ParseRequest) -> Result<ParseRecord, ParseError> {
 /// envelope.
 #[doc(hidden)]
 pub fn parse_rust_ast(request: ParseRequest) -> Result<RustAstRecord, ParseError> {
+    parse_rust_ast_with_options(request, RustAstOptions::default())
+}
+
+/// Parses one Rust pattern with options exposed only by the pinned AST parser.
+///
+/// This is a source-addressable conformance boundary. AST-only options are
+/// retained in [`RustAstRecord`] and never affect normal HIR parsing through
+/// [`parse`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`parse_rust_ast`].
+#[doc(hidden)]
+pub fn parse_rust_ast_with_options(
+    request: ParseRequest,
+    ast_options: RustAstOptions,
+) -> Result<RustAstRecord, ParseError> {
     request.validate_and_charge_source()?;
     match request.profile() {
         CompatibilityProfile::RustText(_) | CompatibilityProfile::RustBytes(_) => {
-            rust::parse_rust_ast(request)
+            rust::parse_rust_ast(request, ast_options)
         }
         CompatibilityProfile::Re2(_) => Err(ParseError::new(
             request.profile().clone(),

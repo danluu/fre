@@ -1,6 +1,6 @@
 use regex_syntax::{ast::Ast, hir::Hir};
 
-use crate::{AdmissionPolicy, CompatibilityProfile, ParseError, SafetyEnvelope};
+use crate::{AdmissionPolicy, CompatibilityProfile, ParseError, RustAstOptions, SafetyEnvelope};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
@@ -177,6 +177,8 @@ pub struct RustParsed {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RustAstRecord {
     pub key: CacheKey,
+    /// AST-only parser options completing this record's semantic identity.
+    pub ast_options: RustAstOptions,
     pub admission_status: AdmissionStatus,
     pub reserved_ast_nodes: u64,
     pub reserved_max_nesting: u64,

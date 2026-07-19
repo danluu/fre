@@ -3,9 +3,10 @@ use std::collections::{BTreeSet, HashSet};
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CanonicalPattern, CompatibilityProfile, ErrorCategory,
     PackageIdentity, ParseRequest, QuotaBounded, Re2CapabilityStatus, Re2Encoding, Re2Options,
-    Re2Profile, Re2Surface, ResourceKind, RustConstructor, RustMatchKind, RustProfile,
-    RustUnicodeFeatures, SafetyEnvelope, StrictAdmission, SyntaxQuotas, UnicodeVersion,
-    UpstreamRevision, parse, parse_rust_ast, re2_surface_inventory,
+    Re2Profile, Re2Surface, ResourceKind, RustAstOptions, RustConstructor, RustMatchKind,
+    RustProfile, RustUnicodeFeatures, SafetyEnvelope, StrictAdmission, SyntaxQuotas,
+    UnicodeVersion, UpstreamRevision, parse, parse_rust_ast, parse_rust_ast_with_options,
+    re2_surface_inventory,
 };
 
 const GENCAT_ALIASES: &[&str] = include!("../src/unicode_gencat_aliases.in");
@@ -167,6 +168,72 @@ fn rust_ast_parse_reserves_work_before_parser_execution() {
             resource: ResourceKind::HirNodes,
             limit: baseline.reserved_ast_nodes - 1,
             observed: baseline.reserved_ast_nodes,
+        }
+    );
+}
+
+#[test]
+fn rust_ast_empty_min_range_is_explicit_and_resource_bounded() {
+    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
+
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let pattern = r"a{,9}";
+    let default_error = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+        .expect_err("default AST parsing rejects an omitted lower bound");
+    assert_eq!(default_error.category, ErrorCategory::UpstreamRustSyntax);
+
+    let ast_options = RustAstOptions {
+        empty_min_range: true,
+    };
+    let baseline =
+        parse_rust_ast_with_options(ParseRequest::rust(pattern, profile.clone()), ast_options)
+            .expect("explicit AST-only option accepts an omitted lower bound");
+    assert_eq!(baseline.ast_options, ast_options);
+    assert!(matches!(
+        baseline.ast,
+        Ast::Repetition(ref repetition)
+            if repetition.op.kind
+                == RepetitionKind::Range(RepetitionRange::Bounded(0, 9))
+    ));
+
+    let same_ast = parse_rust_ast_with_options(
+        ParseRequest::rust("a{5}", profile.clone()),
+        RustAstOptions::default(),
+    )
+    .expect("default identity parses an ordinary counted repetition");
+    let distinct_identity =
+        parse_rust_ast_with_options(ParseRequest::rust("a{5}", profile.clone()), ast_options)
+            .expect("AST-only identity also parses an ordinary counted repetition");
+    assert_eq!(same_ast.ast, distinct_identity.ast);
+    assert_ne!(same_ast, distinct_identity);
+
+    let mut quotas = SyntaxQuotas {
+        max_hir_nodes: baseline.reserved_ast_nodes,
+        max_nesting: baseline.reserved_max_nesting,
+        max_traversal_stack: baseline.reserved_parser_stack,
+        max_parse_work: baseline.reserved_parse_work,
+        ..SyntaxQuotas::default()
+    };
+    parse_rust_ast_with_options(
+        ParseRequest::rust(pattern, profile.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        ast_options,
+    )
+    .expect("exact prospective AST limits pass with AST-only options");
+
+    quotas.max_parse_work = baseline.reserved_parse_work - 1;
+    let error = parse_rust_ast_with_options(
+        ParseRequest::rust(pattern, profile)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        ast_options,
+    )
+    .expect_err("one below prospective AST work fails before option-enabled parsing");
+    assert_eq!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit: baseline.reserved_parse_work - 1,
+            observed: baseline.reserved_parse_work,
         }
     );
 }
