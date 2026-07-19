@@ -176,6 +176,11 @@ const UNICODE_RANGE_CONTAINS_CASE_ID: &str = "unicode::tests::range_contains";
 const UNICODE_REGRESSION_466_CASE_ID: &str = "unicode::tests::regression_466";
 const UNICODE_SYM_NORMALIZE_CASE_ID: &str = "unicode::tests::sym_normalize";
 const UNICODE_VALID_UTF8_SYMBOLIC_CASE_ID: &str = "unicode::tests::valid_utf8_symbolic";
+const AST_SIZE_CASE_ID: &str = "ast::tests::ast_size";
+const AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID: &str = "ast::tests::no_stack_overflow_on_drop";
+const ERROR_REGRESSION_464_CASE_ID: &str = "error::tests::regression_464";
+const ERROR_REPETITION_DECIMAL_CASE_ID: &str =
+    "error::tests::repetition_quantifier_expects_a_valid_decimal";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -3535,6 +3540,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
     if is_supported_unicode_case(&obligation.case_id) {
         return execute_unicode_case(&obligation.case_id);
     }
+    if is_supported_ast_robustness_case(&obligation.case_id) {
+        return execute_ast_robustness_case(&obligation.case_id);
+    }
     if is_supported_hir_misc_case(&obligation.case_id) {
         return execute_hir_misc_case(&obligation.case_id);
     }
@@ -3939,6 +3947,16 @@ fn is_supported_unicode_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_ast_robustness_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        AST_SIZE_CASE_ID
+            | AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID
+            | ERROR_REGRESSION_464_CASE_ID
+            | ERROR_REPETITION_DECIMAL_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -4280,6 +4298,28 @@ fn execute_unicode_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-unicode-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_ast_robustness_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_ast_robustness_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: ast_robustness_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: ast_robustness_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-ast-robustness-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -6088,6 +6128,99 @@ fn pinned_symbolic_name_normalize_bytes(bytes: &mut [u8]) -> &mut [u8] {
     &mut bytes[..next_write]
 }
 
+fn run_ast_robustness_case(case_id: &str) -> Result<(), AstMismatch> {
+    match case_id {
+        AST_SIZE_CASE_ID => {
+            let max = 2usize
+                .checked_mul(std::mem::size_of::<usize>())
+                .expect("two pointer widths fit usize");
+            let observed = std::mem::size_of::<Ast>();
+            if observed > max {
+                return Err(AstMismatch {
+                    expected: format!("{case_id}: Ast size at most {max} bytes"),
+                    observed: format!("{case_id}: Ast size {observed} bytes"),
+                });
+            }
+            execute_ast_equivalence_probe("a", &format!("{case_id}-fre-ast-binding"))?;
+        }
+        AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID => {
+            use regex_syntax::ast::{Group, GroupKind};
+
+            execute_ast_equivalence_probe("a", &format!("{case_id}-fre-ast-binding"))?;
+            let joined = std::thread::Builder::new()
+                .stack_size(16_384)
+                .spawn(|| {
+                    let span = || Span::splat(Position::new(0, 0, 0));
+                    let mut ast = Ast::empty(span());
+                    for index in 0..200 {
+                        ast = Ast::group(Group {
+                            span: span(),
+                            kind: GroupKind::CaptureIndex(index),
+                            ast: Box::new(ast),
+                        });
+                    }
+                    !ast.is_empty()
+                })
+                .map_err(|error| AstMismatch {
+                    expected: format!("{case_id}: 16KiB-stack worker starts"),
+                    observed: format!("{case_id}: {error:?}"),
+                })?
+                .join()
+                .map_err(|_| AstMismatch {
+                    expected: format!("{case_id}: bounded public AST drops without overflow"),
+                    observed: format!("{case_id}: worker panicked"),
+                })?;
+            hir_doctest_assert_eq(case_id, "non-empty", &true, &joined)?;
+        }
+        ERROR_REGRESSION_464_CASE_ID => {
+            assert_ast_error_binding(case_id, "a{\n", None)?;
+        }
+        ERROR_REPETITION_DECIMAL_CASE_ID => {
+            let expected = r"
+regex parse error:
+    \\u{[^}]*}
+        ^
+error: repetition quantifier expects a valid decimal
+";
+            assert_ast_error_binding(case_id, r"\\u{[^}]*}", Some(expected.trim()))?;
+        }
+        _ => unreachable!("caller checked supported AST robustness case"),
+    }
+    Ok(())
+}
+
+fn assert_ast_error_binding(
+    case_id: &str,
+    pattern: &str,
+    expected_display: Option<&str>,
+) -> Result<(), AstMismatch> {
+    let expected = regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .expect_err("authenticated source test requires an AST parse error");
+    let display = expected.to_string();
+    if display.is_empty() {
+        return Err(AstMismatch {
+            expected: format!("{case_id}: nonempty pinned error display"),
+            observed: format!("{case_id}: empty error display"),
+        });
+    }
+    if let Some(wanted) = expected_display {
+        hir_doctest_assert_eq(case_id, "exact-error-display", wanted, display.as_str())?;
+    }
+
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let observed = match parse_rust_ast(ParseRequest::rust(pattern, profile.clone())) {
+        Err(error) => error,
+        Ok(record) => {
+            return Err(AstMismatch {
+                expected: format!("{case_id}: FRE AST parse rejects with {expected:?}"),
+                observed: format!("{case_id}: FRE AST parse accepted {record:?}"),
+            });
+        }
+    };
+    validate_ast_error(&observed, &expected, pattern, &profile, case_id)
+}
+
 fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
     debug_assert!((0xD800..0xE000).contains(&codepoint));
     [
@@ -7836,6 +7969,26 @@ fn unicode_pass_evidence(case_id: &str) -> String {
     )
 }
 
+fn ast_robustness_pass_evidence(case_id: &str) -> String {
+    let assertions = match case_id {
+        AST_SIZE_CASE_ID => "two-pointer-width-size-bound-plus-fre-ast-binding",
+        AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID => {
+            "two-hundred-groups-on-16KiB-stack-plus-fre-ast-binding"
+        }
+        ERROR_REGRESSION_464_CASE_ID => "nonempty-multiline-error-plus-exact-fre-error-binding",
+        ERROR_REPETITION_DECIMAL_CASE_ID => {
+            "exact-repetition-decimal-diagnostic-plus-fre-error-binding"
+        }
+        _ => unreachable!("caller checked supported AST robustness case"),
+    };
+    sha256(
+        format!(
+            "fre.regex-syntax.ast-robustness-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertions={assertions}\nexpected=exact-public-ast-and-error-robustness-semantics\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -8259,6 +8412,15 @@ fn unicode_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> S
     )
 }
 
+fn ast_robustness_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.ast-robustness-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -8285,6 +8447,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_utf8_case(case_id)
         || is_supported_top_level_case(case_id)
         || is_supported_unicode_case(case_id)
+        || is_supported_ast_robustness_case(case_id)
         || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
@@ -8305,6 +8468,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         top_level_pass_evidence(case_id)
     } else if is_supported_unicode_case(case_id) {
         unicode_pass_evidence(case_id)
+    } else if is_supported_ast_robustness_case(case_id) {
+        ast_robustness_pass_evidence(case_id)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8329,6 +8494,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         top_level_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_unicode_case(case_id) {
         unicode_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_ast_robustness_case(case_id) {
+        ast_robustness_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8353,6 +8520,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-top-level-syntax-adapter"
     } else if is_supported_unicode_case(case_id) {
         "fre-unicode-adapter"
+    } else if is_supported_ast_robustness_case(case_id) {
+        "fre-ast-robustness-adapter"
     } else if is_supported_hir_misc_case(case_id) {
         "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -9314,6 +9483,41 @@ mod tests {
                 disposition,
             })
             .expect("supported Unicode unit receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_ast_robustness_cases_execute_all_4_source_identities() {
+        for case_id in [
+            AST_SIZE_CASE_ID,
+            AST_NO_STACK_OVERFLOW_ON_DROP_CASE_ID,
+            ERROR_REGRESSION_464_CASE_ID,
+            ERROR_REPETITION_DECIMAL_CASE_ID,
+        ] {
+            let disposition = execute_ast_robustness_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: ast_robustness_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: if case_id.starts_with("ast::") {
+                        "src/ast/mod.rs".to_owned()
+                    } else {
+                        "src/error.rs".to_owned()
+                    },
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported AST robustness receipt");
         }
     }
 
