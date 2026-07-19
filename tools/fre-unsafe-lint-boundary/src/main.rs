@@ -18,10 +18,90 @@ const EXACT_ALLOC_PACKAGE: &str = "fre-exact-alloc";
 const EXACT_ALLOC_LIBRARY: &str = "fre_exact_alloc";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
-const EXACT_ALLOC_ALLOW_ATTRIBUTE: &str = r#"#[allow(
+const EXACT_VEC_REVIEWED_BLOCK: &str = r#"#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
+)]
+fn exact_vec_with_capacity<T>(
+    capacity: usize,
+    force_failure: bool,
+) -> Result<ExactVec<T>, CopyError> {
+    if size_of::<T>() == 0 {
+        return Err(CopyError::LayoutOverflow);
+    }
+    if capacity == 0 {
+        return Ok(ExactVec { inner: Vec::new() });
+    }
+    let layout = Layout::array::<T>(capacity).map_err(|_| CopyError::LayoutOverflow)?;
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+    // SAFETY: `alloc` returned exactly `layout`; a zero-length Vec owns the
+    // uninitialized spare capacity and later deallocates with the same layout.
+    let inner = unsafe { Vec::from_raw_parts(allocation.cast::<T>(), 0, capacity) };
+    Ok(ExactVec { inner })
+}"#;
+const ZEROED_EXACT_REVIEWED_BLOCK: &str = r#"#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout zero-initialization boundary"
+)]
+fn zeroed_exact_with(len: usize, force_failure: bool) -> Result<Vec<u8>, CopyError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = Layout::array::<u8>(len).map_err(|_| CopyError::LayoutOverflow)?;
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc_zeroed(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+
+    // SAFETY: `alloc_zeroed` returned a fresh allocation for exactly `layout`
+    // and initialized every byte. With `len == capacity`, `Vec` later uses the
+    // identical layout for deallocation.
+    unsafe { Ok(Vec::from_raw_parts(allocation, len, len)) }
+}"#;
+const COPY_EXACT_REVIEWED_BLOCK: &str = r#"#[allow(
     unsafe_code,
     reason = "this one reviewed function owns FRE's exact-layout allocation boundary"
-)]"#;
+)]
+fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let layout = Layout::array::<u8>(bytes.len()).map_err(|_| CopyError::LayoutOverflow)?;
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+
+    // SAFETY: `alloc` returned a fresh global allocation for exactly `layout`.
+    // Every `u8` alignment is valid, the allocation is disjoint from the input,
+    // and the copy initializes all `len` bytes. No panicking operation occurs
+    // between successful allocation and `Vec` ownership. Since `len == capacity`,
+    // `Vec` later deallocates with the same layout.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), allocation, bytes.len());
+        Ok(Vec::from_raw_parts(allocation, bytes.len(), bytes.len()))
+    }
+}"#;
+const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 3] = [
+    EXACT_VEC_REVIEWED_BLOCK,
+    ZEROED_EXACT_REVIEWED_BLOCK,
+    COPY_EXACT_REVIEWED_BLOCK,
+];
 
 const KERNEL_LINTS: &str = r#"
 [lints.rust]
@@ -475,15 +555,28 @@ fn audit_exact_allocator(
 fn audit_exact_allocator_source(source_path: &Path) -> Result<(), String> {
     let source = fs::read_to_string(source_path)
         .map_err(|error| format!("read exact allocator source: {error}"))?;
-    if !source.lines().any(|line| line == DENY_ATTRIBUTE) {
+    if source.matches(DENY_ATTRIBUTE).count() != 1 {
         return Err(format!(
-            "exact allocator source must contain {DENY_ATTRIBUTE}"
+            "exact allocator source must contain exactly one {DENY_ATTRIBUTE}"
         ));
     }
-    if source.matches("unsafe_code").count() != 2
-        || source.matches(EXACT_ALLOC_ALLOW_ATTRIBUTE).count() != 1
-    {
+    if source.matches("unsafe_code").count() != EXACT_ALLOC_REVIEWED_BLOCKS.len() + 1 {
         return Err("exact allocator unsafe-lint lowering inventory drifted".to_owned());
+    }
+    let mut prior_end = 0;
+    for block in EXACT_ALLOC_REVIEWED_BLOCKS {
+        if source.matches(block).count() != 1 {
+            return Err("exact allocator reviewed unsafe site binding drifted".to_owned());
+        }
+        let offset = source
+            .find(block)
+            .ok_or_else(|| "exact allocator reviewed unsafe site disappeared".to_owned())?;
+        if offset < prior_end {
+            return Err("exact allocator reviewed unsafe site order drifted".to_owned());
+        }
+        prior_end = offset
+            .checked_add(block.len())
+            .ok_or_else(|| "exact allocator reviewed unsafe site offset overflow".to_owned())?;
     }
     for forbidden in [
         "include!",
@@ -574,9 +667,9 @@ fn canonical(path: &Path, description: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXACT_ALLOC_ALLOW_ATTRIBUTE, EXACT_ALLOC_LINTS, Package, Target, WARN_UNSAFE_LINTS,
-        audit_exact_allocator, audit_exact_allocator_source, audit_kernel_targets,
-        require_exact_lints,
+        COPY_EXACT_REVIEWED_BLOCK, DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_VEC_REVIEWED_BLOCK,
+        Package, Target, WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
+        audit_exact_allocator_source, audit_kernel_targets, require_exact_lints,
     };
     use std::{
         collections::BTreeMap,
@@ -659,8 +752,17 @@ mod tests {
 
     fn exact_source() -> String {
         format!(
-            "//! fixture\n#![deny(unsafe_code)]\n\n{EXACT_ALLOC_ALLOW_ATTRIBUTE}\npub fn copy_exact() {{ unsafe {{ core::hint::unreachable_unchecked() }} }}\n"
+            "//! fixture\n#![deny(unsafe_code)]\n\n\
+             {EXACT_VEC_REVIEWED_BLOCK}\n\n\
+             {ZEROED_EXACT_REVIEWED_BLOCK}\n\n\
+             {COPY_EXACT_REVIEWED_BLOCK}\n"
         )
+    }
+
+    fn assert_exact_source_rejected(source: &str) {
+        let tree = TestTree::new();
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", source);
+        assert!(audit_exact_allocator_source(&path).is_err());
     }
 
     fn exact_package(tree: &TestTree, additional: Vec<Target>) -> Package {
@@ -741,6 +843,136 @@ mod tests {
         let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
         let error = audit_exact_allocator_source(&path).unwrap_err();
         assert!(error.contains("lowering inventory drifted"));
+    }
+
+    #[test]
+    fn exactly_three_reviewed_unsafe_blocks_in_order_are_accepted() {
+        let tree = TestTree::new();
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &exact_source());
+        assert_eq!(audit_exact_allocator_source(&path), Ok(()));
+    }
+
+    #[test]
+    fn every_missing_or_duplicated_reviewed_unsafe_block_is_rejected() {
+        for block in [
+            EXACT_VEC_REVIEWED_BLOCK,
+            ZEROED_EXACT_REVIEWED_BLOCK,
+            COPY_EXACT_REVIEWED_BLOCK,
+        ] {
+            assert_exact_source_rejected(&exact_source().replace(block, ""));
+            assert_exact_source_rejected(&format!("{}\n{block}\n", exact_source()));
+        }
+    }
+
+    #[test]
+    fn reviewed_unsafe_block_order_and_alternate_allowance_are_rejected() {
+        let reordered = exact_source().replace(
+            &format!("{EXACT_VEC_REVIEWED_BLOCK}\n\n{ZEROED_EXACT_REVIEWED_BLOCK}"),
+            &format!("{ZEROED_EXACT_REVIEWED_BLOCK}\n\n{EXACT_VEC_REVIEWED_BLOCK}"),
+        );
+        assert_exact_source_rejected(&reordered);
+        assert_exact_source_rejected(&format!(
+            "{}\n#[allow( unsafe_code, reason = \"fourth\" )]\nunsafe fn fourth() {{}}\n",
+            exact_source()
+        ));
+        assert_exact_source_rejected(&exact_source().replacen(
+            "#[allow(\n    unsafe_code,",
+            "#[allow( unsafe_code,",
+            1,
+        ));
+    }
+
+    #[test]
+    fn every_reviewed_function_name_and_reason_is_exact() {
+        for (original, replacement) in [
+            ("fn exact_vec_with_capacity<T>(", "fn renamed_exact_vec<T>("),
+            ("fn zeroed_exact_with(", "fn renamed_zeroed_exact_with("),
+            ("fn copy_exact_with(", "fn renamed_copy_exact_with("),
+            (
+                "this reviewed function owns FRE's exact-layout typed allocation boundary",
+                "changed typed allocation boundary",
+            ),
+            (
+                "this reviewed function owns FRE's exact-layout zero-initialization boundary",
+                "changed zero-initialization boundary",
+            ),
+            (
+                "this one reviewed function owns FRE's exact-layout allocation boundary",
+                "changed copy allocation boundary",
+            ),
+        ] {
+            let mutated = exact_source().replacen(original, replacement, 1);
+            assert_ne!(mutated, exact_source());
+            assert_exact_source_rejected(&mutated);
+        }
+    }
+
+    #[test]
+    fn every_reviewed_unsafe_body_is_exact() {
+        for (original, replacement) in [
+            (
+                "unsafe { alloc(layout) }",
+                "unsafe { alloc_zeroed(layout) }",
+            ),
+            ("ptr::null_mut()", "core::ptr::null_mut()"),
+            (
+                "Vec::from_raw_parts(allocation.cast::<T>(), 0, capacity)",
+                "Vec::from_raw_parts(allocation.cast::<T>(), 0, capacity - 1)",
+            ),
+            (
+                "Vec::from_raw_parts(allocation, len, len)",
+                "Vec::from_raw_parts(allocation, len, len + 1)",
+            ),
+            (
+                "ptr::copy_nonoverlapping(bytes.as_ptr(), allocation, bytes.len());",
+                "ptr::copy(bytes.as_ptr(), allocation, bytes.len());",
+            ),
+            (
+                "Vec::from_raw_parts(allocation, bytes.len(), bytes.len())",
+                "Vec::from_raw_parts(allocation, bytes.len(), bytes.len() + 1)",
+            ),
+        ] {
+            let mutated = exact_source().replacen(original, replacement, 1);
+            assert_ne!(mutated, exact_source());
+            assert_exact_source_rejected(&mutated);
+        }
+    }
+
+    #[test]
+    fn exact_allocator_deny_attribute_is_unique() {
+        assert_exact_source_rejected(&exact_source().replace(DENY_ATTRIBUTE, ""));
+        assert_exact_source_rejected(&format!("{DENY_ATTRIBUTE}\n{}", exact_source()));
+    }
+
+    #[test]
+    fn missing_reviewed_unsafe_lowering_is_rejected() {
+        let tree = TestTree::new();
+        let source = exact_source().replace(ZEROED_EXACT_REVIEWED_BLOCK, "");
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
+        let error = audit_exact_allocator_source(&path).unwrap_err();
+        assert!(error.contains("lowering inventory drifted"));
+    }
+
+    #[test]
+    fn reviewed_unsafe_lowering_reason_drift_is_rejected() {
+        let tree = TestTree::new();
+        let source = exact_source().replace(
+            "exact-layout zero-initialization boundary",
+            "changed boundary",
+        );
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
+        let error = audit_exact_allocator_source(&path).unwrap_err();
+        assert!(error.contains("reviewed unsafe site binding drifted"));
+    }
+
+    #[test]
+    fn reviewed_unsafe_lowering_function_binding_drift_is_rejected() {
+        let tree = TestTree::new();
+        let source =
+            exact_source().replace("fn zeroed_exact_with(", "fn renamed_zeroed_exact_with(");
+        let path = tree.write("crates/fre-exact-alloc/src/lib.rs", &source);
+        let error = audit_exact_allocator_source(&path).unwrap_err();
+        assert!(error.contains("reviewed unsafe site binding drifted"));
     }
 
     #[test]
