@@ -136,6 +136,8 @@ const HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID: &str =
     "hir::literal::tests::anything_small_limits";
 const HIR_LITERAL_EMPTY_CASE_ID: &str = "hir::literal::tests::empty";
 const HIR_LITERAL_ODDS_AND_ENDS_CASE_ID: &str = "hir::literal::tests::odds_and_ends";
+const HIR_LITERAL_HOLMES_CASE_ID: &str = "hir::literal::tests::holmes";
+const HIR_LITERAL_HOLMES_ALT_CASE_ID: &str = "hir::literal::tests::holmes_alt";
 const HIR_CLASS_CASE_FOLD_UNICODE_CASE_ID: &str = "hir::tests::class_case_fold_unicode";
 const HIR_CLASS_CASE_FOLD_BYTES_CASE_ID: &str = "hir::tests::class_case_fold_bytes";
 const HIR_CLASS_NEGATE_UNICODE_CASE_ID: &str = "hir::tests::class_negate_unicode";
@@ -217,6 +219,10 @@ const HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID: &str =
     "hir::translate::tests::regression_empty_alt";
 const HIR_TRANSLATE_REGRESSION_SINGLETON_ALT_CASE_ID: &str =
     "hir::translate::tests::regression_singleton_alt";
+const HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID: &str =
+    "hir::translate::tests::regression_fuzz_match";
+const HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID: &str =
+    "hir::translate::tests::regression_fuzz_difference1";
 const INTRINSIC_UNOBSERVABLE_REASON_CODE: &str = "fre-adapter.intrinsic-unobservable";
 #[cfg(test)]
 const INTRINSIC_UNOBSERVABLE_IDS_SHA256: &str =
@@ -1418,6 +1424,13 @@ const HIR_TRANSLATE_CLASS_UNICODE_AGE_PROBES: [HirTranslateProbe; 0] = [];
 const HIR_TRANSLATE_CLASS_UNICODE_AGE_ERROR_PROBES: [HirTranslateProbe; 1] =
     [(r"\p{age:Foo}", false)];
 const HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_PROBES: [HirTranslateProbe; 1] = [(r"\P{any}", false)];
+const HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_PATTERN: &str = "[(\u{6} \0-\u{afdf5}]  \0 ";
+const HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_PROBES: [HirTranslateProbe; 1] =
+    [(HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_PATTERN, false)];
+const HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_PROBES: [HirTranslateProbe; 1] = [(
+    r"\W\W|\W[^\v--\W\W\P{Script_Extensions:Pau_Cin_Hau}\u10A1A1-\U{3E3E3}--~~~~--~~~~~~~~------~~~~~~--~~~~~~]*",
+    false,
+)];
 const HIR_LITERAL_LITERAL_PROBES: [&str; 17] = [
     "a",
     "aaaaa",
@@ -1585,6 +1598,9 @@ const HIR_LITERAL_ODDS_AND_ENDS_PROBES: [&str; 10] = [
     r"(?m)^Sherlock Holmes|Sherlock Holmes$",
     r"\bs(?:[ab])",
 ];
+const HIR_LITERAL_HOLMES_PROBES: [&str; 1] = [r"(?i)Holmes"];
+const HIR_LITERAL_HOLMES_ALT_PROBES: [&str; 1] =
+    [r"(?i)Sherlock|Holmes|Watson|Irene|Adler|John|Baker"];
 const HIR_CLASS_CASE_FOLD_UNICODE_PROBES: [HirUnicodeClassProbe; 8] = [
     HirUnicodeClassProbe::new(
         &[
@@ -3677,6 +3693,8 @@ fn is_supported_hir_literal_case(case_id: &str) -> bool {
             | HIR_LITERAL_ANYTHING_SMALL_LIMITS_CASE_ID
             | HIR_LITERAL_EMPTY_CASE_ID
             | HIR_LITERAL_ODDS_AND_ENDS_CASE_ID
+            | HIR_LITERAL_HOLMES_CASE_ID
+            | HIR_LITERAL_HOLMES_ALT_CASE_ID
     )
 }
 
@@ -3742,6 +3760,8 @@ fn is_supported_hir_translate_case(case_id: &str) -> bool {
             | HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID
             | HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID
             | HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_CASE_ID
+            | HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID
+            | HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID
     )
 }
 
@@ -4415,6 +4435,11 @@ fn run_hir_literal_case(case_id: &str) -> Result<(), AstMismatch> {
     for (index, pattern) in probes.iter().copied().enumerate() {
         execute_hir_literal_probe(pattern, limit_total, &format!("{label}-{index}"))?;
     }
+    if case_id == HIR_LITERAL_HOLMES_CASE_ID {
+        execute_hir_literal_holmes_probe(probes[0], label)?;
+    } else if case_id == HIR_LITERAL_HOLMES_ALT_CASE_ID {
+        execute_hir_literal_holmes_alt_probe(probes[0], label)?;
+    }
     Ok(())
 }
 
@@ -4451,6 +4476,12 @@ fn hir_literal_probes(case_id: &str) -> (&'static [&'static str], &'static str, 
         HIR_LITERAL_ODDS_AND_ENDS_CASE_ID => (
             &HIR_LITERAL_ODDS_AND_ENDS_PROBES,
             "hir-literal-odds-and-ends",
+            None,
+        ),
+        HIR_LITERAL_HOLMES_CASE_ID => (&HIR_LITERAL_HOLMES_PROBES, "hir-literal-holmes", None),
+        HIR_LITERAL_HOLMES_ALT_CASE_ID => (
+            &HIR_LITERAL_HOLMES_ALT_PROBES,
+            "hir-literal-holmes-alt",
             None,
         ),
         _ => unreachable!("caller checked supported HIR literal case"),
@@ -4519,6 +4550,79 @@ fn execute_hir_literal_probe(
         }
     }
     Ok(())
+}
+
+fn extract_hir_literal_sequence(
+    hir: &regex_syntax::hir::Hir,
+    kind: regex_syntax::hir::literal::ExtractKind,
+) -> regex_syntax::hir::literal::Seq {
+    regex_syntax::hir::literal::Extractor::new()
+        .kind(kind)
+        .extract(hir)
+}
+
+fn execute_hir_literal_holmes_probe(pattern: &str, assertion: &str) -> Result<(), AstMismatch> {
+    let (expected_hir, observed_hir) = exact_hir_pair(pattern, assertion)?;
+    let mut expected_prefixes = extract_hir_literal_sequence(
+        &expected_hir,
+        regex_syntax::hir::literal::ExtractKind::Prefix,
+    );
+    let mut expected_suffixes = extract_hir_literal_sequence(
+        &expected_hir,
+        regex_syntax::hir::literal::ExtractKind::Suffix,
+    );
+    let mut observed_prefixes = extract_hir_literal_sequence(
+        &observed_hir,
+        regex_syntax::hir::literal::ExtractKind::Prefix,
+    );
+    let mut observed_suffixes = extract_hir_literal_sequence(
+        &observed_hir,
+        regex_syntax::hir::literal::ExtractKind::Suffix,
+    );
+    expected_prefixes.keep_first_bytes(3);
+    expected_suffixes.keep_last_bytes(3);
+    expected_prefixes.minimize_by_preference();
+    expected_suffixes.minimize_by_preference();
+    observed_prefixes.keep_first_bytes(3);
+    observed_suffixes.keep_last_bytes(3);
+    observed_prefixes.minimize_by_preference();
+    observed_suffixes.minimize_by_preference();
+    let expected = (expected_prefixes, expected_suffixes);
+    let observed = (observed_prefixes, observed_suffixes);
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: exact three-byte minimized sequences {expected:?}"),
+            observed: format!("{assertion}: {observed:?}"),
+        })
+    }
+}
+
+fn execute_hir_literal_holmes_alt_probe(pattern: &str, assertion: &str) -> Result<(), AstMismatch> {
+    let (expected_hir, observed_hir) = exact_hir_pair(pattern, assertion)?;
+    let mut expected = extract_hir_literal_sequence(
+        &expected_hir,
+        regex_syntax::hir::literal::ExtractKind::Prefix,
+    );
+    let mut observed = extract_hir_literal_sequence(
+        &observed_hir,
+        regex_syntax::hir::literal::ExtractKind::Prefix,
+    );
+    let initial_nonempty =
+        expected.len().is_some_and(|len| len > 0) && observed.len().is_some_and(|len| len > 0);
+    expected.optimize_for_prefix_by_preference();
+    observed.optimize_for_prefix_by_preference();
+    let optimized_nonempty =
+        expected.len().is_some_and(|len| len > 0) && observed.len().is_some_and(|len| len > 0);
+    if initial_nonempty && optimized_nonempty && observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: nonempty exact optimized prefix sequence {expected:?}"),
+            observed: format!("{assertion}: initial-nonempty={initial_nonempty}, {observed:?}"),
+        })
+    }
 }
 
 fn run_hir_class_operation_case(case_id: &str) -> Result<(), AstMismatch> {
@@ -4920,6 +5024,9 @@ fn apply_bytes_class_operation(
 }
 
 fn run_hir_translate_case(case_id: &str) -> Result<(), AstMismatch> {
+    if case_id == HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID {
+        return execute_hir_translate_fuzz_match_probe();
+    }
     let (probes, label) = hir_translate_probes(case_id);
     for (index, (pattern, bytes)) in probes.iter().copied().enumerate() {
         execute_hir_translate_probe(pattern, bytes, &format!("{label}-{index}"))?;
@@ -5017,6 +5124,14 @@ fn hir_translate_probes(case_id: &str) -> (&'static [HirTranslateProbe], &'stati
         HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_CASE_ID => (
             &HIR_TRANSLATE_ANALYSIS_IS_ALTERNATION_LITERAL_PROBES,
             "hir-translate-analysis-is-alternation-literal",
+        ),
+        HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID => (
+            &HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_PROBES,
+            "hir-translate-regression-fuzz-difference",
+        ),
+        HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID => (
+            &HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_PROBES,
+            "hir-translate-regression-fuzz-match",
         ),
         _ => unreachable!("caller checked supported HIR translate case"),
     }
@@ -5188,6 +5303,56 @@ fn execute_hir_translate_probe(
     } else {
         Err(AstMismatch {
             expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
+            observed: format!("{assertion}: {record:?}"),
+        })
+    }
+}
+
+fn execute_hir_translate_fuzz_match_probe() -> Result<(), AstMismatch> {
+    let pattern = HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_PATTERN;
+    let assertion = "hir-translate-regression-fuzz-match";
+    let mut rust_profile = RustProfile::regex_1_12_4();
+    rust_profile.options.octal = false;
+    rust_profile.options.ignore_whitespace = true;
+    rust_profile.options.swap_greed = true;
+    let compatibility = CompatibilityProfile::RustText(rust_profile.clone());
+    let expected_hir = regex_syntax::ParserBuilder::new()
+        .octal(false)
+        .utf8(true)
+        .ignore_whitespace(true)
+        .case_insensitive(false)
+        .multi_line(false)
+        .dot_matches_new_line(false)
+        .swap_greed(true)
+        .unicode(true)
+        .build()
+        .parse(pattern)
+        .map_err(|error| AstMismatch {
+            expected: format!("{assertion}: authenticated upstream HIR translation succeeds"),
+            observed: format!("{assertion}: upstream HIR translation error {error:?}"),
+        })?;
+    let record =
+        parse(ParseRequest::rust(pattern, compatibility.clone())).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: FRE HIR translation succeeds"),
+            observed: format!("{assertion}: FRE HIR translation error {error:?}"),
+        })?;
+    let CanonicalPattern::Rust(parsed) = &record.pattern else {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: FRE Rust canonical HIR"),
+            observed: format!("{assertion}: {:?}", record.pattern),
+        });
+    };
+    let identity_valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == pattern.as_bytes()
+        && record.key.profile == compatibility
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+    if identity_valid && parsed.hir == expected_hir {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: exact custom-profile HIR {expected_hir:?}"),
             observed: format!("{assertion}: {record:?}"),
         })
     }
@@ -5851,8 +6016,13 @@ fn write_hir_class_operation_evidence(
 }
 
 fn hir_translate_pass_evidence(case_id: &str) -> String {
+    let profile_contract = if case_id == HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID {
+        "ast-octal=false,ignore-whitespace=true,swap-greed=true"
+    } else {
+        "ast-octal=true"
+    };
     let mut contract = format!(
-        "fre.regex-syntax.hir-translate-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nast-octal=true\n"
+        "fre.regex-syntax.hir-translate-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\n{profile_contract}\n"
     );
     let (probes, _) = hir_translate_probes(case_id);
     for (index, (pattern, bytes)) in probes.iter().copied().enumerate() {
@@ -6923,6 +7093,75 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR class-operation receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_robustness_cases_execute_all_5_public_outcomes() {
+        let literal_cases = [
+            (HIR_LITERAL_HOLMES_CASE_ID, 1, true, false),
+            (HIR_LITERAL_HOLMES_ALT_CASE_ID, 2, true, false),
+        ];
+        let translate_cases = [
+            (HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID, 1, true, true),
+            (
+                HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID,
+                1,
+                true,
+                false,
+            ),
+        ];
+        assert_eq!(
+            literal_cases
+                .iter()
+                .chain(translate_cases.iter())
+                .map(|(_, outcomes, _, _)| outcomes)
+                .sum::<usize>(),
+            5,
+        );
+        for (case_id, _, default_member, no_default_member) in literal_cases {
+            let disposition = execute_hir_literal_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_literal_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/literal.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: default_member,
+                    no_default_harness_member: no_default_member,
+                },
+                disposition,
+            })
+            .expect("supported HIR literal-robustness receipt");
+        }
+        for (case_id, _, default_member, no_default_member) in translate_cases {
+            let disposition = execute_hir_translate_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_translate_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/translate.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: default_member,
+                    no_default_harness_member: no_default_member,
+                },
+                disposition,
+            })
+            .expect("supported HIR translate-robustness receipt");
         }
     }
 
