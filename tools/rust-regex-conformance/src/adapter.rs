@@ -31,7 +31,8 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v24-context-safe-bounded-captures-singleton-set-domains-and-set-compilation";
+pub const ADAPTER_ID: &str =
+    "fre-portable-rust-facade-v25-singleton-set-domains-and-utf8-bytes-set-selection";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
@@ -39,7 +40,7 @@ const LIMITATIONS: [&str; 7] = [
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
-    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence, while set which does so only for zero or one pattern; UTF-8 bytes rows delegate to the text set and do not claim native bytes-set execution",
+    "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence, while set which does so for zero or one pattern and for UTF-8 bytes overlapping/all multi-pattern rows over the full unbounded haystack; delegated UTF-8 bytes rows do not claim native bytes-set execution",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations remain gated on exact policy support",
 ];
 
@@ -195,6 +196,11 @@ fn execute_case(
                 .is_ok() =>
         {
             execute_text_set_is_match(case, input)
+        }
+        AdapterSurface::RustBytesSetWhich
+            if utf8_bytes_overlapping_all_set_which_applicability(case, input).is_ok() =>
+        {
+            execute_text_set_which(case, input)
         }
         AdapterSurface::RustBytesSetWhich
             if case.utf8
@@ -1764,6 +1770,9 @@ fn surface_applicability(
         AdapterSurface::RustBytesSetCompile if case.utf8 => {
             set_applicability(surface, case, input, true)?;
         }
+        AdapterSurface::RustBytesSetWhich if case.utf8 && input.patterns.len() > 1 => {
+            utf8_bytes_overlapping_all_set_which_applicability(case, input)?;
+        }
         AdapterSurface::RustBytesSetCompile
         | AdapterSurface::RustBytesSetIsMatch
         | AdapterSurface::RustBytesSetWhich => set_applicability(surface, case, input, false)?,
@@ -1976,6 +1985,44 @@ fn selection_invariant_set_observation_applicability(
     }
     if text && std::str::from_utf8(&input.haystack).is_err() {
         return Err(NotApplicableReason::InvalidUtf8Haystack);
+    }
+    Ok(())
+}
+
+/// A UTF-8 bytes `RegexSet` with overlapping/all semantics asks for every
+/// matching pattern ID in an unbounded haystack. That observation is exactly
+/// the already-qualified text-set `matches` operation after the same UTF-8
+/// profile proof used for bytes-set compilation. Keep this delegation narrow:
+/// selection-sensitive modes, anchors, bounds, limits and invalid UTF-8 stay
+/// outside the admitted domain.
+fn utf8_bytes_overlapping_all_set_which_applicability(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<(), NotApplicableReason> {
+    if input.patterns.len() <= 1 {
+        return Err(NotApplicableReason::PatternMultiplicity);
+    }
+    if case.search_kind != SearchKind::Overlapping {
+        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
+    }
+    if case.match_kind != MatchKind::All {
+        return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
+    }
+    if case.anchored {
+        return Err(NotApplicableReason::ProfileCannotRepresentAnchoring);
+    }
+    if input.bounds
+        != (SearchBounds {
+            start: 0,
+            end: input.haystack.len(),
+        })
+    {
+        return Err(NotApplicableReason::ProfileCannotRepresentBounds);
+    }
+    // Preserve the existing bytes-profile refusal for every excluded UTF-8
+    // row so this new lane cannot rewrite non-gain N/A evidence.
+    if !case.utf8 || case.match_limit.is_some() || std::str::from_utf8(&input.haystack).is_err() {
+        return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
     }
     Ok(())
 }
@@ -2672,6 +2719,50 @@ mod tests {
         ));
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesSetWhich, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesSetWhich, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        let mut selection_sensitive = case.clone();
+        selection_sensitive.match_kind = MatchKind::LeftmostFirst;
+        assert_eq!(
+            surface_applicability(
+                AdapterSurface::RustBytesSetWhich,
+                &selection_sensitive,
+                &input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentMatchMode)
+        );
+
+        let mut anchored = case.clone();
+        anchored.anchored = true;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetWhich, &anchored, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentAnchoring)
+        );
+
+        let mut bounded = input.clone();
+        bounded.bounds.start = 1;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetWhich, &case, &bounded),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+
+        let mut limited = case.clone();
+        limited.match_limit = Some(0);
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetWhich, &limited, &input),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+
+        let mut invalid = input.clone();
+        invalid.haystack = vec![0xFF];
+        invalid.bounds.end = 1;
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustBytesSetWhich, &case, &invalid),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
         );
 
