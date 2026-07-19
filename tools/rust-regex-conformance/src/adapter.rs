@@ -31,13 +31,12 @@ use crate::{
 /// Stable adapter report schema.
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
-pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v23-context-safe-bounded-captures-and-set-compilation";
+pub const ADAPTER_ID: &str = "fre-portable-rust-facade-v24-context-safe-bounded-captures-singleton-set-domains-and-set-compilation";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; certified text and bytes persistent-history captures preserve original-haystack assertion context across bounded search windows",
-    "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
+    "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence, while set which does so only for zero or one pattern; UTF-8 bytes rows delegate to the text set and do not claim native bytes-set execution",
@@ -1864,6 +1863,11 @@ fn set_applicability(
             Err(NotApplicableReason::InvalidUtf8Haystack) => {
                 return Err(NotApplicableReason::InvalidUtf8Haystack);
             }
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+                if case.match_limit == Some(0) =>
+            {
+                return Err(NotApplicableReason::ProfileCannotRepresentBounds);
+            }
             Err(_) => {}
         }
     }
@@ -1908,14 +1912,11 @@ fn singleton_set_delegate_applicability(
     if input.patterns.len() != 1 {
         return Err(NotApplicableReason::PatternMultiplicity);
     }
-    // Preserve the canonical singleton-delegation envelope. Broader reviewed
-    // set observations are admitted separately below; this single-regex lane
-    // must not silently widen their cross-product.
-    if case.search_kind != SearchKind::Leftmost {
-        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
-    }
-    if case.match_kind != MatchKind::LeftmostFirst {
-        return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
+    // Match existence and the sole pattern ID do not depend on search or
+    // match-selection policy. A zero match limit still suppresses every
+    // observation and must not be replaced by an unconstrained facade call.
+    if case.match_limit == Some(0) {
+        return Err(NotApplicableReason::ProfileCannotRepresentBounds);
     }
     let (delegate, text) = match surface {
         AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich => {
@@ -2819,6 +2820,126 @@ mod tests {
             execute_case(AdapterSurface::RustTextSetWhich, &text_case, &bounded),
             AdapterDisposition::Pass { .. }
         ));
+    }
+
+    #[test]
+    fn singleton_set_domain_is_policy_invariant_but_keeps_strict_guards() {
+        let expected = vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }];
+        for (search_kind, match_kind) in [
+            (SearchKind::Earliest, MatchKind::LeftmostFirst),
+            (SearchKind::Leftmost, MatchKind::All),
+            (SearchKind::Overlapping, MatchKind::LeftmostFirst),
+            (SearchKind::Overlapping, MatchKind::All),
+        ] {
+            let mut case = fixture_case(true, true, None);
+            case.search_kind = search_kind;
+            case.match_kind = match_kind;
+            case.anchored = true;
+            case.bounded_search = true;
+            let mut input = fixture_input(expected.clone());
+            input.bounds.start = 1;
+            for surface in [
+                AdapterSurface::RustTextSetIsMatch,
+                AdapterSurface::RustTextSetWhich,
+                AdapterSurface::RustBytesSetIsMatch,
+                AdapterSurface::RustBytesSetWhich,
+            ] {
+                assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+                assert!(matches!(
+                    execute_case(surface, &case, &input),
+                    AdapterDisposition::Pass { .. }
+                ));
+            }
+        }
+
+        let mut bytes_case = fixture_case(true, false, None);
+        bytes_case.search_kind = SearchKind::Overlapping;
+        bytes_case.match_kind = MatchKind::All;
+        bytes_case.anchored = true;
+        bytes_case.bounded_search = true;
+        let mut bytes_input = fixture_input(expected.clone());
+        bytes_input.bounds.start = 1;
+        for surface in [
+            AdapterSurface::RustBytesSetIsMatch,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &bytes_case, &bytes_input),
+                Ok(())
+            );
+            assert!(matches!(
+                execute_case(surface, &bytes_case, &bytes_input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn singleton_set_domain_keeps_strict_guards() {
+        let expected = vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }];
+        let mut zero_limit = fixture_case(true, true, Some(0));
+        zero_limit.search_kind = SearchKind::Overlapping;
+        zero_limit.match_kind = MatchKind::All;
+        let zero_input = fixture_input(Vec::new());
+        for surface in [
+            AdapterSurface::RustTextSetIsMatch,
+            AdapterSurface::RustTextSetWhich,
+            AdapterSurface::RustBytesSetIsMatch,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &zero_limit, &zero_input),
+                Err(NotApplicableReason::ProfileCannotRepresentBounds)
+            );
+            assert!(matches!(
+                execute_case(surface, &zero_limit, &zero_input),
+                AdapterDisposition::NotApplicable {
+                    reason: NotApplicableReason::ProfileCannotRepresentBounds
+                }
+            ));
+        }
+
+        let mut invalid_case = fixture_case(true, true, None);
+        invalid_case.search_kind = SearchKind::Overlapping;
+        invalid_case.match_kind = MatchKind::All;
+        invalid_case.anchored = true;
+        let mut invalid_input = fixture_input(Vec::new());
+        invalid_input.haystack = vec![0xFF];
+        invalid_input.bounds = SearchBounds { start: 0, end: 1 };
+        for surface in [
+            AdapterSurface::RustBytesSetIsMatch,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &invalid_case, &invalid_input),
+                Err(NotApplicableReason::InvalidUtf8Haystack)
+            );
+        }
+
+        let mut multiple_case = fixture_case(true, true, None);
+        multiple_case.pattern_count = 2;
+        multiple_case.search_kind = SearchKind::Overlapping;
+        multiple_case.match_kind = MatchKind::All;
+        multiple_case.anchored = true;
+        let mut multiple_input = fixture_input(expected);
+        multiple_input.patterns.push("b".to_owned());
+        for surface in [
+            AdapterSurface::RustTextSetIsMatch,
+            AdapterSurface::RustTextSetWhich,
+            AdapterSurface::RustBytesSetIsMatch,
+            AdapterSurface::RustBytesSetWhich,
+        ] {
+            assert_eq!(
+                surface_applicability(surface, &multiple_case, &multiple_input),
+                Err(NotApplicableReason::ProfileCannotRepresentAnchoring)
+            );
+        }
     }
 
     #[test]
