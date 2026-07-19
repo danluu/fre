@@ -33,9 +33,9 @@ use crate::{
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
 pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v31-utf8-off-direct-and-set-existence-proofs";
+    "fre-portable-rust-facade-v32-utf8-off-direct-and-set-observation-proofs";
 
-const LIMITATIONS: [&str; 9] = [
+const LIMITATIONS: [&str; 10] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
     "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; certified text and bytes persistent-history captures preserve original-haystack assertion context across bounded search windows",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade across selection policies while preserving exact anchoring, bounds, UTF-8, and match-limit semantics; these rows do not claim native set execution",
@@ -43,6 +43,7 @@ const LIMITATIONS: [&str; 9] = [
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
     "set is-match may ignore search and match-selection policy only for unanchored full-haystack existence; selection-sensitive multi-pattern set which uses an adapter-only repeated constituent-search correctness fallback (up to O(patterns × haystack positions) facade search calls, each over a remaining window) for leftmost-first ordered-union and exact-literal leftmost/all selection, not a native or fast production RegexSet engine; UTF-8 bytes rows delegate through the qualified text proof and do not claim native bytes-set execution",
     "UTF-8-off text-set match existence executes only for an unanchored, unlimited full-haystack UTF-8 input after both text and bytes set compilers accept and their independently executed existence observations agree; this input-specific proof does not admit set-which, anchoring, bounded search, match limits, invalid UTF-8, or a text/bytes compile gap",
+    "UTF-8-off singleton text-set pattern-ID observation executes only for the same unanchored, unlimited, full-haystack text/bytes compiler proof after both engines return the same ID set; multi-pattern set-which and every inexact search domain remain excluded",
     "single-pattern compile acceptance and match existence are independent of upstream match-selection and iteration policy; span and capture observations support exact non-overlapping leftmost-first, earliest-end and leftmost/all search plus bounded correctness-oriented overlapping enumeration through exact-span capture queries (up to O(haystack squared) facade calls), not a native streaming overlapping engine; other policies remain rejected",
     "UTF-8-off bytes-profile cases may execute on text compile, text set compile, and text match-existence surfaces only after candidate-independent expected values are ignored and FRE proves matching text/bytes compiler outcomes; match existence additionally requires a valid UTF-8 haystack and exact scalar-boundary search bounds",
 ];
@@ -174,6 +175,14 @@ fn execute_case(
                 .is_ok() =>
         {
             execute_utf8_off_text_set_is_match_equivalence(case, input)
+        }
+        AdapterSurface::RustTextSetWhich
+            if utf8_off_text_singleton_set_which_equivalence_applicability(
+                surface, case, input,
+            )
+            .is_ok() =>
+        {
+            execute_utf8_off_text_singleton_set_which_equivalence(case, input)
         }
         surface @ (AdapterSurface::RustTextSetIsMatch | AdapterSurface::RustTextSetWhich)
             if singleton_set_delegate_applicability(surface, case, input).is_ok() =>
@@ -1102,6 +1111,62 @@ fn execute_utf8_off_text_set_is_match_equivalence(
         );
     }
     compare(&expected, &SemanticValue::IsMatch(text_observed))
+}
+
+/// Execute one UTF-8-off singleton pattern-ID obligation with two independent
+/// set engines. With exactly one pattern, both ID sets are either empty or
+/// `[0]`; their agreement is checked before the expected IDs are consulted.
+fn execute_utf8_off_text_singleton_set_which_equivalence(
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> AdapterDisposition {
+    let expected = SemanticValue::PatternIds(expected_pattern_ids(input));
+    let text_set = match build_text_set(case, input) {
+        TextSetBuildAttempt::Built(set) => set,
+        TextSetBuildAttempt::Rejected
+        | TextSetBuildAttempt::Unsupported(_)
+        | TextSetBuildAttempt::Fault(_) => {
+            return fault("adapter.utf8-off-text-singleton-set-proof-drift");
+        }
+    };
+    let bytes_set = match build_bytes_set(case, input) {
+        BytesSetBuildAttempt::Built(set) => set,
+        BytesSetBuildAttempt::Rejected
+        | BytesSetBuildAttempt::Unsupported(_)
+        | BytesSetBuildAttempt::Fault(_) => {
+            return fault("adapter.utf8-off-bytes-singleton-set-proof-drift");
+        }
+    };
+    let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
+        return fault("adapter.utf8-off-singleton-set-haystack-proof-drift");
+    };
+    let Ok(text_matches) = text_set.matches(haystack, PortableRegexSetRunLimits::unlimited())
+    else {
+        return unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.utf8-off-text-singleton-set-execution-refused",
+        );
+    };
+    let Ok(bytes_matches) =
+        bytes_set.matches(&input.haystack, PortableRegexSetRunLimits::unlimited())
+    else {
+        return unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.utf8-off-bytes-singleton-set-execution-refused",
+        );
+    };
+    let text_observed = text_matches.iter().collect::<Vec<_>>();
+    let bytes_observed = bytes_matches.iter().collect::<Vec<_>>();
+    if text_observed.iter().any(|&id| id != 0) || bytes_observed.iter().any(|&id| id != 0) {
+        return fault("adapter.utf8-off-singleton-set-pattern-id-drift");
+    }
+    if text_observed != bytes_observed {
+        return unsupported(
+            CapabilityId::RustTextSetFacade,
+            "search.utf8-off-text-bytes-singleton-set-ids-disagree",
+        );
+    }
+    compare(&expected, &SemanticValue::PatternIds(text_observed))
 }
 
 fn execute_text_set_which(case: &CaseReceipt, input: &ExecutableCase) -> AdapterDisposition {
@@ -2957,6 +3022,9 @@ fn set_applicability(
     if utf8_off_text_set_is_match_equivalence_applicability(surface, case, input).is_ok() {
         return Ok(());
     }
+    if utf8_off_text_singleton_set_which_equivalence_applicability(surface, case, input).is_ok() {
+        return Ok(());
+    }
     // A singleton set exposes only match existence and the sole pattern ID.
     // Delegate applicability to the corresponding already-qualified single
     // facade so its search policy, anchoring, bounds, and UTF-8 proof remain
@@ -3044,6 +3112,27 @@ fn utf8_off_text_set_is_match_equivalence_applicability(
         return Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode);
     }
     Ok(())
+}
+
+/// Pattern IDs are equivalent to match existence for exactly one pattern.
+/// Reuse the complete UTF-8-off text/bytes set proof, but do not let this
+/// theorem admit a multi-pattern selection obligation.
+fn utf8_off_text_singleton_set_which_equivalence_applicability(
+    surface: AdapterSurface,
+    case: &CaseReceipt,
+    input: &ExecutableCase,
+) -> Result<(), NotApplicableReason> {
+    if surface != AdapterSurface::RustTextSetWhich {
+        return Err(NotApplicableReason::ProfileCannotRepresentSearchMode);
+    }
+    if case.pattern_count != 1 || input.patterns.len() != 1 {
+        return Err(NotApplicableReason::PatternMultiplicity);
+    }
+    utf8_off_text_set_is_match_equivalence_applicability(
+        AdapterSurface::RustTextSetIsMatch,
+        case,
+        input,
+    )
 }
 
 fn singleton_set_delegate_applicability(
@@ -4659,7 +4748,8 @@ mod tests {
             AdapterDisposition::Pass { .. }
         ));
 
-        // The proof is deliberately not reusable for set-which.
+        // The match-existence predicate itself is deliberately not reusable
+        // for set-which; that surface needs its own singleton ID-set proof.
         assert_eq!(
             utf8_off_text_set_is_match_equivalence_applicability(
                 AdapterSurface::RustTextSetWhich,
@@ -4668,10 +4758,6 @@ mod tests {
             ),
             Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
         );
-        assert!(matches!(
-            execute_case(AdapterSurface::RustTextSetWhich, &case, &input),
-            AdapterDisposition::NotApplicable { .. }
-        ));
     }
 
     #[test]
@@ -4734,6 +4820,142 @@ mod tests {
         assert_eq!(
             utf8_off_text_set_is_match_equivalence_applicability(
                 AdapterSurface::RustTextSetIsMatch,
+                &case,
+                &byte_only,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentUtf8Mode)
+        );
+    }
+
+    #[test]
+    fn utf8_off_text_singleton_set_which_requires_dual_id_agreement() {
+        let mut case = fixture_case(true, false, None);
+        case.search_kind = SearchKind::Earliest;
+        case.match_kind = MatchKind::All;
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["é".to_owned()],
+            haystack: "xéy".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 0, end: 4 },
+            line_terminator: b'\n',
+            expected: vec![ExpectedCaptures {
+                pattern_id: 0,
+                groups: vec![Some(ExpectedSpan { start: 1, end: 3 })],
+            }],
+        };
+
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &case,
+                &input,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextSetWhich, &case, &input),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+
+        // The proof is independent of expected IDs. A deliberately false
+        // empty expectation stays eligible and produces a mismatch.
+        let mut false_expected = input.clone();
+        false_expected.expected.clear();
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &case,
+                &false_expected,
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &case, &false_expected,),
+            AdapterDisposition::Mismatch { .. }
+        ));
+
+        let mut multiple_case = case.clone();
+        multiple_case.pattern_count = 2;
+        let mut multiple = input;
+        multiple.patterns.push("z".to_owned());
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &multiple_case,
+                &multiple,
+            ),
+            Err(NotApplicableReason::PatternMultiplicity)
+        );
+        assert!(matches!(
+            execute_case(AdapterSurface::RustTextSetWhich, &multiple_case, &multiple,),
+            AdapterDisposition::NotApplicable { .. }
+        ));
+    }
+
+    #[test]
+    fn utf8_off_text_singleton_set_which_keeps_inexact_domains_ineligible() {
+        let case = fixture_case(true, false, None);
+        let input = fixture_input(vec![ExpectedCaptures {
+            pattern_id: 0,
+            groups: vec![Some(ExpectedSpan { start: 1, end: 2 })],
+        }]);
+
+        let mut invalid = input.clone();
+        invalid.haystack = vec![0xFF];
+        invalid.bounds.end = 1;
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &case,
+                &invalid,
+            ),
+            Err(NotApplicableReason::InvalidUtf8Haystack)
+        );
+
+        let mut anchored = case.clone();
+        anchored.anchored = true;
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &anchored,
+                &input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentAnchoring)
+        );
+
+        let mut bounded_case = case.clone();
+        bounded_case.bounded_search = true;
+        let mut bounded = input.clone();
+        bounded.bounds.start = 1;
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &bounded_case,
+                &bounded,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+
+        let limited = fixture_case(true, false, Some(1));
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
+                &limited,
+                &input,
+            ),
+            Err(NotApplicableReason::ProfileCannotRepresentBounds)
+        );
+
+        let mut byte_only = input;
+        byte_only.patterns = vec![r"(?-u:\xFF)".to_owned()];
+        byte_only.expected.clear();
+        assert_eq!(
+            utf8_off_text_singleton_set_which_equivalence_applicability(
+                AdapterSurface::RustTextSetWhich,
                 &case,
                 &byte_only,
             ),
