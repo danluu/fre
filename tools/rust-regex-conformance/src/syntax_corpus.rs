@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as FmtWrite,
     fs,
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -60,7 +61,76 @@ const AST_PARSE_PREFIX: &str = "ast::parse::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
-const AST_HOLISTIC_PASS_EVIDENCE: &str = "fre.regex-syntax.ast-adapter.v1\ncase=ast::parse::tests::parse_holistic\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n";
+const AST_REGRESSION_454_CASE_ID: &str = "ast::parse::tests::regression_454_nest_too_big";
+const AST_REGRESSION_455_CASE_ID: &str =
+    "ast::parse::tests::regression_455_trailing_dash_ignore_whitespace";
+const REGRESSION_454_PATTERN: &str = r"
+        2(?:
+          [45]\d{3}|
+          7(?:
+            1[0-267]|
+            2[0-289]|
+            3[0-29]|
+            4[01]|
+            5[1-3]|
+            6[013]|
+            7[0178]|
+            91
+          )|
+          8(?:
+            0[125]|
+            [139][1-6]|
+            2[0157-9]|
+            41|
+            6[1-35]|
+            7[1-5]|
+            8[1-8]|
+            90
+          )|
+          9(?:
+            0[0-2]|
+            1[0-4]|
+            2[568]|
+            3[3-6]|
+            5[5-7]|
+            6[0167]|
+            7[15]|
+            8[0146-9]
+          )
+        )\d{4}
+        ";
+const REGRESSION_455_PROBES: [(&str, bool); 8] = [
+    ("(?x)[ / - ]", true),
+    ("(?x)[ a - ]", true),
+    (
+        "(?x)[
+            a
+            - ]
+        ",
+        true,
+    ),
+    (
+        "(?x)[
+            a # wat
+            - ]
+        ",
+        true,
+    ),
+    ("(?x)[ / -", false),
+    ("(?x)[ / - ", false),
+    (
+        "(?x)[
+            / -
+        ",
+        false,
+    ),
+    (
+        "(?x)[
+            / - # wat
+        ",
+        false,
+    ),
+];
 const MAX_PACKAGE_FILE_BYTES: u64 = 2 * 1_048_576;
 
 const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
@@ -78,8 +148,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly ast::parse::tests::parse_holistic; the other 28 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 157 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "The FRE AST adapter executes exactly parse_holistic and regressions 454/455; the other 26 AST parser identities remain explicit Unsupported dispositions.",
+    "The other 155 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -1411,8 +1481,8 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
         };
     }
     if obligation.case_id.starts_with(AST_PARSE_PREFIX) {
-        if obligation.case_id == AST_HOLISTIC_CASE_ID {
-            return execute_ast_holistic();
+        if is_supported_ast_case(&obligation.case_id) {
+            return execute_ast_case(&obligation.case_id);
         }
         return RegexSyntaxCorpusDisposition::Unsupported {
             reason_code: "fre-adapter.ast-parse-not-implemented".to_owned(),
@@ -1429,14 +1499,27 @@ struct AstMismatch {
     observed: String,
 }
 
-fn execute_ast_holistic() -> RegexSyntaxCorpusDisposition {
-    match catch_unwind(AssertUnwindSafe(run_ast_holistic)) {
+fn is_supported_ast_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        AST_HOLISTIC_CASE_ID | AST_REGRESSION_454_CASE_ID | AST_REGRESSION_455_CASE_ID
+    )
+}
+
+fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = match case_id {
+        AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
+        AST_REGRESSION_454_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_regression_454)),
+        AST_REGRESSION_455_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_regression_455)),
+        _ => unreachable!("caller checked supported AST case"),
+    };
+    match execution {
         Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
-            evidence_sha256: ast_holistic_pass_evidence(),
+            evidence_sha256: ast_case_pass_evidence(case_id),
         },
         Ok(Err(mismatch)) => {
             let evidence_sha256 =
-                ast_mismatch_evidence(AST_HOLISTIC_CASE_ID, &mismatch.expected, &mismatch.observed);
+                ast_mismatch_evidence(case_id, &mismatch.expected, &mismatch.observed);
             RegexSyntaxCorpusDisposition::Mismatch {
                 expected: mismatch.expected,
                 observed: mismatch.observed,
@@ -1458,7 +1541,7 @@ fn run_ast_holistic() -> Result<(), AstMismatch> {
         c: ']',
     });
     let first = execute_ast_assertion(first_pattern, &first_expected, "verbatim-right-bracket")?;
-    validate_ast_record(&first, first_pattern, 2, 2, 2, 1_024)?;
+    validate_ast_record(&first, first_pattern, &RustProfile::regex_1_12_4())?;
 
     let second_pattern = r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~";
     let metacharacters = [
@@ -1485,7 +1568,46 @@ fn run_ast_holistic() -> Result<(), AstMismatch> {
         &second_expected,
         "escaped-metacharacters-with-exact-spans",
     )?;
-    validate_ast_record(&second, second_pattern, 37, 37, 37, 18_944)
+    validate_ast_record(&second, second_pattern, &RustProfile::regex_1_12_4())
+}
+
+fn run_ast_regression_454() -> Result<(), AstMismatch> {
+    execute_ast_outcome_probe(REGRESSION_454_PATTERN, 50, true, "regression-454")
+}
+
+fn run_ast_regression_455() -> Result<(), AstMismatch> {
+    for (index, (pattern, expected_ok)) in REGRESSION_455_PROBES.into_iter().enumerate() {
+        execute_ast_outcome_probe(
+            pattern,
+            RustProfile::regex_1_12_4().options.nest_limit,
+            expected_ok,
+            &format!("regression-455-probe-{index}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn execute_ast_outcome_probe(
+    pattern: &str,
+    nest_limit: u32,
+    expected_ok: bool,
+    assertion: &str,
+) -> Result<(), AstMismatch> {
+    let mut rust_profile = RustProfile::regex_1_12_4();
+    rust_profile.options.nest_limit = nest_limit;
+    let profile = CompatibilityProfile::RustText(rust_profile.clone());
+    match parse_rust_ast(ParseRequest::rust(pattern, profile)) {
+        Ok(record) if expected_ok => validate_ast_record(&record, pattern, &rust_profile),
+        Err(_) if !expected_ok => Ok(()),
+        Ok(record) => Err(AstMismatch {
+            expected: format!("{assertion}: Err(_)"),
+            observed: format!("{assertion}: Ok({:?})", record.ast),
+        }),
+        Err(error) => Err(AstMismatch {
+            expected: format!("{assertion}: Ok(_)"),
+            observed: format!("{assertion}: Err({error:?})"),
+        }),
+    }
 }
 
 fn execute_ast_assertion(
@@ -1511,12 +1633,15 @@ fn execute_ast_assertion(
 fn validate_ast_record(
     record: &RustAstRecord,
     pattern: &str,
-    nodes: u64,
-    nesting: u64,
-    stack: u64,
-    work: u64,
+    rust_profile: &RustProfile,
 ) -> Result<(), AstMismatch> {
-    let expected_profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let expected_profile = CompatibilityProfile::RustText(rust_profile.clone());
+    let nodes = u64::try_from(pattern.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let nesting = nodes.min(u64::from(rust_profile.options.nest_limit).saturating_add(1));
+    let stack = nesting;
+    let work = nodes.saturating_mul(512);
     let valid = record.key.schema_version == SCHEMA_VERSION
         && record.key.pattern.as_bytes() == pattern.as_bytes()
         && record.key.profile == expected_profile
@@ -1546,8 +1671,38 @@ fn ast_span(start: usize, end: usize) -> Span {
     )
 }
 
-fn ast_holistic_pass_evidence() -> String {
-    sha256(AST_HOLISTIC_PASS_EVIDENCE.as_bytes())
+fn ast_case_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.ast-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\n"
+    );
+    match case_id {
+        AST_HOLISTIC_CASE_ID => contract.push_str(
+            "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
+        ),
+        AST_REGRESSION_454_CASE_ID => {
+            writeln!(
+                contract,
+                "probe=sha256:{},bytes:{},nest-limit:50,expected:ok",
+                sha256(REGRESSION_454_PATTERN.as_bytes()),
+                REGRESSION_454_PATTERN.len(),
+            )
+            .expect("writing to a String cannot fail");
+        }
+        AST_REGRESSION_455_CASE_ID => {
+            for (index, (pattern, expected_ok)) in REGRESSION_455_PROBES.into_iter().enumerate() {
+                writeln!(
+                    contract,
+                    "probe-{index}=sha256:{},bytes:{},nest-limit:250,expected:{}",
+                    sha256(pattern.as_bytes()),
+                    pattern.len(),
+                    if expected_ok { "ok" } else { "err" },
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        _ => unreachable!("pass evidence requires a supported AST case"),
+    }
+    sha256(contract.as_bytes())
 }
 
 fn ast_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
@@ -1584,10 +1739,10 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
-        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+        ) if is_supported_ast_case(&obligation.case_id) => {
             obligation.default_harness_member
                 && obligation.no_default_harness_member
-                && evidence_sha256 == &ast_holistic_pass_evidence()
+                && evidence_sha256 == &ast_case_pass_evidence(&obligation.case_id)
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
@@ -1596,7 +1751,7 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
                 observed,
                 evidence_sha256,
             },
-        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+        ) if is_supported_ast_case(&obligation.case_id) => {
             !expected.is_empty()
                 && !observed.is_empty()
                 && expected.len() <= 65_536
@@ -1607,14 +1762,14 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Fault { stage, reason_code },
-        ) if obligation.case_id == AST_HOLISTIC_CASE_ID => {
+        ) if is_supported_ast_case(&obligation.case_id) => {
             stage == "fre-ast-adapter" && reason_code == "candidate.adapter-panicked"
         }
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) if obligation.case_id.starts_with(AST_PARSE_PREFIX) => {
-            obligation.case_id != AST_HOLISTIC_CASE_ID
+            !is_supported_ast_case(&obligation.case_id)
                 && obligation.default_harness_member
                 && reason_code == "fre-adapter.ast-parse-not-implemented"
         }
@@ -2010,7 +2165,7 @@ mod tests {
         assert_eq!(
             disposition,
             RegexSyntaxCorpusDisposition::Pass {
-                evidence_sha256: ast_holistic_pass_evidence(),
+                evidence_sha256: ast_case_pass_evidence(AST_HOLISTIC_CASE_ID),
             }
         );
         let receipt = RegexSyntaxCorpusReceipt {
@@ -2024,6 +2179,32 @@ mod tests {
             evidence_sha256: "0".repeat(64),
         };
         assert!(validate_disposition(&corrupt).is_err());
+    }
+
+    #[test]
+    fn authenticated_ast_regressions_execute_their_complete_outcome_sets() {
+        for case_id in [AST_REGRESSION_454_CASE_ID, AST_REGRESSION_455_CASE_ID] {
+            let disposition = execute_ast_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: ast_case_pass_evidence(case_id),
+                }
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/ast/parse.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported AST regression receipt");
+        }
     }
 
     #[test]
