@@ -10,7 +10,7 @@ use std::{
 use bstr::ByteVec;
 use fre::{
     BuildError, CaptureAggregateLimits, CaptureBuildError, CaptureBuilder, CaptureRegex,
-    PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
+    CaptureWindow, PortableBuilder, PortableRegex, PortableRegexSet, PortableRegexSetBuildError,
     PortableRegexSetBuilder, PortableRegexSetRunLimits, PortableTextBuildError,
     PortableTextBuilder, PortableTextCaptureBuildError, PortableTextCaptureBuilder,
     PortableTextCaptureRegex, PortableTextRegex, PortableTextRegexSet,
@@ -32,11 +32,11 @@ use crate::{
 pub const ADAPTER_REPORT_SCHEMA: &str = "fre.upstream-rust-regex.adapter-report.v1";
 /// Stable implementation identity for this portable-facade adapter.
 pub const ADAPTER_ID: &str =
-    "fre-portable-rust-facade-v22-selection-invariant-observations-and-set-compilation";
+    "fre-portable-rust-facade-v23-context-safe-bounded-captures-and-set-compilation";
 
 const LIMITATIONS: [&str; 7] = [
     "the production FRE Rust text matcher and RegexSet are restricted to finite languages proved byte-equivalent or identical UTF-8 HIRs with boundary-safe contextual search semantics",
-    "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; text and bytes captures otherwise remain restricted to the certified persistent-history subset",
+    "the production FRE Rust text capture iterator requires an exact UTF-8-safe RustText/RustBytes HIR; certified text and bytes persistent-history captures preserve original-haystack assertion context across bounded search windows",
     "singleton RegexSet observations may delegate to the corresponding qualified single-pattern facade; anchored, bounded, and UTF-8 bytes rows do not claim native set execution",
     "UTF-8 bytes capture observations may delegate only through the exact UTF-8-safe text capture facade and do not claim native bytes-engine UTF-8 capture execution",
     "RegexSet compile acceptance is independent of search and match-selection policy for every pattern count; UTF-8 bytes compilation may delegate to the corresponding qualified text RegexSet compiler after exact UTF-8 profile proof and does not expose native bytes-set execution",
@@ -1409,7 +1409,17 @@ fn execute_text_captures(case: &CaseReceipt, input: &ExecutableCase) -> AdapterD
     let Ok(haystack) = std::str::from_utf8(&input.haystack) else {
         return fault("adapter.text-haystack-invalid-utf8");
     };
-    let Ok(report) = regex.captures_iter(haystack, CaptureAggregateLimits::default()) else {
+    let Some(bounds) = text_search_bounds(haystack, input.bounds) else {
+        return compare(&expected, &SemanticValue::Captures(Vec::new()));
+    };
+    let Ok(report) = regex.captures_iter_window(
+        haystack,
+        CaptureWindow {
+            start: bounds.start,
+            end: bounds.end,
+        },
+        CaptureAggregateLimits::default(),
+    ) else {
         return unsupported(
             CapabilityId::CaptureIteration,
             "search.text-capture-execution-refused",
@@ -1534,7 +1544,14 @@ fn execute_bytes_captures(case: &CaseReceipt, input: &ExecutableCase) -> Adapter
             return disposition;
         }
     };
-    let Ok(report) = regex.captures_iter(&input.haystack, CaptureAggregateLimits::default()) else {
+    let Ok(report) = regex.captures_iter_window(
+        &input.haystack,
+        CaptureWindow {
+            start: input.bounds.start,
+            end: input.bounds.end,
+        },
+        CaptureAggregateLimits::default(),
+    ) else {
         return unsupported(
             CapabilityId::CaptureIteration,
             "search.capture-execution-refused",
@@ -1775,14 +1792,16 @@ fn single_applicability(
             return Err(NotApplicableReason::ProfileCannotRepresentMatchMode);
         }
     }
-    if matches!(
-        surface,
-        AdapterSurface::RustTextCapturesIter | AdapterSurface::RustBytesCapturesIter
-    ) && input.bounds
-        != (SearchBounds {
-            start: 0,
-            end: input.haystack.len(),
-        })
+    // Preserve the authenticated rejection precedence for a bounded text
+    // capture row whose UTF-8 profile is independently ineligible. Eligible
+    // text and bytes capture profiles continue into bounded execution below.
+    if surface == AdapterSurface::RustTextCapturesIter
+        && !case.utf8
+        && input.bounds
+            != (SearchBounds {
+                start: 0,
+                end: input.haystack.len(),
+            })
     {
         return Err(NotApplicableReason::ProfileCannotRepresentBounds);
     }
@@ -3514,14 +3533,16 @@ mod tests {
                 AdapterDisposition::Pass { .. }
             ));
         }
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustTextCapturesIter, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentBounds)
-        );
-        assert_eq!(
-            surface_applicability(AdapterSurface::RustBytesCapturesIter, &case, &input),
-            Err(NotApplicableReason::ProfileCannotRepresentBounds)
-        );
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert_eq!(surface_applicability(surface, &case, &input), Ok(()));
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
         assert_eq!(
             surface_applicability(AdapterSurface::RustBytesCompile, &case, &input),
             Ok(())
@@ -3574,6 +3595,70 @@ mod tests {
                 &bytes_case,
                 &bytes_input,
             ),
+            Ok(())
+        );
+        assert!(matches!(
+            execute_case(
+                AdapterSurface::RustBytesCapturesIter,
+                &bytes_case,
+                &bytes_input,
+            ),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn split_utf8_capture_window_is_empty() {
+        let case = fixture_case(true, true, None);
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec![String::new()],
+            haystack: "é".as_bytes().to_vec(),
+            bounds: SearchBounds { start: 1, end: 1 },
+            line_terminator: b'\n',
+            expected: Vec::new(),
+        };
+        for surface in [
+            AdapterSurface::RustTextCapturesIter,
+            AdapterSurface::RustBytesCapturesIter,
+        ] {
+            assert!(matches!(
+                execute_case(surface, &case, &input),
+                AdapterDisposition::Pass { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_byte_capture_keeps_left_context() {
+        let case = fixture_case(true, false, None);
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec![r"(?-u:\b)(a)".to_owned()],
+            haystack: b"za a".to_vec(),
+            bounds: SearchBounds { start: 1, end: 3 },
+            line_terminator: b'\n',
+            expected: Vec::new(),
+        };
+        assert!(matches!(
+            execute_case(AdapterSurface::RustBytesCapturesIter, &case, &input),
+            AdapterDisposition::Pass { .. }
+        ));
+    }
+
+    #[test]
+    fn ineligible_bounded_text_capture_keeps_bounds_precedence() {
+        let case = fixture_case(true, false, None);
+        let input = ExecutableCase {
+            id: case.id.clone(),
+            patterns: vec!["a".to_owned()],
+            haystack: b"zaz".to_vec(),
+            bounds: SearchBounds { start: 1, end: 2 },
+            line_terminator: b'\n',
+            expected: Vec::new(),
+        };
+        assert_eq!(
+            surface_applicability(AdapterSurface::RustTextCapturesIter, &case, &input),
             Err(NotApplicableReason::ProfileCannotRepresentBounds)
         );
     }

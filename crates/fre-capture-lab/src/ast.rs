@@ -9,20 +9,20 @@ pub enum Greed {
     Lazy,
 }
 
-/// A zero-width predicate with exact logical-window context.
+/// A zero-width predicate with exact original-haystack context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Assertion {
-    /// Beginning of the logical window.
+    /// Beginning of the original haystack.
     Start,
-    /// End of the logical window.
+    /// End of the original haystack.
     End,
-    /// Beginning of the logical window or immediately after LF.
+    /// Beginning of the original haystack or immediately after LF.
     StartLf,
-    /// End of the logical window or immediately before LF.
+    /// End of the original haystack or immediately before LF.
     EndLf,
-    /// Beginning of the logical window or immediately after the configured byte.
+    /// Beginning of the original haystack or immediately after the configured byte.
     StartLine(u8),
-    /// End of the logical window or immediately before the configured byte.
+    /// End of the original haystack or immediately before the configured byte.
     EndLine(u8),
     /// Beginning of a CRLF-aware line without splitting a CRLF pair.
     StartCrlf,
@@ -87,9 +87,9 @@ pub enum Ast {
         /// Captured expression.
         child: Box<Ast>,
     },
-    /// Beginning of the logical window.
+    /// Beginning of the original haystack.
     Start,
-    /// End of the logical window.
+    /// End of the original haystack.
     End,
     /// Another admitted zero-width assertion.
     Assert(Assertion),

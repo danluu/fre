@@ -9,9 +9,11 @@ pub struct Span {
     pub end: usize,
 }
 
-/// A logical search window in the original haystack.
+/// A half-open search span in the original haystack.
 ///
-/// Anchors refer to these boundaries, while returned offsets remain absolute.
+/// Consuming transitions and returned matches are clipped to these bounds,
+/// while zero-width assertions retain the surrounding context of the original
+/// haystack. Returned offsets remain absolute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Window {
     /// Inclusive first byte eligible for matching.

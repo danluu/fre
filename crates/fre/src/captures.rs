@@ -490,6 +490,13 @@ pub enum PortableTextCaptureIterationError {
         start: usize,
         end: usize,
     },
+    /// The requested search window is not a valid UTF-8 substring boundary.
+    InvalidUtf8Window {
+        /// Inclusive search start.
+        start: usize,
+        /// Exclusive search end.
+        end: usize,
+    },
 }
 
 /// Failure from one bounded Rust text capture search.
@@ -665,6 +672,10 @@ impl fmt::Display for PortableTextCaptureIterationError {
                 formatter,
                 "text capture match {match_index} group {group_index} has non-boundary span [{start}, {end})",
             ),
+            Self::InvalidUtf8Window { start, end } => write!(
+                formatter,
+                "text capture window [{start}, {end}) is not a valid UTF-8 substring",
+            ),
         }
     }
 }
@@ -673,7 +684,9 @@ impl std::error::Error for PortableTextCaptureIterationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Capture(error) => Some(error),
-            Self::MissingOverall { .. } | Self::InvalidUtf8Capture { .. } => None,
+            Self::MissingOverall { .. }
+            | Self::InvalidUtf8Capture { .. }
+            | Self::InvalidUtf8Window { .. } => None,
         }
     }
 }
@@ -839,9 +852,31 @@ impl PortableTextCaptureRegex {
         haystack: &str,
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
+        self.captures_iter_window(haystack, Window::all(haystack.as_bytes()), limits)
+    }
+
+    /// Materialize complete text captures whose whole-match spans are
+    /// constrained to `window`, while assertions retain original-haystack
+    /// context.
+    pub fn captures_iter_window(
+        &self,
+        haystack: &str,
+        window: Window,
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, PortableTextCaptureIterationError> {
+        if window.start > window.end
+            || window.end > haystack.len()
+            || !haystack.is_char_boundary(window.start)
+            || !haystack.is_char_boundary(window.end)
+        {
+            return Err(PortableTextCaptureIterationError::InvalidUtf8Window {
+                start: window.start,
+                end: window.end,
+            });
+        }
         let mut report = self
             .inner
-            .captures_iter(haystack.as_bytes(), limits)
+            .captures_iter_window(haystack.as_bytes(), window, limits)
             .map_err(PortableTextCaptureIterationError::Capture)?;
         for (match_index, record) in report.captures.iter().enumerate() {
             if record.overall().is_none() {
@@ -1142,6 +1177,17 @@ impl CaptureRegex {
         haystack: &[u8],
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, CaptureIterationError> {
+        self.captures_iter_window(haystack, Window::all(haystack), limits)
+    }
+
+    /// Collect every match wholly inside `window` while retaining assertion
+    /// context from the original haystack.
+    pub fn captures_iter_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: AggregateLimits,
+    ) -> Result<CaptureIterationReport, CaptureIterationError> {
         let identity = self.iteration_identity(limits);
         let AggregateOutcome {
             captures,
@@ -1151,7 +1197,7 @@ impl CaptureRegex {
             total_history_nodes,
         } = self
             .engine
-            .captures_iter(haystack, Window::all(haystack), limits)
+            .captures_iter(haystack, window, limits)
             .map_err(|source| CaptureIterationError {
                 identity: Box::new(identity.clone()),
                 source,

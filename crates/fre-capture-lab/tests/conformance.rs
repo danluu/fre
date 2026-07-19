@@ -12,6 +12,19 @@ use fre_capture_lab::{
     Window,
 };
 use regex::bytes::Regex;
+use regex_automata::{Input, MatchKind, meta, util::syntax};
+
+fn bounded_reference(pattern: &str) -> meta::Regex {
+    meta::Regex::builder()
+        .configure(
+            meta::Regex::config()
+                .match_kind(MatchKind::LeftmostFirst)
+                .utf8_empty(false),
+        )
+        .syntax(syntax::Config::default().utf8(false))
+        .build(pattern)
+        .unwrap()
+}
 
 fn pair(ast: &Ast) -> (InlineRegex, HistoryRegex) {
     let program = Arc::new(Program::compile(ast, BuildLimits::default()).unwrap());
@@ -22,19 +35,28 @@ fn pair(ast: &Ast) -> (InlineRegex, HistoryRegex) {
 }
 
 fn reference(pattern: &str, haystack: &[u8], window: Window) -> Option<CaptureRecord> {
-    let re = Regex::new(pattern).unwrap();
-    let slice = &haystack[window.start..window.end];
-    re.captures(slice).map(|captures| {
-        let names = re.capture_names().collect::<Vec<_>>();
-        let groups = captures
-            .iter()
+    let names = Regex::new(pattern)
+        .unwrap()
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    let re = bounded_reference(pattern);
+    let mut captures = re.create_captures();
+    re.captures(
+        Input::new(haystack).span(window.start..window.end),
+        &mut captures,
+    );
+    captures.is_match().then(|| {
+        assert_eq!(names.len(), captures.group_len());
+        let groups = names
+            .into_iter()
             .enumerate()
-            .map(|(index, matched)| GroupRecord {
+            .map(|(index, name)| GroupRecord {
                 index: u32::try_from(index).unwrap(),
-                name: names[index].map(str::to_owned),
-                span: matched.map(|matched| Span {
-                    start: matched.start() + window.start,
-                    end: matched.end() + window.start,
+                name,
+                span: captures.get_group(index).map(|matched| Span {
+                    start: matched.start,
+                    end: matched.end,
                 }),
             })
             .collect();
@@ -43,19 +65,23 @@ fn reference(pattern: &str, haystack: &[u8], window: Window) -> Option<CaptureRe
 }
 
 fn reference_iter(pattern: &str, haystack: &[u8], window: Window) -> Vec<CaptureRecord> {
-    let re = Regex::new(pattern).unwrap();
-    let names = re.capture_names().collect::<Vec<_>>();
-    re.captures_iter(&haystack[window.start..window.end])
+    let names = Regex::new(pattern)
+        .unwrap()
+        .capture_names()
+        .map(|name| name.map(str::to_owned))
+        .collect::<Vec<_>>();
+    let re = bounded_reference(pattern);
+    re.captures_iter(Input::new(haystack).span(window.start..window.end))
         .map(|captures| CaptureRecord {
-            groups: captures
+            groups: names
                 .iter()
                 .enumerate()
-                .map(|(index, matched)| GroupRecord {
+                .map(|(index, name)| GroupRecord {
                     index: u32::try_from(index).unwrap(),
-                    name: names[index].map(str::to_owned),
-                    span: matched.map(|matched| Span {
-                        start: matched.start() + window.start,
-                        end: matched.end() + window.start,
+                    name: name.clone(),
+                    span: captures.get_group(index).map(|matched| Span {
+                        start: matched.start,
+                        end: matched.end,
                     }),
                 })
                 .collect(),
@@ -281,6 +307,134 @@ fn window_offsets_and_anchor_context_are_exact() {
     let haystack = b"xay";
     assert_case(&ast, haystack, Window { start: 1, end: 2 });
     assert_case(&ast, haystack, Window { start: 0, end: 2 });
+}
+
+#[test]
+fn bounded_window_keeps_left_ascii_word_context() {
+    let ast = Ast::concat([
+        Ast::Assert(Assertion::WordAscii),
+        Ast::Byte(b'a').capture(1),
+    ]);
+    let (inline, history) = pair(&ast);
+    let haystack = b"za a";
+    let window = Window { start: 1, end: 3 };
+
+    assert_eq!(
+        inline
+            .captures(haystack, window, SearchLimits::default())
+            .unwrap()
+            .captures,
+        None
+    );
+    assert_eq!(
+        history
+            .captures(haystack, window, SearchLimits::default())
+            .unwrap()
+            .captures,
+        None
+    );
+}
+
+#[test]
+fn bounded_windows_preserve_all_assertion_context_and_clip_matches() {
+    let cases = [
+        (
+            Ast::concat([
+                Ast::Assert(Assertion::WordAscii),
+                Ast::Byte(b'a').capture(1),
+            ]),
+            b"za a".as_slice(),
+            Window { start: 1, end: 3 },
+        ),
+        (
+            Ast::concat([
+                Ast::Byte(b'a').capture(1),
+                Ast::Assert(Assertion::WordAscii),
+            ]),
+            b"az ".as_slice(),
+            Window { start: 0, end: 1 },
+        ),
+        (
+            Ast::concat([
+                Ast::Assert(Assertion::WordUnicode),
+                Ast::Byte(b'a').capture(1),
+            ]),
+            "éa ".as_bytes(),
+            Window { start: 2, end: 3 },
+        ),
+        (
+            Ast::concat([
+                Ast::Byte(b'a').capture(1),
+                Ast::Assert(Assertion::WordUnicode),
+            ]),
+            "aé".as_bytes(),
+            Window { start: 0, end: 1 },
+        ),
+        (
+            Ast::concat([
+                Ast::Assert(Assertion::WordUnicode),
+                Ast::Byte(b'a').capture(1),
+                Ast::Assert(Assertion::WordUnicode),
+            ]),
+            "é a!".as_bytes(),
+            Window { start: 3, end: 4 },
+        ),
+        (
+            Ast::concat([Ast::Start, Ast::Byte(b'a').capture(1)]),
+            b"za".as_slice(),
+            Window { start: 1, end: 2 },
+        ),
+        (
+            Ast::concat([Ast::Byte(b'a').capture(1), Ast::End]),
+            b"az".as_slice(),
+            Window { start: 0, end: 1 },
+        ),
+        (
+            Ast::concat([Ast::Assert(Assertion::StartLf), Ast::Byte(b'a').capture(1)]),
+            b"x\na".as_slice(),
+            Window { start: 2, end: 3 },
+        ),
+        (
+            Ast::Byte(b'a').repeat(1, None, Greed::Greedy).capture(1),
+            b"zaaaz".as_slice(),
+            Window { start: 2, end: 4 },
+        ),
+    ];
+    for (ast, haystack, window) in cases {
+        assert_case(&ast, haystack, window);
+    }
+
+    let empty = Ast::Empty.capture(1);
+    let pattern = render(&empty);
+    let haystack = b"abcd";
+    let window = Window { start: 1, end: 3 };
+    let expected = reference_iter(&pattern, haystack, window);
+    assert_eq!(
+        expected
+            .iter()
+            .filter_map(CaptureRecord::overall)
+            .collect::<Vec<_>>(),
+        vec![
+            Span { start: 1, end: 1 },
+            Span { start: 2, end: 2 },
+            Span { start: 3, end: 3 },
+        ]
+    );
+    let (inline, history) = pair(&empty);
+    assert_eq!(
+        inline
+            .captures_iter(haystack, window, AggregateLimits::default())
+            .unwrap()
+            .captures,
+        expected
+    );
+    assert_eq!(
+        history
+            .captures_iter(haystack, window, AggregateLimits::default())
+            .unwrap()
+            .captures,
+        expected
+    );
 }
 
 #[test]

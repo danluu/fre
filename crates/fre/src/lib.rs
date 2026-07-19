@@ -111,7 +111,7 @@ pub use fre_capture_lab::{
     CaptureCountOutcome, CaptureRecord, GroupRecord as CaptureGroupRecord,
     ResourceKind as CaptureResource, RunReport as CaptureSearchAccounting,
     SearchError as CaptureSearchError, SearchLimits as CaptureSearchLimits,
-    SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan,
+    SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan, Window as CaptureWindow,
 };
 pub use fre_kernels::{
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,

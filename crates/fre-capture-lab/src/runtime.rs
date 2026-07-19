@@ -19,35 +19,38 @@ pub(crate) fn assertion_matches(
     if position < window.start || position > window.end || window.end > haystack.len() {
         return Err(SearchError::InvalidWindow);
     }
+    // `window` constrains which match spans may be selected, but assertions
+    // retain the surrounding context of the original haystack. This mirrors
+    // a Rust regex search over an `Input::span`: slicing at `window.start`
+    // would incorrectly turn that boundary into the start of the haystack.
     let left_byte = position
         .checked_sub(1)
-        .filter(|&index| index >= window.start)
         .and_then(|index| haystack.get(index));
-    let right_byte = (position < window.end)
+    let right_byte = (position < haystack.len())
         .then(|| haystack.get(position))
         .flatten();
     let left_ascii_word = left_byte.is_some_and(|&byte| is_ascii_word(byte));
     let right_ascii_word = right_byte.is_some_and(|&byte| is_ascii_word(byte));
     Ok(match assertion {
-        Assertion::Start => position == window.start,
-        Assertion::End => position == window.end,
-        Assertion::StartLf => {
-            position == window.start || left_byte.is_some_and(|&byte| byte == b'\n')
+        Assertion::Start => position == 0,
+        Assertion::End => position == haystack.len(),
+        Assertion::StartLf => position == 0 || left_byte.is_some_and(|&byte| byte == b'\n'),
+        Assertion::EndLf => {
+            position == haystack.len() || right_byte.is_some_and(|&byte| byte == b'\n')
         }
-        Assertion::EndLf => position == window.end || right_byte.is_some_and(|&byte| byte == b'\n'),
         Assertion::StartLine(terminator) => {
-            position == window.start || left_byte.is_some_and(|&byte| byte == terminator)
+            position == 0 || left_byte.is_some_and(|&byte| byte == terminator)
         }
         Assertion::EndLine(terminator) => {
-            position == window.end || right_byte.is_some_and(|&byte| byte == terminator)
+            position == haystack.len() || right_byte.is_some_and(|&byte| byte == terminator)
         }
         Assertion::StartCrlf => {
-            position == window.start
+            position == 0
                 || left_byte == Some(&b'\n')
                 || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
         }
         Assertion::EndCrlf => {
-            position == window.end
+            position == haystack.len()
                 || right_byte == Some(&b'\r')
                 || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
         }
@@ -63,12 +66,8 @@ pub(crate) fn assertion_matches(
         | Assertion::WordEndUnicode
         | Assertion::WordStartHalfUnicode
         | Assertion::WordEndHalfUnicode) => {
-            let before = haystack
-                .get(window.start..position)
-                .ok_or(SearchError::InvalidWindow)?;
-            let after = haystack
-                .get(position..window.end)
-                .ok_or(SearchError::InvalidWindow)?;
+            let before = haystack.get(..position).ok_or(SearchError::InvalidWindow)?;
+            let after = haystack.get(position..).ok_or(SearchError::InvalidWindow)?;
             unicode_assertion_matches(assertion, before, after)?
         }
     })
