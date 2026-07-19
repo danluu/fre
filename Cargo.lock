@@ -431,6 +431,7 @@ dependencies = [
  "bstr",
  "fre",
  "fre-syntax",
+ "regex-automata",
  "regex-syntax",
  "serde",
  "serde_json",

@@ -16,6 +16,11 @@ use std::{
     path::Path,
 };
 
+use fre::{PortableRegex, PortableRegexSet, SearchLimits};
+use regex_automata::{
+    Input,
+    dfa::{Automaton, dense},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -25,6 +30,8 @@ use crate::{
 
 /// Complete candidate coverage report over every feature-mode membership.
 pub const REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
+    "fre.regex-automata-0.4.14.adapter-report.v2";
+const LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.adapter-report.v1";
 /// One immutable source-work assignment derived from a complete report.
 pub const REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA: &str =
@@ -32,10 +39,24 @@ pub const REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA: &str =
 
 const INVENTORY_UNSUPPORTED_REASON: &str = "fre-adapter.regex-automata-member-not-implemented";
 const ASSIGNMENT_TARGET_LIMIT: usize = 16;
-const REPORT_LIMITATIONS: [&str; 2] = [
+const LEGACY_REPORT_LIMITATIONS: [&str; 2] = [
     "A pass is emitted only after an exact registered adapter function executes successfully; absent registrations remain unsupported.",
     "One unique harness/case adapter disposition is projected across every authenticated feature-mode membership for that same identity.",
 ];
+const REPORT_LIMITATIONS: [&str; 3] = [
+    "A pass requires an exact mode/case execution receipt from a compiled registry membership and exhaustive execution of the authenticated upstream assertion inventory.",
+    "No result is projected across build modes; a mode without its own compiled execution remains unsupported.",
+    "The current bridge compiles only the package-default doctest mode; vcs-all-features doctest memberships remain unsupported until separately compiled and executed.",
+];
+
+const COMPILED_MODE_ID: &str = "package-default-doctest";
+const AUTOMATON_SOURCE_PATH: &str = "src/dfa/automaton.rs";
+const AUTOMATON_SOURCE_SHA256: &str =
+    "a2af61cdfb7f16a8419a25ccb3ae250afe736ff397c7a3101c8a77781d096a9b";
+const PATTERN_LEN_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 800)";
+const TRY_SEARCH_FWD_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1209)";
 
 /// Candidate disposition for one exact feature-mode membership.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +75,63 @@ pub struct RegexAutomataAdapterReceipt {
     pub harness: RegexAutomataHarnessKind,
     pub case_id: String,
     pub disposition: RegexAutomataAdapterDisposition,
+}
+
+/// One assertion parsed from an exact authenticated upstream rustdoc span.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataAssertionContract {
+    pub assertion_id: String,
+    pub source_line: usize,
+    pub source_line_sha256: String,
+    pub expected_observation: String,
+}
+
+/// Exact upstream source and exhaustive assertion inventory for one doctest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataSourceContract {
+    pub source_path: String,
+    pub source_sha256: String,
+    pub span_start_line: usize,
+    pub span_end_line: usize,
+    pub source_span_sha256: String,
+    pub assertion_inventory_sha256: String,
+    pub assertions: Vec<RegexAutomataAssertionContract>,
+}
+
+/// The one Cargo feature/harness mode in which an adapter actually executed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataModeExecution {
+    pub mode_id: String,
+    pub harness: RegexAutomataHarnessKind,
+    pub default_features: bool,
+    pub all_features: bool,
+    pub features: Vec<String>,
+    pub dependency_package: String,
+    pub dependency_version: String,
+}
+
+/// Both sides of one explicitly bound upstream assertion execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataAssertionExecution {
+    pub assertion_id: String,
+    pub upstream_observation: String,
+    pub fre_observation: String,
+}
+
+/// Auditable evidence for one exact feature-mode membership. The pass
+/// disposition's evidence SHA-256 is the canonical hash of this entire value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataExecutionReceipt {
+    pub mode: RegexAutomataModeExecution,
+    pub harness: RegexAutomataHarnessKind,
+    pub case_id: String,
+    pub source: RegexAutomataSourceContract,
+    pub assertion_executions: Vec<RegexAutomataAssertionExecution>,
 }
 
 /// Complete result cardinalities.
@@ -75,6 +153,8 @@ pub struct RegexAutomataAdapterReportPayload {
     pub candidate: CandidateIdentity,
     pub counts: RegexAutomataAdapterCounts,
     pub receipts: Vec<RegexAutomataAdapterReceipt>,
+    #[serde(default)]
+    pub execution_receipts: Vec<RegexAutomataExecutionReceipt>,
     pub limitations: Vec<String>,
 }
 
@@ -125,19 +205,183 @@ pub struct RegexAutomataStrictGain {
     pub current_pass: usize,
 }
 
-type AdapterFunction = fn() -> Result<String, String>;
+type AdapterFunction =
+    fn(&AdapterContext<'_>) -> Result<Vec<RegexAutomataAssertionExecution>, String>;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct AssertionSpec {
+    assertion_id: &'static str,
+    source_line: usize,
+    source_line_sha256: &'static str,
+    expected_observation: &'static str,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SourceContractSpec {
+    source_path: &'static str,
+    source_sha256: &'static str,
+    span_start_line: usize,
+    span_end_line: usize,
+    source_span: &'static str,
+    source_span_sha256: &'static str,
+    assertion_inventory_sha256: &'static str,
+    assertions: &'static [AssertionSpec],
+}
+
+struct AdapterContext<'a> {
+    mode: &'a RegexAutomataModeExecution,
+}
 
 #[derive(Clone, Copy)]
 struct RegisteredAdapter {
+    mode_id: &'static str,
     harness: RegexAutomataHarnessKind,
     case_id: &'static str,
+    source: SourceContractSpec,
     run: AdapterFunction,
 }
 
-// Source workers add narrowly reviewed registrations only after implementing
-// a faithful adapter for an assigned upstream member. Keeping this empty is a
-// deliberate zero-fake-pass baseline.
-const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[];
+const PATTERN_LEN_ASSERTIONS: &[AssertionSpec] = &[AssertionSpec {
+    assertion_id: "pattern-len-never-match-zero",
+    source_line: 804,
+    source_line_sha256: "3b7e88058c1a1fa94a3e1d8f128b2ff7ed129588f2eb3bd590c2282b2498adf9",
+    expected_observation: "usize:0",
+}];
+const TRY_SEARCH_FWD_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "try-search-fwd-foo-digits",
+        source_line: 1214,
+        source_line_sha256: "70a54c1802196923425dc9837c82c5fe2b5e2b879e45c7d7cec2797a39f95411",
+        expected_observation: "half-match:some:pattern=0:offset=8",
+    },
+    AssertionSpec {
+        assertion_id: "try-search-fwd-leftmost-first",
+        source_line: 1221,
+        source_line_sha256: "5e5c9f3ab5a9a805d5c96a396780de77d1b202364584d5c86b4d1f37032c8b67",
+        expected_observation: "half-match:some:pattern=0:offset=3",
+    },
+];
+
+const PATTERN_LEN_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 800,
+    span_end_line: 806,
+    source_span: concat!(
+        "    /// ```\n",
+        "    /// use regex_automata::dfa::{Automaton, dense::DFA};\n",
+        "    ///\n",
+        "    /// let dfa: DFA<Vec<u32>> = DFA::never_match()?;\n",
+        "    /// assert_eq!(dfa.pattern_len(), 0);\n",
+        "    /// # Ok::<(), Box<dyn std::error::Error>>(())\n",
+        "    /// ```\n",
+    ),
+    source_span_sha256: "f57f6c9927950180823c7d9f981ec01aad1fda3e6ded8abc317892aa1aa95ca7",
+    assertion_inventory_sha256: "7c56b2f92e4e226ae4be923582b0ef39d808755f169964a021ca831973b2542f",
+    assertions: PATTERN_LEN_ASSERTIONS,
+};
+
+const TRY_SEARCH_FWD_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 1209,
+    span_end_line: 1224,
+    source_span: concat!(
+        "    /// ```\n",
+        "    /// use regex_automata::{dfa::{Automaton, dense}, HalfMatch, Input};\n",
+        "    ///\n",
+        "    /// let dfa = dense::DFA::new(\"foo[0-9]+\")?;\n",
+        "    /// let expected = Some(HalfMatch::must(0, 8));\n",
+        "    /// assert_eq!(expected, dfa.try_search_fwd(&Input::new(b\"foo12345\"))?);\n",
+        "    ///\n",
+        "    /// // Even though a match is found after reading the first byte (`a`),\n",
+        "    /// // the leftmost first match semantics demand that we find the earliest\n",
+        "    /// // match that prefers earlier parts of the pattern over latter parts.\n",
+        "    /// let dfa = dense::DFA::new(\"abc|a\")?;\n",
+        "    /// let expected = Some(HalfMatch::must(0, 3));\n",
+        "    /// assert_eq!(expected, dfa.try_search_fwd(&Input::new(b\"abc\"))?);\n",
+        "    ///\n",
+        "    /// # Ok::<(), Box<dyn std::error::Error>>(())\n",
+        "    /// ```\n",
+    ),
+    source_span_sha256: "c431055ba7bc0ea80c3ce8629af0257eef415609ade8341825c0490a6b06dc7e",
+    assertion_inventory_sha256: "91005984a3b82958c524a4308e97308e1e0906b2b2cf303768d296b5f9d2f038",
+    assertions: TRY_SEARCH_FWD_ASSERTIONS,
+};
+
+// Each registration is one actual compiled membership. In particular, there
+// is intentionally no all-features registration: this binary is built with
+// regex-automata's package defaults, so relabelling this execution as the VCS
+// all-features mode is structurally rejected.
+const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
+    RegisteredAdapter {
+        mode_id: COMPILED_MODE_ID,
+        harness: RegexAutomataHarnessKind::Doctest,
+        case_id: PATTERN_LEN_CASE,
+        source: PATTERN_LEN_SOURCE,
+        run: run_pattern_len_never_match,
+    },
+    RegisteredAdapter {
+        mode_id: COMPILED_MODE_ID,
+        harness: RegexAutomataHarnessKind::Doctest,
+        case_id: TRY_SEARCH_FWD_CASE,
+        source: TRY_SEARCH_FWD_SOURCE,
+        run: run_try_search_fwd,
+    },
+];
+
+fn run_pattern_len_never_match(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let upstream: dense::DFA<Vec<u32>> =
+        dense::DFA::never_match().map_err(|error| format!("upstream-build:{error}"))?;
+    let fre = PortableRegexSet::new(std::iter::empty::<&str>())
+        .map_err(|error| format!("fre-build:{error}"))?;
+    Ok(vec![RegexAutomataAssertionExecution {
+        assertion_id: PATTERN_LEN_ASSERTIONS[0].assertion_id.to_owned(),
+        upstream_observation: format!("usize:{}", upstream.pattern_len()),
+        fre_observation: format!("usize:{}", fre.patterns().len()),
+    }])
+}
+
+fn run_try_search_fwd(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let upstream_first = dense::DFA::new("foo[0-9]+")
+        .map_err(|error| format!("upstream-build-first:{error}"))?
+        .try_search_fwd(&Input::new(b"foo12345"))
+        .map_err(|error| format!("upstream-search-first:{error}"))?;
+    let fre_first = PortableRegex::new("foo[0-9]+")
+        .map_err(|error| format!("fre-build-first:{error}"))?
+        .find(b"foo12345", SearchLimits::unlimited())
+        .map_err(|error| format!("fre-search-first:{error}"))?
+        .0;
+
+    let upstream_second = dense::DFA::new("abc|a")
+        .map_err(|error| format!("upstream-build-second:{error}"))?
+        .try_search_fwd(&Input::new(b"abc"))
+        .map_err(|error| format!("upstream-search-second:{error}"))?;
+    let fre_second = PortableRegex::new("abc|a")
+        .map_err(|error| format!("fre-build-second:{error}"))?
+        .find(b"abc", SearchLimits::unlimited())
+        .map_err(|error| format!("fre-search-second:{error}"))?
+        .0;
+
+    Ok(vec![
+        RegexAutomataAssertionExecution {
+            assertion_id: TRY_SEARCH_FWD_ASSERTIONS[0].assertion_id.to_owned(),
+            upstream_observation: upstream_half_match(upstream_first),
+            fre_observation: fre_half_match(fre_first),
+        },
+        RegexAutomataAssertionExecution {
+            assertion_id: TRY_SEARCH_FWD_ASSERTIONS[1].assertion_id.to_owned(),
+            upstream_observation: upstream_half_match(upstream_second),
+            fre_observation: fre_half_match(fre_second),
+        },
+    ])
+}
 
 /// Execute every registered adapter and retain every unregistered obligation
 /// as unsupported.
@@ -159,34 +403,32 @@ fn build_adapter_report_with_registry(
         .payload
         .obligations
         .iter()
-        .map(obligation_identity)
+        .map(obligation_membership_identity)
         .collect::<BTreeSet<_>>();
     let mut registered = BTreeMap::new();
     for adapter in registry {
-        let key = (adapter.harness, adapter.case_id.to_owned());
-        if !inventory_identities.contains(&key) || registered.insert(key, adapter.run).is_some() {
+        validate_registered_adapter(inventory, adapter)?;
+        let key = (
+            adapter.mode_id.to_owned(),
+            adapter.harness,
+            adapter.case_id.to_owned(),
+        );
+        if !inventory_identities.contains(&key) || registered.insert(key, adapter).is_some() {
             return Err(InventoryError::new(
-                "regex-automata adapter registry has a foreign or duplicate identity",
+                "regex-automata adapter registry has a foreign or duplicate membership",
             ));
         }
     }
     let mut outcomes = BTreeMap::new();
-    for (identity, run) in registered {
-        let disposition = match catch_unwind(AssertUnwindSafe(run)) {
-            Ok(Ok(transcript)) => {
-                if !bounded_text(&transcript, 4096) {
-                    return Err(InventoryError::new(
-                        "regex-automata adapter transcript is invalid",
-                    ));
-                }
-                let evidence = Evidence {
-                    harness: identity.0,
-                    case_id: identity.1.clone(),
-                    transcript,
-                };
-                RegexAutomataAdapterDisposition::Pass {
-                    evidence_sha256: hash_json(&evidence, "encode adapter evidence")?,
-                }
+    let mut execution_receipts = Vec::new();
+    for (identity, adapter) in registered {
+        let mode = mode_execution(inventory, adapter.mode_id)?;
+        let disposition = match catch_unwind(AssertUnwindSafe(|| execute_adapter(adapter, &mode))) {
+            Ok(Ok(receipt)) => {
+                let evidence_sha256 =
+                    hash_json(&receipt, "encode regex-automata execution receipt")?;
+                execution_receipts.push(receipt);
+                RegexAutomataAdapterDisposition::Pass { evidence_sha256 }
             }
             Ok(Err(reason)) => RegexAutomataAdapterDisposition::Fault {
                 stage: "adapter".to_owned(),
@@ -208,7 +450,7 @@ fn build_adapter_report_with_registry(
             harness: obligation.harness,
             case_id: obligation.case_id.clone(),
             disposition: outcomes
-                .get(&obligation_identity(obligation))
+                .get(&obligation_membership_identity(obligation))
                 .cloned()
                 .unwrap_or_else(|| RegexAutomataAdapterDisposition::Unsupported {
                     reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
@@ -226,6 +468,7 @@ fn build_adapter_report_with_registry(
         candidate,
         counts,
         receipts,
+        execution_receipts,
         limitations: REPORT_LIMITATIONS
             .iter()
             .map(|text| (*text).to_owned())
@@ -236,7 +479,7 @@ fn build_adapter_report_with_registry(
         payload_sha256: hash_json(&payload, "encode regex-automata adapter payload")?,
         payload,
     };
-    report.validate(inventory)?;
+    report.validate_structure(inventory)?;
     Ok(report)
 }
 
@@ -292,8 +535,8 @@ pub fn validate_regex_automata_strict_gain(
     assignment: &RegexAutomataGapAssignment,
 ) -> Result<RegexAutomataStrictGain, InventoryError> {
     inventory.validate()?;
-    previous.validate(inventory)?;
-    current.validate(inventory)?;
+    previous.validate_for_gain(inventory)?;
+    validate_regex_automata_adapter_execution(inventory, current)?;
     assignment.validate(inventory, previous)?;
     if previous.payload.candidate.revision == current.payload.candidate.revision
         || previous.payload.candidate.tree == current.payload.candidate.tree
@@ -305,7 +548,12 @@ pub fn validate_regex_automata_strict_gain(
     let assigned = assignment
         .targets
         .iter()
-        .map(|target| (target.harness, target.case_id.clone()))
+        .flat_map(|target| {
+            target
+                .mode_ids
+                .iter()
+                .map(|mode_id| (mode_id.clone(), target.harness, target.case_id.clone()))
+        })
         .collect::<BTreeSet<_>>();
     let (gained_unique_cases, gained_mode_memberships) = gain_vectors(
         &previous.payload.receipts,
@@ -330,15 +578,44 @@ impl RegexAutomataAdapterReport {
     /// Validate the full inventory identity, candidate identity, exact receipt
     /// order, per-case consistency, counts and payload seal.
     pub fn validate(&self, inventory: &RegexAutomataCorpusReport) -> Result<(), InventoryError> {
+        self.validate_structure(inventory)
+    }
+
+    fn validate_structure(
+        &self,
+        inventory: &RegexAutomataCorpusReport,
+    ) -> Result<(), InventoryError> {
         inventory.validate()?;
-        if self.schema != REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
-            || self.payload_sha256
-                != hash_json(&self.payload, "encode regex-automata adapter payload")?
+        let limitations = if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            REPORT_LIMITATIONS.as_slice()
+        } else if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            LEGACY_REPORT_LIMITATIONS.as_slice()
+        } else {
+            return Err(InventoryError::new(
+                "regex-automata adapter report schema mismatch",
+            ));
+        };
+        let expected_payload_sha256 = if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            hash_json(&self.payload, "encode regex-automata adapter payload")?
+        } else {
+            hash_json(
+                &LegacyAdapterPayload {
+                    inventory_payload_sha256: &self.payload.inventory_payload_sha256,
+                    obligation_inventory_sha256: &self.payload.obligation_inventory_sha256,
+                    candidate: &self.payload.candidate,
+                    counts: &self.payload.counts,
+                    receipts: &self.payload.receipts,
+                    limitations: &self.payload.limitations,
+                },
+                "encode legacy regex-automata adapter payload",
+            )?
+        };
+        if self.payload_sha256 != expected_payload_sha256
             || self.payload.inventory_payload_sha256 != inventory.payload_sha256
             || self.payload.obligation_inventory_sha256
                 != inventory.payload.harness.obligation_inventory_sha256
             || self.payload.limitations
-                != REPORT_LIMITATIONS
+                != limitations
                     .iter()
                     .map(|text| (*text).to_owned())
                     .collect::<Vec<_>>()
@@ -353,7 +630,6 @@ impl RegexAutomataAdapterReport {
                 "regex-automata adapter receipt denominator mismatch",
             ));
         }
-        let mut per_case = BTreeMap::new();
         for (receipt, obligation) in self
             .payload
             .receipts
@@ -369,22 +645,69 @@ impl RegexAutomataAdapterReport {
                 ));
             }
             validate_disposition(&receipt.disposition)?;
-            let key = (receipt.harness, receipt.case_id.clone());
-            if let Some(prior) = per_case.insert(key, receipt.disposition.clone())
-                && prior != receipt.disposition
-            {
-                return Err(InventoryError::new(
-                    "regex-automata adapter disagrees across feature modes",
-                ));
-            }
         }
         if self.payload.counts != adapter_counts(&self.payload.receipts) {
             return Err(InventoryError::new(
                 "regex-automata adapter disposition counts mismatch",
             ));
         }
+        if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            if !self.payload.execution_receipts.is_empty()
+                || self.payload.counts.pass != 0
+                || self.payload.counts.fault != 0
+                || self.payload.receipts.iter().any(|receipt| {
+                    !matches!(
+                        &receipt.disposition,
+                        RegexAutomataAdapterDisposition::Unsupported { reason_code }
+                            if reason_code == INVENTORY_UNSUPPORTED_REASON
+                    )
+                })
+            {
+                return Err(InventoryError::new(
+                    "legacy regex-automata report is not a zero-pass baseline",
+                ));
+            }
+            return Ok(());
+        }
+        validate_execution_receipt_set(inventory, self)?;
         Ok(())
     }
+
+    fn validate_for_gain(
+        &self,
+        inventory: &RegexAutomataCorpusReport,
+    ) -> Result<(), InventoryError> {
+        self.validate_structure(inventory)?;
+        if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            validate_regex_automata_adapter_execution(inventory, self)?;
+        }
+        Ok(())
+    }
+}
+
+/// Re-run every compiled adapter membership and require exact receipt/report
+/// equality. This prevents a JSON author from manufacturing a plausible pass.
+fn validate_regex_automata_adapter_execution(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    report.validate_structure(inventory)?;
+    if report.schema != REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        return Err(InventoryError::new(
+            "legacy regex-automata baseline has no executable passes",
+        ));
+    }
+    let reproduced = build_adapter_report_with_registry(
+        inventory,
+        report.payload.candidate.clone(),
+        REGISTERED_ADAPTERS,
+    )?;
+    if &reproduced != report {
+        return Err(InventoryError::new(
+            "regex-automata report differs from compiled mode-bound execution",
+        ));
+    }
+    Ok(())
 }
 
 impl RegexAutomataGapAssignment {
@@ -463,7 +786,7 @@ pub fn write_regex_automata_adapter_report(
     report: &RegexAutomataAdapterReport,
     inventory: &RegexAutomataCorpusReport,
 ) -> Result<(), InventoryError> {
-    report.validate(inventory)?;
+    validate_regex_automata_adapter_execution(inventory, report)?;
     write_new_json(path, report)
 }
 
@@ -481,28 +804,20 @@ pub fn write_regex_automata_gap_assignment(
 fn pending_clusters(
     report: &RegexAutomataAdapterReport,
 ) -> Result<BTreeMap<String, Vec<RegexAutomataGapTarget>>, InventoryError> {
-    let mut cases: BTreeMap<
-        (RegexAutomataHarnessKind, String),
-        (RegexAutomataAdapterDisposition, BTreeSet<String>),
-    > = BTreeMap::new();
+    let mut cases: BTreeMap<(RegexAutomataHarnessKind, String), BTreeSet<String>> = BTreeMap::new();
     for receipt in &report.payload.receipts {
-        let entry = cases
-            .entry((receipt.harness, receipt.case_id.clone()))
-            .or_insert_with(|| (receipt.disposition.clone(), BTreeSet::new()));
-        if entry.0 != receipt.disposition || !entry.1.insert(receipt.mode_id.clone()) {
-            return Err(InventoryError::new(
-                "regex-automata report has inconsistent or duplicate memberships",
-            ));
+        if matches!(
+            receipt.disposition,
+            RegexAutomataAdapterDisposition::Unsupported { .. }
+        ) {
+            cases
+                .entry((receipt.harness, receipt.case_id.clone()))
+                .or_default()
+                .insert(receipt.mode_id.clone());
         }
     }
     let mut clusters: BTreeMap<String, Vec<RegexAutomataGapTarget>> = BTreeMap::new();
-    for ((harness, case_id), (disposition, mode_ids)) in cases {
-        if !matches!(
-            disposition,
-            RegexAutomataAdapterDisposition::Unsupported { .. }
-        ) {
-            continue;
-        }
+    for ((harness, case_id), mode_ids) in cases {
         let family = case_family(harness, &case_id)?;
         clusters
             .entry(family)
@@ -545,8 +860,325 @@ fn case_family(harness: RegexAutomataHarnessKind, case_id: &str) -> Result<Strin
     Ok(format!("{harness}-{component}"))
 }
 
-fn obligation_identity(obligation: &RegexAutomataObligation) -> (RegexAutomataHarnessKind, String) {
-    (obligation.harness, obligation.case_id.clone())
+fn obligation_membership_identity(
+    obligation: &RegexAutomataObligation,
+) -> (String, RegexAutomataHarnessKind, String) {
+    (
+        obligation.mode_id.clone(),
+        obligation.harness,
+        obligation.case_id.clone(),
+    )
+}
+
+fn require_compiled_mode(context: &AdapterContext<'_>) -> Result<(), String> {
+    if context.mode.mode_id != COMPILED_MODE_ID
+        || context.mode.harness != RegexAutomataHarnessKind::Doctest
+        || !context.mode.default_features
+        || context.mode.all_features
+        || !context.mode.features.is_empty()
+        || context.mode.dependency_package != "regex-automata"
+        || context.mode.dependency_version != "0.4.14"
+    {
+        return Err("compiled-mode-mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn upstream_half_match(matched: Option<regex_automata::HalfMatch>) -> String {
+    match matched {
+        None => "half-match:none".to_owned(),
+        Some(matched) => format!(
+            "half-match:some:pattern={}:offset={}",
+            matched.pattern().as_usize(),
+            matched.offset()
+        ),
+    }
+}
+
+fn fre_half_match(matched: Option<fre::Match>) -> String {
+    match matched {
+        None => "half-match:none".to_owned(),
+        Some(matched) => format!("half-match:some:pattern=0:offset={}", matched.end()),
+    }
+}
+
+fn mode_execution(
+    inventory: &RegexAutomataCorpusReport,
+    mode_id: &str,
+) -> Result<RegexAutomataModeExecution, InventoryError> {
+    if mode_id != COMPILED_MODE_ID {
+        return Err(InventoryError::new(
+            "regex-automata adapter mode is not this binary's compiled mode",
+        ));
+    }
+    let mut matching = inventory
+        .payload
+        .modes
+        .iter()
+        .filter(|mode| mode.id == mode_id);
+    let mode = matching
+        .next()
+        .ok_or_else(|| InventoryError::new("compiled regex-automata mode is absent"))?;
+    if matching.next().is_some()
+        || mode.harness != RegexAutomataHarnessKind::Doctest
+        || !mode.default_features
+        || mode.all_features
+        || !mode.features.is_empty()
+    {
+        return Err(InventoryError::new(
+            "compiled regex-automata mode identity mismatch",
+        ));
+    }
+    Ok(RegexAutomataModeExecution {
+        mode_id: mode.id.clone(),
+        harness: mode.harness,
+        default_features: mode.default_features,
+        all_features: mode.all_features,
+        features: mode.features.clone(),
+        dependency_package: "regex-automata".to_owned(),
+        dependency_version: "0.4.14".to_owned(),
+    })
+}
+
+fn validate_registered_adapter(
+    inventory: &RegexAutomataCorpusReport,
+    adapter: &RegisteredAdapter,
+) -> Result<(), InventoryError> {
+    let expected_source = match adapter.case_id {
+        PATTERN_LEN_CASE => PATTERN_LEN_SOURCE,
+        TRY_SEARCH_FWD_CASE => TRY_SEARCH_FWD_SOURCE,
+        _ => {
+            return Err(InventoryError::new(
+                "regex-automata adapter has an unreviewed case",
+            ));
+        }
+    };
+    if adapter.mode_id != COMPILED_MODE_ID
+        || adapter.harness != RegexAutomataHarnessKind::Doctest
+        || adapter.source != expected_source
+    {
+        return Err(InventoryError::new(
+            "regex-automata adapter registration binding mismatch",
+        ));
+    }
+    let _ = mode_execution(inventory, adapter.mode_id)?;
+    let file = inventory
+        .payload
+        .source
+        .files
+        .iter()
+        .find(|file| file.path == adapter.source.source_path)
+        .ok_or_else(|| InventoryError::new("adapter upstream source file is absent"))?;
+    if file.sha256 != adapter.source.source_sha256
+        || file.sha256 != AUTOMATON_SOURCE_SHA256
+        || file.mode != "0644"
+    {
+        return Err(InventoryError::new(
+            "adapter upstream source file identity mismatch",
+        ));
+    }
+    validate_source_spec(&adapter.source)?;
+    Ok(())
+}
+
+fn validate_source_spec(source: &SourceContractSpec) -> Result<(), InventoryError> {
+    if source.source_path != AUTOMATON_SOURCE_PATH
+        || source.source_sha256 != AUTOMATON_SOURCE_SHA256
+        || source.span_start_line == 0
+        || source.span_end_line < source.span_start_line
+        || !source.source_span.ends_with('\n')
+        || source.source_span.contains(['\0', '\r'])
+        || sha256(source.source_span.as_bytes()) != source.source_span_sha256
+        || !hex(source.source_span_sha256, 64)
+        || !hex(source.assertion_inventory_sha256, 64)
+        || source.assertions.is_empty()
+    {
+        return Err(InventoryError::new(
+            "regex-automata upstream source-span contract mismatch",
+        ));
+    }
+    let expected_lines = source
+        .span_end_line
+        .checked_sub(source.span_start_line)
+        .and_then(|lines| lines.checked_add(1))
+        .ok_or_else(|| InventoryError::new("regex-automata source-span line overflow"))?;
+    let lines = source.source_span.split_inclusive('\n').collect::<Vec<_>>();
+    if lines.len() != expected_lines {
+        return Err(InventoryError::new(
+            "regex-automata upstream source-span line count mismatch",
+        ));
+    }
+    let mut discovered = Vec::new();
+    for (offset, line) in lines.iter().enumerate() {
+        let source_line = source
+            .span_start_line
+            .checked_add(offset)
+            .ok_or_else(|| InventoryError::new("regex-automata source line overflow"))?;
+        if line.contains("assert") {
+            discovered.push((source_line, sha256(line.as_bytes())));
+        }
+    }
+    if discovered.len() != source.assertions.len() {
+        return Err(InventoryError::new(
+            "regex-automata upstream assertion inventory is incomplete",
+        ));
+    }
+    let assertions = source_contract(source).assertions;
+    if hash_json(&assertions, "encode upstream assertion inventory")?
+        != source.assertion_inventory_sha256
+    {
+        return Err(InventoryError::new(
+            "regex-automata upstream assertion inventory seal mismatch",
+        ));
+    }
+    for ((line, line_sha256), assertion) in discovered.iter().zip(source.assertions) {
+        if *line != assertion.source_line
+            || line_sha256 != assertion.source_line_sha256
+            || !token(assertion.assertion_id)
+            || !bounded_text(assertion.expected_observation, 256)
+        {
+            return Err(InventoryError::new(
+                "regex-automata upstream assertion binding mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn source_contract(source: &SourceContractSpec) -> RegexAutomataSourceContract {
+    RegexAutomataSourceContract {
+        source_path: source.source_path.to_owned(),
+        source_sha256: source.source_sha256.to_owned(),
+        span_start_line: source.span_start_line,
+        span_end_line: source.span_end_line,
+        source_span_sha256: source.source_span_sha256.to_owned(),
+        assertion_inventory_sha256: source.assertion_inventory_sha256.to_owned(),
+        assertions: source
+            .assertions
+            .iter()
+            .map(|assertion| RegexAutomataAssertionContract {
+                assertion_id: assertion.assertion_id.to_owned(),
+                source_line: assertion.source_line,
+                source_line_sha256: assertion.source_line_sha256.to_owned(),
+                expected_observation: assertion.expected_observation.to_owned(),
+            })
+            .collect(),
+    }
+}
+
+fn execute_adapter(
+    adapter: &RegisteredAdapter,
+    mode: &RegexAutomataModeExecution,
+) -> Result<RegexAutomataExecutionReceipt, String> {
+    if adapter.mode_id != mode.mode_id || adapter.harness != mode.harness {
+        return Err("adapter-mode-binding-mismatch".to_owned());
+    }
+    let assertion_executions = (adapter.run)(&AdapterContext { mode })?;
+    validate_assertion_executions(adapter.source.assertions, &assertion_executions)?;
+    Ok(RegexAutomataExecutionReceipt {
+        mode: mode.clone(),
+        harness: adapter.harness,
+        case_id: adapter.case_id.to_owned(),
+        source: source_contract(&adapter.source),
+        assertion_executions,
+    })
+}
+
+fn validate_assertion_executions(
+    expected: &[AssertionSpec],
+    actual: &[RegexAutomataAssertionExecution],
+) -> Result<(), String> {
+    if actual.len() != expected.len() {
+        return Err("assertion-execution-count-mismatch".to_owned());
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if actual.assertion_id != expected.assertion_id
+            || !bounded_text(&actual.upstream_observation, 256)
+            || !bounded_text(&actual.fre_observation, 256)
+            || actual.upstream_observation != expected.expected_observation
+            || actual.fre_observation != expected.expected_observation
+        {
+            return Err("assertion-execution-binding-mismatch".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_receipt_set(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    let mut executions = BTreeMap::new();
+    for execution in &report.payload.execution_receipts {
+        let key = (
+            execution.mode.mode_id.clone(),
+            execution.harness,
+            execution.case_id.clone(),
+        );
+        let adapter = REGISTERED_ADAPTERS
+            .iter()
+            .find(|adapter| {
+                (adapter.mode_id, adapter.harness, adapter.case_id)
+                    == (key.0.as_str(), key.1, key.2.as_str())
+            })
+            .ok_or_else(|| InventoryError::new("foreign regex-automata execution receipt"))?;
+        validate_registered_adapter(inventory, adapter)?;
+        let expected_mode = mode_execution(inventory, adapter.mode_id)?;
+        if execution.mode != expected_mode
+            || execution.harness != adapter.harness
+            || execution.case_id != adapter.case_id
+            || execution.source != source_contract(&adapter.source)
+            || validate_assertion_executions(
+                adapter.source.assertions,
+                &execution.assertion_executions,
+            )
+            .is_err()
+            || executions
+                .insert(
+                    key,
+                    hash_json(execution, "encode regex-automata execution receipt")?,
+                )
+                .is_some()
+        {
+            return Err(InventoryError::new(
+                "invalid or duplicate regex-automata execution receipt",
+            ));
+        }
+    }
+    let mut passed = 0_usize;
+    for receipt in &report.payload.receipts {
+        let key = (
+            receipt.mode_id.clone(),
+            receipt.harness,
+            receipt.case_id.clone(),
+        );
+        match &receipt.disposition {
+            RegexAutomataAdapterDisposition::Pass { evidence_sha256 } => {
+                passed = passed
+                    .checked_add(1)
+                    .ok_or_else(|| InventoryError::new("regex-automata pass count overflow"))?;
+                if executions.get(&key) != Some(evidence_sha256) {
+                    return Err(InventoryError::new(
+                        "regex-automata pass lacks its exact execution receipt",
+                    ));
+                }
+            }
+            RegexAutomataAdapterDisposition::Unsupported { .. }
+            | RegexAutomataAdapterDisposition::Fault { .. } => {
+                if executions.contains_key(&key) {
+                    return Err(InventoryError::new(
+                        "non-pass regex-automata membership has execution evidence",
+                    ));
+                }
+            }
+        }
+    }
+    if passed != executions.len() {
+        return Err(InventoryError::new(
+            "regex-automata execution receipt cardinality mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn adapter_counts(receipts: &[RegexAutomataAdapterReceipt]) -> RegexAutomataAdapterCounts {
@@ -620,10 +1252,13 @@ fn validate_candidate(candidate: &CandidateIdentity) -> Result<(), InventoryErro
 }
 
 #[derive(Serialize)]
-struct Evidence {
-    harness: RegexAutomataHarnessKind,
-    case_id: String,
-    transcript: String,
+struct LegacyAdapterPayload<'a> {
+    inventory_payload_sha256: &'a str,
+    obligation_inventory_sha256: &'a str,
+    candidate: &'a CandidateIdentity,
+    counts: &'a RegexAutomataAdapterCounts,
+    receipts: &'a [RegexAutomataAdapterReceipt],
+    limitations: &'a [String],
 }
 
 fn normalized_reason(reason: &str) -> String {
@@ -765,7 +1400,7 @@ fn unsafe_free_euid() -> u32 {
 fn gain_vectors(
     previous: &[RegexAutomataAdapterReceipt],
     current: &[RegexAutomataAdapterReceipt],
-    assigned: &BTreeSet<(RegexAutomataHarnessKind, String)>,
+    assigned: &BTreeSet<(String, RegexAutomataHarnessKind, String)>,
 ) -> Result<(usize, usize), InventoryError> {
     if previous.len() != current.len() {
         return Err(InventoryError::new("strict-gain denominator changed"));
@@ -778,7 +1413,7 @@ fn gain_vectors(
         {
             return Err(InventoryError::new("strict-gain receipt identity changed"));
         }
-        let identity = (old.harness, old.case_id.clone());
+        let identity = (old.mode_id.clone(), old.harness, old.case_id.clone());
         let old_pass = matches!(
             old.disposition,
             RegexAutomataAdapterDisposition::Pass { .. }
@@ -794,7 +1429,7 @@ fn gain_vectors(
             return Err(InventoryError::new("strict-gain unassigned change"));
         }
         if assigned.contains(&identity) && !old_pass && new_pass {
-            unique.insert(identity);
+            unique.insert((identity.1, identity.2));
             memberships = memberships
                 .checked_add(1)
                 .ok_or_else(|| InventoryError::new("strict-gain count overflow"))?;
@@ -845,7 +1480,11 @@ mod tests {
         ];
         let mut current = old.clone();
         current[0].disposition = pass.clone();
-        let assigned = BTreeSet::from([(RegexAutomataHarnessKind::Unit, "dfa::a".to_owned())]);
+        let assigned = BTreeSet::from([(
+            "m0".to_owned(),
+            RegexAutomataHarnessKind::Unit,
+            "dfa::a".to_owned(),
+        )]);
         assert_eq!(gain_vectors(&old, &current, &assigned).unwrap(), (1, 1));
         let mut foreign = current.clone();
         foreign[1].disposition = unsupported.clone();
@@ -878,5 +1517,100 @@ mod tests {
         assert!(case_family(RegexAutomataHarnessKind::Unit, "bad family::x").is_err());
         assert!(validate_candidate(&candidate('a', 'b')).is_ok());
         assert!(validate_candidate(&candidate('g', 'b')).is_err());
+    }
+
+    fn compiled_mode() -> RegexAutomataModeExecution {
+        RegexAutomataModeExecution {
+            mode_id: COMPILED_MODE_ID.to_owned(),
+            harness: RegexAutomataHarnessKind::Doctest,
+            default_features: true,
+            all_features: false,
+            features: Vec::new(),
+            dependency_package: "regex-automata".to_owned(),
+            dependency_version: "0.4.14".to_owned(),
+        }
+    }
+
+    fn wrong_pattern_len(
+        context: &AdapterContext<'_>,
+    ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+        require_compiled_mode(context)?;
+        let upstream = dense::Builder::new()
+            .build_many(&["a", "b"])
+            .map_err(|error| error.to_string())?;
+        let fre = PortableRegexSet::new(["a", "b"]).map_err(|error| error.to_string())?;
+        Ok(vec![RegexAutomataAssertionExecution {
+            assertion_id: PATTERN_LEN_ASSERTIONS[0].assertion_id.to_owned(),
+            upstream_observation: format!("usize:{}", upstream.pattern_len()),
+            fre_observation: format!("usize:{}", fre.patterns().len()),
+        }])
+    }
+
+    fn omitted_second_assertion(
+        context: &AdapterContext<'_>,
+    ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+        let mut executions = run_try_search_fwd(context)?;
+        executions.pop();
+        Ok(executions)
+    }
+
+    #[test]
+    fn exact_upstream_spans_bind_every_assertion() {
+        validate_source_spec(&PATTERN_LEN_SOURCE).unwrap();
+        validate_source_spec(&TRY_SEARCH_FWD_SOURCE).unwrap();
+
+        let mut changed_span = PATTERN_LEN_SOURCE;
+        changed_span.source_span = "    /// changed\n";
+        assert!(validate_source_spec(&changed_span).is_err());
+
+        let mut changed_hash = PATTERN_LEN_SOURCE;
+        changed_hash.source_span_sha256 =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(validate_source_spec(&changed_hash).is_err());
+
+        let mut omitted_inventory = TRY_SEARCH_FWD_SOURCE;
+        omitted_inventory.assertions = &TRY_SEARCH_FWD_ASSERTIONS[..1];
+        assert!(validate_source_spec(&omitted_inventory).is_err());
+    }
+
+    #[test]
+    fn observers_execute_exact_assertions_and_reject_misbinding_or_omission() {
+        let mode = compiled_mode();
+        execute_adapter(&REGISTERED_ADAPTERS[0], &mode).unwrap();
+        execute_adapter(&REGISTERED_ADAPTERS[1], &mode).unwrap();
+
+        let misbound = RegisteredAdapter {
+            run: wrong_pattern_len,
+            ..REGISTERED_ADAPTERS[0]
+        };
+        assert_eq!(
+            execute_adapter(&misbound, &mode).unwrap_err(),
+            "assertion-execution-binding-mismatch",
+        );
+
+        let omitted = RegisteredAdapter {
+            run: omitted_second_assertion,
+            ..REGISTERED_ADAPTERS[1]
+        };
+        assert_eq!(
+            execute_adapter(&omitted, &mode).unwrap_err(),
+            "assertion-execution-count-mismatch",
+        );
+    }
+
+    #[test]
+    fn mode_agnostic_execution_cannot_be_relabeled() {
+        let mut relabeled_mode = compiled_mode();
+        relabeled_mode.mode_id = "vcs-all-features-doctest".to_owned();
+        relabeled_mode.default_features = false;
+        relabeled_mode.all_features = true;
+        let relabeled = RegisteredAdapter {
+            mode_id: "vcs-all-features-doctest",
+            ..REGISTERED_ADAPTERS[0]
+        };
+        assert_eq!(
+            execute_adapter(&relabeled, &relabeled_mode).unwrap_err(),
+            "compiled-mode-mismatch",
+        );
     }
 }
