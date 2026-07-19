@@ -71,16 +71,19 @@ pub(crate) fn parse_rust_ast(
         .octal(options.octal)
         .ignore_whitespace(options.ignore_whitespace)
         .empty_min_range(ast_options.empty_min_range);
-    let ast = builder.build().parse(source).map_err(|error| {
-        with_regex_span(
-            ParseError::new(
-                profile.clone(),
-                ErrorCategory::UpstreamRustSyntax,
-                error.to_string(),
-            ),
-            Some(error.span()),
-        )
-    })?;
+    let parsed = builder
+        .build()
+        .parse_with_comments(source)
+        .map_err(|error| {
+            with_regex_span(
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::UpstreamRustSyntax,
+                    error.to_string(),
+                ),
+                Some(error.span()),
+            )
+        })?;
     Ok(RustAstRecord {
         key: CacheKey {
             schema_version: SCHEMA_VERSION,
@@ -95,7 +98,8 @@ pub(crate) fn parse_rust_ast(
         reserved_max_nesting: reservation.max_nesting,
         reserved_parser_stack: reservation.parser_stack,
         reserved_parse_work: reservation.work,
-        ast,
+        ast: parsed.ast,
+        comments: parsed.comments,
     })
 }
 

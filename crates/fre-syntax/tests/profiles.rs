@@ -239,6 +239,30 @@ fn rust_ast_empty_min_range_is_explicit_and_resource_bounded() {
 }
 
 #[test]
+fn rust_ast_retains_exact_comment_side_channel() {
+    let pattern = "(?x)\n# first\nfoo # second\nbar";
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let expected = regex_syntax::ast::parse::Parser::new()
+        .parse_with_comments(pattern)
+        .expect("pinned parser accepts comment probe");
+    let observed = parse_rust_ast(ParseRequest::rust(pattern, profile))
+        .expect("FRE AST adapter accepts comment probe");
+
+    assert_eq!(observed.ast, expected.ast);
+    assert_eq!(observed.comments, expected.comments);
+    assert_eq!(observed.comments.len(), 2);
+    assert_eq!(observed.comments[0].comment, " first");
+    assert_eq!(observed.comments[1].comment, " second");
+
+    let plain = parse_rust_ast(ParseRequest::rust(
+        "foo#bar",
+        CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
+    ))
+    .expect("a hash is literal when whitespace mode is disabled");
+    assert!(plain.comments.is_empty());
+}
+
+#[test]
 fn rust_ast_node_reservation_covers_synthetic_empty_alternation_nodes() {
     use regex_syntax::ast::Ast;
 

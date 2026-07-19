@@ -67,6 +67,7 @@ const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_NEST_LIMIT_CASE_ID: &str = "ast::parse::tests::parse_nest_limit";
 const AST_COMMENTS_CASE_ID: &str = "ast::parse::tests::parse_comments";
+const AST_COMMENTS_PATTERN: &str = "(?x)\n# This is comment 1.\nfoo # This is comment 2.\n  # This is comment 3.\nbar\n# This is comment 4.";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
 const AST_IGNORE_WHITESPACE_CASE_ID: &str = "ast::parse::tests::parse_ignore_whitespace";
 const AST_NEWLINES_CASE_ID: &str = "ast::parse::tests::parse_newlines";
@@ -362,18 +363,14 @@ const HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID: &str =
 const INTRINSIC_UNOBSERVABLE_REASON_CODE: &str = "fre-adapter.intrinsic-unobservable";
 #[cfg(test)]
 const INTRINSIC_UNOBSERVABLE_IDS_SHA256: &str =
-    "2ae7e12c554b73dfd74c13f7e20b859f0615f6a2d00523ce0e027e66eec7225d";
+    "6790a2991ccb82dc1d7d37e8a82225050e9c8acd7a3f46b61473bcc21628d970";
 /// Exact upstream unit receipts whose asserted state cannot be produced or
 /// observed through any current FRE public or hidden syntax adapter.
 ///
 /// This registry is deliberately conservative. Publicly addressable work
 /// remains in the normal unsupported backlog even when its adapter has not
 /// been implemented yet.
-const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 11] = [
-    (
-        AST_COMMENTS_CASE_ID,
-        "private parse_with_comments comment side channel is absent from RustAstRecord",
-    ),
+const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 10] = [
     (
         AST_DECIMAL_CASE_ID,
         "private decimal helper result and pre-wrapper error are absent from public parsing",
@@ -2521,8 +2518,8 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 ];
 
 const LIMITATIONS: [&str; 3] = [
-    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 5 AST parser identities remain explicit Unsupported dispositions.",
-    "Eleven exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor/side-channel or constructor-only AST/HIR state is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
+    "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_comments, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 4 private AST parser identities remain explicit Unsupported dispositions.",
+    "Ten exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor state or constructor-only AST/HIR shape is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -2717,7 +2714,8 @@ enum TestOutcome {
 
 /// Authenticate the complete package, inventory both feature-mode harnesses,
 /// and execute the AST parser family as separately labelled upstream-oracle
-/// evidence. Eleven exact AST obligations additionally execute through FRE.
+/// evidence. Every obligation with a current FRE adapter additionally executes
+/// through FRE.
 #[allow(
     clippy::too_many_lines,
     reason = "the transaction keeps package authentication, four harness lists, the oracle execution, and sealed report assembly adjacent"
@@ -4140,6 +4138,7 @@ fn is_supported_ast_case(case_id: &str) -> bool {
     matches!(
         case_id,
         AST_NEST_LIMIT_CASE_ID
+            | AST_COMMENTS_CASE_ID
             | AST_HOLISTIC_CASE_ID
             | AST_IGNORE_WHITESPACE_CASE_ID
             | AST_NEWLINES_CASE_ID
@@ -4428,6 +4427,7 @@ fn is_supported_hir_translate_case(case_id: &str) -> bool {
 fn execute_ast_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
     let execution = match case_id {
         AST_NEST_LIMIT_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_nest_limit)),
+        AST_COMMENTS_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_comments)),
         AST_HOLISTIC_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_holistic)),
         AST_IGNORE_WHITESPACE_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_ignore_whitespace)),
         AST_NEWLINES_CASE_ID => catch_unwind(AssertUnwindSafe(run_ast_newlines)),
@@ -4788,6 +4788,38 @@ fn run_ast_nest_limit() -> Result<(), AstMismatch> {
         let mut profile = RustProfile::regex_1_12_4();
         profile.options.nest_limit = nest_limit;
         execute_ast_profile_equivalence_probe(pattern, &profile, &format!("nest-limit-{index}"))?;
+    }
+    Ok(())
+}
+
+fn run_ast_comments() -> Result<(), AstMismatch> {
+    let expected = regex_syntax::ast::parse::Parser::new()
+        .parse_with_comments(AST_COMMENTS_PATTERN)
+        .expect("authenticated comment probe parses upstream");
+    let profile = RustProfile::regex_1_12_4();
+    let observed = parse_rust_ast(ParseRequest::rust(
+        AST_COMMENTS_PATTERN,
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| AstMismatch {
+        expected: format!("exact upstream WithComments: {expected:?}"),
+        observed: format!("FRE error: {error:?}"),
+    })?;
+    validate_ast_record(&observed, AST_COMMENTS_PATTERN, &profile)?;
+    if observed.ast != expected.ast || observed.comments != expected.comments {
+        return Err(AstMismatch {
+            expected: format!("exact upstream WithComments: {expected:?}"),
+            observed: format!(
+                "FRE ast={:?} comments={:?}",
+                observed.ast, observed.comments
+            ),
+        });
+    }
+    if observed.comments.len() != 4 {
+        return Err(AstMismatch {
+            expected: "four source-ordered comments".to_owned(),
+            observed: format!("{} comments", observed.comments.len()),
+        });
     }
     Ok(())
 }
@@ -8302,6 +8334,7 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         AST_NEST_LIMIT_CASE_ID | AST_IGNORE_WHITESPACE_CASE_ID | AST_NEWLINES_CASE_ID => {
             write_ast_frontend_profile_evidence(&mut contract, case_id);
         }
+        AST_COMMENTS_CASE_ID => write_ast_comments_evidence(&mut contract),
         AST_HOLISTIC_CASE_ID => contract.push_str(
             "assertion-1=verbatim-right-bracket-span-0-1\nassertion-1-reservation=nodes:2,nesting:2,stack:2,work:1024\nassertion-2=18-escaped-metacharacters-exact-spans-0-36\nassertion-2-reservation=nodes:37,nesting:37,stack:37,work:18944\n",
         ),
@@ -8393,6 +8426,16 @@ fn ast_case_pass_evidence(case_id: &str) -> String {
         _ => unreachable!("pass evidence requires a supported AST case"),
     }
     sha256(contract.as_bytes())
+}
+
+fn write_ast_comments_evidence(contract: &mut String) {
+    writeln!(
+        contract,
+        "probe=sha256:{},bytes:{},expected:exact-pinned-WithComments,comments:4",
+        sha256(AST_COMMENTS_PATTERN.as_bytes()),
+        AST_COMMENTS_PATTERN.len(),
+    )
+    .expect("writing to a String cannot fail");
 }
 
 fn ast_print_pass_evidence(case_id: &str) -> String {
@@ -10843,29 +10886,25 @@ mod tests {
         }
 
         assert!(intrinsic_unobservable_reason("ast::tests::ast_size").is_none());
+        assert!(intrinsic_unobservable_reason(AST_COMMENTS_CASE_ID).is_none());
+        assert!(is_supported_ast_case(AST_COMMENTS_CASE_ID));
         assert!(intrinsic_unobservable_reason("hir::translate::tests::empty").is_none());
         assert!(intrinsic_unobservable_reason("utf8::tests::bmp").is_none());
     }
 
     #[test]
-    fn parser_option_family_covers_public_outcomes_but_not_comment_side_channel() {
+    fn parser_option_family_covers_public_outcomes_and_comment_side_channel() {
         assert_eq!(NEST_LIMIT_PROBES.len(), 20);
         assert_eq!(IGNORE_WHITESPACE_PROBES.len(), 8);
         run_ast_nest_limit().expect("all 20 pinned nest-limit outcomes match exactly");
         run_ast_ignore_whitespace().expect("all 8 pinned ignore-whitespace outcomes match exactly");
-
-        let comments_pattern = "(?x)\n# This is comment 1.\nfoo # This is comment 2.\n  # This is comment 3.\nbar\n# This is comment 4.";
-        let expected = regex_syntax::ast::parse::Parser::new()
-            .parse_with_comments(comments_pattern)
-            .expect("the pinned comment pattern parses with comments");
-        let observed = parse_rust_ast(ParseRequest::rust(
-            comments_pattern,
-            CompatibilityProfile::RustText(RustProfile::regex_1_12_4()),
-        ))
-        .expect("FRE parses the AST portion of the comment pattern");
-        assert_eq!(expected.ast, observed.ast);
-        assert_eq!(expected.comments.len(), 4);
-        assert!(!is_supported_ast_case(AST_COMMENTS_CASE_ID));
+        run_ast_comments().expect("exact AST and four-comment side channel match upstream");
+        assert_eq!(
+            execute_ast_case(AST_COMMENTS_CASE_ID),
+            RegexSyntaxCorpusDisposition::Pass {
+                evidence_sha256: ast_case_pass_evidence(AST_COMMENTS_CASE_ID),
+            },
+        );
     }
 
     #[test]

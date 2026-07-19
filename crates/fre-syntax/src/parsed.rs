@@ -1,4 +1,7 @@
-use regex_syntax::{ast::Ast, hir::Hir};
+use regex_syntax::{
+    ast::{Ast, Comment},
+    hir::Hir,
+};
 
 use crate::{AdmissionPolicy, CompatibilityProfile, ParseError, RustAstOptions, SafetyEnvelope};
 
@@ -185,6 +188,13 @@ pub struct RustAstRecord {
     pub reserved_parser_stack: u64,
     pub reserved_parse_work: u64,
     pub ast: Ast,
+    /// Source comments retained by the pinned parser, in source order.
+    ///
+    /// The aggregate comment text and span count are bounded by the already
+    /// admitted source. The pinned parser constructs this side channel even
+    /// for callers that subsequently discard it, so retaining it does not add
+    /// unreserved parser work or peak parser allocation.
+    pub comments: Vec<Comment>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
