@@ -64,7 +64,6 @@ const HIR_PRINT_PREFIX: &str = "hir::print::tests::";
 const AST_PARSE_IDS_SHA256: &str =
     "4d31a1829c82e76a3387354c9923d36a7305553c4c057723e12bd3f6bbdd4a0e";
 const AST_NEST_LIMIT_CASE_ID: &str = "ast::parse::tests::parse_nest_limit";
-#[cfg(test)]
 const AST_COMMENTS_CASE_ID: &str = "ast::parse::tests::parse_comments";
 const AST_HOLISTIC_CASE_ID: &str = "ast::parse::tests::parse_holistic";
 const AST_IGNORE_WHITESPACE_CASE_ID: &str = "ast::parse::tests::parse_ignore_whitespace";
@@ -76,14 +75,10 @@ const AST_CAPTURE_NAME_CASE_ID: &str = "ast::parse::tests::parse_capture_name";
 const AST_FLAGS_CASE_ID: &str = "ast::parse::tests::parse_flags";
 const AST_FLAG_CASE_ID: &str = "ast::parse::tests::parse_flag";
 const AST_SET_CLASS_CASE_ID: &str = "ast::parse::tests::parse_set_class";
-#[cfg(test)]
 const AST_SET_CLASS_OPEN_CASE_ID: &str = "ast::parse::tests::parse_set_class_open";
-#[cfg(test)]
 const AST_MAYBE_ASCII_CLASS_CASE_ID: &str = "ast::parse::tests::maybe_parse_ascii_class";
 const AST_COUNTED_REPETITION_CASE_ID: &str = "ast::parse::tests::parse_counted_repetition";
-#[cfg(test)]
 const AST_DECIMAL_CASE_ID: &str = "ast::parse::tests::parse_decimal";
-#[cfg(test)]
 const AST_PRIMITIVE_NON_ESCAPE_CASE_ID: &str = "ast::parse::tests::parse_primitive_non_escape";
 const AST_ESCAPE_CASE_ID: &str = "ast::parse::tests::parse_escape";
 const AST_HEX_BRACE_CASE_ID: &str = "ast::parse::tests::parse_hex_brace";
@@ -121,15 +116,56 @@ const HIR_PRINT_WORD_BOUNDARY_CASE_ID: &str = "hir::print::tests::print_word_bou
 const HIR_PRINT_REPETITION_CASE_ID: &str = "hir::print::tests::print_repetition";
 const HIR_PRINT_GROUP_CASE_ID: &str = "hir::print::tests::print_group";
 const HIR_PRINT_ALTERNATION_CASE_ID: &str = "hir::print::tests::print_alternation";
-#[cfg(test)]
 const HIR_PRINT_REGRESSION_REPETITION_CONCAT_CASE_ID: &str =
     "hir::print::tests::regression_repetition_concat";
-#[cfg(test)]
 const HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID: &str =
     "hir::print::tests::regression_repetition_alternation";
-#[cfg(test)]
 const HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID: &str =
     "hir::print::tests::regression_alternation_concat";
+const INTRINSIC_UNOBSERVABLE_REASON_CODE: &str = "fre-adapter.intrinsic-unobservable";
+#[cfg(test)]
+const INTRINSIC_UNOBSERVABLE_IDS_SHA256: &str =
+    "ad134df1ff6d486229b00edfc56039943df5af7a358ad5a192e4995996e4d1e8";
+/// Exact upstream unit receipts whose asserted state cannot be produced or
+/// observed through any current FRE public or hidden syntax adapter.
+///
+/// This registry is deliberately conservative. Publicly addressable work
+/// remains in the normal unsupported backlog even when its adapter has not
+/// been implemented yet.
+const INTRINSIC_UNOBSERVABLE_CASES: [(&str, &str); 8] = [
+    (
+        AST_COMMENTS_CASE_ID,
+        "private parse_with_comments comment side channel is absent from RustAstRecord",
+    ),
+    (
+        AST_DECIMAL_CASE_ID,
+        "private decimal helper result and pre-wrapper error are absent from public parsing",
+    ),
+    (
+        AST_PRIMITIVE_NON_ESCAPE_CASE_ID,
+        "private primitive cursor treats bare pipe as a literal before public alternation parsing",
+    ),
+    (
+        AST_SET_CLASS_OPEN_CASE_ID,
+        "private partial class and union pair plus cursor position are absent from public parsing",
+    ),
+    (
+        AST_MAYBE_ASCII_CLASS_CASE_ID,
+        "private optional ASCII-class probe and rewind state are absent from public parsing",
+    ),
+    (
+        HIR_PRINT_REGRESSION_REPETITION_CONCAT_CASE_ID,
+        "constructor-only repetition-over-concat HIR cannot be produced by FRE pattern parsing",
+    ),
+    (
+        HIR_PRINT_REGRESSION_REPETITION_ALTERNATION_CASE_ID,
+        "constructor-only repetition-over-alternation HIR cannot be produced by FRE pattern parsing",
+    ),
+    (
+        HIR_PRINT_REGRESSION_ALTERNATION_CONCAT_CASE_ID,
+        "constructor-only concat-over-alternation HIR cannot be produced by FRE pattern parsing",
+    ),
+];
 const REGRESSION_454_PATTERN: &str = r"
         2(?:
           [45]\d{3}|
@@ -751,7 +787,7 @@ const UNIT_SOURCE_MODULES: [(&str, &str); 11] = [
 
 const LIMITATIONS: [&str; 3] = [
     "The FRE AST adapter executes exactly parse_alternate, parse_capture_name, parse_counted_repetition, parse_escape, parse_flag, parse_flags, parse_group, parse_hex_brace, parse_hex_two, parse_hex_four, parse_hex_eight, parse_holistic, parse_ignore_whitespace, parse_nest_limit, parse_newlines, parse_octal, parse_perl_class, parse_uncounted_repetition, parse_unicode_class, parse_unsupported_backreference, parse_unsupported_lookaround, and regressions 454/455; the other 5 AST parser identities remain explicit Unsupported dispositions.",
-    "The other 147 regex-syntax unit definitions do not yet have FRE adapters and remain explicit Unsupported dispositions.",
+    "Eight exact upstream unit receipts are statically classified intrinsic-unobservable because their asserted private cursor/side-channel or constructor-only HIR state is absent from every current FRE public and hidden syntax adapter; all other unsupported unit receipts remain an addressable implementation backlog.",
     "Rustdoc identities are inventoried independently in both feature modes, but no FRE doctest adapter exists in this slice.",
 ];
 
@@ -2082,6 +2118,11 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
             reason_code: "fre-adapter.doctest-not-implemented".to_owned(),
         };
     }
+    if intrinsic_unobservable_reason(&obligation.case_id).is_some() {
+        return RegexSyntaxCorpusDisposition::Unsupported {
+            reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
+        };
+    }
     if obligation.case_id.starts_with(AST_PARSE_PREFIX) {
         if is_supported_ast_case(&obligation.case_id) {
             return execute_ast_case(&obligation.case_id);
@@ -2109,6 +2150,12 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
     RegexSyntaxCorpusDisposition::Unsupported {
         reason_code: "fre-adapter.unit-family-not-implemented".to_owned(),
     }
+}
+
+fn intrinsic_unobservable_reason(case_id: &str) -> Option<&'static str> {
+    INTRINSIC_UNOBSERVABLE_CASES
+        .iter()
+        .find_map(|(intrinsic_id, reason)| (*intrinsic_id == case_id).then_some(*reason))
 }
 
 #[derive(Debug)]
@@ -3820,6 +3867,12 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
         (
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
+        ) if intrinsic_unobservable_reason(&obligation.case_id).is_some() => {
+            reason_code == INTRINSIC_UNOBSERVABLE_REASON_CODE
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Unit,
+            RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) if obligation.case_id.starts_with(AST_PARSE_PREFIX) => {
             !is_supported_ast_case(&obligation.case_id)
                 && obligation.default_harness_member
@@ -4393,6 +4446,56 @@ mod tests {
         ] {
             assert!(!is_supported_hir_print_case(intrinsic));
         }
+    }
+
+    #[test]
+    fn intrinsic_unobservable_registry_is_exact_and_cannot_mask_addressable_work() {
+        let registered: BTreeMap<_, _> = INTRINSIC_UNOBSERVABLE_CASES.into_iter().collect();
+        assert_eq!(registered.len(), INTRINSIC_UNOBSERVABLE_CASES.len());
+        assert_eq!(
+            sha256(
+                registered
+                    .keys()
+                    .map(|case_id| format!("{case_id}\n"))
+                    .collect::<String>()
+                    .as_bytes(),
+            ),
+            INTRINSIC_UNOBSERVABLE_IDS_SHA256,
+        );
+        for (case_id, reason) in registered {
+            assert!(!reason.is_empty());
+            assert!(!is_supported_syntax_adapter_case(case_id));
+            let source_path = if case_id.starts_with(AST_PARSE_PREFIX) {
+                "src/ast/parse.rs"
+            } else {
+                "src/hir/print.rs"
+            };
+            let obligation = RegexSyntaxCorpusObligation {
+                case_id: case_id.to_owned(),
+                kind: RegexSyntaxCorpusCaseKind::Unit,
+                source_path: source_path.to_owned(),
+                source_line: 1,
+                source_sha256: "0".repeat(64),
+                default_harness_member: true,
+                no_default_harness_member: true,
+            };
+            let disposition = disposition_for(&obligation);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Unsupported {
+                    reason_code: INTRINSIC_UNOBSERVABLE_REASON_CODE.to_owned(),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation,
+                disposition,
+            })
+            .expect("exact intrinsic receipt must validate");
+        }
+
+        assert!(intrinsic_unobservable_reason("ast::tests::ast_size").is_none());
+        assert!(intrinsic_unobservable_reason("hir::translate::tests::empty").is_none());
+        assert!(intrinsic_unobservable_reason("utf8::tests::bmp").is_none());
     }
 
     #[test]
