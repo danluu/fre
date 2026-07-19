@@ -119,7 +119,7 @@ fn rust_ast_parse_reserves_work_before_parser_execution() {
     let pattern = r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~";
     let baseline = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
         .expect("strict AST conformance parse");
-    assert_eq!(baseline.reserved_ast_nodes, 37);
+    assert_eq!(baseline.reserved_ast_nodes, 74);
     assert_eq!(baseline.reserved_max_nesting, 37);
     assert_eq!(baseline.reserved_parser_stack, 37);
     assert_eq!(baseline.reserved_parse_work, 18_944);
@@ -167,6 +167,58 @@ fn rust_ast_parse_reserves_work_before_parser_execution() {
             observed: baseline.reserved_ast_nodes,
         }
     );
+}
+
+#[test]
+fn rust_ast_node_reservation_covers_synthetic_empty_alternation_nodes() {
+    use regex_syntax::ast::Ast;
+
+    let profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    for (pattern, reserved_nodes) in [("", 2), ("|", 4), ("||", 6), ("|a", 6), ("a|", 6)] {
+        let baseline = parse_rust_ast(ParseRequest::rust(pattern, profile.clone()))
+            .expect("empty alternation must parse under the prospective reservation");
+        assert_eq!(baseline.reserved_ast_nodes, reserved_nodes);
+        if pattern == "|" {
+            let Ast::Alternation(alternation) = &baseline.ast else {
+                panic!("sole alternation must produce an Alternation AST");
+            };
+            assert_eq!(alternation.asts.len(), 2);
+            assert!(
+                alternation
+                    .asts
+                    .iter()
+                    .all(|ast| matches!(ast, Ast::Empty(_)))
+            );
+        }
+
+        let mut quotas = SyntaxQuotas {
+            max_hir_nodes: reserved_nodes,
+            max_nesting: baseline.reserved_max_nesting,
+            max_traversal_stack: baseline.reserved_parser_stack,
+            max_parse_work: baseline.reserved_parse_work,
+            ..SyntaxQuotas::default()
+        };
+        parse_rust_ast(
+            ParseRequest::rust(pattern, profile.clone())
+                .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        )
+        .expect("exact prospective AST-node limit must pass");
+
+        quotas.max_hir_nodes = reserved_nodes - 1;
+        let error = parse_rust_ast(
+            ParseRequest::rust(pattern, profile.clone())
+                .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        )
+        .expect_err("one below prospective AST-node limit must fail before parsing");
+        assert_eq!(
+            error.category,
+            ErrorCategory::FreResourceLimit {
+                resource: ResourceKind::HirNodes,
+                limit: reserved_nodes - 1,
+                observed: reserved_nodes,
+            }
+        );
+    }
 }
 
 #[test]

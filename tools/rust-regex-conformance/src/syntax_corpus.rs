@@ -1636,12 +1636,15 @@ fn validate_ast_record(
     rust_profile: &RustProfile,
 ) -> Result<(), AstMismatch> {
     let expected_profile = CompatibilityProfile::RustText(rust_profile.clone());
-    let nodes = u64::try_from(pattern.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let nesting = nodes.min(u64::from(rust_profile.options.nest_limit).saturating_add(1));
+    let bytes = u64::try_from(pattern.len()).unwrap_or(u64::MAX);
+    let source_units = bytes.saturating_add(1);
+    let nodes = bytes
+        .checked_mul(2)
+        .and_then(|nodes| nodes.checked_add(2))
+        .unwrap_or(u64::MAX);
+    let nesting = source_units.min(u64::from(rust_profile.options.nest_limit).saturating_add(1));
     let stack = nesting;
-    let work = nodes.saturating_mul(512);
+    let work = source_units.saturating_mul(512);
     let valid = record.key.schema_version == SCHEMA_VERSION
         && record.key.pattern.as_bytes() == pattern.as_bytes()
         && record.key.profile == expected_profile

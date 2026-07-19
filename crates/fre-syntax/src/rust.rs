@@ -17,12 +17,18 @@ use crate::{
     RustUnicodeFeatures, SCHEMA_VERSION, SafetyEnvelope, UnicodeVersion,
 };
 
-// The 0.8.11 AST parser is single-pass. Each input byte can create at most one
-// AST node and at most one parser-stack entry. This deliberately generous
-// per-byte work reservation covers token classification, UTF-8 decoding,
-// span maintenance, checked nesting, and collection bookkeeping before any
-// of those operations execute. Keeping the multiplier fixed and visible makes
-// the safety claim auditable and quota behavior deterministic.
+// The 0.8.11 AST parser is single-pass. Its final AST can contain synthetic
+// empty branches in addition to nodes directly introduced by source tokens:
+// for example, `|` produces an Alternation containing two Empty children.
+// Inspection of the pinned parser's primitive, group, repetition, class,
+// Concat::into_ast and Alternation::into_ast construction sites gives the
+// conservative bound `2 * source_bytes + 2`: leaf and unary nodes are bounded
+// by source bytes plus one synthetic empty endpoint, and branching containers
+// have at least two children and are therefore bounded by the leaves beneath
+// them. Nesting, parser-stack and work reservations remain separately bounded
+// by source units. The fixed work multiplier covers token classification,
+// UTF-8 decoding, span maintenance, checked nesting, and collection
+// bookkeeping before any of those operations execute.
 const AST_PARSE_WORK_PER_SOURCE_UNIT: u64 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,13 +97,14 @@ fn reserve_ast_parse(
     safety: SafetyEnvelope,
 ) -> Result<AstParseReservation, ParseError> {
     let bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
-    let nodes = bytes.saturating_add(1);
+    let source_units = bytes.saturating_add(1);
+    let nodes = ast_node_upper_bound(bytes);
     // No nested parser construct can begin without consuming a source byte,
     // and the pinned parser independently refuses depth above `nest_limit`.
     let configured_depth = u64::from(options.nest_limit).saturating_add(1);
-    let max_nesting = nodes.min(configured_depth);
+    let max_nesting = source_units.min(configured_depth);
     let parser_stack = max_nesting;
-    let work = nodes.saturating_mul(AST_PARSE_WORK_PER_SOURCE_UNIT);
+    let work = source_units.saturating_mul(AST_PARSE_WORK_PER_SOURCE_UNIT);
     for (resource, observed) in [
         (ResourceKind::HirNodes, nodes),
         (ResourceKind::Nesting, max_nesting),
@@ -114,6 +121,13 @@ fn reserve_ast_parse(
         parser_stack,
         work,
     })
+}
+
+fn ast_node_upper_bound(source_bytes: u64) -> u64 {
+    source_bytes
+        .checked_mul(2)
+        .and_then(|nodes| nodes.checked_add(2))
+        .unwrap_or(u64::MAX)
 }
 
 pub(crate) fn parse_rust(
@@ -1421,6 +1435,16 @@ fn charge_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ast_node_upper_bound_covers_empty_alternations_and_overflow() {
+        assert_eq!(ast_node_upper_bound(0), 2);
+        assert_eq!(ast_node_upper_bound(1), 4);
+        assert_eq!(ast_node_upper_bound(2), 6);
+        assert_eq!(ast_node_upper_bound((u64::MAX - 2) / 2), u64::MAX - 1);
+        assert_eq!(ast_node_upper_bound((u64::MAX - 1) / 2), u64::MAX);
+        assert_eq!(ast_node_upper_bound(u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn unicode_case_work_constants_cover_pinned_lookup_and_sort_bounds() {
