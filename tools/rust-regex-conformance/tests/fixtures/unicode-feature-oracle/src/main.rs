@@ -47,6 +47,13 @@ const PROBES: &[(&str, &str)] = &[
     ("bool-unreachable-incb", r"\p{InCB}"),
     ("bool-is-c-collision", r"\p{IsC}"),
     ("case", r"(?i:\u{03B4})"),
+    ("case-ascii", r"(?i:a)"),
+    ("case-kelvin", r"(?i:\u{212A})"),
+    ("case-long-s", r"(?i:\u{017F})"),
+    ("case-sigma", r"(?i:\u{03C2})"),
+    ("case-unmapped", r"(?i:\u{1F600})"),
+    ("case-class", r"(?i:[a-z\u{03B4}])"),
+    ("case-negated-class", r"(?i:[^\u{03B4}])"),
     ("gencat", r"\pL"),
     ("perl", r"\b\w\b"),
     ("script", r"\p{Greek}"),
@@ -70,6 +77,7 @@ const PROBES: &[(&str, &str)] = &[
     ("i-direct-perl", r"(?i:\w)"),
     ("i-bracket-perl", r"(?i:[\w])"),
     ("scoped-order", r"(?i)(?-u:a)(?-i:\u{03B4})"),
+    ("nested-case-scope", r"(?i:(?-i:\u{03B4})a)"),
 ];
 
 fn main() {

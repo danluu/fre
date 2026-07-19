@@ -190,6 +190,7 @@ enum SemanticContract {
     NoUnicode,
     AgeUnicode,
     BoolUnicode,
+    CaseUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -208,6 +209,7 @@ struct QualifiedSemanticEvidence {
     no_unicode: String,
     age_unicode: String,
     bool_unicode: String,
+    case_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -323,7 +325,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-case",
         default_features: false,
         features: &["std", "unicode-case"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::CaseUnicode,
     },
     ConfigurationSpec {
         id: "unicode-gencat",
@@ -488,6 +490,7 @@ pub fn build_feature_matrix_report(
         no_unicode: run_no_unicode_contract()?,
         age_unicode: run_age_unicode_contract()?,
         bool_unicode: run_bool_unicode_contract()?,
+        case_unicode: run_case_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -724,6 +727,9 @@ fn run_configuration(
                 },
                 SemanticContract::BoolUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.bool_unicode.clone(),
+                },
+                SemanticContract::CaseUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.case_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -1034,6 +1040,73 @@ fn expected_bool_unicode_evidence() -> String {
     sha256(
         b"regex-1.12.4-unicode-bool;ascii=parsed;bool=parsed;age=refused;case=refused;gencat=refused;perl=refused;script=refused;segment=refused",
     )
+}
+
+fn run_case_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::CASE;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-case profile rejected table-free syntax: {error}"
+        ))
+    })?;
+
+    for pattern in [r"(?i:a)", r"(?i:\u{03B4})", r"(?i:[a-z\u{03A3}])"] {
+        let folded = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ))
+        .map_err(|error| {
+            InventoryError::new(format!(
+                "unicode-case profile rejected its case-fold witness {pattern}: {error}"
+            ))
+        })?;
+        if folded.summary.class_ranges == 0 {
+            return Err(InventoryError::new(format!(
+                "unicode-case witness {pattern} produced no class ranges"
+            )));
+        }
+    }
+
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "case" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-case profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-case {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_case_unicode_evidence())
+}
+
+fn expected_case_unicode_evidence() -> String {
+    let mut evidence = "regex-1.12.4-unicode-case;ascii=parsed;case=parsed".to_owned();
+    for &(family, _) in NO_UNICODE_WITNESSES {
+        if family == "case" {
+            continue;
+        }
+        evidence.push(';');
+        evidence.push_str(family);
+        evidence.push_str("=refused");
+    }
+    sha256(evidence.as_bytes())
 }
 
 fn authenticate_upstream_package(
@@ -1380,6 +1453,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_bool_unicode_evidence() => Ok(()),
         (
+            SemanticContract::CaseUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_case_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1443,6 +1523,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         SemanticContract::NoUnicode => return expected_no_unicode_evidence(),
         SemanticContract::AgeUnicode => return expected_age_unicode_evidence(),
         SemanticContract::BoolUnicode => return expected_bool_unicode_evidence(),
+        SemanticContract::CaseUnicode => return expected_case_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1503,12 +1584,19 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::CaseUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(
                     spec.semantic,
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            5
+            4
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1541,6 +1629,9 @@ mod tests {
             bool_unicode,
             "1bb69975eda4493bb237976772da97ec3b6ea15c0416c55c5924e41e87c84b6a"
         );
+        let case_unicode = run_case_unicode_contract().expect("unicode-case semantic gate");
+        assert_eq!(case_unicode, expected_case_unicode_evidence());
+        assert!(is_sha256(&case_unicode));
     }
 
     #[test]

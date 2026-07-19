@@ -202,6 +202,17 @@ struct ActiveUnicodeFlags {
     unicode: bool,
 }
 
+enum CaseClassNode<'a> {
+    Set(&'a ast::ClassSet),
+    Item(&'a ast::ClassSetItem),
+}
+
+const UNICODE_CASE_CODEPOINTS: u64 = 0x11_0000;
+const UNICODE_CASE_TABLE_KEYS: u64 = 2_938;
+const UNICODE_CASE_MAX_FOLDS_PER_KEY: u64 = 3;
+const UNICODE_CASE_MAPPING_WORK_PER_CODEPOINT: u64 = 20;
+const UNICODE_CASE_CANONICALIZE_WORK_PER_RANGE: u64 = 256;
+
 impl UnicodeAvailabilityVisitor<'_> {
     fn charge(&mut self, amount: u64) -> Result<(), ParseError> {
         checked_add(
@@ -234,14 +245,157 @@ impl UnicodeAvailabilityVisitor<'_> {
         }
     }
 
-    fn require_case(&self, span: &ast::Span) -> Result<(), ParseError> {
-        if !self.flags.case_insensitive || !self.flags.unicode {
-            return Ok(());
+    fn require_case(&mut self, span: &ast::Span) -> Result<bool, ParseError> {
+        // Charge each branch/feature comparison performed by this classifier.
+        // `has_case` performs at most two comparisons (`ALL`, then `CASE`), so
+        // both are charged before consulting it. This keeps the gate bounded
+        // independently of whether the requested profile owns the table.
+        self.charge(1)?;
+        if !self.flags.case_insensitive {
+            return Ok(false);
+        }
+        self.charge(1)?;
+        if !self.flags.unicode {
+            return Ok(false);
+        }
+        self.charge(2)?;
+        if self.features.has_case() {
+            return Ok(true);
         }
         self.reject(
             span,
             "Unicode case-folding data is unavailable in this Rust profile",
-        )
+        )?;
+        Ok(false)
+    }
+
+    fn charge_case_fold_literal(&mut self) -> Result<(), ParseError> {
+        // Two pinned-table binary searches, the ordered mapping lookup and a
+        // maximum three-member equivalence class all fit within this bound.
+        // Reserving it before translation prevents a quota from being checked
+        // only after regex-syntax has already done the work.
+        self.charge(64)
+    }
+
+    fn charge_case_fold_class(&mut self, class: &ast::ClassBracketed) -> Result<(), ParseError> {
+        // regex-syntax 0.8.11 / Unicode 16.0 has exactly 2,938 simple-fold
+        // keys and at most three mapped scalars per key. Its class folder does
+        // an ordered mapping lookup for every scalar in each canonical input
+        // range, then canonicalizes the original and appended ranges. We
+        // derive conservative scalar/range upper bounds from this exact AST,
+        // charging the auxiliary analysis itself as it runs.
+        let mut stack = Vec::new();
+        self.push_case_class_node(&mut stack, CaseClassNode::Set(&class.kind))?;
+        let mut codepoints = 0_u64;
+        let mut ranges = 0_u64;
+        // The root bracket is folded once. ASCII items and nested brackets
+        // are folded before union, and each binary operator folds both sides
+        // before applying the operator. Multiplying the aggregate upper bound
+        // by all sites conservatively covers repeated folding at every level.
+        let mut fold_sites = 1_u64;
+        loop {
+            // Charge the emptiness comparison before the pop, then reserve
+            // the enum/cardinality branch and checked/capped arithmetic.
+            self.charge(1)?;
+            let Some(node) = stack.pop() else {
+                break;
+            };
+            self.charge(7)?;
+            match node {
+                CaseClassNode::Set(ast::ClassSet::Item(item)) => {
+                    self.push_case_class_node(&mut stack, CaseClassNode::Item(item))?;
+                }
+                CaseClassNode::Set(ast::ClassSet::BinaryOp(op)) => {
+                    fold_sites = fold_sites.saturating_add(2);
+                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&op.lhs))?;
+                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&op.rhs))?;
+                }
+                CaseClassNode::Item(
+                    ast::ClassSetItem::Empty(_)
+                    | ast::ClassSetItem::Unicode(_)
+                    | ast::ClassSetItem::Perl(_),
+                ) => {
+                    // A CASE-only profile rejects Unicode/Perl families later
+                    // in this same walk, before translation can fold them.
+                    // An empty set likewise requires no table work.
+                }
+                CaseClassNode::Item(ast::ClassSetItem::Literal(_)) => {
+                    codepoints = codepoints.saturating_add(1).min(UNICODE_CASE_CODEPOINTS);
+                    ranges = ranges.saturating_add(1);
+                }
+                CaseClassNode::Item(ast::ClassSetItem::Range(range)) => {
+                    let width = u64::from(u32::from(range.end.c))
+                        .saturating_sub(u64::from(u32::from(range.start.c)))
+                        .saturating_add(1);
+                    codepoints = codepoints
+                        .saturating_add(width)
+                        .min(UNICODE_CASE_CODEPOINTS);
+                    ranges = ranges.saturating_add(1);
+                }
+                CaseClassNode::Item(ast::ClassSetItem::Ascii(_)) => {
+                    // Every POSIX ASCII class is a subset of the 128 ASCII
+                    // scalars and has at most that many singleton ranges.
+                    codepoints = codepoints.saturating_add(128).min(UNICODE_CASE_CODEPOINTS);
+                    ranges = ranges.saturating_add(128);
+                    fold_sites = fold_sites.saturating_add(1);
+                }
+                CaseClassNode::Item(ast::ClassSetItem::Bracketed(nested)) => {
+                    fold_sites = fold_sites.saturating_add(1);
+                    // regex-syntax folds the positive nested class before
+                    // negation and preserves the folded marker through that
+                    // negation. Therefore only the nested positive operands,
+                    // visited below, contribute table lookups.
+                    self.push_case_class_node(&mut stack, CaseClassNode::Set(&nested.kind))?;
+                }
+                CaseClassNode::Item(ast::ClassSetItem::Union(union)) => {
+                    ranges =
+                        ranges.saturating_add(u64::try_from(union.items.len()).unwrap_or(u64::MAX));
+                    for item in &union.items {
+                        self.push_case_class_node(&mut stack, CaseClassNode::Item(item))?;
+                    }
+                }
+            }
+        }
+
+        if codepoints == 0 {
+            return Ok(());
+        }
+        let mapping_work = codepoints
+            .saturating_mul(fold_sites)
+            .saturating_mul(UNICODE_CASE_MAPPING_WORK_PER_CODEPOINT);
+        let fold_outputs = UNICODE_CASE_TABLE_KEYS.saturating_mul(UNICODE_CASE_MAX_FOLDS_PER_KEY);
+        let canonicalize_work = ranges
+            .saturating_add(fold_outputs)
+            .saturating_mul(fold_sites)
+            .saturating_mul(UNICODE_CASE_CANONICALIZE_WORK_PER_RANGE);
+        self.charge(mapping_work)?;
+        self.charge(canonicalize_work)
+    }
+
+    fn push_case_class_node<'a>(
+        &mut self,
+        stack: &mut Vec<CaseClassNode<'a>>,
+        node: CaseClassNode<'a>,
+    ) -> Result<(), ParseError> {
+        // Reserve the length conversion, checked increment and limit
+        // comparison before observing or mutating the auxiliary stack.
+        self.charge(3)?;
+        let pending = u64::try_from(stack.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let limit = self
+            .admission
+            .limit_for(ResourceKind::TraversalStack, self.safety);
+        if pending > limit {
+            return Err(self.admission.limit_error(
+                self.profile.clone(),
+                ResourceKind::TraversalStack,
+                self.safety,
+                pending,
+            ));
+        }
+        stack.push(node);
+        Ok(())
     }
 
     fn class_perl(&self, class: &ast::ClassPerl) -> Result<(), ParseError> {
@@ -385,8 +539,18 @@ impl ast::Visitor for UnicodeAvailabilityVisitor<'_> {
             }
         }
         match node {
-            Ast::Literal(literal) => self.require_case(&literal.span),
-            Ast::ClassBracketed(class) => self.require_case(&class.span),
+            Ast::Literal(literal) => {
+                if self.require_case(&literal.span)? {
+                    self.charge_case_fold_literal()?;
+                }
+                Ok(())
+            }
+            Ast::ClassBracketed(class) => {
+                if self.require_case(&class.span)? {
+                    self.charge_case_fold_class(class)?;
+                }
+                Ok(())
+            }
             Ast::Assertion(assertion)
                 if self.flags.unicode
                     && matches!(
@@ -883,4 +1047,32 @@ fn charge_kind(
         safety,
         ResourceKind::ParseWork,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_case_work_constants_cover_pinned_lookup_and_sort_bounds() {
+        const COMPARISON_EQUIVALENTS_PER_SORT_LEVEL: u64 = 8;
+        const CANONICALIZE_LINEAR_PASSES: u64 = 4;
+
+        let table_search_levels =
+            u64::from(u64::BITS - (UNICODE_CASE_TABLE_KEYS.saturating_sub(1)).leading_zeros());
+        // Besides binary search, mapping checks ordered input, the next
+        // cursor, key equality, exhaustion and the successful-index invariant.
+        assert!(UNICODE_CASE_MAPPING_WORK_PER_CODEPOINT >= table_search_levels + 7);
+
+        let max_authenticated_input_ranges = SafetyEnvelope::default().max_pattern_bytes;
+        let max_fold_outputs = UNICODE_CASE_TABLE_KEYS * UNICODE_CASE_MAX_FOLDS_PER_KEY;
+        let max_sort_ranges = max_authenticated_input_ranges + max_fold_outputs;
+        let sort_levels = u64::from(u64::BITS - max_sort_ranges.saturating_sub(1).leading_zeros());
+        assert!(sort_levels <= 26);
+        assert!(
+            UNICODE_CASE_CANONICALIZE_WORK_PER_RANGE
+                >= sort_levels * COMPARISON_EQUIVALENTS_PER_SORT_LEVEL + CANONICALIZE_LINEAR_PASSES
+        );
+        assert_eq!(UNICODE_CASE_CODEPOINTS, 0x11_0000);
+    }
 }

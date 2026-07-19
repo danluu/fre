@@ -237,6 +237,114 @@ fn unicode_bool_profile_accepts_only_binary_property_data() {
 }
 
 #[test]
+fn unicode_case_profile_accepts_only_unicode_simple_case_folding() {
+    let mut case = RustProfile::regex_1_12_4();
+    case.unicode_features = RustUnicodeFeatures::CASE;
+    let case_profile = CompatibilityProfile::RustText(case.clone());
+    let full_profile = CompatibilityProfile::rust_text();
+
+    // These cover literals with and without mappings, multi-member simple
+    // folds, bracket/range folding, negation and all flag-scope transitions.
+    for pattern in [
+        r"(?i:a)",
+        r"(?i:\u{03B4})",
+        r"(?i:k)",
+        r"(?i:\u{212A})",
+        r"(?i:s)",
+        r"(?i:\u{017F})",
+        r"(?i:\u{03A3})",
+        r"(?i:\u{03C2})",
+        r"(?i:\u{1F600})",
+        r"(?i:[a-z])",
+        r"(?i:[^\u{03B4}])",
+        r"(?i:[a-z&&[^q]])",
+        r"(?i)(?-u:a)(?u:\u{03B4})",
+        r"(?i:(?-i:\u{03B4})a)",
+    ] {
+        let partial = parse(ParseRequest::rust(pattern, case_profile.clone()))
+            .unwrap_or_else(|error| panic!("unicode-case rejected {pattern}: {error:?}"));
+        let full = parse(ParseRequest::rust(pattern, full_profile.clone()))
+            .unwrap_or_else(|error| panic!("all-table profile rejected {pattern}: {error:?}"));
+        let CanonicalPattern::Rust(partial) = partial.pattern else {
+            panic!("Rust request returned another syntax family")
+        };
+        let CanonicalPattern::Rust(full) = full.pattern else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(partial.hir, full.hir, "case-folded HIR for {pattern}");
+    }
+
+    // Case folding has no property aliases of its own. Every independently
+    // feature-gated Unicode family remains unavailable, including when `i`
+    // would otherwise ask to case-fold the resulting class.
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"\p{Alphabetic}",
+        r"\pL",
+        r"\w",
+        r"\b",
+        r"\p{Greek}",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"(?i:\p{Age=6.0})",
+        r"(?i:[\w])",
+    ] {
+        let error = parse(ParseRequest::rust(pattern, case_profile.clone()))
+            .expect_err("unicode-case must not borrow another data family");
+        assert_eq!(
+            error.category,
+            ErrorCategory::UpstreamRustSyntax,
+            "{pattern}"
+        );
+    }
+
+    for pattern in [r"(?i)", r"(?i:.)", r"(?i:^$)", r"(?i-u:a)", r"(?-u:\w)"] {
+        parse(ParseRequest::rust(pattern, case_profile.clone()))
+            .unwrap_or_else(|error| panic!("table-free case scope {pattern}: {error:?}"));
+    }
+
+    let mut builder_case = case.clone();
+    builder_case.options.case_insensitive = true;
+    let mut builder_full = RustProfile::regex_1_12_4();
+    builder_full.options.case_insensitive = true;
+    for pattern in ["a", "Σ", "[a-z]"] {
+        let partial = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(builder_case.clone()),
+        ))
+        .expect("unicode-case builder option parses");
+        let full = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(builder_full.clone()),
+        ))
+        .expect("all-table builder option parses");
+        let (CanonicalPattern::Rust(partial), CanonicalPattern::Rust(full)) =
+            (partial.pattern, full.pattern)
+        else {
+            panic!("Rust request returned another syntax family")
+        };
+        assert_eq!(
+            partial.hir, full.hir,
+            "builder case-folded HIR for {pattern}"
+        );
+    }
+
+    let mut case_set = RustProfile::regex_set_1_12_4();
+    case_set.unicode_features = RustUnicodeFeatures::CASE;
+    fre_syntax::validate_rust_regex_set_admission(
+        &[r"(?i:a)", r"(?i:\u{03B4})"],
+        &CompatibilityProfile::RustText(case_set.clone()),
+    )
+    .expect("unicode-case set admission");
+    let error = fre_syntax::validate_rust_regex_set_admission(
+        &[r"(?i:a)", r"\p{Alphabetic}"],
+        &CompatibilityProfile::RustText(case_set),
+    )
+    .expect_err("unicode-case set cannot borrow unicode-bool");
+    assert_eq!(error.pattern, Some(1));
+    assert_eq!(error.source.category, ErrorCategory::UpstreamRustSyntax);
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -272,6 +380,18 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     assert_ne!(partial.key, boolean.key);
     assert_ne!(age.key, boolean.key);
     assert_ne!(boolean.key, full.key);
+
+    let mut case = RustProfile::regex_1_12_4();
+    case.unicode_features = RustUnicodeFeatures::CASE;
+    let case = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(case),
+    ))
+    .expect("table-free syntax under case profile");
+    assert_ne!(partial.key, case.key);
+    assert_ne!(age.key, case.key);
+    assert_ne!(boolean.key, case.key);
+    assert_ne!(case.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -453,6 +573,132 @@ fn unicode_bool_alias_analysis_obeys_exact_parse_work_limit() {
             } if limit == exact - 1
         ));
     }
+}
+
+#[test]
+fn unicode_case_analysis_obeys_exact_parse_work_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::CASE;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"(?i:[A-Z\u{03A3}\u{212A}])|(?i-u:[a-z])|(?-i:\u{03B4})";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("baseline unicode-case analysis");
+    let exact = baseline.summary.parse_work;
+    assert!(exact > u64::try_from(pattern.len()).expect("pattern length fits u64"));
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    let exact_record = parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact Unicode case classifier work limit must pass");
+    assert_eq!(exact_record.summary.parse_work, exact);
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below Unicode case classifier work must fail");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_case_wide_range_work_is_reserved_before_translation() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::CASE;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"(?i:[\u{0}-\u{10FFFF}])";
+    let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+        .expect("wide Unicode case-fold range is within the hard safety envelope");
+    let exact = baseline.summary.parse_work;
+    assert!(
+        exact > 20_000_000,
+        "wide table traversal must be precharged"
+    );
+
+    let mut quotas = SyntaxQuotas {
+        max_parse_work: exact,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone())
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect("exact wide-range case-fold work limit must pass");
+
+    quotas.max_parse_work = exact - 1;
+    let error = parse(
+        ParseRequest::rust(pattern, compatibility)
+            .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+    )
+    .expect_err("one below wide-range case-fold work must fail before translation");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::ParseWork,
+            limit,
+            ..
+        } if limit == exact - 1
+    ));
+}
+
+#[test]
+fn unicode_case_auxiliary_stack_has_an_exact_prospective_limit() {
+    const EXPECTED_MAX_STACK: u64 = 5;
+
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::CASE;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    let pattern = r"(?i:[a&&[b&&[c&&[d&&e]]]])";
+
+    // Each binary node pushes lhs then rhs, so LIFO traversal retains one lhs
+    // while descending the right-nested operand. The root reaches 2 pending
+    // nodes, and the three nested binary nodes raise that to 3, 4 and exactly
+    // 5. Bracket wrapper nodes replace themselves and do not raise the peak.
+
+    let exact_quotas = SyntaxQuotas {
+        max_parse_work: 60_000_000,
+        max_traversal_stack: EXPECTED_MAX_STACK,
+        ..SyntaxQuotas::default()
+    };
+    parse(
+        ParseRequest::rust(pattern, compatibility.clone()).with_admission(AdmissionPolicy::Quota(
+            QuotaBounded {
+                syntax: exact_quotas,
+            },
+        )),
+    )
+    .expect("exact auxiliary traversal-stack limit must pass");
+
+    let below_quotas = SyntaxQuotas {
+        max_traversal_stack: EXPECTED_MAX_STACK - 1,
+        ..exact_quotas
+    };
+    let error = parse(ParseRequest::rust(pattern, compatibility).with_admission(
+        AdmissionPolicy::Quota(QuotaBounded {
+            syntax: below_quotas,
+        }),
+    ))
+    .expect_err("one below auxiliary traversal-stack limit must fail prospectively");
+    assert!(matches!(
+        error.category,
+        ErrorCategory::FreResourceLimit {
+            resource: ResourceKind::TraversalStack,
+            limit,
+            observed,
+        } if limit == EXPECTED_MAX_STACK - 1 && observed == EXPECTED_MAX_STACK
+    ));
 }
 
 #[test]
