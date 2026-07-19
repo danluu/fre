@@ -223,6 +223,32 @@ const HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID: &str =
     "hir::translate::tests::regression_fuzz_match";
 const HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_CASE_ID: &str =
     "hir::translate::tests::regression_fuzz_difference1";
+const HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor (line 103)";
+const HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor (line 128)";
+const HIR_DOCTEST_LIMIT_CLASS_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor::limit_class (line 237)";
+const HIR_DOCTEST_LIMIT_REPEAT_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor::limit_repeat (line 274)";
+const HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor::limit_literal_len (line 311)";
+const HIR_DOCTEST_LIMIT_TOTAL_CASE_ID: &str =
+    "src/hir/literal.rs - hir::literal::Extractor::limit_total (line 353)";
+const HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Class::minimum_len (line 926)";
+const HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Class::maximum_len (line 970)";
+const HIR_DOCTEST_PROPERTIES_IS_UTF8_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Properties::is_utf8 (line 2094)";
+const HIR_DOCTEST_PROPERTIES_CAPTURES_LEN_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Properties::explicit_captures_len (line 2155)";
+const HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Properties::static_explicit_captures_len (line 2183)";
+const HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Properties::union (line 2255)";
+const HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID: &str =
+    "src/hir/mod.rs - hir::Properties::union (line 2285)";
 const INTRINSIC_UNOBSERVABLE_REASON_CODE: &str = "fre-adapter.intrinsic-unobservable";
 #[cfg(test)]
 const INTRINSIC_UNOBSERVABLE_IDS_SHA256: &str =
@@ -1431,6 +1457,12 @@ const HIR_TRANSLATE_REGRESSION_FUZZ_DIFFERENCE_PROBES: [HirTranslateProbe; 1] = 
     r"\W\W|\W[^\v--\W\W\P{Script_Extensions:Pau_Cin_Hau}\u10A1A1-\U{3E3E3}--~~~~--~~~~~~~~------~~~~~~--~~~~~~]*",
     false,
 )];
+const HIR_DOCTEST_CLASS_MINIMUM_LEN_PROBES: [&str; 6] =
+    [r"", r"^$\b\B", r"a*", r"[a&&b]", r"\w", r"\p{Cyrillic}"];
+const HIR_DOCTEST_CLASS_MAXIMUM_LEN_PROBES: [&str; 6] =
+    [r"", r"^$\b\B", r"[a&&b]", r"x{2,10}", r"x{2,}", r"\w"];
+const HIR_DOCTEST_PROPERTIES_UNION_NEVER_PROBES: [&str; 3] = [r"ab?c?", r"[a&&b]", r"wxy?z?"];
+const HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_PROBES: [&str; 3] = [r"ab?c?", r"a+", r"wxy?z?"];
 const HIR_LITERAL_LITERAL_PROBES: [&str; 17] = [
     "a",
     "aaaaa",
@@ -3355,6 +3387,9 @@ fn is_harness_fault(reason_code: &str) -> bool {
 
 fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpusDisposition {
     if obligation.kind == RegexSyntaxCorpusCaseKind::Doctest {
+        if is_supported_hir_doctest_case(&obligation.case_id) {
+            return execute_hir_doctest_case(&obligation.case_id);
+        }
         return RegexSyntaxCorpusDisposition::Unsupported {
             reason_code: "fre-adapter.doctest-not-implemented".to_owned(),
         };
@@ -3716,6 +3751,25 @@ fn is_supported_hir_class_operation_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_hir_doctest_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID
+            | HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID
+            | HIR_DOCTEST_LIMIT_CLASS_CASE_ID
+            | HIR_DOCTEST_LIMIT_REPEAT_CASE_ID
+            | HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID
+            | HIR_DOCTEST_LIMIT_TOTAL_CASE_ID
+            | HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID
+            | HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID
+            | HIR_DOCTEST_PROPERTIES_IS_UTF8_CASE_ID
+            | HIR_DOCTEST_PROPERTIES_CAPTURES_LEN_CASE_ID
+            | HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID
+            | HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID
+            | HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID
+    )
+}
+
 fn is_supported_hir_translate_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -3904,6 +3958,28 @@ fn execute_hir_class_operation_case(case_id: &str) -> RegexSyntaxCorpusDispositi
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-hir-class-operation-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_hir_doctest_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_hir_doctest_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: hir_doctest_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: hir_doctest_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-hir-doctest-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -5023,6 +5099,166 @@ fn apply_bytes_class_operation(
     }
 }
 
+fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
+    if let Some(pattern) = hir_extractor_doctest_pattern(case_id) {
+        let (expected_hir, observed_hir) = exact_text_hir_pair(pattern, case_id)?;
+        let expected = hir_extractor_doctest_sequences(case_id, &expected_hir);
+        let observed = hir_extractor_doctest_sequences(case_id, &observed_hir);
+        return if observed == expected {
+            Ok(())
+        } else {
+            Err(AstMismatch {
+                expected: format!("{case_id}: exact public extractor sequences {expected:?}"),
+                observed: format!("{case_id}: {observed:?}"),
+            })
+        };
+    }
+    match case_id {
+        HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID => {
+            run_hir_doctest_property_probes(&HIR_DOCTEST_CLASS_MINIMUM_LEN_PROBES, case_id)
+        }
+        HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID => {
+            run_hir_doctest_property_probes(&HIR_DOCTEST_CLASS_MAXIMUM_LEN_PROBES, case_id)
+        }
+        HIR_DOCTEST_PROPERTIES_IS_UTF8_CASE_ID => {
+            run_hir_translate_case(HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID)
+        }
+        HIR_DOCTEST_PROPERTIES_CAPTURES_LEN_CASE_ID => {
+            run_hir_translate_case(HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID)
+        }
+        HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID => {
+            run_hir_translate_case(HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID)
+        }
+        HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID => {
+            run_hir_doctest_properties_union(&HIR_DOCTEST_PROPERTIES_UNION_NEVER_PROBES, case_id)
+        }
+        HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID => run_hir_doctest_properties_union(
+            &HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_PROBES,
+            case_id,
+        ),
+        _ => unreachable!("caller checked supported HIR doctest case"),
+    }
+}
+
+fn hir_extractor_doctest_pattern(case_id: &str) -> Option<&'static str> {
+    match case_id {
+        HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID => Some(r"(a|b|c)(x|y|z)[A-Z]+foo"),
+        HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID => Some(r"foo|[A-Z]+bar"),
+        HIR_DOCTEST_LIMIT_CLASS_CASE_ID => Some(r"[0-9]"),
+        HIR_DOCTEST_LIMIT_REPEAT_CASE_ID => Some(r"(abc){8}"),
+        HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID => Some(r"(abc){2}{2}{2}"),
+        HIR_DOCTEST_LIMIT_TOTAL_CASE_ID => Some(r"[ab]{2}{2}"),
+        _ => None,
+    }
+}
+
+fn hir_extractor_doctest_sequences(
+    case_id: &str,
+    hir: &regex_syntax::hir::Hir,
+) -> Vec<regex_syntax::hir::literal::Seq> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let default = || Extractor::new().extract(hir);
+    match case_id {
+        HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID => vec![default()],
+        HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID => {
+            vec![Extractor::new().kind(ExtractKind::Suffix).extract(hir)]
+        }
+        HIR_DOCTEST_LIMIT_CLASS_CASE_ID => {
+            vec![default(), Extractor::new().limit_class(4).extract(hir)]
+        }
+        HIR_DOCTEST_LIMIT_REPEAT_CASE_ID => {
+            vec![default(), Extractor::new().limit_repeat(4).extract(hir)]
+        }
+        HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID => vec![
+            default(),
+            Extractor::new().limit_literal_len(14).extract(hir),
+        ],
+        HIR_DOCTEST_LIMIT_TOTAL_CASE_ID => {
+            vec![default(), Extractor::new().limit_total(10).extract(hir)]
+        }
+        _ => unreachable!("caller checked extractor doctest case"),
+    }
+}
+
+fn exact_text_hir_pair(
+    pattern: &str,
+    assertion: &str,
+) -> Result<(regex_syntax::hir::Hir, regex_syntax::hir::Hir), AstMismatch> {
+    let compatibility = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let expected_hir = regex_syntax::parse(pattern).map_err(|error| AstMismatch {
+        expected: format!("{assertion}: authenticated upstream HIR parse succeeds"),
+        observed: format!("{assertion}: upstream HIR parse error {error:?}"),
+    })?;
+    let record =
+        parse(ParseRequest::rust(pattern, compatibility.clone())).map_err(|error| AstMismatch {
+            expected: format!("{assertion}: FRE HIR parse succeeds"),
+            observed: format!("{assertion}: FRE HIR parse error {error:?}"),
+        })?;
+    let CanonicalPattern::Rust(parsed) = &record.pattern else {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: FRE Rust canonical HIR"),
+            observed: format!("{assertion}: {:?}", record.pattern),
+        });
+    };
+    let identity_valid = record.key.schema_version == SCHEMA_VERSION
+        && record.key.pattern.as_bytes() == pattern.as_bytes()
+        && record.key.profile == compatibility
+        && record.key.admission == AdmissionPolicy::default()
+        && record.key.safety == SafetyEnvelope::default()
+        && record.admission_status == AdmissionStatus::UpstreamOraclePending;
+    if !identity_valid || parsed.hir != expected_hir {
+        return Err(AstMismatch {
+            expected: format!("{assertion}: exact FRE record and HIR {expected_hir:?}"),
+            observed: format!("{assertion}: {record:?}"),
+        });
+    }
+    Ok((expected_hir, parsed.hir.clone()))
+}
+
+fn run_hir_doctest_property_probes(probes: &[&str], assertion: &str) -> Result<(), AstMismatch> {
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        let (expected, observed) = exact_text_hir_pair(pattern, &format!("{assertion}-{index}"))?;
+        if observed.properties() != expected.properties() {
+            return Err(AstMismatch {
+                expected: format!(
+                    "{assertion}-{index}: properties {:?}",
+                    expected.properties()
+                ),
+                observed: format!(
+                    "{assertion}-{index}: properties {:?}",
+                    observed.properties()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn run_hir_doctest_properties_union(probes: &[&str], assertion: &str) -> Result<(), AstMismatch> {
+    let mut expected_hirs = Vec::new();
+    let mut observed_hirs = Vec::new();
+    for (index, pattern) in probes.iter().copied().enumerate() {
+        let (expected, observed) = exact_text_hir_pair(pattern, &format!("{assertion}-{index}"))?;
+        expected_hirs.push(expected);
+        observed_hirs.push(observed);
+    }
+    let expected = regex_syntax::hir::Properties::union(
+        expected_hirs.iter().map(regex_syntax::hir::Hir::properties),
+    );
+    let observed = regex_syntax::hir::Properties::union(
+        observed_hirs.iter().map(regex_syntax::hir::Hir::properties),
+    );
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(AstMismatch {
+            expected: format!("{assertion}: unioned properties {expected:?}"),
+            observed: format!("{assertion}: unioned properties {observed:?}"),
+        })
+    }
+}
+
 fn run_hir_translate_case(case_id: &str) -> Result<(), AstMismatch> {
     if case_id == HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID {
         return execute_hir_translate_fuzz_match_probe();
@@ -6015,6 +6251,69 @@ fn write_hir_class_operation_evidence(
     .expect("writing to a String cannot fail");
 }
 
+fn hir_doctest_pass_evidence(case_id: &str) -> String {
+    let mut contract = format!(
+        "fre.regex-syntax.hir-doctest-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nexpected=exact-public-doctest-semantics\n"
+    );
+    if let Some(pattern) = hir_extractor_doctest_pattern(case_id) {
+        writeln!(
+            contract,
+            "pattern=sha256:{},bytes:{}\nadapter=literal-extractor",
+            sha256(pattern.as_bytes()),
+            pattern.len(),
+        )
+        .expect("writing to a String cannot fail");
+    } else if case_id == HIR_DOCTEST_PROPERTIES_IS_UTF8_CASE_ID {
+        writeln!(
+            contract,
+            "bound-unit-evidence={}",
+            hir_translate_pass_evidence(HIR_TRANSLATE_ANALYSIS_IS_UTF8_CASE_ID),
+        )
+        .expect("writing to a String cannot fail");
+    } else if case_id == HIR_DOCTEST_PROPERTIES_CAPTURES_LEN_CASE_ID {
+        writeln!(
+            contract,
+            "bound-unit-evidence={}",
+            hir_translate_pass_evidence(HIR_TRANSLATE_ANALYSIS_CAPTURES_LEN_CASE_ID),
+        )
+        .expect("writing to a String cannot fail");
+    } else if case_id == HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID {
+        writeln!(
+            contract,
+            "bound-unit-evidence={}",
+            hir_translate_pass_evidence(HIR_TRANSLATE_ANALYSIS_STATIC_CAPTURES_LEN_CASE_ID),
+        )
+        .expect("writing to a String cannot fail");
+    } else {
+        for (index, pattern) in hir_doctest_property_patterns(case_id)
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            writeln!(
+                contract,
+                "pattern-{index}=sha256:{},bytes:{}",
+                sha256(pattern.as_bytes()),
+                pattern.len(),
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    sha256(contract.as_bytes())
+}
+
+fn hir_doctest_property_patterns(case_id: &str) -> &'static [&'static str] {
+    match case_id {
+        HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID => &HIR_DOCTEST_CLASS_MINIMUM_LEN_PROBES,
+        HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID => &HIR_DOCTEST_CLASS_MAXIMUM_LEN_PROBES,
+        HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID => &HIR_DOCTEST_PROPERTIES_UNION_NEVER_PROBES,
+        HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID => {
+            &HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_PROBES
+        }
+        _ => &[],
+    }
+}
+
 fn hir_translate_pass_evidence(case_id: &str) -> String {
     let profile_contract = if case_id == HIR_TRANSLATE_REGRESSION_FUZZ_MATCH_CASE_ID {
         "ast-octal=false,ignore-whitespace=true,swap-greed=true"
@@ -6297,6 +6596,15 @@ fn hir_class_operation_mismatch_evidence(case_id: &str, expected: &str, observed
     )
 }
 
+fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.hir-doctest-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_translate_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -6413,9 +6721,39 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
     let valid = match (&obligation.kind, &receipt.disposition) {
         (
             RegexSyntaxCorpusCaseKind::Doctest,
+            RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
+        ) if is_supported_hir_doctest_case(&obligation.case_id) => {
+            obligation.default_harness_member
+                && obligation.no_default_harness_member
+                && evidence_sha256 == &hir_doctest_pass_evidence(&obligation.case_id)
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Doctest,
+            RegexSyntaxCorpusDisposition::Mismatch {
+                expected,
+                observed,
+                evidence_sha256,
+            },
+        ) if is_supported_hir_doctest_case(&obligation.case_id) => {
+            !expected.is_empty()
+                && !observed.is_empty()
+                && expected.len() <= 65_536
+                && observed.len() <= 65_536
+                && evidence_sha256
+                    == &hir_doctest_mismatch_evidence(&obligation.case_id, expected, observed)
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Doctest,
+            RegexSyntaxCorpusDisposition::Fault { stage, reason_code },
+        ) if is_supported_hir_doctest_case(&obligation.case_id) => {
+            stage == "fre-hir-doctest-adapter" && reason_code == "candidate.adapter-panicked"
+        }
+        (
+            RegexSyntaxCorpusCaseKind::Doctest,
             RegexSyntaxCorpusDisposition::Unsupported { reason_code },
         ) => {
-            obligation.default_harness_member
+            !is_supported_hir_doctest_case(&obligation.case_id)
+                && obligation.default_harness_member
                 && obligation.no_default_harness_member
                 && reason_code == "fre-adapter.doctest-not-implemented"
         }
@@ -7162,6 +7500,53 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR translate-robustness receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_doctest_cases_execute_all_13_public_examples() {
+        let cases = [
+            HIR_DOCTEST_EXTRACT_PREFIX_CASE_ID,
+            HIR_DOCTEST_EXTRACT_SUFFIX_CASE_ID,
+            HIR_DOCTEST_LIMIT_CLASS_CASE_ID,
+            HIR_DOCTEST_LIMIT_REPEAT_CASE_ID,
+            HIR_DOCTEST_LIMIT_LITERAL_LEN_CASE_ID,
+            HIR_DOCTEST_LIMIT_TOTAL_CASE_ID,
+            HIR_DOCTEST_CLASS_MINIMUM_LEN_CASE_ID,
+            HIR_DOCTEST_CLASS_MAXIMUM_LEN_CASE_ID,
+            HIR_DOCTEST_PROPERTIES_IS_UTF8_CASE_ID,
+            HIR_DOCTEST_PROPERTIES_CAPTURES_LEN_CASE_ID,
+            HIR_DOCTEST_PROPERTIES_STATIC_CAPTURES_LEN_CASE_ID,
+            HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID,
+            HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID,
+        ];
+        assert_eq!(cases.len(), 13);
+        for case_id in cases {
+            let disposition = execute_hir_doctest_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_doctest_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Doctest,
+                    source_path: if case_id.starts_with("src/hir/literal.rs") {
+                        "src/hir/literal.rs"
+                    } else {
+                        "src/hir/mod.rs"
+                    }
+                    .to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported HIR doctest receipt");
         }
     }
 
