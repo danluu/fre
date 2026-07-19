@@ -191,6 +191,52 @@ fn unicode_age_profile_accepts_only_age_named_value_properties() {
 }
 
 #[test]
+fn unicode_bool_profile_accepts_only_binary_property_data() {
+    let mut boolean = RustProfile::regex_1_12_4();
+    boolean.unicode_features = RustUnicodeFeatures::BOOL;
+    for pattern in [
+        r"\p{Alphabetic}",
+        r"\P{alpha}",
+        r"\p{Is_A-lphabetic}",
+        r"\p{A💥lpha}",
+        r"\p{Other_Default_Ignorable_Code_Point}",
+        r"[\p{Uppercase}&&\p{Alphabetic}]",
+        r"\s",
+        r"\S",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(boolean.clone()),
+        ))
+        .unwrap_or_else(|error| panic!("unicode-bool alias {pattern}: {error:?}"));
+    }
+    for pattern in [
+        r"\p{Age=6.0}",
+        r"(?i:\p{Alphabetic})",
+        r"(?i:[\p{Alphabetic}])",
+        r"(?i:[\s])",
+        r"\pL",
+        r"\d",
+        r"\w",
+        r"\b",
+        r"\p{Greek}",
+        r"\p{Grapheme_Cluster_Break=Extend}",
+        r"\p{Alphabetic=Yes}",
+        r"\p{Alphabeticish}",
+        r"\p{InCB}",
+        r"\p{cf}",
+        r"\p{sc}",
+        r"\p{lc}",
+    ] {
+        parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(boolean.clone()),
+        ))
+        .expect_err("unicode-bool must not borrow another data family");
+    }
+}
+
+#[test]
 fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     let mut none = RustProfile::regex_1_12_4();
     none.unicode_features = RustUnicodeFeatures::NONE;
@@ -215,6 +261,17 @@ fn unicode_feature_availability_participates_in_cache_and_rebar_identity() {
     .expect("table-free syntax under age profile");
     assert_ne!(partial.key, age.key);
     assert_ne!(age.key, full.key);
+
+    let mut boolean = RustProfile::regex_1_12_4();
+    boolean.unicode_features = RustUnicodeFeatures::BOOL;
+    let boolean = parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(boolean),
+    ))
+    .expect("table-free syntax under bool profile");
+    assert_ne!(partial.key, boolean.key);
+    assert_ne!(age.key, boolean.key);
+    assert_ne!(boolean.key, full.key);
 
     let mut forged_rebar = RustProfile::rebar_1_12_4();
     forged_rebar.unicode_features = RustUnicodeFeatures::NONE;
@@ -356,6 +413,46 @@ fn unicode_age_name_analysis_obeys_exact_parse_work_limit() {
             ..
         } if limit == exact - 1
     ));
+}
+
+#[test]
+fn unicode_bool_alias_analysis_obeys_exact_parse_work_limit() {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::BOOL;
+    let compatibility = CompatibilityProfile::RustText(profile);
+    for pattern in [
+        r"\p{Other_Default_Ignorable_Code_Point}",
+        r"\p{IsAlphabetic}",
+    ] {
+        let baseline = parse(ParseRequest::rust(pattern, compatibility.clone()))
+            .expect("authenticated unicode-bool alias");
+        let exact = baseline.summary.parse_work;
+
+        let mut quotas = SyntaxQuotas {
+            max_parse_work: exact,
+            ..SyntaxQuotas::default()
+        };
+        parse(
+            ParseRequest::rust(pattern, compatibility.clone())
+                .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        )
+        .expect("exact Unicode bool alias-analysis limit must pass");
+
+        quotas.max_parse_work = exact - 1;
+        let error = parse(
+            ParseRequest::rust(pattern, compatibility.clone())
+                .with_admission(AdmissionPolicy::Quota(QuotaBounded { syntax: quotas })),
+        )
+        .expect_err("one below Unicode bool alias-analysis work must fail");
+        assert!(matches!(
+            error.category,
+            ErrorCategory::FreResourceLimit {
+                resource: ResourceKind::ParseWork,
+                limit,
+                ..
+            } if limit == exact - 1
+        ));
+    }
 }
 
 #[test]

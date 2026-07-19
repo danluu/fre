@@ -1,5 +1,8 @@
 use regex_syntax::ParserBuilder;
 
+const BOOL_PROPERTY_ALIASES: &[&str] =
+    include!("../../../../../../crates/fre-syntax/src/unicode_bool_aliases.in");
+
 const PROBES: &[(&str, &str)] = &[
     ("ascii", "ascii"),
     ("age", r"\p{Age:6.0}"),
@@ -20,6 +23,29 @@ const PROBES: &[(&str, &str)] = &[
         r"[\p{Age=6.0}--\p{Age=5.0}]",
     ),
     ("bool", r"\p{Alphabetic}"),
+    ("bool-normalized", r"\p{P_at-tern White Space}"),
+    ("bool-is-prefix", r"\p{IsAlphabetic}"),
+    ("bool-non-ascii", r"\p{A💥lpha}"),
+    (
+        "bool-long-alias",
+        r"\p{Other_Default_Ignorable_Code_Point}",
+    ),
+    (
+        "bool-set-intersection",
+        r"[\p{Uppercase}&&\p{Alphabetic}]",
+    ),
+    ("bool-space", r"\s"),
+    ("bool-space-casefold", r"(?i:\s)"),
+    ("bool-space-bracket-casefold", r"(?i:[\s])"),
+    (
+        "bool-property-bracket-casefold",
+        r"(?i:[\p{Alphabetic}])",
+    ),
+    ("bool-space-no-u", r"(?-u:\s)"),
+    ("bool-named-value", r"\p{Alphabetic=Yes}"),
+    ("bool-near-miss", r"\p{Alphabeticish}"),
+    ("bool-unreachable-incb", r"\p{InCB}"),
+    ("bool-is-c-collision", r"\p{IsC}"),
     ("case", r"(?i:\u{03B4})"),
     ("gencat", r"\pL"),
     ("perl", r"\b\w\b"),
@@ -50,5 +76,10 @@ fn main() {
     for &(id, pattern) in PROBES {
         let passed = ParserBuilder::new().build().parse(pattern).is_ok();
         println!("{id}\t{}", u8::from(passed));
+    }
+    for (index, &alias) in BOOL_PROPERTY_ALIASES.iter().enumerate() {
+        let pattern = format!(r"\p{{{alias}}}");
+        let passed = ParserBuilder::new().build().parse(&pattern).is_ok();
+        println!("bool-alias-{index}:{alias}\t{}", u8::from(passed));
     }
 }

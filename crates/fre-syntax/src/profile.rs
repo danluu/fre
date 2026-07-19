@@ -94,9 +94,10 @@ pub struct UnicodeVersion {
 /// `regex-syntax` 0.8.11.
 ///
 /// This is distinct from [`RustOptions::unicode`], which controls the `u`
-/// syntax flag. The all-features, no-features and `unicode-age` profiles are
-/// represented. Other singleton data-family profiles remain outside this type
-/// until their classifiers are bounded and oracle-qualified.
+/// syntax flag. The all-features, no-features, `unicode-age` and
+/// `unicode-bool` profiles are represented. Other singleton data-family
+/// profiles remain outside this type until their classifiers are bounded and
+/// oracle-qualified.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RustUnicodeFeatures(u8);
 
@@ -104,6 +105,7 @@ impl RustUnicodeFeatures {
     pub const NONE: Self = Self(0);
     pub const ALL: Self = Self(1);
     pub const AGE: Self = Self(2);
+    pub const BOOL: Self = Self(3);
 
     #[must_use]
     pub const fn is_all(self) -> bool {
@@ -113,6 +115,11 @@ impl RustUnicodeFeatures {
     #[must_use]
     pub(crate) const fn has_age(self) -> bool {
         self.is_all() || self.0 == Self::AGE.0
+    }
+
+    #[must_use]
+    pub(crate) const fn has_bool(self) -> bool {
+        self.is_all() || self.0 == Self::BOOL.0
     }
 }
 

@@ -5,6 +5,9 @@ use regex_syntax::{
     hir::{Class, Hir, HirKind},
 };
 
+const UNICODE_BOOL_PROPERTY_ALIASES: &[&str] = include!("unicode_bool_aliases.in");
+const MAX_UNICODE_BOOL_ALIAS_BYTES: usize = 30;
+
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
@@ -245,6 +248,12 @@ impl UnicodeAvailabilityVisitor<'_> {
         if !self.flags.unicode {
             return Ok(());
         }
+        if self.features.has_bool() && matches!(class.kind, ast::ClassPerlKind::Space) {
+            // Upstream treats direct Perl classes as already closed under
+            // simple case folding. (`[\s]` remains a bracketed class and is
+            // checked separately.)
+            return Ok(());
+        }
         self.reject(
             &class.span,
             "Unicode Perl-class data is unavailable in this Rust profile",
@@ -255,23 +264,86 @@ impl UnicodeAvailabilityVisitor<'_> {
         if !self.flags.unicode {
             return Ok(());
         }
-        let ast::ClassUnicodeKind::NamedValue { name, .. } = &class.kind else {
-            return self.reject(
-                &class.span,
-                "Unicode property data is unavailable in this Rust profile",
-            );
-        };
-        if self.features.has_age() {
-            self.charge(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
-            if is_unicode_age_property_name(name) {
-                self.require_case(&class.span)?;
-                return Ok(());
+        match &class.kind {
+            ast::ClassUnicodeKind::NamedValue { name, .. } if self.features.has_age() => {
+                self.charge(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
+                if is_unicode_age_property_name(name) {
+                    self.require_case(&class.span)?;
+                    return Ok(());
+                }
             }
+            ast::ClassUnicodeKind::Named(name) if self.features.has_bool() => {
+                if self.is_unicode_bool_property_name(name)? {
+                    self.require_case(&class.span)?;
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
         self.reject(
             &class.span,
             "Unicode property data is unavailable in this Rust profile",
         )
+    }
+
+    fn is_unicode_bool_property_name(&mut self, name: &str) -> Result<bool, ParseError> {
+        // Match `regex-syntax` 0.8.11's UAX44-LM3 normalization without an
+        // allocation. Every source byte and every alias comparison is charged
+        // before it is examined. The fixed buffer is exactly the longest
+        // authenticated alias in `unicode_bool_aliases.in`.
+        self.charge(u64::try_from(name.len()).unwrap_or(u64::MAX))?;
+        let raw = name.as_bytes();
+        let starts_with_is = raw.len() >= 2
+            && raw[0].eq_ignore_ascii_case(&b'i')
+            && raw[1].eq_ignore_ascii_case(&b's');
+        let start = if starts_with_is { 2 } else { 0 };
+        let mut normalized = [0_u8; MAX_UNICODE_BOOL_ALIAS_BYTES];
+        let mut normalized_len = 0_usize;
+        for &byte in &raw[start..] {
+            let Some(byte) = (match byte {
+                b' ' | b'_' | b'-' => None,
+                0x00..=0x7F => Some(byte.to_ascii_lowercase()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if normalized_len == normalized.len() {
+                return Ok(false);
+            }
+            normalized[normalized_len] = byte;
+            normalized_len = normalized_len.saturating_add(1);
+        }
+        let normalized = &normalized[..normalized_len];
+        // `isc` is upstream's exception to stripping an `Is` prefix. Charge
+        // the length and byte comparisons explicitly before applying it. It
+        // is an ISO_Comment alias, never a binary-property alias.
+        if starts_with_is {
+            self.charge(1)?;
+            if normalized.len() == 1 {
+                self.charge(1)?;
+                if normalized[0] == b'c' {
+                    return Ok(false);
+                }
+            }
+        }
+        for &alias in UNICODE_BOOL_PROPERTY_ALIASES {
+            self.charge(1)?;
+            if alias.len() != normalized.len() {
+                continue;
+            }
+            let mut equal = true;
+            for (&actual, &expected) in normalized.iter().zip(alias.as_bytes()) {
+                self.charge(1)?;
+                if actual != expected {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

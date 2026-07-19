@@ -189,6 +189,7 @@ enum SemanticContract {
     RebarUnicode,
     NoUnicode,
     AgeUnicode,
+    BoolUnicode,
     MissingUnicodeAvailabilityProfile,
     NightlyPatternApi,
 }
@@ -206,6 +207,7 @@ struct QualifiedSemanticEvidence {
     rebar: String,
     no_unicode: String,
     age_unicode: String,
+    bool_unicode: String,
 }
 
 const CONFIGURATIONS: &[ConfigurationSpec] = &[
@@ -315,7 +317,7 @@ const CONFIGURATIONS: &[ConfigurationSpec] = &[
         id: "unicode-bool",
         default_features: false,
         features: &["std", "unicode-bool"],
-        semantic: SemanticContract::MissingUnicodeAvailabilityProfile,
+        semantic: SemanticContract::BoolUnicode,
     },
     ConfigurationSpec {
         id: "unicode-case",
@@ -485,6 +487,7 @@ pub fn build_feature_matrix_report(
         rebar: run_semantic_contract(RustProfile::rebar_1_12_4())?,
         no_unicode: run_no_unicode_contract()?,
         age_unicode: run_age_unicode_contract()?,
+        bool_unicode: run_bool_unicode_contract()?,
     };
     let mut receipts = Vec::with_capacity(CONFIGURATIONS.len());
     for spec in CONFIGURATIONS {
@@ -718,6 +721,9 @@ fn run_configuration(
                 },
                 SemanticContract::AgeUnicode => FeatureMatrixDisposition::Pass {
                     semantic_evidence_sha256: evidence.age_unicode.clone(),
+                },
+                SemanticContract::BoolUnicode => FeatureMatrixDisposition::Pass {
+                    semantic_evidence_sha256: evidence.bool_unicode.clone(),
                 },
                 SemanticContract::MissingUnicodeAvailabilityProfile => {
                     FeatureMatrixDisposition::Unsupported {
@@ -972,6 +978,62 @@ fn expected_age_unicode_evidence() -> String {
         evidence.push_str("=refused");
     }
     sha256(evidence.as_bytes())
+}
+
+fn run_bool_unicode_contract() -> Result<String, InventoryError> {
+    let mut profile = RustProfile::regex_1_12_4();
+    profile.unicode_features = RustUnicodeFeatures::BOOL;
+    parse(ParseRequest::rust(
+        "ascii",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-bool profile rejected table-free syntax: {error}"
+        ))
+    })?;
+    let boolean = parse(ParseRequest::rust(
+        r"\p{Alphabetic}",
+        CompatibilityProfile::RustText(profile.clone()),
+    ))
+    .map_err(|error| {
+        InventoryError::new(format!(
+            "unicode-bool profile rejected its binary-property witness: {error}"
+        ))
+    })?;
+    if boolean.summary.class_ranges == 0 {
+        return Err(InventoryError::new(
+            "unicode-bool witness produced no class ranges",
+        ));
+    }
+    for &(family, pattern) in NO_UNICODE_WITNESSES {
+        if family == "bool" {
+            continue;
+        }
+        let result = parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustText(profile.clone()),
+        ));
+        let Err(error) = result else {
+            return Err(InventoryError::new(format!(
+                "unicode-bool profile falsely admitted {family} witness {pattern}"
+            )));
+        };
+        if error.category != ErrorCategory::UpstreamRustSyntax
+            || !error.message.contains("unavailable in this Rust profile")
+        {
+            return Err(InventoryError::new(format!(
+                "unicode-bool {family} witness returned an unauthenticated refusal: {error}"
+            )));
+        }
+    }
+    Ok(expected_bool_unicode_evidence())
+}
+
+fn expected_bool_unicode_evidence() -> String {
+    sha256(
+        b"regex-1.12.4-unicode-bool;ascii=parsed;bool=parsed;age=refused;case=refused;gencat=refused;perl=refused;script=refused;segment=refused",
+    )
 }
 
 fn authenticate_upstream_package(
@@ -1311,6 +1373,13 @@ fn validate_disposition(
             },
         ) if semantic_evidence_sha256 == &expected_age_unicode_evidence() => Ok(()),
         (
+            SemanticContract::BoolUnicode,
+            _,
+            FeatureMatrixDisposition::Pass {
+                semantic_evidence_sha256,
+            },
+        ) if semantic_evidence_sha256 == &expected_bool_unicode_evidence() => Ok(()),
+        (
             SemanticContract::MissingUnicodeAvailabilityProfile,
             _,
             FeatureMatrixDisposition::Unsupported {
@@ -1373,6 +1442,7 @@ fn expected_semantic_evidence(contract: SemanticContract) -> String {
         }
         SemanticContract::NoUnicode => return expected_no_unicode_evidence(),
         SemanticContract::AgeUnicode => return expected_age_unicode_evidence(),
+        SemanticContract::BoolUnicode => return expected_bool_unicode_evidence(),
         SemanticContract::MissingUnicodeAvailabilityProfile
         | SemanticContract::NightlyPatternApi => b"unsupported".as_slice(),
     };
@@ -1412,6 +1482,13 @@ mod tests {
         assert_eq!(
             CONFIGURATIONS
                 .iter()
+                .filter(|spec| matches!(spec.semantic, SemanticContract::BoolUnicode))
+                .count(),
+            1
+        );
+        assert_eq!(
+            CONFIGURATIONS
+                .iter()
                 .filter(|spec| matches!(spec.semantic, SemanticContract::NoUnicode))
                 .count(),
             3
@@ -1431,7 +1508,7 @@ mod tests {
                     SemanticContract::MissingUnicodeAvailabilityProfile
                 ))
                 .count(),
-            6
+            5
         );
         assert_eq!(
             CONFIGURATIONS
@@ -1458,6 +1535,12 @@ mod tests {
         let age_unicode = run_age_unicode_contract().expect("unicode-age semantic gate");
         assert_eq!(age_unicode, expected_age_unicode_evidence());
         assert!(is_sha256(&age_unicode));
+        let bool_unicode = run_bool_unicode_contract().expect("unicode-bool semantic gate");
+        assert_eq!(bool_unicode, expected_bool_unicode_evidence());
+        assert_eq!(
+            bool_unicode,
+            "1bb69975eda4493bb237976772da97ec3b6ea15c0416c55c5924e41e87c84b6a"
+        );
     }
 
     #[test]
@@ -1477,8 +1560,8 @@ mod tests {
         };
         let unsupported = CONFIGURATIONS
             .iter()
-            .find(|spec| spec.id == "unicode-bool")
-            .expect("unicode-bool configuration");
+            .find(|spec| spec.id == "unicode-case")
+            .expect("unicode-case configuration");
         let forged = FeatureMatrixDisposition::Pass {
             semantic_evidence_sha256: "0".repeat(64),
         };
