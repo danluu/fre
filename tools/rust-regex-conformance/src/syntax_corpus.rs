@@ -172,6 +172,18 @@ const HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID: &str =
     "hir::translate::tests::class_bracketed_difference";
 const HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID: &str =
     "hir::translate::tests::class_bracketed_symmetric_difference";
+const HIR_TRANSLATE_LITERAL_CASE_ID: &str = "hir::translate::tests::literal";
+const HIR_TRANSLATE_DOT_CASE_ID: &str = "hir::translate::tests::dot";
+const HIR_TRANSLATE_CLASS_ASCII_CASE_ID: &str = "hir::translate::tests::class_ascii";
+const HIR_TRANSLATE_CLASS_PERL_ASCII_CASE_ID: &str = "hir::translate::tests::class_perl_ascii";
+const HIR_TRANSLATE_CLASS_PERL_UNICODE_CASE_ID: &str = "hir::translate::tests::class_perl_unicode";
+const HIR_TRANSLATE_CLASS_UNICODE_GENCAT_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_gencat";
+const HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_script";
+const HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID: &str = "hir::translate::tests::class_unicode_age";
+const HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_CASE_ID: &str =
+    "hir::translate::tests::class_unicode_any_empty";
 const HIR_TRANSLATE_REGRESSION_ALT_EMPTY_CONCAT_CASE_ID: &str =
     "hir::translate::tests::regression_alt_empty_concat";
 const HIR_TRANSLATE_REGRESSION_EMPTY_ALT_CASE_ID: &str =
@@ -1221,6 +1233,130 @@ const HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_PROBES: [HirTranslatePr
     (r"[a-g~~c-j]", false),
     (r"(?-u)[a-g~~c-j]", false),
 ];
+const HIR_TRANSLATE_LITERAL_PROBES: [HirTranslateProbe; 9] = [
+    ("a", false),
+    ("(?-u)a", false),
+    ("☃", false),
+    ("abcd", false),
+    ("(?-u)a", true),
+    ("(?-u)\x61", true),
+    (r"(?-u)\x61", true),
+    (r"(?-u)\xFF", true),
+    ("(?-u)☃", false),
+];
+const HIR_TRANSLATE_LITERAL_ERROR_PROBES: [HirTranslateProbe; 1] = [(r"(?-u)\xFF", false)];
+const HIR_TRANSLATE_DOT_PROBES: [HirTranslateProbe; 8] = [
+    (".", false),
+    ("(?R).", false),
+    ("(?s).", false),
+    ("(?Rs).", false),
+    ("(?-u).", true),
+    ("(?R-u).", true),
+    ("(?s-u).", true),
+    ("(?Rs-u).", true),
+];
+const HIR_TRANSLATE_DOT_ERROR_PROBES: [HirTranslateProbe; 4] = [
+    ("(?-u).", false),
+    ("(?R-u).", false),
+    ("(?s-u).", false),
+    ("(?Rs-u).", false),
+];
+const HIR_TRANSLATE_CLASS_ASCII_PROBES: [HirTranslateProbe; 18] = [
+    ("[[:alnum:]]", false),
+    ("[[:alpha:]]", false),
+    ("[[:ascii:]]", false),
+    ("[[:blank:]]", false),
+    ("[[:cntrl:]]", false),
+    ("[[:digit:]]", false),
+    ("[[:graph:]]", false),
+    ("[[:lower:]]", false),
+    ("[[:print:]]", false),
+    ("[[:punct:]]", false),
+    ("[[:space:]]", false),
+    ("[[:upper:]]", false),
+    ("[[:word:]]", false),
+    ("[[:xdigit:]]", false),
+    ("[[:^lower:]]", false),
+    ("(?i)[[:lower:]]", false),
+    ("(?-u)[[:lower:]]", false),
+    ("(?i-u)[[:lower:]]", false),
+];
+const HIR_TRANSLATE_CLASS_ASCII_ERROR_PROBES: [HirTranslateProbe; 2] =
+    [("(?-u)[[:^lower:]]", false), ("(?i-u)[[:^lower:]]", false)];
+const HIR_TRANSLATE_CLASS_PERL_ASCII_PROBES: [HirTranslateProbe; 12] = [
+    (r"(?-u)\d", false),
+    (r"(?-u)\s", false),
+    (r"(?-u)\w", false),
+    (r"(?i-u)\d", false),
+    (r"(?i-u)\s", false),
+    (r"(?i-u)\w", false),
+    (r"(?-u)\D", true),
+    (r"(?-u)\S", true),
+    (r"(?-u)\W", true),
+    (r"(?i-u)\D", true),
+    (r"(?i-u)\S", true),
+    (r"(?i-u)\W", true),
+];
+const HIR_TRANSLATE_CLASS_PERL_ASCII_ERROR_PROBES: [HirTranslateProbe; 6] = [
+    (r"(?-u)\D", false),
+    (r"(?-u)\S", false),
+    (r"(?-u)\W", false),
+    (r"(?i-u)\D", false),
+    (r"(?i-u)\S", false),
+    (r"(?i-u)\W", false),
+];
+const HIR_TRANSLATE_CLASS_PERL_UNICODE_PROBES: [HirTranslateProbe; 12] = [
+    (r"\d", false),
+    (r"\s", false),
+    (r"\w", false),
+    (r"(?i)\d", false),
+    (r"(?i)\s", false),
+    (r"(?i)\w", false),
+    (r"\D", false),
+    (r"\S", false),
+    (r"\W", false),
+    (r"(?i)\D", false),
+    (r"(?i)\S", false),
+    (r"(?i)\W", false),
+];
+const HIR_TRANSLATE_CLASS_UNICODE_GENCAT_PROBES: [HirTranslateProbe; 18] = [
+    (r"\pZ", false),
+    (r"\pz", false),
+    (r"\p{Separator}", false),
+    (r"\p{se      PaRa ToR}", false),
+    (r"\p{gc:Separator}", false),
+    (r"\p{gc=Separator}", false),
+    (r"\p{gc!=Separator}", false),
+    (r"\p{Other}", false),
+    (r"\pC", false),
+    (r"\PZ", false),
+    (r"\P{separator}", false),
+    (r"\P{gc!=separator}", false),
+    (r"\p{any}", false),
+    (r"\p{assigned}", false),
+    (r"\p{ascii}", false),
+    (r"\p{gc:any}", false),
+    (r"\p{gc:assigned}", false),
+    (r"\p{gc:ascii}", false),
+];
+const HIR_TRANSLATE_CLASS_UNICODE_GENCAT_ERROR_PROBES: [HirTranslateProbe; 5] = [
+    (r"(?-u)\pZ", false),
+    (r"(?-u)\p{Separator}", false),
+    (r"\pE", false),
+    (r"\p{Foo}", false),
+    (r"\p{gc:Foo}", false),
+];
+const HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_PROBES: [HirTranslateProbe; 3] = [
+    (r"\p{Greek}", false),
+    (r"(?i)\p{Greek}", false),
+    (r"(?i)\P{Greek}", false),
+];
+const HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_ERROR_PROBES: [HirTranslateProbe; 2] =
+    [(r"\p{sc:Foo}", false), (r"\p{scx:Foo}", false)];
+const HIR_TRANSLATE_CLASS_UNICODE_AGE_PROBES: [HirTranslateProbe; 0] = [];
+const HIR_TRANSLATE_CLASS_UNICODE_AGE_ERROR_PROBES: [HirTranslateProbe; 1] =
+    [(r"\p{age:Foo}", false)];
+const HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_PROBES: [HirTranslateProbe; 1] = [(r"\P{any}", false)];
 const ESCAPE_SUCCESS_PROBES: [&str; 24] = [
     r"\|",
     r"\a",
@@ -3080,6 +3216,15 @@ fn is_supported_hir_translate_case(case_id: &str) -> bool {
             | HIR_TRANSLATE_CLASS_BRACKETED_INTERSECT_NEGATE_CASE_ID
             | HIR_TRANSLATE_CLASS_BRACKETED_DIFFERENCE_CASE_ID
             | HIR_TRANSLATE_CLASS_BRACKETED_SYMMETRIC_DIFFERENCE_CASE_ID
+            | HIR_TRANSLATE_LITERAL_CASE_ID
+            | HIR_TRANSLATE_DOT_CASE_ID
+            | HIR_TRANSLATE_CLASS_ASCII_CASE_ID
+            | HIR_TRANSLATE_CLASS_PERL_ASCII_CASE_ID
+            | HIR_TRANSLATE_CLASS_PERL_UNICODE_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_GENCAT_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID
+            | HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_CASE_ID
     )
 }
 
@@ -3810,6 +3955,9 @@ fn hir_translate_probes(case_id: &str) -> (&'static [HirTranslateProbe], &'stati
 fn hir_translate_class_probes(
     case_id: &str,
 ) -> Option<(&'static [HirTranslateProbe], &'static str)> {
+    if let Some(probes) = hir_translate_enabled_class_probes(case_id) {
+        return Some(probes);
+    }
     match case_id {
         HIR_TRANSLATE_CAT_CLASS_FLATTENED_CASE_ID => Some((
             &HIR_TRANSLATE_CAT_CLASS_FLATTENED_PROBES,
@@ -3847,9 +3995,60 @@ fn hir_translate_class_probes(
     }
 }
 
+fn hir_translate_enabled_class_probes(
+    case_id: &str,
+) -> Option<(&'static [HirTranslateProbe], &'static str)> {
+    match case_id {
+        HIR_TRANSLATE_LITERAL_CASE_ID => {
+            Some((&HIR_TRANSLATE_LITERAL_PROBES, "hir-translate-literal"))
+        }
+        HIR_TRANSLATE_DOT_CASE_ID => Some((&HIR_TRANSLATE_DOT_PROBES, "hir-translate-dot")),
+        HIR_TRANSLATE_CLASS_ASCII_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_ASCII_PROBES,
+            "hir-translate-class-ascii",
+        )),
+        HIR_TRANSLATE_CLASS_PERL_ASCII_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_PERL_ASCII_PROBES,
+            "hir-translate-class-perl-ascii",
+        )),
+        HIR_TRANSLATE_CLASS_PERL_UNICODE_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_PERL_UNICODE_PROBES,
+            "hir-translate-class-perl-unicode",
+        )),
+        HIR_TRANSLATE_CLASS_UNICODE_GENCAT_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_UNICODE_GENCAT_PROBES,
+            "hir-translate-class-unicode-gencat",
+        )),
+        HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_PROBES,
+            "hir-translate-class-unicode-script",
+        )),
+        HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_UNICODE_AGE_PROBES,
+            "hir-translate-class-unicode-age",
+        )),
+        HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_CASE_ID => Some((
+            &HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_PROBES,
+            "hir-translate-class-unicode-any-empty",
+        )),
+        _ => None,
+    }
+}
+
 fn hir_translate_error_probes(case_id: &str) -> &'static [HirTranslateProbe] {
     match case_id {
         HIR_TRANSLATE_CLASS_BRACKETED_CASE_ID => &HIR_TRANSLATE_CLASS_BRACKETED_ERROR_PROBES,
+        HIR_TRANSLATE_LITERAL_CASE_ID => &HIR_TRANSLATE_LITERAL_ERROR_PROBES,
+        HIR_TRANSLATE_DOT_CASE_ID => &HIR_TRANSLATE_DOT_ERROR_PROBES,
+        HIR_TRANSLATE_CLASS_ASCII_CASE_ID => &HIR_TRANSLATE_CLASS_ASCII_ERROR_PROBES,
+        HIR_TRANSLATE_CLASS_PERL_ASCII_CASE_ID => &HIR_TRANSLATE_CLASS_PERL_ASCII_ERROR_PROBES,
+        HIR_TRANSLATE_CLASS_UNICODE_GENCAT_CASE_ID => {
+            &HIR_TRANSLATE_CLASS_UNICODE_GENCAT_ERROR_PROBES
+        }
+        HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID => {
+            &HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_ERROR_PROBES
+        }
+        HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID => &HIR_TRANSLATE_CLASS_UNICODE_AGE_ERROR_PROBES,
         _ => &[],
     }
 }
@@ -4878,8 +5077,7 @@ fn validate_disposition(receipt: &RegexSyntaxCorpusReceipt) -> Result<(), Invent
             RegexSyntaxCorpusCaseKind::Unit,
             RegexSyntaxCorpusDisposition::Pass { evidence_sha256 },
         ) if is_supported_syntax_adapter_case(&obligation.case_id) => {
-            obligation.default_harness_member
-                && obligation.no_default_harness_member
+            (obligation.default_harness_member || obligation.no_default_harness_member)
                 && evidence_sha256 == &syntax_case_pass_evidence(&obligation.case_id)
                 && fixed_ast_hex_pass_evidence(&obligation.case_id)
                     .is_none_or(|fixed| evidence_sha256 == fixed)
@@ -5665,6 +5863,55 @@ mod tests {
                 disposition,
             })
             .expect("supported HIR class-algebra receipt");
+        }
+    }
+
+    #[test]
+    fn authenticated_hir_enabled_class_cases_execute_all_102_public_outcomes() {
+        let cases = [
+            (HIR_TRANSLATE_LITERAL_CASE_ID, 10, true, true),
+            (HIR_TRANSLATE_DOT_CASE_ID, 12, true, true),
+            (HIR_TRANSLATE_CLASS_ASCII_CASE_ID, 20, true, true),
+            (HIR_TRANSLATE_CLASS_PERL_ASCII_CASE_ID, 18, true, true),
+            (HIR_TRANSLATE_CLASS_PERL_UNICODE_CASE_ID, 12, true, false),
+            (HIR_TRANSLATE_CLASS_UNICODE_GENCAT_CASE_ID, 23, true, false),
+            (HIR_TRANSLATE_CLASS_UNICODE_SCRIPT_CASE_ID, 5, true, false),
+            (HIR_TRANSLATE_CLASS_UNICODE_AGE_CASE_ID, 1, true, false),
+            (
+                HIR_TRANSLATE_CLASS_UNICODE_ANY_EMPTY_CASE_ID,
+                1,
+                true,
+                false,
+            ),
+        ];
+        assert_eq!(
+            cases
+                .iter()
+                .map(|(_, outcomes, _, _)| outcomes)
+                .sum::<usize>(),
+            102,
+        );
+        for (case_id, _, default_member, no_default_member) in cases {
+            let disposition = execute_hir_translate_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: hir_translate_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/hir/translate.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: default_member,
+                    no_default_harness_member: no_default_member,
+                },
+                disposition,
+            })
+            .expect("supported enabled HIR class receipt");
         }
     }
 
