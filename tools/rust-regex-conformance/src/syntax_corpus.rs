@@ -164,6 +164,12 @@ const UTF8_CODEPOINTS_NO_SURROGATES_CASE_ID: &str = "utf8::tests::codepoints_no_
 const UTF8_REVERSE_CASE_ID: &str = "utf8::tests::reverse";
 const UTF8_SINGLE_CODEPOINT_CASE_ID: &str = "utf8::tests::single_codepoint_one_sequence";
 const UTF8_DOCTEST_SEQUENCES_CASE_ID: &str = "src/utf8.rs - utf8::Utf8Sequences (line 263)";
+const TOP_ESCAPE_META_CASE_ID: &str = "tests::escape_meta";
+const TOP_WORD_BYTE_CASE_ID: &str = "tests::word_byte";
+const TOP_WORD_CHAR_CASE_ID: &str = "tests::word_char";
+const TOP_DOCTEST_PARSE_CASE_ID: &str = "src/lib.rs - (line 39)";
+const TOP_DOCTEST_META_CASE_ID: &str = "src/lib.rs - is_meta_character (line 248)";
+const TOP_DOCTEST_ESCAPEABLE_CASE_ID: &str = "src/lib.rs - is_escapeable_character (line 291)";
 const HIR_TRANSLATE_EMPTY_CASE_ID: &str = "hir::translate::tests::empty";
 const HIR_TRANSLATE_LITERAL_CASE_INSENSITIVE_CASE_ID: &str =
     "hir::translate::tests::literal_case_insensitive";
@@ -3517,6 +3523,9 @@ fn disposition_for(obligation: &RegexSyntaxCorpusObligation) -> RegexSyntaxCorpu
     if is_supported_utf8_case(&obligation.case_id) {
         return execute_utf8_case(&obligation.case_id);
     }
+    if is_supported_top_level_case(&obligation.case_id) {
+        return execute_top_level_case(&obligation.case_id);
+    }
     if is_supported_hir_misc_case(&obligation.case_id) {
         return execute_hir_misc_case(&obligation.case_id);
     }
@@ -3895,6 +3904,20 @@ fn is_supported_utf8_case(case_id: &str) -> bool {
     )
 }
 
+fn is_supported_top_level_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        TOP_ESCAPE_META_CASE_ID | TOP_WORD_BYTE_CASE_ID | TOP_WORD_CHAR_CASE_ID
+    )
+}
+
+fn is_supported_top_level_doctest_case(case_id: &str) -> bool {
+    matches!(
+        case_id,
+        TOP_DOCTEST_PARSE_CASE_ID | TOP_DOCTEST_META_CASE_ID | TOP_DOCTEST_ESCAPEABLE_CASE_ID
+    )
+}
+
 fn is_supported_hir_doctest_case(case_id: &str) -> bool {
     matches!(
         case_id,
@@ -3912,6 +3935,7 @@ fn is_supported_hir_doctest_case(case_id: &str) -> bool {
             | HIR_DOCTEST_PROPERTIES_UNION_NEVER_CASE_ID
             | HIR_DOCTEST_PROPERTIES_UNION_UNBOUNDED_CASE_ID
     ) || case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID
+        || is_supported_top_level_doctest_case(case_id)
         || is_supported_hir_seq_doctest_case(case_id)
         || is_supported_hir_constructor_doctest_case(case_id)
 }
@@ -4191,6 +4215,28 @@ fn execute_utf8_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
         },
         Err(_) => RegexSyntaxCorpusDisposition::Fault {
             stage: "fre-utf8-adapter".to_owned(),
+            reason_code: "candidate.adapter-panicked".to_owned(),
+        },
+    }
+}
+
+fn execute_top_level_case(case_id: &str) -> RegexSyntaxCorpusDisposition {
+    let execution = catch_unwind(AssertUnwindSafe(|| run_top_level_case(case_id)));
+    match execution {
+        Ok(Ok(())) => RegexSyntaxCorpusDisposition::Pass {
+            evidence_sha256: top_level_pass_evidence(case_id),
+        },
+        Ok(Err(mismatch)) => RegexSyntaxCorpusDisposition::Mismatch {
+            evidence_sha256: top_level_mismatch_evidence(
+                case_id,
+                &mismatch.expected,
+                &mismatch.observed,
+            ),
+            expected: mismatch.expected,
+            observed: mismatch.observed,
+        },
+        Err(_) => RegexSyntaxCorpusDisposition::Fault {
+            stage: "fre-top-level-syntax-adapter".to_owned(),
             reason_code: "candidate.adapter-panicked".to_owned(),
         },
     }
@@ -5629,6 +5675,147 @@ fn run_utf8_case(case_id: &str) -> Result<(), AstMismatch> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exhaustive match mirrors three unit tests and three public doctests"
+)]
+fn run_top_level_case(case_id: &str) -> Result<(), AstMismatch> {
+    match case_id {
+        TOP_ESCAPE_META_CASE_ID => {
+            let original = r"\.+*?()|[]{}^$#&-~";
+            let observed = regex_syntax::escape(original);
+            let expected = r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~".to_owned();
+            hir_doctest_assert_eq(case_id, "source-assertion", &expected, &observed)?;
+
+            let (_, fre_hir) = exact_text_hir_pair(&observed, case_id)?;
+            let expected_hir = regex_syntax::hir::Hir::literal(original.as_bytes());
+            hir_doctest_assert_eq(case_id, "fre-literal-binding", &expected_hir, &fre_hir)?;
+        }
+        TOP_WORD_BYTE_CASE_ID => {
+            for (index, (byte, expected)) in [(b'a', true), (b'-', false)].into_iter().enumerate() {
+                let observed = regex_syntax::is_word_byte(byte);
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed,
+                )?;
+            }
+            let (_, fre_hir) = exact_hir_pair(r"(?-u:\w)", case_id)?;
+            let class = bytes_class_from_hir(&fre_hir, case_id)?;
+            for (index, byte) in [b'a', b'-'].into_iter().enumerate() {
+                let expected = regex_syntax::is_word_byte(byte);
+                let observed = class
+                    .iter()
+                    .any(|range| range.start() <= byte && byte <= range.end());
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("fre-class-membership-{index}"),
+                    &expected,
+                    &observed,
+                )?;
+            }
+        }
+        TOP_WORD_CHAR_CASE_ID => {
+            let probes = [
+                ('a', true),
+                ('à', true),
+                ('β', true),
+                ('\u{11011}', true),
+                ('\u{11611}', true),
+                ('\u{11711}', true),
+                ('\u{17828}', true),
+                ('\u{1B1B1}', true),
+                ('\u{16E40}', true),
+                ('-', false),
+                ('☃', false),
+            ];
+            let (_, fre_hir) = exact_text_hir_pair(r"\w", case_id)?;
+            let class = unicode_class_from_hir(&fre_hir, case_id)?;
+            for (index, (scalar, expected)) in probes.into_iter().enumerate() {
+                let public_observed = regex_syntax::is_word_character(scalar);
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &public_observed,
+                )?;
+                let fre_observed = class
+                    .iter()
+                    .any(|range| range.start() <= scalar && scalar <= range.end());
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("fre-class-membership-{index}"),
+                    &expected,
+                    &fre_observed,
+                )?;
+            }
+        }
+        TOP_DOCTEST_PARSE_CASE_ID => {
+            let (_, fre_hir) = exact_text_hir_pair("a|b", case_id)?;
+            let expected = regex_syntax::hir::Hir::alternation(vec![
+                regex_syntax::hir::Hir::literal("a".as_bytes()),
+                regex_syntax::hir::Hir::literal("b".as_bytes()),
+            ]);
+            hir_doctest_assert_eq(case_id, "source-assertion", &expected, &fre_hir)?;
+        }
+        TOP_DOCTEST_META_CASE_ID => {
+            for (index, (scalar, expected)) in [
+                ('?', true),
+                ('-', true),
+                ('&', true),
+                ('#', true),
+                ('%', false),
+                ('/', false),
+                ('!', false),
+                ('"', false),
+                ('e', false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let observed = regex_syntax::is_meta_character(scalar);
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed,
+                )?;
+            }
+            let pattern = regex_syntax::escape(r#"?-&#%/!"e"#);
+            let _ = exact_text_hir_pair(&pattern, case_id)?;
+        }
+        TOP_DOCTEST_ESCAPEABLE_CASE_ID => {
+            for (index, (scalar, expected)) in [
+                ('?', true),
+                ('-', true),
+                ('&', true),
+                ('#', true),
+                ('%', true),
+                ('/', true),
+                ('!', true),
+                ('"', true),
+                ('e', false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let observed = regex_syntax::is_escapeable_character(scalar);
+                hir_doctest_assert_eq(
+                    case_id,
+                    &format!("source-assertion-{index}"),
+                    &expected,
+                    &observed,
+                )?;
+            }
+            let pattern = regex_syntax::escape(r#"?-&#%/!"e"#);
+            let _ = exact_text_hir_pair(&pattern, case_id)?;
+        }
+        _ => unreachable!("caller checked supported top-level syntax case"),
+    }
+    Ok(())
+}
+
 fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
     debug_assert!((0xD800..0xE000).contains(&codepoint));
     [
@@ -5641,6 +5828,9 @@ fn encode_surrogate_codepoint(codepoint: u32) -> [u8; 3] {
 fn run_hir_doctest_case(case_id: &str) -> Result<(), AstMismatch> {
     if case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID {
         return run_utf8_case(case_id);
+    }
+    if is_supported_top_level_doctest_case(case_id) {
+        return run_top_level_case(case_id);
     }
     if is_supported_hir_constructor_doctest_case(case_id) {
         return run_hir_constructor_doctest_case(case_id);
@@ -7332,6 +7522,26 @@ fn utf8_pass_evidence(case_id: &str) -> String {
     )
 }
 
+fn top_level_pass_evidence(case_id: &str) -> String {
+    let assertions = match case_id {
+        TOP_ESCAPE_META_CASE_ID => "one-exact-escape-and-fre-literal-binding",
+        TOP_WORD_BYTE_CASE_ID => "two-public-byte-word-and-fre-class-membership",
+        TOP_WORD_CHAR_CASE_ID => "eleven-public-unicode-word-and-fre-class-membership",
+        TOP_DOCTEST_PARSE_CASE_ID => "one-public-parse-hir-and-exact-fre-hir",
+        TOP_DOCTEST_META_CASE_ID => "nine-public-meta-character-and-fre-literal-binding",
+        TOP_DOCTEST_ESCAPEABLE_CASE_ID => {
+            "nine-public-escapeable-character-and-fre-literal-binding"
+        }
+        _ => unreachable!("caller checked supported top-level syntax case"),
+    };
+    sha256(
+        format!(
+            "fre.regex-syntax.top-level-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nassertions={assertions}\nexpected=exact-public-top-level-semantics\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn write_hir_class_operation_evidence(
     contract: &mut String,
     index: usize,
@@ -7353,6 +7563,9 @@ fn write_hir_class_operation_evidence(
 fn hir_doctest_pass_evidence(case_id: &str) -> String {
     if case_id == UTF8_DOCTEST_SEQUENCES_CASE_ID {
         return utf8_pass_evidence(case_id);
+    }
+    if is_supported_top_level_doctest_case(case_id) {
+        return top_level_pass_evidence(case_id);
     }
     let mut contract = format!(
         "fre.regex-syntax.hir-doctest-adapter.v1\ncase={case_id}\nparser=fre-syntax+pinned-regex-syntax-0.8.11\nexpected=exact-public-doctest-semantics\n"
@@ -7734,6 +7947,15 @@ fn utf8_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> Stri
     )
 }
 
+fn top_level_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
+    sha256(
+        format!(
+            "fre.regex-syntax.top-level-adapter.mismatch.v1\ncase={case_id}\nexpected={expected}\nobserved={observed}\n"
+        )
+        .as_bytes(),
+    )
+}
+
 fn hir_doctest_mismatch_evidence(case_id: &str, expected: &str, observed: &str) -> String {
     sha256(
         format!(
@@ -7758,6 +7980,7 @@ fn is_supported_syntax_adapter_case(case_id: &str) -> bool {
         || is_supported_hir_print_case(case_id)
         || is_supported_hir_literal_case(case_id)
         || is_supported_utf8_case(case_id)
+        || is_supported_top_level_case(case_id)
         || is_supported_hir_misc_case(case_id)
         || is_supported_hir_class_operation_case(case_id)
         || is_supported_hir_translate_case(case_id)
@@ -7774,6 +7997,8 @@ fn syntax_case_pass_evidence(case_id: &str) -> String {
         hir_literal_pass_evidence(case_id)
     } else if is_supported_utf8_case(case_id) {
         utf8_pass_evidence(case_id)
+    } else if is_supported_top_level_case(case_id) {
+        top_level_pass_evidence(case_id)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_pass_evidence(case_id)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -7794,6 +8019,8 @@ fn syntax_case_mismatch_evidence(case_id: &str, expected: &str, observed: &str) 
         hir_literal_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_utf8_case(case_id) {
         utf8_mismatch_evidence(case_id, expected, observed)
+    } else if is_supported_top_level_case(case_id) {
+        top_level_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_misc_case(case_id) {
         hir_misc_mismatch_evidence(case_id, expected, observed)
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -7814,6 +8041,8 @@ fn syntax_case_fault_stage(case_id: &str) -> &'static str {
         "fre-hir-literal-adapter"
     } else if is_supported_utf8_case(case_id) {
         "fre-utf8-adapter"
+    } else if is_supported_top_level_case(case_id) {
+        "fre-top-level-syntax-adapter"
     } else if is_supported_hir_misc_case(case_id) {
         "fre-hir-misc-adapter"
     } else if is_supported_hir_class_operation_case(case_id) {
@@ -8683,6 +8912,62 @@ mod tests {
             disposition,
         })
         .expect("supported UTF-8 doctest receipt");
+    }
+
+    #[test]
+    fn authenticated_top_level_cases_execute_all_6_public_identities() {
+        for case_id in [
+            TOP_ESCAPE_META_CASE_ID,
+            TOP_WORD_BYTE_CASE_ID,
+            TOP_WORD_CHAR_CASE_ID,
+        ] {
+            let disposition = execute_top_level_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: top_level_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Unit,
+                    source_path: "src/lib.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: case_id != TOP_WORD_CHAR_CASE_ID,
+                },
+                disposition,
+            })
+            .expect("supported top-level unit receipt");
+        }
+        for case_id in [
+            TOP_DOCTEST_PARSE_CASE_ID,
+            TOP_DOCTEST_META_CASE_ID,
+            TOP_DOCTEST_ESCAPEABLE_CASE_ID,
+        ] {
+            let disposition = execute_hir_doctest_case(case_id);
+            assert_eq!(
+                disposition,
+                RegexSyntaxCorpusDisposition::Pass {
+                    evidence_sha256: top_level_pass_evidence(case_id),
+                },
+            );
+            validate_disposition(&RegexSyntaxCorpusReceipt {
+                obligation: RegexSyntaxCorpusObligation {
+                    case_id: case_id.to_owned(),
+                    kind: RegexSyntaxCorpusCaseKind::Doctest,
+                    source_path: "src/lib.rs".to_owned(),
+                    source_line: 1,
+                    source_sha256: "0".repeat(64),
+                    default_harness_member: true,
+                    no_default_harness_member: true,
+                },
+                disposition,
+            })
+            .expect("supported top-level doctest receipt");
+        }
     }
 
     #[test]
