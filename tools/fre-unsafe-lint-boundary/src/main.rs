@@ -555,7 +555,13 @@ fn audit_exact_allocator(
 fn audit_exact_allocator_source(source_path: &Path) -> Result<(), String> {
     let source = fs::read_to_string(source_path)
         .map_err(|error| format!("read exact allocator source: {error}"))?;
-    if source.matches(DENY_ATTRIBUTE).count() != 1 {
+    if source.matches(DENY_ATTRIBUTE).count() != 1
+        || source
+            .lines()
+            .filter(|line| *line == DENY_ATTRIBUTE)
+            .count()
+            != 1
+    {
         return Err(format!(
             "exact allocator source must contain exactly one {DENY_ATTRIBUTE}"
         ));
@@ -942,6 +948,9 @@ mod tests {
     fn exact_allocator_deny_attribute_is_unique() {
         assert_exact_source_rejected(&exact_source().replace(DENY_ATTRIBUTE, ""));
         assert_exact_source_rejected(&format!("{DENY_ATTRIBUTE}\n{}", exact_source()));
+        assert_exact_source_rejected(
+            &exact_source().replace(DENY_ATTRIBUTE, &format!("// {DENY_ATTRIBUTE}")),
+        );
     }
 
     #[test]
