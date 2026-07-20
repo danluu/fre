@@ -16,7 +16,7 @@ use std::{
     path::Path,
 };
 
-use fre::{PortableRegex, PortableRegexSet, SearchLimits};
+use fre::{PortableRegex, PortableRegexSet, SearchLimits, SearchWindow};
 use regex_automata::{
     HalfMatch, Input, MatchKind,
     dfa::{Automaton, OverlappingState, dense},
@@ -69,6 +69,8 @@ const TRY_SEARCH_OVERLAPPING_FWD_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_overlapping_fwd (line 1553)";
 const TRY_SEARCH_FWD_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1209)";
+const TRY_SEARCH_FWD_BOUNDS_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1267)";
 
 /// Candidate disposition for one exact feature-mode membership.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -238,6 +240,14 @@ struct SourceContractSpec {
     source_span_sha256: &'static str,
     assertion_inventory_sha256: &'static str,
     assertions: &'static [AssertionSpec],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct TrySearchFwdBoundsVector {
+    pattern: &'static str,
+    haystack: &'static str,
+    range_start: usize,
+    range_end: usize,
 }
 
 struct AdapterContext<'a> {
@@ -434,6 +444,26 @@ const TRY_SEARCH_FWD_ASSERTIONS: &[AssertionSpec] = &[
         expected_observation: "half-match:some:pattern=0:offset=3",
     },
 ];
+const TRY_SEARCH_FWD_BOUNDS_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "try-search-fwd-bounds-subslice",
+        source_line: 1283,
+        source_line_sha256: "4fe1a4118cc23d46ae3c8d9f6a2321f9ac189c31e1e0b030d22eb0ff836509e5",
+        expected_observation: "half-match:some:pattern=0:offset=3",
+    },
+    AssertionSpec {
+        assertion_id: "try-search-fwd-bounds-context",
+        source_line: 1292,
+        source_line_sha256: "4fe1a4118cc23d46ae3c8d9f6a2321f9ac189c31e1e0b030d22eb0ff836509e5",
+        expected_observation: "half-match:none",
+    },
+];
+const TRY_SEARCH_FWD_BOUNDS_VECTOR: TrySearchFwdBoundsVector = TrySearchFwdBoundsVector {
+    pattern: r"(?-u)\b[0-9]{3}\b",
+    haystack: "foo123bar",
+    range_start: 3,
+    range_end: 6,
+};
 
 const PATTERN_LEN_SOURCE: SourceContractSpec = SourceContractSpec {
     source_path: AUTOMATON_SOURCE_PATH,
@@ -808,6 +838,46 @@ const TRY_SEARCH_FWD_SOURCE: SourceContractSpec = SourceContractSpec {
     assertions: TRY_SEARCH_FWD_ASSERTIONS,
 };
 
+const TRY_SEARCH_FWD_BOUNDS_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 1267,
+    span_end_line: 1295,
+    source_span: r#"    /// ```
+    /// use regex_automata::{dfa::{Automaton, dense}, HalfMatch, Input};
+    ///
+    /// // N.B. We disable Unicode here so that we use a simple ASCII word
+    /// // boundary. Alternatively, we could enable heuristic support for
+    /// // Unicode word boundaries.
+    /// let dfa = dense::DFA::new(r"(?-u)\b[0-9]{3}\b")?;
+    /// let haystack = "foo123bar".as_bytes();
+    ///
+    /// // Since we sub-slice the haystack, the search doesn't know about the
+    /// // larger context and assumes that `123` is surrounded by word
+    /// // boundaries. And of course, the match position is reported relative
+    /// // to the sub-slice as well, which means we get `3` instead of `6`.
+    /// let input = Input::new(&haystack[3..6]);
+    /// let expected = Some(HalfMatch::must(0, 3));
+    /// let got = dfa.try_search_fwd(&input)?;
+    /// assert_eq!(expected, got);
+    ///
+    /// // But if we provide the bounds of the search within the context of the
+    /// // entire haystack, then the search can take the surrounding context
+    /// // into account. (And if we did find a match, it would be reported
+    /// // as a valid offset into `haystack` instead of its sub-slice.)
+    /// let input = Input::new(haystack).range(3..6);
+    /// let expected = None;
+    /// let got = dfa.try_search_fwd(&input)?;
+    /// assert_eq!(expected, got);
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+"#,
+    source_span_sha256: "7a107341165090031ae322427e59560ed3a9f895aba49896557a7610a50f0530",
+    assertion_inventory_sha256: "2bbe88fc6fc55dc9ee186d0b84b09019c1fd0515dd99802ae250ec21726a5d08",
+    assertions: TRY_SEARCH_FWD_BOUNDS_ASSERTIONS,
+};
+
 // Each registration is one actual compiled membership. In particular, there
 // is intentionally no all-features registration: this binary is built with
 // regex-automata's package defaults, so relabelling this execution as the VCS
@@ -868,6 +938,13 @@ const TRY_SEARCH_FWD_ADAPTER: RegisteredAdapter = RegisteredAdapter {
     source: TRY_SEARCH_FWD_SOURCE,
     run: run_try_search_fwd,
 };
+const TRY_SEARCH_FWD_BOUNDS_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: TRY_SEARCH_FWD_BOUNDS_CASE,
+    source: TRY_SEARCH_FWD_BOUNDS_SOURCE,
+    run: run_try_search_fwd_bounds,
+};
 
 // This predecessor registry is independent of every report being verified.
 // Its separately sealed manifest prevents a prior report from authorizing a
@@ -893,6 +970,7 @@ const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ALWAYS_ADAPTER,
     TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
     TRY_SEARCH_FWD_ADAPTER,
+    TRY_SEARCH_FWD_BOUNDS_ADAPTER,
 ];
 
 fn run_pattern_len_never_match(
@@ -1401,6 +1479,54 @@ fn run_try_search_fwd(
             upstream_observation: upstream_half_match(upstream_second),
             fre_observation: fre_half_match(fre_second),
         },
+    ])
+}
+
+fn run_try_search_fwd_bounds(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let vector = TRY_SEARCH_FWD_BOUNDS_VECTOR;
+    let haystack = vector.haystack.as_bytes();
+    let upstream = dense::DFA::new(vector.pattern)
+        .map_err(|error| format!("upstream-bounds-build:{error}"))?;
+    let fre =
+        PortableRegex::new(vector.pattern).map_err(|error| format!("fre-bounds-build:{error}"))?;
+
+    let upstream_subslice = upstream
+        .try_search_fwd(&Input::new(&haystack[vector.range_start..vector.range_end]))
+        .map_err(|error| format!("upstream-bounds-subslice:{error}"))?;
+    let fre_subslice = fre
+        .find(
+            &haystack[vector.range_start..vector.range_end],
+            SearchLimits::unlimited(),
+        )
+        .map_err(|error| format!("fre-bounds-subslice:{error}"))?
+        .0;
+
+    let upstream_context = upstream
+        .try_search_fwd(&Input::new(haystack).range(vector.range_start..vector.range_end))
+        .map_err(|error| format!("upstream-bounds-context:{error}"))?;
+    let fre_context = fre
+        .find_window(
+            haystack,
+            SearchWindow::new(vector.range_start, vector.range_end),
+            SearchLimits::unlimited(),
+        )
+        .map_err(|error| format!("fre-bounds-context:{error}"))?
+        .0;
+
+    Ok(vec![
+        assertion_execution(
+            &TRY_SEARCH_FWD_BOUNDS_ASSERTIONS[0],
+            upstream_half_match(upstream_subslice),
+            fre_half_match(fre_subslice),
+        ),
+        assertion_execution(
+            &TRY_SEARCH_FWD_BOUNDS_ASSERTIONS[1],
+            upstream_half_match(upstream_context),
+            fre_half_match(fre_context),
+        ),
     ])
 }
 
@@ -2053,6 +2179,10 @@ fn adapter_observer_id(adapter: &RegisteredAdapter) -> Result<&'static str, Inve
         && same_adapter_function(adapter.run, run_try_search_fwd)
     {
         "run-try-search-fwd-v1"
+    } else if adapter.case_id == TRY_SEARCH_FWD_BOUNDS_CASE
+        && same_adapter_function(adapter.run, run_try_search_fwd_bounds)
+    {
+        "run-try-search-fwd-bounds-v1"
     } else {
         return Err(InventoryError::new(
             "regex-automata adapter observer binding mismatch",
@@ -2102,6 +2232,7 @@ fn validate_registered_adapter(
         PATTERN_LEN_ALWAYS_CASE => PATTERN_LEN_ALWAYS_SOURCE,
         TRY_SEARCH_OVERLAPPING_FWD_CASE => TRY_SEARCH_OVERLAPPING_FWD_SOURCE,
         TRY_SEARCH_FWD_CASE => TRY_SEARCH_FWD_SOURCE,
+        TRY_SEARCH_FWD_BOUNDS_CASE => TRY_SEARCH_FWD_BOUNDS_SOURCE,
         _ => {
             return Err(InventoryError::new(
                 "regex-automata adapter has an unreviewed case",
@@ -2134,6 +2265,63 @@ fn validate_registered_adapter(
         ));
     }
     validate_source_spec(&adapter.source)?;
+    if adapter.case_id == TRY_SEARCH_FWD_BOUNDS_CASE {
+        validate_try_search_fwd_bounds_vector(&adapter.source, TRY_SEARCH_FWD_BOUNDS_VECTOR)?;
+    }
+    Ok(())
+}
+
+fn validate_try_search_fwd_bounds_vector(
+    source: &SourceContractSpec,
+    vector: TrySearchFwdBoundsVector,
+) -> Result<(), InventoryError> {
+    if source != &TRY_SEARCH_FWD_BOUNDS_SOURCE
+        || vector.pattern.is_empty()
+        || vector.pattern.contains(['"', '\n', '\r', '\0'])
+        || vector.haystack.is_empty()
+        || !vector
+            .haystack
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+        || vector.range_start >= vector.range_end
+        || vector.range_end > vector.haystack.len()
+    {
+        return Err(InventoryError::new(
+            "try-search-fwd bounds vector is structurally invalid",
+        ));
+    }
+    let relative_end = vector
+        .range_end
+        .checked_sub(vector.range_start)
+        .ok_or_else(|| InventoryError::new("try-search-fwd bounds vector underflow"))?;
+    let required_lines = [
+        format!(
+            "    /// let dfa = dense::DFA::new(r\"{}\")?;\n",
+            vector.pattern,
+        ),
+        format!(
+            "    /// let haystack = \"{}\".as_bytes();\n",
+            vector.haystack,
+        ),
+        format!(
+            "    /// let input = Input::new(&haystack[{}..{}]);\n",
+            vector.range_start, vector.range_end,
+        ),
+        format!("    /// let expected = Some(HalfMatch::must(0, {relative_end}));\n",),
+        format!(
+            "    /// let input = Input::new(haystack).range({}..{});\n",
+            vector.range_start, vector.range_end,
+        ),
+        "    /// let expected = None;\n".to_owned(),
+    ];
+    if required_lines
+        .iter()
+        .any(|line| source.source_span.matches(line).count() != 1)
+    {
+        return Err(InventoryError::new(
+            "try-search-fwd bounds vector is not bound to the upstream span",
+        ));
+    }
     Ok(())
 }
 
@@ -2776,9 +2964,18 @@ mod tests {
 
     #[test]
     fn predecessor_authority_rejects_registry_and_evidence_substitution() {
-        let mut missing = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
-        missing.pop();
-        assert!(validate_predecessor_registry_manifest(&missing).is_err());
+        let stale_three = [
+            PATTERN_LEN_ADAPTER,
+            PATTERN_LEN_MANY_ADAPTER,
+            TRY_SEARCH_FWD_ADAPTER,
+        ];
+        assert!(validate_predecessor_registry_manifest(&stale_three).is_err());
+
+        for omitted in 0..PREDECESSOR_REGISTERED_ADAPTERS.len() {
+            let mut missing = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+            missing.remove(omitted);
+            assert!(validate_predecessor_registry_manifest(&missing).is_err());
+        }
 
         let mut reordered = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
         reordered.swap(0, 1);
@@ -2797,6 +2994,10 @@ mod tests {
             ..PATTERN_LEN_ADAPTER
         };
         assert!(validate_predecessor_registry_manifest(&wrong_observer).is_err());
+
+        let mut current_only = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+        current_only.push(TRY_SEARCH_FWD_BOUNDS_ADAPTER);
+        assert!(validate_predecessor_registry_manifest(&current_only).is_err());
 
         let authentic = predecessor_report_fixture();
         let mut altered = authentic.clone();
@@ -2848,6 +3049,161 @@ mod tests {
             evidence_sha256: "b".repeat(64),
         };
         assert!(gain_vectors(&old, &unassigned, &assigned).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
+    fn authenticated_assignment_accepts_only_the_line_1267_membership() {
+        const INVENTORY_FILE_SHA256: &str =
+            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2";
+        const BASELINE_FILE_SHA256: &str =
+            "c6304c387772d756e8394e39faf015b6243e1e406175ea3a9871aa4eebee6910";
+        const INVENTORY_PAYLOAD_SHA256: &str =
+            "f2bab4e81ce6510474c8fec373ebadfc506f94fa4b2eef9bad99e7f2b06ac547";
+        const OBLIGATION_INVENTORY_SHA256: &str =
+            "a0a791feca9f0b22ac3045a9997a5129d3beed0e772a1dcef73e9bb83fd54a04";
+        const BASELINE_PAYLOAD_SHA256: &str =
+            "23092431142b7af68efb7d77da12c5adcb38bb3f155b11af96b4f658acd0302d";
+        const TARGETS_SHA256: &str =
+            "9915623138f2f8044f42cd95c2e1e46194dcaeebdcae08a99f9677c3b1e41275";
+        const LINE_1267_EVIDENCE_SHA256: &str =
+            "50b6c68a302c7e4dd4db74727c633859b495fdf433185a3e4257dd040ccc6550";
+
+        let evidence = std::env::var_os("FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR");
+        let inventory_bytes = fs::read(evidence.join("regex-automata-inventory.json")).unwrap();
+        let baseline_bytes = fs::read(evidence.join("regex-automata.json")).unwrap();
+        assert_eq!(sha256(&inventory_bytes), INVENTORY_FILE_SHA256);
+        assert_eq!(sha256(&baseline_bytes), BASELINE_FILE_SHA256);
+        let inventory: RegexAutomataCorpusReport =
+            serde_json::from_slice(&inventory_bytes).unwrap();
+        let baseline: RegexAutomataAdapterReport = serde_json::from_slice(&baseline_bytes).unwrap();
+        assert_eq!(inventory.payload_sha256, INVENTORY_PAYLOAD_SHA256);
+        assert_eq!(
+            inventory.payload.harness.obligation_inventory_sha256,
+            OBLIGATION_INVENTORY_SHA256,
+        );
+        assert_eq!(baseline.payload_sha256, BASELINE_PAYLOAD_SHA256);
+
+        let assignment =
+            schedule_regex_automata_gap(&inventory, &baseline, "g0-doctest-dfa-line1267-51a-r1", 0)
+                .unwrap();
+        assert_eq!(assignment.family, "doctest-dfa");
+        assert_eq!(assignment.targets.len(), 16);
+        assert_eq!(
+            assignment
+                .targets
+                .iter()
+                .map(|target| target.mode_ids.len())
+                .sum::<usize>(),
+            24,
+        );
+        assert_eq!(assignment.targets_sha256, TARGETS_SHA256);
+        assert_eq!(assignment.targets[14].case_id, TRY_SEARCH_FWD_BOUNDS_CASE);
+        assert_eq!(
+            assignment.targets[14].mode_ids,
+            [COMPILED_MODE_ID, "vcs-all-features-doctest"],
+        );
+
+        let current = build_regex_automata_adapter_report(&inventory, candidate('d', 'e')).unwrap();
+        let changed = baseline
+            .payload
+            .receipts
+            .iter()
+            .zip(&current.payload.receipts)
+            .filter(|(old, new)| old.disposition != new.disposition)
+            .map(|(_, new)| (new.mode_id.as_str(), new.harness, new.case_id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            [(
+                COMPILED_MODE_ID,
+                RegexAutomataHarnessKind::Doctest,
+                TRY_SEARCH_FWD_BOUNDS_CASE,
+            )],
+        );
+        assert_eq!(
+            baseline
+                .payload
+                .receipts
+                .iter()
+                .zip(&current.payload.receipts)
+                .filter(|(old, new)| old.disposition == new.disposition)
+                .count(),
+            3841,
+        );
+        assert!(matches!(
+            current
+                .payload
+                .receipts
+                .iter()
+                .find(|receipt| {
+                    receipt.mode_id == "vcs-all-features-doctest"
+                        && receipt.harness == RegexAutomataHarnessKind::Doctest
+                        && receipt.case_id == TRY_SEARCH_FWD_BOUNDS_CASE
+                })
+                .unwrap()
+                .disposition,
+            RegexAutomataAdapterDisposition::Unsupported { .. },
+        ));
+        let line_1267_execution = current
+            .payload
+            .execution_receipts
+            .iter()
+            .find(|execution| execution.case_id == TRY_SEARCH_FWD_BOUNDS_CASE)
+            .unwrap();
+        assert_eq!(
+            hash_json(line_1267_execution, "encode line-1267 test execution").unwrap(),
+            LINE_1267_EVIDENCE_SHA256,
+        );
+        assert_eq!(
+            (
+                line_1267_execution.source.source_sha256.as_str(),
+                line_1267_execution.source.source_span_sha256.as_str(),
+                line_1267_execution
+                    .source
+                    .assertion_inventory_sha256
+                    .as_str(),
+            ),
+            (
+                AUTOMATON_SOURCE_SHA256,
+                "7a107341165090031ae322427e59560ed3a9f895aba49896557a7610a50f0530",
+                "2bbe88fc6fc55dc9ee186d0b84b09019c1fd0515dd99802ae250ec21726a5d08",
+            ),
+        );
+        assert_eq!(
+            (
+                baseline.payload.counts.pass,
+                baseline.payload.counts.unsupported,
+                baseline.payload.counts.fault,
+                baseline.payload.counts.total,
+            ),
+            (8, 3834, 0, 3842),
+        );
+        assert_eq!(
+            (
+                current.payload.counts.pass,
+                current.payload.counts.unsupported,
+                current.payload.counts.fault,
+                current.payload.counts.total,
+            ),
+            (9, 3833, 0, 3842),
+        );
+        assert!(
+            PREDECESSOR_REGISTERED_ADAPTERS
+                .iter()
+                .all(|adapter| adapter.case_id != TRY_SEARCH_FWD_BOUNDS_CASE),
+        );
+        let gain =
+            validate_regex_automata_strict_gain(&inventory, &baseline, &current, &assignment)
+                .unwrap();
+        assert_eq!(gain.family, "doctest-dfa");
+        assert_eq!(
+            (gain.gained_unique_cases, gain.gained_mode_memberships),
+            (1, 1),
+        );
+        assert_eq!((gain.previous_pass, gain.current_pass), (8, 9));
     }
 
     #[test]
@@ -2908,6 +3264,14 @@ mod tests {
         Ok(executions)
     }
 
+    fn omitted_bounds_assertion(
+        context: &AdapterContext<'_>,
+    ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+        let mut executions = run_try_search_fwd_bounds(context)?;
+        executions.pop();
+        Ok(executions)
+    }
+
     fn wrong_pattern_len_many(
         context: &AdapterContext<'_>,
     ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
@@ -2943,6 +3307,12 @@ mod tests {
         validate_source_spec(&PATTERN_LEN_ALWAYS_SOURCE).unwrap();
         validate_source_spec(&TRY_SEARCH_OVERLAPPING_FWD_SOURCE).unwrap();
         validate_source_spec(&TRY_SEARCH_FWD_SOURCE).unwrap();
+        validate_source_spec(&TRY_SEARCH_FWD_BOUNDS_SOURCE).unwrap();
+        validate_try_search_fwd_bounds_vector(
+            &TRY_SEARCH_FWD_BOUNDS_SOURCE,
+            TRY_SEARCH_FWD_BOUNDS_VECTOR,
+        )
+        .unwrap();
 
         let mut changed_span = PATTERN_LEN_SOURCE;
         changed_span.source_span = "    /// changed\n";
@@ -2964,6 +3334,30 @@ mod tests {
         let mut wrong_span = PATTERN_LEN_MANY_SOURCE;
         wrong_span.source_span = PATTERN_LEN_SOURCE.source_span;
         assert!(validate_source_spec(&wrong_span).is_err());
+
+        for changed in [
+            TrySearchFwdBoundsVector {
+                pattern: "[0-9]{3}",
+                ..TRY_SEARCH_FWD_BOUNDS_VECTOR
+            },
+            TrySearchFwdBoundsVector {
+                haystack: "foo123baz",
+                ..TRY_SEARCH_FWD_BOUNDS_VECTOR
+            },
+            TrySearchFwdBoundsVector {
+                range_start: 2,
+                ..TRY_SEARCH_FWD_BOUNDS_VECTOR
+            },
+            TrySearchFwdBoundsVector {
+                range_end: 7,
+                ..TRY_SEARCH_FWD_BOUNDS_VECTOR
+            },
+        ] {
+            assert!(
+                validate_try_search_fwd_bounds_vector(&TRY_SEARCH_FWD_BOUNDS_SOURCE, changed)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3006,6 +3400,15 @@ mod tests {
         };
         assert_eq!(
             execute_adapter(&omitted_many, &mode).unwrap_err(),
+            "assertion-execution-count-mismatch",
+        );
+
+        let omitted_bounds = RegisteredAdapter {
+            run: omitted_bounds_assertion,
+            ..TRY_SEARCH_FWD_BOUNDS_ADAPTER
+        };
+        assert_eq!(
+            execute_adapter(&omitted_bounds, &mode).unwrap_err(),
             "assertion-execution-count-mismatch",
         );
     }
@@ -3058,6 +3461,15 @@ mod tests {
         };
         assert_eq!(
             execute_adapter(&relabeled, &relabeled_mode).unwrap_err(),
+            "compiled-mode-mismatch",
+        );
+
+        let relabeled_bounds = RegisteredAdapter {
+            mode_id: "vcs-all-features-doctest",
+            ..TRY_SEARCH_FWD_BOUNDS_ADAPTER
+        };
+        assert_eq!(
+            execute_adapter(&relabeled_bounds, &relabeled_mode).unwrap_err(),
             "compiled-mode-mismatch",
         );
     }
