@@ -875,10 +875,15 @@ const TRY_SEARCH_FWD_ADAPTER: RegisteredAdapter = RegisteredAdapter {
 const PREDECESSOR_REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ADAPTER,
     PATTERN_LEN_MANY_ADAPTER,
+    IS_SPECIAL_STATE_ADAPTER,
+    IS_START_STATE_ADAPTER,
+    MATCH_LEN_ADAPTER,
+    PATTERN_LEN_ALWAYS_ADAPTER,
+    TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
     TRY_SEARCH_FWD_ADAPTER,
 ];
 const PREDECESSOR_REGISTRY_MANIFEST_SHA256: &str =
-    "f6f6afe53a2a7409a9bb9b31be637bee4efc42d08461997d2817934395e407f5";
+    "6cc030a55a7d5c32b29f1da01b7d779efa46e9d0fbd308638d750a966c570df8";
 const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ADAPTER,
     PATTERN_LEN_MANY_ADAPTER,
@@ -2632,72 +2637,17 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let receipts = vec![
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: PATTERN_LEN_CASE.to_owned(),
+        let receipts = PREDECESSOR_REGISTERED_ADAPTERS
+            .iter()
+            .map(|adapter| RegexAutomataAdapterReceipt {
+                mode_id: adapter.mode_id.to_owned(),
+                harness: adapter.harness,
+                case_id: adapter.case_id.to_owned(),
                 disposition: RegexAutomataAdapterDisposition::Pass {
-                    evidence_sha256: evidence[PATTERN_LEN_CASE].clone(),
+                    evidence_sha256: evidence[adapter.case_id].clone(),
                 },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: PATTERN_LEN_MANY_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Pass {
-                    evidence_sha256: evidence[PATTERN_LEN_MANY_CASE].clone(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: IS_SPECIAL_STATE_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Unsupported {
-                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: IS_START_STATE_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Unsupported {
-                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: MATCH_LEN_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Unsupported {
-                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: PATTERN_LEN_ALWAYS_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Unsupported {
-                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: TRY_SEARCH_OVERLAPPING_FWD_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Unsupported {
-                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
-                },
-            },
-            RegexAutomataAdapterReceipt {
-                mode_id: COMPILED_MODE_ID.to_owned(),
-                harness: RegexAutomataHarnessKind::Doctest,
-                case_id: TRY_SEARCH_FWD_CASE.to_owned(),
-                disposition: RegexAutomataAdapterDisposition::Pass {
-                    evidence_sha256: evidence[TRY_SEARCH_FWD_CASE].clone(),
-                },
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
         let payload = RegexAutomataAdapterReportPayload {
             inventory_payload_sha256: "1".repeat(64),
             obligation_inventory_sha256: "2".repeat(64),
@@ -2724,60 +2674,82 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_predecessor_manifest_allows_exact_three_to_eight_transition() {
+    fn authenticated_predecessor_manifest_replays_exact_eight() {
         validate_predecessor_registry_manifest(PREDECESSOR_REGISTERED_ADAPTERS).unwrap();
         let previous = predecessor_report_fixture();
         validate_predecessor_report_authority(&previous, &previous).unwrap();
+        assert_eq!(previous.payload.counts.pass, 8);
+        assert_eq!(previous.payload.counts.unsupported, 0);
+        assert_eq!(previous.payload.execution_receipts.len(), 8);
+    }
 
-        let mut current = previous.clone();
-        current.payload.candidate = candidate('c', 'd');
-        let gained_adapters = [
-            IS_SPECIAL_STATE_ADAPTER,
-            IS_START_STATE_ADAPTER,
-            MATCH_LEN_ADAPTER,
-            PATTERN_LEN_ALWAYS_ADAPTER,
-            TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
-        ];
-        for adapter in gained_adapters {
-            let execution = execute_adapter(&adapter, &compiled_mode()).unwrap();
-            let evidence_sha256 = hash_json(&execution, "encode gained test execution").unwrap();
-            let gained = current
-                .payload
-                .receipts
-                .iter_mut()
-                .find(|receipt| receipt.case_id == adapter.case_id)
-                .unwrap();
-            gained.disposition = RegexAutomataAdapterDisposition::Pass { evidence_sha256 };
-            current.payload.execution_receipts.push(execution);
-        }
-        reseal_report(&mut current);
-        let assigned = gained_adapters
+    #[test]
+    #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
+    fn authenticated_exact_036_report_matches_eight_adapter_predecessor() {
+        const INVENTORY_FILE_SHA256: &str =
+            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2";
+        const REPORT_FILE_SHA256: &str =
+            "c6304c387772d756e8394e39faf015b6243e1e406175ea3a9871aa4eebee6910";
+        let evidence = std::env::var_os("FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR");
+        let inventory_bytes = fs::read(evidence.join("regex-automata-inventory.json")).unwrap();
+        let report_bytes = fs::read(evidence.join("regex-automata.json")).unwrap();
+        assert_eq!(sha256(&inventory_bytes), INVENTORY_FILE_SHA256);
+        assert_eq!(sha256(&report_bytes), REPORT_FILE_SHA256);
+        let inventory: RegexAutomataCorpusReport =
+            serde_json::from_slice(&inventory_bytes).unwrap();
+        let report: RegexAutomataAdapterReport = serde_json::from_slice(&report_bytes).unwrap();
+        assert_eq!(
+            report.payload.candidate,
+            CandidateIdentity {
+                revision: "03651e7efa58a4ca7ee5f58a15295a51a88027a0".to_owned(),
+                tree: "5d1d2633c3a6c5d555c65298039da07a775efdf2".to_owned(),
+                tracked_and_untracked_worktree_clean: true,
+            },
+        );
+        assert_eq!(
+            (
+                report.payload.counts.pass,
+                report.payload.counts.unsupported,
+                report.payload.counts.fault,
+                report.payload.counts.total,
+            ),
+            (8, 3834, 0, 3842),
+        );
+        validate_regex_automata_predecessor_execution(&inventory, &report).unwrap();
+        let expected = PREDECESSOR_REGISTERED_ADAPTERS
             .iter()
-            .map(|adapter| {
+            .map(|adapter| (adapter.mode_id, adapter.harness, adapter.case_id))
+            .collect::<BTreeSet<_>>();
+        let observed = report
+            .payload
+            .receipts
+            .iter()
+            .filter(|receipt| {
+                matches!(
+                    receipt.disposition,
+                    RegexAutomataAdapterDisposition::Pass { .. }
+                )
+            })
+            .map(|receipt| {
                 (
-                    COMPILED_MODE_ID.to_owned(),
-                    RegexAutomataHarnessKind::Doctest,
-                    adapter.case_id.to_owned(),
+                    receipt.mode_id.as_str(),
+                    receipt.harness,
+                    receipt.case_id.as_str(),
                 )
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            gain_vectors(
-                &previous.payload.receipts,
-                &current.payload.receipts,
-                &assigned,
-            )
-            .unwrap(),
-            (5, 5),
-        );
-        assert_eq!(previous.payload.counts.pass, 3);
-        assert_eq!(current.payload.counts.pass, 8);
+        assert_eq!(observed, expected);
     }
 
     #[test]
     fn predecessor_authority_rejects_resealed_pass_downgrades() {
         let authentic = predecessor_report_fixture();
-        for case_id in [PATTERN_LEN_CASE, PATTERN_LEN_MANY_CASE, TRY_SEARCH_FWD_CASE] {
+        for case_id in PREDECESSOR_REGISTERED_ADAPTERS
+            .iter()
+            .map(|adapter| adapter.case_id)
+        {
             let mut downgraded = authentic.clone();
             downgraded
                 .payload
@@ -2797,40 +2769,34 @@ mod tests {
                 downgraded.payload_sha256,
                 hash_json(&downgraded.payload, "verify downgraded test seal").unwrap(),
             );
-            assert_eq!(downgraded.payload.counts.pass, 2);
+            assert_eq!(downgraded.payload.counts.pass, 7);
             assert!(validate_predecessor_report_authority(&downgraded, &authentic).is_err(),);
         }
     }
 
     #[test]
     fn predecessor_authority_rejects_registry_and_evidence_substitution() {
-        let missing = [PATTERN_LEN_ADAPTER, PATTERN_LEN_MANY_ADAPTER];
+        let mut missing = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+        missing.pop();
         assert!(validate_predecessor_registry_manifest(&missing).is_err());
 
-        let foreign = RegisteredAdapter {
+        let mut reordered = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+        reordered.swap(0, 1);
+        assert!(validate_predecessor_registry_manifest(&reordered).is_err());
+
+        let mut foreign = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+        foreign[7] = RegisteredAdapter {
             case_id: "src/dfa/automaton.rs - foreign (line 1)",
             ..TRY_SEARCH_FWD_ADAPTER
         };
-        assert!(
-            validate_predecessor_registry_manifest(&[
-                PATTERN_LEN_ADAPTER,
-                PATTERN_LEN_MANY_ADAPTER,
-                foreign,
-            ])
-            .is_err(),
-        );
-        let wrong_observer = RegisteredAdapter {
+        assert!(validate_predecessor_registry_manifest(&foreign).is_err());
+
+        let mut wrong_observer = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
+        wrong_observer[0] = RegisteredAdapter {
             run: run_pattern_len_many,
             ..PATTERN_LEN_ADAPTER
         };
-        assert!(
-            validate_predecessor_registry_manifest(&[
-                wrong_observer,
-                PATTERN_LEN_MANY_ADAPTER,
-                TRY_SEARCH_FWD_ADAPTER,
-            ])
-            .is_err(),
-        );
+        assert!(validate_predecessor_registry_manifest(&wrong_observer).is_err());
 
         let authentic = predecessor_report_fixture();
         let mut altered = authentic.clone();
