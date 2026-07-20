@@ -3874,6 +3874,159 @@ mod tests {
         assert_eq!(observed, expected);
     }
 
+    fn assert_exact_look_report_seals(
+        previous: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        assert_eq!(
+            previous.payload_sha256,
+            "e6e42fbb27c0f9be371c47cefcad455940b60516a0b9b188105c06b91fd3a56c",
+        );
+        assert_eq!(
+            hash_json(previous, "encode exact nine-pass predecessor").unwrap(),
+            "ca0c28984a2d5d8d15daea5302327df9b647f2f30d87dd87481ba8ffcd6a3657",
+        );
+        assert_eq!(
+            current.payload_sha256,
+            "c23a3f239ce4932835e8428f5e1ed4e5e56cdf4af544eeee1cfbabbd2d9a735c",
+        );
+        assert_eq!(
+            hash_json(current, "encode exact thirteen-pass current report").unwrap(),
+            "476d87115ac01256cc5eb20338d6725998165a12c44a20585fd90340fafffdf2",
+        );
+        assert_eq!(
+            (&previous.payload.counts, &current.payload.counts),
+            (
+                &RegexAutomataAdapterCounts {
+                    pass: 9,
+                    unsupported: 3_833,
+                    fault: 0,
+                    total: 3_842,
+                },
+                &RegexAutomataAdapterCounts {
+                    pass: 13,
+                    unsupported: 3_829,
+                    fault: 0,
+                    total: 3_842,
+                },
+            ),
+        );
+    }
+
+    fn assert_exact_look_receipt_delta(
+        previous: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        let changed = previous
+            .payload
+            .receipts
+            .iter()
+            .zip(&current.payload.receipts)
+            .filter(|(old, new)| old.disposition != new.disposition)
+            .map(|(_, receipt)| {
+                (
+                    receipt.mode_id.as_str(),
+                    receipt.harness,
+                    receipt.case_id.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_changed = LOOK_CASES
+            .iter()
+            .map(|case| {
+                (
+                    COMPILED_UNIT_MODE_ID,
+                    RegexAutomataHarnessKind::Unit,
+                    case.case_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(changed, expected_changed);
+        assert_eq!(
+            previous
+                .payload
+                .receipts
+                .iter()
+                .zip(&current.payload.receipts)
+                .filter(|(old, new)| old.disposition == new.disposition)
+                .count(),
+            3_838,
+        );
+        let look_case_ids = LOOK_CASES
+            .iter()
+            .map(|case| case.case_id)
+            .collect::<BTreeSet<_>>();
+        let retained_other_modes = current.payload.receipts.iter().filter(|receipt| {
+            look_case_ids.contains(receipt.case_id.as_str())
+                && (receipt.mode_id != COMPILED_UNIT_MODE_ID
+                    || receipt.harness != RegexAutomataHarnessKind::Unit)
+        });
+        assert_eq!(retained_other_modes.clone().count(), 116);
+        assert!(retained_other_modes.clone().all(|receipt| matches!(
+            receipt.disposition,
+            RegexAutomataAdapterDisposition::Unsupported { .. }
+        )));
+        assert_eq!(
+            current
+                .payload
+                .execution_receipts
+                .iter()
+                .filter(|execution| look_case_ids.contains(execution.case_id.as_str()))
+                .map(|execution| execution.assertion_executions.len())
+                .sum::<usize>(),
+            32,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
+    fn authenticated_exact_dfd_look_gain_is_thirteen_with_no_other_change() {
+        const IMPLEMENTATION_REVISION: &str = "57e621c95eaa93091baebf39c202209737fd04f6";
+        const IMPLEMENTATION_TREE: &str = "450dd4b6c98f87dfb33365f022dfb9a788c3f96c";
+        let (inventory, _) = authenticated_exact_036_evidence();
+        let previous = build_adapter_report_with_registry(
+            &inventory,
+            CandidateIdentity {
+                revision: LOOK_BASE_REVISION.to_owned(),
+                tree: LOOK_BASE_TREE.to_owned(),
+                tracked_and_untracked_worktree_clean: true,
+            },
+            PREDECESSOR_REGISTERED_ADAPTERS,
+        )
+        .unwrap();
+        let candidate = CandidateIdentity {
+            revision: IMPLEMENTATION_REVISION.to_owned(),
+            tree: IMPLEMENTATION_TREE.to_owned(),
+            tracked_and_untracked_worktree_clean: true,
+        };
+        let current = build_regex_automata_adapter_report(&inventory, candidate.clone()).unwrap();
+        let duplicate = build_regex_automata_adapter_report(&inventory, candidate).unwrap();
+        assert_eq!(current, duplicate);
+        assert_exact_look_report_seals(&previous, &current);
+        assert_exact_look_receipt_delta(&previous, &current);
+        let gain =
+            validate_regex_automata_look_strict_gain(&inventory, &previous, &current).unwrap();
+        assert_eq!(gain.family, "unit-util");
+        assert_eq!(
+            (
+                gain.gained_unique_cases,
+                gain.gained_mode_memberships,
+                gain.previous_pass,
+                gain.current_pass,
+            ),
+            (4, 4, 9, 13),
+        );
+
+        let mut relabeled = current;
+        relabeled.schema = PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA.to_owned();
+        relabeled.payload.limitations = DOCTEST_ONLY_REPORT_LIMITATIONS
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect();
+        reseal_report(&mut relabeled);
+        assert!(relabeled.validate_structure(&inventory).is_err());
+    }
+
     #[test]
     fn predecessor_authority_rejects_resealed_pass_downgrades() {
         let authentic = predecessor_report_fixture();
