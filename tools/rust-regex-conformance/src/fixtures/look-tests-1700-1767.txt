@@ -1,0 +1,68 @@
+mod tests {
+    use super::*;
+
+    macro_rules! testlook {
+        ($look:expr, $haystack:expr, $at:expr) => {
+            LookMatcher::default().matches($look, $haystack.as_bytes(), $at)
+        };
+    }
+
+    #[test]
+    fn look_matches_start_line() {
+        let look = Look::StartLF;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "a", 0));
+        assert!(testlook!(look, "\na", 1));
+
+        assert!(!testlook!(look, "a", 1));
+        assert!(!testlook!(look, "a\na", 1));
+    }
+
+    #[test]
+    fn look_matches_end_line() {
+        let look = Look::EndLF;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "\na", 0));
+        assert!(testlook!(look, "\na", 2));
+        assert!(testlook!(look, "a\na", 1));
+
+        assert!(!testlook!(look, "a", 0));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a\na", 0));
+        assert!(!testlook!(look, "a\na", 2));
+    }
+
+    #[test]
+    fn look_matches_start_text() {
+        let look = Look::Start;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 0));
+        assert!(testlook!(look, "a", 0));
+
+        assert!(!testlook!(look, "\n", 1));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a", 1));
+        assert!(!testlook!(look, "a\na", 1));
+    }
+
+    #[test]
+    fn look_matches_end_text() {
+        let look = Look::End;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "\na", 2));
+
+        assert!(!testlook!(look, "\na", 0));
+        assert!(!testlook!(look, "a\na", 1));
+        assert!(!testlook!(look, "a", 0));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a\na", 0));
+        assert!(!testlook!(look, "a\na", 2));
+    }

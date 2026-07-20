@@ -16,10 +16,14 @@ use std::{
     path::Path,
 };
 
-use fre::{PortableRegex, PortableRegexSet, SearchLimits, SearchWindow};
+use fre::{
+    PlanKind, PlanSelection, PortableBuilder, PortableRegex, PortableRegexSet, RustProfile,
+    SearchAccounting, SearchLimits, SearchWindow,
+};
 use regex_automata::{
     HalfMatch, Input, MatchKind,
     dfa::{Automaton, OverlappingState, dense},
+    util::look::{Look, LookMatcher},
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +34,8 @@ use crate::{
 
 /// Complete candidate coverage report over every feature-mode membership.
 pub const REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
+    "fre.regex-automata-0.4.14.adapter-report.v3";
+const PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.adapter-report.v2";
 const LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.adapter-report.v1";
@@ -43,16 +49,30 @@ const LEGACY_REPORT_LIMITATIONS: [&str; 2] = [
     "A pass is emitted only after an exact registered adapter function executes successfully; absent registrations remain unsupported.",
     "One unique harness/case adapter disposition is projected across every authenticated feature-mode membership for that same identity.",
 ];
-const REPORT_LIMITATIONS: [&str; 3] = [
+const DOCTEST_ONLY_REPORT_LIMITATIONS: [&str; 3] = [
     "A pass requires an exact mode/case execution receipt from a compiled registry membership and exhaustive execution of the authenticated upstream assertion inventory.",
     "No result is projected across build modes; a mode without its own compiled execution remains unsupported.",
     "The current bridge compiles only the package-default doctest mode; vcs-all-features doctest memberships remain unsupported until separately compiled and executed.",
 ];
+const MIXED_DEFAULT_REPORT_LIMITATIONS: [&str; 3] = [
+    "A pass requires an exact mode/case execution receipt from a compiled registry membership and exhaustive execution of the authenticated upstream assertion inventory.",
+    "No result is projected across build modes; a mode without its own compiled execution remains unsupported.",
+    "The current bridge compiles only package-default doctest and unit memberships; VCS feature-mode memberships remain unsupported until separately compiled and executed.",
+];
 
 const COMPILED_MODE_ID: &str = "package-default-doctest";
+const COMPILED_UNIT_MODE_ID: &str = "package-default-unit";
 const AUTOMATON_SOURCE_PATH: &str = "src/dfa/automaton.rs";
 const AUTOMATON_SOURCE_SHA256: &str =
     "a2af61cdfb7f16a8419a25ccb3ae250afe736ff397c7a3101c8a77781d096a9b";
+const LOOK_SOURCE_PATH: &str = "src/util/look.rs";
+const LOOK_SOURCE_SHA256: &str = "fca6dac7bf7b3b975f177db91e122af89e1510b3664d04210ca8b84738a08305";
+const LOOK_FULL_SPAN_SHA256: &str =
+    "7d4a1ac128aa3df29bab8bece1cd9481df88abfdb31ee7086668503f48eead84";
+const LOOK_TARGET_IDENTITIES_SHA256: &str =
+    "053675c6955c5ca165db98bf1a684105cbb59176b1893ab9b022a4d98fd16c9b";
+const LOOK_BASE_REVISION: &str = "dfdba9d2848d7d228d53bffcefe7843fbe6307c9";
+const LOOK_BASE_TREE: &str = "5434af1bf92b264f46149fa50dcf533503212133";
 const PATTERN_LEN_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 800)";
 const PATTERN_LEN_MANY_CASE: &str =
@@ -71,6 +91,10 @@ const TRY_SEARCH_FWD_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1209)";
 const TRY_SEARCH_FWD_BOUNDS_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1267)";
+const LOOK_END_LINE_CASE: &str = "util::look::tests::look_matches_end_line";
+const LOOK_END_TEXT_CASE: &str = "util::look::tests::look_matches_end_text";
+const LOOK_START_LINE_CASE: &str = "util::look::tests::look_matches_start_line";
+const LOOK_START_TEXT_CASE: &str = "util::look::tests::look_matches_start_text";
 
 /// Candidate disposition for one exact feature-mode membership.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,6 +272,31 @@ struct TrySearchFwdBoundsVector {
     haystack: &'static str,
     range_start: usize,
     range_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LookKind {
+    StartLine,
+    EndLine,
+    StartText,
+    EndText,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LookAssertionVector {
+    assertion_id: &'static str,
+    haystack: &'static str,
+    at: usize,
+    expected: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LookCaseSpec {
+    case_id: &'static str,
+    kind: LookKind,
+    pattern: &'static str,
+    source: SourceContractSpec,
+    vectors: &'static [LookAssertionVector],
 }
 
 struct AdapterContext<'a> {
@@ -464,6 +513,417 @@ const TRY_SEARCH_FWD_BOUNDS_VECTOR: TrySearchFwdBoundsVector = TrySearchFwdBound
     range_start: 3,
     range_end: 6,
 };
+
+const LOOK_FULL_SOURCE_SPAN: &str = include_str!("fixtures/look-tests-1700-1767.txt");
+const LOOK_TARGET_IDENTITIES: &str = concat!(
+    "package-default-unit\tunit\tutil::look::tests::look_matches_end_line\n",
+    "package-default-unit\tunit\tutil::look::tests::look_matches_end_text\n",
+    "package-default-unit\tunit\tutil::look::tests::look_matches_start_line\n",
+    "package-default-unit\tunit\tutil::look::tests::look_matches_start_text\n",
+);
+
+macro_rules! look_assertion {
+    ($id:literal, $line:literal, $sha:literal, $expected:literal) => {
+        AssertionSpec {
+            assertion_id: $id,
+            source_line: $line,
+            source_line_sha256: $sha,
+            expected_observation: $expected,
+        }
+    };
+}
+
+macro_rules! look_vector {
+    ($id:literal, $haystack:literal, $at:literal, $expected:literal) => {
+        LookAssertionVector {
+            assertion_id: $id,
+            haystack: $haystack,
+            at: $at,
+            expected: $expected,
+        }
+    };
+}
+
+const LOOK_START_LINE_ASSERTIONS: &[AssertionSpec] = &[
+    look_assertion!(
+        "start-line-01",
+        1713,
+        "377dfed8f74dbe76733e82eed63b286d848175afe150f159854e895d736694e8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-line-02",
+        1714,
+        "7b2cfa46bc12bb41f8dd64a5a3f45e0603c5976d41eda5fea32a80208c63fde3",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-line-03",
+        1715,
+        "b42d9fdef3267e00e4e2dd9db9e1bc1db76fbec9e55717474236e2118574a966",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-line-04",
+        1716,
+        "cc0496799a38779e4a93d2e1dbf3f89d7f41cde7a21bc0d07cf3ae710799290d",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-line-05",
+        1717,
+        "14b0b97ccabd2878376f3a74775e207a7b556a63a5bdec8c726c032e778a9525",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-line-06",
+        1719,
+        "6ab89399ee98889064e395fd85629964a999a957fbb752245e5d66acaf487c9c",
+        "bool:false"
+    ),
+    look_assertion!(
+        "start-line-07",
+        1720,
+        "db5782d607b536a50e01ae79fc3a8fed05c2d99add15f883936b76075e70efca",
+        "bool:false"
+    ),
+];
+const LOOK_START_LINE_VECTORS: &[LookAssertionVector] = &[
+    look_vector!("start-line-01", "", 0, true),
+    look_vector!("start-line-02", "\n", 0, true),
+    look_vector!("start-line-03", "\n", 1, true),
+    look_vector!("start-line-04", "a", 0, true),
+    look_vector!("start-line-05", "\na", 1, true),
+    look_vector!("start-line-06", "a", 1, false),
+    look_vector!("start-line-07", "a\na", 1, false),
+];
+
+const LOOK_END_LINE_ASSERTIONS: &[AssertionSpec] = &[
+    look_assertion!(
+        "end-line-01",
+        1727,
+        "377dfed8f74dbe76733e82eed63b286d848175afe150f159854e895d736694e8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-line-02",
+        1728,
+        "b42d9fdef3267e00e4e2dd9db9e1bc1db76fbec9e55717474236e2118574a966",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-line-03",
+        1729,
+        "e9135de67b9945051bbbb48b42c7443029de4a65e359146986f7c38182ee287b",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-line-04",
+        1730,
+        "a88d87906229d739eb4b3fffd47c7f364a57a5eb4060ede6ff73476aaee482c8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-line-05",
+        1731,
+        "0c025b0926008a9be12f52a21ea90eb1f4ce1df9895af7027f85a8f63ad60bf5",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-line-06",
+        1733,
+        "77a69a1cba2710948745e169c85a459bb230077bdebf5d3209cb8483877f254c",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-line-07",
+        1734,
+        "3d696539cf90acd95b83dd8c5402da3d3812f0ed8e63003bcacfb3bbfa65579d",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-line-08",
+        1735,
+        "dd8b6b9a75a9c6ac1c16e96cf3439fa6554e4a0448273cef0acc5bfae8947170",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-line-09",
+        1736,
+        "edc6f359cf4db83bed32bc0e0910c10f0f540a770dc47b8abf2c22d17bf1501a",
+        "bool:false"
+    ),
+];
+const LOOK_END_LINE_VECTORS: &[LookAssertionVector] = &[
+    look_vector!("end-line-01", "", 0, true),
+    look_vector!("end-line-02", "\n", 1, true),
+    look_vector!("end-line-03", "\na", 0, true),
+    look_vector!("end-line-04", "\na", 2, true),
+    look_vector!("end-line-05", "a\na", 1, true),
+    look_vector!("end-line-06", "a", 0, false),
+    look_vector!("end-line-07", "\na", 1, false),
+    look_vector!("end-line-08", "a\na", 0, false),
+    look_vector!("end-line-09", "a\na", 2, false),
+];
+
+const LOOK_START_TEXT_ASSERTIONS: &[AssertionSpec] = &[
+    look_assertion!(
+        "start-text-01",
+        1743,
+        "377dfed8f74dbe76733e82eed63b286d848175afe150f159854e895d736694e8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-text-02",
+        1744,
+        "7b2cfa46bc12bb41f8dd64a5a3f45e0603c5976d41eda5fea32a80208c63fde3",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-text-03",
+        1745,
+        "cc0496799a38779e4a93d2e1dbf3f89d7f41cde7a21bc0d07cf3ae710799290d",
+        "bool:true"
+    ),
+    look_assertion!(
+        "start-text-04",
+        1747,
+        "3a7f74fdd5456c3de6a8bfd94b09e3c4372fbc872dbaa86d3a4d4737501c4e8e",
+        "bool:false"
+    ),
+    look_assertion!(
+        "start-text-05",
+        1748,
+        "3d696539cf90acd95b83dd8c5402da3d3812f0ed8e63003bcacfb3bbfa65579d",
+        "bool:false"
+    ),
+    look_assertion!(
+        "start-text-06",
+        1749,
+        "6ab89399ee98889064e395fd85629964a999a957fbb752245e5d66acaf487c9c",
+        "bool:false"
+    ),
+    look_assertion!(
+        "start-text-07",
+        1750,
+        "db5782d607b536a50e01ae79fc3a8fed05c2d99add15f883936b76075e70efca",
+        "bool:false"
+    ),
+];
+const LOOK_START_TEXT_VECTORS: &[LookAssertionVector] = &[
+    look_vector!("start-text-01", "", 0, true),
+    look_vector!("start-text-02", "\n", 0, true),
+    look_vector!("start-text-03", "a", 0, true),
+    look_vector!("start-text-04", "\n", 1, false),
+    look_vector!("start-text-05", "\na", 1, false),
+    look_vector!("start-text-06", "a", 1, false),
+    look_vector!("start-text-07", "a\na", 1, false),
+];
+
+const LOOK_END_TEXT_ASSERTIONS: &[AssertionSpec] = &[
+    look_assertion!(
+        "end-text-01",
+        1757,
+        "377dfed8f74dbe76733e82eed63b286d848175afe150f159854e895d736694e8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-text-02",
+        1758,
+        "b42d9fdef3267e00e4e2dd9db9e1bc1db76fbec9e55717474236e2118574a966",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-text-03",
+        1759,
+        "a88d87906229d739eb4b3fffd47c7f364a57a5eb4060ede6ff73476aaee482c8",
+        "bool:true"
+    ),
+    look_assertion!(
+        "end-text-04",
+        1761,
+        "5c5d4f64bdd5b41dc02c36db4fe0c5a294da9d1fb35552e4ac0ed8b40d554540",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-text-05",
+        1762,
+        "db5782d607b536a50e01ae79fc3a8fed05c2d99add15f883936b76075e70efca",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-text-06",
+        1763,
+        "77a69a1cba2710948745e169c85a459bb230077bdebf5d3209cb8483877f254c",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-text-07",
+        1764,
+        "3d696539cf90acd95b83dd8c5402da3d3812f0ed8e63003bcacfb3bbfa65579d",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-text-08",
+        1765,
+        "dd8b6b9a75a9c6ac1c16e96cf3439fa6554e4a0448273cef0acc5bfae8947170",
+        "bool:false"
+    ),
+    look_assertion!(
+        "end-text-09",
+        1766,
+        "edc6f359cf4db83bed32bc0e0910c10f0f540a770dc47b8abf2c22d17bf1501a",
+        "bool:false"
+    ),
+];
+const LOOK_END_TEXT_VECTORS: &[LookAssertionVector] = &[
+    look_vector!("end-text-01", "", 0, true),
+    look_vector!("end-text-02", "\n", 1, true),
+    look_vector!("end-text-03", "\na", 2, true),
+    look_vector!("end-text-04", "\na", 0, false),
+    look_vector!("end-text-05", "a\na", 1, false),
+    look_vector!("end-text-06", "a", 0, false),
+    look_vector!("end-text-07", "\na", 1, false),
+    look_vector!("end-text-08", "a\na", 0, false),
+    look_vector!("end-text-09", "a\na", 2, false),
+];
+
+const LOOK_START_LINE_SOURCE_SPAN: &str = r#"    #[test]
+    fn look_matches_start_line() {
+        let look = Look::StartLF;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "a", 0));
+        assert!(testlook!(look, "\na", 1));
+
+        assert!(!testlook!(look, "a", 1));
+        assert!(!testlook!(look, "a\na", 1));
+    }
+"#;
+const LOOK_END_LINE_SOURCE_SPAN: &str = r#"    #[test]
+    fn look_matches_end_line() {
+        let look = Look::EndLF;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "\na", 0));
+        assert!(testlook!(look, "\na", 2));
+        assert!(testlook!(look, "a\na", 1));
+
+        assert!(!testlook!(look, "a", 0));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a\na", 0));
+        assert!(!testlook!(look, "a\na", 2));
+    }
+"#;
+const LOOK_START_TEXT_SOURCE_SPAN: &str = r#"    #[test]
+    fn look_matches_start_text() {
+        let look = Look::Start;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 0));
+        assert!(testlook!(look, "a", 0));
+
+        assert!(!testlook!(look, "\n", 1));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a", 1));
+        assert!(!testlook!(look, "a\na", 1));
+    }
+"#;
+const LOOK_END_TEXT_SOURCE_SPAN: &str = r#"    #[test]
+    fn look_matches_end_text() {
+        let look = Look::End;
+
+        assert!(testlook!(look, "", 0));
+        assert!(testlook!(look, "\n", 1));
+        assert!(testlook!(look, "\na", 2));
+
+        assert!(!testlook!(look, "\na", 0));
+        assert!(!testlook!(look, "a\na", 1));
+        assert!(!testlook!(look, "a", 0));
+        assert!(!testlook!(look, "\na", 1));
+        assert!(!testlook!(look, "a\na", 0));
+        assert!(!testlook!(look, "a\na", 2));
+    }
+"#;
+
+const LOOK_START_LINE_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: LOOK_SOURCE_PATH,
+    source_sha256: LOOK_SOURCE_SHA256,
+    span_start_line: 1709,
+    span_end_line: 1721,
+    source_span: LOOK_START_LINE_SOURCE_SPAN,
+    source_span_sha256: "0fa8cd8b1e6235cb8d2e55af690d3dbd5bbd04327a6c2999948111ab70ba6bcc",
+    assertion_inventory_sha256: "a7437eaf5a12a7b85ccfaa5e0bce44661254c4082ac9dbe20866a6f363894995",
+    assertions: LOOK_START_LINE_ASSERTIONS,
+};
+const LOOK_END_LINE_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: LOOK_SOURCE_PATH,
+    source_sha256: LOOK_SOURCE_SHA256,
+    span_start_line: 1723,
+    span_end_line: 1737,
+    source_span: LOOK_END_LINE_SOURCE_SPAN,
+    source_span_sha256: "a51c9ed353e6dc78a266e37d247570e5d201ce1e681ad667375097c5e816b0e5",
+    assertion_inventory_sha256: "4bd75d51227505183e3504c0dd5b279a7e1111e98b5fd20f77749d371cb280c7",
+    assertions: LOOK_END_LINE_ASSERTIONS,
+};
+const LOOK_START_TEXT_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: LOOK_SOURCE_PATH,
+    source_sha256: LOOK_SOURCE_SHA256,
+    span_start_line: 1739,
+    span_end_line: 1751,
+    source_span: LOOK_START_TEXT_SOURCE_SPAN,
+    source_span_sha256: "e079a9104f429305c5e613c0b025a1f1b39f7d1eed6702fe2426239a88cf6bc3",
+    assertion_inventory_sha256: "4609e1c99a84ed463c0026893e60ba4abc82147a86178d9a47db2427b9ee578f",
+    assertions: LOOK_START_TEXT_ASSERTIONS,
+};
+const LOOK_END_TEXT_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: LOOK_SOURCE_PATH,
+    source_sha256: LOOK_SOURCE_SHA256,
+    span_start_line: 1753,
+    span_end_line: 1767,
+    source_span: LOOK_END_TEXT_SOURCE_SPAN,
+    source_span_sha256: "6af248fac72ca90b58753b6554be9c92e3c886d827c629d8fcb8d5fbb0e71ccb",
+    assertion_inventory_sha256: "46ecf1705053e21af088502624e82140fbdcdc1aa546d1176bacd1be1878abe4",
+    assertions: LOOK_END_TEXT_ASSERTIONS,
+};
+
+const LOOK_END_LINE: LookCaseSpec = LookCaseSpec {
+    case_id: LOOK_END_LINE_CASE,
+    kind: LookKind::EndLine,
+    pattern: r"(?m:$)",
+    source: LOOK_END_LINE_SOURCE,
+    vectors: LOOK_END_LINE_VECTORS,
+};
+const LOOK_END_TEXT: LookCaseSpec = LookCaseSpec {
+    case_id: LOOK_END_TEXT_CASE,
+    kind: LookKind::EndText,
+    pattern: r"\z",
+    source: LOOK_END_TEXT_SOURCE,
+    vectors: LOOK_END_TEXT_VECTORS,
+};
+const LOOK_START_LINE: LookCaseSpec = LookCaseSpec {
+    case_id: LOOK_START_LINE_CASE,
+    kind: LookKind::StartLine,
+    pattern: r"(?m:^)",
+    source: LOOK_START_LINE_SOURCE,
+    vectors: LOOK_START_LINE_VECTORS,
+};
+const LOOK_START_TEXT: LookCaseSpec = LookCaseSpec {
+    case_id: LOOK_START_TEXT_CASE,
+    kind: LookKind::StartText,
+    pattern: r"\A",
+    source: LOOK_START_TEXT_SOURCE,
+    vectors: LOOK_START_TEXT_VECTORS,
+};
+const LOOK_CASES: &[LookCaseSpec] = &[
+    LOOK_END_LINE,
+    LOOK_END_TEXT,
+    LOOK_START_LINE,
+    LOOK_START_TEXT,
+];
 
 const PATTERN_LEN_SOURCE: SourceContractSpec = SourceContractSpec {
     source_path: AUTOMATON_SOURCE_PATH,
@@ -945,6 +1405,34 @@ const TRY_SEARCH_FWD_BOUNDS_ADAPTER: RegisteredAdapter = RegisteredAdapter {
     source: TRY_SEARCH_FWD_BOUNDS_SOURCE,
     run: run_try_search_fwd_bounds,
 };
+const LOOK_END_LINE_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_UNIT_MODE_ID,
+    harness: RegexAutomataHarnessKind::Unit,
+    case_id: LOOK_END_LINE_CASE,
+    source: LOOK_END_LINE_SOURCE,
+    run: run_look_end_line,
+};
+const LOOK_END_TEXT_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_UNIT_MODE_ID,
+    harness: RegexAutomataHarnessKind::Unit,
+    case_id: LOOK_END_TEXT_CASE,
+    source: LOOK_END_TEXT_SOURCE,
+    run: run_look_end_text,
+};
+const LOOK_START_LINE_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_UNIT_MODE_ID,
+    harness: RegexAutomataHarnessKind::Unit,
+    case_id: LOOK_START_LINE_CASE,
+    source: LOOK_START_LINE_SOURCE,
+    run: run_look_start_line,
+};
+const LOOK_START_TEXT_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_UNIT_MODE_ID,
+    harness: RegexAutomataHarnessKind::Unit,
+    case_id: LOOK_START_TEXT_CASE,
+    source: LOOK_START_TEXT_SOURCE,
+    run: run_look_start_text,
+};
 
 // This predecessor registry is independent of every report being verified.
 // Its separately sealed manifest prevents a prior report from authorizing a
@@ -958,9 +1446,10 @@ const PREDECESSOR_REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ALWAYS_ADAPTER,
     TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
     TRY_SEARCH_FWD_ADAPTER,
+    TRY_SEARCH_FWD_BOUNDS_ADAPTER,
 ];
 const PREDECESSOR_REGISTRY_MANIFEST_SHA256: &str =
-    "6cc030a55a7d5c32b29f1da01b7d779efa46e9d0fbd308638d750a966c570df8";
+    "9fe47d0442a4c9339c404ca0e5ef7d162f506e5c0f2caa446a4629e9d5b4d8fe";
 const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ADAPTER,
     PATTERN_LEN_MANY_ADAPTER,
@@ -971,6 +1460,10 @@ const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
     TRY_SEARCH_FWD_ADAPTER,
     TRY_SEARCH_FWD_BOUNDS_ADAPTER,
+    LOOK_END_LINE_ADAPTER,
+    LOOK_END_TEXT_ADAPTER,
+    LOOK_START_LINE_ADAPTER,
+    LOOK_START_TEXT_ADAPTER,
 ];
 
 fn run_pattern_len_never_match(
@@ -1530,6 +2023,130 @@ fn run_try_search_fwd_bounds(
     ])
 }
 
+fn run_look_end_line(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case(context, LOOK_END_LINE)
+}
+
+fn run_look_end_text(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case(context, LOOK_END_TEXT)
+}
+
+fn run_look_start_line(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case(context, LOOK_START_LINE)
+}
+
+fn run_look_start_text(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case(context, LOOK_START_TEXT)
+}
+
+fn run_look_case(
+    context: &AdapterContext<'_>,
+    case: LookCaseSpec,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    const MAX_WORK: u64 = 18;
+    const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+
+    require_compiled_mode(context)?;
+    validate_look_case_spec(case).map_err(|error| format!("look-case-contract:{error}"))?;
+    let look = match case.kind {
+        LookKind::StartLine => Look::StartLF,
+        LookKind::EndLine => Look::EndLF,
+        LookKind::StartText => Look::Start,
+        LookKind::EndText => Look::End,
+    };
+    let fre = PortableBuilder::new(case.pattern)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .map_err(|error| format!("look-fre-build:{error}"))?;
+    validate_look_fre_plan(&fre)?;
+
+    let mut executions = Vec::with_capacity(case.vectors.len());
+    for vector in case.vectors {
+        let haystack = vector.haystack.as_bytes();
+        let upstream = LookMatcher::default().matches(look, haystack, vector.at);
+        let (matched, accounting) = fre
+            .find_window(
+                haystack,
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits {
+                    max_work: MAX_WORK,
+                    max_scratch_bytes: MAX_SCRATCH_BYTES,
+                },
+            )
+            .map_err(|error| format!("look-fre-search:{error}"))?;
+        let observed_span = matched.map(|matched| (matched.start(), matched.end()));
+        let expected_span = vector.expected.then_some((vector.at, vector.at));
+        let observed = observed_span.is_some();
+        let (expected_work, expected_transition_work) =
+            if vector.expected { (18, 4) } else { (17, 3) };
+        let expected_initialized_bytes = if usize::BITS == 64 { 96 } else { 56 };
+        let exact_accounting = matches!(
+            accounting,
+            SearchAccounting::K0(accounting)
+                if accounting.work() == expected_work
+                    && accounting.setup_work() == 14
+                    && accounting.transition_work() == expected_transition_work
+                    && accounting.scratch_bytes() <= MAX_SCRATCH_BYTES
+                    && accounting.boundaries() == 1
+                    && !accounting.setup().reused()
+                    && accounting.setup().allocated_bytes()
+                        == accounting.setup().retained_bytes()
+                    && accounting.setup().retained_bytes() == accounting.scratch_bytes()
+                    && accounting.setup().initialized_bytes() == expected_initialized_bytes
+        );
+        if !exact_accounting
+            || upstream != vector.expected
+            || observed_span != expected_span
+            || observed != vector.expected
+        {
+            return Err("look-triple-agreement-mismatch".to_owned());
+        }
+        executions.push(RegexAutomataAssertionExecution {
+            assertion_id: vector.assertion_id.to_owned(),
+            upstream_observation: format!("bool:{upstream}"),
+            fre_observation: format!("bool:{observed}"),
+        });
+    }
+    Ok(executions)
+}
+
+fn validate_look_fre_plan(fre: &PortableRegex) -> Result<(), String> {
+    let build = fre.build_report();
+    if build.plan != PlanKind::K0
+        || fre.runtime_implementation_id() != "k0"
+        || build.states != 2
+        || build.edges != 1
+        || build
+            .lowering
+            .as_ref()
+            .is_none_or(|lowering| lowering.states() != 2 || lowering.edges() != 1)
+    {
+        return Err("look-fre-non-k0-plan".to_owned());
+    }
+    Ok(())
+}
+
+fn registry_report_limitations(registry: &[RegisteredAdapter]) -> &'static [&'static str] {
+    if registry
+        .iter()
+        .any(|adapter| adapter.mode_id == COMPILED_UNIT_MODE_ID)
+    {
+        MIXED_DEFAULT_REPORT_LIMITATIONS.as_slice()
+    } else {
+        DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice()
+    }
+}
+
 /// Execute every registered adapter and retain every unregistered obligation
 /// as unsupported.
 pub fn build_regex_automata_adapter_report(
@@ -1616,13 +2233,21 @@ fn build_adapter_report_with_registry(
         counts,
         receipts,
         execution_receipts,
-        limitations: REPORT_LIMITATIONS
+        limitations: registry_report_limitations(registry)
             .iter()
             .map(|text| (*text).to_owned())
             .collect(),
     };
     let report = RegexAutomataAdapterReport {
-        schema: REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA.to_owned(),
+        schema: if registry
+            .iter()
+            .any(|adapter| adapter.mode_id == COMPILED_UNIT_MODE_ID)
+        {
+            REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
+        } else {
+            PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
+        }
+        .to_owned(),
         payload_sha256: hash_json(&payload, "encode regex-automata adapter payload")?,
         payload,
     };
@@ -1721,6 +2346,75 @@ pub fn validate_regex_automata_strict_gain(
     })
 }
 
+/// Validate the one sealed four-membership `util::look` assignment rooted at
+/// the reviewed nine-pass `dfdba9d2` report. This does not alter or bypass the
+/// lexicographic scheduler for any other assignment: its authority is the
+/// exact base, target identity seal and compiled execution registry below.
+pub fn validate_regex_automata_look_strict_gain(
+    inventory: &RegexAutomataCorpusReport,
+    previous: &RegexAutomataAdapterReport,
+    current: &RegexAutomataAdapterReport,
+) -> Result<RegexAutomataStrictGain, InventoryError> {
+    inventory.validate()?;
+    previous.validate_for_gain(inventory)?;
+    validate_regex_automata_adapter_execution(inventory, current)?;
+    validate_look_fixture()?;
+    if previous.payload.candidate.revision != LOOK_BASE_REVISION
+        || previous.payload.candidate.tree != LOOK_BASE_TREE
+        || !previous
+            .payload
+            .candidate
+            .tracked_and_untracked_worktree_clean
+        || previous.payload.counts
+            != (RegexAutomataAdapterCounts {
+                pass: 9,
+                unsupported: 3_833,
+                fault: 0,
+                total: 3_842,
+            })
+        || current.payload.candidate.revision == previous.payload.candidate.revision
+        || current.payload.candidate.tree == previous.payload.candidate.tree
+        || current.payload.counts
+            != (RegexAutomataAdapterCounts {
+                pass: 13,
+                unsupported: 3_829,
+                fault: 0,
+                total: 3_842,
+            })
+    {
+        return Err(InventoryError::new(
+            "regex-automata look gain identity or cardinality mismatch",
+        ));
+    }
+    let assigned = LOOK_CASES
+        .iter()
+        .map(|case| {
+            (
+                COMPILED_UNIT_MODE_ID.to_owned(),
+                RegexAutomataHarnessKind::Unit,
+                case.case_id.to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let (gained_unique_cases, gained_mode_memberships) = gain_vectors(
+        &previous.payload.receipts,
+        &current.payload.receipts,
+        &assigned,
+    )?;
+    if (gained_unique_cases, gained_mode_memberships) != (4, 4) {
+        return Err(InventoryError::new(
+            "regex-automata look gain is not exact four-membership progress",
+        ));
+    }
+    Ok(RegexAutomataStrictGain {
+        family: "unit-util".to_owned(),
+        gained_unique_cases,
+        gained_mode_memberships,
+        previous_pass: previous.payload.counts.pass,
+        current_pass: current.payload.counts.pass,
+    })
+}
+
 impl RegexAutomataAdapterReport {
     /// Validate the full inventory identity, candidate identity, exact receipt
     /// order, per-case consistency, counts and payload seal.
@@ -1734,7 +2428,9 @@ impl RegexAutomataAdapterReport {
     ) -> Result<(), InventoryError> {
         inventory.validate()?;
         let limitations = if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            REPORT_LIMITATIONS.as_slice()
+            MIXED_DEFAULT_REPORT_LIMITATIONS.as_slice()
+        } else if self.schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice()
         } else if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
             LEGACY_REPORT_LIMITATIONS.as_slice()
         } else {
@@ -1742,9 +2438,8 @@ impl RegexAutomataAdapterReport {
                 "regex-automata adapter report schema mismatch",
             ));
         };
-        let expected_payload_sha256 = if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            hash_json(&self.payload, "encode regex-automata adapter payload")?
-        } else {
+        let expected_payload_sha256 = if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
+        {
             hash_json(
                 &LegacyAdapterPayload {
                     inventory_payload_sha256: &self.payload.inventory_payload_sha256,
@@ -1756,6 +2451,8 @@ impl RegexAutomataAdapterReport {
                 },
                 "encode legacy regex-automata adapter payload",
             )?
+        } else {
+            hash_json(&self.payload, "encode regex-automata adapter payload")?
         };
         if self.payload_sha256 != expected_payload_sha256
             || self.payload.inventory_payload_sha256 != inventory.payload_sha256
@@ -1816,7 +2513,7 @@ impl RegexAutomataAdapterReport {
             }
             return Ok(());
         }
-        validate_execution_receipt_set(inventory, self)?;
+        validate_execution_receipt_set(inventory, self, report_registry(self.schema.as_str())?)?;
         Ok(())
     }
 
@@ -1825,8 +2522,12 @@ impl RegexAutomataAdapterReport {
         inventory: &RegexAutomataCorpusReport,
     ) -> Result<(), InventoryError> {
         self.validate_structure(inventory)?;
-        if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        if self.schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
             validate_regex_automata_predecessor_execution(inventory, self)?;
+        } else if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+            return Err(InventoryError::new(
+                "current regex-automata report cannot serve as this transition's predecessor",
+            ));
         }
         Ok(())
     }
@@ -1839,7 +2540,7 @@ fn validate_regex_automata_predecessor_execution(
     report: &RegexAutomataAdapterReport,
 ) -> Result<(), InventoryError> {
     report.validate_structure(inventory)?;
-    if report.schema != REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+    if report.schema != PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         return Err(InventoryError::new(
             "legacy regex-automata baseline has no executable passes",
         ));
@@ -2074,8 +2775,7 @@ fn obligation_membership_identity(
 }
 
 fn require_compiled_mode(context: &AdapterContext<'_>) -> Result<(), String> {
-    if context.mode.mode_id != COMPILED_MODE_ID
-        || context.mode.harness != RegexAutomataHarnessKind::Doctest
+    if compiled_mode_id(context.mode.harness) != Some(context.mode.mode_id.as_str())
         || !context.mode.default_features
         || context.mode.all_features
         || !context.mode.features.is_empty()
@@ -2085,6 +2785,14 @@ fn require_compiled_mode(context: &AdapterContext<'_>) -> Result<(), String> {
         return Err("compiled-mode-mismatch".to_owned());
     }
     Ok(())
+}
+
+const fn compiled_mode_id(harness: RegexAutomataHarnessKind) -> Option<&'static str> {
+    match harness {
+        RegexAutomataHarnessKind::Doctest => Some(COMPILED_MODE_ID),
+        RegexAutomataHarnessKind::Unit => Some(COMPILED_UNIT_MODE_ID),
+        RegexAutomataHarnessKind::Integration => None,
+    }
 }
 
 fn upstream_half_match(matched: Option<regex_automata::HalfMatch>) -> String {
@@ -2109,11 +2817,6 @@ fn mode_execution(
     inventory: &RegexAutomataCorpusReport,
     mode_id: &str,
 ) -> Result<RegexAutomataModeExecution, InventoryError> {
-    if mode_id != COMPILED_MODE_ID {
-        return Err(InventoryError::new(
-            "regex-automata adapter mode is not this binary's compiled mode",
-        ));
-    }
     let mut matching = inventory
         .payload
         .modes
@@ -2123,7 +2826,7 @@ fn mode_execution(
         .next()
         .ok_or_else(|| InventoryError::new("compiled regex-automata mode is absent"))?;
     if matching.next().is_some()
-        || mode.harness != RegexAutomataHarnessKind::Doctest
+        || compiled_mode_id(mode.harness) != Some(mode_id)
         || !mode.default_features
         || mode.all_features
         || !mode.features.is_empty()
@@ -2183,12 +2886,47 @@ fn adapter_observer_id(adapter: &RegisteredAdapter) -> Result<&'static str, Inve
         && same_adapter_function(adapter.run, run_try_search_fwd_bounds)
     {
         "run-try-search-fwd-bounds-v1"
+    } else if adapter.case_id == LOOK_END_LINE_CASE
+        && same_adapter_function(adapter.run, run_look_end_line)
+    {
+        "run-look-end-line-k0-v1"
+    } else if adapter.case_id == LOOK_END_TEXT_CASE
+        && same_adapter_function(adapter.run, run_look_end_text)
+    {
+        "run-look-end-text-k0-v1"
+    } else if adapter.case_id == LOOK_START_LINE_CASE
+        && same_adapter_function(adapter.run, run_look_start_line)
+    {
+        "run-look-start-line-k0-v1"
+    } else if adapter.case_id == LOOK_START_TEXT_CASE
+        && same_adapter_function(adapter.run, run_look_start_text)
+    {
+        "run-look-start-text-k0-v1"
     } else {
         return Err(InventoryError::new(
             "regex-automata adapter observer binding mismatch",
         ));
     };
     Ok(observer)
+}
+
+fn reviewed_adapter(case_id: &str) -> Option<RegisteredAdapter> {
+    match case_id {
+        PATTERN_LEN_CASE => Some(PATTERN_LEN_ADAPTER),
+        PATTERN_LEN_MANY_CASE => Some(PATTERN_LEN_MANY_ADAPTER),
+        IS_SPECIAL_STATE_CASE => Some(IS_SPECIAL_STATE_ADAPTER),
+        IS_START_STATE_CASE => Some(IS_START_STATE_ADAPTER),
+        MATCH_LEN_CASE => Some(MATCH_LEN_ADAPTER),
+        PATTERN_LEN_ALWAYS_CASE => Some(PATTERN_LEN_ALWAYS_ADAPTER),
+        TRY_SEARCH_OVERLAPPING_FWD_CASE => Some(TRY_SEARCH_OVERLAPPING_FWD_ADAPTER),
+        TRY_SEARCH_FWD_CASE => Some(TRY_SEARCH_FWD_ADAPTER),
+        TRY_SEARCH_FWD_BOUNDS_CASE => Some(TRY_SEARCH_FWD_BOUNDS_ADAPTER),
+        LOOK_END_LINE_CASE => Some(LOOK_END_LINE_ADAPTER),
+        LOOK_END_TEXT_CASE => Some(LOOK_END_TEXT_ADAPTER),
+        LOOK_START_LINE_CASE => Some(LOOK_START_LINE_ADAPTER),
+        LOOK_START_TEXT_CASE => Some(LOOK_START_TEXT_ADAPTER),
+        _ => None,
+    }
 }
 
 fn registry_manifest_sha256(registry: &[RegisteredAdapter]) -> Result<String, InventoryError> {
@@ -2223,25 +2961,12 @@ fn validate_registered_adapter(
     inventory: &RegexAutomataCorpusReport,
     adapter: &RegisteredAdapter,
 ) -> Result<(), InventoryError> {
-    let expected_source = match adapter.case_id {
-        PATTERN_LEN_CASE => PATTERN_LEN_SOURCE,
-        PATTERN_LEN_MANY_CASE => PATTERN_LEN_MANY_SOURCE,
-        IS_SPECIAL_STATE_CASE => IS_SPECIAL_STATE_SOURCE,
-        IS_START_STATE_CASE => IS_START_STATE_SOURCE,
-        MATCH_LEN_CASE => MATCH_LEN_SOURCE,
-        PATTERN_LEN_ALWAYS_CASE => PATTERN_LEN_ALWAYS_SOURCE,
-        TRY_SEARCH_OVERLAPPING_FWD_CASE => TRY_SEARCH_OVERLAPPING_FWD_SOURCE,
-        TRY_SEARCH_FWD_CASE => TRY_SEARCH_FWD_SOURCE,
-        TRY_SEARCH_FWD_BOUNDS_CASE => TRY_SEARCH_FWD_BOUNDS_SOURCE,
-        _ => {
-            return Err(InventoryError::new(
-                "regex-automata adapter has an unreviewed case",
-            ));
-        }
-    };
-    if adapter.mode_id != COMPILED_MODE_ID
-        || adapter.harness != RegexAutomataHarnessKind::Doctest
-        || adapter.source != expected_source
+    let expected = reviewed_adapter(adapter.case_id)
+        .ok_or_else(|| InventoryError::new("regex-automata adapter has an unreviewed case"))?;
+    if adapter.mode_id != expected.mode_id
+        || adapter.harness != expected.harness
+        || adapter.source != expected.source
+        || !same_adapter_function(adapter.run, expected.run)
     {
         return Err(InventoryError::new(
             "regex-automata adapter registration binding mismatch",
@@ -2256,10 +2981,7 @@ fn validate_registered_adapter(
         .iter()
         .find(|file| file.path == adapter.source.source_path)
         .ok_or_else(|| InventoryError::new("adapter upstream source file is absent"))?;
-    if file.sha256 != adapter.source.source_sha256
-        || file.sha256 != AUTOMATON_SOURCE_SHA256
-        || file.mode != "0644"
-    {
+    if file.sha256 != adapter.source.source_sha256 || file.mode != "0644" {
         return Err(InventoryError::new(
             "adapter upstream source file identity mismatch",
         ));
@@ -2267,6 +2989,9 @@ fn validate_registered_adapter(
     validate_source_spec(&adapter.source)?;
     if adapter.case_id == TRY_SEARCH_FWD_BOUNDS_CASE {
         validate_try_search_fwd_bounds_vector(&adapter.source, TRY_SEARCH_FWD_BOUNDS_VECTOR)?;
+    } else if let Some(case) = reviewed_look_case(adapter.case_id) {
+        validate_look_fixture()?;
+        validate_look_case_spec(case)?;
     }
     Ok(())
 }
@@ -2325,9 +3050,159 @@ fn validate_try_search_fwd_bounds_vector(
     Ok(())
 }
 
+fn reviewed_look_case(case_id: &str) -> Option<LookCaseSpec> {
+    LOOK_CASES
+        .iter()
+        .find(|case| case.case_id == case_id)
+        .copied()
+}
+
+fn validate_look_fixture() -> Result<(), InventoryError> {
+    validate_look_fixture_parts(
+        LOOK_FULL_SOURCE_SPAN,
+        LOOK_CASES,
+        LOOK_TARGET_IDENTITIES_SHA256,
+    )
+}
+
+fn validate_look_fixture_parts(
+    full_span: &str,
+    cases: &[LookCaseSpec],
+    target_identities_sha256: &str,
+) -> Result<(), InventoryError> {
+    if full_span.len() != 1_955
+        || full_span.split_inclusive('\n').count() != 68
+        || !full_span.ends_with('\n')
+        || full_span.contains(['\0', '\r'])
+        || sha256(full_span.as_bytes()) != LOOK_FULL_SPAN_SHA256
+        || cases.len() != 4
+    {
+        return Err(InventoryError::new(
+            "look upstream fixture identity mismatch",
+        ));
+    }
+    let mut target_identities = String::new();
+    for case in cases {
+        target_identities.push_str(COMPILED_UNIT_MODE_ID);
+        target_identities.push_str("\tunit\t");
+        target_identities.push_str(case.case_id);
+        target_identities.push('\n');
+    }
+    if target_identities != LOOK_TARGET_IDENTITIES
+        || sha256(target_identities.as_bytes()) != target_identities_sha256
+        || target_identities_sha256 != LOOK_TARGET_IDENTITIES_SHA256
+    {
+        return Err(InventoryError::new("look target identity seal mismatch"));
+    }
+
+    let lines = full_span.split_inclusive('\n').collect::<Vec<_>>();
+    let mut assertion_lines = BTreeSet::new();
+    for case in cases {
+        validate_look_case_spec(*case)?;
+        let start = case
+            .source
+            .span_start_line
+            .checked_sub(1700)
+            .ok_or_else(|| InventoryError::new("look source span starts before fixture"))?;
+        let end = case
+            .source
+            .span_end_line
+            .checked_sub(1700)
+            .and_then(|offset| offset.checked_add(1))
+            .ok_or_else(|| InventoryError::new("look source span end overflow"))?;
+        let observed = lines
+            .get(start..end)
+            .ok_or_else(|| InventoryError::new("look source span exceeds fixture"))?
+            .concat();
+        if observed != case.source.source_span {
+            return Err(InventoryError::new("look case span is not in full fixture"));
+        }
+        for assertion in case.source.assertions {
+            if !assertion_lines.insert(assertion.source_line) {
+                return Err(InventoryError::new("duplicate look assertion source line"));
+            }
+        }
+    }
+    let discovered = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("assert"))
+        .map(|(offset, _)| {
+            1_700_usize
+                .checked_add(offset)
+                .ok_or_else(|| InventoryError::new("look assertion source line overflow"))
+        })
+        .collect::<Result<BTreeSet<_>, InventoryError>>()?;
+    if discovered.len() != 32 || assertion_lines != discovered {
+        return Err(InventoryError::new(
+            "look fixture assertion partition is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_look_case_spec(case: LookCaseSpec) -> Result<(), InventoryError> {
+    let expected = reviewed_look_case(case.case_id)
+        .ok_or_else(|| InventoryError::new("unreviewed look case"))?;
+    let expected_binding = match case.kind {
+        LookKind::StartLine => (r"(?m:^)", LOOK_START_LINE_CASE),
+        LookKind::EndLine => (r"(?m:$)", LOOK_END_LINE_CASE),
+        LookKind::StartText => (r"\A", LOOK_START_TEXT_CASE),
+        LookKind::EndText => (r"\z", LOOK_END_TEXT_CASE),
+    };
+    if case != expected
+        || (case.pattern, case.case_id) != expected_binding
+        || case.vectors.len() != case.source.assertions.len()
+        || case.vectors.is_empty()
+    {
+        return Err(InventoryError::new("look case binding mismatch"));
+    }
+    let mut assertion_ids = BTreeSet::new();
+    for (vector, assertion) in case.vectors.iter().zip(case.source.assertions) {
+        let source_offset = assertion
+            .source_line
+            .checked_sub(case.source.span_start_line)
+            .ok_or_else(|| InventoryError::new("look assertion precedes its source span"))?;
+        let source_line = case
+            .source
+            .source_span
+            .split_inclusive('\n')
+            .nth(source_offset)
+            .ok_or_else(|| InventoryError::new("look assertion exceeds its source span"))?;
+        if vector.assertion_id != assertion.assertion_id
+            || vector.at > vector.haystack.len()
+            || assertion.expected_observation != format!("bool:{}", vector.expected)
+            || source_line != render_look_assertion(vector)?
+            || !assertion_ids.insert(vector.assertion_id)
+        {
+            return Err(InventoryError::new("look assertion vector mismatch"));
+        }
+    }
+    Ok(())
+}
+
+fn render_look_assertion(vector: &LookAssertionVector) -> Result<String, InventoryError> {
+    let haystack = match vector.haystack {
+        "" => r#""""#,
+        "\n" => r#""\n""#,
+        "a" => r#""a""#,
+        "\na" => r#""\na""#,
+        "a\na" => r#""a\na""#,
+        _ => return Err(InventoryError::new("unreviewed look assertion haystack")),
+    };
+    let negation = if vector.expected { "" } else { "!" };
+    Ok(format!(
+        "        assert!({negation}testlook!(look, {haystack}, {}));\n",
+        vector.at,
+    ))
+}
+
 fn validate_source_spec(source: &SourceContractSpec) -> Result<(), InventoryError> {
-    if source.source_path != AUTOMATON_SOURCE_PATH
-        || source.source_sha256 != AUTOMATON_SOURCE_SHA256
+    let authenticated_source = matches!(
+        (source.source_path, source.source_sha256),
+        (AUTOMATON_SOURCE_PATH, AUTOMATON_SOURCE_SHA256) | (LOOK_SOURCE_PATH, LOOK_SOURCE_SHA256)
+    );
+    if !authenticated_source
         || source.span_start_line == 0
         || source.span_end_line < source.span_start_line
         || !source.source_span.ends_with('\n')
@@ -2448,9 +3323,20 @@ fn validate_assertion_executions(
     Ok(())
 }
 
+fn report_registry(schema: &str) -> Result<&'static [RegisteredAdapter], InventoryError> {
+    match schema {
+        PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA => Ok(PREDECESSOR_REGISTERED_ADAPTERS),
+        REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA => Ok(REGISTERED_ADAPTERS),
+        _ => Err(InventoryError::new(
+            "regex-automata report schema has no execution registry",
+        )),
+    }
+}
+
 fn validate_execution_receipt_set(
     inventory: &RegexAutomataCorpusReport,
     report: &RegexAutomataAdapterReport,
+    registry: &[RegisteredAdapter],
 ) -> Result<(), InventoryError> {
     let mut executions = BTreeMap::new();
     for execution in &report.payload.execution_receipts {
@@ -2459,7 +3345,7 @@ fn validate_execution_receipt_set(
             execution.harness,
             execution.case_id.clone(),
         );
-        let adapter = REGISTERED_ADAPTERS
+        let adapter = registry
             .iter()
             .find(|adapter| {
                 (adapter.mode_id, adapter.harness, adapter.case_id)
@@ -2843,13 +3729,13 @@ mod tests {
             counts: adapter_counts(&receipts),
             receipts,
             execution_receipts,
-            limitations: REPORT_LIMITATIONS
+            limitations: DOCTEST_ONLY_REPORT_LIMITATIONS
                 .iter()
                 .map(|text| (*text).to_owned())
                 .collect(),
         };
         RegexAutomataAdapterReport {
-            schema: REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA.to_owned(),
+            schema: PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA.to_owned(),
             payload_sha256: hash_json(&payload, "encode predecessor test payload").unwrap(),
             payload,
         }
@@ -2861,19 +3747,8 @@ mod tests {
             hash_json(&report.payload, "re-encode adversarial test payload").unwrap();
     }
 
-    #[test]
-    fn authenticated_predecessor_manifest_replays_exact_eight() {
-        validate_predecessor_registry_manifest(PREDECESSOR_REGISTERED_ADAPTERS).unwrap();
-        let previous = predecessor_report_fixture();
-        validate_predecessor_report_authority(&previous, &previous).unwrap();
-        assert_eq!(previous.payload.counts.pass, 8);
-        assert_eq!(previous.payload.counts.unsupported, 0);
-        assert_eq!(previous.payload.execution_receipts.len(), 8);
-    }
-
-    #[test]
-    #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
-    fn authenticated_exact_036_report_matches_eight_adapter_predecessor() {
+    fn authenticated_exact_036_evidence() -> (RegexAutomataCorpusReport, RegexAutomataAdapterReport)
+    {
         const INVENTORY_FILE_SHA256: &str =
             "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2";
         const REPORT_FILE_SHA256: &str =
@@ -2885,9 +3760,59 @@ mod tests {
         let report_bytes = fs::read(evidence.join("regex-automata.json")).unwrap();
         assert_eq!(sha256(&inventory_bytes), INVENTORY_FILE_SHA256);
         assert_eq!(sha256(&report_bytes), REPORT_FILE_SHA256);
-        let inventory: RegexAutomataCorpusReport =
-            serde_json::from_slice(&inventory_bytes).unwrap();
-        let report: RegexAutomataAdapterReport = serde_json::from_slice(&report_bytes).unwrap();
+        (
+            serde_json::from_slice(&inventory_bytes).unwrap(),
+            serde_json::from_slice(&report_bytes).unwrap(),
+        )
+    }
+
+    #[test]
+    fn authenticated_predecessor_manifest_replays_exact_nine() {
+        validate_predecessor_registry_manifest(PREDECESSOR_REGISTERED_ADAPTERS).unwrap();
+        let previous = predecessor_report_fixture();
+        validate_predecessor_report_authority(&previous, &previous).unwrap();
+        assert_eq!(previous.payload.counts.pass, 9);
+        assert_eq!(previous.payload.counts.unsupported, 0);
+        assert_eq!(previous.payload.execution_receipts.len(), 9);
+    }
+
+    #[test]
+    fn report_schema_selects_only_its_exact_execution_registry() {
+        let previous = report_registry(PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA).unwrap();
+        let current = report_registry(REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA).unwrap();
+        for (observed, expected) in previous.iter().zip(PREDECESSOR_REGISTERED_ADAPTERS) {
+            assert_eq!(observed.mode_id, expected.mode_id);
+            assert_eq!(observed.harness, expected.harness);
+            assert_eq!(observed.case_id, expected.case_id);
+            assert!(same_adapter_function(observed.run, expected.run));
+        }
+        for (observed, expected) in current.iter().zip(REGISTERED_ADAPTERS) {
+            assert_eq!(observed.mode_id, expected.mode_id);
+            assert_eq!(observed.harness, expected.harness);
+            assert_eq!(observed.case_id, expected.case_id);
+            assert!(same_adapter_function(observed.run, expected.run));
+        }
+        assert_eq!(previous.len(), 9);
+        assert_eq!(current.len(), 13);
+        assert!(
+            previous
+                .iter()
+                .all(|adapter| adapter.mode_id == COMPILED_MODE_ID),
+        );
+        assert_eq!(
+            current
+                .iter()
+                .filter(|adapter| adapter.mode_id == COMPILED_UNIT_MODE_ID)
+                .count(),
+            4,
+        );
+        assert!(report_registry(LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
+    fn authenticated_exact_036_inventory_derives_exact_dfd_nine_pass_predecessor() {
+        let (inventory, report) = authenticated_exact_036_evidence();
         assert_eq!(
             report.payload.candidate,
             CandidateIdentity {
@@ -2905,12 +3830,30 @@ mod tests {
             ),
             (8, 3834, 0, 3842),
         );
-        validate_regex_automata_predecessor_execution(&inventory, &report).unwrap();
+        report.validate_structure(&inventory).unwrap();
+        let dfd = CandidateIdentity {
+            revision: LOOK_BASE_REVISION.to_owned(),
+            tree: LOOK_BASE_TREE.to_owned(),
+            tracked_and_untracked_worktree_clean: true,
+        };
+        let previous =
+            build_adapter_report_with_registry(&inventory, dfd, PREDECESSOR_REGISTERED_ADAPTERS)
+                .unwrap();
+        validate_regex_automata_predecessor_execution(&inventory, &previous).unwrap();
+        assert_eq!(
+            (
+                previous.payload.counts.pass,
+                previous.payload.counts.unsupported,
+                previous.payload.counts.fault,
+                previous.payload.counts.total,
+            ),
+            (9, 3833, 0, 3842),
+        );
         let expected = PREDECESSOR_REGISTERED_ADAPTERS
             .iter()
             .map(|adapter| (adapter.mode_id, adapter.harness, adapter.case_id))
             .collect::<BTreeSet<_>>();
-        let observed = report
+        let observed = previous
             .payload
             .receipts
             .iter()
@@ -2957,7 +3900,7 @@ mod tests {
                 downgraded.payload_sha256,
                 hash_json(&downgraded.payload, "verify downgraded test seal").unwrap(),
             );
-            assert_eq!(downgraded.payload.counts.pass, 7);
+            assert_eq!(downgraded.payload.counts.pass, 8);
             assert!(validate_predecessor_report_authority(&downgraded, &authentic).is_err(),);
         }
     }
@@ -2996,7 +3939,7 @@ mod tests {
         assert!(validate_predecessor_registry_manifest(&wrong_observer).is_err());
 
         let mut current_only = PREDECESSOR_REGISTERED_ADAPTERS.to_vec();
-        current_only.push(TRY_SEARCH_FWD_BOUNDS_ADAPTER);
+        current_only.push(LOOK_END_LINE_ADAPTER);
         assert!(validate_predecessor_registry_manifest(&current_only).is_err());
 
         let authentic = predecessor_report_fixture();
@@ -3054,37 +3997,9 @@ mod tests {
     #[test]
     #[ignore = "requires the sealed exact-036 regex-automata evidence directory"]
     fn authenticated_assignment_accepts_only_the_line_1267_membership() {
-        const INVENTORY_FILE_SHA256: &str =
-            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2";
-        const BASELINE_FILE_SHA256: &str =
-            "c6304c387772d756e8394e39faf015b6243e1e406175ea3a9871aa4eebee6910";
-        const INVENTORY_PAYLOAD_SHA256: &str =
-            "f2bab4e81ce6510474c8fec373ebadfc506f94fa4b2eef9bad99e7f2b06ac547";
-        const OBLIGATION_INVENTORY_SHA256: &str =
-            "a0a791feca9f0b22ac3045a9997a5129d3beed0e772a1dcef73e9bb83fd54a04";
-        const BASELINE_PAYLOAD_SHA256: &str =
-            "23092431142b7af68efb7d77da12c5adcb38bb3f155b11af96b4f658acd0302d";
         const TARGETS_SHA256: &str =
             "9915623138f2f8044f42cd95c2e1e46194dcaeebdcae08a99f9677c3b1e41275";
-        const LINE_1267_EVIDENCE_SHA256: &str =
-            "50b6c68a302c7e4dd4db74727c633859b495fdf433185a3e4257dd040ccc6550";
-
-        let evidence = std::env::var_os("FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR")
-            .map(std::path::PathBuf::from)
-            .expect("set FRE_REGEX_AUTOMATA_AUTHENTICATED_EVIDENCE_DIR");
-        let inventory_bytes = fs::read(evidence.join("regex-automata-inventory.json")).unwrap();
-        let baseline_bytes = fs::read(evidence.join("regex-automata.json")).unwrap();
-        assert_eq!(sha256(&inventory_bytes), INVENTORY_FILE_SHA256);
-        assert_eq!(sha256(&baseline_bytes), BASELINE_FILE_SHA256);
-        let inventory: RegexAutomataCorpusReport =
-            serde_json::from_slice(&inventory_bytes).unwrap();
-        let baseline: RegexAutomataAdapterReport = serde_json::from_slice(&baseline_bytes).unwrap();
-        assert_eq!(inventory.payload_sha256, INVENTORY_PAYLOAD_SHA256);
-        assert_eq!(
-            inventory.payload.harness.obligation_inventory_sha256,
-            OBLIGATION_INVENTORY_SHA256,
-        );
-        assert_eq!(baseline.payload_sha256, BASELINE_PAYLOAD_SHA256);
+        let (inventory, baseline) = authenticated_exact_036_evidence();
 
         let assignment =
             schedule_regex_automata_gap(&inventory, &baseline, "g0-doctest-dfa-line1267-51a-r1", 0)
@@ -3106,7 +4021,12 @@ mod tests {
             [COMPILED_MODE_ID, "vcs-all-features-doctest"],
         );
 
-        let current = build_regex_automata_adapter_report(&inventory, candidate('d', 'e')).unwrap();
+        let current = build_adapter_report_with_registry(
+            &inventory,
+            candidate('d', 'e'),
+            PREDECESSOR_REGISTERED_ADAPTERS,
+        )
+        .unwrap();
         let changed = baseline
             .payload
             .receipts
@@ -3122,55 +4042,6 @@ mod tests {
                 RegexAutomataHarnessKind::Doctest,
                 TRY_SEARCH_FWD_BOUNDS_CASE,
             )],
-        );
-        assert_eq!(
-            baseline
-                .payload
-                .receipts
-                .iter()
-                .zip(&current.payload.receipts)
-                .filter(|(old, new)| old.disposition == new.disposition)
-                .count(),
-            3841,
-        );
-        assert!(matches!(
-            current
-                .payload
-                .receipts
-                .iter()
-                .find(|receipt| {
-                    receipt.mode_id == "vcs-all-features-doctest"
-                        && receipt.harness == RegexAutomataHarnessKind::Doctest
-                        && receipt.case_id == TRY_SEARCH_FWD_BOUNDS_CASE
-                })
-                .unwrap()
-                .disposition,
-            RegexAutomataAdapterDisposition::Unsupported { .. },
-        ));
-        let line_1267_execution = current
-            .payload
-            .execution_receipts
-            .iter()
-            .find(|execution| execution.case_id == TRY_SEARCH_FWD_BOUNDS_CASE)
-            .unwrap();
-        assert_eq!(
-            hash_json(line_1267_execution, "encode line-1267 test execution").unwrap(),
-            LINE_1267_EVIDENCE_SHA256,
-        );
-        assert_eq!(
-            (
-                line_1267_execution.source.source_sha256.as_str(),
-                line_1267_execution.source.source_span_sha256.as_str(),
-                line_1267_execution
-                    .source
-                    .assertion_inventory_sha256
-                    .as_str(),
-            ),
-            (
-                AUTOMATON_SOURCE_SHA256,
-                "7a107341165090031ae322427e59560ed3a9f895aba49896557a7610a50f0530",
-                "2bbe88fc6fc55dc9ee186d0b84b09019c1fd0515dd99802ae250ec21726a5d08",
-            ),
         );
         assert_eq!(
             (
@@ -3193,17 +4064,27 @@ mod tests {
         assert!(
             PREDECESSOR_REGISTERED_ADAPTERS
                 .iter()
-                .all(|adapter| adapter.case_id != TRY_SEARCH_FWD_BOUNDS_CASE),
+                .any(|adapter| adapter.case_id == TRY_SEARCH_FWD_BOUNDS_CASE),
         );
-        let gain =
-            validate_regex_automata_strict_gain(&inventory, &baseline, &current, &assignment)
-                .unwrap();
-        assert_eq!(gain.family, "doctest-dfa");
+        let assigned = assignment
+            .targets
+            .iter()
+            .flat_map(|target| {
+                target
+                    .mode_ids
+                    .iter()
+                    .map(|mode_id| (mode_id.clone(), target.harness, target.case_id.clone()))
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            (gain.gained_unique_cases, gain.gained_mode_memberships),
+            gain_vectors(
+                &baseline.payload.receipts,
+                &current.payload.receipts,
+                &assigned,
+            )
+            .unwrap(),
             (1, 1),
         );
-        assert_eq!((gain.previous_pass, gain.current_pass), (8, 9));
     }
 
     #[test]
@@ -3233,6 +4114,18 @@ mod tests {
         RegexAutomataModeExecution {
             mode_id: COMPILED_MODE_ID.to_owned(),
             harness: RegexAutomataHarnessKind::Doctest,
+            default_features: true,
+            all_features: false,
+            features: Vec::new(),
+            dependency_package: "regex-automata".to_owned(),
+            dependency_version: "0.4.14".to_owned(),
+        }
+    }
+
+    fn compiled_unit_mode() -> RegexAutomataModeExecution {
+        RegexAutomataModeExecution {
+            mode_id: COMPILED_UNIT_MODE_ID.to_owned(),
+            harness: RegexAutomataHarnessKind::Unit,
             default_features: true,
             all_features: false,
             features: Vec::new(),
@@ -3308,6 +4201,11 @@ mod tests {
         validate_source_spec(&TRY_SEARCH_OVERLAPPING_FWD_SOURCE).unwrap();
         validate_source_spec(&TRY_SEARCH_FWD_SOURCE).unwrap();
         validate_source_spec(&TRY_SEARCH_FWD_BOUNDS_SOURCE).unwrap();
+        validate_source_spec(&LOOK_END_LINE_SOURCE).unwrap();
+        validate_source_spec(&LOOK_END_TEXT_SOURCE).unwrap();
+        validate_source_spec(&LOOK_START_LINE_SOURCE).unwrap();
+        validate_source_spec(&LOOK_START_TEXT_SOURCE).unwrap();
+        validate_look_fixture().unwrap();
         validate_try_search_fwd_bounds_vector(
             &TRY_SEARCH_FWD_BOUNDS_SOURCE,
             TRY_SEARCH_FWD_BOUNDS_VECTOR,
@@ -3361,10 +4259,230 @@ mod tests {
     }
 
     #[test]
+    fn look_fixture_authority_rejects_every_named_mutation_class() {
+        validate_look_fixture().unwrap();
+        assert_eq!(
+            sha256(LOOK_TARGET_IDENTITIES.as_bytes()),
+            LOOK_TARGET_IDENTITIES_SHA256
+        );
+
+        let mut changed_fixture = LOOK_FULL_SOURCE_SPAN.to_owned();
+        changed_fixture.replace_range(0..1, "M");
+        assert!(
+            validate_look_fixture_parts(
+                &changed_fixture,
+                LOOK_CASES,
+                LOOK_TARGET_IDENTITIES_SHA256,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_look_fixture_parts(
+                LOOK_FULL_SOURCE_SPAN,
+                &LOOK_CASES[..3],
+                LOOK_TARGET_IDENTITIES_SHA256,
+            )
+            .is_err()
+        );
+
+        let mut duplicate = LOOK_CASES.to_vec();
+        duplicate[1] = duplicate[0];
+        assert!(
+            validate_look_fixture_parts(
+                LOOK_FULL_SOURCE_SPAN,
+                &duplicate,
+                LOOK_TARGET_IDENTITIES_SHA256,
+            )
+            .is_err()
+        );
+        let mut reordered = LOOK_CASES.to_vec();
+        reordered.swap(0, 1);
+        assert!(
+            validate_look_fixture_parts(
+                LOOK_FULL_SOURCE_SPAN,
+                &reordered,
+                LOOK_TARGET_IDENTITIES_SHA256,
+            )
+            .is_err()
+        );
+
+        let mut flipped_vectors = LOOK_END_LINE_VECTORS.to_vec();
+        flipped_vectors[0].expected = false;
+        let flipped = LookCaseSpec {
+            vectors: Box::leak(flipped_vectors.into_boxed_slice()),
+            ..LOOK_END_LINE
+        };
+        assert!(validate_look_case_spec(flipped).is_err());
+
+        let mut wrong_at_vectors = LOOK_END_LINE_VECTORS.to_vec();
+        wrong_at_vectors[0].at = 1;
+        let wrong_at = LookCaseSpec {
+            vectors: Box::leak(wrong_at_vectors.into_boxed_slice()),
+            ..LOOK_END_LINE
+        };
+        assert!(validate_look_case_spec(wrong_at).is_err());
+        assert!(
+            validate_look_case_spec(LookCaseSpec {
+                pattern: r"\z",
+                ..LOOK_END_LINE
+            })
+            .is_err()
+        );
+        assert!(
+            validate_look_case_spec(LookCaseSpec {
+                kind: LookKind::EndText,
+                ..LOOK_END_LINE
+            })
+            .is_err()
+        );
+
+        let non_k0 = PortableRegex::new("a").unwrap();
+        assert!(validate_look_fre_plan(&non_k0).is_err());
+    }
+
+    #[test]
+    fn look_observers_execute_all_thirty_two_assertions_only_in_default_unit_mode() {
+        let mode = compiled_unit_mode();
+        let adapters = [
+            LOOK_END_LINE_ADAPTER,
+            LOOK_END_TEXT_ADAPTER,
+            LOOK_START_LINE_ADAPTER,
+            LOOK_START_TEXT_ADAPTER,
+        ];
+        let executions = adapters
+            .iter()
+            .map(|adapter| execute_adapter(adapter, &mode).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            executions
+                .iter()
+                .map(|execution| execution.assertion_executions.len())
+                .collect::<Vec<_>>(),
+            [9, 9, 7, 7],
+        );
+        assert_eq!(
+            executions
+                .iter()
+                .map(|execution| execution.assertion_executions.len())
+                .sum::<usize>(),
+            32,
+        );
+
+        let mut relabeled_mode = mode;
+        relabeled_mode.mode_id = "vcs-all-features-unit".to_owned();
+        relabeled_mode.default_features = false;
+        relabeled_mode.all_features = true;
+        let relabeled = RegisteredAdapter {
+            mode_id: "vcs-all-features-unit",
+            ..LOOK_END_LINE_ADAPTER
+        };
+        assert_eq!(
+            execute_adapter(&relabeled, &relabeled_mode).unwrap_err(),
+            "compiled-mode-mismatch",
+        );
+    }
+
+    #[test]
+    fn look_execution_receipts_reject_omission_duplicate_reorder_and_flip() {
+        let mode = compiled_unit_mode();
+        let authentic = run_look_end_line(&AdapterContext { mode: &mode }).unwrap();
+        validate_assertion_executions(LOOK_END_LINE_ASSERTIONS, &authentic).unwrap();
+
+        let mut omitted = authentic.clone();
+        omitted.pop();
+        assert_eq!(
+            validate_assertion_executions(LOOK_END_LINE_ASSERTIONS, &omitted).unwrap_err(),
+            "assertion-execution-count-mismatch",
+        );
+
+        let mut duplicated = authentic.clone();
+        duplicated.push(authentic[0].clone());
+        assert_eq!(
+            validate_assertion_executions(LOOK_END_LINE_ASSERTIONS, &duplicated).unwrap_err(),
+            "assertion-execution-count-mismatch",
+        );
+
+        let mut reordered = authentic.clone();
+        reordered.swap(0, 1);
+        assert_eq!(
+            validate_assertion_executions(LOOK_END_LINE_ASSERTIONS, &reordered).unwrap_err(),
+            "assertion-execution-binding-mismatch",
+        );
+
+        let mut flipped = authentic;
+        flipped[0].upstream_observation = "bool:false".to_owned();
+        flipped[0].fre_observation = "bool:false".to_owned();
+        assert_eq!(
+            validate_assertion_executions(LOOK_END_LINE_ASSERTIONS, &flipped).unwrap_err(),
+            "assertion-execution-binding-mismatch",
+        );
+    }
+
+    #[test]
+    fn look_k0_true_boundary_requires_the_exact_finite_work_limit() {
+        let fre = PortableBuilder::new(LOOK_START_TEXT.pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        validate_look_fre_plan(&fre).unwrap();
+        let vector = LOOK_START_TEXT_VECTORS[0];
+        assert!(vector.expected);
+        assert!(
+            fre.find_window(
+                vector.haystack.as_bytes(),
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits {
+                    max_work: 17,
+                    max_scratch_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .is_err(),
+        );
+        let (matched, accounting) = fre
+            .find_window(
+                vector.haystack.as_bytes(),
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits {
+                    max_work: 18,
+                    max_scratch_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            matched.map(|matched| (matched.start(), matched.end())),
+            Some((0, 0))
+        );
+        let SearchAccounting::K0(accounting) = accounting else {
+            panic!("forced look plan did not return K0 accounting")
+        };
+        assert_eq!(accounting.work(), 18);
+        let retained = accounting.scratch_bytes();
+        assert!(retained > 0);
+        assert!(
+            fre.find_window(
+                vector.haystack.as_bytes(),
+                SearchWindow::new(vector.at, vector.at),
+                SearchLimits {
+                    max_work: 18,
+                    max_scratch_bytes: retained - 1,
+                },
+            )
+            .is_err(),
+        );
+    }
+
+    #[test]
     fn observers_execute_exact_assertions_and_reject_misbinding_or_omission() {
         let mode = compiled_mode();
         for adapter in REGISTERED_ADAPTERS {
-            execute_adapter(adapter, &mode).unwrap();
+            let adapter_mode = if adapter.harness == RegexAutomataHarnessKind::Unit {
+                compiled_unit_mode()
+            } else {
+                mode.clone()
+            };
+            execute_adapter(adapter, &adapter_mode).unwrap();
         }
 
         let misbound = RegisteredAdapter {

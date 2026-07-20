@@ -51,8 +51,9 @@ pub use automata_progress::{
     RegexAutomataAdapterReport, RegexAutomataAdapterReportPayload, RegexAutomataGapAssignment,
     RegexAutomataGapTarget, RegexAutomataStrictGain, build_regex_automata_adapter_report,
     read_regex_automata_adapter_report, read_regex_automata_gap_assignment,
-    schedule_regex_automata_gap, validate_regex_automata_strict_gain,
-    write_regex_automata_adapter_report, write_regex_automata_gap_assignment,
+    schedule_regex_automata_gap, validate_regex_automata_look_strict_gain,
+    validate_regex_automata_strict_gain, write_regex_automata_adapter_report,
+    write_regex_automata_gap_assignment,
 };
 pub use doctest_api::{
     DOCTEST_API_CASES, DOCTEST_API_REPORT_SCHEMA, DoctestCapability, DoctestCounts,
