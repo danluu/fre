@@ -18,8 +18,8 @@ use std::{
 
 use fre::{PortableRegex, PortableRegexSet, SearchLimits};
 use regex_automata::{
-    Input,
-    dfa::{Automaton, dense},
+    HalfMatch, Input, MatchKind,
+    dfa::{Automaton, OverlappingState, dense},
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,16 @@ const PATTERN_LEN_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 800)";
 const PATTERN_LEN_MANY_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 820)";
+const IS_SPECIAL_STATE_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::is_special_state (line 416)";
+const IS_START_STATE_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::is_start_state (line 648)";
+const MATCH_LEN_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::match_len (line 869)";
+const PATTERN_LEN_ALWAYS_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 810)";
+const TRY_SEARCH_OVERLAPPING_FWD_CASE: &str =
+    "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_overlapping_fwd (line 1553)";
 const TRY_SEARCH_FWD_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::try_search_fwd (line 1209)";
 
@@ -264,6 +274,152 @@ const PATTERN_LEN_MANY_ASSERTIONS: &[AssertionSpec] = &[AssertionSpec {
     source_line_sha256: "e666e42f7d3083264808f23a7f3cc609521cb456f6ac2c0c5849434cfade1c25",
     expected_observation: "usize:3",
 }];
+const IS_SPECIAL_STATE_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "special-alpha-pattern",
+        source_line: 479,
+        source_line_sha256: "6b3249670a94041d8abcbb5546a0419968e8dc0252068ab1a586333e19fb0fa8",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "special-alpha-offset",
+        source_line: 480,
+        source_line_sha256: "d8ccef8020510ae2c8fa4b14c5c519292daf2bf80286c5d5690272a7be42d880",
+        expected_observation: "usize:10",
+    },
+    AssertionSpec {
+        assertion_id: "special-eoi-pattern",
+        source_line: 489,
+        source_line_sha256: "6b3249670a94041d8abcbb5546a0419968e8dc0252068ab1a586333e19fb0fa8",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "special-eoi-offset",
+        source_line: 490,
+        source_line_sha256: "d13192f290c03a1cfae4194b17587819d6cbd1d09b3ab229619395805cd0e5c5",
+        expected_observation: "usize:15",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-head-pattern",
+        source_line: 498,
+        source_line_sha256: "7bcf380536f373b32ee34eb7869ed5745c5c94853f14ca23f7645bbd0a1cfaf4",
+        expected_observation: "usize:1",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-head-offset",
+        source_line: 499,
+        source_line_sha256: "58a12a90be71949903c00cdcb1b10a65779b5c31ec8c1bee6db49a195a84e8fd",
+        expected_observation: "usize:3",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-middle-pattern",
+        source_line: 501,
+        source_line_sha256: "6b3249670a94041d8abcbb5546a0419968e8dc0252068ab1a586333e19fb0fa8",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-middle-offset",
+        source_line: 502,
+        source_line_sha256: "a18a1e55f769c74ebef06b3b77094b7079a65f40c7427ad4a323be7d286c1e1e",
+        expected_observation: "usize:7",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-tail-pattern",
+        source_line: 504,
+        source_line_sha256: "7bcf380536f373b32ee34eb7869ed5745c5c94853f14ca23f7645bbd0a1cfaf4",
+        expected_observation: "usize:1",
+    },
+    AssertionSpec {
+        assertion_id: "special-many-tail-offset",
+        source_line: 505,
+        source_line_sha256: "f890c2127dafdef9733747c70b250262373e413e9772292ece317df540076029",
+        expected_observation: "usize:5",
+    },
+];
+const IS_START_STATE_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "start-prefix-pattern",
+        source_line: 727,
+        source_line_sha256: "6b3249670a94041d8abcbb5546a0419968e8dc0252068ab1a586333e19fb0fa8",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "start-prefix-offset",
+        source_line: 728,
+        source_line_sha256: "d13192f290c03a1cfae4194b17587819d6cbd1d09b3ab229619395805cd0e5c5",
+        expected_observation: "usize:15",
+    },
+    AssertionSpec {
+        assertion_id: "start-no-prefix-pattern",
+        source_line: 733,
+        source_line_sha256: "6b3249670a94041d8abcbb5546a0419968e8dc0252068ab1a586333e19fb0fa8",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "start-no-prefix-offset",
+        source_line: 734,
+        source_line_sha256: "d13192f290c03a1cfae4194b17587819d6cbd1d09b3ab229619395805cd0e5c5",
+        expected_observation: "usize:15",
+    },
+    AssertionSpec {
+        assertion_id: "start-wrong-prefix-none",
+        source_line: 738,
+        source_line_sha256: "5da41fff987b44ef31e7dde327d08810b7ef0844074ea010a91316ed9ef990cb",
+        expected_observation: "half-match:none",
+    },
+];
+const MATCH_LEN_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "match-len-is-match",
+        source_line: 889,
+        source_line_sha256: "9512b440c7d6eff01d10cc8ae6b092054bd37e21f5cc6e6aefddb8515dfc4b61",
+        expected_observation: "bool:true",
+    },
+    AssertionSpec {
+        assertion_id: "match-len-count",
+        source_line: 890,
+        source_line_sha256: "15bc72b327319af2fa9539f13f0ab5c52962b74ad70ce84a53c6c005716800b6",
+        expected_observation: "usize:3",
+    },
+    AssertionSpec {
+        assertion_id: "match-len-pattern-first",
+        source_line: 893,
+        source_line_sha256: "a8ba7fc12f6f698efc043aab033bb19b525bd698b3131763fdc8f7d43a2bdba9",
+        expected_observation: "usize:3",
+    },
+    AssertionSpec {
+        assertion_id: "match-len-pattern-second",
+        source_line: 894,
+        source_line_sha256: "c48b79a8ca0e69647ab9c3abba962f585d1ab6534b7e818da3b62c1ac7ae614b",
+        expected_observation: "usize:0",
+    },
+    AssertionSpec {
+        assertion_id: "match-len-pattern-third",
+        source_line: 895,
+        source_line_sha256: "2e87ea91642f8ad9c9d1d5a98d3a170bd140a4144d58ea1798ee61caf5a5c467",
+        expected_observation: "usize:1",
+    },
+];
+const PATTERN_LEN_ALWAYS_ASSERTIONS: &[AssertionSpec] = &[AssertionSpec {
+    assertion_id: "pattern-len-always-match-one",
+    source_line: 814,
+    source_line_sha256: "49178ef715e91c23eae56c7523f0dec2e7391b634d12920f3ecf74d7b3a819e5",
+    expected_observation: "usize:1",
+}];
+const TRY_SEARCH_OVERLAPPING_FWD_ASSERTIONS: &[AssertionSpec] = &[
+    AssertionSpec {
+        assertion_id: "overlap-fwd-earliest",
+        source_line: 1568,
+        source_line_sha256: "a3a1bc37ecfc2e6db340ee89694d2647844350529d1e278478b666352206a713",
+        expected_observation: "half-match:some:pattern=1:offset=4",
+    },
+    AssertionSpec {
+        assertion_id: "overlap-fwd-next",
+        source_line: 1577,
+        source_line_sha256: "a3a1bc37ecfc2e6db340ee89694d2647844350529d1e278478b666352206a713",
+        expected_observation: "half-match:some:pattern=0:offset=4",
+    },
+];
 const TRY_SEARCH_FWD_ASSERTIONS: &[AssertionSpec] = &[
     AssertionSpec {
         assertion_id: "try-search-fwd-foo-digits",
@@ -317,6 +473,313 @@ const PATTERN_LEN_MANY_SOURCE: SourceContractSpec = SourceContractSpec {
     assertions: PATTERN_LEN_MANY_ASSERTIONS,
 };
 
+const IS_SPECIAL_STATE_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 416,
+    span_end_line: 508,
+    source_span: r#"    /// ```
+    /// use regex_automata::{
+    ///     dfa::{Automaton, dense},
+    ///     HalfMatch, MatchError, Input,
+    /// };
+    ///
+    /// fn find<A: Automaton>(
+    ///     dfa: &A,
+    ///     haystack: &[u8],
+    /// ) -> Result<Option<HalfMatch>, MatchError> {
+    ///     // The start state is determined by inspecting the position and the
+    ///     // initial bytes of the haystack. Note that start states can never
+    ///     // be match states (since DFAs in this crate delay matches by 1
+    ///     // byte), so we don't need to check if the start state is a match.
+    ///     let mut state = dfa.start_state_forward(&Input::new(haystack))?;
+    ///     let mut last_match = None;
+    ///     // Walk all the bytes in the haystack. We can quit early if we see
+    ///     // a dead or a quit state. The former means the automaton will
+    ///     // never transition to any other state. The latter means that the
+    ///     // automaton entered a condition in which its search failed.
+    ///     for (i, &b) in haystack.iter().enumerate() {
+    ///         state = dfa.next_state(state, b);
+    ///         if dfa.is_special_state(state) {
+    ///             if dfa.is_match_state(state) {
+    ///                 last_match = Some(HalfMatch::new(
+    ///                     dfa.match_pattern(state, 0),
+    ///                     i,
+    ///                 ));
+    ///             } else if dfa.is_dead_state(state) {
+    ///                 return Ok(last_match);
+    ///             } else if dfa.is_quit_state(state) {
+    ///                 // It is possible to enter into a quit state after
+    ///                 // observing a match has occurred. In that case, we
+    ///                 // should return the match instead of an error.
+    ///                 if last_match.is_some() {
+    ///                     return Ok(last_match);
+    ///                 }
+    ///                 return Err(MatchError::quit(b, i));
+    ///             }
+    ///             // Implementors may also want to check for start or accel
+    ///             // states and handle them differently for performance
+    ///             // reasons. But it is not necessary for correctness.
+    ///         }
+    ///     }
+    ///     // Matches are always delayed by 1 byte, so we must explicitly walk
+    ///     // the special "EOI" transition at the end of the search.
+    ///     state = dfa.next_eoi_state(state);
+    ///     if dfa.is_match_state(state) {
+    ///         last_match = Some(HalfMatch::new(
+    ///             dfa.match_pattern(state, 0),
+    ///             haystack.len(),
+    ///         ));
+    ///     }
+    ///     Ok(last_match)
+    /// }
+    ///
+    /// // We use a greedy '+' operator to show how the search doesn't just
+    /// // stop once a match is detected. It continues extending the match.
+    /// // Using '[a-z]+?' would also work as expected and stop the search
+    /// // early. Greediness is built into the automaton.
+    /// let dfa = dense::DFA::new(r"[a-z]+")?;
+    /// let haystack = "123 foobar 4567".as_bytes();
+    /// let mat = find(&dfa, haystack)?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 0);
+    /// assert_eq!(mat.offset(), 10);
+    ///
+    /// // Here's another example that tests our handling of the special EOI
+    /// // transition. This will fail to find a match if we don't call
+    /// // 'next_eoi_state' at the end of the search since the match isn't
+    /// // found until the final byte in the haystack.
+    /// let dfa = dense::DFA::new(r"[0-9]{4}")?;
+    /// let haystack = "123 foobar 4567".as_bytes();
+    /// let mat = find(&dfa, haystack)?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 0);
+    /// assert_eq!(mat.offset(), 15);
+    ///
+    /// // And note that our search implementation above automatically works
+    /// // with multi-DFAs. Namely, `dfa.match_pattern(match_state, 0)` selects
+    /// // the appropriate pattern ID for us.
+    /// let dfa = dense::DFA::new_many(&[r"[a-z]+", r"[0-9]+"])?;
+    /// let haystack = "123 foobar 4567".as_bytes();
+    /// let mat = find(&dfa, haystack)?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 1);
+    /// assert_eq!(mat.offset(), 3);
+    /// let mat = find(&dfa, &haystack[3..])?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 0);
+    /// assert_eq!(mat.offset(), 7);
+    /// let mat = find(&dfa, &haystack[10..])?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 1);
+    /// assert_eq!(mat.offset(), 5);
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+"#,
+    source_span_sha256: "8791249d073357db5a2d099416ef15264be37289e39f02ea02e255e63903402e",
+    assertion_inventory_sha256: "d5dbea2c7bb486f8ada05df07d57ab0019b245467152138db78440d196de5001",
+    assertions: IS_SPECIAL_STATE_ASSERTIONS,
+};
+
+const IS_START_STATE_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 648,
+    span_end_line: 741,
+    source_span: r#"    /// ```
+    /// use regex_automata::{
+    ///     dfa::{Automaton, dense},
+    ///     HalfMatch, MatchError, Input,
+    /// };
+    ///
+    /// fn find_byte(slice: &[u8], at: usize, byte: u8) -> Option<usize> {
+    ///     // Would be faster to use the memchr crate, but this is still
+    ///     // faster than running through the DFA.
+    ///     slice[at..].iter().position(|&b| b == byte).map(|i| at + i)
+    /// }
+    ///
+    /// fn find<A: Automaton>(
+    ///     dfa: &A,
+    ///     haystack: &[u8],
+    ///     prefix_byte: Option<u8>,
+    /// ) -> Result<Option<HalfMatch>, MatchError> {
+    ///     // See the Automaton::is_special_state example for similar code
+    ///     // with more comments.
+    ///
+    ///     let mut state = dfa.start_state_forward(&Input::new(haystack))?;
+    ///     let mut last_match = None;
+    ///     let mut pos = 0;
+    ///     while pos < haystack.len() {
+    ///         let b = haystack[pos];
+    ///         state = dfa.next_state(state, b);
+    ///         pos += 1;
+    ///         if dfa.is_special_state(state) {
+    ///             if dfa.is_match_state(state) {
+    ///                 last_match = Some(HalfMatch::new(
+    ///                     dfa.match_pattern(state, 0),
+    ///                     pos - 1,
+    ///                 ));
+    ///             } else if dfa.is_dead_state(state) {
+    ///                 return Ok(last_match);
+    ///             } else if dfa.is_quit_state(state) {
+    ///                 // It is possible to enter into a quit state after
+    ///                 // observing a match has occurred. In that case, we
+    ///                 // should return the match instead of an error.
+    ///                 if last_match.is_some() {
+    ///                     return Ok(last_match);
+    ///                 }
+    ///                 return Err(MatchError::quit(b, pos - 1));
+    ///             } else if dfa.is_start_state(state) {
+    ///                 // If we're in a start state and know all matches begin
+    ///                 // with a particular byte, then we can quickly skip to
+    ///                 // candidate matches without running the DFA through
+    ///                 // every byte inbetween.
+    ///                 if let Some(prefix_byte) = prefix_byte {
+    ///                     pos = match find_byte(haystack, pos, prefix_byte) {
+    ///                         Some(pos) => pos,
+    ///                         None => break,
+    ///                     };
+    ///                 }
+    ///             }
+    ///         }
+    ///     }
+    ///     // Matches are always delayed by 1 byte, so we must explicitly walk
+    ///     // the special "EOI" transition at the end of the search.
+    ///     state = dfa.next_eoi_state(state);
+    ///     if dfa.is_match_state(state) {
+    ///         last_match = Some(HalfMatch::new(
+    ///             dfa.match_pattern(state, 0),
+    ///             haystack.len(),
+    ///         ));
+    ///     }
+    ///     Ok(last_match)
+    /// }
+    ///
+    /// // In this example, it's obvious that all occurrences of our pattern
+    /// // begin with 'Z', so we pass in 'Z'. Note also that we need to
+    /// // enable start state specialization, or else it won't be possible to
+    /// // detect start states during a search. ('is_start_state' would always
+    /// // return false.)
+    /// let dfa = dense::DFA::builder()
+    ///     .configure(dense::DFA::config().specialize_start_states(true))
+    ///     .build(r"Z[a-z]+")?;
+    /// let haystack = "123 foobar Zbaz quux".as_bytes();
+    /// let mat = find(&dfa, haystack, Some(b'Z'))?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 0);
+    /// assert_eq!(mat.offset(), 15);
+    ///
+    /// // But note that we don't need to pass in a prefix byte. If we don't,
+    /// // then the search routine does no acceleration.
+    /// let mat = find(&dfa, haystack, None)?.unwrap();
+    /// assert_eq!(mat.pattern().as_usize(), 0);
+    /// assert_eq!(mat.offset(), 15);
+    ///
+    /// // However, if we pass an incorrect byte, then the prefix search will
+    /// // result in incorrect results.
+    /// assert_eq!(find(&dfa, haystack, Some(b'X'))?, None);
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+"#,
+    source_span_sha256: "43143172a82349b0c205eee7d61ef4f127012919b62e0c33c6c586beb5e14aa4",
+    assertion_inventory_sha256: "fed3bec39108bfae17f9f5170c169cf0de3c66670352ed725dc1ffd3fa504ca0",
+    assertions: IS_START_STATE_ASSERTIONS,
+};
+
+const MATCH_LEN_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 869,
+    span_end_line: 898,
+    source_span: r#"    /// ```
+    /// # if cfg!(miri) { return Ok(()); } // miri takes too long
+    /// use regex_automata::{dfa::{Automaton, dense}, Input, MatchKind};
+    ///
+    /// let dfa = dense::Builder::new()
+    ///     .configure(dense::Config::new().match_kind(MatchKind::All))
+    ///     .build_many(&[
+    ///         r"[[:word:]]+", r"[a-z]+", r"[A-Z]+", r"[[:^space:]]+",
+    ///     ])?;
+    /// let haystack = "@bar".as_bytes();
+    ///
+    /// // The start state is determined by inspecting the position and the
+    /// // initial bytes of the haystack.
+    /// let mut state = dfa.start_state_forward(&Input::new(haystack))?;
+    /// // Walk all the bytes in the haystack.
+    /// for &b in haystack {
+    ///     state = dfa.next_state(state, b);
+    /// }
+    /// state = dfa.next_eoi_state(state);
+    ///
+    /// assert!(dfa.is_match_state(state));
+    /// assert_eq!(dfa.match_len(state), 3);
+    /// // The following calls are guaranteed to not panic since `match_len`
+    /// // returned `3` above.
+    /// assert_eq!(dfa.match_pattern(state, 0).as_usize(), 3);
+    /// assert_eq!(dfa.match_pattern(state, 1).as_usize(), 0);
+    /// assert_eq!(dfa.match_pattern(state, 2).as_usize(), 1);
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+"#,
+    source_span_sha256: "f8d8b88c939146ffab3a6180a2d3bfa668463730dba85af983d797d26db79f10",
+    assertion_inventory_sha256: "ab04b7447cb12c209123dbb45466abd842e72e3549b0304c5dd23dfc8bd3571d",
+    assertions: MATCH_LEN_ASSERTIONS,
+};
+
+const PATTERN_LEN_ALWAYS_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 810,
+    span_end_line: 816,
+    source_span: r"    /// ```
+    /// use regex_automata::dfa::{Automaton, dense::DFA};
+    ///
+    /// let dfa: DFA<Vec<u32>> = DFA::always_match()?;
+    /// assert_eq!(dfa.pattern_len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+",
+    source_span_sha256: "e95e40b73e1b4df140cc92eb4815737f2e466a2d3aff609950121036e71898e5",
+    assertion_inventory_sha256: "f96d81e05b74c6921a2d9aa789fde5cbb1680230d59ab145f5b8616e89c9b642",
+    assertions: PATTERN_LEN_ALWAYS_ASSERTIONS,
+};
+
+const TRY_SEARCH_OVERLAPPING_FWD_SOURCE: SourceContractSpec = SourceContractSpec {
+    source_path: AUTOMATON_SOURCE_PATH,
+    source_sha256: AUTOMATON_SOURCE_SHA256,
+    span_start_line: 1553,
+    span_end_line: 1580,
+    source_span: r#"    /// ```
+    /// # if cfg!(miri) { return Ok(()); } // miri takes too long
+    /// use regex_automata::{
+    ///     dfa::{Automaton, OverlappingState, dense},
+    ///     HalfMatch, Input, MatchKind,
+    /// };
+    ///
+    /// let dfa = dense::Builder::new()
+    ///     .configure(dense::Config::new().match_kind(MatchKind::All))
+    ///     .build_many(&[r"[[:word:]]+$", r"[[:^space:]]+$"])?;
+    /// let haystack = "@foo";
+    /// let mut state = OverlappingState::start();
+    ///
+    /// let expected = Some(HalfMatch::must(1, 4));
+    /// dfa.try_search_overlapping_fwd(&Input::new(haystack), &mut state)?;
+    /// assert_eq!(expected, state.get_match());
+    ///
+    /// // The first pattern also matches at the same position, so re-running
+    /// // the search will yield another match. Notice also that the first
+    /// // pattern is returned after the second. This is because the second
+    /// // pattern begins its match before the first, is therefore an earlier
+    /// // match and is thus reported first.
+    /// let expected = Some(HalfMatch::must(0, 4));
+    /// dfa.try_search_overlapping_fwd(&Input::new(haystack), &mut state)?;
+    /// assert_eq!(expected, state.get_match());
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+"#,
+    source_span_sha256: "0473de999fa57fa4182ead88a4124200bfc6d9b3702ab3fc0eb6c07db79ca7a3",
+    assertion_inventory_sha256: "da04daa73e64d56ecb6d5750ef65624a215c0ce74fd7f8bd83ce25bdda51af56",
+    assertions: TRY_SEARCH_OVERLAPPING_FWD_ASSERTIONS,
+};
+
 const TRY_SEARCH_FWD_SOURCE: SourceContractSpec = SourceContractSpec {
     source_path: AUTOMATON_SOURCE_PATH,
     source_sha256: AUTOMATON_SOURCE_SHA256,
@@ -363,6 +826,41 @@ const PATTERN_LEN_MANY_ADAPTER: RegisteredAdapter = RegisteredAdapter {
     source: PATTERN_LEN_MANY_SOURCE,
     run: run_pattern_len_many,
 };
+const IS_SPECIAL_STATE_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: IS_SPECIAL_STATE_CASE,
+    source: IS_SPECIAL_STATE_SOURCE,
+    run: run_is_special_state,
+};
+const IS_START_STATE_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: IS_START_STATE_CASE,
+    source: IS_START_STATE_SOURCE,
+    run: run_is_start_state,
+};
+const MATCH_LEN_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: MATCH_LEN_CASE,
+    source: MATCH_LEN_SOURCE,
+    run: run_match_len,
+};
+const PATTERN_LEN_ALWAYS_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: PATTERN_LEN_ALWAYS_CASE,
+    source: PATTERN_LEN_ALWAYS_SOURCE,
+    run: run_pattern_len_always,
+};
+const TRY_SEARCH_OVERLAPPING_FWD_ADAPTER: RegisteredAdapter = RegisteredAdapter {
+    mode_id: COMPILED_MODE_ID,
+    harness: RegexAutomataHarnessKind::Doctest,
+    case_id: TRY_SEARCH_OVERLAPPING_FWD_CASE,
+    source: TRY_SEARCH_OVERLAPPING_FWD_SOURCE,
+    run: run_try_search_overlapping_fwd,
+};
 const TRY_SEARCH_FWD_ADAPTER: RegisteredAdapter = RegisteredAdapter {
     mode_id: COMPILED_MODE_ID,
     harness: RegexAutomataHarnessKind::Doctest,
@@ -374,13 +872,21 @@ const TRY_SEARCH_FWD_ADAPTER: RegisteredAdapter = RegisteredAdapter {
 // This predecessor registry is independent of every report being verified.
 // Its separately sealed manifest prevents a prior report from authorizing a
 // smaller replay set by downgrading one of its historical passes.
-const PREDECESSOR_REGISTERED_ADAPTERS: &[RegisteredAdapter] =
-    &[PATTERN_LEN_ADAPTER, TRY_SEARCH_FWD_ADAPTER];
+const PREDECESSOR_REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
+    PATTERN_LEN_ADAPTER,
+    PATTERN_LEN_MANY_ADAPTER,
+    TRY_SEARCH_FWD_ADAPTER,
+];
 const PREDECESSOR_REGISTRY_MANIFEST_SHA256: &str =
-    "2c649d45428ff405582c4f1d363f6981ceedf7790df7279e9c9704bd71c53d0f";
+    "f6f6afe53a2a7409a9bb9b31be637bee4efc42d08461997d2817934395e407f5";
 const REGISTERED_ADAPTERS: &[RegisteredAdapter] = &[
     PATTERN_LEN_ADAPTER,
     PATTERN_LEN_MANY_ADAPTER,
+    IS_SPECIAL_STATE_ADAPTER,
+    IS_START_STATE_ADAPTER,
+    MATCH_LEN_ADAPTER,
+    PATTERN_LEN_ALWAYS_ADAPTER,
+    TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
     TRY_SEARCH_FWD_ADAPTER,
 ];
 
@@ -412,6 +918,447 @@ fn run_pattern_len_many(
         upstream_observation: format!("usize:{}", upstream.pattern_len()),
         fre_observation: format!("usize:{}", fre.patterns().len()),
     }])
+}
+
+fn assertion_execution(
+    assertion: &AssertionSpec,
+    upstream_observation: String,
+    fre_observation: String,
+) -> RegexAutomataAssertionExecution {
+    RegexAutomataAssertionExecution {
+        assertion_id: assertion.assertion_id.to_owned(),
+        upstream_observation,
+        fre_observation,
+    }
+}
+
+fn usize_execution(
+    assertion: &AssertionSpec,
+    upstream: usize,
+    fre: usize,
+) -> RegexAutomataAssertionExecution {
+    assertion_execution(
+        assertion,
+        format!("usize:{upstream}"),
+        format!("usize:{fre}"),
+    )
+}
+
+fn upstream_special_find<A: Automaton>(
+    dfa: &A,
+    haystack: &[u8],
+) -> Result<Option<HalfMatch>, String> {
+    let mut state = dfa
+        .start_state_forward(&Input::new(haystack))
+        .map_err(|error| format!("upstream-special-start:{error}"))?;
+    let mut last_match = None;
+    for (index, &byte) in haystack.iter().enumerate() {
+        state = dfa.next_state(state, byte);
+        if dfa.is_special_state(state) {
+            if dfa.is_match_state(state) {
+                last_match = Some(HalfMatch::new(dfa.match_pattern(state, 0), index));
+            } else if dfa.is_dead_state(state) {
+                return Ok(last_match);
+            } else if dfa.is_quit_state(state) {
+                if last_match.is_some() {
+                    return Ok(last_match);
+                }
+                return Err(format!("upstream-special-quit:{byte}:{index}"));
+            }
+        }
+    }
+    state = dfa.next_eoi_state(state);
+    if dfa.is_match_state(state) {
+        last_match = Some(HalfMatch::new(dfa.match_pattern(state, 0), haystack.len()));
+    }
+    Ok(last_match)
+}
+
+fn fre_earliest_match(
+    patterns: &[&str],
+    haystack: &[u8],
+) -> Result<Option<(usize, usize, usize)>, String> {
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (pattern_id, pattern) in patterns.iter().enumerate() {
+        let matched = PortableRegex::new(*pattern)
+            .map_err(|error| format!("fre-build-pattern-{pattern_id}:{error}"))?
+            .find(haystack, SearchLimits::unlimited())
+            .map_err(|error| format!("fre-search-pattern-{pattern_id}:{error}"))?
+            .0;
+        let Some(matched) = matched else {
+            continue;
+        };
+        let candidate = (pattern_id, matched.start(), matched.end());
+        if match best {
+            None => true,
+            Some(current) => (candidate.1, candidate.0) < (current.1, current.0),
+        } {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn required_upstream_match(
+    matched: Option<HalfMatch>,
+    label: &str,
+) -> Result<(usize, usize), String> {
+    matched
+        .map(|matched| (matched.pattern().as_usize(), matched.offset()))
+        .ok_or_else(|| format!("upstream-{label}-missing-match"))
+}
+
+fn required_fre_match(
+    matched: Option<(usize, usize, usize)>,
+    label: &str,
+) -> Result<(usize, usize), String> {
+    matched
+        .map(|(pattern, _, end)| (pattern, end))
+        .ok_or_else(|| format!("fre-{label}-missing-match"))
+}
+
+fn run_is_special_state(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let haystack = b"123 foobar 4567";
+
+    let upstream_alpha = required_upstream_match(
+        upstream_special_find(
+            &dense::DFA::new(r"[a-z]+").map_err(|error| format!("upstream-alpha:{error}"))?,
+            haystack,
+        )?,
+        "special-alpha",
+    )?;
+    let fre_alpha =
+        required_fre_match(fre_earliest_match(&[r"[a-z]+"], haystack)?, "special-alpha")?;
+
+    let upstream_eoi = required_upstream_match(
+        upstream_special_find(
+            &dense::DFA::new(r"[0-9]{4}").map_err(|error| format!("upstream-eoi:{error}"))?,
+            haystack,
+        )?,
+        "special-eoi",
+    )?;
+    let fre_eoi = required_fre_match(fre_earliest_match(&[r"[0-9]{4}"], haystack)?, "special-eoi")?;
+
+    let patterns = [r"[a-z]+", r"[0-9]+"];
+    let upstream_many_dfa =
+        dense::DFA::new_many(&patterns).map_err(|error| format!("upstream-many:{error}"))?;
+    let upstream_many_head = required_upstream_match(
+        upstream_special_find(&upstream_many_dfa, haystack)?,
+        "special-many-head",
+    )?;
+    let upstream_many_middle = required_upstream_match(
+        upstream_special_find(&upstream_many_dfa, &haystack[3..])?,
+        "special-many-middle",
+    )?;
+    let upstream_many_tail = required_upstream_match(
+        upstream_special_find(&upstream_many_dfa, &haystack[10..])?,
+        "special-many-tail",
+    )?;
+    let fre_many_head = required_fre_match(
+        fre_earliest_match(&patterns, haystack)?,
+        "special-many-head",
+    )?;
+    let fre_many_middle = required_fre_match(
+        fre_earliest_match(&patterns, &haystack[3..])?,
+        "special-many-middle",
+    )?;
+    let fre_many_tail = required_fre_match(
+        fre_earliest_match(&patterns, &haystack[10..])?,
+        "special-many-tail",
+    )?;
+
+    let pairs = [
+        (upstream_alpha, fre_alpha),
+        (upstream_eoi, fre_eoi),
+        (upstream_many_head, fre_many_head),
+        (upstream_many_middle, fre_many_middle),
+        (upstream_many_tail, fre_many_tail),
+    ];
+    let mut executions = Vec::with_capacity(IS_SPECIAL_STATE_ASSERTIONS.len());
+    for (index, (upstream, fre)) in pairs.into_iter().enumerate() {
+        let pattern_index = index
+            .checked_mul(2)
+            .ok_or_else(|| "special-state-assertion-index-overflow".to_owned())?;
+        let offset_index = pattern_index
+            .checked_add(1)
+            .ok_or_else(|| "special-state-assertion-index-overflow".to_owned())?;
+        let pattern_assertion = IS_SPECIAL_STATE_ASSERTIONS
+            .get(pattern_index)
+            .ok_or_else(|| "special-state-pattern-assertion-missing".to_owned())?;
+        let offset_assertion = IS_SPECIAL_STATE_ASSERTIONS
+            .get(offset_index)
+            .ok_or_else(|| "special-state-offset-assertion-missing".to_owned())?;
+        executions.push(usize_execution(pattern_assertion, upstream.0, fre.0));
+        executions.push(usize_execution(offset_assertion, upstream.1, fre.1));
+    }
+    Ok(executions)
+}
+
+fn upstream_start_state_find<A: Automaton>(
+    dfa: &A,
+    haystack: &[u8],
+    prefix_byte: Option<u8>,
+) -> Result<Option<HalfMatch>, String> {
+    let mut state = dfa
+        .start_state_forward(&Input::new(haystack))
+        .map_err(|error| format!("upstream-start-state-start:{error}"))?;
+    let mut last_match = None;
+    let mut position = 0;
+    while position < haystack.len() {
+        let byte = haystack[position];
+        state = dfa.next_state(state, byte);
+        let observed_position = position;
+        position = position
+            .checked_add(1)
+            .ok_or_else(|| "upstream-start-state-position-overflow".to_owned())?;
+        if dfa.is_special_state(state) {
+            if dfa.is_match_state(state) {
+                last_match = Some(HalfMatch::new(
+                    dfa.match_pattern(state, 0),
+                    observed_position,
+                ));
+            } else if dfa.is_dead_state(state) {
+                return Ok(last_match);
+            } else if dfa.is_quit_state(state) {
+                if last_match.is_some() {
+                    return Ok(last_match);
+                }
+                return Err(format!(
+                    "upstream-start-state-quit:{byte}:{observed_position}",
+                ));
+            } else if dfa.is_start_state(state)
+                && let Some(prefix_byte) = prefix_byte
+            {
+                let Some(relative) = haystack[position..]
+                    .iter()
+                    .position(|&candidate| candidate == prefix_byte)
+                else {
+                    break;
+                };
+                position = position
+                    .checked_add(relative)
+                    .ok_or_else(|| "upstream-start-state-skip-overflow".to_owned())?;
+            }
+        }
+    }
+    state = dfa.next_eoi_state(state);
+    if dfa.is_match_state(state) {
+        last_match = Some(HalfMatch::new(dfa.match_pattern(state, 0), haystack.len()));
+    }
+    Ok(last_match)
+}
+
+fn fre_prefix_find(
+    pattern: &str,
+    haystack: &[u8],
+    prefix_byte: Option<u8>,
+) -> Result<Option<(usize, usize, usize)>, String> {
+    let start = match prefix_byte {
+        None => 0,
+        Some(prefix) => match haystack.iter().position(|&byte| byte == prefix) {
+            Some(start) => start,
+            None => return Ok(None),
+        },
+    };
+    let matched = PortableRegex::new(pattern)
+        .map_err(|error| format!("fre-prefix-build:{error}"))?
+        .find_at(haystack, start, SearchLimits::unlimited())
+        .map_err(|error| format!("fre-prefix-search:{error}"))?
+        .0;
+    Ok(matched.map(|matched| (0, matched.start(), matched.end())))
+}
+
+fn run_is_start_state(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let dfa = dense::DFA::builder()
+        .configure(dense::DFA::config().specialize_start_states(true))
+        .build(r"Z[a-z]+")
+        .map_err(|error| format!("upstream-start-state-build:{error}"))?;
+    let haystack = b"123 foobar Zbaz quux";
+
+    let upstream_prefix = required_upstream_match(
+        upstream_start_state_find(&dfa, haystack, Some(b'Z'))?,
+        "start-prefix",
+    )?;
+    let fre_prefix = required_fre_match(
+        fre_prefix_find(r"Z[a-z]+", haystack, Some(b'Z'))?,
+        "start-prefix",
+    )?;
+    let upstream_none = required_upstream_match(
+        upstream_start_state_find(&dfa, haystack, None)?,
+        "start-no-prefix",
+    )?;
+    let fre_none = required_fre_match(
+        fre_prefix_find(r"Z[a-z]+", haystack, None)?,
+        "start-no-prefix",
+    )?;
+    let upstream_wrong = upstream_start_state_find(&dfa, haystack, Some(b'X'))?;
+    let fre_wrong = fre_prefix_find(r"Z[a-z]+", haystack, Some(b'X'))?;
+
+    Ok(vec![
+        usize_execution(
+            &IS_START_STATE_ASSERTIONS[0],
+            upstream_prefix.0,
+            fre_prefix.0,
+        ),
+        usize_execution(
+            &IS_START_STATE_ASSERTIONS[1],
+            upstream_prefix.1,
+            fre_prefix.1,
+        ),
+        usize_execution(&IS_START_STATE_ASSERTIONS[2], upstream_none.0, fre_none.0),
+        usize_execution(&IS_START_STATE_ASSERTIONS[3], upstream_none.1, fre_none.1),
+        assertion_execution(
+            &IS_START_STATE_ASSERTIONS[4],
+            upstream_half_match(upstream_wrong),
+            tuple_half_match(fre_wrong),
+        ),
+    ])
+}
+
+fn run_match_len(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let patterns = [r"[[:word:]]+", r"[a-z]+", r"[A-Z]+", r"[[:^space:]]+"];
+    let haystack = b"@bar";
+    let upstream = dense::Builder::new()
+        .configure(dense::Config::new().match_kind(MatchKind::All))
+        .build_many(&patterns)
+        .map_err(|error| format!("upstream-match-len-build:{error}"))?;
+    let mut state = upstream
+        .start_state_forward(&Input::new(haystack))
+        .map_err(|error| format!("upstream-match-len-start:{error}"))?;
+    for &byte in haystack {
+        state = upstream.next_state(state, byte);
+    }
+    state = upstream.next_eoi_state(state);
+    let upstream_is_match = upstream.is_match_state(state);
+    let upstream_len = upstream.match_len(state);
+    let upstream_patterns = (0..upstream_len)
+        .map(|index| upstream.match_pattern(state, index).as_usize())
+        .collect::<Vec<_>>();
+
+    let mut fre_matches = Vec::new();
+    for (pattern_id, pattern) in patterns.iter().enumerate() {
+        let matched = PortableRegex::new(*pattern)
+            .map_err(|error| format!("fre-match-len-build-{pattern_id}:{error}"))?
+            .find(haystack, SearchLimits::unlimited())
+            .map_err(|error| format!("fre-match-len-search-{pattern_id}:{error}"))?
+            .0;
+        if let Some(matched) = matched.filter(|matched| matched.end() == haystack.len()) {
+            fre_matches.push((matched.start(), pattern_id));
+        }
+    }
+    fre_matches.sort_unstable();
+    let fre_patterns = fre_matches
+        .iter()
+        .map(|&(_, pattern_id)| pattern_id)
+        .collect::<Vec<_>>();
+
+    if upstream_patterns.len() != 3 || fre_patterns.len() != 3 {
+        return Err("match-len-observed-cardinality-mismatch".to_owned());
+    }
+    Ok(vec![
+        assertion_execution(
+            &MATCH_LEN_ASSERTIONS[0],
+            format!("bool:{upstream_is_match}"),
+            format!("bool:{}", !fre_patterns.is_empty()),
+        ),
+        usize_execution(&MATCH_LEN_ASSERTIONS[1], upstream_len, fre_patterns.len()),
+        usize_execution(
+            &MATCH_LEN_ASSERTIONS[2],
+            upstream_patterns[0],
+            fre_patterns[0],
+        ),
+        usize_execution(
+            &MATCH_LEN_ASSERTIONS[3],
+            upstream_patterns[1],
+            fre_patterns[1],
+        ),
+        usize_execution(
+            &MATCH_LEN_ASSERTIONS[4],
+            upstream_patterns[2],
+            fre_patterns[2],
+        ),
+    ])
+}
+
+fn run_pattern_len_always(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let upstream: dense::DFA<Vec<u32>> =
+        dense::DFA::always_match().map_err(|error| format!("upstream-always:{error}"))?;
+    let fre = PortableRegexSet::new([""]).map_err(|error| format!("fre-always:{error}"))?;
+    Ok(vec![usize_execution(
+        &PATTERN_LEN_ALWAYS_ASSERTIONS[0],
+        upstream.pattern_len(),
+        fre.patterns().len(),
+    )])
+}
+
+fn tuple_half_match(matched: Option<(usize, usize, usize)>) -> String {
+    match matched {
+        None => "half-match:none".to_owned(),
+        Some((pattern, _, end)) => {
+            format!("half-match:some:pattern={pattern}:offset={end}")
+        }
+    }
+}
+
+fn run_try_search_overlapping_fwd(
+    context: &AdapterContext<'_>,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    let patterns = [r"[[:word:]]+$", r"[[:^space:]]+$"];
+    let haystack = b"@foo";
+    let upstream = dense::Builder::new()
+        .configure(dense::Config::new().match_kind(MatchKind::All))
+        .build_many(&patterns)
+        .map_err(|error| format!("upstream-overlap-build:{error}"))?;
+    let mut state = OverlappingState::start();
+    upstream
+        .try_search_overlapping_fwd(&Input::new(haystack), &mut state)
+        .map_err(|error| format!("upstream-overlap-first:{error}"))?;
+    let upstream_first = state.get_match();
+    upstream
+        .try_search_overlapping_fwd(&Input::new(haystack), &mut state)
+        .map_err(|error| format!("upstream-overlap-second:{error}"))?;
+    let upstream_second = state.get_match();
+
+    let mut fre_matches = Vec::new();
+    for (pattern_id, pattern) in patterns.iter().enumerate() {
+        let matched = PortableRegex::new(*pattern)
+            .map_err(|error| format!("fre-overlap-build-{pattern_id}:{error}"))?
+            .find(haystack, SearchLimits::unlimited())
+            .map_err(|error| format!("fre-overlap-search-{pattern_id}:{error}"))?
+            .0;
+        if let Some(matched) = matched.filter(|matched| matched.end() == haystack.len()) {
+            fre_matches.push((pattern_id, matched.start(), matched.end()));
+        }
+    }
+    fre_matches.sort_unstable_by_key(|&(pattern, start, _)| (start, pattern));
+    if fre_matches.len() != 2 {
+        return Err("fre-overlap-cardinality-mismatch".to_owned());
+    }
+    Ok(vec![
+        assertion_execution(
+            &TRY_SEARCH_OVERLAPPING_FWD_ASSERTIONS[0],
+            upstream_half_match(upstream_first),
+            tuple_half_match(Some(fre_matches[0])),
+        ),
+        assertion_execution(
+            &TRY_SEARCH_OVERLAPPING_FWD_ASSERTIONS[1],
+            upstream_half_match(upstream_second),
+            tuple_half_match(Some(fre_matches[1])),
+        ),
+    ])
 }
 
 fn run_try_search_fwd(
@@ -1078,6 +2025,25 @@ fn adapter_observer_id(adapter: &RegisteredAdapter) -> Result<&'static str, Inve
         && same_adapter_function(adapter.run, run_pattern_len_many)
     {
         "run-pattern-len-many-v1"
+    } else if adapter.case_id == IS_SPECIAL_STATE_CASE
+        && same_adapter_function(adapter.run, run_is_special_state)
+    {
+        "run-is-special-state-v1"
+    } else if adapter.case_id == IS_START_STATE_CASE
+        && same_adapter_function(adapter.run, run_is_start_state)
+    {
+        "run-is-start-state-v1"
+    } else if adapter.case_id == MATCH_LEN_CASE && same_adapter_function(adapter.run, run_match_len)
+    {
+        "run-match-len-v1"
+    } else if adapter.case_id == PATTERN_LEN_ALWAYS_CASE
+        && same_adapter_function(adapter.run, run_pattern_len_always)
+    {
+        "run-pattern-len-always-v1"
+    } else if adapter.case_id == TRY_SEARCH_OVERLAPPING_FWD_CASE
+        && same_adapter_function(adapter.run, run_try_search_overlapping_fwd)
+    {
+        "run-try-search-overlapping-fwd-v1"
     } else if adapter.case_id == TRY_SEARCH_FWD_CASE
         && same_adapter_function(adapter.run, run_try_search_fwd)
     {
@@ -1125,6 +2091,11 @@ fn validate_registered_adapter(
     let expected_source = match adapter.case_id {
         PATTERN_LEN_CASE => PATTERN_LEN_SOURCE,
         PATTERN_LEN_MANY_CASE => PATTERN_LEN_MANY_SOURCE,
+        IS_SPECIAL_STATE_CASE => IS_SPECIAL_STATE_SOURCE,
+        IS_START_STATE_CASE => IS_START_STATE_SOURCE,
+        MATCH_LEN_CASE => MATCH_LEN_SOURCE,
+        PATTERN_LEN_ALWAYS_CASE => PATTERN_LEN_ALWAYS_SOURCE,
+        TRY_SEARCH_OVERLAPPING_FWD_CASE => TRY_SEARCH_OVERLAPPING_FWD_SOURCE,
         TRY_SEARCH_FWD_CASE => TRY_SEARCH_FWD_SOURCE,
         _ => {
             return Err(InventoryError::new(
@@ -1674,6 +2645,46 @@ mod tests {
                 mode_id: COMPILED_MODE_ID.to_owned(),
                 harness: RegexAutomataHarnessKind::Doctest,
                 case_id: PATTERN_LEN_MANY_CASE.to_owned(),
+                disposition: RegexAutomataAdapterDisposition::Pass {
+                    evidence_sha256: evidence[PATTERN_LEN_MANY_CASE].clone(),
+                },
+            },
+            RegexAutomataAdapterReceipt {
+                mode_id: COMPILED_MODE_ID.to_owned(),
+                harness: RegexAutomataHarnessKind::Doctest,
+                case_id: IS_SPECIAL_STATE_CASE.to_owned(),
+                disposition: RegexAutomataAdapterDisposition::Unsupported {
+                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
+                },
+            },
+            RegexAutomataAdapterReceipt {
+                mode_id: COMPILED_MODE_ID.to_owned(),
+                harness: RegexAutomataHarnessKind::Doctest,
+                case_id: IS_START_STATE_CASE.to_owned(),
+                disposition: RegexAutomataAdapterDisposition::Unsupported {
+                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
+                },
+            },
+            RegexAutomataAdapterReceipt {
+                mode_id: COMPILED_MODE_ID.to_owned(),
+                harness: RegexAutomataHarnessKind::Doctest,
+                case_id: MATCH_LEN_CASE.to_owned(),
+                disposition: RegexAutomataAdapterDisposition::Unsupported {
+                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
+                },
+            },
+            RegexAutomataAdapterReceipt {
+                mode_id: COMPILED_MODE_ID.to_owned(),
+                harness: RegexAutomataHarnessKind::Doctest,
+                case_id: PATTERN_LEN_ALWAYS_CASE.to_owned(),
+                disposition: RegexAutomataAdapterDisposition::Unsupported {
+                    reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
+                },
+            },
+            RegexAutomataAdapterReceipt {
+                mode_id: COMPILED_MODE_ID.to_owned(),
+                harness: RegexAutomataHarnessKind::Doctest,
+                case_id: TRY_SEARCH_OVERLAPPING_FWD_CASE.to_owned(),
                 disposition: RegexAutomataAdapterDisposition::Unsupported {
                     reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
                 },
@@ -1713,29 +2724,43 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_predecessor_manifest_allows_exact_two_to_three_transition() {
+    fn authenticated_predecessor_manifest_allows_exact_three_to_eight_transition() {
         validate_predecessor_registry_manifest(PREDECESSOR_REGISTERED_ADAPTERS).unwrap();
         let previous = predecessor_report_fixture();
         validate_predecessor_report_authority(&previous, &previous).unwrap();
 
         let mut current = previous.clone();
         current.payload.candidate = candidate('c', 'd');
-        let execution = execute_adapter(&PATTERN_LEN_MANY_ADAPTER, &compiled_mode()).unwrap();
-        let evidence_sha256 = hash_json(&execution, "encode gained test execution").unwrap();
-        let gained = current
-            .payload
-            .receipts
-            .iter_mut()
-            .find(|receipt| receipt.case_id == PATTERN_LEN_MANY_CASE)
-            .unwrap();
-        gained.disposition = RegexAutomataAdapterDisposition::Pass { evidence_sha256 };
-        current.payload.execution_receipts.push(execution);
+        let gained_adapters = [
+            IS_SPECIAL_STATE_ADAPTER,
+            IS_START_STATE_ADAPTER,
+            MATCH_LEN_ADAPTER,
+            PATTERN_LEN_ALWAYS_ADAPTER,
+            TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
+        ];
+        for adapter in gained_adapters {
+            let execution = execute_adapter(&adapter, &compiled_mode()).unwrap();
+            let evidence_sha256 = hash_json(&execution, "encode gained test execution").unwrap();
+            let gained = current
+                .payload
+                .receipts
+                .iter_mut()
+                .find(|receipt| receipt.case_id == adapter.case_id)
+                .unwrap();
+            gained.disposition = RegexAutomataAdapterDisposition::Pass { evidence_sha256 };
+            current.payload.execution_receipts.push(execution);
+        }
         reseal_report(&mut current);
-        let assigned = BTreeSet::from([(
-            COMPILED_MODE_ID.to_owned(),
-            RegexAutomataHarnessKind::Doctest,
-            PATTERN_LEN_MANY_CASE.to_owned(),
-        )]);
+        let assigned = gained_adapters
+            .iter()
+            .map(|adapter| {
+                (
+                    COMPILED_MODE_ID.to_owned(),
+                    RegexAutomataHarnessKind::Doctest,
+                    adapter.case_id.to_owned(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
         assert_eq!(
             gain_vectors(
                 &previous.payload.receipts,
@@ -1743,16 +2768,16 @@ mod tests {
                 &assigned,
             )
             .unwrap(),
-            (1, 1),
+            (5, 5),
         );
-        assert_eq!(previous.payload.counts.pass, 2);
-        assert_eq!(current.payload.counts.pass, 3);
+        assert_eq!(previous.payload.counts.pass, 3);
+        assert_eq!(current.payload.counts.pass, 8);
     }
 
     #[test]
     fn predecessor_authority_rejects_resealed_pass_downgrades() {
         let authentic = predecessor_report_fixture();
-        for case_id in [PATTERN_LEN_CASE, TRY_SEARCH_FWD_CASE] {
+        for case_id in [PATTERN_LEN_CASE, PATTERN_LEN_MANY_CASE, TRY_SEARCH_FWD_CASE] {
             let mut downgraded = authentic.clone();
             downgraded
                 .payload
@@ -1772,28 +2797,39 @@ mod tests {
                 downgraded.payload_sha256,
                 hash_json(&downgraded.payload, "verify downgraded test seal").unwrap(),
             );
-            assert_eq!(downgraded.payload.counts.pass, 1);
+            assert_eq!(downgraded.payload.counts.pass, 2);
             assert!(validate_predecessor_report_authority(&downgraded, &authentic).is_err(),);
         }
     }
 
     #[test]
     fn predecessor_authority_rejects_registry_and_evidence_substitution() {
-        let missing = [PATTERN_LEN_ADAPTER];
+        let missing = [PATTERN_LEN_ADAPTER, PATTERN_LEN_MANY_ADAPTER];
         assert!(validate_predecessor_registry_manifest(&missing).is_err());
 
         let foreign = RegisteredAdapter {
             case_id: "src/dfa/automaton.rs - foreign (line 1)",
             ..TRY_SEARCH_FWD_ADAPTER
         };
-        assert!(validate_predecessor_registry_manifest(&[PATTERN_LEN_ADAPTER, foreign]).is_err(),);
+        assert!(
+            validate_predecessor_registry_manifest(&[
+                PATTERN_LEN_ADAPTER,
+                PATTERN_LEN_MANY_ADAPTER,
+                foreign,
+            ])
+            .is_err(),
+        );
         let wrong_observer = RegisteredAdapter {
             run: run_pattern_len_many,
             ..PATTERN_LEN_ADAPTER
         };
         assert!(
-            validate_predecessor_registry_manifest(&[wrong_observer, TRY_SEARCH_FWD_ADAPTER,])
-                .is_err(),
+            validate_predecessor_registry_manifest(&[
+                wrong_observer,
+                PATTERN_LEN_MANY_ADAPTER,
+                TRY_SEARCH_FWD_ADAPTER,
+            ])
+            .is_err(),
         );
 
         let authentic = predecessor_report_fixture();
@@ -1935,6 +2971,11 @@ mod tests {
 
         validate_source_spec(&PATTERN_LEN_SOURCE).unwrap();
         validate_source_spec(&PATTERN_LEN_MANY_SOURCE).unwrap();
+        validate_source_spec(&IS_SPECIAL_STATE_SOURCE).unwrap();
+        validate_source_spec(&IS_START_STATE_SOURCE).unwrap();
+        validate_source_spec(&MATCH_LEN_SOURCE).unwrap();
+        validate_source_spec(&PATTERN_LEN_ALWAYS_SOURCE).unwrap();
+        validate_source_spec(&TRY_SEARCH_OVERLAPPING_FWD_SOURCE).unwrap();
         validate_source_spec(&TRY_SEARCH_FWD_SOURCE).unwrap();
 
         let mut changed_span = PATTERN_LEN_SOURCE;
@@ -1962,9 +3003,9 @@ mod tests {
     #[test]
     fn observers_execute_exact_assertions_and_reject_misbinding_or_omission() {
         let mode = compiled_mode();
-        execute_adapter(&REGISTERED_ADAPTERS[0], &mode).unwrap();
-        execute_adapter(&REGISTERED_ADAPTERS[1], &mode).unwrap();
-        execute_adapter(&REGISTERED_ADAPTERS[2], &mode).unwrap();
+        for adapter in REGISTERED_ADAPTERS {
+            execute_adapter(adapter, &mode).unwrap();
+        }
 
         let misbound = RegisteredAdapter {
             run: wrong_pattern_len,
@@ -1977,7 +3018,7 @@ mod tests {
 
         let omitted = RegisteredAdapter {
             run: omitted_second_assertion,
-            ..REGISTERED_ADAPTERS[2]
+            ..TRY_SEARCH_FWD_ADAPTER
         };
         assert_eq!(
             execute_adapter(&omitted, &mode).unwrap_err(),
@@ -2000,6 +3041,42 @@ mod tests {
         assert_eq!(
             execute_adapter(&omitted_many, &mode).unwrap_err(),
             "assertion-execution-count-mismatch",
+        );
+    }
+
+    #[test]
+    fn batched_dfa_observers_bind_all_twenty_three_assertions() {
+        let mode = compiled_mode();
+        let adapters = [
+            IS_SPECIAL_STATE_ADAPTER,
+            IS_START_STATE_ADAPTER,
+            MATCH_LEN_ADAPTER,
+            PATTERN_LEN_ALWAYS_ADAPTER,
+            TRY_SEARCH_OVERLAPPING_FWD_ADAPTER,
+        ];
+        let executions = adapters
+            .iter()
+            .map(|adapter| execute_adapter(adapter, &mode).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            executions
+                .iter()
+                .map(|execution| execution.assertion_executions.len())
+                .collect::<Vec<_>>(),
+            vec![10, 5, 5, 1, 2],
+        );
+        assert_eq!(
+            executions
+                .iter()
+                .map(|execution| execution.case_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                IS_SPECIAL_STATE_CASE,
+                IS_START_STATE_CASE,
+                MATCH_LEN_CASE,
+                PATTERN_LEN_ALWAYS_CASE,
+                TRY_SEARCH_OVERLAPPING_FWD_CASE,
+            ],
         );
     }
 
