@@ -921,11 +921,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires authenticated external inventory/report fixtures"]
     fn authenticated_v5_v6_validators_reject_adversarial_mutations() {
-        let inventory_path = "/private/tmp/fre-control/progress-refill-v7-correctness-results/current-report-evidence-51a40873216499517d157ecb8ff88cec4ecdf4f3-1/regex-automata-inventory.json";
-        let predecessor_path =
-            "/private/tmp/fre-artifacts/regex-automata-v5-prefix-119c1a3c-qualified-r1/report.json";
-        let current_path = "/private/tmp/fre-unicode-reports-y/r31.json";
+        assert_eq!(std::env::args().any(|arg| arg == "--exact"), true);
+        let inventory_path = std::env::var("FRE_UNICODE_INVENTORY").unwrap();
+        let predecessor_path = std::env::var("FRE_UNICODE_V5").unwrap();
+        let current_path = std::env::var("FRE_UNICODE_V6").unwrap();
         let inventory =
             crate::read_regex_automata_corpus_report(PathBuf::from(inventory_path).as_path())
                 .unwrap();
@@ -950,31 +951,47 @@ mod tests {
 
         let mut wrong_predecessor = predecessor.clone();
         wrong_predecessor.payload.candidate.revision = "wrong".to_owned();
+        wrong_predecessor.payload_sha256 = hash_json(&wrong_predecessor.payload, "test").unwrap();
         assert!(validate_predecessor(&inventory, &wrong_predecessor).is_err());
         let mut changed_limitations = current.clone();
         changed_limitations.payload.limitations[0].push('x');
+        changed_limitations.payload_sha256 =
+            hash_json(&changed_limitations.payload, "test").unwrap();
         assert!(changed_limitations.validate_structure(&inventory).is_err());
         let mut changed_matrix = current.clone();
         changed_matrix.payload.look_mode_matrix = None;
+        changed_matrix.payload_sha256 = hash_json(&changed_matrix.payload, "test").unwrap();
         assert!(changed_matrix.validate_structure(&inventory).is_err());
         let mut wrong_mode = current.clone();
         wrong_mode.payload.receipts[0].mode_id = "wrong-mode".to_owned();
+        wrong_mode.payload_sha256 = hash_json(&wrong_mode.payload, "test").unwrap();
         assert!(wrong_mode.validate_structure(&inventory).is_err());
         let mut missing_target = current.clone();
         missing_target.payload.execution_receipts.pop();
+        missing_target.payload_sha256 = hash_json(&missing_target.payload, "test").unwrap();
         assert!(missing_target.validate_structure(&inventory).is_err());
         let mut duplicate_target = current.clone();
         duplicate_target
             .payload
             .execution_receipts
             .push(duplicate_target.payload.execution_receipts[0].clone());
+        duplicate_target.payload_sha256 = hash_json(&duplicate_target.payload, "test").unwrap();
         assert!(duplicate_target.validate_structure(&inventory).is_err());
-        let output =
-            std::env::temp_dir().join(format!("fre-unicode-v6-test-{}.json", std::process::id()));
+        let output = std::env::temp_dir().join(format!("fre-unicode-v6-audit-{}", uuid_like()));
+        std::fs::create_dir(&output).unwrap();
+        let output = output.join("positive.json");
         crate::write_regex_automata_adapter_report(&output, &current, &inventory).unwrap();
         assert!(
             crate::write_regex_automata_adapter_report(&output, &changed_limitations, &inventory)
                 .is_err()
         );
+    }
+
+    fn uuid_like() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
+        )
     }
 }
