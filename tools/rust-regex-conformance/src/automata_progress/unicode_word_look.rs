@@ -923,7 +923,7 @@ mod tests {
     #[test]
     #[ignore = "requires authenticated external inventory/report fixtures"]
     fn authenticated_v5_v6_validators_reject_adversarial_mutations() {
-        assert_eq!(std::env::args().any(|arg| arg == "--exact"), true);
+        assert!(std::env::args().any(|arg| arg == "--exact"));
         let inventory_path = std::env::var("FRE_UNICODE_INVENTORY").unwrap();
         let predecessor_path = std::env::var("FRE_UNICODE_V5").unwrap();
         let current_path = std::env::var("FRE_UNICODE_V6").unwrap();
