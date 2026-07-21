@@ -392,8 +392,8 @@ fn reconstruct_predecessor(
     previous
         .schema
         .push_str(REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA);
-    previous.payload.candidate.revision = PREDECESSOR_REVISION.to_owned();
-    previous.payload.candidate.tree = PREDECESSOR_TREE.to_owned();
+    PREDECESSOR_REVISION.clone_into(&mut previous.payload.candidate.revision);
+    PREDECESSOR_TREE.clone_into(&mut previous.payload.candidate.tree);
     previous.payload.limitations =
         crate::automata_progress::word_look::ASCII_WORD_LOOK_REPORT_LIMITATIONS
             .iter()

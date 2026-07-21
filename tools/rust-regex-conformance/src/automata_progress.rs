@@ -3398,9 +3398,9 @@ pub fn write_regex_automata_adapter_report(
 ) -> Result<(), InventoryError> {
     if report.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
         validate_all_mode_look_execution(inventory, report)?;
-    } else if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
-        report.validate_structure(inventory)?;
-    } else if report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
+    } else if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
+    {
         report.validate_structure(inventory)?;
     } else {
         validate_regex_automata_adapter_execution(inventory, report)?;
