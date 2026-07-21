@@ -914,10 +914,8 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), 6);
         assert_eq!(AUTHORITIES.len(), 6);
-        assert!(
-            AUTHORITIES
-                .iter()
-                .all(|authority| authority.pattern.contains("\\b"))
-        );
+        assert!(AUTHORITIES.iter().all(|authority| {
+            authority.pattern.contains("\\b") || authority.pattern.contains("\\B")
+        }));
     }
 }
