@@ -15,6 +15,7 @@ use memchr::memmem::{Finder, FinderBuilder};
 mod bounded_class_sequence;
 mod bounded_context;
 mod bounded_separated_fields;
+mod byte_start_map;
 mod fixed_class_sandwich;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
@@ -72,6 +73,14 @@ pub use bounded_separated_fields::{
     ReduceError as BoundedSeparatedFieldsReduceError,
     ReduceLimits as BoundedSeparatedFieldsReduceLimits,
     ReduceUpperBounds as BoundedSeparatedFieldsUpperBounds,
+};
+pub use byte_start_map::{
+    BuildAccounting as ByteStartMapBuildAccounting, BuildError as ByteStartMapBuildError,
+    BuildLimits as ByteStartMapBuildLimits, ByteStartMap, Direction as ByteStartDirection,
+    LookupAccounting as ByteStartMapLookupAccounting, LookupError as ByteStartMapLookupError,
+    LookupLimits as ByteStartMapLookupLimits, LookupResult as ByteStartMapLookupResult,
+    PLAN_ID as BYTE_START_MAP_PLAN_ID, Resource as ByteStartMapResource,
+    StartClass as ByteStartClass,
 };
 pub use fixed_class_sandwich::{
     BuildAccounting as FixedClassSandwichBuildAccounting,

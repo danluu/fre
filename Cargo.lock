@@ -231,6 +231,7 @@ dependencies = [
  "fre-exact-alloc",
  "memchr",
  "regex",
+ "regex-automata",
 ]
 
 [[package]]
