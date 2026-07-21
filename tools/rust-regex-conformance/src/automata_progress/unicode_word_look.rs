@@ -926,7 +926,16 @@ mod tests {
         assert!(std::env::args().any(|arg| arg == "--exact"));
         let inventory_path = std::env::var("FRE_UNICODE_INVENTORY").unwrap();
         let predecessor_path = std::env::var("FRE_UNICODE_V5").unwrap();
-        let current_path = std::env::var("FRE_UNICODE_V6").unwrap();
+        let candidate_revision = std::env::var("FRE_UNICODE_FINAL_REVISION").unwrap();
+        let candidate_tree = std::env::var("FRE_UNICODE_FINAL_TREE").unwrap();
+        assert_eq!(
+            crate::sha256(&std::fs::read(&inventory_path).unwrap()),
+            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2"
+        );
+        assert_eq!(
+            crate::sha256(&std::fs::read(&predecessor_path).unwrap()),
+            "b8295fa5e3cba0f9097aa1d6ac935a09f389b0d70c43113b8cd681892dd3c90c"
+        );
         let inventory =
             crate::read_regex_automata_corpus_report(PathBuf::from(inventory_path).as_path())
                 .unwrap();
@@ -935,9 +944,14 @@ mod tests {
             &inventory,
         )
         .unwrap();
-        let current = crate::read_regex_automata_adapter_report(
-            PathBuf::from(current_path).as_path(),
+        let current = build_regex_automata_unicode_word_look_report(
             &inventory,
+            &predecessor,
+            CandidateIdentity {
+                revision: candidate_revision,
+                tree: candidate_tree,
+                tracked_and_untracked_worktree_clean: true,
+            },
         )
         .unwrap();
         validate_predecessor(&inventory, &predecessor).unwrap();
