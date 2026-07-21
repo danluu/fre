@@ -36,9 +36,14 @@ use crate::{
     RegexAutomataObligation, authenticate_candidate_source, sha256,
 };
 
+mod start_map;
 mod unicode_word_look;
 mod word_look;
 
+pub use start_map::{
+    REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA, build_regex_automata_start_map_report,
+    validate_regex_automata_start_map_strict_gain,
+};
 pub use unicode_word_look::{
     REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA, build_regex_automata_unicode_word_look_report,
     validate_regex_automata_unicode_word_look_strict_gain,
@@ -3087,6 +3092,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(word_look::ASCII_WORD_LOOK_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
         Ok(unicode_word_look::UNICODE_WORD_LOOK_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA {
+        Ok(start_map::START_MAP_REPORT_LIMITATIONS.as_slice())
     } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
     } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
@@ -3172,43 +3179,14 @@ impl RegexAutomataAdapterReport {
         if self.schema != REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
         {
             return Err(InventoryError::new(
                 "legacy regex-automata report unexpectedly embeds a look-mode matrix",
             ));
         }
-        if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            if !self.payload.execution_receipts.is_empty()
-                || self.payload.counts.pass != 0
-                || self.payload.counts.fault != 0
-                || self.payload.receipts.iter().any(|receipt| {
-                    !matches!(
-                        &receipt.disposition,
-                        RegexAutomataAdapterDisposition::Unsupported { reason_code }
-                            if reason_code == INVENTORY_UNSUPPORTED_REASON
-                    )
-                })
-            {
-                return Err(InventoryError::new(
-                    "legacy regex-automata report is not a zero-pass baseline",
-                ));
-            }
-            return Ok(());
-        }
-        if self.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
-            return validate_all_mode_look_execution_after_structure(inventory, self);
-        }
-        if self.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
-            return word_look::validate_ascii_word_look_execution_after_structure(inventory, self);
-        }
-        if self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
-            return unicode_word_look::validate_unicode_word_look_execution_after_structure(
-                inventory, self,
-            );
-        }
-        validate_execution_receipt_set(inventory, self, report_registry(self.schema.as_str())?)?;
-        Ok(())
+        validate_report_execution_after_structure(inventory, self)
     }
 
     fn validate_for_gain(
@@ -3222,6 +3200,7 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
         {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
@@ -3229,6 +3208,46 @@ impl RegexAutomataAdapterReport {
         }
         Ok(())
     }
+}
+
+fn validate_report_execution_after_structure(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    if report.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        if !report.payload.execution_receipts.is_empty()
+            || report.payload.counts.pass != 0
+            || report.payload.counts.fault != 0
+            || report.payload.receipts.iter().any(|receipt| {
+                !matches!(
+                    &receipt.disposition,
+                    RegexAutomataAdapterDisposition::Unsupported { reason_code }
+                        if reason_code == INVENTORY_UNSUPPORTED_REASON
+                )
+            })
+        {
+            return Err(InventoryError::new(
+                "legacy regex-automata report is not a zero-pass baseline",
+            ));
+        }
+        return Ok(());
+    }
+    if report.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+        return validate_all_mode_look_execution_after_structure(inventory, report);
+    }
+    if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
+        return word_look::validate_ascii_word_look_execution_after_structure(inventory, report);
+    }
+    if report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
+        return unicode_word_look::validate_unicode_word_look_execution_after_structure(
+            inventory, report,
+        );
+    }
+    if report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA {
+        return start_map::validate_start_map_execution_after_structure(inventory, report);
+    }
+    validate_execution_receipt_set(inventory, report, report_registry(report.schema.as_str())?)?;
+    Ok(())
 }
 
 /// Re-run the independently sealed predecessor registry. The expected replay
@@ -3400,6 +3419,7 @@ pub fn write_regex_automata_adapter_report(
         validate_all_mode_look_execution(inventory, report)?;
     } else if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
     {
         report.validate_structure(inventory)?;
     } else {
@@ -4166,7 +4186,9 @@ fn render_look_assertion(vector: &LookAssertionVector) -> Result<String, Invento
 fn validate_source_spec(source: &SourceContractSpec) -> Result<(), InventoryError> {
     let authenticated_source = matches!(
         (source.source_path, source.source_sha256),
-        (AUTOMATON_SOURCE_PATH, AUTOMATON_SOURCE_SHA256) | (LOOK_SOURCE_PATH, LOOK_SOURCE_SHA256)
+        (AUTOMATON_SOURCE_PATH, AUTOMATON_SOURCE_SHA256)
+            | (LOOK_SOURCE_PATH, LOOK_SOURCE_SHA256)
+            | (start_map::SOURCE_PATH, start_map::SOURCE_SHA256)
     );
     if !authenticated_source
         || source.span_start_line == 0

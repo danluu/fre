@@ -431,6 +431,7 @@ version = "0.1.0"
 dependencies = [
  "bstr",
  "fre",
+ "fre-kernels",
  "fre-syntax",
  "regex-automata",
  "regex-syntax",
