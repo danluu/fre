@@ -5,20 +5,21 @@ use rust_regex_conformance::{
     build_feature_matrix_report, build_inventory, build_misc_regression_report,
     build_regex_automata_adapter_report, build_regex_automata_all_mode_look_report,
     build_regex_automata_ascii_word_look_report, build_regex_automata_corpus_report,
-    build_regex_automata_look_mode_matrix, build_regex_syntax_corpus_report,
-    build_replacement_api_report, build_searcher_api_report, load_executable_cases,
-    read_adapter_report, read_doctest_report, read_feature_matrix_report, read_inventory,
-    read_misc_regression_report, read_regex_automata_adapter_report,
+    build_regex_automata_look_mode_matrix, build_regex_automata_unicode_word_look_report,
+    build_regex_syntax_corpus_report, build_replacement_api_report, build_searcher_api_report,
+    load_executable_cases, read_adapter_report, read_doctest_report, read_feature_matrix_report,
+    read_inventory, read_misc_regression_report, read_regex_automata_adapter_report,
     read_regex_automata_corpus_report, read_regex_automata_gap_assignment,
     read_regex_automata_look_mode_matrix, read_regex_syntax_corpus_report,
     read_replacement_api_report, read_searcher_api_report, schedule_regex_automata_gap,
     validate_regex_automata_all_mode_look_strict_gain,
     validate_regex_automata_ascii_word_look_strict_gain, validate_regex_automata_look_strict_gain,
-    validate_regex_automata_strict_gain, write_adapter_report, write_doctest_report,
-    write_feature_matrix_report, write_inventory, write_misc_regression_report,
-    write_regex_automata_adapter_report, write_regex_automata_corpus_report,
-    write_regex_automata_gap_assignment, write_regex_automata_look_mode_matrix,
-    write_regex_syntax_corpus_report, write_replacement_api_report, write_searcher_api_report,
+    validate_regex_automata_strict_gain, validate_regex_automata_unicode_word_look_strict_gain,
+    write_adapter_report, write_doctest_report, write_feature_matrix_report, write_inventory,
+    write_misc_regression_report, write_regex_automata_adapter_report,
+    write_regex_automata_corpus_report, write_regex_automata_gap_assignment,
+    write_regex_automata_look_mode_matrix, write_regex_syntax_corpus_report,
+    write_replacement_api_report, write_searcher_api_report,
 };
 
 fn main() -> ExitCode {
@@ -140,6 +141,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "run-regex-automata-look-ascii-word" => {
             run_regex_automata_look_ascii_word(&mut args)?;
         }
+        "run-regex-automata-look-unicode-word" => {
+            run_regex_automata_look_unicode_word(&mut args)?;
+        }
         "schedule-regex-automata-gap" => schedule_regex_automata_assignment(&mut args)?,
         "verify-regex-automata-strict-gain" => verify_regex_automata_gain(&mut args)?,
         "verify-regex-automata-look-strict-gain" => {
@@ -150,6 +154,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "verify-regex-automata-look-ascii-word-strict-gain" => {
             verify_regex_automata_look_ascii_word_gain(&mut args)?;
+        }
+        "verify-regex-automata-look-unicode-word-strict-gain" => {
+            verify_regex_automata_look_unicode_word_gain(&mut args)?;
         }
         "-h" | "--help" | "help" => println!("{}", usage()),
         _ => return Err(usage().into()),
@@ -253,6 +260,31 @@ fn run_regex_automata_look_ascii_word(
     write_regex_automata_adapter_report(&output, &report, &inventory)?;
     println!(
         "regex-automata-look-ascii-word candidate={} pass={} unsupported={} fault={} total={} payload_sha256={}",
+        report.payload.candidate.revision,
+        report.payload.counts.pass,
+        report.payload.counts.unsupported,
+        report.payload.counts.fault,
+        report.payload.counts.total,
+        report.payload_sha256,
+    );
+    Ok(())
+}
+
+fn run_regex_automata_look_unicode_word(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inventory_path = PathBuf::from(args.next().ok_or(usage())?);
+    let previous_path = PathBuf::from(args.next().ok_or(usage())?);
+    let candidate_path = PathBuf::from(args.next().ok_or(usage())?);
+    let output = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let inventory = read_regex_automata_corpus_report(&inventory_path)?;
+    let previous = read_regex_automata_adapter_report(&previous_path, &inventory)?;
+    let candidate = authenticate_candidate_source(&candidate_path)?;
+    let report = build_regex_automata_unicode_word_look_report(&inventory, &previous, candidate)?;
+    write_regex_automata_adapter_report(&output, &report, &inventory)?;
+    println!(
+        "regex-automata-look-unicode-word candidate={} pass={} unsupported={} fault={} total={} payload_sha256={}",
         report.payload.candidate.revision,
         report.payload.counts.pass,
         report.payload.counts.unsupported,
@@ -380,6 +412,29 @@ fn verify_regex_automata_look_ascii_word_gain(
         validate_regex_automata_ascii_word_look_strict_gain(&inventory, &previous, &current)?;
     println!(
         "verified regex-automata-look-ascii-word-strict-gain family={} unique_cases={} mode_memberships={} previous_pass={} current_pass={}",
+        gain.family,
+        gain.gained_unique_cases,
+        gain.gained_mode_memberships,
+        gain.previous_pass,
+        gain.current_pass,
+    );
+    Ok(())
+}
+
+fn verify_regex_automata_look_unicode_word_gain(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inventory_path = PathBuf::from(args.next().ok_or(usage())?);
+    let previous_path = PathBuf::from(args.next().ok_or(usage())?);
+    let current_path = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let inventory = read_regex_automata_corpus_report(&inventory_path)?;
+    let previous = read_regex_automata_adapter_report(&previous_path, &inventory)?;
+    let current = read_regex_automata_adapter_report(&current_path, &inventory)?;
+    let gain =
+        validate_regex_automata_unicode_word_look_strict_gain(&inventory, &previous, &current)?;
+    println!(
+        "verified regex-automata-look-unicode-word-strict-gain family={} unique_cases={} mode_memberships={} previous_pass={} current_pass={}",
         gain.family,
         gain.gained_unique_cases,
         gain.gained_mode_memberships,
@@ -753,5 +808,5 @@ fn reject_extra(args: &mut impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT | run-doctest-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-doctest-api-report REPORT | run-regex-syntax-corpus UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-syntax-corpus-report REPORT | inventory-regex-automata-corpus CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT TARGET_DIR OUTPUT | verify-regex-automata-corpus-report REPORT | run-regex-automata-adapter INVENTORY CANDIDATE_REPO OUTPUT | run-regex-automata-look-mode-matrix CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT INVENTORY TARGET_DIR OUTPUT | run-regex-automata-look-all-modes INVENTORY PREVIOUS_REPORT MATRIX CANDIDATE_REPO OUTPUT | run-regex-automata-look-ascii-word INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | schedule-regex-automata-gap INVENTORY BASELINE_REPORT ATTEMPT SLOT OUTPUT | verify-regex-automata-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT ASSIGNMENT | verify-regex-automata-look-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-look-all-modes-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT CANDIDATE_REPO | verify-regex-automata-look-ascii-word-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT"
+    "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT | run-doctest-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-doctest-api-report REPORT | run-regex-syntax-corpus UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-syntax-corpus-report REPORT | inventory-regex-automata-corpus CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT TARGET_DIR OUTPUT | verify-regex-automata-corpus-report REPORT | run-regex-automata-adapter INVENTORY CANDIDATE_REPO OUTPUT | run-regex-automata-look-mode-matrix CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT INVENTORY TARGET_DIR OUTPUT | run-regex-automata-look-all-modes INVENTORY PREVIOUS_REPORT MATRIX CANDIDATE_REPO OUTPUT | run-regex-automata-look-ascii-word INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | run-regex-automata-look-unicode-word INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | schedule-regex-automata-gap INVENTORY BASELINE_REPORT ATTEMPT SLOT OUTPUT | verify-regex-automata-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT ASSIGNMENT | verify-regex-automata-look-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-look-all-modes-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT CANDIDATE_REPO | verify-regex-automata-look-ascii-word-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-look-unicode-word-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT"
 }

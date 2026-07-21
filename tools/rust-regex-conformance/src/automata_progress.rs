@@ -36,8 +36,13 @@ use crate::{
     RegexAutomataObligation, authenticate_candidate_source, sha256,
 };
 
+mod unicode_word_look;
 mod word_look;
 
+pub use unicode_word_look::{
+    REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA, build_regex_automata_unicode_word_look_report,
+    validate_regex_automata_unicode_word_look_strict_gain,
+};
 pub use word_look::{
     REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA, build_regex_automata_ascii_word_look_report,
     validate_regex_automata_ascii_word_look_strict_gain,
