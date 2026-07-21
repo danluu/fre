@@ -3085,6 +3085,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(ALL_MODE_LOOK_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
         Ok(word_look::ASCII_WORD_LOOK_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
+        Ok(unicode_word_look::UNICODE_WORD_LOOK_REPORT_LIMITATIONS.as_slice())
     } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
     } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
@@ -3169,6 +3171,7 @@ impl RegexAutomataAdapterReport {
         }
         if self.schema != REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
         {
             return Err(InventoryError::new(
@@ -3199,6 +3202,11 @@ impl RegexAutomataAdapterReport {
         if self.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
             return word_look::validate_ascii_word_look_execution_after_structure(inventory, self);
         }
+        if self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
+            return unicode_word_look::validate_unicode_word_look_execution_after_structure(
+                inventory, self,
+            );
+        }
         validate_execution_receipt_set(inventory, self, report_registry(self.schema.as_str())?)?;
         Ok(())
     }
@@ -3213,6 +3221,7 @@ impl RegexAutomataAdapterReport {
         } else if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
         {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
@@ -3390,6 +3399,8 @@ pub fn write_regex_automata_adapter_report(
     if report.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
         validate_all_mode_look_execution(inventory, report)?;
     } else if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA {
+        report.validate_structure(inventory)?;
+    } else if report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA {
         report.validate_structure(inventory)?;
     } else {
         validate_regex_automata_adapter_execution(inventory, report)?;
