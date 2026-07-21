@@ -32,11 +32,13 @@ pub const REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA: &str =
 pub(super) const UNICODE_WORD_LOOK_REPORT_LIMITATIONS: [&str; 3] = [
     "A pass requires direct triple agreement between the authenticated upstream LookMatcher assertion, a forced-K0 FRE search at the exact empty window, and the sealed expected observation.",
     "Only six package-default Unicode word-look unit memberships are added; no result is projected across Cargo feature modes.",
-    "The predecessor 129-membership all-mode look report, including its compiled-mode matrix and every non-target disposition, is retained exactly.",
+    "The predecessor 135-membership ASCII word-look report, including its compiled-mode matrix and every non-target disposition, is retained exactly.",
 ];
 
-const PREDECESSOR_REVISION: &str = "3bae1dac5e5d06de56aab0310b373d4d3af3a36b";
-const PREDECESSOR_TREE: &str = "254f84cdc256cadaa18f89babb9f81b437225518";
+const PREDECESSOR_REVISION: &str = "119c1a3c2b1b53a3e80dcdbc9dc637ee5c843e11";
+const PREDECESSOR_TREE: &str = "088c1ee0e444bfff59a8a8ca956df93d51408b3b";
+const PREDECESSOR_PAYLOAD_SHA256: &str =
+    "57338888329628d69daac44c533f6d501fbd5f983e27ac003a94d8f6810da2ac";
 const FIXTURE: &str = include_str!("../fixtures/look-unicode-word-tests-v1.txt");
 const FIXTURE_SHA256: &str = "011d5ded55f3d446f797e8799471a025b367fffe734daaf4947c9638f98be4bc";
 const TARGET_IDENTITIES_SHA256: &str =
@@ -272,6 +274,9 @@ pub(super) fn validate_unicode_word_look_execution_after_structure(
             })
         || report.payload.candidate.revision == PREDECESSOR_REVISION
         || report.payload.candidate.tree == PREDECESSOR_TREE
+        || report.payload.candidate.revision != PREDECESSOR_REVISION
+        || report.payload.candidate.tree != PREDECESSOR_TREE
+        || report.payload_sha256 != PREDECESSOR_PAYLOAD_SHA256
         || !report
             .payload
             .candidate
@@ -387,6 +392,13 @@ fn reconstruct_predecessor(
     previous
         .schema
         .push_str(REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA);
+    previous.payload.candidate.revision = PREDECESSOR_REVISION.to_owned();
+    previous.payload.candidate.tree = PREDECESSOR_TREE.to_owned();
+    previous.payload.limitations =
+        crate::automata_progress::word_look::ASCII_WORD_LOOK_REPORT_LIMITATIONS
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect();
     for receipt in &mut previous.payload.receipts {
         let identity = (
             receipt.mode_id.clone(),
@@ -408,6 +420,11 @@ fn reconstruct_predecessor(
         &previous.payload,
         "encode reconstructed all-mode look payload",
     )?;
+    if previous.payload_sha256 != PREDECESSOR_PAYLOAD_SHA256 {
+        return Err(InventoryError::new(
+            "reconstructed predecessor payload SHA-256 mismatch",
+        ));
+    }
     Ok(previous)
 }
 
