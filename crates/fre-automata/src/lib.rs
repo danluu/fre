@@ -20,6 +20,7 @@ mod contract;
 mod error;
 mod k0;
 mod plan;
+mod unicode_look;
 
 pub use contract::{
     EarliestEnd, Exists, MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport,
@@ -30,3 +31,4 @@ pub use k0::{K0Workspace, WorkspaceLayout, WorkspaceLimits};
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
 };
+pub use unicode_look::{UnicodeLookError, UnicodeLookMatcher};

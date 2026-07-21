@@ -2,7 +2,7 @@ use core::mem::size_of;
 
 use crate::{
     Automaton, EdgeKind, MatchSpan, ResourceKind, SearchAccounting, SearchError, SearchLimits,
-    SearchWindow, SetupAccounting, StateRole,
+    SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
@@ -793,71 +793,27 @@ fn is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
-fn is_unicode_word_character(character: char) -> bool {
-    regex_syntax::try_is_word_character(character)
-        .expect("fre-automata enables regex-syntax's Unicode Perl tables")
-}
-
 fn unicode_assertion_matches(
     kind: EdgeKind,
     haystack: &[u8],
     position: usize,
 ) -> Result<bool, SearchError> {
-    let before = haystack
-        .get(..position)
-        .ok_or(SearchError::InternalInvariant {
-            detail: "Unicode assertion prefix missing",
-        })?;
-    let after = haystack
-        .get(position..)
-        .ok_or(SearchError::InternalInvariant {
-            detail: "Unicode assertion suffix missing",
-        })?;
-    let left_scalar = decode_last_utf8(before);
-    let right_scalar = decode_utf8(after);
-    let left_valid = before.is_empty() || left_scalar.is_some();
-    let right_valid = after.is_empty() || right_scalar.is_some();
-    let left_word = left_scalar.is_some_and(is_unicode_word_character);
-    let right_word = right_scalar.is_some_and(is_unicode_word_character);
-    Ok(match kind {
-        EdgeKind::AssertWordUnicode => left_word != right_word,
-        EdgeKind::AssertWordUnicodeNegate => left_valid && right_valid && left_word == right_word,
-        EdgeKind::AssertWordStartUnicode => !left_word && right_word,
-        EdgeKind::AssertWordEndUnicode => left_word && !right_word,
-        EdgeKind::AssertWordStartHalfUnicode => left_valid && !left_word,
-        EdgeKind::AssertWordEndHalfUnicode => right_valid && !right_word,
+    let look = match kind {
+        EdgeKind::AssertWordUnicode => regex_syntax::hir::Look::WordUnicode,
+        EdgeKind::AssertWordUnicodeNegate => regex_syntax::hir::Look::WordUnicodeNegate,
+        EdgeKind::AssertWordStartUnicode => regex_syntax::hir::Look::WordStartUnicode,
+        EdgeKind::AssertWordEndUnicode => regex_syntax::hir::Look::WordEndUnicode,
+        EdgeKind::AssertWordStartHalfUnicode => regex_syntax::hir::Look::WordStartHalfUnicode,
+        EdgeKind::AssertWordEndHalfUnicode => regex_syntax::hir::Look::WordEndHalfUnicode,
         _ => {
             return Err(SearchError::InternalInvariant {
                 detail: "non-Unicode edge in Unicode assertion dispatch",
             });
         }
-    })
-}
-
-fn decode_utf8(bytes: &[u8]) -> Option<char> {
-    let first = *bytes.first()?;
-    let len = match first {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF7 => 4,
-        _ => return None,
     };
-    let scalar = core::str::from_utf8(bytes.get(..len)?).ok()?;
-    scalar.chars().next()
-}
-
-fn decode_last_utf8(bytes: &[u8]) -> Option<char> {
-    let last = bytes.len().checked_sub(1)?;
-    let lower = bytes.len().saturating_sub(4);
-    let mut start = last;
-    while start > lower && matches!(bytes[start], 0x80..=0xBF) {
-        start = start.checked_sub(1)?;
-    }
-    // Match the pinned directional decoder: after scanning back over at most
-    // three continuation bytes, classify the scalar starting there without
-    // requiring it to consume the entire suffix.
-    decode_utf8(&bytes[start..])
+    Ok(UnicodeLookMatcher::matches_prevalidated(
+        look, haystack, position,
+    ))
 }
 
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
