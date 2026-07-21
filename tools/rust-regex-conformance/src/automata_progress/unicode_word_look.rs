@@ -274,9 +274,6 @@ pub(super) fn validate_unicode_word_look_execution_after_structure(
             })
         || report.payload.candidate.revision == PREDECESSOR_REVISION
         || report.payload.candidate.tree == PREDECESSOR_TREE
-        || report.payload.candidate.revision != PREDECESSOR_REVISION
-        || report.payload.candidate.tree != PREDECESSOR_TREE
-        || report.payload_sha256 != PREDECESSOR_PAYLOAD_SHA256
         || !report
             .payload
             .candidate
@@ -371,6 +368,9 @@ fn validate_predecessor(
                 fault: 0,
                 total: 3_842,
             })
+        || report.payload.candidate.revision != PREDECESSOR_REVISION
+        || report.payload.candidate.tree != PREDECESSOR_TREE
+        || report.payload_sha256 != PREDECESSOR_PAYLOAD_SHA256
         || !report
             .payload
             .candidate
