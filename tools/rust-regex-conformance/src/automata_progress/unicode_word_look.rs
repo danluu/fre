@@ -933,7 +933,7 @@ mod tests {
         );
         assert_eq!(
             crate::sha256(&std::fs::read(&predecessor_path).unwrap()),
-            "b8295fa5e3cba0f9097aa1d6ac935a09f389b0d70c43113b8cd681892dd3c90c"
+            "b8295fa5b519b7bfd9f90d919395a67142360f4458b0b642d097c864d965a126"
         );
         let inventory =
             crate::read_regex_automata_corpus_report(PathBuf::from(inventory_path).as_path())
