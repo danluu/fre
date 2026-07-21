@@ -101,6 +101,9 @@ pub(crate) const REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES: usize = 512 
 pub(crate) const REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES: usize = 24 * 1_048_576;
 const LOOK_FEATURE_GRAPH_SHA256: &str =
     "40d5101080f340f1a8a91a2dcb6a4813bc92f0aaec8d1a6425ceeff7146e31d4";
+#[cfg(test)]
+const LOOK_NORMALIZED_MANIFEST_SHA256: &str =
+    "83e288a27db86536cc16d1b1b82e9c5e89276781340518d234ecc919dde093fc";
 const LOOK_INVENTORY_RUSTC_HOST: &str = "x86_64-unknown-linux-gnu";
 #[cfg(target_os = "linux")]
 const LOOK_O_NOFOLLOW: i32 = 0o400_000;
@@ -2197,9 +2200,15 @@ fn authenticated_local_feature_graph(
     package: &Path,
 ) -> Result<BTreeMap<String, Vec<String>>, InventoryError> {
     let bytes = read_snapshot_regular_file(&package.join("Cargo.toml"), MAX_PACKAGE_FILE_BYTES)?;
-    let manifest: toml::Value = std::str::from_utf8(&bytes)
-        .map_err(|error| InventoryError::new(format!("Cargo.toml is not UTF-8: {error}")))?
-        .parse()
+    parse_local_feature_graph(&bytes)
+}
+
+fn parse_local_feature_graph(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, Vec<String>>, InventoryError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| InventoryError::new(format!("Cargo.toml is not UTF-8: {error}")))?;
+    let manifest: toml::Value = toml::from_str(text)
         .map_err(|error| InventoryError::new(format!("parse Cargo.toml: {error}")))?;
     if manifest
         .get("package")
@@ -4178,6 +4187,23 @@ fn is_oid(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn look_normalized_manifest_uses_the_document_parser() {
+        const MANIFEST: &[u8] = include_bytes!("fixtures/regex-automata-0.4.14-Cargo.toml");
+        assert_eq!(sha256(MANIFEST), LOOK_NORMALIZED_MANIFEST_SHA256);
+        let graph = parse_local_feature_graph(MANIFEST).unwrap();
+        assert_eq!(
+            hash_json(&graph, "encode normalized-manifest test graph").unwrap(),
+            LOOK_FEATURE_GRAPH_SHA256,
+        );
+        assert_eq!(
+            graph.get("default").unwrap(),
+            &[
+                "std", "syntax", "perf", "unicode", "meta", "nfa", "dfa", "hybrid",
+            ],
+        );
+    }
 
     #[test]
     fn exact_vcs_feature_script_parser_covers_both_blocks() {
