@@ -53,13 +53,14 @@ pub use automata_corpus::{
 };
 pub use automata_progress::{
     REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA, REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA,
-    REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA, RegexAutomataAdapterCounts,
-    RegexAutomataAdapterDisposition, RegexAutomataAdapterReceipt, RegexAutomataAdapterReport,
-    RegexAutomataAdapterReportPayload, RegexAutomataGapAssignment, RegexAutomataGapTarget,
-    RegexAutomataStrictGain, build_regex_automata_adapter_report,
-    build_regex_automata_all_mode_look_report, read_regex_automata_adapter_report,
-    read_regex_automata_gap_assignment, schedule_regex_automata_gap,
-    validate_regex_automata_all_mode_look_strict_gain, validate_regex_automata_look_strict_gain,
+    REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA, REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA,
+    RegexAutomataAdapterCounts, RegexAutomataAdapterDisposition, RegexAutomataAdapterReceipt,
+    RegexAutomataAdapterReport, RegexAutomataAdapterReportPayload, RegexAutomataGapAssignment,
+    RegexAutomataGapTarget, RegexAutomataStrictGain, build_regex_automata_adapter_report,
+    build_regex_automata_all_mode_look_report, build_regex_automata_ascii_word_look_report,
+    read_regex_automata_adapter_report, read_regex_automata_gap_assignment,
+    schedule_regex_automata_gap, validate_regex_automata_all_mode_look_strict_gain,
+    validate_regex_automata_ascii_word_look_strict_gain, validate_regex_automata_look_strict_gain,
     validate_regex_automata_strict_gain, write_regex_automata_adapter_report,
     write_regex_automata_gap_assignment,
 };
