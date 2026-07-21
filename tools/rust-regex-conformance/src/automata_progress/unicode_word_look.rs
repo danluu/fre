@@ -884,4 +884,40 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn unicode_word_look_transition_contract_rejects_stale_or_malformed_identity() {
+        assert_eq!(
+            PREDECESSOR_REVISION,
+            "119c1a3c2b1b53a3e80dcdbc9dc637ee5c843e11"
+        );
+        assert_eq!(PREDECESSOR_TREE, "088c1ee0e444bfff59a8a8ca956df93d51408b3b");
+        assert_eq!(PREDECESSOR_PAYLOAD_SHA256.len(), 64);
+        assert_ne!(
+            PREDECESSOR_REVISION,
+            "3bae1dac5e5d06de56aab0310b373d4d3af3a36b"
+        );
+        assert_ne!(PREDECESSOR_TREE, "254f84cdc256cadaa18f89babb9f81b437225518");
+        assert_eq!(TARGET_IDENTITIES_SHA256.len(), 64);
+        assert!(
+            UNICODE_WORD_LOOK_REPORT_LIMITATIONS
+                .iter()
+                .any(|text| text.contains("135-membership"))
+        );
+    }
+
+    #[test]
+    fn unicode_word_look_target_set_is_exactly_six_unique_authorities() {
+        let ids = AUTHORITIES
+            .iter()
+            .map(|authority| authority.case_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 6);
+        assert_eq!(AUTHORITIES.len(), 6);
+        assert!(
+            AUTHORITIES
+                .iter()
+                .all(|authority| authority.pattern.contains("\\b"))
+        );
+    }
 }
