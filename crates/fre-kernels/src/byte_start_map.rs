@@ -483,6 +483,14 @@ mod tests {
     #[test]
     fn byte_start_map_build_limits_are_exact_and_one_below() {
         let needed = ByteStartMap::build_requirements();
+        assert_eq!(needed.initialized_entries, 256);
+        assert_eq!(needed.work, 8_224);
+        assert_eq!(needed.scratch_bytes, 256);
+        assert_eq!(needed.persistent_bytes, size_of::<ByteStartMap>());
+        assert_eq!(
+            needed.peak_bytes,
+            size_of::<ByteStartMap>().checked_add(256).unwrap(),
+        );
         let exact = BuildLimits {
             max_work: needed.work,
             max_scratch_bytes: needed.scratch_bytes,
@@ -538,6 +546,8 @@ mod tests {
             .unwrap();
         assert_eq!(accounting.random_access_bytes, 1);
         assert_eq!(accounting.map_reads, 1);
+        assert_eq!(accounting.prospective_work, 80);
+        assert_eq!(accounting.actual_work, 80);
         assert_eq!(accounting.actual_work, accounting.prospective_work);
         let exact = exact_lookup_limits(accounting);
         assert_eq!(
@@ -582,6 +592,8 @@ mod tests {
             .unwrap();
         assert_eq!(empty.random_access_bytes, 0);
         assert_eq!(empty.map_reads, 0);
+        assert_eq!(empty.prospective_work, 80);
+        assert_eq!(empty.actual_work, 64);
         assert!(empty.actual_work < empty.prospective_work);
         assert_eq!(
             map.lookup(b"", Direction::Forward, 1, 0, exact_lookup_limits(empty))
