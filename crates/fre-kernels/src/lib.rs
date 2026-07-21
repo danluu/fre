@@ -21,6 +21,7 @@ mod byte_start_map;
 mod determinize_state_codec;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
+mod fixed_predicate_word64;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
 mod literal_aggregate;
@@ -172,6 +173,25 @@ pub use fixed_class_sandwich::{
     ReduceUpperBounds as FixedClassSandwichUpperBounds,
     SPAN_SUM_OPERATION_ID as FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
     Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
+};
+pub use fixed_predicate_word64::{
+    BuildAccounting as FixedPredicateWord64BuildAccounting,
+    BuildError as FixedPredicateWord64BuildError, BuildLimits as FixedPredicateWord64BuildLimits,
+    COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
+    CountResult as FixedPredicateWord64CountResult, FixedPredicateWord64Plan,
+    MAX_WIDTH as FIXED_PREDICATE_WORD64_MAX_WIDTH, MIN_WIDTH as FIXED_PREDICATE_WORD64_MIN_WIDTH,
+    MatchSelection as FixedPredicateWord64MatchSelection,
+    MatchSemantics as FixedPredicateWord64MatchSemantics,
+    Operation as FixedPredicateWord64Operation,
+    OperationIdentity as FixedPredicateWord64OperationIdentity,
+    PLAN_ID as FIXED_PREDICATE_WORD64_PLAN_ID,
+    ReduceAccounting as FixedPredicateWord64ReduceAccounting,
+    ReduceActualCounters as FixedPredicateWord64ActualCounters,
+    ReduceError as FixedPredicateWord64ReduceError,
+    ReduceLimits as FixedPredicateWord64ReduceLimits,
+    ReduceUpperBounds as FixedPredicateWord64UpperBounds,
+    SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as FixedPredicateWord64SpanSumResult,
 };
 pub use forward_anchored::{
     ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
