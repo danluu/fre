@@ -717,6 +717,20 @@ fn execute_vector(
             max_scratch_bytes: MAX_SCRATCH_BYTES,
         },
     );
+    let exact_one_below_refusal = matches!(
+        one_below,
+        Err(fre::SearchError::K0(
+            fre::K0SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested,
+                position,
+            }
+        )) if limit == one_below_work
+            && consumed == one_below_work
+            && requested == 1
+            && position == vector.at
+    );
     let (exact_match, exact_accounting_value) = fre
         .find_window(
             &vector.haystack,
@@ -732,7 +746,7 @@ fn execute_vector(
     if upstream != vector.expected
         || observed_span != expected_span
         || !exact_accounting
-        || one_below.is_ok()
+        || !exact_one_below_refusal
         || exact_match != matched
         || exact_accounting_value != accounting
     {
