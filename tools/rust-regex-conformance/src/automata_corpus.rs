@@ -3293,9 +3293,13 @@ fn parse_single_look_test_run(
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
 {expected_filtered} filtered out; finished in ",
     );
-    let Some(duration) = stdout
+    let normalized = stdout
+        .strip_suffix("\n\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .ok_or_else(|| InventoryError::new("look test execution lacks a terminal line ending"))?;
+    let Some(duration) = normalized
         .strip_prefix(prefix.as_str())
-        .and_then(|rest| rest.strip_suffix("s\n"))
+        .and_then(|rest| rest.strip_suffix('s'))
     else {
         return Err(InventoryError::new(
             "look test execution did not prove exactly one named pass",
@@ -4291,6 +4295,7 @@ features=(
 test util::look::tests::look_matches_end_line ... ok\n\n\
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; finished in 0.00s\n";
         parse_single_look_test_run(good, case_id, 134).unwrap();
+        parse_single_look_test_run(&format!("{good}\n"), case_id, 134).unwrap();
         assert!(
             parse_single_look_test_run(&good.replace("... ok", "... FAILED"), case_id, 134)
                 .is_err()
@@ -4306,6 +4311,11 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; fi
         for forged in [
             format!("prefix{good}"),
             format!("{good}suffix"),
+            good.trim_end_matches('\n').to_owned(),
+            format!("{good}\n\n"),
+            format!("{}\r\n", good.trim_end_matches('\n')),
+            format!("{good} "),
+            format!("{good}{good}"),
             good.replace("134 filtered", "133 filtered"),
             good.replace("0.00s", ".s"),
             good.replace("0.00s", "0.s"),
