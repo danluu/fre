@@ -40,7 +40,7 @@ const PREDECESSOR_TREE: &str = "254f84cdc256cadaa18f89babb9f81b437225518";
 const FIXTURE: &str = include_str!("../fixtures/look-unicode-word-tests-v1.txt");
 const FIXTURE_SHA256: &str = "011d5ded55f3d446f797e8799471a025b367fffe734daaf4947c9638f98be4bc";
 const TARGET_IDENTITIES_SHA256: &str =
-    "125db15807fad708c66130f74cef55032570211fbdeea4a53815130a76e03f0e";
+    "308c1de620e97cf9a213f4f92c2e622282b65189fba8565d3683732a32dadbbe";
 const MAX_WORK: u64 = 18;
 const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
