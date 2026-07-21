@@ -771,6 +771,7 @@ fn execute_vector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn unicode_word_look_fixture_is_complete_and_exact() {
@@ -917,5 +918,63 @@ mod tests {
         assert!(AUTHORITIES.iter().all(|authority| {
             authority.pattern.contains("\\b") || authority.pattern.contains("\\B")
         }));
+    }
+
+    #[test]
+    fn authenticated_v5_v6_validators_reject_adversarial_mutations() {
+        let inventory_path = "/private/tmp/fre-control/progress-refill-v7-correctness-results/current-report-evidence-51a40873216499517d157ecb8ff88cec4ecdf4f3-1/regex-automata-inventory.json";
+        let predecessor_path =
+            "/private/tmp/fre-artifacts/regex-automata-v5-prefix-119c1a3c-qualified-r1/report.json";
+        let current_path = "/private/tmp/fre-unicode-reports-y/r31.json";
+        let inventory =
+            crate::read_regex_automata_corpus_report(PathBuf::from(inventory_path).as_path())
+                .unwrap();
+        let predecessor = crate::read_regex_automata_adapter_report(
+            PathBuf::from(predecessor_path).as_path(),
+            &inventory,
+        )
+        .unwrap();
+        let current = crate::read_regex_automata_adapter_report(
+            PathBuf::from(current_path).as_path(),
+            &inventory,
+        )
+        .unwrap();
+        validate_predecessor(&inventory, &predecessor).unwrap();
+        validate_unicode_word_look_execution_after_structure(&inventory, &current).unwrap();
+        crate::validate_regex_automata_unicode_word_look_strict_gain(
+            &inventory,
+            &predecessor,
+            &current,
+        )
+        .unwrap();
+
+        let mut wrong_predecessor = predecessor.clone();
+        wrong_predecessor.payload.candidate.revision = "wrong".to_owned();
+        assert!(validate_predecessor(&inventory, &wrong_predecessor).is_err());
+        let mut changed_limitations = current.clone();
+        changed_limitations.payload.limitations[0].push('x');
+        assert!(changed_limitations.validate_structure(&inventory).is_err());
+        let mut changed_matrix = current.clone();
+        changed_matrix.payload.look_mode_matrix = None;
+        assert!(changed_matrix.validate_structure(&inventory).is_err());
+        let mut wrong_mode = current.clone();
+        wrong_mode.payload.receipts[0].mode_id = "wrong-mode".to_owned();
+        assert!(wrong_mode.validate_structure(&inventory).is_err());
+        let mut missing_target = current.clone();
+        missing_target.payload.execution_receipts.pop();
+        assert!(missing_target.validate_structure(&inventory).is_err());
+        let mut duplicate_target = current.clone();
+        duplicate_target
+            .payload
+            .execution_receipts
+            .push(duplicate_target.payload.execution_receipts[0].clone());
+        assert!(duplicate_target.validate_structure(&inventory).is_err());
+        let output =
+            std::env::temp_dir().join(format!("fre-unicode-v6-test-{}.json", std::process::id()));
+        crate::write_regex_automata_adapter_report(&output, &current, &inventory).unwrap();
+        assert!(
+            crate::write_regex_automata_adapter_report(&output, &changed_limitations, &inventory)
+                .is_err()
+        );
     }
 }
