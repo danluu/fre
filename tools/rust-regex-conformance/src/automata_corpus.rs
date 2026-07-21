@@ -8,11 +8,20 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::process::CommandExt,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::OnceLock,
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +31,17 @@ use crate::{InventoryError, sha256};
 /// Schema for the sealed inventory-only report.
 pub const REGEX_AUTOMATA_CORPUS_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.package-corpus-inventory.v1";
+
+/// Schema for an authenticated, no-clock execution of the four pinned
+/// `util::look` unit tests under every unit-harness feature mode.
+pub const REGEX_AUTOMATA_LOOK_MODE_MATRIX_SCHEMA: &str =
+    "fre.regex-automata-0.4.14.look-mode-matrix.v1";
+
+/// Seal of the ordered 30-mode unit-harness contract. The contract is the
+/// package-default unit mode, the VCS all-features unit mode and the 28 VCS
+/// lib feature modes derived from the authenticated upstream `test` script.
+pub const REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256: &str =
+    "f6104b9cafdfc8a0c787bc78028327d465a145ef3ad671b0f24ca6b9f0f94841";
 
 const UPSTREAM_REPOSITORY: &str = "https://github.com/rust-lang/regex";
 const UPSTREAM_PACKAGE: &str = "regex-automata";
@@ -57,6 +77,44 @@ const UNIQUE_DOCTEST_MEMBERS: usize = 461;
 const UNIQUE_MEMBERS: usize = 654;
 const FEATURE_SCRIPT_MODES: usize = 42;
 const SUPPLEMENTAL_DEFAULT_MODES: usize = 3;
+const LOOK_MODE_COUNT: usize = 30;
+const LOOK_TESTS_PER_MODE: usize = 4;
+const LOOK_TEST_MEMBERSHIPS: usize = LOOK_MODE_COUNT * LOOK_TESTS_PER_MODE;
+const LOOK_SOURCE_SHA256: &str = "fca6dac7bf7b3b975f177db91e122af89e1510b3664d04210ca8b84738a08305";
+const LOOK_SPAN_SHA256: &str = "7d4a1ac128aa3df29bab8bece1cd9481df88abfdb31ee7086668503f48eead84";
+const LOOK_TARGET_IDS_SHA256: &str =
+    "053675c6955c5ca165db98bf1a684105cbb59176b1893ab9b022a4d98fd16c9b";
+const LOOK_SOURCE_FIRST_LINE: usize = 1700;
+const LOOK_SOURCE_LAST_LINE: usize = 1767;
+const LOOK_SOURCE_FIRST_INDEX: usize = 1699;
+const MAX_LOOK_ARTIFACT_BYTES: u64 = 512 * 1_048_576;
+const LOOK_COMPILE_TIMEOUT: Duration = Duration::from_secs(900);
+const LOOK_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const LOOK_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const LOOK_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+const LOOK_SIGNAL_TIMEOUT: Duration = Duration::from_secs(1);
+const LOOK_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const LOOK_CHILD_POLL: Duration = Duration::from_millis(10);
+/// Maximum retained UTF-8 stdout or stderr bytes for one matrix command.
+pub(crate) const REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES: usize = 512 * 1024;
+/// Maximum compact or pretty serialized matrix size accepted by the validator.
+pub(crate) const REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES: usize = 24 * 1_048_576;
+const LOOK_FEATURE_GRAPH_SHA256: &str =
+    "40d5101080f340f1a8a91a2dcb6a4813bc92f0aaec8d1a6425ceeff7146e31d4";
+const LOOK_INVENTORY_RUSTC_HOST: &str = "x86_64-unknown-linux-gnu";
+#[cfg(target_os = "linux")]
+const LOOK_O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(target_os = "macos")]
+const LOOK_O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const LOOK_O_NOFOLLOW: i32 = 0;
+
+const LOOK_TEST_IDS: [&str; LOOK_TESTS_PER_MODE] = [
+    "util::look::tests::look_matches_end_line",
+    "util::look::tests::look_matches_end_text",
+    "util::look::tests::look_matches_start_line",
+    "util::look::tests::look_matches_start_text",
+];
 
 // These are parsed from the exact authenticated VCS `regex-automata/test`
 // script and then compared with this fixed semantic transcription. Keeping
@@ -243,6 +301,134 @@ pub struct RegexAutomataCorpusReport {
     pub schema: String,
     pub payload_sha256: String,
     pub payload: RegexAutomataCorpusReportPayload,
+}
+
+/// Exact toolchain and inventory authority for a look-mode matrix.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookModeHarnessIdentity {
+    pub inventory_payload_sha256: String,
+    pub inventory_obligation_sha256: String,
+    pub inventory_harness_sha256: String,
+    pub inventory_cargo_release: String,
+    pub inventory_cargo_executable_sha256: String,
+    pub inventory_rustc_release: String,
+    pub inventory_rustc_executable_sha256: String,
+    pub cargo_path: String,
+    pub cargo_release: String,
+    pub cargo_executable_sha256: String,
+    pub rustc_path: String,
+    pub rustc_release: String,
+    pub rustc_verbose: String,
+    pub rustc_verbose_sha256: String,
+    pub rustc_host: String,
+    pub rustc_executable_sha256: String,
+}
+
+/// Bounded UTF-8 evidence for one no-clock subprocess. Raw output is retained
+/// alongside its independently checked byte length and digest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookCommandEvidence {
+    pub argv: Vec<String>,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout_bytes: u64,
+    pub stdout_sha256: String,
+    pub stdout: String,
+    pub stderr_bytes: u64,
+    pub stderr_sha256: String,
+    pub stderr: String,
+}
+
+/// Outcome of compiling and directly executing one unit-harness mode.
+/// Unavailability is evidence, never a passing disposition.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "available and unavailable evidence remain directly inspectable in sealed JSON"
+)]
+pub enum RegexAutomataLookModeDisposition {
+    Available {
+        resolved_features: Vec<String>,
+        resolved_features_sha256: String,
+        compiled_artifact_path: String,
+        artifact_path: String,
+        artifact_bytes: u64,
+        artifact_sha256: String,
+        build: RegexAutomataLookCommandEvidence,
+        runs: Vec<RegexAutomataLookCommandEvidence>,
+        test_ids: Vec<String>,
+        test_ids_sha256: String,
+    },
+    Unavailable {
+        stage: String,
+        reason_code: String,
+        detail_sha256: String,
+        evidence_sha256: String,
+        attempted_argv: Vec<String>,
+        command: Option<RegexAutomataLookCommandEvidence>,
+    },
+}
+
+/// One exact mode tuple, its authenticated inventory membership seal and its
+/// observed compile/execution disposition.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookModeReceipt {
+    pub mode_id: String,
+    pub harness: RegexAutomataHarnessKind,
+    pub default_features: bool,
+    pub all_features: bool,
+    pub features: Vec<String>,
+    pub inventory_members: usize,
+    pub inventory_member_ids_sha256: String,
+    pub mode_tuple_sha256: String,
+    pub disposition: RegexAutomataLookModeDisposition,
+}
+
+/// Cardinalities distinguish executed memberships from unavailable modes.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookModeCounts {
+    pub modes: usize,
+    pub available_modes: usize,
+    pub unavailable_modes: usize,
+    pub tests_per_mode: usize,
+    pub available_test_memberships: usize,
+    pub total_test_memberships: usize,
+}
+
+/// Payload covered by `payload_sha256` in a look-mode matrix.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookModeMatrixPayload {
+    pub source: RegexAutomataSourceIdentity,
+    pub source_identity_sha256: String,
+    pub harness: RegexAutomataLookModeHarnessIdentity,
+    pub snapshot_package_path: String,
+    pub mode_target_root: String,
+    pub local_feature_graph: BTreeMap<String, Vec<String>>,
+    pub local_feature_graph_sha256: String,
+    pub mode_contract_sha256: String,
+    pub look_source_sha256: String,
+    pub look_source_first_line: usize,
+    pub look_source_last_line: usize,
+    pub look_span_sha256: String,
+    pub look_target_ids_sha256: String,
+    pub target_test_ids: Vec<String>,
+    pub receipts: Vec<RegexAutomataLookModeReceipt>,
+    pub counts: RegexAutomataLookModeCounts,
+}
+
+/// Sealed, no-clock look-mode execution matrix.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegexAutomataLookModeMatrix {
+    pub schema: String,
+    pub payload_sha256: String,
+    pub payload: RegexAutomataLookModeMatrixPayload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,6 +639,346 @@ pub fn write_regex_automata_corpus_report(
     result
 }
 
+/// Compile and directly execute the four authenticated `util::look` unit
+/// tests under all 30 unit-harness modes. A mode-local failure is preserved as
+/// `Unavailable`; it can never become a passing receipt.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated snapshot and tool identity transaction stays contiguous"
+)]
+pub fn build_regex_automata_look_mode_matrix(
+    crate_archive: &Path,
+    package: &Path,
+    vcs_checkout: &Path,
+    inventory: &RegexAutomataCorpusReport,
+    target_dir: &Path,
+) -> Result<RegexAutomataLookModeMatrix, InventoryError> {
+    inventory.validate()?;
+    authenticate_archive(crate_archive)?;
+    let vcs = authenticate_vcs(vcs_checkout)?;
+    let source = authenticate_package(package, vcs_checkout, true)?;
+    if source != inventory.payload.source {
+        return Err(InventoryError::new(
+            "look-mode source differs from authenticated corpus inventory",
+        ));
+    }
+    let parsed_features = parse_test_script_features(&vcs.script)?;
+    if parsed_features.0 != VCS_LIB_FEATURES || parsed_features.1 != VCS_INTEGRATION_FEATURES {
+        return Err(InventoryError::new(
+            "look-mode VCS feature transcription mismatch",
+        ));
+    }
+    let inventory_modes = look_inventory_modes(inventory)?;
+
+    let target_dir = prepare_target_dir(target_dir, &[crate_archive, package, vcs_checkout])?;
+    let snapshot_workspace = target_dir.join("upstream-snapshot");
+    create_private_directory(&snapshot_workspace)?;
+    let snapshot = snapshot_workspace.join("regex-automata");
+    create_private_directory(&snapshot)?;
+    snapshot_package(package, &snapshot, &source)?;
+    snapshot_vcs_support(&snapshot_workspace, vcs_checkout, &source)?;
+    seal_execution_snapshot(&snapshot_workspace)?;
+    validate_sealed_execution_snapshot(&snapshot_workspace, &source)?;
+    authenticate_snapshot_look_source(&snapshot)?;
+    reject_ancestor_cargo_configs(&snapshot)?;
+    let local_feature_graph = authenticated_local_feature_graph(&snapshot)?;
+
+    let cargo_home = resolve_cargo_home()?;
+    reject_cargo_home_configs(&cargo_home)?;
+    let cargo = canonical_tool("cargo")?;
+    let rustc = canonical_tool("rustc")?;
+    let cargo_release = sanitized_tool_release(&cargo, "cargo", false)?;
+    let rustc_release = sanitized_tool_release(&rustc, "rustc", false)?;
+    let rustc_verbose = sanitized_tool_release(&rustc, "rustc", true)?;
+    let rustc_host = parse_rustc_host(&rustc_verbose)?;
+    let cargo_executable_sha256 = hash_tool(&cargo, "cargo")?;
+    let rustc_executable_sha256 = hash_tool(&rustc, "rustc")?;
+    if cargo_release != inventory.payload.harness.cargo_release
+        || cargo_executable_sha256 != inventory.payload.harness.cargo_executable_sha256
+        || rustc_release != inventory.payload.harness.rustc_release
+        || rustc_executable_sha256 != inventory.payload.harness.rustc_executable_sha256
+        || rustc_host != LOOK_INVENTORY_RUSTC_HOST
+    {
+        return Err(InventoryError::new(
+            "look-mode toolchain differs from authenticated inventory harness",
+        ));
+    }
+    let harness = RegexAutomataLookModeHarnessIdentity {
+        inventory_payload_sha256: inventory.payload_sha256.clone(),
+        inventory_obligation_sha256: inventory
+            .payload
+            .harness
+            .obligation_inventory_sha256
+            .clone(),
+        inventory_harness_sha256: hash_json(
+            &inventory.payload.harness,
+            "encode inventory harness authority",
+        )?,
+        inventory_cargo_release: inventory.payload.harness.cargo_release.clone(),
+        inventory_cargo_executable_sha256: inventory
+            .payload
+            .harness
+            .cargo_executable_sha256
+            .clone(),
+        inventory_rustc_release: inventory.payload.harness.rustc_release.clone(),
+        inventory_rustc_executable_sha256: inventory
+            .payload
+            .harness
+            .rustc_executable_sha256
+            .clone(),
+        cargo_path: path_text(&cargo, "cargo")?,
+        cargo_release,
+        cargo_executable_sha256,
+        rustc_path: path_text(&rustc, "rustc")?,
+        rustc_release,
+        rustc_verbose_sha256: sha256(rustc_verbose.as_bytes()),
+        rustc_verbose,
+        rustc_host,
+        rustc_executable_sha256,
+    };
+
+    let mode_targets = target_dir.join("mode-targets");
+    create_private_directory(&mode_targets)?;
+    let specs = look_mode_specs();
+    let mut receipts = Vec::with_capacity(LOOK_MODE_COUNT);
+    for (spec, inventory_mode) in specs.iter().zip(&inventory_modes) {
+        validate_sealed_execution_snapshot(&snapshot_workspace, &source)?;
+        authenticate_snapshot_look_source(&snapshot)?;
+        let mode_target = mode_targets.join(&spec.id);
+        create_private_directory(&mode_target)?;
+        receipts.push(execute_look_mode(
+            &snapshot,
+            &mode_target,
+            &cargo_home,
+            &cargo,
+            &rustc,
+            spec,
+            inventory_mode,
+            &local_feature_graph,
+        )?);
+        validate_sealed_execution_snapshot(&snapshot_workspace, &source)?;
+        authenticate_snapshot_look_source(&snapshot)?;
+    }
+
+    authenticate_archive(crate_archive)?;
+    if authenticate_vcs(vcs_checkout)?.script != vcs.script
+        || authenticate_package(package, vcs_checkout, true)? != source
+        || validate_sealed_execution_snapshot(&snapshot_workspace, &source).is_err()
+        || sanitized_tool_release(&cargo, "cargo", false)? != harness.cargo_release
+        || sanitized_tool_release(&rustc, "rustc", false)? != harness.rustc_release
+        || sanitized_tool_release(&rustc, "rustc", true)? != harness.rustc_verbose
+        || hash_tool(&cargo, "cargo")? != harness.cargo_executable_sha256
+        || hash_tool(&rustc, "rustc")? != harness.rustc_executable_sha256
+    {
+        return Err(InventoryError::new(
+            "look-mode source, snapshot or tool identity changed during execution",
+        ));
+    }
+    reject_ancestor_cargo_configs(&snapshot)?;
+    reject_cargo_home_configs(&cargo_home)?;
+
+    let counts = look_mode_counts(&receipts)?;
+    let payload = RegexAutomataLookModeMatrixPayload {
+        source_identity_sha256: hash_json(&source, "encode look-mode source identity")?,
+        source,
+        harness,
+        snapshot_package_path: path_text(&snapshot, "look-mode snapshot package")?,
+        mode_target_root: path_text(&mode_targets, "look-mode target root")?,
+        local_feature_graph_sha256: hash_json(
+            &local_feature_graph,
+            "encode regex-automata local feature graph",
+        )?,
+        local_feature_graph,
+        mode_contract_sha256: REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256.to_owned(),
+        look_source_sha256: LOOK_SOURCE_SHA256.to_owned(),
+        look_source_first_line: LOOK_SOURCE_FIRST_LINE,
+        look_source_last_line: LOOK_SOURCE_LAST_LINE,
+        look_span_sha256: LOOK_SPAN_SHA256.to_owned(),
+        look_target_ids_sha256: LOOK_TARGET_IDS_SHA256.to_owned(),
+        target_test_ids: look_test_ids(),
+        receipts,
+        counts,
+    };
+    let payload_sha256 = hash_json(&payload, "encode look-mode matrix payload")?;
+    let matrix = RegexAutomataLookModeMatrix {
+        schema: REGEX_AUTOMATA_LOOK_MODE_MATRIX_SCHEMA.to_owned(),
+        payload_sha256,
+        payload,
+    };
+    matrix.validate()?;
+    Ok(matrix)
+}
+
+/// Read and fully validate one sealed look-mode matrix.
+pub fn read_regex_automata_look_mode_matrix(
+    path: &Path,
+) -> Result<RegexAutomataLookModeMatrix, InventoryError> {
+    let bytes = read_sealed_look_mode_matrix(path)?;
+    let matrix: RegexAutomataLookModeMatrix = serde_json::from_slice(&bytes).map_err(|error| {
+        InventoryError::new(format!(
+            "decode regex-automata look-mode matrix {}: {error}",
+            path.display()
+        ))
+    })?;
+    matrix.validate()?;
+    Ok(matrix)
+}
+
+fn read_sealed_look_mode_matrix(path: &Path) -> Result<Vec<u8>, InventoryError> {
+    read_sealed_look_mode_matrix_with_limit(path, REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES)
+}
+
+fn read_sealed_look_mode_matrix_with_limit(
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<u8>, InventoryError> {
+    if LOOK_O_NOFOLLOW == 0 {
+        return Err(InventoryError::new(
+            "look-mode matrix O_NOFOLLOW is unavailable on this platform",
+        ));
+    }
+    if maximum == 0 {
+        return Err(InventoryError::new("look-mode matrix read bound is zero"));
+    }
+    let maximum_u64 = u64::try_from(maximum)
+        .map_err(|_| InventoryError::new("look-mode matrix maximum does not fit u64"))?;
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        InventoryError::new(format!("stat look-mode matrix {}: {error}", path.display()))
+    })?;
+    if before.file_type().is_symlink()
+        || !before.file_type().is_file()
+        || before.uid() != unsafe_free_euid()
+        || before.nlink() != 1
+        || before.permissions().mode() & 0o7777 != 0o400
+        || before.len() == 0
+        || before.len() > maximum_u64
+    {
+        return Err(InventoryError::new("invalid look-mode matrix metadata"));
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(LOOK_O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| InventoryError::new(format!("open look-mode matrix: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat look-mode matrix: {error}")))?;
+    if opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || opened.uid() != before.uid()
+        || opened.nlink() != before.nlink()
+        || opened.permissions().mode() != before.permissions().mode()
+        || opened.len() != before.len()
+    {
+        return Err(InventoryError::new(
+            "look-mode matrix changed between lstat and open",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .map_err(|_| InventoryError::new("look-mode matrix length does not fit usize"))?,
+    );
+    std::io::Read::by_ref(&mut file)
+        .take(maximum_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| InventoryError::new(format!("read look-mode matrix: {error}")))?;
+    let after = file.metadata().map_err(|error| {
+        InventoryError::new(format!("fstat look-mode matrix after read: {error}"))
+    })?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.uid() != opened.uid()
+        || after.nlink() != opened.nlink()
+        || after.permissions().mode() != opened.permissions().mode()
+        || after.len() != opened.len()
+        || u64::try_from(bytes.len()) != Ok(opened.len())
+        || bytes.len() > maximum
+    {
+        return Err(InventoryError::new(
+            "look-mode matrix changed while being read",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Install canonical pretty JSON without replacing existing evidence.
+pub fn write_regex_automata_look_mode_matrix(
+    path: &Path,
+    matrix: &RegexAutomataLookModeMatrix,
+) -> Result<(), InventoryError> {
+    matrix.validate()?;
+    write_new_pretty_json(path, matrix, "regex-automata look-mode matrix")
+}
+
+fn write_new_pretty_json(
+    path: &Path,
+    value: &impl Serialize,
+    label: &str,
+) -> Result<(), InventoryError> {
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(InventoryError::new(format!(
+            "{label} output already exists: {}",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| InventoryError::new(format!("{label} output has no parent")))?;
+    require_real_directory(parent, "look-mode output parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_control()))
+        .ok_or_else(|| InventoryError::new(format!("invalid {label} output name")))?;
+    let temporary = parent.join(format!(".{name}.tmp.{}", std::process::id()));
+    let mut output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| InventoryError::new(format!("create {}: {error}", temporary.display())))?;
+    let bytes =
+        encode_bounded_pretty_json(value, REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES, label)?;
+    let result = (|| {
+        output.write_all(&bytes).map_err(|error| {
+            InventoryError::new(format!("write {}: {error}", temporary.display()))
+        })?;
+        output.sync_all().map_err(|error| {
+            InventoryError::new(format!("sync {}: {error}", temporary.display()))
+        })?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o400)).map_err(|error| {
+            InventoryError::new(format!("seal {}: {error}", temporary.display()))
+        })?;
+        fs::hard_link(&temporary, path)
+            .map_err(|error| InventoryError::new(format!("install {}: {error}", path.display())))?;
+        fs::remove_file(&temporary).map_err(|error| {
+            InventoryError::new(format!("remove {}: {error}", temporary.display()))
+        })?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| InventoryError::new(format!("sync output parent: {error}")))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn encode_bounded_pretty_json(
+    value: &impl Serialize,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<u8>, InventoryError> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| InventoryError::new(format!("encode {label}: {error}")))?;
+    bytes.push(b'\n');
+    if bytes.len() > maximum {
+        return Err(InventoryError::new(format!(
+            "encoded {label} exceeds the sealed read bound"
+        )));
+    }
+    Ok(bytes)
+}
+
 impl RegexAutomataCorpusReport {
     /// Validate the exact source identity, mode denominator, zero-pass
     /// contract, ordering, cardinalities and payload seal.
@@ -556,6 +1082,395 @@ impl RegexAutomataCorpusReport {
         }
         Ok(())
     }
+}
+
+impl RegexAutomataLookModeMatrix {
+    /// Validate the source/tool authority, exact 30-row contract, every
+    /// command receipt and the distinction between available and unavailable
+    /// modes. This validation never interprets an unavailable mode as pass.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete sealed evidence contract is intentionally reviewed together"
+    )]
+    pub fn validate(&self) -> Result<(), InventoryError> {
+        if self.schema != REGEX_AUTOMATA_LOOK_MODE_MATRIX_SCHEMA
+            || self.payload_sha256 != hash_json(&self.payload, "encode look-mode matrix payload")?
+            || serde_json::to_vec(self)
+                .map_err(|error| InventoryError::new(format!("encode look-mode matrix: {error}")))?
+                .len()
+                > REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES
+            || serde_json::to_vec_pretty(self)
+                .map_err(|error| {
+                    InventoryError::new(format!("pretty-encode look-mode matrix: {error}"))
+                })?
+                .len()
+                .checked_add(1)
+                .is_none_or(|bytes| bytes > REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES)
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode schema or payload seal mismatch",
+            ));
+        }
+        validate_source(&self.payload.source)?;
+        let snapshot_path = Path::new(&self.payload.snapshot_package_path);
+        let mode_target_path = Path::new(&self.payload.mode_target_root);
+        let execution_root = snapshot_path.parent().and_then(Path::parent);
+        if self.payload.source_identity_sha256
+            != hash_json(&self.payload.source, "encode look-mode source identity")?
+            || self.payload.mode_contract_sha256 != REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256
+            || self.payload.look_source_sha256 != LOOK_SOURCE_SHA256
+            || self.payload.look_source_first_line != LOOK_SOURCE_FIRST_LINE
+            || self.payload.look_source_last_line != LOOK_SOURCE_LAST_LINE
+            || self.payload.look_span_sha256 != LOOK_SPAN_SHA256
+            || self.payload.look_target_ids_sha256 != LOOK_TARGET_IDS_SHA256
+            || self.payload.target_test_ids != look_test_ids()
+            || !safe_absolute_path_text(&self.payload.snapshot_package_path)
+            || !safe_absolute_path_text(&self.payload.mode_target_root)
+            || snapshot_path.file_name().and_then(|name| name.to_str()) != Some("regex-automata")
+            || snapshot_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                != Some("upstream-snapshot")
+            || mode_target_path.file_name().and_then(|name| name.to_str()) != Some("mode-targets")
+            || mode_target_path.parent() != execution_root
+            || self.payload.local_feature_graph_sha256 != LOOK_FEATURE_GRAPH_SHA256
+            || hash_json(
+                &self.payload.local_feature_graph,
+                "encode regex-automata local feature graph",
+            )? != LOOK_FEATURE_GRAPH_SHA256
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode source or target authority mismatch",
+            ));
+        }
+        validate_look_harness(&self.payload.harness)?;
+        let specs = look_mode_specs();
+        if self.payload.receipts.len() != LOOK_MODE_COUNT
+            || self.payload.receipts.len() != specs.len()
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode receipt denominator mismatch",
+            ));
+        }
+        for (receipt, spec) in self.payload.receipts.iter().zip(&specs) {
+            validate_look_mode_receipt(
+                receipt,
+                spec,
+                &self.payload.harness,
+                &self.payload.snapshot_package_path,
+                &self.payload.mode_target_root,
+                &self.payload.local_feature_graph,
+            )?;
+        }
+        if look_mode_contract_hash(&self.payload.receipts)
+            != REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256
+            || self.payload.counts != look_mode_counts(&self.payload.receipts)?
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode contract or counts mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_look_harness(
+    harness: &RegexAutomataLookModeHarnessIdentity,
+) -> Result<(), InventoryError> {
+    let inventory_harness = RegexAutomataHarnessIdentity {
+        cargo_release: harness.inventory_cargo_release.clone(),
+        cargo_executable_sha256: harness.inventory_cargo_executable_sha256.clone(),
+        rustc_release: harness.inventory_rustc_release.clone(),
+        rustc_executable_sha256: harness.inventory_rustc_executable_sha256.clone(),
+        feature_script_modes: FEATURE_SCRIPT_MODES,
+        supplemental_default_modes: SUPPLEMENTAL_DEFAULT_MODES,
+        obligation_inventory_sha256: harness.inventory_obligation_sha256.clone(),
+    };
+    if !is_sha256(&harness.inventory_payload_sha256)
+        || harness.inventory_obligation_sha256 != OBLIGATION_INVENTORY_SHA256
+        || !is_sha256(&harness.inventory_harness_sha256)
+        || hash_json(&inventory_harness, "encode inventory harness authority")?
+            != harness.inventory_harness_sha256
+        || !is_sha256(&harness.inventory_cargo_executable_sha256)
+        || !is_sha256(&harness.inventory_rustc_executable_sha256)
+        || !is_sha256(&harness.cargo_executable_sha256)
+        || !is_sha256(&harness.rustc_verbose_sha256)
+        || !is_sha256(&harness.rustc_executable_sha256)
+        || sha256(harness.rustc_verbose.as_bytes()) != harness.rustc_verbose_sha256
+        || parse_rustc_host(&harness.rustc_verbose)? != harness.rustc_host
+        || harness.cargo_release.is_empty()
+        || harness.rustc_release.is_empty()
+        || harness.inventory_cargo_release != harness.cargo_release
+        || harness.inventory_cargo_executable_sha256 != harness.cargo_executable_sha256
+        || harness.inventory_rustc_release != harness.rustc_release
+        || harness.inventory_rustc_executable_sha256 != harness.rustc_executable_sha256
+        || harness.rustc_host != LOOK_INVENTORY_RUSTC_HOST
+        || harness
+            .rustc_verbose
+            .lines()
+            .next()
+            .is_none_or(|line| line.trim() != harness.rustc_release)
+        || !safe_absolute_path_text(&harness.cargo_path)
+        || !safe_absolute_path_text(&harness.rustc_path)
+    {
+        return Err(InventoryError::new(
+            "regex-automata look-mode harness identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_look_mode_receipt(
+    receipt: &RegexAutomataLookModeReceipt,
+    spec: &ModeSpec,
+    harness: &RegexAutomataLookModeHarnessIdentity,
+    snapshot_package_path: &str,
+    mode_target_root: &str,
+    feature_graph: &BTreeMap<String, Vec<String>>,
+) -> Result<(), InventoryError> {
+    if receipt.mode_id != spec.id
+        || receipt.harness != RegexAutomataHarnessKind::Unit
+        || receipt.harness != spec.harness
+        || receipt.default_features != spec.default_features
+        || receipt.all_features != spec.all_features
+        || receipt.features != spec.features
+        || receipt.inventory_members == 0
+        || !is_sha256(&receipt.inventory_member_ids_sha256)
+        || receipt.mode_tuple_sha256 != sha256(look_mode_contract_line(receipt).as_bytes())
+    {
+        return Err(InventoryError::new(
+            "regex-automata look-mode tuple mismatch",
+        ));
+    }
+    match &receipt.disposition {
+        RegexAutomataLookModeDisposition::Available { .. } => {
+            validate_available_look_mode_receipt(
+                &receipt.disposition,
+                spec,
+                harness,
+                snapshot_package_path,
+                mode_target_root,
+                feature_graph,
+                receipt.inventory_members,
+            )?;
+        }
+        RegexAutomataLookModeDisposition::Unavailable { .. } => {
+            validate_unavailable_look_mode_receipt(
+                &receipt.disposition,
+                spec,
+                harness,
+                mode_target_root,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_available_look_mode_receipt(
+    disposition: &RegexAutomataLookModeDisposition,
+    spec: &ModeSpec,
+    harness: &RegexAutomataLookModeHarnessIdentity,
+    snapshot_package_path: &str,
+    mode_target_root: &str,
+    feature_graph: &BTreeMap<String, Vec<String>>,
+    inventory_members: usize,
+) -> Result<(), InventoryError> {
+    let RegexAutomataLookModeDisposition::Available {
+        resolved_features,
+        resolved_features_sha256,
+        compiled_artifact_path,
+        artifact_path,
+        artifact_bytes,
+        artifact_sha256,
+        build,
+        runs,
+        test_ids,
+        test_ids_sha256,
+    } = disposition
+    else {
+        return Err(InventoryError::new(
+            "expected available regex-automata look-mode receipt",
+        ));
+    };
+    let expected_features = expected_local_feature_closure(spec, feature_graph)?;
+    let stable_artifact = Path::new(mode_target_root)
+        .join(&spec.id)
+        .join("authenticated-look-test");
+    let exact_mode_target = Path::new(mode_target_root).join(&spec.id);
+    if resolved_features != &expected_features
+        || resolved_features_sha256 != &hash_line_list(&expected_features.into_iter().collect())
+        || resolved_features.iter().any(|feature| !safe_atom(feature))
+        || !safe_absolute_path_text(compiled_artifact_path)
+        || !Path::new(compiled_artifact_path).starts_with(&exact_mode_target)
+        || !safe_absolute_path_text(artifact_path)
+        || Path::new(artifact_path) != stable_artifact
+        || *artifact_bytes == 0
+        || *artifact_bytes > MAX_LOOK_ARTIFACT_BYTES
+        || !is_sha256(artifact_sha256)
+        || !build.success
+        || build.argv != expected_look_compile_argv(&harness.cargo_path, spec)
+        || runs.len() != LOOK_TESTS_PER_MODE
+        || test_ids != &look_test_ids()
+        || test_ids_sha256 != &look_test_ids_hash()
+    {
+        return Err(InventoryError::new(
+            "regex-automata available look-mode evidence mismatch",
+        ));
+    }
+    validate_command_evidence(build)?;
+    let parsed = parse_look_compiler_artifact_evidence(&build.stdout, snapshot_package_path)?;
+    if parsed.0.as_slice() != resolved_features.as_slice()
+        || parsed.1.as_str() != compiled_artifact_path
+    {
+        return Err(InventoryError::new(
+            "regex-automata look-mode compiler evidence changed",
+        ));
+    }
+    for (run, test_id) in runs.iter().zip(LOOK_TEST_IDS) {
+        validate_command_evidence(run)?;
+        let filtered = inventory_members
+            .checked_sub(1)
+            .ok_or_else(|| InventoryError::new("look-mode member count underflow"))?;
+        if !run.success
+            || run.argv != expected_look_run_argv(artifact_path, test_id)
+            || parse_single_look_test_run(&run.stdout, test_id, filtered).is_err()
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode run evidence changed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unavailable_look_mode_receipt(
+    disposition: &RegexAutomataLookModeDisposition,
+    spec: &ModeSpec,
+    harness: &RegexAutomataLookModeHarnessIdentity,
+    mode_target_root: &str,
+) -> Result<(), InventoryError> {
+    let RegexAutomataLookModeDisposition::Unavailable {
+        stage,
+        reason_code,
+        detail_sha256,
+        evidence_sha256,
+        attempted_argv,
+        command,
+    } = disposition
+    else {
+        return Err(InventoryError::new(
+            "expected unavailable regex-automata look-mode receipt",
+        ));
+    };
+    let valid_stage_reason = matches!(
+        (stage.as_str(), reason_code.as_str()),
+        (
+            "compile-spawn" | "execute-spawn",
+            "look-mode-tool-unavailable"
+        ) | ("compile-exit", "look-mode-compile-failed")
+            | (
+                "compile-output",
+                "look-mode-build-evidence-invalid" | "look-mode-compile-output-overflow"
+            )
+            | ("compile-timeout", "look-mode-compile-timeout")
+            | ("artifact-authentication", "look-mode-artifact-invalid")
+            | ("execute-exit", "look-mode-execution-failed")
+            | (
+                "execute-output",
+                "look-mode-test-evidence-invalid" | "look-mode-execution-output-overflow"
+            )
+            | ("execute-timeout", "look-mode-execution-timeout")
+            | ("artifact-drift", "look-mode-artifact-changed")
+    );
+    if !valid_stage_reason
+        || !is_sha256(detail_sha256)
+        || !is_sha256(evidence_sha256)
+        || attempted_argv.is_empty()
+    {
+        return Err(InventoryError::new(
+            "regex-automata unavailable look-mode evidence mismatch",
+        ));
+    }
+    let compile_stage = stage.starts_with("compile") || stage == "artifact-authentication";
+    let expected_compile = expected_look_compile_argv(&harness.cargo_path, spec);
+    let expected_run = LOOK_TEST_IDS
+        .iter()
+        .map(|test_id| {
+            expected_look_run_argv(
+                &Path::new(mode_target_root)
+                    .join(&spec.id)
+                    .join("authenticated-look-test")
+                    .to_string_lossy(),
+                test_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    if (compile_stage && attempted_argv != &expected_compile)
+        || (!compile_stage && !expected_run.contains(attempted_argv))
+        || evidence_sha256
+            != &unavailable_evidence_hash(
+                &spec.id,
+                stage,
+                reason_code,
+                detail_sha256,
+                attempted_argv,
+                command.as_ref(),
+            )?
+    {
+        return Err(InventoryError::new(
+            "regex-automata unavailable stage command mismatch",
+        ));
+    }
+    if let Some(command) = command {
+        validate_command_evidence(command)?;
+        if command.argv.as_slice() != attempted_argv.as_slice() {
+            return Err(InventoryError::new(
+                "regex-automata unavailable command/attempt mismatch",
+            ));
+        }
+        let expected_success = !stage.ends_with("exit");
+        if command.success != expected_success {
+            return Err(InventoryError::new(
+                "regex-automata unavailable command status/stage mismatch",
+            ));
+        }
+    } else if !stage.ends_with("spawn")
+        && !stage.ends_with("output")
+        && !stage.ends_with("timeout")
+        && stage != "artifact-drift"
+    {
+        return Err(InventoryError::new(
+            "regex-automata unavailable evidence omitted executed command",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_command_evidence(
+    evidence: &RegexAutomataLookCommandEvidence,
+) -> Result<(), InventoryError> {
+    if evidence.argv.is_empty()
+        || !safe_absolute_path_text(&evidence.argv[0])
+        || evidence
+            .argv
+            .iter()
+            .any(|value| value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()))
+        || !is_sha256(&evidence.stdout_sha256)
+        || !is_sha256(&evidence.stderr_sha256)
+        || evidence.stdout_bytes != u64::try_from(evidence.stdout.len()).unwrap_or(u64::MAX)
+        || evidence.stderr_bytes != u64::try_from(evidence.stderr.len()).unwrap_or(u64::MAX)
+        || evidence.stdout.len() > REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES
+        || evidence.stderr.len() > REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES
+        || sha256(evidence.stdout.as_bytes()) != evidence.stdout_sha256
+        || sha256(evidence.stderr.as_bytes()) != evidence.stderr_sha256
+        || evidence.success != (evidence.exit_code == Some(0))
+    {
+        return Err(InventoryError::new(
+            "regex-automata look-mode command evidence mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn authenticate_archive(crate_archive: &Path) -> Result<(), InventoryError> {
@@ -1095,7 +2010,7 @@ fn validate_execution_snapshot(
         let (expected_bytes, expected_sha256) = expected
             .get(&path)
             .ok_or_else(|| InventoryError::new("unexpected execution snapshot path"))?;
-        let bytes = read_owned_regular_file(&workspace.join(&path), MAX_PACKAGE_FILE_BYTES)?;
+        let bytes = read_snapshot_regular_file(&workspace.join(&path), MAX_PACKAGE_FILE_BYTES)?;
         if u64::try_from(bytes.len()) != Ok(*expected_bytes) || sha256(&bytes) != *expected_sha256 {
             return Err(InventoryError::new(format!(
                 "execution snapshot byte mismatch: {path}"
@@ -1103,6 +2018,265 @@ fn validate_execution_snapshot(
         }
     }
     Ok(())
+}
+
+fn seal_execution_snapshot(workspace: &Path) -> Result<(), InventoryError> {
+    seal_snapshot_node(workspace)
+}
+
+fn seal_snapshot_node(path: &Path) -> Result<(), InventoryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| InventoryError::new(format!("stat snapshot node: {error}")))?;
+    if metadata.file_type().is_symlink() || metadata.uid() != unsafe_free_euid() {
+        return Err(InventoryError::new("snapshot node ownership/type mismatch"));
+    }
+    if metadata.file_type().is_file() {
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o7777 != 0o644 {
+            return Err(InventoryError::new(
+                "snapshot file is not an unshared writable staging file",
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+            .map_err(|error| InventoryError::new(format!("seal snapshot file: {error}")))?;
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(InventoryError::new("snapshot contains a non-file node"));
+    }
+    let mut children = fs::read_dir(path)
+        .map_err(|error| InventoryError::new(format!("read snapshot directory: {error}")))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| InventoryError::new(format!("read snapshot entry: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    children.sort();
+    for child in children {
+        seal_snapshot_node(&child)?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+        .map_err(|error| InventoryError::new(format!("seal snapshot directory: {error}")))
+}
+
+fn validate_sealed_execution_snapshot(
+    workspace: &Path,
+    source: &RegexAutomataSourceIdentity,
+) -> Result<(), InventoryError> {
+    validate_execution_snapshot(workspace, source)?;
+    validate_sealed_snapshot_node(workspace)
+}
+
+fn validate_sealed_snapshot_node(path: &Path) -> Result<(), InventoryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| InventoryError::new(format!("stat sealed snapshot node: {error}")))?;
+    if metadata.file_type().is_symlink() || metadata.uid() != unsafe_free_euid() {
+        return Err(InventoryError::new(
+            "sealed snapshot node ownership/type mismatch",
+        ));
+    }
+    if metadata.file_type().is_file() {
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o7777 != 0o400 {
+            return Err(InventoryError::new("sealed snapshot file mode mismatch"));
+        }
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o7777 != 0o500 {
+        return Err(InventoryError::new(
+            "sealed snapshot directory mode mismatch",
+        ));
+    }
+    let mut children = fs::read_dir(path)
+        .map_err(|error| InventoryError::new(format!("read sealed snapshot directory: {error}")))?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| {
+                InventoryError::new(format!("read sealed snapshot entry: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    children.sort();
+    for child in children {
+        validate_sealed_snapshot_node(&child)?;
+    }
+    Ok(())
+}
+
+fn read_snapshot_regular_file(path: &Path, maximum: u64) -> Result<Vec<u8>, InventoryError> {
+    if LOOK_O_NOFOLLOW == 0 {
+        return Err(InventoryError::new(
+            "snapshot O_NOFOLLOW is unavailable on this platform",
+        ));
+    }
+    let before = fs::symlink_metadata(path).map_err(|error| {
+        InventoryError::new(format!("stat snapshot file {}: {error}", path.display()))
+    })?;
+    let mode = before.permissions().mode() & 0o7777;
+    if before.file_type().is_symlink()
+        || !before.file_type().is_file()
+        || before.uid() != unsafe_free_euid()
+        || before.nlink() != 1
+        || !matches!(mode, 0o400 | 0o644)
+        || before.len() > maximum
+    {
+        return Err(InventoryError::new(format!(
+            "invalid snapshot file metadata: {}",
+            path.display()
+        )));
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(LOOK_O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| InventoryError::new(format!("open snapshot file: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat snapshot file: {error}")))?;
+    if opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || opened.uid() != before.uid()
+        || opened.nlink() != before.nlink()
+        || opened.permissions().mode() != before.permissions().mode()
+        || opened.len() != before.len()
+    {
+        return Err(InventoryError::new(
+            "snapshot file changed between lstat and open",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .map_err(|_| InventoryError::new("snapshot file length does not fit usize"))?,
+    );
+    std::io::Read::by_ref(&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| InventoryError::new(format!("read snapshot file: {error}")))?;
+    let after = file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat snapshot file after read: {error}")))?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.uid() != opened.uid()
+        || after.nlink() != opened.nlink()
+        || after.permissions().mode() != opened.permissions().mode()
+        || after.len() != opened.len()
+        || u64::try_from(bytes.len()) != Ok(opened.len())
+        || u64::try_from(bytes.len()).is_ok_and(|length| length > maximum)
+    {
+        return Err(InventoryError::new(
+            "snapshot file changed while being read",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn authenticate_snapshot_look_source(package: &Path) -> Result<(), InventoryError> {
+    let bytes =
+        read_snapshot_regular_file(&package.join("src/util/look.rs"), MAX_PACKAGE_FILE_BYTES)?;
+    if sha256(&bytes) != LOOK_SOURCE_SHA256 {
+        return Err(InventoryError::new("snapshot look.rs SHA-256 mismatch"));
+    }
+    let lines = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    let span = lines
+        .get(LOOK_SOURCE_FIRST_INDEX..LOOK_SOURCE_LAST_LINE)
+        .ok_or_else(|| InventoryError::new("snapshot look.rs line span is absent"))?;
+    let span = span
+        .iter()
+        .flat_map(|line| line.iter().copied())
+        .collect::<Vec<_>>();
+    if span.len() != 1_955 || sha256(&span) != LOOK_SPAN_SHA256 {
+        return Err(InventoryError::new(
+            "snapshot look.rs authenticated line span mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_local_feature_graph(
+    package: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, InventoryError> {
+    let bytes = read_snapshot_regular_file(&package.join("Cargo.toml"), MAX_PACKAGE_FILE_BYTES)?;
+    let manifest: toml::Value = std::str::from_utf8(&bytes)
+        .map_err(|error| InventoryError::new(format!("Cargo.toml is not UTF-8: {error}")))?
+        .parse()
+        .map_err(|error| InventoryError::new(format!("parse Cargo.toml: {error}")))?;
+    if manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        != Some(UPSTREAM_PACKAGE)
+        || manifest
+            .get("package")
+            .and_then(|package| package.get("version"))
+            .and_then(toml::Value::as_str)
+            != Some(UPSTREAM_VERSION)
+    {
+        return Err(InventoryError::new("Cargo.toml package identity mismatch"));
+    }
+    let table = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| InventoryError::new("Cargo.toml feature graph is absent"))?;
+    let mut graph = BTreeMap::new();
+    for (feature, edges) in table {
+        if !safe_atom(feature) {
+            return Err(InventoryError::new("Cargo.toml feature name is invalid"));
+        }
+        let edges = edges
+            .as_array()
+            .ok_or_else(|| InventoryError::new("Cargo.toml feature edges are not an array"))?
+            .iter()
+            .map(|edge| {
+                edge.as_str()
+                    .filter(|edge| {
+                        !edge.is_empty() && !edge.bytes().any(|byte| byte.is_ascii_control())
+                    })
+                    .map(str::to_owned)
+                    .ok_or_else(|| InventoryError::new("Cargo.toml feature edge is invalid"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if graph.insert(feature.clone(), edges).is_some() {
+            return Err(InventoryError::new("duplicate Cargo.toml feature"));
+        }
+    }
+    if hash_json(&graph, "encode regex-automata local feature graph")? != LOOK_FEATURE_GRAPH_SHA256
+    {
+        return Err(InventoryError::new(
+            "Cargo.toml local feature graph seal mismatch",
+        ));
+    }
+    Ok(graph)
+}
+
+fn expected_local_feature_closure(
+    spec: &ModeSpec,
+    graph: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<String>, InventoryError> {
+    let mut pending = if spec.all_features {
+        graph.keys().cloned().collect::<Vec<_>>()
+    } else {
+        let mut pending = spec.features.clone();
+        if spec.default_features {
+            pending.push("default".to_owned());
+        }
+        pending
+    };
+    let mut enabled = BTreeSet::new();
+    while let Some(feature) = pending.pop() {
+        if !enabled.insert(feature.clone()) {
+            continue;
+        }
+        let edges = graph
+            .get(&feature)
+            .ok_or_else(|| InventoryError::new("requested local Cargo feature is absent"))?;
+        for edge in edges {
+            if graph.contains_key(edge) {
+                pending.push(edge.clone());
+            }
+        }
+    }
+    Ok(enabled.into_iter().collect())
 }
 
 fn mode_specs() -> Vec<ModeSpec> {
@@ -1152,6 +2326,107 @@ fn mode_specs() -> Vec<ModeSpec> {
         });
     }
     specs
+}
+
+fn look_mode_specs() -> Vec<ModeSpec> {
+    mode_specs()
+        .into_iter()
+        .filter(|spec| spec.harness == RegexAutomataHarnessKind::Unit)
+        .collect()
+}
+
+fn look_inventory_modes(
+    inventory: &RegexAutomataCorpusReport,
+) -> Result<Vec<RegexAutomataFeatureMode>, InventoryError> {
+    let specs = look_mode_specs();
+    let mut modes = Vec::with_capacity(LOOK_MODE_COUNT);
+    for spec in &specs {
+        let mode = inventory
+            .payload
+            .modes
+            .iter()
+            .find(|mode| mode.id == spec.id)
+            .ok_or_else(|| InventoryError::new("look mode absent from corpus inventory"))?;
+        if mode.harness != RegexAutomataHarnessKind::Unit
+            || mode.default_features != spec.default_features
+            || mode.all_features != spec.all_features
+            || mode.features != spec.features
+        {
+            return Err(InventoryError::new(
+                "look mode differs from corpus inventory",
+            ));
+        }
+        let obligations = inventory
+            .payload
+            .obligations
+            .iter()
+            .filter(|row| row.mode_id == mode.id && row.harness == RegexAutomataHarnessKind::Unit)
+            .map(|row| row.case_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if LOOK_TEST_IDS.iter().any(|id| !obligations.contains(*id)) {
+            return Err(InventoryError::new(
+                "look target absent from authenticated mode membership",
+            ));
+        }
+        modes.push(mode.clone());
+    }
+    let provisional = specs
+        .iter()
+        .zip(&modes)
+        .map(|(spec, mode)| RegexAutomataLookModeReceipt {
+            mode_id: spec.id.clone(),
+            harness: spec.harness,
+            default_features: spec.default_features,
+            all_features: spec.all_features,
+            features: spec.features.clone(),
+            inventory_members: mode.members,
+            inventory_member_ids_sha256: mode.member_ids_sha256.clone(),
+            mode_tuple_sha256: String::new(),
+            disposition: RegexAutomataLookModeDisposition::Unavailable {
+                stage: "compile-spawn".to_owned(),
+                reason_code: "look-mode-tool-unavailable".to_owned(),
+                detail_sha256: sha256(b"contract-only"),
+                evidence_sha256: sha256(b"contract-only"),
+                attempted_argv: Vec::new(),
+                command: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    if look_mode_contract_hash(&provisional) != REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256 {
+        return Err(InventoryError::new(
+            "authenticated look-mode contract hash mismatch",
+        ));
+    }
+    Ok(modes)
+}
+
+fn look_mode_contract_line(receipt: &RegexAutomataLookModeReceipt) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        receipt.mode_id,
+        harness_slug(receipt.harness),
+        receipt.default_features,
+        receipt.all_features,
+        receipt.features.join(","),
+        receipt.inventory_members,
+        receipt.inventory_member_ids_sha256,
+    )
+}
+
+fn look_mode_contract_hash(receipts: &[RegexAutomataLookModeReceipt]) -> String {
+    let mut bytes = Vec::new();
+    for receipt in receipts {
+        bytes.extend_from_slice(look_mode_contract_line(receipt).as_bytes());
+    }
+    sha256(&bytes)
+}
+
+fn look_test_ids() -> Vec<String> {
+    LOOK_TEST_IDS.iter().map(|id| (*id).to_owned()).collect()
+}
+
+fn look_test_ids_hash() -> String {
+    hash_line_list(&LOOK_TEST_IDS.iter().map(|id| (*id).to_owned()).collect())
 }
 
 fn split_features(features: &str) -> Vec<String> {
@@ -1258,6 +2533,780 @@ fn list_mode_members(
     parse_test_list(stdout)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "all authenticated inputs and the fail-closed mode transaction stay adjacent"
+)]
+fn execute_look_mode(
+    package: &Path,
+    target: &Path,
+    cargo_home: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    spec: &ModeSpec,
+    inventory_mode: &RegexAutomataFeatureMode,
+    feature_graph: &BTreeMap<String, Vec<String>>,
+) -> Result<RegexAutomataLookModeReceipt, InventoryError> {
+    let compile_command = expected_look_compile_argv(&path_text(cargo, "cargo")?, spec);
+    let compile_cli_args = compile_command
+        .get(1..)
+        .ok_or_else(|| InventoryError::new("look-mode compile argv is empty"))?;
+    let compile =
+        match sanitized_cargo_output(package, target, cargo_home, cargo, rustc, compile_cli_args) {
+            Ok(output) => output,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Err(InventoryError::new(format!(
+                        "look-mode compile cleanup did not reach quiescence: {error}"
+                    )));
+                }
+                let (stage, reason_code) = match error.kind() {
+                    std::io::ErrorKind::TimedOut => {
+                        ("compile-timeout", "look-mode-compile-timeout")
+                    }
+                    std::io::ErrorKind::InvalidData => {
+                        ("compile-output", "look-mode-compile-output-overflow")
+                    }
+                    _ => ("compile-spawn", "look-mode-tool-unavailable"),
+                };
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    stage,
+                    reason_code,
+                    &error.to_string(),
+                    compile_command,
+                    None,
+                );
+            }
+        };
+    let compile_evidence = match command_evidence_record(compile_command.clone(), &compile) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return unavailable_look_mode_receipt(
+                spec,
+                inventory_mode,
+                "compile-output",
+                "look-mode-build-evidence-invalid",
+                &format!(
+                    "{}; raw_evidence_sha256={}",
+                    error,
+                    command_evidence(&compile)
+                ),
+                compile_command,
+                None,
+            );
+        }
+    };
+    if !compile.status.success() {
+        return unavailable_look_mode_receipt(
+            spec,
+            inventory_mode,
+            "compile-exit",
+            "look-mode-compile-failed",
+            "cargo test --no-run returned nonzero",
+            compile_command,
+            Some(compile_evidence),
+        );
+    }
+    let (resolved_features, artifact) =
+        match parse_look_compiler_artifact(&compile_evidence.stdout, package, target) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    "compile-output",
+                    "look-mode-build-evidence-invalid",
+                    &error.to_string(),
+                    compile_command,
+                    Some(compile_evidence),
+                );
+            }
+        };
+    let expected_features = expected_local_feature_closure(spec, feature_graph)?;
+    if resolved_features != expected_features {
+        return unavailable_look_mode_receipt(
+            spec,
+            inventory_mode,
+            "compile-output",
+            "look-mode-build-evidence-invalid",
+            "Cargo resolved feature closure differs from authenticated Cargo.toml graph",
+            compile_command,
+            Some(compile_evidence),
+        );
+    }
+    let (compiled_artifact_path, compiled_artifact_bytes, compiled_artifact_sha256) =
+        match authenticate_look_artifact(&artifact, target) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    "artifact-authentication",
+                    "look-mode-artifact-invalid",
+                    &error.to_string(),
+                    compile_command,
+                    Some(compile_evidence),
+                );
+            }
+        };
+    let stable_artifact = target.join("authenticated-look-test");
+    let authenticated_artifact =
+        match install_stable_look_artifact(&artifact, &stable_artifact, target) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    "artifact-authentication",
+                    "look-mode-artifact-invalid",
+                    &error.to_string(),
+                    compile_command,
+                    Some(compile_evidence),
+                );
+            }
+        };
+    let artifact_path = authenticated_artifact.logical_path.clone();
+    let artifact_bytes = authenticated_artifact.bytes;
+    let artifact_sha256 = authenticated_artifact.sha256.clone();
+    if artifact_bytes != compiled_artifact_bytes || artifact_sha256 != compiled_artifact_sha256 {
+        return unavailable_look_mode_receipt(
+            spec,
+            inventory_mode,
+            "artifact-authentication",
+            "look-mode-artifact-invalid",
+            "stable executable copy differs from authenticated Cargo artifact",
+            compile_command,
+            Some(compile_evidence),
+        );
+    }
+    let mut runs = Vec::with_capacity(LOOK_TESTS_PER_MODE);
+    for test_id in LOOK_TEST_IDS {
+        let test_command = expected_look_run_argv(&artifact_path, test_id);
+        let test_cli_args = test_command
+            .get(1..)
+            .ok_or_else(|| InventoryError::new("look-mode run argv is empty"))?;
+        if let Err(error) = authenticate_held_look_artifact(&authenticated_artifact) {
+            return unavailable_look_mode_receipt(
+                spec,
+                inventory_mode,
+                "artifact-drift",
+                "look-mode-artifact-changed",
+                &error.to_string(),
+                test_command,
+                None,
+            );
+        }
+        let run = match sanitized_direct_output(package, &authenticated_artifact, test_cli_args) {
+            Ok(output) => output,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Err(InventoryError::new(format!(
+                        "look-mode execution cleanup did not reach quiescence: {error}"
+                    )));
+                }
+                let (stage, reason_code) = match error.kind() {
+                    std::io::ErrorKind::TimedOut => {
+                        ("execute-timeout", "look-mode-execution-timeout")
+                    }
+                    std::io::ErrorKind::InvalidData => {
+                        ("execute-output", "look-mode-execution-output-overflow")
+                    }
+                    _ => ("execute-spawn", "look-mode-tool-unavailable"),
+                };
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    stage,
+                    reason_code,
+                    &error.to_string(),
+                    test_command,
+                    None,
+                );
+            }
+        };
+        let run_evidence = match command_evidence_record(test_command.clone(), &run) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return unavailable_look_mode_receipt(
+                    spec,
+                    inventory_mode,
+                    "execute-output",
+                    "look-mode-test-evidence-invalid",
+                    &format!("{}; raw_evidence_sha256={}", error, command_evidence(&run)),
+                    test_command,
+                    None,
+                );
+            }
+        };
+        if !run.status.success() {
+            return unavailable_look_mode_receipt(
+                spec,
+                inventory_mode,
+                "execute-exit",
+                "look-mode-execution-failed",
+                "direct exact look-mode test execution returned nonzero",
+                test_command,
+                Some(run_evidence),
+            );
+        }
+        let filtered = inventory_mode
+            .members
+            .checked_sub(1)
+            .ok_or_else(|| InventoryError::new("look-mode member count underflow"))?;
+        if let Err(error) = parse_single_look_test_run(&run_evidence.stdout, test_id, filtered) {
+            return unavailable_look_mode_receipt(
+                spec,
+                inventory_mode,
+                "execute-output",
+                "look-mode-test-evidence-invalid",
+                &error.to_string(),
+                test_command,
+                Some(run_evidence),
+            );
+        }
+        if let Err(error) = authenticate_held_look_artifact(&authenticated_artifact) {
+            return unavailable_look_mode_receipt(
+                spec,
+                inventory_mode,
+                "artifact-drift",
+                "look-mode-artifact-changed",
+                &error.to_string(),
+                test_command,
+                Some(run_evidence),
+            );
+        }
+        runs.push(run_evidence);
+    }
+    let resolved_features_sha256 = hash_line_list(&resolved_features.iter().cloned().collect());
+    let disposition = RegexAutomataLookModeDisposition::Available {
+        resolved_features,
+        resolved_features_sha256,
+        compiled_artifact_path,
+        artifact_path,
+        artifact_bytes,
+        artifact_sha256,
+        build: compile_evidence,
+        runs,
+        test_ids: look_test_ids(),
+        test_ids_sha256: look_test_ids_hash(),
+    };
+    Ok(make_look_mode_receipt(spec, inventory_mode, disposition))
+}
+
+fn make_look_mode_receipt(
+    spec: &ModeSpec,
+    inventory_mode: &RegexAutomataFeatureMode,
+    disposition: RegexAutomataLookModeDisposition,
+) -> RegexAutomataLookModeReceipt {
+    let mut receipt = RegexAutomataLookModeReceipt {
+        mode_id: spec.id.clone(),
+        harness: spec.harness,
+        default_features: spec.default_features,
+        all_features: spec.all_features,
+        features: spec.features.clone(),
+        inventory_members: inventory_mode.members,
+        inventory_member_ids_sha256: inventory_mode.member_ids_sha256.clone(),
+        mode_tuple_sha256: String::new(),
+        disposition,
+    };
+    receipt.mode_tuple_sha256 = sha256(look_mode_contract_line(&receipt).as_bytes());
+    receipt
+}
+
+fn unavailable_look_mode_receipt(
+    spec: &ModeSpec,
+    inventory_mode: &RegexAutomataFeatureMode,
+    stage: &str,
+    reason_code: &str,
+    detail: &str,
+    attempted_argv: Vec<String>,
+    command: Option<RegexAutomataLookCommandEvidence>,
+) -> Result<RegexAutomataLookModeReceipt, InventoryError> {
+    let detail_sha256 = sha256(detail.as_bytes());
+    let evidence_sha256 = unavailable_evidence_hash(
+        &spec.id,
+        stage,
+        reason_code,
+        &detail_sha256,
+        &attempted_argv,
+        command.as_ref(),
+    )?;
+    Ok(make_look_mode_receipt(
+        spec,
+        inventory_mode,
+        RegexAutomataLookModeDisposition::Unavailable {
+            stage: stage.to_owned(),
+            reason_code: reason_code.to_owned(),
+            detail_sha256,
+            evidence_sha256,
+            attempted_argv,
+            command,
+        },
+    ))
+}
+
+fn unavailable_evidence_hash(
+    mode_id: &str,
+    stage: &str,
+    reason_code: &str,
+    detail_sha256: &str,
+    attempted_argv: &[String],
+    command: Option<&RegexAutomataLookCommandEvidence>,
+) -> Result<String, InventoryError> {
+    hash_json(
+        &(
+            mode_id,
+            stage,
+            reason_code,
+            detail_sha256,
+            attempted_argv,
+            command,
+        ),
+        "encode unavailable look-mode evidence",
+    )
+}
+
+fn expected_look_compile_argv(cargo_path: &str, spec: &ModeSpec) -> Vec<String> {
+    let mut argv = vec![
+        cargo_path.to_owned(),
+        "test".to_owned(),
+        "--offline".to_owned(),
+        "--locked".to_owned(),
+        "--lib".to_owned(),
+        "--no-run".to_owned(),
+        "--message-format=json".to_owned(),
+    ];
+    if spec.all_features {
+        argv.push("--all-features".to_owned());
+    } else if !spec.default_features {
+        argv.push("--no-default-features".to_owned());
+        if !spec.features.is_empty() {
+            argv.push("--features".to_owned());
+            argv.push(spec.features.join(","));
+        }
+    }
+    argv
+}
+
+fn expected_look_run_argv(artifact_path: &str, test_id: &str) -> Vec<String> {
+    vec![
+        artifact_path.to_owned(),
+        test_id.to_owned(),
+        "--exact".to_owned(),
+        "--test-threads=1".to_owned(),
+        "--nocapture".to_owned(),
+    ]
+}
+
+fn parse_look_compiler_artifact(
+    stdout: &str,
+    package: &Path,
+    target: &Path,
+) -> Result<(Vec<String>, PathBuf), InventoryError> {
+    let package_text = path_text(package, "look-mode snapshot package")?;
+    let (features, artifact_text) = parse_look_compiler_artifact_evidence(stdout, &package_text)?;
+    let artifact = PathBuf::from(artifact_text);
+    let target = target
+        .canonicalize()
+        .map_err(|error| InventoryError::new(format!("canonicalize mode target: {error}")))?;
+    let artifact = artifact
+        .canonicalize()
+        .map_err(|error| InventoryError::new(format!("canonicalize test artifact: {error}")))?;
+    if !artifact.starts_with(&target) {
+        return Err(InventoryError::new(
+            "Cargo test artifact escaped its isolated mode target",
+        ));
+    }
+    Ok((features, artifact))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact Cargo artifact JSON contract is reviewed as one transaction"
+)]
+fn parse_look_compiler_artifact_evidence(
+    stdout: &str,
+    snapshot_package_path: &str,
+) -> Result<(Vec<String>, String), InventoryError> {
+    let expected_package_id = format!("path+file://{snapshot_package_path}#{UPSTREAM_VERSION}");
+    let expected_source = Path::new(snapshot_package_path).join("src/lib.rs");
+    let expected_source = path_text(&expected_source, "regex-automata lib target")?;
+    let mut artifacts = Vec::new();
+    let mut build_finished = 0_usize;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| InventoryError::new(format!("invalid Cargo JSON line: {error}")))?;
+        match value.get("reason").and_then(serde_json::Value::as_str) {
+            Some("compiler-artifact") => {
+                let package_id = value.get("package_id").and_then(serde_json::Value::as_str);
+                let target_value = value
+                    .get("target")
+                    .ok_or_else(|| InventoryError::new("Cargo artifact has no target"))?;
+                let target_name = target_value.get("name").and_then(serde_json::Value::as_str);
+                let kind = target_value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_array);
+                let crate_types = target_value
+                    .get("crate_types")
+                    .and_then(serde_json::Value::as_array);
+                let source_path = target_value
+                    .get("src_path")
+                    .and_then(serde_json::Value::as_str);
+                let target_test = target_value
+                    .get("test")
+                    .and_then(serde_json::Value::as_bool);
+                let target_doc = target_value.get("doc").and_then(serde_json::Value::as_bool);
+                let target_doctest = target_value
+                    .get("doctest")
+                    .and_then(serde_json::Value::as_bool);
+                let target_edition = target_value
+                    .get("edition")
+                    .and_then(serde_json::Value::as_str);
+                let profile = value.get("profile");
+                let profile_test = profile
+                    .and_then(|profile| profile.get("test"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                let profile_debug_assertions = profile
+                    .and_then(|profile| profile.get("debug_assertions"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                let profile_overflow_checks = profile
+                    .and_then(|profile| profile.get("overflow_checks"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                let profile_opt_level = profile
+                    .and_then(|profile| profile.get("opt_level"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("0");
+                let Some(executable) = value.get("executable").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let exact_lib = kind
+                    .is_some_and(|items| items.len() == 1 && items[0].as_str() == Some("lib"))
+                    && crate_types
+                        .is_some_and(|items| items.len() == 1 && items[0].as_str() == Some("lib"));
+                if package_id == Some(expected_package_id.as_str())
+                    && target_name == Some("regex_automata")
+                    && exact_lib
+                    && source_path == Some(expected_source.as_str())
+                    && target_test == Some(true)
+                    && target_doc == Some(true)
+                    && target_doctest == Some(true)
+                    && target_edition == Some("2021")
+                    && profile_test
+                    && profile_debug_assertions
+                    && profile_overflow_checks
+                    && profile_opt_level
+                {
+                    let mut features = value
+                        .get("features")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| InventoryError::new("Cargo artifact has no feature list"))?
+                        .iter()
+                        .map(|feature| {
+                            feature.as_str().map(str::to_owned).ok_or_else(|| {
+                                InventoryError::new("Cargo artifact feature is not text")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    features.sort();
+                    if features.windows(2).any(|pair| pair[0] == pair[1])
+                        || features.iter().any(|feature| !safe_atom(feature))
+                    {
+                        return Err(InventoryError::new(
+                            "Cargo artifact feature list is invalid",
+                        ));
+                    }
+                    if !safe_absolute_path_text(executable) {
+                        return Err(InventoryError::new(
+                            "Cargo lib-test executable path is invalid",
+                        ));
+                    }
+                    artifacts.push((features, executable.to_owned()));
+                }
+            }
+            Some("build-finished") => {
+                if value.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err(InventoryError::new(
+                        "Cargo build-finished was not successful",
+                    ));
+                }
+                build_finished = build_finished
+                    .checked_add(1)
+                    .ok_or_else(|| InventoryError::new("Cargo build-finished count overflow"))?;
+            }
+            Some("compiler-message" | "build-script-executed") => {}
+            Some(_) | None => {
+                return Err(InventoryError::new("unexpected Cargo JSON message kind"));
+            }
+        }
+    }
+    if artifacts.len() != 1 || build_finished != 1 {
+        return Err(InventoryError::new(
+            "Cargo output did not identify exactly one lib-test artifact",
+        ));
+    }
+    Ok(artifacts.pop().expect("length checked"))
+}
+
+fn authenticate_look_artifact(
+    artifact: &Path,
+    target: &Path,
+) -> Result<(String, u64, String), InventoryError> {
+    let (path, bytes, sha256, _) = read_authenticated_look_artifact(artifact, target)?;
+    Ok((path, bytes, sha256))
+}
+
+fn read_authenticated_look_artifact(
+    artifact: &Path,
+    target: &Path,
+) -> Result<(String, u64, String, Vec<u8>), InventoryError> {
+    if LOOK_O_NOFOLLOW == 0 {
+        return Err(InventoryError::new(
+            "look artifact O_NOFOLLOW is unavailable on this platform",
+        ));
+    }
+    let before = fs::symlink_metadata(artifact)
+        .map_err(|error| InventoryError::new(format!("lstat look test artifact: {error}")))?;
+    let target = target
+        .canonicalize()
+        .map_err(|error| InventoryError::new(format!("canonicalize mode target: {error}")))?;
+    let canonical = artifact.canonicalize().map_err(|error| {
+        InventoryError::new(format!("canonicalize look test artifact: {error}"))
+    })?;
+    if before.file_type().is_symlink()
+        || !before.file_type().is_file()
+        || before.uid() != unsafe_free_euid()
+        || before.nlink() != 1
+        || before.permissions().mode() & 0o111 == 0
+        || before.len() == 0
+        || before.len() > MAX_LOOK_ARTIFACT_BYTES
+        || canonical.as_path() != artifact
+        || !canonical.starts_with(target)
+    {
+        return Err(InventoryError::new("look test artifact metadata mismatch"));
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(LOOK_O_NOFOLLOW)
+        .open(&canonical)
+        .map_err(|error| InventoryError::new(format!("open look test artifact: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat look test artifact: {error}")))?;
+    if opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || opened.uid() != before.uid()
+        || opened.nlink() != before.nlink()
+        || opened.len() != before.len()
+        || opened.permissions().mode() != before.permissions().mode()
+    {
+        return Err(InventoryError::new(
+            "look test artifact changed between lstat and open",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .map_err(|_| InventoryError::new("look artifact length does not fit usize"))?,
+    );
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_LOOK_ARTIFACT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| InventoryError::new(format!("read look test artifact: {error}")))?;
+    let after = file.metadata().map_err(|error| {
+        InventoryError::new(format!("fstat look test artifact after read: {error}"))
+    })?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+        || u64::try_from(bytes.len()) != Ok(opened.len())
+        || bytes.len() > usize::try_from(MAX_LOOK_ARTIFACT_BYTES).unwrap_or(usize::MAX)
+    {
+        return Err(InventoryError::new(
+            "look test artifact changed while being read",
+        ));
+    }
+    Ok((
+        path_text(&canonical, "look test artifact")?,
+        opened.len(),
+        sha256(&bytes),
+        bytes,
+    ))
+}
+
+fn install_stable_look_artifact(
+    source: &Path,
+    destination: &Path,
+    target: &Path,
+) -> Result<AuthenticatedLookArtifact, InventoryError> {
+    let (_, source_bytes, source_sha256, bytes) = read_authenticated_look_artifact(source, target)?;
+    if !bytes.starts_with(b"\x7fELF") {
+        return Err(InventoryError::new(
+            "look test artifact is not a native ELF image",
+        ));
+    }
+    let mut output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o500)
+        .custom_flags(LOOK_O_NOFOLLOW)
+        .open(destination)
+        .map_err(|error| InventoryError::new(format!("create stable look artifact: {error}")))?;
+    output
+        .write_all(&bytes)
+        .map_err(|error| InventoryError::new(format!("write stable look artifact: {error}")))?;
+    output
+        .sync_all()
+        .map_err(|error| InventoryError::new(format!("sync stable look artifact: {error}")))?;
+    drop(output);
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o500))
+        .map_err(|error| InventoryError::new(format!("seal stable look artifact: {error}")))?;
+    let logical_path = path_text(destination, "stable look artifact")?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(LOOK_O_NOFOLLOW)
+        .open(destination)
+        .map_err(|error| InventoryError::new(format!("open stable look artifact: {error}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat stable look artifact: {error}")))?;
+    let copied = read_held_look_artifact(&file, metadata.len())?;
+    if metadata.uid() != unsafe_free_euid()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o500
+        || metadata.len() != source_bytes
+        || sha256(&copied) != source_sha256
+    {
+        return Err(InventoryError::new(
+            "stable look artifact differs from source artifact",
+        ));
+    }
+    fs::remove_file(destination)
+        .map_err(|error| InventoryError::new(format!("unlink stable look artifact: {error}")))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| InventoryError::new("stable look artifact has no parent"))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| InventoryError::new(format!("sync stable artifact parent: {error}")))?;
+    let artifact = AuthenticatedLookArtifact {
+        logical_path,
+        file,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        mode: metadata.permissions().mode(),
+        bytes: metadata.len(),
+        sha256: source_sha256,
+    };
+    authenticate_held_look_artifact(&artifact)?;
+    Ok(artifact)
+}
+
+struct AuthenticatedLookArtifact {
+    logical_path: String,
+    file: fs::File,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    bytes: u64,
+    sha256: String,
+}
+
+fn authenticate_held_look_artifact(
+    artifact: &AuthenticatedLookArtifact,
+) -> Result<(), InventoryError> {
+    let metadata = artifact
+        .file
+        .metadata()
+        .map_err(|error| InventoryError::new(format!("fstat held look artifact: {error}")))?;
+    if metadata.dev() != artifact.dev
+        || metadata.ino() != artifact.ino
+        || metadata.uid() != artifact.uid
+        || metadata.nlink() != 0
+        || metadata.permissions().mode() != artifact.mode
+        || metadata.len() != artifact.bytes
+    {
+        return Err(InventoryError::new("held look artifact metadata changed"));
+    }
+    let bytes = read_held_look_artifact(&artifact.file, artifact.bytes)?;
+    if sha256(&bytes) != artifact.sha256 {
+        return Err(InventoryError::new("held look artifact bytes changed"));
+    }
+    Ok(())
+}
+
+fn read_held_look_artifact(file: &fs::File, length: u64) -> Result<Vec<u8>, InventoryError> {
+    if length == 0 || length > MAX_LOOK_ARTIFACT_BYTES {
+        return Err(InventoryError::new("held look artifact length is invalid"));
+    }
+    let capacity = usize::try_from(length)
+        .map_err(|_| InventoryError::new("held look artifact length does not fit usize"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    while offset < length {
+        let remaining = usize::try_from(length.saturating_sub(offset))
+            .map_err(|_| InventoryError::new("held artifact remainder does not fit usize"))?
+            .min(buffer.len());
+        let read = file
+            .read_at(&mut buffer[..remaining], offset)
+            .map_err(|error| InventoryError::new(format!("read held look artifact: {error}")))?;
+        if read == 0 {
+            return Err(InventoryError::new(
+                "held look artifact ended before authenticated length",
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        offset = offset
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| InventoryError::new("held artifact read does not fit u64"))?,
+            )
+            .ok_or_else(|| InventoryError::new("held artifact offset overflow"))?;
+    }
+    Ok(bytes)
+}
+
+fn parse_single_look_test_run(
+    stdout: &str,
+    expected_test_id: &str,
+    expected_filtered: usize,
+) -> Result<(), InventoryError> {
+    let prefix = format!(
+        "\nrunning 1 test\ntest {expected_test_id} ... ok\n\n\
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+{expected_filtered} filtered out; finished in ",
+    );
+    let Some(duration) = stdout
+        .strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.strip_suffix("s\n"))
+    else {
+        return Err(InventoryError::new(
+            "look test execution did not prove exactly one named pass",
+        ));
+    };
+    let Some((whole, fractional)) = duration.split_once('.') else {
+        return Err(InventoryError::new(
+            "look test duration lacks decimal point",
+        ));
+    };
+    if whole.is_empty()
+        || fractional.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(InventoryError::new("look test duration is malformed"));
+    }
+    Ok(())
+}
+
 fn parse_test_list(stdout: &str) -> Result<BTreeSet<String>, InventoryError> {
     let mut members = BTreeSet::new();
     let mut summary = None;
@@ -1353,6 +3402,35 @@ fn counts_for(
         ));
     }
     Ok(counts)
+}
+
+fn look_mode_counts(
+    receipts: &[RegexAutomataLookModeReceipt],
+) -> Result<RegexAutomataLookModeCounts, InventoryError> {
+    let available_modes = receipts
+        .iter()
+        .filter(|receipt| {
+            matches!(
+                &receipt.disposition,
+                RegexAutomataLookModeDisposition::Available { .. }
+            )
+        })
+        .count();
+    let unavailable_modes = receipts
+        .len()
+        .checked_sub(available_modes)
+        .ok_or_else(|| InventoryError::new("look-mode count underflow"))?;
+    let available_test_memberships = available_modes
+        .checked_mul(LOOK_TESTS_PER_MODE)
+        .ok_or_else(|| InventoryError::new("look-mode membership count overflow"))?;
+    Ok(RegexAutomataLookModeCounts {
+        modes: receipts.len(),
+        available_modes,
+        unavailable_modes,
+        tests_per_mode: LOOK_TESTS_PER_MODE,
+        available_test_memberships,
+        total_test_memberships: LOOK_TEST_MEMBERSHIPS,
+    })
 }
 
 fn prepare_target_dir(target: &Path, protected: &[&Path]) -> Result<PathBuf, InventoryError> {
@@ -1515,8 +3593,443 @@ fn cargo_output(
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_INCREMENTAL", "0")
+        .env("RUSTC", rustc);
+    supervised_command_output_with_limit(
+        &mut command,
+        LOOK_COMPILE_TIMEOUT,
+        usize::try_from(MAX_PACKAGE_FILE_BYTES).unwrap_or(usize::MAX),
+    )
+}
+
+fn sanitized_cargo_output(
+    package: &Path,
+    target: &Path,
+    cargo_home: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    args: &[String],
+) -> std::io::Result<Output> {
+    let temporary = target.join("tmp");
+    fs::create_dir(&temporary)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
+    let mut command = Command::new(cargo);
+    command
+        .args(args)
+        .current_dir(package)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", cargo_home)
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TERM_COLOR", "never")
+        .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC", rustc)
-        .output()
+        .env("RUST_BACKTRACE", "0")
+        .env("TMPDIR", temporary);
+    supervised_command_output(&mut command, LOOK_COMPILE_TIMEOUT)
+}
+
+fn sanitized_direct_output(
+    package: &Path,
+    executable: &AuthenticatedLookArtifact,
+    args: &[String],
+) -> std::io::Result<Output> {
+    let descriptor_path = format!("/proc/self/fd/{}", executable.file.as_raw_fd());
+    let mut command = Command::new(&descriptor_path);
+    command
+        .arg0(&executable.logical_path)
+        .args(args)
+        .current_dir(package)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RUST_BACKTRACE", "0");
+    supervised_command_output(&mut command, LOOK_TEST_TIMEOUT)
+}
+
+struct BoundedPipe {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn supervised_command_output(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    supervised_command_output_with_limit(
+        command,
+        timeout,
+        REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES,
+    )
+}
+
+fn supervised_command_output_with_limit(
+    command: &mut Command,
+    timeout: Duration,
+    maximum_output_bytes: usize,
+) -> std::io::Result<Output> {
+    if maximum_output_bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "supervised command output bound is zero",
+        ));
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let process_group = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("supervised child stdout is absent"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("supervised child stderr is absent"))?;
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader =
+        spawn_bounded_pipe_reader(stdout, Arc::clone(&output_exceeded), maximum_output_bytes);
+    let stderr_reader =
+        spawn_bounded_pipe_reader(stderr, Arc::clone(&output_exceeded), maximum_output_bytes);
+    let started = Instant::now();
+    let mut status: Option<ExitStatus> = None;
+    loop {
+        if output_exceeded.load(Ordering::Acquire) {
+            cleanup_supervised_failure(
+                &mut child,
+                process_group,
+                status.is_some(),
+                stdout_reader,
+                stderr_reader,
+            )?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "supervised command output exceeded retained bound",
+            ));
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(observed)) => status = Some(observed),
+                Ok(None) => {}
+                Err(error) => {
+                    cleanup_supervised_failure(
+                        &mut child,
+                        process_group,
+                        false,
+                        stdout_reader,
+                        stderr_reader,
+                    )?;
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("poll supervised command: {error}"),
+                    ));
+                }
+            }
+        }
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            cleanup_supervised_failure(
+                &mut child,
+                process_group,
+                status.is_some(),
+                stdout_reader,
+                stderr_reader,
+            )?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "supervised command exceeded monotonic deadline",
+            ));
+        }
+        thread::sleep(LOOK_CHILD_POLL);
+    }
+    let stdout = join_bounded_pipe(stdout_reader)?;
+    let stderr = join_bounded_pipe(stderr_reader)?;
+    if stdout.exceeded || stderr.exceeded {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "supervised command output exceeded retained bound",
+        ));
+    }
+    Ok(Output {
+        status: status.ok_or_else(|| {
+            std::io::Error::other("supervised command completed without an exit status")
+        })?,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn spawn_bounded_pipe_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    exceeded: Arc<AtomicBool>,
+    maximum: usize,
+) -> thread::JoinHandle<std::io::Result<BoundedPipe>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(maximum.min(16 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut over_limit = false;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let retained = maximum.saturating_sub(bytes.len()).min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            if retained != read {
+                over_limit = true;
+                exceeded.store(true, Ordering::Release);
+            }
+        }
+        Ok(BoundedPipe {
+            bytes,
+            exceeded: over_limit,
+        })
+    })
+}
+
+fn join_bounded_pipe(
+    reader: thread::JoinHandle<std::io::Result<BoundedPipe>>,
+) -> std::io::Result<BoundedPipe> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("supervised pipe reader panicked"))?
+}
+
+fn terminate_process_group_and_reap(
+    child: &mut Child,
+    process_group: u32,
+    mut child_reaped: bool,
+) -> std::io::Result<()> {
+    let mut first_error = bounded_signal_process_group(process_group, "-TERM").err();
+    let grace_started = Instant::now();
+    while grace_started.elapsed() < LOOK_TERMINATE_GRACE {
+        if !child_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => child_reaped = true,
+                Ok(None) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        thread::sleep(LOOK_CHILD_POLL);
+    }
+    if let Err(error) = bounded_signal_process_group(process_group, "-KILL")
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    if !child_reaped {
+        let _ = child.kill();
+        if let Err(error) = child.wait()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn bounded_signal_process_group(process_group: u32, signal: &str) -> std::io::Result<()> {
+    let process_group = format!("-{process_group}");
+    let mut signaler = Command::new("/bin/kill")
+        .args([signal, "--", process_group.as_str()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        if signaler.try_wait()?.is_some() {
+            // A nonzero exit is expected when TERM already emptied the group.
+            // Quiescence is proved separately by both pipe readers reaching
+            // EOF; a failed signal with a live pipe holder therefore cannot
+            // be mistaken for successful cleanup.
+            return Ok(());
+        }
+        if started.elapsed() >= LOOK_SIGNAL_TIMEOUT {
+            let _ = signaler.kill();
+            let _ = signaler.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process-group signal command exceeded monotonic deadline",
+            ));
+        }
+        thread::sleep(LOOK_CHILD_POLL);
+    }
+}
+
+fn cleanup_supervised_failure(
+    child: &mut Child,
+    process_group: u32,
+    child_reaped: bool,
+    stdout_reader: thread::JoinHandle<std::io::Result<BoundedPipe>>,
+    stderr_reader: thread::JoinHandle<std::io::Result<BoundedPipe>>,
+) -> std::io::Result<()> {
+    terminate_process_group_and_reap(child, process_group, child_reaped).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("supervised process-group cleanup failed: {error}"),
+        )
+    })?;
+    let started = Instant::now();
+    while started.elapsed() < LOOK_PIPE_DRAIN_GRACE
+        && (!stdout_reader.is_finished() || !stderr_reader.is_finished())
+    {
+        thread::sleep(LOOK_CHILD_POLL);
+    }
+    if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "supervised pipe holders survived process-group cleanup",
+        ));
+    }
+    join_bounded_pipe(stdout_reader).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("supervised stdout cleanup failed: {error}"),
+        )
+    })?;
+    join_bounded_pipe(stderr_reader).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("supervised stderr cleanup failed: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn canonical_tool(tool: &str) -> Result<PathBuf, InventoryError> {
+    let path = resolve_tool(tool)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| InventoryError::new(format!("canonicalize {tool}: {error}")))?;
+    let metadata = fs::symlink_metadata(&canonical)
+        .map_err(|error| InventoryError::new(format!("stat {tool}: {error}")))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe_free_euid()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(InventoryError::new(format!(
+            "resolved {tool} is not an owned executable file"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn sanitized_tool_release(
+    tool: &Path,
+    name: &str,
+    verbose: bool,
+) -> Result<String, InventoryError> {
+    let mut command = Command::new(tool);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--version");
+    if verbose {
+        command.arg("--verbose");
+    }
+    let output = supervised_command_output(&mut command, LOOK_TOOL_TIMEOUT)
+        .map_err(|error| InventoryError::new(format!("execute {name} --version: {error}")))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(InventoryError::new(format!(
+            "sanitized {name} --version failed"
+        )));
+    }
+    let release = std::str::from_utf8(&output.stdout)
+        .map_err(|error| InventoryError::new(format!("{name} version is not UTF-8: {error}")))?
+        .trim()
+        .to_owned();
+    if release.is_empty()
+        || release
+            .bytes()
+            .any(|byte| byte == 0 || (byte.is_ascii_control() && byte != b'\n'))
+    {
+        return Err(InventoryError::new(format!(
+            "invalid sanitized {name} release"
+        )));
+    }
+    Ok(release)
+}
+
+fn parse_rustc_host(verbose: &str) -> Result<String, InventoryError> {
+    let mut host = None;
+    for line in verbose.lines() {
+        let Some(value) = line.strip_prefix("host: ") else {
+            continue;
+        };
+        if host.replace(value.to_owned()).is_some() || !safe_atom(value) {
+            return Err(InventoryError::new("invalid duplicate rustc host"));
+        }
+    }
+    host.ok_or_else(|| InventoryError::new("rustc verbose output has no host"))
+}
+
+fn command_evidence_record(
+    argv: Vec<String>,
+    output: &Output,
+) -> Result<RegexAutomataLookCommandEvidence, InventoryError> {
+    if output.stdout.len() > REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES
+        || output.stderr.len() > REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES
+    {
+        return Err(InventoryError::new(
+            "look-mode command output exceeds retained evidence bound",
+        ));
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|error| InventoryError::new(format!("command stdout is not UTF-8: {error}")))?
+        .to_owned();
+    let stderr = std::str::from_utf8(&output.stderr)
+        .map_err(|error| InventoryError::new(format!("command stderr is not UTF-8: {error}")))?
+        .to_owned();
+    Ok(RegexAutomataLookCommandEvidence {
+        argv,
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout_bytes: u64::try_from(output.stdout.len())
+            .map_err(|_| InventoryError::new("command stdout length does not fit u64"))?,
+        stdout_sha256: sha256(&output.stdout),
+        stdout,
+        stderr_bytes: u64::try_from(output.stderr.len())
+            .map_err(|_| InventoryError::new("command stderr length does not fit u64"))?,
+        stderr_sha256: sha256(&output.stderr),
+        stderr,
+    })
+}
+
+fn path_text(path: &Path, label: &str) -> Result<String, InventoryError> {
+    path.to_str()
+        .filter(|text| safe_absolute_path_text(text))
+        .map(str::to_owned)
+        .ok_or_else(|| InventoryError::new(format!("invalid absolute {label} path")))
+}
+
+fn safe_absolute_path_text(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        && !value.is_empty()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+        && Path::new(value).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
+fn safe_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn resolve_tool(tool: &str) -> Result<PathBuf, InventoryError> {
@@ -1544,9 +4057,9 @@ fn resolve_tool(tool: &str) -> Result<PathBuf, InventoryError> {
 }
 
 fn tool_release(tool: &Path, name: &str) -> Result<String, InventoryError> {
-    let output = Command::new(tool)
-        .arg("--version")
-        .output()
+    let mut command = Command::new(tool);
+    command.arg("--version");
+    let output = supervised_command_output(&mut command, LOOK_TOOL_TIMEOUT)
         .map_err(|error| InventoryError::new(format!("execute {name} --version: {error}")))?;
     if !output.status.success() {
         return Err(InventoryError::new(format!("{name} --version failed")));
@@ -1581,18 +4094,21 @@ fn git_text(repo: &Path, args: &[&str]) -> Result<String, InventoryError> {
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, InventoryError> {
     let mut command = Command::new("/usr/bin/git");
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("GIT_")) {
-            command.env_remove(key);
-        }
-    }
-    let output = command
+    command
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
-        .map_err(|error| InventoryError::new(format!("execute Git: {error}")))?;
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let output = supervised_command_output_with_limit(
+        &mut command,
+        LOOK_TOOL_TIMEOUT,
+        usize::try_from(MAX_PACKAGE_FILE_BYTES).unwrap_or(usize::MAX),
+    )
+    .map_err(|error| InventoryError::new(format!("execute Git: {error}")))?;
     if !output.status.success() {
         return Err(InventoryError::new(format!(
             "Git command failed: evidence_sha256={}",
@@ -1612,9 +4128,9 @@ fn unsafe_free_euid() -> u32 {
     // every ownership check.
     static EUID: OnceLock<u32> = OnceLock::new();
     *EUID.get_or_init(|| {
-        Command::new("/usr/bin/id")
-            .arg("-u")
-            .output()
+        let mut command = Command::new("/usr/bin/id");
+        command.arg("-u").env_clear();
+        supervised_command_output_with_limit(&mut command, LOOK_TOOL_TIMEOUT, 64)
             .ok()
             .filter(|output| output.status.success())
             .and_then(|output| parse_euid(&output.stdout))
@@ -1724,5 +4240,194 @@ features=(
         .unwrap();
         assert!(encoded.contains("unsupported"));
         assert!(!encoded.contains("pass"));
+    }
+
+    #[test]
+    fn look_mode_specs_are_the_exact_unit_projection() {
+        let specs = look_mode_specs();
+        assert_eq!(specs.len(), LOOK_MODE_COUNT);
+        assert_eq!(specs[0].id, "package-default-unit");
+        assert_eq!(specs[1].id, "vcs-all-features-unit");
+        assert_eq!(specs[2].id, "vcs-lib-00");
+        assert_eq!(specs[29].id, "vcs-lib-27");
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.harness == RegexAutomataHarnessKind::Unit)
+        );
+        assert!(is_sha256(&look_test_ids_hash()));
+    }
+
+    #[test]
+    fn look_test_output_parser_requires_one_exact_named_pass() {
+        let case_id = "util::look::tests::look_matches_end_line";
+        let good = "\nrunning 1 test\n\
+test util::look::tests::look_matches_end_line ... ok\n\n\
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; finished in 0.00s\n";
+        parse_single_look_test_run(good, case_id, 134).unwrap();
+        assert!(
+            parse_single_look_test_run(&good.replace("... ok", "... FAILED"), case_id, 134)
+                .is_err()
+        );
+        assert!(
+            parse_single_look_test_run(
+                &good.replace("look_matches_end_line", "look_matches_end_text"),
+                case_id,
+                134,
+            )
+            .is_err()
+        );
+        for forged in [
+            format!("prefix{good}"),
+            format!("{good}suffix"),
+            good.replace("134 filtered", "133 filtered"),
+            good.replace("0.00s", ".s"),
+            good.replace("0.00s", "0.s"),
+            good.replace("0.00s", ".00s"),
+            good.replace("\nrunning 1 test\n", "\nrunning 1 test\n\nrunning 1 test\n"),
+        ] {
+            assert!(parse_single_look_test_run(&forged, case_id, 134).is_err());
+        }
+    }
+
+    #[test]
+    fn look_mode_supervisor_caps_output_and_reaps_deadline() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let reader = spawn_bounded_pipe_reader(
+            std::io::Cursor::new(vec![
+                b'x';
+                REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES + 1
+            ]),
+            Arc::clone(&exceeded),
+            REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES,
+        );
+        let captured = join_bounded_pipe(reader).unwrap();
+        assert!(captured.exceeded);
+        assert!(exceeded.load(Ordering::Acquire));
+        assert_eq!(
+            captured.bytes.len(),
+            REGEX_AUTOMATA_LOOK_MODE_MAX_COMMAND_OUTPUT_BYTES,
+        );
+
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5").env_clear();
+        let started = Instant::now();
+        let error = supervised_command_output(&mut command, Duration::from_millis(20))
+            .expect_err("sleep must exceed the supervised deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let mut descendant = Command::new("/bin/sh");
+        descendant
+            .args(["-c", "(trap '' TERM; sleep 30) & exit 0"])
+            .env_clear();
+        let started = Instant::now();
+        let error = supervised_command_output(&mut descendant, Duration::from_millis(20))
+            .expect_err("a descendant retaining the pipes must not outlive the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let mut overflow = Command::new("/bin/sh");
+        overflow
+            .args(["-c", "while :; do printf 0123456789abcdef; done"])
+            .env_clear();
+        let started = Instant::now();
+        let error =
+            supervised_command_output_with_limit(&mut overflow, Duration::from_secs(5), 1_024)
+                .expect_err("unbounded child output must trip the retained-byte cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn look_mode_supervisor_kills_a_recorded_descendant() {
+        let directory =
+            std::env::temp_dir().join(format!("fre-look-descendant-test-{}", std::process::id(),));
+        fs::create_dir(&directory).unwrap();
+        let pid_path = directory.join("descendant.pid");
+        let mut descendant = Command::new("/bin/sh");
+        descendant
+            .args([
+                "-c",
+                "(trap '' TERM; sleep 30) & child=$!; printf '%s\\n' \"$child\" > \"$FRE_PID_FILE\"; exit 0",
+            ])
+            .env_clear()
+            .env("FRE_PID_FILE", &pid_path);
+        let error = supervised_command_output(&mut descendant, Duration::from_millis(20))
+            .expect_err("recorded descendant must exceed the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let started = Instant::now();
+        while proc_path.exists() && started.elapsed() < LOOK_PIPE_DRAIN_GRACE {
+            thread::sleep(LOOK_CHILD_POLL);
+        }
+        assert!(!proc_path.exists(), "recorded descendant survived cleanup");
+        fs::remove_file(pid_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn look_mode_matrix_writer_and_reader_share_an_inclusive_bound() {
+        let directory = std::env::temp_dir()
+            .join(format!("fre-look-matrix-bound-test-{}", std::process::id(),));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("matrix.json");
+        let value = BTreeMap::from([("key", "value")]);
+        let exact = encode_bounded_pretty_json(&value, usize::MAX, "matrix test").unwrap();
+        assert!(encode_bounded_pretty_json(&value, exact.len() - 1, "matrix test").is_err());
+        write_new_pretty_json(&path, &value, "matrix test").unwrap();
+        assert_eq!(
+            read_sealed_look_mode_matrix_with_limit(&path, exact.len()).unwrap(),
+            exact,
+        );
+        assert!(read_sealed_look_mode_matrix_with_limit(&path, exact.len() - 1).is_err());
+        assert_eq!(
+            REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES,
+            24 * 1_048_576,
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn look_mode_executes_an_unlinked_authenticated_descriptor() {
+        let directory =
+            std::env::temp_dir().join(format!("fre-look-fd-exec-test-{}", std::process::id(),));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let logical = directory.join("authenticated-look-test");
+        fs::copy("/bin/true", &logical).unwrap();
+        fs::set_permissions(&logical, fs::Permissions::from_mode(0o500)).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(LOOK_O_NOFOLLOW)
+            .open(&logical)
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        let bytes = read_held_look_artifact(&file, metadata.len()).unwrap();
+        fs::remove_file(&logical).unwrap();
+        let artifact = AuthenticatedLookArtifact {
+            logical_path: logical.to_str().unwrap().to_owned(),
+            file,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.permissions().mode(),
+            bytes: metadata.len(),
+            sha256: sha256(&bytes),
+        };
+        authenticate_held_look_artifact(&artifact).unwrap();
+        let output = sanitized_direct_output(&directory, &artifact, &[]).unwrap();
+        assert!(output.status.success());
+        drop(artifact);
+        fs::remove_dir(&directory).unwrap();
     }
 }

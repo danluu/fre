@@ -10,10 +10,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
+    process::Command,
 };
 
 use fre::{
@@ -27,14 +28,20 @@ use regex_automata::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::automata_corpus::REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES;
+
 use crate::{
     CandidateIdentity, InventoryError, RegexAutomataCorpusReport, RegexAutomataHarnessKind,
-    RegexAutomataObligation, sha256,
+    RegexAutomataLookModeDisposition, RegexAutomataLookModeMatrix, RegexAutomataLookModeReceipt,
+    RegexAutomataObligation, authenticate_candidate_source, sha256,
 };
 
 /// Complete candidate coverage report over every feature-mode membership.
 pub const REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.adapter-report.v3";
+/// Report schema for the exact 30-mode `util::look` execution expansion.
+pub const REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA: &str =
+    "fre.regex-automata-0.4.14.adapter-report.v4";
 const PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.adapter-report.v2";
 const LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA: &str =
@@ -45,6 +52,14 @@ pub const REGEX_AUTOMATA_GAP_ASSIGNMENT_SCHEMA: &str =
 
 const INVENTORY_UNSUPPORTED_REASON: &str = "fre-adapter.regex-automata-member-not-implemented";
 const ASSIGNMENT_TARGET_LIMIT: usize = 16;
+const REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES: usize = 8 * 1_048_576;
+const LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES: usize = b",\"look_mode_matrix\":".len();
+// Adapter reports use compact JSON so embedding changes the old, matrix-free
+// envelope by exactly one member prefix plus the matrix's compact encoding.
+// Matrix validation independently caps that encoding at 24 MiB.
+const REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES: usize = REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES
+    + LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES
+    + REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES;
 const LEGACY_REPORT_LIMITATIONS: [&str; 2] = [
     "A pass is emitted only after an exact registered adapter function executes successfully; absent registrations remain unsupported.",
     "One unique harness/case adapter disposition is projected across every authenticated feature-mode membership for that same identity.",
@@ -58,6 +73,11 @@ const MIXED_DEFAULT_REPORT_LIMITATIONS: [&str; 3] = [
     "A pass requires an exact mode/case execution receipt from a compiled registry membership and exhaustive execution of the authenticated upstream assertion inventory.",
     "No result is projected across build modes; a mode without its own compiled execution remains unsupported.",
     "The current bridge compiles only package-default doctest and unit memberships; VCS feature-mode memberships remain unsupported until separately compiled and executed.",
+];
+const ALL_MODE_LOOK_REPORT_LIMITATIONS: [&str; 3] = [
+    "A pass requires an exact mode/case execution receipt from a compiled registry membership and exhaustive execution of the authenticated upstream assertion inventory.",
+    "No result is projected across build modes; every added util::look membership is linked to its own authenticated feature-mode compilation and direct unit-test execution.",
+    "All 30 authenticated regex-automata unit modes execute the same four sealed util::look cases; every other inventory membership remains unsupported unless independently compiled and executed.",
 ];
 
 const COMPILED_MODE_ID: &str = "package-default-doctest";
@@ -73,6 +93,16 @@ const LOOK_TARGET_IDENTITIES_SHA256: &str =
     "053675c6955c5ca165db98bf1a684105cbb59176b1893ab9b022a4d98fd16c9b";
 const LOOK_BASE_REVISION: &str = "dfdba9d2848d7d228d53bffcefe7843fbe6307c9";
 const LOOK_BASE_TREE: &str = "5434af1bf92b264f46149fa50dcf533503212133";
+const LOOK_ALL_MODE_PREDECESSOR_REVISION: &str = "6512b9510b11a458e2c2e2cc5b90973a33f92a48";
+const LOOK_ALL_MODE_PREDECESSOR_TREE: &str = "b1ee85dba9114d10112cf29b7ec87d70665709e3";
+const LOOK_ALL_MODE_TARGET_IDENTITIES_SHA256: &str =
+    "ab829c5294f23107c12eddfb24dbf31060da7ca1fb0967264a3e6fc5562129df";
+const LOOK_ALL_MODE_NEW_IDENTITIES_SHA256: &str =
+    "89d980ec919ef2d85dc051720e43c6afc913aca0ca8da2be8f4595ab2ff94e70";
+const LOOK_ALL_MODE_FINAL_UNSUPPORTED_SHA256: &str =
+    "aef97899de5d6d023ff2092f2226b06c9efec48c43b5dfeb4444c5a36ccc2678";
+const LOOK_ALL_MODE_UNCHANGED_IDENTITIES_SHA256: &str =
+    "2488d9b966096fd99371073de627f5d144ff4e0a166edcd63e73acdb55b1043b";
 const PATTERN_LEN_CASE: &str =
     "src/dfa/automaton.rs - dfa::automaton::Automaton::pattern_len (line 800)";
 const PATTERN_LEN_MANY_CASE: &str =
@@ -149,6 +179,8 @@ pub struct RegexAutomataModeExecution {
     pub features: Vec<String>,
     pub dependency_package: String,
     pub dependency_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_evidence_sha256: Option<String>,
 }
 
 /// Both sides of one explicitly bound upstream assertion execution.
@@ -193,6 +225,8 @@ pub struct RegexAutomataAdapterReportPayload {
     pub receipts: Vec<RegexAutomataAdapterReceipt>,
     #[serde(default)]
     pub execution_receipts: Vec<RegexAutomataExecutionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look_mode_matrix: Option<RegexAutomataLookModeMatrix>,
     pub limitations: Vec<String>,
 }
 
@@ -2051,10 +2085,29 @@ fn run_look_case(
     context: &AdapterContext<'_>,
     case: LookCaseSpec,
 ) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    require_compiled_mode(context)?;
+    run_look_case_observer(case)
+}
+
+fn run_look_case_observer(
+    case: LookCaseSpec,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case_observer_inner(case, true)
+}
+
+fn run_look_case_matrix_observer(
+    case: LookCaseSpec,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
+    run_look_case_observer_inner(case, false)
+}
+
+fn run_look_case_observer_inner(
+    case: LookCaseSpec,
+    execute_local_upstream: bool,
+) -> Result<Vec<RegexAutomataAssertionExecution>, String> {
     const MAX_WORK: u64 = 18;
     const MAX_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
-    require_compiled_mode(context)?;
     validate_look_case_spec(case).map_err(|error| format!("look-case-contract:{error}"))?;
     let look = match case.kind {
         LookKind::StartLine => Look::StartLF,
@@ -2073,7 +2126,15 @@ fn run_look_case(
     let mut executions = Vec::with_capacity(case.vectors.len());
     for vector in case.vectors {
         let haystack = vector.haystack.as_bytes();
-        let upstream = LookMatcher::default().matches(look, haystack, vector.at);
+        // The package-default registry executes its in-process upstream
+        // matcher. For another Cargo mode, the separately authenticated exact
+        // unit-test artifact is the upstream authority, so this observer must
+        // not project the conformance binary's default feature graph onto it.
+        let upstream = if execute_local_upstream {
+            LookMatcher::default().matches(look, haystack, vector.at)
+        } else {
+            vector.expected
+        };
         let (matched, accounting) = fre
             .find_window(
                 haystack,
@@ -2233,6 +2294,7 @@ fn build_adapter_report_with_registry(
         counts,
         receipts,
         execution_receipts,
+        look_mode_matrix: None,
         limitations: registry_report_limitations(registry)
             .iter()
             .map(|text| (*text).to_owned())
@@ -2415,6 +2477,611 @@ pub fn validate_regex_automata_look_strict_gain(
     })
 }
 
+/// Extend the exact thirteen-pass predecessor with independently compiled and
+/// executed receipts for the remaining 29 unit modes. The historical
+/// package-default receipts are retained byte-for-byte; labels are never
+/// projected from one Cargo feature mode to another.
+pub fn build_regex_automata_all_mode_look_report(
+    inventory: &RegexAutomataCorpusReport,
+    previous: &RegexAutomataAdapterReport,
+    matrix: RegexAutomataLookModeMatrix,
+    candidate: CandidateIdentity,
+) -> Result<RegexAutomataAdapterReport, InventoryError> {
+    inventory.validate()?;
+    validate_all_mode_look_predecessor(inventory, previous)?;
+    validate_all_mode_matrix(inventory, &matrix)?;
+    validate_candidate(&candidate)?;
+    if candidate.revision == previous.payload.candidate.revision
+        || candidate.tree == previous.payload.candidate.tree
+    {
+        return Err(InventoryError::new(
+            "regex-automata all-mode look candidate is not distinct",
+        ));
+    }
+
+    let assigned = new_mode_look_identities(inventory)?;
+    let mode_receipts = matrix
+        .payload
+        .receipts
+        .iter()
+        .map(|receipt| (receipt.mode_id.as_str(), receipt))
+        .collect::<BTreeMap<_, _>>();
+    let mut receipts = previous.payload.receipts.clone();
+    let mut executions = previous.payload.execution_receipts.clone();
+    for receipt in &mut receipts {
+        let identity = (
+            receipt.mode_id.clone(),
+            receipt.harness,
+            receipt.case_id.clone(),
+        );
+        if !assigned.contains(&identity) {
+            continue;
+        }
+        let mode_receipt = mode_receipts
+            .get(receipt.mode_id.as_str())
+            .ok_or_else(|| InventoryError::new("look mode lacks execution evidence"))?;
+        if !matches!(
+            mode_receipt.disposition,
+            RegexAutomataLookModeDisposition::Available { .. }
+        ) {
+            return Err(InventoryError::new(format!(
+                "look mode {} is explicitly unavailable",
+                receipt.mode_id,
+            )));
+        }
+        let case = reviewed_look_case(&receipt.case_id)
+            .ok_or_else(|| InventoryError::new("look target has an unreviewed case"))?;
+        let assertion_executions =
+            match catch_unwind(AssertUnwindSafe(|| run_look_case_matrix_observer(case))) {
+                Ok(Ok(executions)) => executions,
+                Ok(Err(reason)) => {
+                    return Err(InventoryError::new(format!(
+                        "look observer rejected {}: {}",
+                        receipt.case_id,
+                        normalized_reason(&reason),
+                    )));
+                }
+                Err(_) => return Err(InventoryError::new("look observer panicked")),
+            };
+        let execution = RegexAutomataExecutionReceipt {
+            mode: matrix_mode_execution(inventory, matrix.payload_sha256.as_str(), mode_receipt)?,
+            harness: RegexAutomataHarnessKind::Unit,
+            case_id: receipt.case_id.clone(),
+            source: source_contract(&case.source),
+            assertion_executions,
+        };
+        let evidence_sha256 = hash_json(&execution, "encode all-mode look execution")?;
+        receipt.disposition = RegexAutomataAdapterDisposition::Pass { evidence_sha256 };
+        executions.push(execution);
+    }
+    let executions = order_execution_receipts(&receipts, executions, "all-mode look report")?;
+    let counts = adapter_counts(&receipts);
+    let payload = RegexAutomataAdapterReportPayload {
+        inventory_payload_sha256: inventory.payload_sha256.clone(),
+        obligation_inventory_sha256: inventory
+            .payload
+            .harness
+            .obligation_inventory_sha256
+            .clone(),
+        candidate,
+        counts,
+        receipts,
+        execution_receipts: executions,
+        look_mode_matrix: Some(matrix),
+        limitations: ALL_MODE_LOOK_REPORT_LIMITATIONS
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect(),
+    };
+    let report = RegexAutomataAdapterReport {
+        schema: REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA.to_owned(),
+        payload_sha256: hash_json(&payload, "encode all-mode look report payload")?,
+        payload,
+    };
+    validate_all_mode_look_execution(inventory, &report)?;
+    Ok(report)
+}
+
+/// Require the exact 13 -> 129 transition with all 3,713 non-target
+/// dispositions unchanged, bound to the clean checkout that built this
+/// verifier and whose sole parent is the authenticated predecessor.
+pub fn validate_regex_automata_all_mode_look_strict_gain(
+    inventory: &RegexAutomataCorpusReport,
+    previous: &RegexAutomataAdapterReport,
+    current: &RegexAutomataAdapterReport,
+    candidate_path: &Path,
+) -> Result<RegexAutomataStrictGain, InventoryError> {
+    validate_all_mode_look_predecessor(inventory, previous)?;
+    let authenticated_candidate = authenticate_candidate_source(candidate_path)?;
+    let checkout = candidate_checkout_provenance(candidate_path)?;
+    validate_all_mode_candidate_provenance(
+        &current.payload.candidate,
+        &authenticated_candidate,
+        &checkout.tree,
+        &checkout.revision_and_parents,
+        &previous.payload.candidate.revision,
+    )?;
+    validate_regex_automata_all_mode_look_strict_gain_against_candidate(
+        inventory,
+        previous,
+        current,
+        &authenticated_candidate,
+    )
+}
+
+fn validate_regex_automata_all_mode_look_strict_gain_against_candidate(
+    inventory: &RegexAutomataCorpusReport,
+    previous: &RegexAutomataAdapterReport,
+    current: &RegexAutomataAdapterReport,
+    authenticated_candidate: &CandidateIdentity,
+) -> Result<RegexAutomataStrictGain, InventoryError> {
+    validate_all_mode_look_predecessor(inventory, previous)?;
+    validate_all_mode_look_execution(inventory, current)?;
+    if current.payload.counts
+        != (RegexAutomataAdapterCounts {
+            pass: 129,
+            unsupported: 3_713,
+            fault: 0,
+            total: 3_842,
+        })
+        || current.payload.candidate.revision == previous.payload.candidate.revision
+        || current.payload.candidate.tree == previous.payload.candidate.tree
+        || current.payload.candidate != *authenticated_candidate
+    {
+        return Err(InventoryError::new(
+            "regex-automata all-mode look gain identity or cardinality mismatch",
+        ));
+    }
+    let assigned = new_mode_look_identities(inventory)?;
+    let (gained_unique_cases, gained_mode_memberships) = gain_vectors(
+        &previous.payload.receipts,
+        &current.payload.receipts,
+        &assigned,
+    )?;
+    if (gained_unique_cases, gained_mode_memberships) != (4, 116) {
+        return Err(InventoryError::new(
+            "regex-automata all-mode look gain is not exact 116-membership progress",
+        ));
+    }
+    Ok(RegexAutomataStrictGain {
+        family: "unit-util".to_owned(),
+        gained_unique_cases,
+        gained_mode_memberships,
+        previous_pass: previous.payload.counts.pass,
+        current_pass: current.payload.counts.pass,
+    })
+}
+
+fn validate_all_mode_candidate_provenance(
+    reported: &CandidateIdentity,
+    authenticated: &CandidateIdentity,
+    authenticated_tree: &str,
+    revision_and_parents: &str,
+    expected_parent: &str,
+) -> Result<(), InventoryError> {
+    validate_candidate(reported)?;
+    validate_candidate(authenticated)?;
+    let mut commits = revision_and_parents.split_ascii_whitespace();
+    if reported != authenticated
+        || authenticated.tree != authenticated_tree
+        || commits.next() != Some(authenticated.revision.as_str())
+        || commits.next() != Some(expected_parent)
+        || commits.next().is_some()
+    {
+        return Err(InventoryError::new(
+            "all-mode look candidate checkout revision/tree/parent mismatch",
+        ));
+    }
+    Ok(())
+}
+
+struct CandidateCheckoutProvenance {
+    tree: String,
+    revision_and_parents: String,
+}
+
+fn candidate_checkout_provenance(
+    candidate_path: &Path,
+) -> Result<CandidateCheckoutProvenance, InventoryError> {
+    let status = strict_candidate_git_output(
+        candidate_path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES,
+    )?;
+    if !status.is_empty() {
+        return Err(InventoryError::new(
+            "all-mode look candidate checkout is dirty",
+        ));
+    }
+    let tree = strict_candidate_git_output(
+        candidate_path,
+        &["rev-parse", "--verify", "HEAD^{tree}"],
+        64,
+    )?;
+    let revision_and_parents = strict_candidate_git_output(
+        candidate_path,
+        &["rev-list", "--parents", "-n", "1", "HEAD^{commit}"],
+        256,
+    )?;
+    Ok(CandidateCheckoutProvenance {
+        tree,
+        revision_and_parents,
+    })
+}
+
+fn strict_candidate_git_output(
+    candidate_path: &Path,
+    args: &[&str],
+    maximum_output_bytes: usize,
+) -> Result<String, InventoryError> {
+    let output = Command::new("/usr/bin/git")
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(candidate_path)
+        .args(args)
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|error| InventoryError::new(format!("run candidate Git: {error}")))?;
+    if !output.status.success()
+        || !output.stderr.is_empty()
+        || output.stdout.len() > maximum_output_bytes
+    {
+        return Err(InventoryError::new(
+            "cannot authenticate all-mode look candidate checkout",
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|line| line.trim().to_owned())
+        .map_err(|_| InventoryError::new("candidate Git output is not UTF-8"))
+}
+
+fn validate_all_mode_look_predecessor(
+    inventory: &RegexAutomataCorpusReport,
+    previous: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    validate_regex_automata_adapter_execution(inventory, previous)?;
+    if previous.schema != REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
+        || previous.payload.candidate.revision != LOOK_ALL_MODE_PREDECESSOR_REVISION
+        || previous.payload.candidate.tree != LOOK_ALL_MODE_PREDECESSOR_TREE
+        || !previous
+            .payload
+            .candidate
+            .tracked_and_untracked_worktree_clean
+        || previous.payload.counts
+            != (RegexAutomataAdapterCounts {
+                pass: 13,
+                unsupported: 3_829,
+                fault: 0,
+                total: 3_842,
+            })
+        || previous.payload.look_mode_matrix.is_some()
+    {
+        return Err(InventoryError::new(
+            "regex-automata all-mode look predecessor authority mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_all_mode_matrix(
+    inventory: &RegexAutomataCorpusReport,
+    matrix: &RegexAutomataLookModeMatrix,
+) -> Result<(), InventoryError> {
+    matrix.validate()?;
+    if matrix.payload.source != inventory.payload.source
+        || matrix.payload.harness.inventory_payload_sha256 != inventory.payload_sha256
+        || matrix.payload.harness.inventory_obligation_sha256
+            != inventory.payload.harness.obligation_inventory_sha256
+        || matrix.payload.harness.inventory_harness_sha256
+            != hash_json(
+                &inventory.payload.harness,
+                "encode regex-automata inventory harness",
+            )?
+        || matrix.payload.counts.modes != 30
+        || matrix.payload.counts.available_modes != 30
+        || matrix.payload.counts.unavailable_modes != 0
+        || matrix.payload.counts.tests_per_mode != 4
+        || matrix.payload.counts.available_test_memberships != 120
+        || matrix.payload.counts.total_test_memberships != 120
+    {
+        return Err(InventoryError::new(
+            "regex-automata look-mode matrix is not an exact available 30-mode execution",
+        ));
+    }
+    let target_modes = all_mode_look_identities(inventory)?
+        .into_iter()
+        .map(|(mode_id, _, _)| mode_id)
+        .collect::<BTreeSet<_>>();
+    let observed_modes = matrix
+        .payload
+        .receipts
+        .iter()
+        .map(|receipt| receipt.mode_id.clone())
+        .collect::<BTreeSet<_>>();
+    if target_modes.len() != 30 || observed_modes != target_modes {
+        return Err(InventoryError::new(
+            "regex-automata look-mode matrix mode set mismatch",
+        ));
+    }
+    for receipt in &matrix.payload.receipts {
+        let mode = inventory
+            .payload
+            .modes
+            .iter()
+            .find(|mode| mode.id == receipt.mode_id)
+            .ok_or_else(|| InventoryError::new("look-mode matrix mode is absent"))?;
+        if mode.harness != RegexAutomataHarnessKind::Unit
+            || receipt.harness != mode.harness
+            || receipt.default_features != mode.default_features
+            || receipt.all_features != mode.all_features
+            || receipt.features != mode.features
+            || receipt.inventory_members != mode.members
+            || receipt.inventory_member_ids_sha256 != mode.member_ids_sha256
+            || !matches!(
+                receipt.disposition,
+                RegexAutomataLookModeDisposition::Available { .. }
+            )
+        {
+            return Err(InventoryError::new(
+                "regex-automata look-mode matrix differs from inventory mode",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn matrix_mode_execution(
+    inventory: &RegexAutomataCorpusReport,
+    matrix_payload_sha256: &str,
+    receipt: &RegexAutomataLookModeReceipt,
+) -> Result<RegexAutomataModeExecution, InventoryError> {
+    let mode = inventory
+        .payload
+        .modes
+        .iter()
+        .find(|mode| mode.id == receipt.mode_id)
+        .ok_or_else(|| InventoryError::new("matrix execution mode is absent"))?;
+    if receipt.harness != RegexAutomataHarnessKind::Unit
+        || mode.harness != receipt.harness
+        || mode.default_features != receipt.default_features
+        || mode.all_features != receipt.all_features
+        || mode.features != receipt.features
+        || mode.members != receipt.inventory_members
+        || mode.member_ids_sha256 != receipt.inventory_member_ids_sha256
+        || !matches!(
+            receipt.disposition,
+            RegexAutomataLookModeDisposition::Available { .. }
+        )
+    {
+        return Err(InventoryError::new(
+            "matrix execution mode identity mismatch",
+        ));
+    }
+    Ok(RegexAutomataModeExecution {
+        mode_id: mode.id.clone(),
+        harness: mode.harness,
+        default_features: mode.default_features,
+        all_features: mode.all_features,
+        features: mode.features.clone(),
+        dependency_package: "regex-automata".to_owned(),
+        dependency_version: "0.4.14".to_owned(),
+        mode_evidence_sha256: Some(hash_json(
+            &(matrix_payload_sha256, receipt),
+            "encode matrix-bound look-mode receipt",
+        )?),
+    })
+}
+
+fn validate_all_mode_look_execution(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    report.validate_structure(inventory)?;
+    if report.schema != REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+        return Err(InventoryError::new(
+            "regex-automata report is not an all-mode look report",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_all_mode_look_execution_after_structure(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    if report.schema != REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+        return Err(InventoryError::new(
+            "regex-automata report is not an all-mode look report",
+        ));
+    }
+    validate_execution_receipt_order(report)?;
+    let matrix = report
+        .payload
+        .look_mode_matrix
+        .as_ref()
+        .ok_or_else(|| InventoryError::new("all-mode look report lacks its matrix"))?;
+    validate_all_mode_matrix(inventory, matrix)?;
+    let predecessor = build_adapter_report_with_registry(
+        inventory,
+        CandidateIdentity {
+            revision: LOOK_ALL_MODE_PREDECESSOR_REVISION.to_owned(),
+            tree: LOOK_ALL_MODE_PREDECESSOR_TREE.to_owned(),
+            tracked_and_untracked_worktree_clean: true,
+        },
+        REGISTERED_ADAPTERS,
+    )?;
+    validate_all_mode_look_predecessor(inventory, &predecessor)?;
+    if report.payload.candidate.revision == LOOK_ALL_MODE_PREDECESSOR_REVISION
+        || report.payload.candidate.tree == LOOK_ALL_MODE_PREDECESSOR_TREE
+        || report.payload.counts
+            != (RegexAutomataAdapterCounts {
+                pass: 129,
+                unsupported: 3_713,
+                fault: 0,
+                total: 3_842,
+            })
+    {
+        return Err(InventoryError::new(
+            "all-mode look candidate identity or counts mismatch",
+        ));
+    }
+
+    let assigned = new_mode_look_identities(inventory)?;
+    for ((old, current), obligation) in predecessor
+        .payload
+        .receipts
+        .iter()
+        .zip(&report.payload.receipts)
+        .zip(&inventory.payload.obligations)
+    {
+        let identity = obligation_membership_identity(obligation);
+        if assigned.contains(&identity) {
+            if !matches!(
+                current.disposition,
+                RegexAutomataAdapterDisposition::Pass { .. }
+            ) {
+                return Err(InventoryError::new(
+                    "all-mode look target did not become a pass",
+                ));
+            }
+        } else if current != old {
+            return Err(InventoryError::new(
+                "all-mode look report changed a non-target disposition",
+            ));
+        }
+    }
+    validate_all_mode_transition_seals(report, &assigned)?;
+
+    validate_all_mode_look_receipts(inventory, report, matrix, &predecessor, &assigned)
+}
+
+fn validate_all_mode_look_receipts(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+    matrix: &RegexAutomataLookModeMatrix,
+    predecessor: &RegexAutomataAdapterReport,
+    assigned: &BTreeSet<(String, RegexAutomataHarnessKind, String)>,
+) -> Result<(), InventoryError> {
+    let matrix_receipts = matrix
+        .payload
+        .receipts
+        .iter()
+        .map(|receipt| (receipt.mode_id.as_str(), receipt))
+        .collect::<BTreeMap<_, _>>();
+    let predecessor_executions = predecessor
+        .payload
+        .execution_receipts
+        .iter()
+        .map(|execution| {
+            (
+                (
+                    execution.mode.mode_id.clone(),
+                    execution.harness,
+                    execution.case_id.clone(),
+                ),
+                execution,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut executions = BTreeMap::new();
+    for execution in &report.payload.execution_receipts {
+        let identity = (
+            execution.mode.mode_id.clone(),
+            execution.harness,
+            execution.case_id.clone(),
+        );
+        if executions.insert(identity.clone(), execution).is_some() {
+            return Err(InventoryError::new(
+                "duplicate all-mode look execution receipt",
+            ));
+        }
+        if assigned.contains(&identity) {
+            let mode_receipt = matrix_receipts
+                .get(execution.mode.mode_id.as_str())
+                .ok_or_else(|| InventoryError::new("execution lacks a matrix mode"))?;
+            let case = reviewed_look_case(&execution.case_id)
+                .ok_or_else(|| InventoryError::new("execution has an unreviewed look case"))?;
+            let expected_assertions = run_look_case_matrix_observer(case)
+                .map_err(|reason| InventoryError::new(normalized_reason(&reason)))?;
+            if execution.mode
+                != matrix_mode_execution(inventory, matrix.payload_sha256.as_str(), mode_receipt)?
+                || execution.harness != RegexAutomataHarnessKind::Unit
+                || execution.source != source_contract(&case.source)
+                || execution.assertion_executions != expected_assertions
+            {
+                return Err(InventoryError::new(
+                    "all-mode look execution evidence mismatch",
+                ));
+            }
+        } else if predecessor_executions.get(&identity) != Some(&execution) {
+            return Err(InventoryError::new(
+                "all-mode look report altered or added non-target execution evidence",
+            ));
+        }
+    }
+    if executions.len() != 129
+        || predecessor_executions
+            .keys()
+            .any(|identity| !executions.contains_key(identity))
+        || assigned
+            .iter()
+            .any(|identity| !executions.contains_key(identity))
+    {
+        return Err(InventoryError::new(
+            "all-mode look execution evidence denominator mismatch",
+        ));
+    }
+    for receipt in &report.payload.receipts {
+        let identity = (
+            receipt.mode_id.clone(),
+            receipt.harness,
+            receipt.case_id.clone(),
+        );
+        match &receipt.disposition {
+            RegexAutomataAdapterDisposition::Pass { evidence_sha256 } => {
+                let execution = executions.get(&identity).ok_or_else(|| {
+                    InventoryError::new("all-mode look pass lacks execution evidence")
+                })?;
+                if hash_json(*execution, "encode all-mode look execution")? != *evidence_sha256 {
+                    return Err(InventoryError::new(
+                        "all-mode look pass evidence seal mismatch",
+                    ));
+                }
+            }
+            RegexAutomataAdapterDisposition::Unsupported { .. } => {
+                if executions.contains_key(&identity) {
+                    return Err(InventoryError::new(
+                        "unsupported membership has all-mode execution evidence",
+                    ));
+                }
+            }
+            RegexAutomataAdapterDisposition::Fault { .. } => {
+                return Err(InventoryError::new("all-mode look report contains a fault"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_limitations(schema: &str) -> Result<&'static [&'static str], InventoryError> {
+    if schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        Ok(MIXED_DEFAULT_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+        Ok(ALL_MODE_LOOK_REPORT_LIMITATIONS.as_slice())
+    } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
+    } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        Ok(LEGACY_REPORT_LIMITATIONS.as_slice())
+    } else {
+        Err(InventoryError::new(
+            "regex-automata adapter report schema mismatch",
+        ))
+    }
+}
+
 impl RegexAutomataAdapterReport {
     /// Validate the full inventory identity, candidate identity, exact receipt
     /// order, per-case consistency, counts and payload seal.
@@ -2427,17 +3094,7 @@ impl RegexAutomataAdapterReport {
         inventory: &RegexAutomataCorpusReport,
     ) -> Result<(), InventoryError> {
         inventory.validate()?;
-        let limitations = if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            MIXED_DEFAULT_REPORT_LIMITATIONS.as_slice()
-        } else if self.schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice()
-        } else if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
-            LEGACY_REPORT_LIMITATIONS.as_slice()
-        } else {
-            return Err(InventoryError::new(
-                "regex-automata adapter report schema mismatch",
-            ));
-        };
+        let limitations = report_limitations(self.schema.as_str())?;
         let expected_payload_sha256 = if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
         {
             hash_json(
@@ -2468,6 +3125,7 @@ impl RegexAutomataAdapterReport {
                 "regex-automata adapter report identity mismatch",
             ));
         }
+        validate_adapter_report_size_contract(self)?;
         validate_candidate(&self.payload.candidate)?;
         if self.payload.receipts.len() != inventory.payload.obligations.len() {
             return Err(InventoryError::new(
@@ -2495,6 +3153,13 @@ impl RegexAutomataAdapterReport {
                 "regex-automata adapter disposition counts mismatch",
             ));
         }
+        if self.schema != REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
+            && self.payload.look_mode_matrix.is_some()
+        {
+            return Err(InventoryError::new(
+                "legacy regex-automata report unexpectedly embeds a look-mode matrix",
+            ));
+        }
         if self.schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
             if !self.payload.execution_receipts.is_empty()
                 || self.payload.counts.pass != 0
@@ -2513,6 +3178,9 @@ impl RegexAutomataAdapterReport {
             }
             return Ok(());
         }
+        if self.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+            return validate_all_mode_look_execution_after_structure(inventory, self);
+        }
         validate_execution_receipt_set(inventory, self, report_registry(self.schema.as_str())?)?;
         Ok(())
     }
@@ -2524,7 +3192,9 @@ impl RegexAutomataAdapterReport {
         self.validate_structure(inventory)?;
         if self.schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
             validate_regex_automata_predecessor_execution(inventory, self)?;
-        } else if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
+        } else if self.schema == REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA
+        {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
             ));
@@ -2662,7 +3332,11 @@ pub fn read_regex_automata_adapter_report(
     path: &Path,
     inventory: &RegexAutomataCorpusReport,
 ) -> Result<RegexAutomataAdapterReport, InventoryError> {
-    let bytes = read_owned_regular(path)?;
+    let bytes = read_owned_regular(
+        path,
+        REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES,
+        "regex-automata adapter report",
+    )?;
     let report = serde_json::from_slice(&bytes).map_err(|error| {
         InventoryError::new(format!("decode regex-automata adapter report: {error}"))
     })?;
@@ -2676,7 +3350,11 @@ pub fn read_regex_automata_gap_assignment(
     inventory: &RegexAutomataCorpusReport,
     baseline: &RegexAutomataAdapterReport,
 ) -> Result<RegexAutomataGapAssignment, InventoryError> {
-    let bytes = read_owned_regular(path)?;
+    let bytes = read_owned_regular(
+        path,
+        REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES,
+        "regex-automata gap assignment",
+    )?;
     let assignment = serde_json::from_slice(&bytes).map_err(|error| {
         InventoryError::new(format!("decode regex-automata gap assignment: {error}"))
     })?;
@@ -2690,8 +3368,18 @@ pub fn write_regex_automata_adapter_report(
     report: &RegexAutomataAdapterReport,
     inventory: &RegexAutomataCorpusReport,
 ) -> Result<(), InventoryError> {
-    validate_regex_automata_adapter_execution(inventory, report)?;
-    write_new_json(path, report)
+    if report.schema == REGEX_AUTOMATA_ALL_MODE_LOOK_REPORT_SCHEMA {
+        validate_all_mode_look_execution(inventory, report)?;
+    } else {
+        validate_regex_automata_adapter_execution(inventory, report)?;
+    }
+    write_new_json(
+        path,
+        report,
+        REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES,
+        false,
+        "regex-automata adapter report",
+    )
 }
 
 /// Atomically publish one assignment without replacement.
@@ -2702,7 +3390,13 @@ pub fn write_regex_automata_gap_assignment(
     baseline: &RegexAutomataAdapterReport,
 ) -> Result<(), InventoryError> {
     assignment.validate(inventory, baseline)?;
-    write_new_json(path, assignment)
+    write_new_json(
+        path,
+        assignment,
+        REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES,
+        true,
+        "regex-automata gap assignment",
+    )
 }
 
 fn pending_clusters(
@@ -2774,6 +3468,95 @@ fn obligation_membership_identity(
     )
 }
 
+fn adapter_receipt_identity(
+    receipt: &RegexAutomataAdapterReceipt,
+) -> (String, RegexAutomataHarnessKind, String) {
+    (
+        receipt.mode_id.clone(),
+        receipt.harness,
+        receipt.case_id.clone(),
+    )
+}
+
+fn execution_receipt_identity(
+    receipt: &RegexAutomataExecutionReceipt,
+) -> (String, RegexAutomataHarnessKind, String) {
+    (
+        receipt.mode.mode_id.clone(),
+        receipt.harness,
+        receipt.case_id.clone(),
+    )
+}
+
+fn order_execution_receipts(
+    receipts: &[RegexAutomataAdapterReceipt],
+    executions: Vec<RegexAutomataExecutionReceipt>,
+    label: &str,
+) -> Result<Vec<RegexAutomataExecutionReceipt>, InventoryError> {
+    let mut by_identity = BTreeMap::new();
+    for execution in executions {
+        if by_identity
+            .insert(execution_receipt_identity(&execution), execution)
+            .is_some()
+        {
+            return Err(InventoryError::new(format!(
+                "duplicate {label} execution receipt",
+            )));
+        }
+    }
+    let mut ordered = Vec::with_capacity(by_identity.len());
+    for receipt in receipts {
+        if matches!(
+            receipt.disposition,
+            RegexAutomataAdapterDisposition::Pass { .. }
+        ) {
+            ordered.push(
+                by_identity
+                    .remove(&adapter_receipt_identity(receipt))
+                    .ok_or_else(|| {
+                        InventoryError::new(format!(
+                            "{label} pass lacks its canonical execution receipt",
+                        ))
+                    })?,
+            );
+        }
+    }
+    if !by_identity.is_empty() {
+        return Err(InventoryError::new(format!(
+            "{label} has non-pass execution evidence",
+        )));
+    }
+    Ok(ordered)
+}
+
+fn validate_execution_receipt_order(
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    let mut executions = report.payload.execution_receipts.iter();
+    for receipt in &report.payload.receipts {
+        if !matches!(
+            receipt.disposition,
+            RegexAutomataAdapterDisposition::Pass { .. }
+        ) {
+            continue;
+        }
+        let execution = executions.next().ok_or_else(|| {
+            InventoryError::new("regex-automata pass lacks ordered execution evidence")
+        })?;
+        if execution_receipt_identity(execution) != adapter_receipt_identity(receipt) {
+            return Err(InventoryError::new(
+                "regex-automata execution receipt identity/order mismatch",
+            ));
+        }
+    }
+    if executions.next().is_some() {
+        return Err(InventoryError::new(
+            "regex-automata report has excess ordered execution evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn require_compiled_mode(context: &AdapterContext<'_>) -> Result<(), String> {
     if compiled_mode_id(context.mode.harness) != Some(context.mode.mode_id.as_str())
         || !context.mode.default_features
@@ -2843,6 +3626,7 @@ fn mode_execution(
         features: mode.features.clone(),
         dependency_package: "regex-automata".to_owned(),
         dependency_version: "0.4.14".to_owned(),
+        mode_evidence_sha256: None,
     })
 }
 
@@ -3063,6 +3847,156 @@ fn validate_look_fixture() -> Result<(), InventoryError> {
         LOOK_CASES,
         LOOK_TARGET_IDENTITIES_SHA256,
     )
+}
+
+fn all_mode_look_identities(
+    inventory: &RegexAutomataCorpusReport,
+) -> Result<BTreeSet<(String, RegexAutomataHarnessKind, String)>, InventoryError> {
+    validate_look_fixture()?;
+    let case_ids = LOOK_CASES
+        .iter()
+        .map(|case| case.case_id)
+        .collect::<BTreeSet<_>>();
+    let obligation_identities = inventory
+        .payload
+        .obligations
+        .iter()
+        .map(|obligation| {
+            (
+                obligation.mode_id.as_str(),
+                obligation.harness,
+                obligation.case_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let unit_modes = inventory
+        .payload
+        .modes
+        .iter()
+        .filter(|mode| {
+            mode.harness == RegexAutomataHarnessKind::Unit
+                && case_ids.iter().all(|case_id| {
+                    obligation_identities.contains(&(
+                        mode.id.as_str(),
+                        RegexAutomataHarnessKind::Unit,
+                        *case_id,
+                    ))
+                })
+        })
+        .collect::<Vec<_>>();
+    if unit_modes.len() != 30 {
+        return Err(InventoryError::new(
+            "regex-automata look unit-mode denominator mismatch",
+        ));
+    }
+    let identities = unit_modes
+        .iter()
+        .flat_map(|mode| {
+            LOOK_CASES.iter().map(|case| {
+                (
+                    mode.id.clone(),
+                    RegexAutomataHarnessKind::Unit,
+                    case.case_id.to_owned(),
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let mut canonical = String::new();
+    for (mode_id, harness, case_id) in &identities {
+        if *harness != RegexAutomataHarnessKind::Unit {
+            return Err(InventoryError::new(
+                "regex-automata look target contains a non-unit membership",
+            ));
+        }
+        canonical.push_str(mode_id);
+        canonical.push_str("\tunit\t");
+        canonical.push_str(case_id);
+        canonical.push('\n');
+    }
+    if identities.len() != 120
+        || sha256(canonical.as_bytes()) != LOOK_ALL_MODE_TARGET_IDENTITIES_SHA256
+    {
+        return Err(InventoryError::new(
+            "regex-automata all-mode look target seal mismatch",
+        ));
+    }
+    Ok(identities)
+}
+
+fn new_mode_look_identities(
+    inventory: &RegexAutomataCorpusReport,
+) -> Result<BTreeSet<(String, RegexAutomataHarnessKind, String)>, InventoryError> {
+    let identities = all_mode_look_identities(inventory)?
+        .into_iter()
+        .filter(|(mode_id, _, _)| mode_id != COMPILED_UNIT_MODE_ID)
+        .collect::<BTreeSet<_>>();
+    let mut canonical = String::new();
+    for (mode_id, _, case_id) in &identities {
+        canonical.push_str(mode_id);
+        canonical.push_str("\tunit\t");
+        canonical.push_str(case_id);
+        canonical.push('\n');
+    }
+    if identities.len() != 116
+        || sha256(canonical.as_bytes()) != LOOK_ALL_MODE_NEW_IDENTITIES_SHA256
+    {
+        return Err(InventoryError::new(
+            "regex-automata new-mode look target seal mismatch",
+        ));
+    }
+    Ok(identities)
+}
+
+fn validate_all_mode_transition_seals(
+    report: &RegexAutomataAdapterReport,
+    assigned: &BTreeSet<(String, RegexAutomataHarnessKind, String)>,
+) -> Result<(), InventoryError> {
+    let mut unsupported = Vec::new();
+    let mut unchanged = Vec::new();
+    for receipt in &report.payload.receipts {
+        let identity = (
+            receipt.mode_id.clone(),
+            receipt.harness,
+            receipt.case_id.clone(),
+        );
+        if !assigned.contains(&identity) {
+            unchanged.push(format!(
+                "{}\t{}\t{}\n",
+                receipt.mode_id,
+                harness_name(receipt.harness),
+                receipt.case_id,
+            ));
+        }
+        if let RegexAutomataAdapterDisposition::Unsupported { reason_code } = &receipt.disposition {
+            unsupported.push(format!(
+                "{}\t{}\t{}\tunsupported\t{}\n",
+                receipt.mode_id,
+                harness_name(receipt.harness),
+                receipt.case_id,
+                reason_code,
+            ));
+        }
+    }
+    unsupported.sort_unstable();
+    unchanged.sort_unstable();
+    if unsupported.len() != 3_713
+        || sha256(unsupported.concat().as_bytes()) != LOOK_ALL_MODE_FINAL_UNSUPPORTED_SHA256
+        || unchanged.len() != 3_726
+        || sha256(unchanged.concat().as_bytes()) != LOOK_ALL_MODE_UNCHANGED_IDENTITIES_SHA256
+    {
+        return Err(InventoryError::new(
+            "regex-automata all-mode final disposition seal mismatch",
+        ));
+    }
+    Ok(())
+}
+
+const fn harness_name(harness: RegexAutomataHarnessKind) -> &'static str {
+    match harness {
+        RegexAutomataHarnessKind::Unit => "unit",
+        RegexAutomataHarnessKind::Integration => "integration",
+        RegexAutomataHarnessKind::Doctest => "doctest",
+    }
 }
 
 fn validate_look_fixture_parts(
@@ -3491,6 +4425,56 @@ struct LegacyAdapterPayload<'a> {
     limitations: &'a [String],
 }
 
+#[derive(Serialize)]
+struct AdapterReportEnvelope<'a> {
+    schema: &'a str,
+    payload_sha256: &'a str,
+    payload: AdapterPayloadEnvelope<'a>,
+}
+
+#[derive(Serialize)]
+struct AdapterPayloadEnvelope<'a> {
+    inventory_payload_sha256: &'a str,
+    obligation_inventory_sha256: &'a str,
+    candidate: &'a CandidateIdentity,
+    counts: &'a RegexAutomataAdapterCounts,
+    receipts: &'a [RegexAutomataAdapterReceipt],
+    execution_receipts: &'a [RegexAutomataExecutionReceipt],
+    limitations: &'a [String],
+}
+
+fn validate_adapter_report_size_contract(
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    let envelope = AdapterReportEnvelope {
+        schema: &report.schema,
+        payload_sha256: &report.payload_sha256,
+        payload: AdapterPayloadEnvelope {
+            inventory_payload_sha256: &report.payload.inventory_payload_sha256,
+            obligation_inventory_sha256: &report.payload.obligation_inventory_sha256,
+            candidate: &report.payload.candidate,
+            counts: &report.payload.counts,
+            receipts: &report.payload.receipts,
+            execution_receipts: &report.payload.execution_receipts,
+            limitations: &report.payload.limitations,
+        },
+    };
+    let envelope_bytes = serde_json::to_vec(&envelope)
+        .map_err(|error| InventoryError::new(format!("encode adapter envelope: {error}")))?;
+    require_file_size(
+        envelope_bytes.len(),
+        REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES,
+        "regex-automata adapter envelope",
+    )?;
+    let report_bytes = serde_json::to_vec(report)
+        .map_err(|error| InventoryError::new(format!("encode adapter report: {error}")))?;
+    require_file_size(
+        report_bytes.len(),
+        REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES,
+        "regex-automata adapter report",
+    )
+}
+
 fn normalized_reason(reason: &str) -> String {
     let normalized = reason
         .bytes()
@@ -3541,23 +4525,83 @@ fn hash_json(value: &impl Serialize, context: &str) -> Result<String, InventoryE
         .map_err(|error| InventoryError::new(format!("{context}: {error}")))
 }
 
-fn read_owned_regular(path: &Path) -> Result<Vec<u8>, InventoryError> {
+fn require_file_size(
+    json_bytes: usize,
+    maximum_file_bytes: usize,
+    label: &str,
+) -> Result<(), InventoryError> {
+    if json_bytes
+        .checked_add(1)
+        .is_none_or(|file_bytes| file_bytes > maximum_file_bytes)
+    {
+        return Err(InventoryError::new(format!(
+            "{label} exceeds its maximum file size",
+        )));
+    }
+    Ok(())
+}
+
+fn read_owned_regular(
+    path: &Path,
+    maximum_file_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, InventoryError> {
+    let maximum_u64 = u64::try_from(maximum_file_bytes)
+        .map_err(|_| InventoryError::new(format!("{label} size limit does not fit u64")))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| InventoryError::new(format!("stat {}: {error}", path.display())))?;
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.uid() != unsafe_free_euid()
         || metadata.nlink() != 1
-        || metadata.len() > 8 * 1_048_576
+        || metadata.len() == 0
+        || metadata.len() > maximum_u64
     {
-        return Err(InventoryError::new(
-            "unsafe regex-automata progress artifact",
-        ));
+        return Err(InventoryError::new(format!("unsafe {label}")));
     }
-    fs::read(path).map_err(|error| InventoryError::new(format!("read {}: {error}", path.display())))
+    let mut input = fs::File::open(path)
+        .map_err(|error| InventoryError::new(format!("open {}: {error}", path.display())))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .map_err(|_| InventoryError::new(format!("{label} length does not fit usize")))?,
+    );
+    Read::by_ref(&mut input)
+        .take(maximum_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| InventoryError::new(format!("read {}: {error}", path.display())))?;
+    if bytes.len() > maximum_file_bytes || u64::try_from(bytes.len()) != Ok(metadata.len()) {
+        return Err(InventoryError::new(format!(
+            "{label} changed while being read"
+        )));
+    }
+    Ok(bytes)
 }
 
-fn write_new_json(path: &Path, value: &impl Serialize) -> Result<(), InventoryError> {
+fn encode_bounded_json(
+    value: &impl Serialize,
+    maximum_file_bytes: usize,
+    pretty: bool,
+    label: &str,
+) -> Result<Vec<u8>, InventoryError> {
+    let mut bytes = if pretty {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    }
+    .map_err(|error| InventoryError::new(format!("encode {label}: {error}")))?;
+    require_file_size(bytes.len(), maximum_file_bytes, label)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_new_json(
+    path: &Path,
+    value: &impl Serialize,
+    maximum_file_bytes: usize,
+    pretty: bool,
+    label: &str,
+) -> Result<(), InventoryError> {
+    let bytes = encode_bounded_json(value, maximum_file_bytes, pretty, label)?;
     if fs::symlink_metadata(path).is_ok() {
         return Err(InventoryError::new(format!(
             "output exists: {}",
@@ -3586,9 +4630,6 @@ fn write_new_json(path: &Path, value: &impl Serialize) -> Result<(), InventoryEr
         .mode(0o600)
         .open(&temporary)
         .map_err(|error| InventoryError::new(format!("create output: {error}")))?;
-    let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| InventoryError::new(format!("encode output: {error}")))?;
-    bytes.push(b'\n');
     let result = (|| {
         output
             .write_all(&bytes)
@@ -3729,6 +4770,7 @@ mod tests {
             counts: adapter_counts(&receipts),
             receipts,
             execution_receipts,
+            look_mode_matrix: None,
             limitations: DOCTEST_ONLY_REPORT_LIMITATIONS
                 .iter()
                 .map(|text| (*text).to_owned())
@@ -3766,6 +4808,16 @@ mod tests {
         )
     }
 
+    fn authenticated_look_mode_matrix() -> RegexAutomataLookModeMatrix {
+        let path = std::env::var_os("FRE_REGEX_AUTOMATA_LOOK_MODE_MATRIX")
+            .map(std::path::PathBuf::from)
+            .expect("set FRE_REGEX_AUTOMATA_LOOK_MODE_MATRIX");
+        let bytes = fs::read(path).unwrap();
+        let matrix: RegexAutomataLookModeMatrix = serde_json::from_slice(&bytes).unwrap();
+        matrix.validate().unwrap();
+        matrix
+    }
+
     #[test]
     fn authenticated_predecessor_manifest_replays_exact_nine() {
         validate_predecessor_registry_manifest(PREDECESSOR_REGISTERED_ADAPTERS).unwrap();
@@ -3774,6 +4826,157 @@ mod tests {
         assert_eq!(previous.payload.counts.pass, 9);
         assert_eq!(previous.payload.counts.unsupported, 0);
         assert_eq!(previous.payload.execution_receipts.len(), 9);
+    }
+
+    #[test]
+    fn execution_receipts_are_a_canonical_ordered_vector() {
+        let authentic = predecessor_report_fixture();
+        validate_execution_receipt_order(&authentic).unwrap();
+        let expected = authentic.payload.execution_receipts.clone();
+
+        let mut reordered = authentic.clone();
+        reordered.payload.execution_receipts.swap(0, 1);
+        reseal_report(&mut reordered);
+        assert!(validate_execution_receipt_order(&reordered).is_err());
+
+        let restored = order_execution_receipts(
+            &reordered.payload.receipts,
+            reordered.payload.execution_receipts,
+            "reorder test",
+        )
+        .unwrap();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn all_mode_candidate_provenance_rejects_resealed_oids_and_wrong_parents() {
+        let parent = "a".repeat(40);
+        let authenticated = candidate('b', 'c');
+        let exact = format!("{} {parent}", authenticated.revision);
+        validate_all_mode_candidate_provenance(
+            &authenticated,
+            &authenticated,
+            &authenticated.tree,
+            &exact,
+            &parent,
+        )
+        .unwrap();
+
+        let forged_revision = candidate('d', 'c');
+        assert!(
+            validate_all_mode_candidate_provenance(
+                &forged_revision,
+                &authenticated,
+                &authenticated.tree,
+                &exact,
+                &parent,
+            )
+            .is_err(),
+        );
+        let forged_tree = candidate('b', 'd');
+        assert!(
+            validate_all_mode_candidate_provenance(
+                &forged_tree,
+                &authenticated,
+                &authenticated.tree,
+                &exact,
+                &parent,
+            )
+            .is_err(),
+        );
+        assert!(
+            validate_all_mode_candidate_provenance(
+                &authenticated,
+                &authenticated,
+                &"d".repeat(40),
+                &exact,
+                &parent,
+            )
+            .is_err(),
+        );
+        for invalid_parents in [
+            authenticated.revision.clone(),
+            format!("{} {}", authenticated.revision, "e".repeat(40)),
+            format!("{} {parent} {}", authenticated.revision, "f".repeat(40),),
+            format!("{} malformed", authenticated.revision),
+        ] {
+            assert!(
+                validate_all_mode_candidate_provenance(
+                    &authenticated,
+                    &authenticated,
+                    &authenticated.tree,
+                    &invalid_parents,
+                    &parent,
+                )
+                .is_err(),
+            );
+        }
+    }
+
+    #[test]
+    fn progress_json_size_limits_include_the_wire_newline() {
+        assert_eq!(
+            REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES,
+            32 * 1_048_576 + LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES,
+        );
+        let value = BTreeMap::from([("key", "value")]);
+        let mut expected = serde_json::to_vec_pretty(&value).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            encode_bounded_json(&value, expected.len(), true, "boundary test").unwrap(),
+            expected,
+        );
+        assert!(encode_bounded_json(&value, expected.len() - 1, true, "boundary test").is_err(),);
+    }
+
+    #[test]
+    fn progress_reader_and_writer_enforce_the_same_inclusive_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "fre-automata-progress-size-test-{}",
+            std::process::id(),
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+
+        let value = BTreeMap::from([("key", "value")]);
+        let mut expected = serde_json::to_vec_pretty(&value).unwrap();
+        expected.push(b'\n');
+        let exact = root.join("exact.json");
+        write_new_json(
+            &exact,
+            &value,
+            expected.len(),
+            true,
+            "boundary test artifact",
+        )
+        .unwrap();
+        assert_eq!(
+            read_owned_regular(&exact, expected.len(), "boundary test artifact").unwrap(),
+            expected,
+        );
+
+        let rejected = root.join("rejected.json");
+        assert!(
+            write_new_json(
+                &rejected,
+                &value,
+                expected.len() - 1,
+                true,
+                "boundary test artifact",
+            )
+            .is_err(),
+        );
+        assert!(!rejected.exists());
+        assert!(
+            !root
+                .join(format!(".rejected.json.tmp.{}", std::process::id(),))
+                .exists(),
+        );
+
+        let oversized = root.join("oversized.json");
+        fs::write(&oversized, vec![b'x'; expected.len() + 1]).unwrap();
+        assert!(read_owned_regular(&oversized, expected.len(), "boundary test artifact").is_err(),);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4028,6 +5231,150 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires exact-036 inventory and a separately executed 30-mode matrix"]
+    fn authenticated_all_mode_look_gain_is_exact_129_and_fails_closed() {
+        let (inventory, _) = authenticated_exact_036_evidence();
+        let previous = build_adapter_report_with_registry(
+            &inventory,
+            CandidateIdentity {
+                revision: LOOK_ALL_MODE_PREDECESSOR_REVISION.to_owned(),
+                tree: LOOK_ALL_MODE_PREDECESSOR_TREE.to_owned(),
+                tracked_and_untracked_worktree_clean: true,
+            },
+            REGISTERED_ADAPTERS,
+        )
+        .unwrap();
+        let matrix = authenticated_look_mode_matrix();
+        let current = build_regex_automata_all_mode_look_report(
+            &inventory,
+            &previous,
+            matrix,
+            candidate('e', 'f'),
+        )
+        .unwrap();
+        assert_eq!(
+            current.payload.counts,
+            RegexAutomataAdapterCounts {
+                pass: 129,
+                unsupported: 3_713,
+                fault: 0,
+                total: 3_842,
+            },
+        );
+        validate_execution_receipt_order(&current).unwrap();
+        assert_eq!(current.payload.execution_receipts.len(), 129);
+        let assigned = new_mode_look_identities(&inventory).unwrap();
+        validate_all_mode_transition_seals(&current, &assigned).unwrap();
+        let gain = validate_regex_automata_all_mode_look_strict_gain_against_candidate(
+            &inventory,
+            &previous,
+            &current,
+            &current.payload.candidate,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                gain.gained_unique_cases,
+                gain.gained_mode_memberships,
+                gain.previous_pass,
+                gain.current_pass,
+            ),
+            (4, 116, 13, 129),
+        );
+
+        assert_all_mode_look_tamper_rejections(&inventory, &current, &assigned);
+    }
+
+    fn assert_all_mode_look_tamper_rejections(
+        inventory: &RegexAutomataCorpusReport,
+        current: &RegexAutomataAdapterReport,
+        assigned: &BTreeSet<(String, RegexAutomataHarnessKind, String)>,
+    ) {
+        let first_target = assigned.iter().next().unwrap().clone();
+        let mut reordered = current.clone();
+        reordered.payload.execution_receipts.swap(0, 1);
+        reseal_report(&mut reordered);
+        assert!(reordered.validate(inventory).is_err());
+
+        let mut downgraded = current.clone();
+        downgraded
+            .payload
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                (
+                    receipt.mode_id.as_str(),
+                    receipt.harness,
+                    receipt.case_id.as_str(),
+                ) == (
+                    first_target.0.as_str(),
+                    first_target.1,
+                    first_target.2.as_str(),
+                )
+            })
+            .unwrap()
+            .disposition = RegexAutomataAdapterDisposition::Unsupported {
+            reason_code: INVENTORY_UNSUPPORTED_REASON.to_owned(),
+        };
+        downgraded.payload.execution_receipts.retain(|execution| {
+            (
+                execution.mode.mode_id.as_str(),
+                execution.harness,
+                execution.case_id.as_str(),
+            ) != (
+                first_target.0.as_str(),
+                first_target.1,
+                first_target.2.as_str(),
+            )
+        });
+        reseal_report(&mut downgraded);
+        assert!(downgraded.validate(inventory).is_err());
+
+        let mut evidence_swap = current.clone();
+        let execution = evidence_swap
+            .payload
+            .execution_receipts
+            .iter_mut()
+            .find(|execution| {
+                (
+                    execution.mode.mode_id.as_str(),
+                    execution.harness,
+                    execution.case_id.as_str(),
+                ) == (
+                    first_target.0.as_str(),
+                    first_target.1,
+                    first_target.2.as_str(),
+                )
+            })
+            .unwrap();
+        execution.mode.mode_evidence_sha256 = Some("0".repeat(64));
+        reseal_report(&mut evidence_swap);
+        assert!(evidence_swap.validate(inventory).is_err());
+
+        let mut non_target = current.clone();
+        let receipt = non_target
+            .payload
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                !assigned.contains(&(
+                    receipt.mode_id.clone(),
+                    receipt.harness,
+                    receipt.case_id.clone(),
+                )) && matches!(
+                    receipt.disposition,
+                    RegexAutomataAdapterDisposition::Unsupported { .. }
+                )
+            })
+            .unwrap();
+        receipt.disposition = RegexAutomataAdapterDisposition::Pass {
+            evidence_sha256: "1".repeat(64),
+        };
+        reseal_report(&mut non_target);
+        assert!(non_target.validate(inventory).is_err());
+    }
+
+    #[test]
     fn predecessor_authority_rejects_resealed_pass_downgrades() {
         let authentic = predecessor_report_fixture();
         for case_id in PREDECESSOR_REGISTERED_ADAPTERS
@@ -4272,6 +5619,7 @@ mod tests {
             features: Vec::new(),
             dependency_package: "regex-automata".to_owned(),
             dependency_version: "0.4.14".to_owned(),
+            mode_evidence_sha256: None,
         }
     }
 
@@ -4284,6 +5632,7 @@ mod tests {
             features: Vec::new(),
             dependency_package: "regex-automata".to_owned(),
             dependency_version: "0.4.14".to_owned(),
+            mode_evidence_sha256: None,
         }
     }
 
