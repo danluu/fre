@@ -771,7 +771,13 @@ fn execute_vector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::RegexAutomataAdapterReceipt;
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, MetadataExt},
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn unicode_word_look_fixture_is_complete_and_exact() {
@@ -923,26 +929,19 @@ mod tests {
     #[test]
     #[ignore = "requires authenticated external inventory/report fixtures"]
     fn authenticated_v5_v6_validators_reject_adversarial_mutations() {
-        let inventory_path = std::env::var("FRE_UNICODE_INVENTORY").unwrap();
-        let predecessor_path = std::env::var("FRE_UNICODE_V5").unwrap();
+        let inventory_path = authenticated_fixture(
+            "FRE_UNICODE_INVENTORY",
+            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2",
+        );
+        let predecessor_path = authenticated_fixture(
+            "FRE_UNICODE_V5",
+            "b8295fa5b519b7bfd9f90d919395a67142360f4458b0b642d097c864d965a126",
+        );
         let candidate_revision = std::env::var("FRE_UNICODE_FINAL_REVISION").unwrap();
         let candidate_tree = std::env::var("FRE_UNICODE_FINAL_TREE").unwrap();
-        assert_eq!(
-            crate::sha256(&std::fs::read(&inventory_path).unwrap()),
-            "b6c4ff208f546f2b45d9a37d1f5508680d0c2a6e29c0e59df9f4b96f1dcdfbe2"
-        );
-        assert_eq!(
-            crate::sha256(&std::fs::read(&predecessor_path).unwrap()),
-            "b8295fa5b519b7bfd9f90d919395a67142360f4458b0b642d097c864d965a126"
-        );
-        let inventory =
-            crate::read_regex_automata_corpus_report(PathBuf::from(inventory_path).as_path())
-                .unwrap();
-        let predecessor = crate::read_regex_automata_adapter_report(
-            PathBuf::from(predecessor_path).as_path(),
-            &inventory,
-        )
-        .unwrap();
+        let inventory = crate::read_regex_automata_corpus_report(&inventory_path).unwrap();
+        let predecessor =
+            crate::read_regex_automata_adapter_report(&predecessor_path, &inventory).unwrap();
         let current = build_regex_automata_unicode_word_look_report(
             &inventory,
             &predecessor,
@@ -962,49 +961,318 @@ mod tests {
         )
         .unwrap();
 
-        let mut wrong_predecessor = predecessor.clone();
-        wrong_predecessor.payload.candidate.revision = "wrong".to_owned();
-        wrong_predecessor.payload_sha256 = hash_json(&wrong_predecessor.payload, "test").unwrap();
-        assert!(validate_predecessor(&inventory, &wrong_predecessor).is_err());
+        assert_predecessor_mutations_rejected(&inventory, &predecessor);
+        assert_report_contract_mutations_rejected(&inventory, &predecessor, &current);
+        assert_retained_mutations_rejected(&inventory, &predecessor, &current);
+        assert_target_mutations_rejected(&inventory, &predecessor, &current);
+        assert_writer_boundary(&inventory, &current);
+    }
+
+    fn assert_predecessor_mutations_rejected(
+        inventory: &RegexAutomataCorpusReport,
+        predecessor: &RegexAutomataAdapterReport,
+    ) {
+        let mut wrong_predecessor_revision = predecessor.clone();
+        wrong_predecessor_revision.payload.candidate.revision = "0".repeat(40);
+        reseal(&mut wrong_predecessor_revision);
+        assert!(validate_predecessor(inventory, &wrong_predecessor_revision).is_err());
+
+        let mut wrong_predecessor_tree = predecessor.clone();
+        wrong_predecessor_tree.payload.candidate.tree = "1".repeat(40);
+        reseal(&mut wrong_predecessor_tree);
+        assert!(validate_predecessor(inventory, &wrong_predecessor_tree).is_err());
+    }
+
+    fn assert_report_contract_mutations_rejected(
+        inventory: &RegexAutomataCorpusReport,
+        predecessor: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
         let mut changed_limitations = current.clone();
         changed_limitations.payload.limitations[0].push('x');
-        changed_limitations.payload_sha256 =
-            hash_json(&changed_limitations.payload, "test").unwrap();
-        assert!(changed_limitations.validate_structure(&inventory).is_err());
+        reseal(&mut changed_limitations);
+        assert_current_rejected(inventory, predecessor, &changed_limitations);
+
         let mut changed_matrix = current.clone();
         changed_matrix.payload.look_mode_matrix = None;
-        changed_matrix.payload_sha256 = hash_json(&changed_matrix.payload, "test").unwrap();
-        assert!(changed_matrix.validate_structure(&inventory).is_err());
-        let mut wrong_mode = current.clone();
-        wrong_mode.payload.receipts[0].mode_id = "wrong-mode".to_owned();
-        wrong_mode.payload_sha256 = hash_json(&wrong_mode.payload, "test").unwrap();
-        assert!(wrong_mode.validate_structure(&inventory).is_err());
+        reseal(&mut changed_matrix);
+        assert_current_rejected(inventory, predecessor, &changed_matrix);
+    }
+
+    fn assert_retained_mutations_rejected(
+        inventory: &RegexAutomataCorpusReport,
+        predecessor: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        let retained_identity = (
+            COMPILED_UNIT_MODE_ID,
+            RegexAutomataHarnessKind::Unit,
+            "util::look::tests::look_matches_end_line",
+        );
+        let mut changed_retained_receipt = current.clone();
+        let retained_receipt = exact_receipt_mut(&mut changed_retained_receipt, retained_identity);
+        let RegexAutomataAdapterDisposition::Pass { evidence_sha256 } =
+            &mut retained_receipt.disposition
+        else {
+            panic!("retained non-target receipt is not a pass");
+        };
+        *evidence_sha256 = "2".repeat(64);
+        reseal(&mut changed_retained_receipt);
+        assert_current_rejected(inventory, predecessor, &changed_retained_receipt);
+
+        let mut changed_retained_execution = current.clone();
+        let retained_evidence_sha256 = {
+            let execution = exact_execution_mut(&mut changed_retained_execution, retained_identity);
+            let observation = &mut execution
+                .assertion_executions
+                .first_mut()
+                .expect("retained execution has an assertion")
+                .fre_observation;
+            *observation = if observation == "bool:true" {
+                "bool:false".to_owned()
+            } else {
+                "bool:true".to_owned()
+            };
+            hash_json(execution, "encode mutated retained execution").unwrap()
+        };
+        let retained_receipt =
+            exact_receipt_mut(&mut changed_retained_execution, retained_identity);
+        let RegexAutomataAdapterDisposition::Pass { evidence_sha256 } =
+            &mut retained_receipt.disposition
+        else {
+            panic!("retained non-target receipt is not a pass");
+        };
+        *evidence_sha256 = retained_evidence_sha256;
+        reseal(&mut changed_retained_execution);
+        assert_current_rejected(inventory, predecessor, &changed_retained_execution);
+    }
+
+    fn assert_target_mutations_rejected(
+        inventory: &RegexAutomataCorpusReport,
+        predecessor: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        let target_identity = (
+            COMPILED_UNIT_MODE_ID,
+            RegexAutomataHarnessKind::Unit,
+            "util::look::tests::look_matches_word_unicode",
+        );
+        let mut wrong_target_mode = current.clone();
+        exact_execution_mut(&mut wrong_target_mode, target_identity)
+            .mode
+            .mode_id = "vcs-all-features-unit".to_owned();
+        reseal(&mut wrong_target_mode);
+        assert_current_rejected(inventory, predecessor, &wrong_target_mode);
+
         let mut missing_target = current.clone();
-        missing_target.payload.execution_receipts.pop();
-        missing_target.payload_sha256 = hash_json(&missing_target.payload, "test").unwrap();
-        assert!(missing_target.validate_structure(&inventory).is_err());
-        let mut duplicate_target = current.clone();
-        duplicate_target
+        let before = missing_target.payload.execution_receipts.len();
+        missing_target
             .payload
             .execution_receipts
-            .push(duplicate_target.payload.execution_receipts[0].clone());
-        duplicate_target.payload_sha256 = hash_json(&duplicate_target.payload, "test").unwrap();
-        assert!(duplicate_target.validate_structure(&inventory).is_err());
-        let output = std::env::temp_dir().join(format!("fre-unicode-v6-audit-{}", uuid_like()));
-        std::fs::create_dir(&output).unwrap();
-        let output = output.join("positive.json");
-        crate::write_regex_automata_adapter_report(&output, &current, &inventory).unwrap();
+            .retain(|execution| execution_identity_ref(execution) != target_identity);
+        assert_eq!(
+            missing_target
+                .payload
+                .execution_receipts
+                .len()
+                .checked_add(1),
+            Some(before),
+        );
+        reseal(&mut missing_target);
+        assert_current_rejected(inventory, predecessor, &missing_target);
+
+        let mut duplicate_target = current.clone();
+        let duplicate = exact_execution(&duplicate_target, target_identity).clone();
+        duplicate_target.payload.execution_receipts.push(duplicate);
+        reseal(&mut duplicate_target);
+        assert_current_rejected(inventory, predecessor, &duplicate_target);
+    }
+
+    fn assert_writer_boundary(
+        inventory: &RegexAutomataCorpusReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        let mut changed_limitations = current.clone();
+        changed_limitations.payload.limitations[0].push('x');
+        reseal(&mut changed_limitations);
+        let mut output = AuditOutputDirectory::create();
+        let positive = output.path.join("positive.json");
+        let negative = output.path.join("negative.json");
+        assert_absent(&positive);
+        assert_absent(&negative);
+        crate::write_regex_automata_adapter_report(&positive, current, inventory).unwrap();
         assert!(
-            crate::write_regex_automata_adapter_report(&output, &changed_limitations, &inventory)
+            crate::write_regex_automata_adapter_report(&negative, &changed_limitations, inventory,)
                 .is_err()
+        );
+        assert_absent(&negative);
+        fs::remove_file(&positive).unwrap();
+        assert_absent(&positive);
+        fs::remove_dir(&output.path).unwrap();
+        let removed = output.path.clone();
+        output.armed = false;
+        assert_absent(&removed);
+    }
+
+    fn authenticated_fixture(variable: &str, expected_sha256: &str) -> PathBuf {
+        let path = PathBuf::from(std::env::var(variable).expect("authenticated fixture path"));
+        let metadata = fs::symlink_metadata(&path).expect("stat authenticated fixture");
+        assert!(!metadata.file_type().is_symlink());
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), 501);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o777, 0o400);
+        assert_eq!(
+            crate::sha256(&fs::read(&path).expect("read authenticated fixture")),
+            expected_sha256,
+        );
+        path
+    }
+
+    fn reseal(report: &mut RegexAutomataAdapterReport) {
+        report.payload.counts = adapter_counts(&report.payload.receipts);
+        report.payload_sha256 =
+            hash_json(&report.payload, "encode adversarial Unicode payload").unwrap();
+    }
+
+    fn assert_current_rejected(
+        inventory: &RegexAutomataCorpusReport,
+        predecessor: &RegexAutomataAdapterReport,
+        current: &RegexAutomataAdapterReport,
+    ) {
+        assert!(current.validate_structure(inventory).is_err());
+        assert!(
+            crate::validate_regex_automata_unicode_word_look_strict_gain(
+                inventory,
+                predecessor,
+                current,
+            )
+            .is_err()
         );
     }
 
-    fn uuid_like() -> String {
-        format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
+    fn receipt_identity_ref(
+        receipt: &RegexAutomataAdapterReceipt,
+    ) -> (&str, RegexAutomataHarnessKind, &str) {
+        (&receipt.mode_id, receipt.harness, &receipt.case_id)
+    }
+
+    fn execution_identity_ref(
+        execution: &RegexAutomataExecutionReceipt,
+    ) -> (&str, RegexAutomataHarnessKind, &str) {
+        (
+            &execution.mode.mode_id,
+            execution.harness,
+            &execution.case_id,
         )
+    }
+
+    fn exact_receipt_mut<'a>(
+        report: &'a mut RegexAutomataAdapterReport,
+        identity: (&str, RegexAutomataHarnessKind, &str),
+    ) -> &'a mut RegexAutomataAdapterReceipt {
+        let count = report
+            .payload
+            .receipts
+            .iter()
+            .filter(|receipt| receipt_identity_ref(receipt) == identity)
+            .count();
+        assert_eq!(count, 1, "expected exactly one receipt for {identity:?}");
+        report
+            .payload
+            .receipts
+            .iter_mut()
+            .find(|receipt| receipt_identity_ref(receipt) == identity)
+            .unwrap()
+    }
+
+    fn exact_execution<'a>(
+        report: &'a RegexAutomataAdapterReport,
+        identity: (&str, RegexAutomataHarnessKind, &str),
+    ) -> &'a RegexAutomataExecutionReceipt {
+        let count = report
+            .payload
+            .execution_receipts
+            .iter()
+            .filter(|execution| execution_identity_ref(execution) == identity)
+            .count();
+        assert_eq!(count, 1, "expected exactly one execution for {identity:?}");
+        report
+            .payload
+            .execution_receipts
+            .iter()
+            .find(|execution| execution_identity_ref(execution) == identity)
+            .unwrap()
+    }
+
+    fn exact_execution_mut<'a>(
+        report: &'a mut RegexAutomataAdapterReport,
+        identity: (&str, RegexAutomataHarnessKind, &str),
+    ) -> &'a mut RegexAutomataExecutionReceipt {
+        let count = report
+            .payload
+            .execution_receipts
+            .iter()
+            .filter(|execution| execution_identity_ref(execution) == identity)
+            .count();
+        assert_eq!(count, 1, "expected exactly one execution for {identity:?}");
+        report
+            .payload
+            .execution_receipts
+            .iter_mut()
+            .find(|execution| execution_identity_ref(execution) == identity)
+            .unwrap()
+    }
+
+    struct AuditOutputDirectory {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl AuditOutputDirectory {
+        fn create() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock precedes Unix epoch")
+                .as_nanos();
+            for attempt in 0..16_u8 {
+                let path = std::env::temp_dir().join(format!(
+                    "fre-unicode-v6-audit-{}-{nonce}-{attempt}",
+                    std::process::id(),
+                ));
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&path) {
+                    Ok(()) => {
+                        let metadata = fs::symlink_metadata(&path).unwrap();
+                        assert!(!metadata.file_type().is_symlink());
+                        assert!(metadata.file_type().is_dir());
+                        assert_eq!(metadata.uid(), 501);
+                        assert_eq!(metadata.mode() & 0o777, 0o700);
+                        return Self { path, armed: true };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create private audit directory: {error}"),
+                }
+            }
+            panic!("could not allocate a unique private audit directory");
+        }
+    }
+
+    impl Drop for AuditOutputDirectory {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            for name in ["positive.json", "negative.json"] {
+                let _ = fs::remove_file(self.path.join(name));
+            }
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+
+    fn assert_absent(path: &Path) {
+        let error = fs::symlink_metadata(path).expect_err("path unexpectedly exists");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }
