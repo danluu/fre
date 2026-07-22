@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -503,6 +503,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .availability
             .push_str("; fixed-absolute-domain-v1 supports authenticated endpoint, whole-input and start-prefix count/span-sum routes");
+        identity.identity.push_str(
+            "; terminal-greedy-class-v1 authenticates a canonical greedy byte-class plus literal EndText span-sum theorem with full-haystack pre-source P/A",
+        );
+        identity.availability.push_str(
+            "; terminal-greedy-class-v1 verifies the EOF suffix then reverse-scans the maximal predecessor class without allocation or job dispatch",
+        );
         identity
     }
 
@@ -7634,6 +7640,7 @@ fn fixed_absolute_plan_identity_matches(
             LiteralAggregateOperation::SpanSum,
             fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
                 | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
                 | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix,
         ) | (
             true,
@@ -8128,6 +8135,7 @@ fn fixed_absolute_operation_identity_is_closed(
                     descriptor,
                     fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
                         | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                        | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
                         | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
                 )
         }
@@ -13545,9 +13553,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one table-driven test closes all six fixed-domain route contracts"
+        reason = "one table-driven test closes all seven fixed-domain route contracts"
     )]
-    fn current_fre_fixed_absolute_adapter_covers_all_six_generic_routes() {
+    fn current_fre_fixed_absolute_adapter_covers_all_seven_generic_routes() {
         struct Case {
             model: &'static str,
             pattern: &'static str,
@@ -13570,6 +13578,13 @@ mod tests {
                 haystack: b"a".to_vec(),
                 unicode: false,
                 expected: 1,
+            },
+            Case {
+                model: "count-spans",
+                pattern: r"[a-z]*XYZ$",
+                haystack: b"!abcXYZ".to_vec(),
+                unicode: false,
+                expected: 6,
             },
             Case {
                 model: "count",
@@ -14908,7 +14923,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

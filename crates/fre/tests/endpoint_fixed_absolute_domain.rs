@@ -60,11 +60,12 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
 }
 
 #[test]
-fn endpoint_all_six_canonical_hir_shapes_select_the_closed_route() {
+fn endpoint_all_seven_canonical_hir_shapes_select_the_closed_route() {
     let span_patterns = [
         "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$",
         "A[AB]B[BC]C[CD]D[DE]E[EF]F[FG]G[GH]H[HI]I[IJ]J$",
         r"\w$",
+        r"[a-z]*XYZ$",
         r"^zbc(d|e)",
     ];
     for pattern in span_patterns {
@@ -360,7 +361,7 @@ fn endpoint_direct_descriptors_match_forced_continuation_and_never_rebase_anchor
         }
     }
 
-    let span_cases: [(&str, &[&[u8]]); 3] = [
+    let span_cases: [(&str, &[&[u8]]); 4] = [
         (
             "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$",
             &[
@@ -370,6 +371,10 @@ fn endpoint_direct_descriptors_match_forced_continuation_and_never_rebase_anchor
             ],
         ),
         (r"\w$", &[b"a", b"_", b"!", b"two words"]),
+        (
+            r"[a-z]*XYZ$",
+            &[b"XYZ", b"abcXYZ", b"!abcXYZ", b"abcXY", b"abcXYZ\n"],
+        ),
         (
             r"^zbc(d|e)",
             &[b"zbcd-tail", b"zbce-tail", b"xzbcd", b"zbcf"],

@@ -340,6 +340,49 @@ fn classify_span_sum_candidate(
     if parts.len() <= 1 {
         return Ok(Candidate::Ineligible);
     }
+    if let [repeat_hir, suffix_hir, _end] = parts {
+        let Some(repeat_hir) = meter.peel(repeat_hir)? else {
+            return Ok(Candidate::Possible);
+        };
+        if let HirKind::Repetition(repetition) = repeat_hir.kind() {
+            meter.charge(1)?;
+            if repetition.min != 0 || repetition.max.is_some() || !repetition.greedy {
+                return Ok(Candidate::Ineligible);
+            }
+            let Some(class_hir) = meter.peel(&repetition.sub)? else {
+                return Ok(Candidate::Possible);
+            };
+            meter.charge(1)?;
+            let HirKind::Class(Class::Bytes(class)) = class_hir.kind() else {
+                return Ok(Candidate::Ineligible);
+            };
+            if class.ranges().is_empty() {
+                return Ok(Candidate::Ineligible);
+            }
+            meter.charge(class.ranges().len())?;
+            let mut cardinality = 0_usize;
+            for range in class.ranges() {
+                if !candidate_add_bounded(&mut cardinality, range.len(), CANDIDATE_PAYLOAD_LIMIT) {
+                    return Ok(Candidate::Possible);
+                }
+            }
+            let Some(suffix_hir) = meter.peel(suffix_hir)? else {
+                return Ok(Candidate::Possible);
+            };
+            meter.charge(1)?;
+            let HirKind::Literal(suffix) = suffix_hir.kind() else {
+                return Ok(Candidate::Ineligible);
+            };
+            if suffix.0.is_empty() {
+                return Ok(Candidate::Ineligible);
+            }
+            meter.charge(suffix.0.len())?;
+            if suffix.0.len() > CANDIDATE_PAYLOAD_LIMIT {
+                return Ok(Candidate::Possible);
+            }
+            return Ok(Candidate::ProvenEligible);
+        }
+    }
     meter.charge(1)?;
     if parts.len() > CANDIDATE_NODE_LIMIT {
         return Ok(Candidate::Possible);
@@ -463,6 +506,10 @@ pub(crate) enum Inspection<'a> {
 pub(crate) enum Shape<'a> {
     EndMaskSequence(MaskSource<'a>),
     EndOneByteMask(FixedAbsoluteDomainByteMask),
+    EndGreedyClassLiteral {
+        class: FixedAbsoluteDomainByteMask,
+        suffix: &'a [u8],
+    },
     WholeByteRepeat {
         byte: u8,
         minimum: u32,
@@ -493,6 +540,9 @@ impl Shape<'_> {
             }
             Self::EndOneByteMask(mask) => {
                 FixedAbsoluteDomainPlan::end_one_byte_mask_prospective(*mask)
+            }
+            Self::EndGreedyClassLiteral { class, suffix } => {
+                FixedAbsoluteDomainPlan::end_greedy_class_literal_prospective(*class, suffix.len())
             }
             Self::WholeByteRepeat {
                 byte,
@@ -546,6 +596,9 @@ impl Shape<'_> {
             }
             Self::EndOneByteMask(mask) => {
                 FixedAbsoluteDomainPlan::build_end_one_byte_mask(*mask, limits)
+            }
+            Self::EndGreedyClassLiteral { class, suffix } => {
+                FixedAbsoluteDomainPlan::build_end_greedy_class_literal(*class, suffix, limits)
             }
             Self::WholeByteRepeat {
                 byte,
@@ -1033,6 +1086,17 @@ fn inspect_byte_span_sum<'a>(
     let last_end = visitor.probe_look(&parts[last_index], Look::End)?;
     if last_end && !first_start {
         let core = &parts[..last_index];
+        // A failed shape probe may have traversed some nodes that the
+        // incumbent mask inspector must subsequently own. Preserve all
+        // charged work, but commit node/capture ownership only when this
+        // route succeeds so the authenticated syntax census remains exact.
+        let mut terminal_trial = *visitor;
+        if let Some(shape) = inspect_end_greedy_class_literal(core, &mut terminal_trial)? {
+            *visitor = terminal_trial;
+            visitor.expect_look(&parts[last_index], Look::End)?;
+            return Ok(Some(shape));
+        }
+        visitor.work = terminal_trial.work;
         let Some(positions) = visitor.inspect_masks(core)? else {
             return Ok(None);
         };
@@ -1053,6 +1117,47 @@ fn inspect_byte_span_sum<'a>(
         return inspect_start_prefix(core, visitor);
     }
     Ok(None)
+}
+
+fn inspect_end_greedy_class_literal<'a>(
+    core: &'a [Hir],
+    visitor: &mut Visitor,
+) -> Result<Option<Shape<'a>>, InspectionError> {
+    let [repeat_hir, suffix_hir] = core else {
+        return Ok(None);
+    };
+    let repeat_hir = visitor.peel(repeat_hir)?;
+    let HirKind::Repetition(repetition) = repeat_hir.kind() else {
+        return Ok(None);
+    };
+    if repetition.min != 0 || repetition.max.is_some() || !repetition.greedy {
+        return Ok(None);
+    }
+    let class_hir = visitor.peel(&repetition.sub)?;
+    let HirKind::Class(Class::Bytes(class)) = class_hir.kind() else {
+        return Ok(None);
+    };
+    if class.ranges().is_empty() {
+        return Ok(None);
+    }
+    visitor.charge(class.ranges().len())?;
+    let mut mask = FixedAbsoluteDomainByteMask::default();
+    for range in class.ranges() {
+        visitor.charge(range.len())?;
+        mask.insert_inclusive(range.start(), range.end());
+    }
+    let suffix_hir = visitor.peel(suffix_hir)?;
+    let HirKind::Literal(suffix) = suffix_hir.kind() else {
+        return Ok(None);
+    };
+    if suffix.0.is_empty() {
+        return Ok(None);
+    }
+    visitor.charge(suffix.0.len())?;
+    Ok(Some(Shape::EndGreedyClassLiteral {
+        class: mask,
+        suffix: suffix.0.as_ref(),
+    }))
 }
 
 fn inspect_start_prefix<'a>(
@@ -1260,6 +1365,7 @@ fn inspect_whole_anchors<'a>(
     Ok(Some(&parts[1..last]))
 }
 
+#[derive(Clone, Copy)]
 struct Visitor {
     work: usize,
     limit: usize,

@@ -701,6 +701,19 @@ fn endpoint_every_descriptor_has_exact_and_every_positive_one_below_run_fences()
         FixedAbsoluteDomainOperation::SpanSum,
     );
 
+    let terminal_greedy = FixedAbsoluteDomainPlan::build_end_greedy_class_literal(
+        FixedAbsoluteDomainByteMask::inclusive(b'a', b'z'),
+        b"XYZ",
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    assert_every_run_fence(
+        "end-greedy-class-literal",
+        &terminal_greedy,
+        8,
+        FixedAbsoluteDomainOperation::SpanSum,
+    );
+
     let repeat = FixedAbsoluteDomainPlan::build_whole_byte_repeat(
         b'a',
         2,

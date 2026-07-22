@@ -23,11 +23,12 @@ pub const SPAN_SUM_OPERATION_ID: &str = "fixed-absolute-domain.span-sum.v1";
 /// A normalized 256-bit positional byte predicate.
 pub type ByteMask = ByteClass;
 
-/// One of the six closed absolute-domain theorems.
+/// One of the seven closed absolute-domain theorems.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DescriptorKind {
     EndMaskSequence,
     EndOneByteMask,
+    EndGreedyClassLiteral,
     WholeByteRepeat,
     WholeOrderedWords,
     StartOrderedPrefix,
@@ -73,6 +74,7 @@ impl ContentDigestBuilder {
             DescriptorKind::WholeOrderedWords => 4,
             DescriptorKind::StartOrderedPrefix => 5,
             DescriptorKind::WholeScalarEnvelope => 6,
+            DescriptorKind::EndGreedyClassLiteral => 7,
         };
         Self {
             lane0: 0xcbf2_9ce4_8422_2325_u64 ^ domain,
@@ -124,6 +126,9 @@ pub enum DescriptorIdentity {
         width: usize,
     },
     EndOneByteMask,
+    EndGreedyClassLiteral {
+        suffix_bytes: usize,
+    },
     WholeByteRepeat {
         byte: u8,
         minimum: u32,
@@ -150,6 +155,7 @@ impl DescriptorIdentity {
         match self {
             Self::EndMaskSequence { .. } => DescriptorKind::EndMaskSequence,
             Self::EndOneByteMask => DescriptorKind::EndOneByteMask,
+            Self::EndGreedyClassLiteral { .. } => DescriptorKind::EndGreedyClassLiteral,
             Self::WholeByteRepeat { .. } => DescriptorKind::WholeByteRepeat,
             Self::WholeOrderedWords { .. } => DescriptorKind::WholeOrderedWords,
             Self::StartOrderedPrefix { .. } => DescriptorKind::StartOrderedPrefix,
@@ -604,6 +610,10 @@ struct Word {
 enum Descriptor {
     EndMaskSequence(ExactVec<ByteMask>),
     EndOneByteMask(ByteMask),
+    EndGreedyClassLiteral {
+        class: ByteMask,
+        suffix: ExactVec<u8>,
+    },
     WholeByteRepeat {
         byte: u8,
         minimum: u32,
@@ -705,6 +715,195 @@ impl FixedAbsoluteDomainPlan {
         let identity = DescriptorIdentity::EndOneByteMask;
         let mask_bytes = size_of::<ByteMask>();
         prospective(identity, 1, mask_bytes, 0, 0, 0, mask_bytes, 1)
+    }
+
+    /// Complete construction envelope for a greedy byte-class run followed
+    /// by one nonempty literal at the original end of text.
+    #[doc(hidden)]
+    pub fn end_greedy_class_literal_prospective(
+        class: ByteMask,
+        suffix_bytes: usize,
+    ) -> Result<BuildProspective, BuildError> {
+        if class.is_empty() || suffix_bytes == 0 {
+            return Err(build_error(BuildErrorKind::EmptyDescriptor));
+        }
+        let items = suffix_bytes.checked_add(1).ok_or_else(|| {
+            build_error(BuildErrorKind::ArithmeticOverflow {
+                computation: "terminal greedy item count",
+            })
+        })?;
+        let payload_bytes = suffix_bytes
+            .checked_add(size_of::<ByteMask>())
+            .ok_or_else(|| {
+                build_error(BuildErrorKind::ArithmeticOverflow {
+                    computation: "terminal greedy payload bytes",
+                })
+            })?;
+        let build_work = suffix_bytes
+            .checked_add(class.words().len())
+            .and_then(|work| work.checked_add(1))
+            .and_then(|work| u64::try_from(work).ok())
+            .ok_or_else(|| {
+                build_error(BuildErrorKind::ArithmeticOverflow {
+                    computation: "terminal greedy build work",
+                })
+            })?;
+        prospective(
+            DescriptorIdentity::EndGreedyClassLiteral { suffix_bytes },
+            items,
+            payload_bytes,
+            suffix_bytes,
+            suffix_bytes,
+            1,
+            payload_bytes,
+            build_work,
+        )
+    }
+
+    /// Transactionally retain the suffix only after the complete descriptor
+    /// envelope has passed every caller limit. The byte class remains inline.
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "one transaction keeps suffix retention and its cumulative fixed-domain receipt auditable"
+    )]
+    pub fn build_end_greedy_class_literal(
+        class: ByteMask,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        let prospective = Self::end_greedy_class_literal_prospective(class, suffix.len())?;
+        enforce_build(prospective, limits)?;
+        let identity = prospective.descriptor;
+        let mut actual = BuildActual {
+            identity_bytes: FIXED_IDENTITY_BYTES,
+            ..BuildActual::default()
+        };
+        let mut retained = allocate_exact(suffix.len()).map_err(|error| {
+            allocation_error(
+                error,
+                "terminal greedy suffix",
+                suffix.len(),
+                prospective,
+                actual,
+            )
+        })?;
+        actual.allocations = 1;
+        actual.retained_heap_bytes = suffix.len();
+        actual.persistent_bytes = suffix.len();
+        actual.peak_bytes = suffix.len();
+
+        let mut digest = ContentDigestBuilder::new(DescriptorKind::EndGreedyClassLiteral);
+        digest.write_usize(suffix.len());
+        for word in class.words() {
+            digest.write_u64(word);
+            actual.build_work = add_build_u64(
+                actual.build_work,
+                1,
+                "terminal greedy class identity work",
+                prospective,
+                actual,
+            )?;
+        }
+        actual.items = 1;
+        actual.payload_bytes = size_of::<ByteMask>();
+        actual.identity_bytes = actual
+            .identity_bytes
+            .checked_add(size_of::<ByteMask>())
+            .ok_or_else(|| {
+                build_error_with(
+                    BuildErrorKind::ArithmeticOverflow {
+                        computation: "terminal greedy class identity bytes",
+                    },
+                    prospective,
+                    actual,
+                )
+            })?;
+        actual.initialized_bytes = size_of::<ByteMask>();
+
+        for &byte in suffix {
+            actual.build_work = add_build_u64(
+                actual.build_work,
+                1,
+                "terminal greedy suffix copy work",
+                prospective,
+                actual,
+            )?;
+            digest.write_byte(byte);
+            retained.try_push(byte).map_err(|_| {
+                build_error_with(
+                    BuildErrorKind::InternalInvariant("exact terminal suffix capacity changed"),
+                    prospective,
+                    actual,
+                )
+            })?;
+            actual.items = add_build_usize(
+                actual.items,
+                1,
+                "terminal greedy copied items",
+                prospective,
+                actual,
+            )?;
+            actual.payload_bytes = add_build_usize(
+                actual.payload_bytes,
+                1,
+                "terminal greedy payload bytes",
+                prospective,
+                actual,
+            )?;
+            actual.identity_bytes = add_build_usize(
+                actual.identity_bytes,
+                1,
+                "terminal greedy identity bytes",
+                prospective,
+                actual,
+            )?;
+            actual.copied_bytes = add_build_usize(
+                actual.copied_bytes,
+                1,
+                "terminal greedy copied bytes",
+                prospective,
+                actual,
+            )?;
+            actual.initialized_bytes = add_build_usize(
+                actual.initialized_bytes,
+                1,
+                "terminal greedy initialized bytes",
+                prospective,
+                actual,
+            )?;
+        }
+        actual.build_work = add_build_u64(
+            actual.build_work,
+            1,
+            "terminal greedy publication work",
+            prospective,
+            actual,
+        )?;
+        actual.items = prospective.items;
+        actual.payload_bytes = prospective.payload_bytes;
+        actual.identity_bytes = prospective.identity_bytes;
+        actual.retained_heap_bytes = prospective.retained_heap_bytes;
+        actual.copied_bytes = prospective.copied_bytes;
+        actual.allocations = prospective.allocations;
+        actual.initialized_bytes = prospective.initialized_bytes;
+        actual.build_work = prospective.build_work;
+        actual.persistent_bytes = prospective.persistent_bytes;
+        actual.peak_bytes = prospective.peak_bytes;
+        actual.published = true;
+        validate_build_actual(prospective, actual)?;
+        Ok(Self {
+            descriptor: Descriptor::EndGreedyClassLiteral {
+                class,
+                suffix: retained,
+            },
+            identity,
+            content_digest: digest.finish(),
+            build: BuildAccounting {
+                prospective,
+                actual,
+            },
+        })
     }
 
     pub fn build_whole_byte_repeat(
@@ -1963,6 +2162,7 @@ impl FixedAbsoluteDomainPlan {
         let valid = match self.identity.kind() {
             DescriptorKind::EndMaskSequence
             | DescriptorKind::EndOneByteMask
+            | DescriptorKind::EndGreedyClassLiteral
             | DescriptorKind::StartOrderedPrefix => operation == Operation::SpanSum,
             DescriptorKind::WholeByteRepeat
             | DescriptorKind::WholeOrderedWords
@@ -1985,6 +2185,19 @@ impl FixedAbsoluteDomainPlan {
                 endpoint_candidate(haystack_len, window, masks.len())
             }
             Descriptor::EndOneByteMask(_) => endpoint_candidate(haystack_len, window, 1),
+            Descriptor::EndGreedyClassLiteral { suffix, .. } => {
+                let Some(suffix_start) = haystack_len.checked_sub(suffix.len()) else {
+                    return Ok(Candidate::complete_zero(1));
+                };
+                if window.end() == haystack_len && window.start() <= suffix_start {
+                    // Admission deliberately reserves the complete original
+                    // haystack even though a short observed tail may stop the
+                    // reverse scan almost immediately.
+                    Candidate::verify(haystack_len, 1, 0, haystack_len)
+                } else {
+                    Ok(Candidate::complete_zero(1))
+                }
+            }
             Descriptor::WholeByteRepeat {
                 minimum, maximum, ..
             } => {
@@ -2116,15 +2329,29 @@ impl FixedAbsoluteDomainPlan {
             match &self.descriptor {
                 Descriptor::EndMaskSequence(masks) => {
                     verify_endpoint_masks(haystack, admission.window, masks, &mut actual)
+                        .map(|matched| (matched, None))
                 }
                 Descriptor::EndOneByteMask(mask) => {
                     verify_endpoint_one(haystack, admission.window, *mask, &mut actual)
+                        .map(|matched| (matched, None))
+                }
+                Descriptor::EndGreedyClassLiteral { class, suffix } => {
+                    verify_end_greedy_class_literal(
+                        haystack,
+                        admission.window,
+                        *class,
+                        suffix,
+                        &mut actual,
+                    )
+                    .map(|span| (span.is_some(), span))
                 }
                 Descriptor::WholeByteRepeat { byte, .. } => {
                     verify_whole_repeat(haystack, admission.window, *byte, &mut actual)
+                        .map(|matched| (matched, None))
                 }
                 Descriptor::WholeOrderedWords { bytes, words } => {
                     verify_whole_words(haystack, admission.window, bytes, words, &mut actual)
+                        .map(|matched| (matched, None))
                 }
                 Descriptor::StartOrderedPrefix {
                     prefix,
@@ -2135,14 +2362,15 @@ impl FixedAbsoluteDomainPlan {
                     prefix,
                     alternatives,
                     &mut actual,
-                ),
-                Descriptor::WholeScalarEnvelope { .. } => Ok(false),
+                )
+                .map(|matched| (matched, None)),
+                Descriptor::WholeScalarEnvelope { .. } => Ok((false, None)),
             }
         } else {
-            Ok(false)
+            Ok((false, None))
         };
-        let matched = match verified {
-            Ok(matched) => matched,
+        let (matched, verified_span) = match verified {
+            Ok(value) => value,
             Err(kind) => {
                 return Err(invocation_error(
                     kind,
@@ -2156,7 +2384,20 @@ impl FixedAbsoluteDomainPlan {
             actual.match_events = 1;
             actual.count = 1;
             if admission.operation == Operation::SpanSum {
-                actual.span_sum = admission.prospective.span_sum;
+                actual.span_sum = if let Some(span) = verified_span {
+                    u64::try_from(span).map_err(|_| {
+                        invocation_error(
+                            ReduceErrorKind::ArithmeticOverflow {
+                                computation: "actual span sum",
+                            },
+                            invocation,
+                            Some(admission.prospective),
+                            actual,
+                        )
+                    })?
+                } else {
+                    admission.prospective.span_sum
+                };
             }
         }
         actual.total_work = actual
@@ -2346,6 +2587,64 @@ fn verify_endpoint_one(
         })?;
     record_probe(actual)?;
     Ok(mask.contains(byte))
+}
+
+fn verify_end_greedy_class_literal(
+    haystack: &[u8],
+    window: Window,
+    class: ByteMask,
+    suffix: &[u8],
+    actual: &mut ReduceActual,
+) -> Result<Option<usize>, ReduceErrorKind> {
+    let Some(suffix_start) = haystack.len().checked_sub(suffix.len()) else {
+        return Ok(None);
+    };
+    if window.end() != haystack.len() || window.start() > suffix_start {
+        return Ok(None);
+    }
+    for (offset, &expected) in suffix.iter().enumerate() {
+        let index =
+            suffix_start
+                .checked_add(offset)
+                .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                    computation: "terminal suffix index",
+                })?;
+        let byte = *haystack
+            .get(index)
+            .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                computation: "terminal suffix source access",
+            })?;
+        record_probe(actual)?;
+        if byte != expected {
+            return Ok(None);
+        }
+    }
+
+    let mut start = suffix_start;
+    while start > window.start() {
+        let index = start
+            .checked_sub(1)
+            .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                computation: "terminal predecessor index",
+            })?;
+        let byte = *haystack
+            .get(index)
+            .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                computation: "terminal predecessor source access",
+            })?;
+        record_probe(actual)?;
+        if !class.contains(byte) {
+            break;
+        }
+        start = index;
+    }
+    haystack
+        .len()
+        .checked_sub(start)
+        .map(Some)
+        .ok_or(ReduceErrorKind::ArithmeticOverflow {
+            computation: "terminal greedy span",
+        })
 }
 
 fn verify_whole_repeat(
@@ -3428,6 +3727,12 @@ mod tests {
                 BuildLimits::default(),
             )
             .unwrap(),
+            FixedAbsoluteDomainPlan::build_end_greedy_class_literal(
+                ByteMask::inclusive(b'a', b'z'),
+                b"XYZ",
+                BuildLimits::default(),
+            )
+            .unwrap(),
             FixedAbsoluteDomainPlan::build_start_ordered_prefix(
                 b"zbc",
                 [b'd', b'e'].into_iter(),
@@ -3495,6 +3800,13 @@ mod tests {
         });
         assert_every_build_fence("end-one-byte-mask", |limits| {
             FixedAbsoluteDomainPlan::build_end_one_byte_mask(singleton(b'a'), limits)
+        });
+        assert_every_build_fence("end-greedy-class-literal", |limits| {
+            FixedAbsoluteDomainPlan::build_end_greedy_class_literal(
+                ByteMask::inclusive(b'a', b'z'),
+                b"XYZ",
+                limits,
+            )
         });
         assert_every_build_fence("whole-byte-repeat", |limits| {
             FixedAbsoluteDomainPlan::build_whole_byte_repeat(b'a', 2, 5, limits)
