@@ -35,12 +35,18 @@ use super::{
 use crate::{
     CandidateIdentity, InventoryError, REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA,
     RegexAutomataAdapterCounts, RegexAutomataAdapterDisposition, RegexAutomataAdapterReceipt,
-    RegexAutomataAdapterReport, authenticate_candidate_source,
+    RegexAutomataAdapterReport, RegexAutomataAdapterReportPayload, RegexAutomataStrictGain,
+    authenticate_candidate_source,
 };
 
 /// Schema for an exact, independently compiled start-mode matrix.
 pub const REGEX_AUTOMATA_START_MODE_MATRIX_SCHEMA: &str =
     "fre.regex-automata-0.4.14.start-mode-matrix.v1";
+/// Adapter-report schema for the exact current-baseline start-mode transition.
+pub const REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA: &str =
+    "fre.regex-automata-0.4.14.adapter-report.start-mode.v1";
+/// Maximum encoded size accepted for one authenticated start-mode matrix.
+pub const REGEX_AUTOMATA_START_MODE_MAX_REPORT_BYTES: usize = 64 * 1_048_576;
 /// Exact number of authenticated unit feature tuples.
 pub const REGEX_AUTOMATA_START_MODE_COUNT: usize = 30;
 /// Four exact cases in every exact unit tuple.
@@ -70,8 +76,8 @@ const GENERATED_FILE_BYTES_LIMIT: u64 = 1_048_576;
 const TARGET_FILE_COUNT_LIMIT: u64 = 100_000;
 const TARGET_RETAINED_BYTES_LIMIT: u64 = 8 * 1_024 * 1_024 * 1_024;
 const HELD_ARTIFACT_PEAK_BYTES_LIMIT: u64 = 2 * ARTIFACT_BYTES_LIMIT;
-const REPORT_BYTES_LIMIT: usize = 64 * 1_048_576;
-const REPORT_BYTES_LIMIT_U64: u64 = 64 * 1_048_576;
+const REPORT_BYTES_LIMIT: usize = REGEX_AUTOMATA_START_MODE_MAX_REPORT_BYTES;
+const REPORT_BYTES_LIMIT_U64: u64 = 64 * 1_048_576_u64;
 const EXACT_BASE_REVISION: &str = "82ce00ce18d94fc5843f632eb229b7d94b27b353";
 const EXACT_BASE_TREE: &str = "ba855b4dd993fd440712096d76b8d5d24b195e39";
 const EXACT_BASELINE_PAYLOAD_SHA256: &str =
@@ -80,6 +86,19 @@ const EXACT_BASELINE_REPORT_SHA256: &str =
     "b5e9f004bf1405ec858101aab455230577dcd71c4865d7311a152041827308e8";
 const EXACT_BASELINE_CANONICAL_SHA256: &str =
     "2c39878784eff95745f4a499eaa2c09de95b1c84a086db582db91edf4285e96e";
+const EXACT_EXECUTION_MATRIX_PAYLOAD_SHA256: &str =
+    "6ade77031de5f296813ae52701f1701b35925ef2dbd9c5c57ec562bc0fe2ed14";
+const EXACT_EXECUTION_MATRIX_CANDIDATE: &str = "f09c95fc6ceeae3bcead297bb733e7c5541239d8";
+const EXACT_EXECUTION_MATRIX_CANDIDATE_TREE: &str = "4d3d3e2cc453413c52f2698dcce0706615c91a5a";
+const EXACT_EXECUTION_MATRIX_FRE_KERNELS_TREE: &str = "30bd19b9cd1092d07d4d8dab644adb24912e9345";
+const EXACT_START_MAP_SOURCE_BLOB: &str = "0ca1af3fa0fbba27bb3ba257c9d20493a22cbd06";
+const EXACT_KERNELS_MANIFEST_BLOB: &str = "ed1109890c16b53d78b1b79ce6d9c45931bbd742";
+const EXACT_ALLOC_TREE: &str = "7a6b66bdfbb546d153500dba1e40a873d062a78f";
+const TRANSITION_FRE_KERNELS_TREE: &str = "680adde6d1d1e5895bdf7109a3172eb4f0c33e41";
+const TRANSITION_IMPLEMENTATION_BASE: &str = "f2ce30135529c6740001e25d2a9fe624aaa2db87";
+const TRANSITION_IMPLEMENTATION_BASE_TREE: &str = "9c5d62258ac1e51966f98a435025aa108b2653d8";
+const TRANSITION_IMPLEMENTATION_BASE_LOCK_SHA256: &str =
+    "8a8a90ba3e9eaffce66a313fe23fab8c0dbee5cb6d25c748f5ec0284ba170a7f";
 const RETAINED_START_MODE_ID: &str = "package-default-unit";
 const EXACT_BUILD_PERSISTENT_BYTES: usize = 296;
 const EXACT_BUILD_PEAK_BYTES: usize = 552;
@@ -483,7 +502,7 @@ pub struct RegexAutomataStartQualification {
     pub baseline_counts: RegexAutomataAdapterCounts,
     pub current_counts: RegexAutomataAdapterCounts,
     pub current_receipts: Vec<RegexAutomataAdapterReceipt>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub retained_target_memberships: usize,
     pub gained_memberships: usize,
     pub lost_memberships: usize,
@@ -569,6 +588,13 @@ const LIMITATIONS: [&str; 4] = [
     "Every membership is compiled and executed in its own authenticated Cargo feature tuple; no result is projected across modes.",
     "Cargo target file and byte limits are checked after every command and final retention is sealed; transient within-command filesystem peak is not measured or claimed.",
     "On platforms without descriptor-relative executable and directory entry, including macOS, private single-link executables and the held output-parent path are descriptor-authenticated immediately before and after use; transient mutation by another process with the same uid is outside this local qualification's threat model.",
+];
+
+pub(crate) const START_MODE_REPORT_LIMITATIONS: [&str; 4] = [
+    "A new pass is admitted only when the embedded exact-mode matrix validates every target tuple, source contract, execution receipt, and resource-accounting seal.",
+    "The embedded matrix's behavior-affecting fre-kernels tree and observer bytes are exact identities; no result is projected across different product or observer bytes.",
+    "Exactly four package-default memberships remain byte-identical prior passes and exactly 116 current unsupported memberships transition to pass; every non-target receipt and prior execution receipt is preserved.",
+    "The start-mode matrix limitations remain in force and are authenticated inside this report.",
 ];
 
 /// Authenticate all sources, compile every exact unit tuple and execute both
@@ -843,6 +869,20 @@ pub fn read_regex_automata_start_mode_matrix(
     Ok(report)
 }
 
+/// Read the one exact sealed execution matrix admitted for the current-report
+/// transition. Its original inventory envelope is intentionally distinct;
+/// every mode is revalidated against the current identical obligation seal.
+pub fn read_regex_automata_start_mode_transition_matrix(
+    path: &Path,
+    inventory: &RegexAutomataCorpusReport,
+) -> Result<RegexAutomataStartModeMatrixReport, InventoryError> {
+    let bytes = read_single_link_file(path, REPORT_BYTES_LIMIT_U64, Some(0o400))?;
+    let report = serde_json::from_slice(&bytes)
+        .map_err(|error| InventoryError::new(format!("decode transition matrix: {error}")))?;
+    validate_exact_execution_matrix(inventory, &report)?;
+    Ok(report)
+}
+
 /// Read the one immutable search-cluster-v11 report authorized as this transition's
 /// baseline. The full-file digest includes its exact terminal LF; semantic
 /// authentication separately pins the canonical object and payload digests.
@@ -870,6 +910,176 @@ pub fn write_regex_automata_start_mode_matrix(
 ) -> Result<(), InventoryError> {
     report.validate(inventory)?;
     write_new_json(target, report)
+}
+
+/// Publishable adapter transition derived from the exact current baseline and
+/// the independently executed start-mode matrix.
+pub fn build_regex_automata_start_mode_report(
+    inventory: &RegexAutomataCorpusReport,
+    baseline: &RegexAutomataStartBaseline,
+    matrix: &RegexAutomataStartModeMatrixReport,
+    candidate: &Path,
+) -> Result<RegexAutomataAdapterReport, InventoryError> {
+    let candidate = authenticate_transition_candidate(candidate)?;
+    build_start_mode_report(inventory, baseline, matrix, candidate)
+}
+
+/// Verify the exact 151 -> 267 transition and return its strict-gain receipt.
+pub fn validate_regex_automata_start_mode_strict_gain(
+    inventory: &RegexAutomataCorpusReport,
+    baseline: &RegexAutomataStartBaseline,
+    matrix: &RegexAutomataStartModeMatrixReport,
+    current: &RegexAutomataAdapterReport,
+) -> Result<RegexAutomataStrictGain, InventoryError> {
+    authenticate_exact_baseline(inventory, &baseline.report)?;
+    validate_exact_execution_matrix(inventory, matrix)?;
+    current.validate(inventory)?;
+    if current.schema != REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
+        || current.payload.start_mode_matrix.as_deref() != Some(matrix)
+        || current.payload.start_mode_baseline.as_deref() != Some(&baseline.report)
+    {
+        return Err(InventoryError::new(
+            "current start-mode report does not embed the authenticated matrix",
+        ));
+    }
+    let expected = build_qualification(
+        inventory,
+        &baseline.report,
+        &current.payload.candidate,
+        &matrix.payload.modes,
+    )?;
+    if expected.current_receipts != current.payload.receipts
+        || expected.current_counts != current.payload.counts
+        || expected.gained_memberships != REGEX_AUTOMATA_START_MODE_GAINED_MEMBERSHIPS
+        || expected.lost_memberships != 0
+    {
+        return Err(InventoryError::new(
+            "start-mode strict-gain report transition mismatch",
+        ));
+    }
+    Ok(RegexAutomataStrictGain {
+        family: "util-start-exact-modes".to_owned(),
+        gained_unique_cases: CASE_IDS.len(),
+        gained_mode_memberships: expected.gained_memberships,
+        previous_pass: expected.baseline_counts.pass,
+        current_pass: expected.current_counts.pass,
+    })
+}
+
+pub(crate) fn validate_start_mode_report_after_structure(
+    inventory: &RegexAutomataCorpusReport,
+    report: &RegexAutomataAdapterReport,
+) -> Result<(), InventoryError> {
+    if report.schema != REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA {
+        return Err(InventoryError::new("not a start-mode adapter report"));
+    }
+    let matrix = report
+        .payload
+        .start_mode_matrix
+        .as_deref()
+        .ok_or_else(|| InventoryError::new("start-mode report matrix is absent"))?;
+    validate_exact_execution_matrix(inventory, matrix)?;
+    let baseline = report
+        .payload
+        .start_mode_baseline
+        .as_deref()
+        .ok_or_else(|| InventoryError::new("start-mode report baseline is absent"))?;
+    authenticate_exact_baseline(inventory, baseline)?;
+    let expected = build_qualification(
+        inventory,
+        baseline,
+        &report.payload.candidate,
+        &matrix.payload.modes,
+    )?;
+    if report.payload.counts != expected.current_counts
+        || report.payload.receipts != expected.current_receipts
+        || report.payload.execution_receipts != baseline.payload.execution_receipts
+        || report.payload.look_mode_matrix != baseline.payload.look_mode_matrix
+    {
+        return Err(InventoryError::new(
+            "start-mode adapter report changed non-target or prior execution evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn build_start_mode_report(
+    inventory: &RegexAutomataCorpusReport,
+    baseline: &RegexAutomataStartBaseline,
+    matrix: &RegexAutomataStartModeMatrixReport,
+    candidate: CandidateIdentity,
+) -> Result<RegexAutomataAdapterReport, InventoryError> {
+    authenticate_exact_baseline(inventory, &baseline.report)?;
+    validate_exact_execution_matrix(inventory, matrix)?;
+    let qualification = build_qualification(
+        inventory,
+        &baseline.report,
+        &candidate,
+        &matrix.payload.modes,
+    )?;
+    let payload = RegexAutomataAdapterReportPayload {
+        inventory_payload_sha256: inventory.payload_sha256.clone(),
+        obligation_inventory_sha256: inventory
+            .payload
+            .harness
+            .obligation_inventory_sha256
+            .clone(),
+        candidate,
+        counts: qualification.current_counts,
+        receipts: qualification.current_receipts,
+        execution_receipts: baseline.report.payload.execution_receipts.clone(),
+        look_mode_matrix: baseline.report.payload.look_mode_matrix.clone(),
+        start_mode_matrix: Some(Box::new(matrix.clone())),
+        start_mode_baseline: Some(Box::new(baseline.report.clone())),
+        limitations: START_MODE_REPORT_LIMITATIONS
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect(),
+    };
+    let report = RegexAutomataAdapterReport {
+        schema: REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA.to_owned(),
+        payload_sha256: hash_json(&payload, "encode start-mode adapter report payload")?,
+        payload,
+    };
+    validate_start_mode_report_after_structure(inventory, &report)?;
+    Ok(report)
+}
+
+fn validate_exact_execution_matrix(
+    inventory: &RegexAutomataCorpusReport,
+    matrix: &RegexAutomataStartModeMatrixReport,
+) -> Result<(), InventoryError> {
+    inventory.validate()?;
+    if matrix.schema != REGEX_AUTOMATA_START_MODE_MATRIX_SCHEMA
+        || matrix.payload_sha256 != EXACT_EXECUTION_MATRIX_PAYLOAD_SHA256
+        || matrix.payload_sha256
+            != hash_json(&matrix.payload, "encode exact transition matrix payload")?
+        || matrix.payload.obligation_inventory_sha256
+            != inventory.payload.harness.obligation_inventory_sha256
+        || matrix.payload.candidate.revision != EXACT_EXECUTION_MATRIX_CANDIDATE
+        || matrix.payload.candidate.tree != EXACT_EXECUTION_MATRIX_CANDIDATE_TREE
+        || matrix.payload.candidate_kernels_tree != EXACT_EXECUTION_MATRIX_FRE_KERNELS_TREE
+        || matrix.payload.observer_source_sha256 != sha256(OBSERVER_SOURCE.as_bytes())
+        || matrix.payload.counts.modes != REGEX_AUTOMATA_START_MODE_COUNT
+        || matrix.payload.counts.memberships != REGEX_AUTOMATA_START_MODE_MEMBERSHIPS
+        || matrix.payload.counts.faults != 0
+        || matrix.payload.source_contracts != source_contracts()?
+    {
+        return Err(InventoryError::new(
+            "foreign or stale start-mode execution matrix",
+        ));
+    }
+    let specs = exact_unit_specs(inventory)?;
+    if matrix.payload.modes.len() != specs.len() {
+        return Err(InventoryError::new(
+            "start-mode execution matrix mode denominator mismatch",
+        ));
+    }
+    let contracts = source_contracts()?;
+    for (mode, spec) in matrix.payload.modes.iter().zip(&specs) {
+        validate_mode(mode, spec, &contracts)?;
+    }
+    Ok(())
 }
 
 /// Reject an output pathname that exists or overlaps authenticated inputs
@@ -1302,6 +1512,14 @@ fn candidate_valid(candidate: &CandidateIdentity) -> bool {
         && candidate.tracked_and_untracked_worktree_clean
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a shared-reference predicate"
+)]
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 fn authenticate_exact_baseline(
     inventory: &RegexAutomataCorpusReport,
     baseline: &RegexAutomataAdapterReport,
@@ -1356,6 +1574,122 @@ fn authenticate_candidate_lineage(candidate: &Path) -> Result<(), InventoryError
     let changed = parse_candidate_scope(&changed)?;
     if changed != allowed {
         return Err(InventoryError::new("candidate source scope mismatch"));
+    }
+    Ok(())
+}
+
+fn authenticate_transition_candidate(
+    candidate: &Path,
+) -> Result<CandidateIdentity, InventoryError> {
+    let identity = authenticate_candidate_source(candidate)?;
+    let candidate = candidate.canonicalize().map_err(|error| {
+        InventoryError::new(format!("canonicalize transition candidate: {error}"))
+    })?;
+    let line = git_text(&candidate, &["rev-list", "--parents", "-n", "1", "HEAD"])?;
+    let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+    let base_tree_revision = format!("{TRANSITION_IMPLEMENTATION_BASE}^{{tree}}");
+    if fields.len() != 2
+        || fields[0] != identity.revision
+        || fields[1] != TRANSITION_IMPLEMENTATION_BASE
+        || git_text(&candidate, &["rev-parse", "--verify", &base_tree_revision])?
+            != TRANSITION_IMPLEMENTATION_BASE_TREE
+    {
+        return Err(InventoryError::new(
+            "transition candidate is not one commit on the exact implementation base",
+        ));
+    }
+    let changed = super::git_bytes(
+        &candidate,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            "-r",
+            "HEAD",
+        ],
+    )?;
+    let expected = BTreeSet::from([
+        "tools/rust-regex-conformance/src/automata_corpus/start_mode.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress/search_cluster.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress/start_map.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress/suffix_literal_count.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress/unicode_word_look.rs".to_owned(),
+        "tools/rust-regex-conformance/src/automata_progress/word_look.rs".to_owned(),
+        "tools/rust-regex-conformance/src/lib.rs".to_owned(),
+        "tools/rust-regex-conformance/src/main.rs".to_owned(),
+    ]);
+    if parse_candidate_scope(&changed)? != expected {
+        return Err(InventoryError::new(
+            "transition candidate source scope mismatch",
+        ));
+    }
+    let lock = read_single_link_file(
+        &candidate.join("Cargo.lock"),
+        GENERATED_FILE_BYTES_LIMIT,
+        Some(0o644),
+    )?;
+    if sha256(&lock) != TRANSITION_IMPLEMENTATION_BASE_LOCK_SHA256 {
+        return Err(InventoryError::new(
+            "transition candidate lockfile differs from exact base",
+        ));
+    }
+    validate_transition_route_identity(&candidate)?;
+    Ok(identity)
+}
+
+fn validate_transition_route_identity(candidate: &Path) -> Result<(), InventoryError> {
+    let kernels_tree = git_text(
+        candidate,
+        &["rev-parse", "--verify", "HEAD:crates/fre-kernels"],
+    )?;
+    let start_map_blob = git_text(
+        candidate,
+        &[
+            "rev-parse",
+            "--verify",
+            "HEAD:crates/fre-kernels/src/byte_start_map.rs",
+        ],
+    )?;
+    let kernels_manifest_blob = git_text(
+        candidate,
+        &[
+            "rev-parse",
+            "--verify",
+            "HEAD:crates/fre-kernels/Cargo.toml",
+        ],
+    )?;
+    let exact_alloc_tree = git_text(
+        candidate,
+        &["rev-parse", "--verify", "HEAD:crates/fre-exact-alloc"],
+    )?;
+    let kernel_delta = super::git_bytes(
+        candidate,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            EXACT_EXECUTION_MATRIX_CANDIDATE,
+            "HEAD",
+            "--",
+            "crates/fre-kernels",
+        ],
+    )?;
+    let expected_kernel_delta = BTreeSet::from([
+        "crates/fre-kernels/src/fixed_absolute_domain.rs".to_owned(),
+        "crates/fre-kernels/src/lib.rs".to_owned(),
+        "crates/fre-kernels/tests/endpoint_fixed_absolute_domain.rs".to_owned(),
+    ]);
+    if kernels_tree != TRANSITION_FRE_KERNELS_TREE
+        || start_map_blob != EXACT_START_MAP_SOURCE_BLOB
+        || kernels_manifest_blob != EXACT_KERNELS_MANIFEST_BLOB
+        || exact_alloc_tree != EXACT_ALLOC_TREE
+        || parse_candidate_scope(&kernel_delta)? != expected_kernel_delta
+    {
+        return Err(InventoryError::new(
+            "transition candidate start-map route bytes differ from the execution matrix",
+        ));
     }
     Ok(())
 }
@@ -4715,6 +5049,103 @@ mod tests {
         assert_eq!(retained_passes, 151);
         assert_eq!(target_transitions, 116);
 
+        let baseline_wrapper = RegexAutomataStartBaseline {
+            report: baseline.clone(),
+        };
+        let transition = build_start_mode_report(
+            &inventory,
+            &baseline_wrapper,
+            &mode_fixture,
+            candidate.clone(),
+        )
+        .unwrap();
+        let gain = validate_regex_automata_start_mode_strict_gain(
+            &inventory,
+            &baseline_wrapper,
+            &mode_fixture,
+            &transition,
+        )
+        .unwrap();
+        assert_eq!((gain.previous_pass, gain.current_pass), (151, 267));
+        assert_eq!(gain.gained_mode_memberships, 116);
+
+        let output_root = std::env::temp_dir().join(format!(
+            "fre-start-mode-transition-lifecycle-{}",
+            std::process::id()
+        ));
+        create_private_directory(&output_root).unwrap();
+        let output = output_root.join("report.json");
+        crate::write_regex_automata_adapter_report(&output, &transition, &inventory).unwrap();
+        let reread = crate::read_regex_automata_adapter_report(&output, &inventory).unwrap();
+        assert_eq!(reread, transition);
+        assert!(
+            crate::write_regex_automata_adapter_report(&output, &transition, &inventory).is_err()
+        );
+        fs::remove_file(&output).unwrap();
+        fs::remove_dir(&output_root).unwrap();
+
+        let mut missing_matrix = transition.clone();
+        missing_matrix.payload.start_mode_matrix = None;
+        reseal_transition_report(&mut missing_matrix);
+        assert!(missing_matrix.validate(&inventory).is_err());
+
+        let mut reverted_target = transition.clone();
+        let (index, before) = baseline
+            .payload
+            .receipts
+            .iter()
+            .enumerate()
+            .find(|(index, before)| {
+                matches!(
+                    before.disposition,
+                    RegexAutomataAdapterDisposition::Unsupported { .. }
+                ) && matches!(
+                    transition.payload.receipts[*index].disposition,
+                    RegexAutomataAdapterDisposition::Pass { .. }
+                )
+            })
+            .unwrap();
+        reverted_target.payload.receipts[index] = before.clone();
+        reseal_transition_report(&mut reverted_target);
+        assert!(reverted_target.validate(&inventory).is_err());
+
+        let mut lost_prior_pass = transition.clone();
+        let (index, _) = baseline
+            .payload
+            .receipts
+            .iter()
+            .enumerate()
+            .find(|(_, receipt)| {
+                matches!(
+                    receipt.disposition,
+                    RegexAutomataAdapterDisposition::Pass { .. }
+                )
+            })
+            .unwrap();
+        lost_prior_pass.payload.receipts[index].disposition =
+            RegexAutomataAdapterDisposition::Unsupported {
+                reason_code: "adversarial-prior-pass-loss".to_owned(),
+            };
+        reseal_transition_report(&mut lost_prior_pass);
+        assert!(lost_prior_pass.validate(&inventory).is_err());
+
+        let mut foreign_matrix = transition.clone();
+        foreign_matrix
+            .payload
+            .start_mode_matrix
+            .as_mut()
+            .unwrap()
+            .payload_sha256 = "0".repeat(64);
+        reseal_transition_report(&mut foreign_matrix);
+        assert!(foreign_matrix.validate(&inventory).is_err());
+
+        let mut duplicate_mode = transition.clone();
+        let matrix = duplicate_mode.payload.start_mode_matrix.as_mut().unwrap();
+        matrix.payload.modes[1] = matrix.payload.modes[0].clone();
+        matrix.payload_sha256 = hash_json(&matrix.payload, "reseal duplicate-mode matrix").unwrap();
+        reseal_transition_report(&mut duplicate_mode);
+        assert!(duplicate_mode.validate(&inventory).is_err());
+
         for mutation in mutations {
             match mutation.as_str() {
                 "baseline-revision" => {
@@ -4945,5 +5376,14 @@ mod tests {
         report.payload.counts = adapter_counts(&report.payload.receipts);
         report.payload_sha256 =
             hash_json(&report.payload, "encode adversarial start baseline payload").unwrap();
+    }
+
+    fn reseal_transition_report(report: &mut RegexAutomataAdapterReport) {
+        report.payload.counts = adapter_counts(&report.payload.receipts);
+        report.payload_sha256 = hash_json(
+            &report.payload,
+            "encode adversarial start transition payload",
+        )
+        .unwrap();
     }
 }

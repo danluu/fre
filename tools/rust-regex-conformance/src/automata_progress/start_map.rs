@@ -350,6 +350,8 @@ pub fn build_regex_automata_start_map_report(
         receipts,
         execution_receipts,
         look_mode_matrix: previous.payload.look_mode_matrix.clone(),
+        start_mode_matrix: None,
+        start_mode_baseline: None,
         limitations: START_MAP_REPORT_LIMITATIONS
             .iter()
             .map(|text| (*text).to_owned())

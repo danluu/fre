@@ -213,6 +213,8 @@ pub fn build_regex_automata_ascii_word_look_report(
         receipts,
         execution_receipts,
         look_mode_matrix: previous.payload.look_mode_matrix.clone(),
+        start_mode_matrix: None,
+        start_mode_baseline: None,
         limitations: ASCII_WORD_LOOK_REPORT_LIMITATIONS
             .iter()
             .map(|text| (*text).to_owned())

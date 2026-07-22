@@ -7,7 +7,7 @@ use rust_regex_conformance::{
     build_regex_automata_ascii_word_look_report, build_regex_automata_corpus_report,
     build_regex_automata_look_mode_matrix, build_regex_automata_search_cluster_report,
     build_regex_automata_start_map_report, build_regex_automata_start_mode_matrix,
-    build_regex_automata_suffix_literal_count_report,
+    build_regex_automata_start_mode_report, build_regex_automata_suffix_literal_count_report,
     build_regex_automata_unicode_word_look_report, build_regex_syntax_corpus_report,
     build_replacement_api_report, build_searcher_api_report, load_executable_cases,
     preflight_regex_automata_start_mode_output, read_adapter_report, read_doctest_report,
@@ -15,12 +15,13 @@ use rust_regex_conformance::{
     read_regex_automata_adapter_report, read_regex_automata_corpus_report,
     read_regex_automata_gap_assignment, read_regex_automata_look_mode_matrix,
     read_regex_automata_start_baseline, read_regex_automata_start_mode_matrix,
-    read_regex_syntax_corpus_report, read_replacement_api_report, read_searcher_api_report,
-    schedule_regex_automata_gap, validate_regex_automata_all_mode_look_strict_gain,
+    read_regex_automata_start_mode_transition_matrix, read_regex_syntax_corpus_report,
+    read_replacement_api_report, read_searcher_api_report, schedule_regex_automata_gap,
+    validate_regex_automata_all_mode_look_strict_gain,
     validate_regex_automata_ascii_word_look_strict_gain, validate_regex_automata_look_strict_gain,
     validate_regex_automata_search_cluster_strict_gain,
-    validate_regex_automata_start_map_strict_gain, validate_regex_automata_strict_gain,
-    validate_regex_automata_suffix_literal_count_strict_gain,
+    validate_regex_automata_start_map_strict_gain, validate_regex_automata_start_mode_strict_gain,
+    validate_regex_automata_strict_gain, validate_regex_automata_suffix_literal_count_strict_gain,
     validate_regex_automata_unicode_word_look_strict_gain, write_adapter_report,
     write_doctest_report, write_feature_matrix_report, write_inventory,
     write_misc_regression_report, write_regex_automata_adapter_report,
@@ -157,6 +158,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "verify-regex-automata-start-mode-matrix" => {
             verify_regex_automata_start_mode_matrix(&mut args)?;
         }
+        "run-regex-automata-start-mode-transition" => {
+            run_regex_automata_start_mode_transition(&mut args)?;
+        }
+        "verify-regex-automata-start-mode-transition" => {
+            verify_regex_automata_start_mode_transition(&mut args)?;
+        }
         "run-regex-automata-start-map" => run_regex_automata_start_map(&mut args)?,
         "run-regex-automata-suffix-literal-count" => {
             run_regex_automata_suffix_literal_count(&mut args)?;
@@ -256,6 +263,61 @@ fn verify_regex_automata_start_mode_matrix(
         report.payload.counts.upstream_assertions,
         report.payload.counts.observer_assertions,
         report.payload.counts.faults,
+        report.payload_sha256,
+    );
+    Ok(())
+}
+
+fn run_regex_automata_start_mode_transition(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inventory_path = PathBuf::from(args.next().ok_or(usage())?);
+    let baseline_path = PathBuf::from(args.next().ok_or(usage())?);
+    let matrix_path = PathBuf::from(args.next().ok_or(usage())?);
+    let candidate_path = PathBuf::from(args.next().ok_or(usage())?);
+    let output = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let inventory = read_regex_automata_corpus_report(&inventory_path)?;
+    let baseline = read_regex_automata_start_baseline(&baseline_path, &inventory)?;
+    let matrix = read_regex_automata_start_mode_transition_matrix(&matrix_path, &inventory)?;
+    let report =
+        build_regex_automata_start_mode_report(&inventory, &baseline, &matrix, &candidate_path)?;
+    let gain =
+        validate_regex_automata_start_mode_strict_gain(&inventory, &baseline, &matrix, &report)?;
+    write_regex_automata_adapter_report(&output, &report, &inventory)?;
+    println!(
+        "regex-automata-start-mode-transition candidate={} pass={} unsupported={} fault={} total={} gained={} lost=0 payload_sha256={}",
+        report.payload.candidate.revision,
+        report.payload.counts.pass,
+        report.payload.counts.unsupported,
+        report.payload.counts.fault,
+        report.payload.counts.total,
+        gain.gained_mode_memberships,
+        report.payload_sha256,
+    );
+    Ok(())
+}
+
+fn verify_regex_automata_start_mode_transition(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inventory_path = PathBuf::from(args.next().ok_or(usage())?);
+    let baseline_path = PathBuf::from(args.next().ok_or(usage())?);
+    let matrix_path = PathBuf::from(args.next().ok_or(usage())?);
+    let report_path = PathBuf::from(args.next().ok_or(usage())?);
+    reject_extra(args)?;
+    let inventory = read_regex_automata_corpus_report(&inventory_path)?;
+    let baseline = read_regex_automata_start_baseline(&baseline_path, &inventory)?;
+    let matrix = read_regex_automata_start_mode_transition_matrix(&matrix_path, &inventory)?;
+    let report = read_regex_automata_adapter_report(&report_path, &inventory)?;
+    let gain =
+        validate_regex_automata_start_mode_strict_gain(&inventory, &baseline, &matrix, &report)?;
+    println!(
+        "verified regex-automata-start-mode-transition candidate={} previous_pass={} current_pass={} gained={} lost=0 payload_sha256={}",
+        report.payload.candidate.revision,
+        gain.previous_pass,
+        gain.current_pass,
+        gain.gained_mode_memberships,
         report.payload_sha256,
     );
     Ok(())
@@ -1052,6 +1114,7 @@ fn usage() -> &'static str {
         "usage: rust-regex-conformance generate CHECKOUT OUTPUT | verify CHECKOUT MANIFEST | validate MANIFEST | run CHECKOUT MANIFEST CANDIDATE_REPO OUTPUT | verify-report MANIFEST REPORT | run-replacement-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-replacement-api-report REPORT | run-searcher-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-searcher-api-report REPORT | run-misc-regression-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-misc-regression-api-report REPORT | run-feature-matrix UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-feature-matrix-report REPORT | run-doctest-api UPSTREAM_PACKAGE CANDIDATE_REPO OUTPUT | verify-doctest-api-report REPORT | run-regex-syntax-corpus UPSTREAM_PACKAGE CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-syntax-corpus-report REPORT | inventory-regex-automata-corpus CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT TARGET_DIR OUTPUT | verify-regex-automata-corpus-report REPORT | run-regex-automata-adapter INVENTORY CANDIDATE_REPO OUTPUT | run-regex-automata-look-mode-matrix CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT INVENTORY TARGET_DIR OUTPUT | run-regex-automata-look-all-modes INVENTORY PREVIOUS_REPORT MATRIX CANDIDATE_REPO OUTPUT | run-regex-automata-look-ascii-word INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | run-regex-automata-look-unicode-word INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | run-regex-automata-start-map INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | schedule-regex-automata-gap INVENTORY BASELINE_REPORT ATTEMPT SLOT OUTPUT | verify-regex-automata-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT ASSIGNMENT | verify-regex-automata-look-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-look-all-modes-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT CANDIDATE_REPO | verify-regex-automata-look-ascii-word-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-look-unicode-word-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT | verify-regex-automata-start-map-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT",
         " | run-regex-automata-suffix-literal-count INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | verify-regex-automata-suffix-literal-count-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT",
         " | run-regex-automata-search-cluster INVENTORY PREVIOUS_REPORT CANDIDATE_REPO OUTPUT | verify-regex-automata-search-cluster-strict-gain INVENTORY PREVIOUS_REPORT CURRENT_REPORT",
-        " | run-regex-automata-start-mode-matrix CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT INVENTORY BASELINE_REPORT CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-automata-start-mode-matrix INVENTORY REPORT"
+        " | run-regex-automata-start-mode-matrix CRATE_ARCHIVE UPSTREAM_PACKAGE VCS_CHECKOUT INVENTORY BASELINE_REPORT CANDIDATE_REPO TARGET_DIR OUTPUT | verify-regex-automata-start-mode-matrix INVENTORY REPORT",
+        " | run-regex-automata-start-mode-transition INVENTORY BASELINE_REPORT MATRIX CANDIDATE_REPO OUTPUT | verify-regex-automata-start-mode-transition INVENTORY BASELINE_REPORT MATRIX CURRENT_REPORT"
     )
 }

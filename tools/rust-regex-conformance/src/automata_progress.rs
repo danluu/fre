@@ -28,7 +28,10 @@ use regex_automata::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::automata_corpus::REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES;
+use crate::automata_corpus::{
+    REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES,
+    start_mode::{REGEX_AUTOMATA_START_MODE_MAX_REPORT_BYTES, RegexAutomataStartModeMatrixReport},
+};
 
 use crate::{
     CandidateIdentity, InventoryError, RegexAutomataCorpusReport, RegexAutomataHarnessKind,
@@ -82,12 +85,18 @@ const INVENTORY_UNSUPPORTED_REASON: &str = "fre-adapter.regex-automata-member-no
 const ASSIGNMENT_TARGET_LIMIT: usize = 16;
 const REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES: usize = 8 * 1_048_576;
 const LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES: usize = b",\"look_mode_matrix\":".len();
+const START_MODE_MATRIX_MEMBER_COMPACT_BYTES: usize = b",\"start_mode_matrix\":".len();
+const START_MODE_BASELINE_MEMBER_COMPACT_BYTES: usize = b",\"start_mode_baseline\":".len();
 // Adapter reports use compact JSON so embedding changes the old, matrix-free
 // envelope by exactly one member prefix plus the matrix's compact encoding.
 // Matrix validation independently caps that encoding at 24 MiB.
 const REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES: usize = REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES
     + LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES
-    + REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES;
+    + REGEX_AUTOMATA_LOOK_MODE_MAX_MATRIX_JSON_BYTES
+    + START_MODE_MATRIX_MEMBER_COMPACT_BYTES
+    + REGEX_AUTOMATA_START_MODE_MAX_REPORT_BYTES
+    + START_MODE_BASELINE_MEMBER_COMPACT_BYTES
+    + REGEX_AUTOMATA_PROGRESS_MAX_FILE_BYTES;
 const LEGACY_REPORT_LIMITATIONS: [&str; 2] = [
     "A pass is emitted only after an exact registered adapter function executes successfully; absent registrations remain unsupported.",
     "One unique harness/case adapter disposition is projected across every authenticated feature-mode membership for that same identity.",
@@ -258,6 +267,10 @@ pub struct RegexAutomataAdapterReportPayload {
     pub execution_receipts: Vec<RegexAutomataExecutionReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look_mode_matrix: Option<RegexAutomataLookModeMatrix>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_mode_matrix: Option<Box<RegexAutomataStartModeMatrixReport>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_mode_baseline: Option<Box<RegexAutomataAdapterReport>>,
     pub limitations: Vec<String>,
 }
 
@@ -2326,6 +2339,8 @@ fn build_adapter_report_with_registry(
         receipts,
         execution_receipts,
         look_mode_matrix: None,
+        start_mode_matrix: None,
+        start_mode_baseline: None,
         limitations: registry_report_limitations(registry)
             .iter()
             .map(|text| (*text).to_owned())
@@ -2599,6 +2614,8 @@ pub fn build_regex_automata_all_mode_look_report(
         receipts,
         execution_receipts: executions,
         look_mode_matrix: Some(matrix),
+        start_mode_matrix: None,
+        start_mode_baseline: None,
         limitations: ALL_MODE_LOOK_REPORT_LIMITATIONS
             .iter()
             .map(|text| (*text).to_owned())
@@ -3112,6 +3129,9 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(suffix_literal_count::SUFFIX_LITERAL_COUNT_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA {
         Ok(search_cluster::SEARCH_CLUSTER_REPORT_LIMITATIONS.as_slice())
+    } else if schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
+    {
+        Ok(crate::automata_corpus::start_mode::START_MODE_REPORT_LIMITATIONS.as_slice())
     } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
     } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
@@ -3200,10 +3220,29 @@ impl RegexAutomataAdapterReport {
             && self.schema != REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+            && self.schema
+                != crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
         {
             return Err(InventoryError::new(
                 "legacy regex-automata report unexpectedly embeds a look-mode matrix",
+            ));
+        }
+        if self.schema
+            == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
+        {
+            if self.payload.start_mode_matrix.is_none()
+                || self.payload.start_mode_baseline.is_none()
+            {
+                return Err(InventoryError::new(
+                    "start-mode report lacks its baseline or execution matrix",
+                ));
+            }
+        } else if self.payload.start_mode_matrix.is_some()
+            || self.payload.start_mode_baseline.is_some()
+        {
+            return Err(InventoryError::new(
+                "non-start-mode report unexpectedly embeds start-mode evidence",
             ));
         }
         validate_report_execution_after_structure(inventory, self)
@@ -3223,6 +3262,8 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+            || self.schema
+                == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
         {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
@@ -3275,6 +3316,12 @@ fn validate_report_execution_after_structure(
     }
     if report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA {
         return search_cluster::validate_search_cluster_execution_after_structure(
+            inventory, report,
+        );
+    }
+    if report.schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
+    {
+        return crate::automata_corpus::start_mode::validate_start_mode_report_after_structure(
             inventory, report,
         );
     }
@@ -3454,6 +3501,8 @@ pub fn write_regex_automata_adapter_report(
         || report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+        || report.schema
+            == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
         report.validate_structure(inventory)?;
     } else {
@@ -4860,6 +4909,8 @@ mod tests {
             receipts,
             execution_receipts,
             look_mode_matrix: None,
+            start_mode_matrix: None,
+            start_mode_baseline: None,
             limitations: DOCTEST_ONLY_REPORT_LIMITATIONS
                 .iter()
                 .map(|text| (*text).to_owned())

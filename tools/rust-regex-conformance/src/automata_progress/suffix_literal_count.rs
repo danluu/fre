@@ -141,6 +141,8 @@ pub fn build_regex_automata_suffix_literal_count_report(
         receipts,
         execution_receipts,
         look_mode_matrix: previous.payload.look_mode_matrix.clone(),
+        start_mode_matrix: None,
+        start_mode_baseline: None,
         limitations: SUFFIX_LITERAL_COUNT_REPORT_LIMITATIONS
             .iter()
             .map(|text| (*text).to_owned())
