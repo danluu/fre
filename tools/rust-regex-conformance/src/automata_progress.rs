@@ -37,12 +37,18 @@ use crate::{
 };
 
 mod start_map;
+mod suffix_literal_count;
 mod unicode_word_look;
 mod word_look;
 
 pub use start_map::{
     REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA, build_regex_automata_start_map_report,
     validate_regex_automata_start_map_strict_gain,
+};
+pub use suffix_literal_count::{
+    REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA,
+    build_regex_automata_suffix_literal_count_report,
+    validate_regex_automata_suffix_literal_count_strict_gain,
 };
 pub use unicode_word_look::{
     REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA, build_regex_automata_unicode_word_look_report,
@@ -3094,6 +3100,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(unicode_word_look::UNICODE_WORD_LOOK_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA {
         Ok(start_map::START_MAP_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA {
+        Ok(suffix_literal_count::SUFFIX_LITERAL_COUNT_REPORT_LIMITATIONS.as_slice())
     } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
     } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
@@ -3180,6 +3188,7 @@ impl RegexAutomataAdapterReport {
             && self.schema != REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
         {
             return Err(InventoryError::new(
@@ -3201,6 +3210,7 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
         {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
@@ -3245,6 +3255,11 @@ fn validate_report_execution_after_structure(
     }
     if report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA {
         return start_map::validate_start_map_execution_after_structure(inventory, report);
+    }
+    if report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA {
+        return suffix_literal_count::validate_suffix_literal_count_execution_after_structure(
+            inventory, report,
+        );
     }
     validate_execution_receipt_set(inventory, report, report_registry(report.schema.as_str())?)?;
     Ok(())
@@ -3420,6 +3435,7 @@ pub fn write_regex_automata_adapter_report(
     } else if report.schema == REGEX_AUTOMATA_ASCII_WORD_LOOK_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
     {
         report.validate_structure(inventory)?;
     } else {
