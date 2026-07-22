@@ -36,11 +36,16 @@ use crate::{
     RegexAutomataObligation, authenticate_candidate_source, sha256,
 };
 
+mod search_cluster;
 mod start_map;
 mod suffix_literal_count;
 mod unicode_word_look;
 mod word_look;
 
+pub use search_cluster::{
+    REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA, build_regex_automata_search_cluster_report,
+    validate_regex_automata_search_cluster_strict_gain,
+};
 pub use start_map::{
     REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA, build_regex_automata_start_map_report,
     validate_regex_automata_start_map_strict_gain,
@@ -110,6 +115,9 @@ const AUTOMATON_SOURCE_SHA256: &str =
     "a2af61cdfb7f16a8419a25ccb3ae250afe736ff397c7a3101c8a77781d096a9b";
 const LOOK_SOURCE_PATH: &str = "src/util/look.rs";
 const LOOK_SOURCE_SHA256: &str = "fca6dac7bf7b3b975f177db91e122af89e1510b3664d04210ca8b84738a08305";
+pub(super) const REGEX_SOURCE_PATH: &str = "src/dfa/regex.rs";
+pub(super) const REGEX_SOURCE_SHA256: &str =
+    "567c7a59ca194117986f1818c092b31f825e860fb1b2c55c7de87de97eebb787";
 const LOOK_FULL_SPAN_SHA256: &str =
     "7d4a1ac128aa3df29bab8bece1cd9481df88abfdb31ee7086668503f48eead84";
 const LOOK_TARGET_IDENTITIES_SHA256: &str =
@@ -3102,6 +3110,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(start_map::START_MAP_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA {
         Ok(suffix_literal_count::SUFFIX_LITERAL_COUNT_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA {
+        Ok(search_cluster::SEARCH_CLUSTER_REPORT_LIMITATIONS.as_slice())
     } else if schema == PREVIOUS_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
         Ok(DOCTEST_ONLY_REPORT_LIMITATIONS.as_slice())
     } else if schema == LEGACY_REGEX_AUTOMATA_ADAPTER_REPORT_SCHEMA {
@@ -3189,6 +3199,7 @@ impl RegexAutomataAdapterReport {
             && self.schema != REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
         {
             return Err(InventoryError::new(
@@ -3211,6 +3222,7 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
         {
             return Err(InventoryError::new(
                 "current regex-automata report cannot serve as this transition's predecessor",
@@ -3258,6 +3270,11 @@ fn validate_report_execution_after_structure(
     }
     if report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA {
         return suffix_literal_count::validate_suffix_literal_count_execution_after_structure(
+            inventory, report,
+        );
+    }
+    if report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA {
+        return search_cluster::validate_search_cluster_execution_after_structure(
             inventory, report,
         );
     }
@@ -3436,6 +3453,7 @@ pub fn write_regex_automata_adapter_report(
         || report.schema == REGEX_AUTOMATA_UNICODE_WORD_LOOK_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
     {
         report.validate_structure(inventory)?;
     } else {
@@ -4205,6 +4223,7 @@ fn validate_source_spec(source: &SourceContractSpec) -> Result<(), InventoryErro
         (AUTOMATON_SOURCE_PATH, AUTOMATON_SOURCE_SHA256)
             | (LOOK_SOURCE_PATH, LOOK_SOURCE_SHA256)
             | (start_map::SOURCE_PATH, start_map::SOURCE_SHA256)
+            | (REGEX_SOURCE_PATH, REGEX_SOURCE_SHA256)
     );
     if !authenticated_source
         || source.span_start_line == 0

@@ -1,0 +1,8 @@
+    /// ```
+    /// use regex_automata::dfa::regex::Regex;
+    ///
+    /// let re = Regex::new("foo[0-9]+bar")?;
+    /// assert_eq!(true, re.is_match("foo12345bar"));
+    /// assert_eq!(false, re.is_match("foobar"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```

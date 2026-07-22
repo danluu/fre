@@ -1,0 +1,8 @@
+    /// ```
+    /// # if cfg!(miri) { return Ok(()); } // miri takes too long
+    /// use regex_automata::dfa::regex::Regex;
+    ///
+    /// let re = Regex::new_many(&[r"[a-z]+", r"[0-9]+", r"\w+"])?;
+    /// assert_eq!(3, re.pattern_len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```

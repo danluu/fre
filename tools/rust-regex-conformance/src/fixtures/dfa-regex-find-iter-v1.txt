@@ -1,0 +1,13 @@
+    /// ```
+    /// use regex_automata::{Match, dfa::regex::Regex};
+    ///
+    /// let re = Regex::new("foo[0-9]+")?;
+    /// let text = "foo1 foo12 foo123";
+    /// let matches: Vec<Match> = re.find_iter(text).collect();
+    /// assert_eq!(matches, vec![
+    ///     Match::must(0, 0..4),
+    ///     Match::must(0, 5..10),
+    ///     Match::must(0, 11..17),
+    /// ]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```

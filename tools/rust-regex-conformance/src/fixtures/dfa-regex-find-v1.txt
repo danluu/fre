@@ -1,0 +1,15 @@
+    /// ```
+    /// use regex_automata::{Match, dfa::regex::Regex};
+    ///
+    /// // Greediness is applied appropriately.
+    /// let re = Regex::new("foo[0-9]+")?;
+    /// assert_eq!(Some(Match::must(0, 3..11)), re.find("zzzfoo12345zzz"));
+    ///
+    /// // Even though a match is found after reading the first byte (`a`),
+    /// // the default leftmost-first match semantics demand that we find the
+    /// // earliest match that prefers earlier parts of the pattern over latter
+    /// // parts.
+    /// let re = Regex::new("abc|a")?;
+    /// assert_eq!(Some(Match::must(0, 0..3)), re.find("abc"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```

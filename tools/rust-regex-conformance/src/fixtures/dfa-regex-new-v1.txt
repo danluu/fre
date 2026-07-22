@@ -1,0 +1,10 @@
+    /// ```
+    /// use regex_automata::{Match, dfa::regex::Regex};
+    ///
+    /// let re = Regex::new("foo[0-9]+bar")?;
+    /// assert_eq!(
+    ///     Some(Match::must(0, 3..14)),
+    ///     re.find(b"zzzfoo12345barzzz"),
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
