@@ -16,6 +16,7 @@ mod bounded_class_sequence;
 mod bounded_context;
 mod bounded_separated_fields;
 mod byte_start_map;
+mod determinize_state_codec;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
 mod forward_anchored;
@@ -82,6 +83,17 @@ pub use byte_start_map::{
     LookupLimits as ByteStartMapLookupLimits, LookupResult as ByteStartMapLookupResult,
     PLAN_ID as BYTE_START_MAP_PLAN_ID, Resource as ByteStartMapResource,
     StartClass as ByteStartClass,
+};
+pub use determinize_state_codec::{
+    Accounting as DeterminizeStateCodecAccounting, Decoded as DeterminizeStateDecoded,
+    Error as DeterminizeStateCodecError, Limits as DeterminizeStateCodecLimits,
+    MAX_ENCODED_BYTES as DETERMINIZE_STATE_MAX_ENCODED_BYTES,
+    PLAN_ID as DETERMINIZE_STATE_CODEC_PLAN_ID, Resource as DeterminizeStateCodecResource,
+    decode_i32 as decode_determinize_state_i32,
+    decode_requirements as determinize_state_decode_requirements,
+    decode_u32 as decode_determinize_state_u32, encode_i32 as encode_determinize_state_i32,
+    encode_requirements as determinize_state_encode_requirements,
+    encode_u32 as encode_determinize_state_u32, encoded_len as determinize_state_encoded_len,
 };
 pub use fixed_absolute_domain::{
     ACCOUNTING_VERSION as FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION,

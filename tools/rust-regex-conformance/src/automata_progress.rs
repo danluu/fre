@@ -41,6 +41,7 @@ use crate::{
 
 mod search_cluster;
 mod start_map;
+mod state_codec;
 mod suffix_literal_count;
 mod unicode_word_look;
 mod word_look;
@@ -52,6 +53,10 @@ pub use search_cluster::{
 pub use start_map::{
     REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA, build_regex_automata_start_map_report,
     validate_regex_automata_start_map_strict_gain,
+};
+pub use state_codec::{
+    REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA, build_regex_automata_state_codec_report,
+    validate_regex_automata_state_codec_strict_gain,
 };
 pub use suffix_literal_count::{
     REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA,
@@ -3129,6 +3134,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(suffix_literal_count::SUFFIX_LITERAL_COUNT_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA {
         Ok(search_cluster::SEARCH_CLUSTER_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA {
+        Ok(state_codec::STATE_CODEC_REPORT_LIMITATIONS.as_slice())
     } else if schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
         Ok(crate::automata_corpus::start_mode::START_MODE_REPORT_LIMITATIONS.as_slice())
@@ -3220,6 +3227,7 @@ impl RegexAutomataAdapterReport {
             && self.schema != REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
             && self.schema
                 != crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
@@ -3230,6 +3238,7 @@ impl RegexAutomataAdapterReport {
         }
         if self.schema
             == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
         {
             if self.payload.start_mode_matrix.is_none()
                 || self.payload.start_mode_baseline.is_none()
@@ -3262,6 +3271,7 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
             || self.schema
                 == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
         {
@@ -3318,6 +3328,9 @@ fn validate_report_execution_after_structure(
         return search_cluster::validate_search_cluster_execution_after_structure(
             inventory, report,
         );
+    }
+    if report.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA {
+        return state_codec::validate_state_codec_execution_after_structure(inventory, report);
     }
     if report.schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
@@ -3501,6 +3514,7 @@ pub fn write_regex_automata_adapter_report(
         || report.schema == REGEX_AUTOMATA_START_MAP_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
         || report.schema
             == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
