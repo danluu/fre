@@ -39,6 +39,7 @@ use crate::{
     RegexAutomataObligation, authenticate_candidate_source, sha256,
 };
 
+mod automaton_transition_cluster;
 mod search_cluster;
 mod start_map;
 mod state_codec;
@@ -46,6 +47,11 @@ mod suffix_literal_count;
 mod unicode_word_look;
 mod word_look;
 
+pub use automaton_transition_cluster::{
+    REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA,
+    build_regex_automata_transition_cluster_report,
+    validate_regex_automata_transition_cluster_strict_gain,
+};
 pub use search_cluster::{
     REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA, build_regex_automata_search_cluster_report,
     validate_regex_automata_search_cluster_strict_gain,
@@ -3136,6 +3142,8 @@ fn report_limitations(schema: &str) -> Result<&'static [&'static str], Inventory
         Ok(search_cluster::SEARCH_CLUSTER_REPORT_LIMITATIONS.as_slice())
     } else if schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA {
         Ok(state_codec::STATE_CODEC_REPORT_LIMITATIONS.as_slice())
+    } else if schema == REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA {
+        Ok(automaton_transition_cluster::TRANSITION_CLUSTER_REPORT_LIMITATIONS.as_slice())
     } else if schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
         Ok(crate::automata_corpus::start_mode::START_MODE_REPORT_LIMITATIONS.as_slice())
@@ -3228,6 +3236,7 @@ impl RegexAutomataAdapterReport {
             && self.schema != REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
             && self.schema != REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
+            && self.schema != REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA
             && self.schema
                 != crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
             && self.payload.look_mode_matrix.is_some()
@@ -3239,6 +3248,7 @@ impl RegexAutomataAdapterReport {
         if self.schema
             == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA
         {
             if self.payload.start_mode_matrix.is_none()
                 || self.payload.start_mode_baseline.is_none()
@@ -3272,6 +3282,7 @@ impl RegexAutomataAdapterReport {
             || self.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
             || self.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
+            || self.schema == REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA
             || self.schema
                 == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
         {
@@ -3335,6 +3346,11 @@ fn validate_report_execution_after_structure(
     if report.schema == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
         return crate::automata_corpus::start_mode::validate_start_mode_report_after_structure(
+            inventory, report,
+        );
+    }
+    if report.schema == REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA {
+        return automaton_transition_cluster::validate_transition_cluster_execution_after_structure(
             inventory, report,
         );
     }
@@ -3515,6 +3531,7 @@ pub fn write_regex_automata_adapter_report(
         || report.schema == REGEX_AUTOMATA_SUFFIX_LITERAL_COUNT_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_SEARCH_CLUSTER_REPORT_SCHEMA
         || report.schema == REGEX_AUTOMATA_STATE_CODEC_REPORT_SCHEMA
+        || report.schema == REGEX_AUTOMATA_TRANSITION_CLUSTER_REPORT_SCHEMA
         || report.schema
             == crate::automata_corpus::start_mode::REGEX_AUTOMATA_START_MODE_REPORT_SCHEMA
     {
@@ -4319,7 +4336,12 @@ fn validate_source_spec(source: &SourceContractSpec) -> Result<(), InventoryErro
             .span_start_line
             .checked_add(offset)
             .ok_or_else(|| InventoryError::new("regex-automata source line overflow"))?;
-        if line.contains("assert") {
+        let code = line
+            .trim_start()
+            .strip_prefix("///")
+            .unwrap_or(line)
+            .trim_start();
+        if code.starts_with("assert") && code.contains("!(") {
             discovered.push((source_line, sha256(line.as_bytes())));
         }
     }

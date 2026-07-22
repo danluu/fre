@@ -1,0 +1,25 @@
+    /// ```
+    /// use regex_automata::{dfa::{Automaton, dense}, Input};
+    ///
+    /// let dfa = dense::DFA::new(r"[a-z]+r")?;
+    /// let haystack = "bar".as_bytes();
+    ///
+    /// // The start state is determined by inspecting the position and the
+    /// // initial bytes of the haystack.
+    /// //
+    /// // The unwrap is OK because we aren't requesting a start state for a
+    /// // specific pattern.
+    /// let mut state = dfa.start_state_forward(&Input::new(haystack))?;
+    /// // Walk all the bytes in the haystack.
+    /// for &b in haystack {
+    ///     state = dfa.next_state(state, b);
+    /// }
+    /// // Matches are always delayed by 1 byte, so we must explicitly walk
+    /// // the special "EOI" transition at the end of the search. Without this
+    /// // final transition, the assert below will fail since the DFA will not
+    /// // have entered a match state yet!
+    /// state = dfa.next_eoi_state(state);
+    /// assert!(dfa.is_match_state(state));
+    ///
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
