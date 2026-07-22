@@ -275,7 +275,7 @@ fn every_pinned_bytes_split_and_splitn_doctest_passes() {
         }
         .unwrap_or_else(|error| panic!("upstream split case {} failed: {error}", case.id));
         assert_eq!(
-            actual.selector_report().identity.operation,
+            actual.selector_report().cache_identity().operation,
             AggregateOperation::Spans
         );
         assert_eq!(actual.len(), case.expected.len(), "case {}", case.id);

@@ -172,6 +172,29 @@ pub(super) fn requirements(
     })
 }
 
+pub(super) fn allocation_count(program: &Program, log_bytes: usize) -> Result<usize, Error> {
+    let layout = Layout::new(program)?;
+    let offsets = add(layout.states, 1, Resource::Allocations)?;
+    Ok([
+        offsets,
+        layout.edges,
+        layout.states,
+        layout.states,
+        layout.states,
+        layout.candidate_words,
+        layout.summary_words,
+        log_bytes,
+    ]
+    .into_iter()
+    .filter(|length| *length != 0)
+    .count())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "terminal-frontier construction keeps its two-pass P/A ordering and allocation ledger in one audit unit"
+)]
 pub(super) fn build(
     program: &Program,
     haystack: &[u8],
@@ -180,6 +203,7 @@ pub(super) fn build(
     seed: &TerminalFrontierSeed,
     limits: OperationLimits,
     accounting: &mut ExecutionAccounting,
+    actual_allocations: &mut usize,
 ) -> Result<RowStore, Error> {
     let (storage, frontier, layout) = validate_build_inputs(program, requirements, seed, limits)?;
     let Some(first_prefix_end) = admitted_prefix(
@@ -190,9 +214,27 @@ pub(super) fn build(
         accounting,
     )?
     else {
-        return build_zero_log(program, requirements, storage, limits, accounting, frontier);
+        return build_zero_log(
+            program,
+            requirements,
+            storage,
+            limits,
+            accounting,
+            actual_allocations,
+            frontier,
+        );
     };
-    let mut allocated = Allocated::new(layout, limits, accounting, requirements.work_bound)?;
+    let mut allocated = Allocated::new(
+        layout,
+        limits,
+        accounting,
+        actual_allocations,
+        requirements.work_bound,
+    )?;
+    accounting.random_access_peak_bytes = allocated.bytes;
+    accounting.scratch_peak_bytes = allocated.bytes;
+    accounting.frontier_bytes = allocated.bytes;
+    accounting.peak_bytes = allocated.bytes;
     let index = ReverseIndex::build(
         program,
         &mut allocated.offsets,
@@ -240,12 +282,19 @@ pub(super) fn build(
         frontier.post_build_work,
     )?;
     machine.reset(&mut allocated, accounting)?;
+    let mut store = allocate_log(requirements.requested_log_bytes, allocated.bytes, limits)?;
+    super::record_allocation(actual_allocations, store.capacity())?;
+    accounting.log_bytes = requirements.requested_log_bytes;
+    accounting.peak_bytes = add(
+        requirements.requested_log_bytes,
+        allocated.bytes,
+        Resource::PeakBytes,
+    )?;
     charge_bookkeeping(
         accounting,
         requirements.work_bound,
         requirements.requested_log_bytes,
     )?;
-    let mut store = allocate_log(requirements.requested_log_bytes, allocated.bytes, limits)?;
     machine.work_bound = add(
         accounting.work,
         add(
@@ -365,6 +414,7 @@ fn build_zero_log(
     storage: RowStorage,
     limits: OperationLimits,
     accounting: &mut ExecutionAccounting,
+    actual_allocations: &mut usize,
     frontier: FrontierRequirements,
 ) -> Result<RowStore, Error> {
     let future = add(
@@ -377,18 +427,20 @@ fn build_zero_log(
         limits.max_work,
         Resource::ExecutionWork,
     )?;
+    let store = allocate_log(requirements.requested_log_bytes, 0, limits)?;
+    super::record_allocation(actual_allocations, store.capacity())?;
+    accounting.log_bytes = requirements.requested_log_bytes;
+    accounting.peak_bytes = requirements.requested_log_bytes;
     charge_bookkeeping(
         accounting,
         requirements.work_bound,
         requirements.requested_log_bytes,
     )?;
-    let store = allocate_log(requirements.requested_log_bytes, 0, limits)?;
     accounting.sequential_bytes_written = add(
         accounting.sequential_bytes_written,
         requirements.requested_log_bytes,
         Resource::SequentialBytes,
     )?;
-    accounting.log_bytes = requirements.requested_log_bytes;
     Ok(RowStore {
         bytes: store,
         storage,
@@ -450,6 +502,13 @@ fn allocate_log(length: usize, frontier: usize, limits: OperationLimits) -> Resu
         limits.max_peak_bytes,
         Resource::PeakBytes,
     )?;
+    #[cfg(test)]
+    if length != 0 && super::allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
+            resource: Resource::LogBytes,
+            items: length,
+        });
+    }
     zeroed_exact(length).map_err(|_| Error::AllocationFailed {
         resource: Resource::LogBytes,
         items: length,
@@ -471,18 +530,55 @@ impl Allocated {
         layout: Layout,
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
         work_bound: usize,
     ) -> Result<Self, Error> {
         preflight_frontier_bytes(layout.bytes, 0, limits)?;
-        charge_bookkeeping(accounting, work_bound, layout.total_words)?;
-        let offsets = zeroed_words(add(layout.states, 1, Resource::ScratchBytes)?)?;
-        let predecessors = zeroed_words(layout.edges)?;
-        let active = zeroed_words(layout.states)?;
-        let row = zeroed_words(layout.states)?;
-        let next_row = zeroed_words(layout.states)?;
-        let mut candidates = OrderedSet::reserved(layout)?;
+        let mut live_words = 0_usize;
+        let offsets = zeroed_words_tracked(
+            add(layout.states, 1, Resource::ScratchBytes)?,
+            accounting,
+            actual_allocations,
+            work_bound,
+            &mut live_words,
+        )?;
+        let predecessors = zeroed_words_tracked(
+            layout.edges,
+            accounting,
+            actual_allocations,
+            work_bound,
+            &mut live_words,
+        )?;
+        let active = zeroed_words_tracked(
+            layout.states,
+            accounting,
+            actual_allocations,
+            work_bound,
+            &mut live_words,
+        )?;
+        let row = zeroed_words_tracked(
+            layout.states,
+            accounting,
+            actual_allocations,
+            work_bound,
+            &mut live_words,
+        )?;
+        let next_row = zeroed_words_tracked(
+            layout.states,
+            accounting,
+            actual_allocations,
+            work_bound,
+            &mut live_words,
+        )?;
+        let mut candidates =
+            OrderedSet::reserved_tracked(layout, accounting, actual_allocations, &mut live_words)?;
         let bytes = layout.bytes;
-        candidates.initialize(layout)?;
+        candidates.initialize(layout, accounting, work_bound)?;
+        if live_words != layout.total_words {
+            return Err(Error::InternalInvariant(
+                "terminal frontier live allocation census changed",
+            ));
+        }
         Ok(Self {
             offsets,
             predecessors,
@@ -495,16 +591,90 @@ impl Allocated {
     }
 }
 
-fn reserved_words(length: usize) -> Result<ExactVec<usize>, Error> {
-    ExactVec::try_with_capacity(length).map_err(|_| Error::AllocationFailed {
-        resource: Resource::ScratchBytes,
-        items: length,
-    })
+#[cfg(test)]
+pub(super) fn test_allocation_shape(program: &Program) -> Result<(usize, usize), Error> {
+    let layout = Layout::new(program)?;
+    Ok((layout.total_words, layout.bytes))
 }
 
-fn zeroed_words(length: usize) -> Result<ExactVec<usize>, Error> {
-    let mut values = reserved_words(length)?;
+#[cfg(test)]
+pub(super) fn test_allocated_composite(
+    program: &Program,
+    limits: OperationLimits,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(), Error> {
+    let layout = Layout::new(program)?;
+    let mut actual_allocations = 0;
+    Allocated::new(
+        layout,
+        limits,
+        accounting,
+        &mut actual_allocations,
+        usize::MAX,
+    )
+    .map(drop)
+}
+
+#[cfg(test)]
+pub(super) fn test_allocated_then_log(
+    program: &Program,
+    log_bytes: usize,
+    limits: OperationLimits,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(), Error> {
+    let layout = Layout::new(program)?;
+    let mut actual_allocations = 0;
+    let allocated = Allocated::new(
+        layout,
+        limits,
+        accounting,
+        &mut actual_allocations,
+        usize::MAX,
+    )?;
+    allocate_log(log_bytes, allocated.bytes, limits).map(drop)
+}
+
+fn reserved_words_tracked(
+    length: usize,
+    accounting: &mut ExecutionAccounting,
+    actual_allocations: &mut usize,
+    live_words: &mut usize,
+) -> Result<ExactVec<usize>, Error> {
+    #[cfg(test)]
+    if length != 0 && super::allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
+            resource: Resource::ScratchBytes,
+            items: length,
+        });
+    }
+    let values = ExactVec::try_with_capacity(length).map_err(|_| Error::AllocationFailed {
+        resource: Resource::ScratchBytes,
+        items: length,
+    })?;
+    super::record_allocation(actual_allocations, values.capacity())?;
+    *live_words = add(*live_words, length, Resource::ScratchBytes)?;
+    let live_bytes = mul(
+        *live_words,
+        core::mem::size_of::<usize>(),
+        Resource::ScratchBytes,
+    )?;
+    accounting.random_access_peak_bytes = accounting.random_access_peak_bytes.max(live_bytes);
+    accounting.scratch_peak_bytes = accounting.scratch_peak_bytes.max(live_bytes);
+    accounting.frontier_bytes = accounting.frontier_bytes.max(live_bytes);
+    accounting.peak_bytes = accounting.peak_bytes.max(live_bytes);
+    Ok(values)
+}
+
+fn zeroed_words_tracked(
+    length: usize,
+    accounting: &mut ExecutionAccounting,
+    actual_allocations: &mut usize,
+    work_bound: usize,
+    live_words: &mut usize,
+) -> Result<ExactVec<usize>, Error> {
+    let mut values = reserved_words_tracked(length, accounting, actual_allocations, live_words)?;
     for _ in 0..length {
+        charge_bookkeeping(accounting, work_bound, 1)?;
         values.try_push(0).map_err(|_| {
             Error::InternalInvariant(
                 "terminal frontier exact allocation filled before initialization",
@@ -670,21 +840,42 @@ const ORDERED_POP_WORK: usize = 24;
 const ORDERED_SUMMARY_PROBE_WORK: usize = 4;
 
 impl OrderedSet {
-    fn reserved(layout: Layout) -> Result<Self, Error> {
+    fn reserved_tracked(
+        layout: Layout,
+        accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        live_words: &mut usize,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            bits: reserved_words(layout.candidate_words)?,
-            summary: reserved_words(layout.summary_words)?,
+            bits: reserved_words_tracked(
+                layout.candidate_words,
+                accounting,
+                actual_allocations,
+                live_words,
+            )?,
+            summary: reserved_words_tracked(
+                layout.summary_words,
+                accounting,
+                actual_allocations,
+                live_words,
+            )?,
             states: layout.states,
         })
     }
 
-    fn initialize(&mut self, layout: Layout) -> Result<(), Error> {
+    fn initialize(
+        &mut self,
+        layout: Layout,
+        accounting: &mut ExecutionAccounting,
+        work_bound: usize,
+    ) -> Result<(), Error> {
         if self.states != layout.states {
             return Err(Error::InternalInvariant(
                 "terminal frontier ordered-set shape changed",
             ));
         }
         for _ in 0..layout.candidate_words {
+            charge_bookkeeping(accounting, work_bound, 1)?;
             self.bits.try_push(0).map_err(|_| {
                 Error::InternalInvariant(
                     "terminal frontier candidate words exceeded exact allocation",
@@ -692,6 +883,7 @@ impl OrderedSet {
             })?;
         }
         for _ in 0..layout.summary_words {
+            charge_bookkeeping(accounting, work_bound, 1)?;
             self.summary.try_push(0).map_err(|_| {
                 Error::InternalInvariant(
                     "terminal frontier summary words exceeded exact allocation",

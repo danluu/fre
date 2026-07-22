@@ -2603,6 +2603,7 @@ fn performance_runner_route(
         | (
             "count" | "count-spans",
             "aggregate-exact-literal"
+            | "aggregate-fixed-absolute-domain"
             | "aggregate-unicode-scalar-class"
             | "aggregate-finite-literal-dfa"
             | "aggregate-continuation-program"
@@ -5972,6 +5973,25 @@ mod tests {
                 performance_runner_route("grep-captures", &format!("{plan}-alias"), 1).is_err()
             );
         }
+    }
+
+    #[test]
+    fn fixed_absolute_domain_is_registered_only_for_single_aggregate_operations() {
+        for model in ["count", "count-spans"] {
+            assert_eq!(
+                performance_runner_route(model, "aggregate-fixed-absolute-domain", 1)
+                    .expect("fixed absolute-domain operation route"),
+                PerformanceRunnerRoute::AggregateSingle
+            );
+            assert!(performance_runner_route(model, "aggregate-fixed-absolute-domain", 2).is_err());
+        }
+        assert!(
+            performance_runner_route("compile", "compile-aggregate-fixed-absolute-domain", 1)
+                .is_err()
+        );
+        assert!(
+            performance_runner_route("count", "aggregate-fixed-absolute-domain-alias", 1).is_err()
+        );
     }
 
     #[test]

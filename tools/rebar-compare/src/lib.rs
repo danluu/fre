@@ -156,7 +156,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -487,7 +487,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             });
-        AdapterIdentity {
+        let mut identity = AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields plan, with distinct immutable identities and a same-parse bounded required-any-literal DFA that prunes impossible LF-framed lines before unchanged selector/replay; other capture participation uses a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
@@ -496,7 +496,14 @@ impl CandidateAdapter for CurrentFreAdapter {
             availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language plan preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and prune impossible lines through a bounded DFA before unchanged exact selector/replay; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
-        }
+        };
+        identity
+            .identity
+            .push_str("; fixed-absolute-domain-v1 canonical-HIR generic reducers with sealed exact P/A accounting");
+        identity
+            .availability
+            .push_str("; fixed-absolute-domain-v1 supports authenticated endpoint, whole-input and start-prefix count/span-sum routes");
+        identity
     }
 
     fn execute(&self, request: CandidateRequest<'_>, limits: &RunLimits) -> CandidateOutcome {
@@ -1457,15 +1464,21 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
-            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
-                .count_value(haystack, limits)
-                .map_err(|error| CompareError::new(format!("FRE count lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => {
+                regex.count_value(haystack, limits).map_err(|error| {
+                    let message = format!("FRE count lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                })
+            }
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
-                .span_sum_value(haystack, limits)
-                .map_err(|error| CompareError::new(format!("FRE span-sum lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
+                regex.span_sum_value(haystack, limits).map_err(|error| {
+                    let message = format!("FRE span-sum lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                })
+            }
             CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => {
                 regex.span_sum_value(haystack, *limits).map_err(|error| {
                     CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
@@ -1519,7 +1532,28 @@ fn build_current_fre_count_lifecycle(
             .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
         let plan = aggregate_single_plan_label("count", regex.build_report());
-        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        let fixed_absolute_prospective = regex
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE count lifecycle fixed-domain preflight: {error}"
+                ))
+            })?;
+        let fixed_absolute_composite = regex
+            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE count lifecycle fixed-domain composite preflight: {error}"
+                ))
+            })?;
+        let limits = aggregate_run_limits_with_fixed_absolute(
+            haystack_len,
+            regex.build_report(),
+            fixed_absolute_prospective,
+            fixed_absolute_composite,
+            &RunLimits::default(),
+        )
+        .map_err(|error| CompareError::new(error.message))?;
         (
             plan,
             CurrentFreAggregateOperationInner::CountSingle(regex, limits),
@@ -1569,7 +1603,28 @@ fn build_current_fre_span_sum_lifecycle(
             "count-spans",
         )?;
         let plan = aggregate_single_plan_label("count-spans", regex.build_report());
-        let limits = current_fre_rebar_aggregate_run_limits(haystack_len, regex.build_report())?;
+        let fixed_absolute_prospective = regex
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE span-sum lifecycle fixed-domain preflight: {error}"
+                ))
+            })?;
+        let fixed_absolute_composite = regex
+            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE span-sum lifecycle fixed-domain composite preflight: {error}"
+                ))
+            })?;
+        let limits = aggregate_run_limits_with_fixed_absolute(
+            haystack_len,
+            regex.build_report(),
+            fixed_absolute_prospective,
+            fixed_absolute_composite,
+            &RunLimits::default(),
+        )
+        .map_err(|error| CompareError::new(error.message))?;
         (
             plan,
             CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits),
@@ -1657,6 +1712,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-prefix-class-alternation"
         }
         ("compile", AggregatePlanKind::BoundedContext, _) => "compile-aggregate-bounded-context",
+        ("compile", AggregatePlanKind::FixedAbsoluteDomain, _) => {
+            "compile-aggregate-fixed-absolute-domain"
+        }
         ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
             "compile-aggregate-finite-literal-sparse"
         }
@@ -1674,6 +1732,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
+        (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -1936,8 +1995,10 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
     })
 }
 
-/// Derive the exact whole-operation limits used by the authenticated
-/// current-FRE Rebar adapter for one already-published aggregate plan.
+/// Derive whole-operation limits for a report-authenticated aggregate plan.
+/// Fixed absolute-domain plans require the retained artifact and must use
+/// [`current_fre_rebar_count_run_limits`] or
+/// [`current_fre_rebar_span_sum_run_limits`] instead.
 ///
 /// # Errors
 ///
@@ -1948,6 +2009,70 @@ pub fn current_fre_rebar_aggregate_run_limits(
 ) -> Result<AggregateRunLimits, CompareError> {
     aggregate_run_limits(haystack_len, report, &RunLimits::default())
         .map_err(|error| CompareError::new(error.message))
+}
+
+/// Derive exact operation limits from one retained count artifact, including
+/// its private fixed absolute-domain seal when that generic route is selected.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if the artifact cannot publish an
+/// exact source-free full-window prospective envelope.
+pub fn current_fre_rebar_count_run_limits(
+    haystack_len: usize,
+    regex: &AggregateCountRegex,
+) -> Result<AggregateRunLimits, CompareError> {
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| CompareError::new(format!("FRE count fixed-domain preflight: {error}")))?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE count fixed-domain composite preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        &RunLimits::default(),
+    )
+    .map_err(|error| CompareError::new(error.message))
+}
+
+/// Derive exact operation limits from one retained span-sum artifact,
+/// including its private fixed absolute-domain seal when selected.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if the artifact cannot publish an
+/// exact source-free full-window prospective envelope.
+pub fn current_fre_rebar_span_sum_run_limits(
+    haystack_len: usize,
+    regex: &AggregateSpanSumRegex,
+) -> Result<AggregateRunLimits, CompareError> {
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!("FRE span-sum fixed-domain preflight: {error}"))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE span-sum fixed-domain composite preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        &RunLimits::default(),
+    )
+    .map_err(|error| CompareError::new(error.message))
 }
 
 /// Derive the exact whole-operation limits used by the authenticated
@@ -3576,6 +3701,10 @@ fn composite_preflight(
 
 fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionError> {
     let mut work = report.syntax.parse_work;
+    let fixed_absolute_planner_work =
+        usize::try_from(report.fixed_absolute_planner_work).map_err(|_| {
+            ExecutionError::fault("fixed absolute-domain planner work does not fit usize")
+        })?;
     for planner in [
         report.planner_work,
         report.unicode_scalar_planner_work,
@@ -3586,6 +3715,7 @@ fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionE
         report.bounded_separated_fields_planner_work,
         report.prefix_class_alternation_planner_work,
         report.bounded_context_planner_work,
+        fixed_absolute_planner_work,
         report.capture_erasure_work,
     ] {
         work = composite_checked_add(work, composite_u64(planner, "planner work")?, "build work")?;
@@ -3594,6 +3724,21 @@ fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionE
     let selected = match report.build {
         AggregateBuildAccounting::FiniteLiteral(build) => build.build_work_upper_bound,
         AggregateBuildAccounting::SparseFiniteLiteral(build) => build.build_work,
+        AggregateBuildAccounting::FixedAbsoluteDomain(_) => {
+            let build = report
+                .fixed_absolute_domain_build_accounting()
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "regex-redux fixed absolute-domain build accounting is not authenticated",
+                    )
+                })?;
+            if !report.has_closed_fixed_absolute_domain_identity() {
+                return Err(ExecutionError::fault(
+                    "regex-redux fixed absolute-domain build identity is not closed",
+                ));
+            }
+            build.actual.work
+        }
         AggregateBuildAccounting::Continuation(build) => composite_u64(build.work, "compile work")?,
         _ => {
             return Err(ExecutionError::fault(
@@ -3682,6 +3827,28 @@ fn composite_component_build_peak(report: &AggregateBuildReport) -> Result<usize
             build.peak_bytes,
             build.peak_bytes >= build.persistent_bytes && build.peak_bytes >= build.scratch_bytes,
         ),
+        AggregateBuildAccounting::FixedAbsoluteDomain(_) => {
+            let build = report
+                .fixed_absolute_domain_build_accounting()
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "regex-redux fixed absolute-domain build accounting is not authenticated",
+                    )
+                })?;
+            (
+                build.actual.persistent_bytes,
+                build.actual.peak_bytes,
+                report.has_closed_fixed_absolute_domain_identity()
+                    && build.actual.published
+                    && build.actual.work <= build.prospective.work
+                    && build.actual.allocations <= build.prospective.allocations
+                    && build.actual.persistent_bytes <= build.prospective.persistent_bytes
+                    && build.actual.peak_bytes <= build.prospective.peak_bytes
+                    && build.actual.peak_bytes >= build.actual.persistent_bytes
+                    && build.kernel.actual.published
+                    && fixed_absolute_build_contains(build.kernel.prospective, build.kernel.actual),
+            )
+        }
         AggregateBuildAccounting::Continuation(build) => (
             build.program_bytes,
             build.construction_peak_bytes,
@@ -4056,6 +4223,8 @@ fn composite_replacement_component_limits(
         bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
         prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
         bounded_context: inactive_bounded_context_operation_limits(),
+        fixed_absolute: inactive_fixed_absolute_operation_limits(),
+        fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
         finite_literal: ordered_literal_operation_limits(sequence_len, None, run_limits)?,
         continuation: continuation_spans_operation_limits(
             sequence_len,
@@ -4471,7 +4640,7 @@ fn fre_compile_verify(
         .verify_count(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE compiled artifact failed untimed verification: {error}");
-            aggregate_execution_error(&error.source, message)
+            aggregate_attempt_error(&error, message)
         })?;
     let plan = aggregate_single_plan_label("compile", regex.build_report());
     Ok(FreReduction {
@@ -5543,6 +5712,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         .fre_aggregate_program_bytes
         .checked_div(core::mem::size_of::<u32>())
         .unwrap_or(0);
+    let fixed_absolute_defaults = fre::FixedAbsoluteDomainBuildLimits::default();
     AggregateBuildLimits {
         max_literal_planner_work: limits.fre_literal_planner_work,
         max_unicode_scalar_planner_work: limits.fre_unicode_scalar_planner_work,
@@ -5553,6 +5723,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_bounded_affix_planner_work: limits.fre_bounded_affix_planner_work,
         max_prefix_class_alternation_planner_work: limits.fre_literal_planner_work,
         max_bounded_context_planner_work: limits.fre_unicode_scalar_planner_work,
+        max_fixed_absolute_planner_work: limits.fre_literal_planner_work,
         max_finite_planner_work: u64::try_from(limits.fre_aggregate_compile_work)
             .unwrap_or(u64::MAX),
         exact_literal: LiteralAggregateBuildLimits {
@@ -5627,6 +5798,33 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_scratch_bytes: limits.fre_literal_build_scratch_bytes,
             max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
             max_peak_bytes: limits.fre_literal_build_peak_bytes,
+        },
+        fixed_absolute: fre::FixedAbsoluteDomainBuildLimits {
+            max_items: fixed_absolute_defaults
+                .max_items
+                .min(limits.patterns_per_job),
+            max_payload_bytes: fixed_absolute_defaults
+                .max_payload_bytes
+                .min(limits.fre_literal_build_needle_bytes),
+            max_identity_bytes: fixed_absolute_defaults
+                .max_identity_bytes
+                .min(limits.fre_literal_build_needle_bytes),
+            max_copied_bytes: fixed_absolute_defaults
+                .max_copied_bytes
+                .min(limits.fre_literal_build_needle_bytes),
+            max_allocations: fixed_absolute_defaults.max_allocations,
+            max_initialized_bytes: fixed_absolute_defaults
+                .max_initialized_bytes
+                .min(limits.fre_literal_build_needle_bytes),
+            max_build_work: fixed_absolute_defaults
+                .max_build_work
+                .min(limits.fre_literal_build_work),
+            max_persistent_bytes: fixed_absolute_defaults
+                .max_persistent_bytes
+                .min(limits.fre_literal_build_persistent_bytes),
+            max_peak_bytes: fixed_absolute_defaults
+                .max_peak_bytes
+                .min(limits.fre_literal_build_peak_bytes),
         },
         finite_literal: OrderedLiteralAggregateBuildLimits {
             max_patterns: limits.patterns_per_job,
@@ -6778,6 +6976,90 @@ fn inactive_bounded_context_operation_limits() -> fre::BoundedContextReduceLimit
     fre::BoundedContextReduceLimits::default()
 }
 
+fn inactive_fixed_absolute_operation_limits() -> fre::FixedAbsoluteDomainReduceLimits {
+    fre::FixedAbsoluteDomainReduceLimits::default()
+}
+
+fn inactive_fixed_absolute_residual_limits() -> fre::AggregateFixedAbsoluteDomainResidualLimits {
+    fre::AggregateFixedAbsoluteDomainResidualLimits::default()
+}
+
+fn fixed_absolute_residual_limits(
+    prospective: fre::AggregateFixedAbsoluteDomainResidualProspective,
+    limits: &RunLimits,
+) -> fre::AggregateFixedAbsoluteDomainResidualLimits {
+    fre::AggregateFixedAbsoluteDomainResidualLimits {
+        max_work: prospective
+            .total_work
+            .min(limits.fre_aggregate_operation_work),
+        max_allocations: prospective.allocations,
+        max_persistent_bytes: prospective
+            .persistent_bytes
+            .min(limits.fre_aggregate_peak_bytes),
+        max_peak_bytes: prospective.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    }
+}
+
+fn fixed_absolute_build_contains(
+    prospective: fre::FixedAbsoluteDomainBuildProspective,
+    actual: fre::FixedAbsoluteDomainBuildActual,
+) -> bool {
+    actual.items <= prospective.items
+        && actual.payload_bytes <= prospective.payload_bytes
+        && actual.identity_bytes <= prospective.identity_bytes
+        && actual.retained_heap_bytes <= prospective.retained_heap_bytes
+        && actual.copied_bytes <= prospective.copied_bytes
+        && actual.allocations <= prospective.allocations
+        && actual.initialized_bytes <= prospective.initialized_bytes
+        && actual.build_work <= prospective.build_work
+        && actual.scratch_bytes <= prospective.scratch_bytes
+        && actual.persistent_bytes <= prospective.persistent_bytes
+        && actual.peak_bytes <= prospective.peak_bytes
+}
+
+fn fixed_absolute_operation_limits(
+    prospective: fre::FixedAbsoluteDomainProspective,
+    identity: fre::AggregateFixedAbsoluteDomainIdentity,
+    build: &fre::AggregateFixedAbsoluteDomainBuildAccounting,
+    limits: &RunLimits,
+) -> Result<fre::FixedAbsoluteDomainReduceLimits, ExecutionError> {
+    let descriptor = identity.kernel.descriptor;
+    if build.kernel.prospective.descriptor != descriptor
+        || !build.kernel.actual.published
+        || !fixed_absolute_build_contains(build.kernel.prospective, build.kernel.actual)
+        || build.kernel.actual.persistent_bytes != build.kernel.prospective.persistent_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE fixed absolute-domain build receipt is not closed",
+        ));
+    }
+    if prospective.allocations != 0 {
+        return Err(ExecutionError::fault(
+            "FRE fixed absolute-domain prospective unexpectedly allocates",
+        ));
+    }
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    Ok(fre::FixedAbsoluteDomainReduceLimits {
+        max_byte_probes: prospective.byte_probes,
+        max_branch_checks: prospective.branch_checks,
+        max_match_events: prospective.match_events.min(reducer_limit),
+        max_count: prospective.count.min(limits.reducer_steps),
+        max_span_sum: prospective.span_sum,
+        max_reducer_steps: prospective.reducer_steps.min(reducer_limit),
+        max_total_work: prospective
+            .total_work
+            .min(limits.fre_aggregate_operation_work),
+        max_scratch_bytes: prospective
+            .scratch_bytes
+            .min(limits.fre_aggregate_scratch_bytes),
+        max_persistent_bytes: prospective
+            .persistent_bytes
+            .min(limits.fre_aggregate_peak_bytes),
+        max_peak_bytes: prospective.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
 fn ordered_literal_operation_limits(
     haystack_len: usize,
     build: Option<fre::OrderedLiteralAggregateBuildAccounting>,
@@ -6892,14 +7174,34 @@ fn sparse_ordered_literal_operation_limits(
     clippy::too_many_lines,
     reason = "the exhaustive aggregate-plan dispatch keeps every plan's inactive limits explicit"
 )]
-fn aggregate_run_limits(
+fn aggregate_run_limits_with_fixed_absolute(
     haystack_len: usize,
     report: &AggregateBuildReport,
+    fixed_absolute_prospective: Option<fre::FixedAbsoluteDomainProspective>,
+    fixed_absolute_composite: Option<fre::AggregateFixedAbsoluteDomainResidualProspective>,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
     require_closed_bounded_separated_fields_identity(report)?;
+    require_closed_fixed_absolute_domain_identity(report)?;
     require_closed_required_internal_anchor_identity(report)?;
     require_closed_url_aggregate_identity(report)?;
+    if matches!(
+        report.build,
+        AggregateBuildAccounting::FixedAbsoluteDomain(_)
+    ) != fixed_absolute_prospective.is_some()
+    {
+        return Err(ExecutionError::fault(
+            "FRE fixed absolute-domain artifact/prospective binding is absent or transplanted",
+        ));
+    }
+    let residual_fixed_absolute = fixed_absolute_prospective.is_some_and(|prospective| {
+        prospective.disposition == fre::FixedAbsoluteDomainDisposition::PrepublishedContinuation
+    });
+    if residual_fixed_absolute != fixed_absolute_composite.is_some() {
+        return Err(ExecutionError::fault(
+            "FRE fixed scalar artifact/composite prospective binding is absent or transplanted",
+        ));
+    }
     match report.build {
         AggregateBuildAccounting::ExactLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: literal_operation_limits(haystack_len, build, limits)?,
@@ -6910,6 +7212,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             // The continuation policy remains present in cache identity even
             // though no continuation engine exists and no fallback is legal.
@@ -6928,6 +7232,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -6948,6 +7254,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -6964,6 +7272,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -6984,6 +7294,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -7017,6 +7329,8 @@ fn aggregate_run_limits(
                 )?,
                 prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
                 bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                 finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
                 continuation: continuation_operation_limits(
                     haystack_len,
@@ -7038,6 +7352,8 @@ fn aggregate_run_limits(
                 limits,
             )?,
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -7059,6 +7375,8 @@ fn aggregate_run_limits(
                 report.plan_identity,
                 limits,
             )?,
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -7066,6 +7384,53 @@ fn aggregate_run_limits(
                 limits,
             )?,
         }),
+        AggregateBuildAccounting::FixedAbsoluteDomain(_) => {
+            let AggregatePlanIdentity::FixedAbsoluteDomain(identity) = report.plan_identity else {
+                return Err(ExecutionError::fault(
+                    "FRE fixed absolute-domain resource identity is absent",
+                ));
+            };
+            let build = report
+                .fixed_absolute_domain_build_accounting()
+                .ok_or_else(|| {
+                    ExecutionError::fault(
+                        "FRE fixed absolute-domain full build accounting is not authenticated",
+                    )
+                })?;
+            let continuation = if let Some(compile) = build.residual {
+                continuation_operation_limits(
+                    haystack_len,
+                    ContinuationProgramShape::from(compile),
+                    limits,
+                )?
+            } else {
+                continuation_operation_limits(haystack_len, inactive_continuation_shape(), limits)?
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: fixed_absolute_operation_limits(
+                    fixed_absolute_prospective.ok_or_else(|| {
+                        ExecutionError::fault("FRE fixed absolute-domain prospective is absent")
+                    })?,
+                    identity,
+                    build,
+                    limits,
+                )?,
+                fixed_absolute_residual: fixed_absolute_composite
+                    .map_or_else(inactive_fixed_absolute_residual_limits, |prospective| {
+                        fixed_absolute_residual_limits(prospective, limits)
+                    }),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation,
+            })
+        }
         AggregateBuildAccounting::FiniteLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
@@ -7075,6 +7440,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: ordered_literal_operation_limits(haystack_len, Some(build), limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -7091,6 +7458,8 @@ fn aggregate_run_limits(
             bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
             prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
             bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
             finite_literal: sparse_ordered_literal_operation_limits(haystack_len, build, limits)?,
             continuation: continuation_operation_limits(
                 haystack_len,
@@ -7116,6 +7485,8 @@ fn aggregate_run_limits(
                     bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
                     prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
                     bounded_context: inactive_bounded_context_operation_limits(),
+                    fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                    fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                     finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
                     continuation,
                 });
@@ -7138,11 +7509,21 @@ fn aggregate_run_limits(
                 bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
                 prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
                 bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                 finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
                 continuation: continuation_operation_limits(haystack_len, shape, limits)?,
             })
         }
     }
+}
+
+fn aggregate_run_limits(
+    haystack_len: usize,
+    report: &AggregateBuildReport,
+    limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    aggregate_run_limits_with_fixed_absolute(haystack_len, report, None, None, limits)
 }
 
 fn finite_plan_identity_matches(
@@ -7222,6 +7603,132 @@ fn bounded_separated_fields_plan_identity_matches(
         && report.retained_capacity_bytes == authenticated_build.persistent_bytes
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the adapter keeps every fixed-route identity and accounting invariant in one fail-closed audit boundary"
+)]
+fn fixed_absolute_plan_identity_matches(
+    report: &AggregateBuildReport,
+    identity: fre::AggregateFixedAbsoluteDomainIdentity,
+    build: &fre::AggregateFixedAbsoluteDomainBuildAccounting,
+    unicode: bool,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    let expected_operation = match operation {
+        LiteralAggregateOperation::Count => fre::FixedAbsoluteDomainOperation::Count,
+        LiteralAggregateOperation::SpanSum => fre::FixedAbsoluteDomainOperation::SpanSum,
+    };
+    let kernel = identity.kernel;
+    let descriptor = kernel.descriptor.kind();
+    let descriptor_closed = matches!(
+        (unicode, operation, descriptor),
+        (
+            false,
+            LiteralAggregateOperation::Count,
+            fre::FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
+                | fre::FixedAbsoluteDomainDescriptorKind::WholeOrderedWords,
+        ) | (
+            false,
+            LiteralAggregateOperation::SpanSum,
+            fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix,
+        ) | (
+            true,
+            LiteralAggregateOperation::Count,
+            fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope,
+        )
+    );
+    let scalar = descriptor == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
+    let residual_closed = if scalar {
+        matches!(
+            (
+                identity.residual,
+                identity.residual_strategy,
+                build.residual,
+                kernel.residual,
+                report.continuation_strategy,
+            ),
+            (
+                Some(fre::AggregateContinuationIdentity {
+                    semantics: AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir,
+                    ..
+                }),
+                Some(AggregateStrategy::ReverseSequentialRows),
+                Some(_),
+                fre::FixedAbsoluteDomainResidual::PrepublishedContinuation,
+                Some(AggregateStrategy::ReverseSequentialRows),
+            )
+        )
+    } else {
+        identity.residual.is_none()
+            && identity.residual_strategy.is_none()
+            && build.residual.is_none()
+            && kernel.residual == fre::FixedAbsoluteDomainResidual::None
+            && report.continuation_strategy.is_none()
+    };
+    let owner_guard_closed = build.guard_with_owner.prospective.descriptor == kernel.descriptor
+        && build.guard_with_owner.actual.published
+        && fixed_absolute_build_contains(
+            build.guard_with_owner.prospective,
+            build.guard_with_owner.actual,
+        );
+    let composite_closed = if scalar {
+        build.residual.is_some()
+            && build.actual.published
+            && build.actual.work <= build.prospective.work
+            && build.actual.allocations <= build.prospective.allocations
+            && build.actual.persistent_bytes <= build.prospective.persistent_bytes
+            && build.actual.peak_bytes <= build.prospective.peak_bytes
+    } else {
+        build.residual.is_none()
+            && build.actual.work == build.guard_with_owner.actual.build_work
+            && build.actual.allocations == build.guard_with_owner.actual.allocations
+            && build.actual.persistent_bytes == build.guard_with_owner.actual.persistent_bytes
+            && build.actual.peak_bytes == build.guard_with_owner.actual.peak_bytes
+    };
+
+    report.operation
+        == match operation {
+            LiteralAggregateOperation::Count => AggregateOperation::Count,
+            LiteralAggregateOperation::SpanSum => AggregateOperation::SpanSum,
+        }
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::FixedAbsoluteDomain
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && report.syntax_key.profile == CompatibilityProfile::RustBytes(expected_profile)
+        && report.has_closed_fixed_absolute_domain_identity()
+        && report.authenticates_fixed_absolute_domain_identity(identity)
+        && kernel.plan_id == fre::FIXED_ABSOLUTE_DOMAIN_PLAN_ID
+        && kernel.algorithm_version == fre::FIXED_ABSOLUTE_DOMAIN_ALGORITHM_VERSION
+        && kernel.accounting_version == fre::FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION
+        && kernel.operation == expected_operation
+        && kernel.operation_id
+            == match operation {
+                LiteralAggregateOperation::Count => fre::FIXED_ABSOLUTE_DOMAIN_COUNT_OPERATION_ID,
+                LiteralAggregateOperation::SpanSum => {
+                    fre::FIXED_ABSOLUTE_DOMAIN_SPAN_SUM_OPERATION_ID
+                }
+            }
+        && kernel.original_haystack_anchors
+        && kernel.non_overlapping
+        && descriptor_closed
+        && residual_closed
+        && build.kernel.prospective.descriptor == kernel.descriptor
+        && build.kernel.actual.published
+        && fixed_absolute_build_contains(build.kernel.prospective, build.kernel.actual)
+        && owner_guard_closed
+        && build.actual.published
+        && build.actual.work <= build.prospective.work
+        && build.actual.allocations <= build.prospective.allocations
+        && build.actual.persistent_bytes <= build.prospective.persistent_bytes
+        && build.actual.peak_bytes <= build.prospective.peak_bytes
+        && composite_closed
+        && report.retained_capacity_bytes == build.actual.persistent_bytes
+}
+
 fn require_closed_bounded_separated_fields_identity(
     report: &AggregateBuildReport,
 ) -> Result<(), ExecutionError> {
@@ -7230,6 +7737,17 @@ fn require_closed_bounded_separated_fields_identity(
     }
     Err(ExecutionError::fault(
         "FRE bounded separated-field aggregate identity mismatch: public/private closure is open",
+    ))
+}
+
+fn require_closed_fixed_absolute_domain_identity(
+    report: &AggregateBuildReport,
+) -> Result<(), ExecutionError> {
+    if report.has_closed_fixed_absolute_domain_identity() {
+        return Ok(());
+    }
+    Err(ExecutionError::fault(
+        "FRE fixed absolute-domain identity mismatch: public/private closure is open",
     ))
 }
 
@@ -7265,6 +7783,7 @@ fn require_unicode_plan_identity(
     operation: LiteralAggregateOperation,
 ) -> Result<(), ExecutionError> {
     require_closed_bounded_separated_fields_identity(report)?;
+    require_closed_fixed_absolute_domain_identity(report)?;
     require_closed_required_internal_anchor_identity(report)?;
     require_closed_url_aggregate_identity(report)?;
     if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
@@ -7303,6 +7822,39 @@ fn require_unicode_plan_identity(
         }
         return Err(ExecutionError::fault(format!(
             "bounded separated-field aggregate identity mismatch for {operation:?}: {:?}",
+            report.plan_identity
+        )));
+    }
+    if report.plan == AggregatePlanKind::FixedAbsoluteDomain
+        || matches!(
+            report.build,
+            AggregateBuildAccounting::FixedAbsoluteDomain(_)
+        )
+        || matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::FixedAbsoluteDomain(_)
+        )
+    {
+        let (
+            AggregatePlanIdentity::FixedAbsoluteDomain(identity),
+            AggregateBuildAccounting::FixedAbsoluteDomain(_),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(format!(
+                "fixed absolute-domain aggregate identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        };
+        let Some(build) = report.fixed_absolute_domain_build_accounting() else {
+            return Err(ExecutionError::fault(format!(
+                "fixed absolute-domain aggregate build accounting mismatch for {operation:?}"
+            )));
+        };
+        if fixed_absolute_plan_identity_matches(report, identity, build, unicode, operation) {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(format!(
+            "fixed absolute-domain aggregate identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )));
     }
@@ -7448,6 +8000,339 @@ fn aggregate_engine_error(source: &AggregateEngineError, message: String) -> Exe
         // are candidate faults. The wildcard also keeps future non-resource
         // error variants from being silently downgraded to unsupported.
         _ => ExecutionError::fault(message),
+    }
+}
+
+fn fixed_absolute_build_resource_value(
+    prospective: fre::FixedAbsoluteDomainBuildProspective,
+    resource: fre::FixedAbsoluteDomainBuildResource,
+) -> Option<u64> {
+    match resource {
+        fre::FixedAbsoluteDomainBuildResource::Items => u64::try_from(prospective.items).ok(),
+        fre::FixedAbsoluteDomainBuildResource::PayloadBytes => {
+            u64::try_from(prospective.payload_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::IdentityBytes => {
+            u64::try_from(prospective.identity_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::CopiedBytes => {
+            u64::try_from(prospective.copied_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::Allocations => {
+            u64::try_from(prospective.allocations).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::InitializedBytes => {
+            u64::try_from(prospective.initialized_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::Work => Some(prospective.build_work),
+        fre::FixedAbsoluteDomainBuildResource::PersistentBytes => {
+            u64::try_from(prospective.persistent_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainBuildResource::PeakBytes => {
+            u64::try_from(prospective.peak_bytes).ok()
+        }
+    }
+}
+
+fn fixed_absolute_build_resource_refusal_is_closed(
+    source: &fre::FixedAbsoluteDomainBuildError,
+) -> bool {
+    let fre::FixedAbsoluteDomainBuildErrorKind::ResourceLimit {
+        resource,
+        needed,
+        limit,
+    } = &source.kind
+    else {
+        return false;
+    };
+    let Some(prospective) = source.prospective else {
+        return false;
+    };
+    !source.actual.published
+        && source.actual == fre::FixedAbsoluteDomainBuildActual::default()
+        && fixed_absolute_build_contains(prospective, source.actual)
+        && fixed_absolute_build_resource_value(prospective, *resource) == Some(*needed)
+        && needed > limit
+}
+
+fn fixed_absolute_build_success_is_closed(
+    accounting: fre::FixedAbsoluteDomainBuildAccounting,
+) -> bool {
+    let prospective = accounting.prospective;
+    let actual = accounting.actual;
+    actual.published
+        && actual.items == prospective.items
+        && actual.payload_bytes == prospective.payload_bytes
+        && actual.identity_bytes == prospective.identity_bytes
+        && actual.retained_heap_bytes == prospective.retained_heap_bytes
+        && actual.copied_bytes == prospective.copied_bytes
+        && actual.allocations == prospective.allocations
+        && actual.initialized_bytes == prospective.initialized_bytes
+        && actual.build_work == prospective.build_work
+        && actual.scratch_bytes == prospective.scratch_bytes
+        && actual.persistent_bytes == prospective.persistent_bytes
+        && actual.peak_bytes == prospective.peak_bytes
+}
+
+fn fixed_absolute_reduce_resource_value(
+    prospective: fre::FixedAbsoluteDomainProspective,
+    resource: fre::FixedAbsoluteDomainReduceResource,
+) -> Option<u64> {
+    match resource {
+        fre::FixedAbsoluteDomainReduceResource::ByteProbes => {
+            u64::try_from(prospective.byte_probes).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::BranchChecks => {
+            u64::try_from(prospective.branch_checks).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::MatchEvents => {
+            u64::try_from(prospective.match_events).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::Count => Some(prospective.count),
+        fre::FixedAbsoluteDomainReduceResource::SpanSum => Some(prospective.span_sum),
+        fre::FixedAbsoluteDomainReduceResource::ReducerSteps => {
+            u64::try_from(prospective.reducer_steps).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::TotalWork => {
+            u64::try_from(prospective.total_work).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::ScratchBytes => {
+            u64::try_from(prospective.scratch_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::PersistentBytes => {
+            u64::try_from(prospective.persistent_bytes).ok()
+        }
+        fre::FixedAbsoluteDomainReduceResource::PeakBytes => {
+            u64::try_from(prospective.peak_bytes).ok()
+        }
+    }
+}
+
+fn fixed_absolute_operation_identity_is_closed(
+    identity: fre::FixedAbsoluteDomainOperationIdentity,
+) -> bool {
+    let descriptor = identity.descriptor.kind();
+    let operation_closed = match identity.operation {
+        fre::FixedAbsoluteDomainOperation::Count => {
+            identity.operation_id == fre::FIXED_ABSOLUTE_DOMAIN_COUNT_OPERATION_ID
+                && matches!(
+                    descriptor,
+                    fre::FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
+                        | fre::FixedAbsoluteDomainDescriptorKind::WholeOrderedWords
+                        | fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+                )
+        }
+        fre::FixedAbsoluteDomainOperation::SpanSum => {
+            identity.operation_id == fre::FIXED_ABSOLUTE_DOMAIN_SPAN_SUM_OPERATION_ID
+                && matches!(
+                    descriptor,
+                    fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                        | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                        | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                )
+        }
+    };
+    let residual_closed =
+        if descriptor == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope {
+            identity.residual == fre::FixedAbsoluteDomainResidual::PrepublishedContinuation
+        } else {
+            identity.residual == fre::FixedAbsoluteDomainResidual::None
+        };
+    identity.plan_id == fre::FIXED_ABSOLUTE_DOMAIN_PLAN_ID
+        && identity.algorithm_version == fre::FIXED_ABSOLUTE_DOMAIN_ALGORITHM_VERSION
+        && identity.accounting_version == fre::FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION
+        && identity.original_haystack_anchors
+        && identity.non_overlapping
+        && operation_closed
+        && residual_closed
+}
+
+fn fixed_absolute_reduce_resource_refusal_is_closed(
+    source: &fre::FixedAbsoluteDomainReduceError,
+) -> bool {
+    let fre::FixedAbsoluteDomainReduceErrorKind::ResourceLimit {
+        resource,
+        needed,
+        limit,
+    } = &source.kind
+    else {
+        return false;
+    };
+    let receipt = source.receipt;
+    let Some(prospective) = receipt.prospective else {
+        return false;
+    };
+    fixed_absolute_operation_identity_is_closed(receipt.identity)
+        && receipt.window.start() == 0
+        && receipt.window.end() == receipt.haystack_len
+        && receipt.actual == fre::FixedAbsoluteDomainActual::default()
+        && receipt.actual.fits(prospective)
+        && fixed_absolute_reduce_resource_value(prospective, *resource) == Some(*needed)
+        && needed > limit
+}
+
+fn fixed_absolute_residual_refusal_is_closed(
+    continuation: &fre::AggregateOperationAttemptError,
+    composite: &fre::AggregateFixedAbsoluteDomainResidualReceipt,
+) -> bool {
+    let AggregateEngineError::ResourceLimit {
+        required, limit, ..
+    } = &continuation.source
+    else {
+        return false;
+    };
+    let Some(prospective) = continuation.receipt.prospective else {
+        return false;
+    };
+    let invocation = &continuation.receipt.invocation;
+    let guard = composite.guard;
+    fixed_absolute_operation_identity_is_closed(guard.identity)
+        && composite.contains_actual_with(&continuation.receipt)
+        && guard.identity.operation == fre::FixedAbsoluteDomainOperation::Count
+        && guard.identity.descriptor.kind()
+            == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+        && guard.prospective.disposition
+            == fre::FixedAbsoluteDomainDisposition::PrepublishedContinuation
+        && guard.window.start() == 0
+        && guard.window.end() == guard.haystack_len
+        && guard.actual.source_accesses == 0
+        && guard.actual.allocations == 0
+        && guard.actual.fits(guard.prospective)
+        && continuation.receipt.identity.operation == fre::AggregateOperationAttemptKind::Count
+        && continuation.receipt.identity.operation_id.is_some()
+        && invocation.range.start == 0
+        && invocation.range.end == invocation.haystack_len
+        && invocation.haystack_len == guard.haystack_len
+        && prospective.contains(continuation.receipt.actual)
+        && required > limit
+}
+
+fn fixed_absolute_build_error(
+    source: &fre::FixedAbsoluteDomainBuildError,
+    message: String,
+) -> ExecutionError {
+    if fixed_absolute_build_resource_refusal_is_closed(source) {
+        ExecutionError::unsupported(message)
+    } else {
+        ExecutionError::fault(message)
+    }
+}
+
+fn fixed_absolute_residual_build_resource_value(
+    prospective: fre::AggregateFixedAbsoluteDomainResidualBuildProspective,
+    resource: fre::AggregateFixedAbsoluteDomainResidualBuildResource,
+) -> Option<u64> {
+    match resource {
+        fre::AggregateFixedAbsoluteDomainResidualBuildResource::Work => Some(prospective.work),
+        fre::AggregateFixedAbsoluteDomainResidualBuildResource::Allocations => {
+            u64::try_from(prospective.allocations).ok()
+        }
+        fre::AggregateFixedAbsoluteDomainResidualBuildResource::PersistentBytes => {
+            u64::try_from(prospective.persistent_bytes).ok()
+        }
+        fre::AggregateFixedAbsoluteDomainResidualBuildResource::PeakBytes => {
+            u64::try_from(prospective.peak_bytes).ok()
+        }
+    }
+}
+
+fn fixed_absolute_planner_work_is_closed(planner_work: usize) -> bool {
+    planner_work > 0 && u32::try_from(planner_work).is_ok()
+}
+
+fn fixed_absolute_residual_build_preflight_is_closed(
+    operation: AggregateOperation,
+    selection: AggregatePlanSelection,
+    planner_work: usize,
+    resource: fre::AggregateFixedAbsoluteDomainResidualBuildResource,
+    needed: u64,
+    limit: u64,
+    receipt: fre::AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
+) -> bool {
+    operation == AggregateOperation::Count
+        && selection == AggregatePlanSelection::Auto
+        && fixed_absolute_planner_work_is_closed(planner_work)
+        && receipt.contains_actual()
+        && receipt.actual == fre::AggregateFixedAbsoluteDomainResidualBuildActual::default()
+        && fixed_absolute_residual_build_resource_value(receipt.prospective, resource)
+            == Some(needed)
+        && needed > limit
+}
+
+fn fixed_absolute_residual_guard_build_error(
+    operation: AggregateOperation,
+    selection: AggregatePlanSelection,
+    planner_work: usize,
+    source: &fre::FixedAbsoluteDomainBuildError,
+    composite: fre::AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
+    message: String,
+) -> ExecutionError {
+    let closed = operation == AggregateOperation::Count
+        && selection == AggregatePlanSelection::Auto
+        && fixed_absolute_planner_work_is_closed(planner_work)
+        && composite.contains_actual()
+        && composite.actual == fre::AggregateFixedAbsoluteDomainResidualBuildActual::default()
+        && source.prospective.is_some_and(|prospective| {
+            prospective.descriptor.kind()
+                == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+        })
+        && fixed_absolute_build_resource_refusal_is_closed(source);
+    if closed {
+        ExecutionError::unsupported(message)
+    } else {
+        ExecutionError::fault(message)
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the scalar construction failure closure binds every typed discriminator and immutable P/A receipt explicitly"
+)]
+fn fixed_absolute_residual_compile_error(
+    operation: AggregateOperation,
+    selection: AggregatePlanSelection,
+    planner_work: usize,
+    strategy: AggregateStrategy,
+    guard: fre::FixedAbsoluteDomainBuildAccounting,
+    source: &fre::AggregateCompileAttemptError,
+    composite: fre::AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
+    message: String,
+) -> ExecutionError {
+    let receipt = source.receipt;
+    let expected_work = u64::try_from(receipt.actual.work)
+        .ok()
+        .and_then(|work| guard.actual.build_work.checked_add(work));
+    let expected_allocations = receipt
+        .actual_allocations
+        .and_then(|allocations| guard.actual.allocations.checked_add(allocations));
+    let expected_persistent = guard
+        .actual
+        .persistent_bytes
+        .checked_add(receipt.live_construction_bytes);
+    let expected_peak = guard
+        .actual
+        .persistent_bytes
+        .checked_add(receipt.actual.construction_peak_bytes)
+        .map(|peak| peak.max(guard.actual.peak_bytes));
+    let closed = operation == AggregateOperation::Count
+        && selection == AggregatePlanSelection::Auto
+        && fixed_absolute_planner_work_is_closed(planner_work)
+        && strategy == AggregateStrategy::ReverseSequentialRows
+        && guard.prospective.descriptor.kind()
+            == fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+        && fixed_absolute_build_success_is_closed(guard)
+        && receipt.identity.kind == fre::AggregateCompileAttemptKind::EraseCapturesForWholeMatch
+        && receipt.contains_actual()
+        && !receipt.published
+        && composite.contains_actual()
+        && expected_work == Some(composite.actual.work)
+        && expected_allocations == Some(composite.actual.allocations)
+        && expected_persistent == Some(composite.actual.persistent_bytes)
+        && expected_peak == Some(composite.actual.peak_bytes);
+    if closed {
+        aggregate_engine_error(&source.source, message)
+    } else {
+        ExecutionError::fault(message)
     }
 }
 
@@ -7780,6 +8665,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::BoundedContext(source) => {
             bounded_context_reduce_error(source, message)
         }
+        AggregateExecutionSource::FixedAbsoluteDomain
+        | AggregateExecutionSource::FixedAbsoluteDomainResidual
+        | AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
         }
@@ -7787,10 +8675,73 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
             sparse_ordered_literal_reduce_error(source, message)
         }
         AggregateExecutionSource::Continuation(source) => aggregate_engine_error(source, message),
-        AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
 }
 
+fn aggregate_attempt_error(
+    error: &fre::AggregateExecutionError,
+    message: String,
+) -> ExecutionError {
+    match &error.source {
+        AggregateExecutionSource::FixedAbsoluteDomain => {
+            let Some(attempt) = error.identity.as_fixed_absolute_domain_attempt() else {
+                return ExecutionError::fault(message);
+            };
+            let Some(owner) = error.identity.as_fixed_absolute_domain() else {
+                return ExecutionError::fault(message);
+            };
+            let Some(receipt) = error.fixed_absolute_domain_receipt() else {
+                return ExecutionError::fault(message);
+            };
+            let Some(source) = receipt.guard_error() else {
+                return ExecutionError::fault(message);
+            };
+            if error.has_closed_fixed_attempt()
+                && std::ptr::eq(attempt.owner_identity(), owner)
+                && std::ptr::eq(attempt.receipt(), receipt)
+                && source.receipt.identity == owner.plan_identity.kernel
+                && fixed_absolute_reduce_resource_refusal_is_closed(source)
+            {
+                ExecutionError::unsupported(message)
+            } else {
+                ExecutionError::fault(message)
+            }
+        }
+        AggregateExecutionSource::FixedAbsoluteDomainResidual => {
+            let Some(attempt) = error.identity.as_fixed_absolute_domain_attempt() else {
+                return ExecutionError::fault(message);
+            };
+            let Some(owner) = error.identity.as_fixed_absolute_domain() else {
+                return ExecutionError::fault(message);
+            };
+            let Some(receipt) = error.fixed_absolute_domain_receipt() else {
+                return ExecutionError::fault(message);
+            };
+            let Some((continuation, composite)) = receipt.residual_error() else {
+                return ExecutionError::fault(message);
+            };
+            if error.has_closed_fixed_attempt()
+                && std::ptr::eq(attempt.owner_identity(), owner)
+                && std::ptr::eq(attempt.receipt(), receipt)
+                && composite.guard.identity == owner.plan_identity.kernel
+                && fixed_absolute_residual_refusal_is_closed(continuation, composite)
+            {
+                aggregate_engine_error(&continuation.source, message)
+            } else {
+                ExecutionError::fault(message)
+            }
+        }
+        _ if error.identity.as_cache_identity().is_some() => {
+            aggregate_execution_error(&error.source, message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the adapter exhaustively classifies every typed aggregate construction terminal at one fail-closed boundary"
+)]
 fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
     let message = format!("FRE aggregate build refused input: {error}");
     match &error {
@@ -7804,6 +8755,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit { .. }
         | AggregateBuildError::PrefixClassAlternationPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedContextPlannerWorkLimit { .. }
+        | AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerWorkLimit { .. }
         | AggregateBuildError::FinitePlannerAllocationFailed { .. }
         | AggregateBuildError::ExactLiteralIneligible { .. } => {
@@ -7833,6 +8785,73 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         AggregateBuildError::BoundedContextBuild { source, .. } => {
             bounded_context_build_error(source, message)
         }
+        AggregateBuildError::FixedAbsoluteDomainBuild {
+            planner_work,
+            source,
+            ..
+        } => {
+            if fixed_absolute_planner_work_is_closed(*planner_work) {
+                fixed_absolute_build_error(source, message)
+            } else {
+                ExecutionError::fault(message)
+            }
+        }
+        AggregateBuildError::FixedAbsoluteDomainResidualGuardBuild {
+            operation,
+            selection,
+            planner_work,
+            source,
+            composite,
+        } => fixed_absolute_residual_guard_build_error(
+            *operation,
+            *selection,
+            *planner_work,
+            source,
+            *composite,
+            message,
+        ),
+        AggregateBuildError::FixedAbsoluteDomainResidualPreflight {
+            operation,
+            selection,
+            planner_work,
+            resource,
+            needed,
+            limit,
+            receipt,
+            ..
+        } => {
+            if fixed_absolute_residual_build_preflight_is_closed(
+                *operation,
+                *selection,
+                *planner_work,
+                *resource,
+                *needed,
+                *limit,
+                *receipt,
+            ) {
+                ExecutionError::unsupported(message)
+            } else {
+                ExecutionError::fault(message)
+            }
+        }
+        AggregateBuildError::FixedAbsoluteDomainResidualCompile {
+            operation,
+            selection,
+            planner_work,
+            strategy,
+            guard,
+            source,
+            composite,
+        } => fixed_absolute_residual_compile_error(
+            *operation,
+            *selection,
+            *planner_work,
+            *strategy,
+            *guard,
+            source,
+            *composite,
+            message,
+        ),
         AggregateBuildError::FiniteLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
         }
@@ -7872,14 +8891,33 @@ fn fre_aggregate_count(
         request.unicode,
         LiteralAggregateOperation::Count,
     )?;
-    let operation_limits =
-        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(request.haystack.len())
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE fixed absolute-domain count preflight failed: {error}"
+            ))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(request.haystack.len())
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE fixed absolute-domain count composite preflight failed: {error}"
+            ))
+        })?;
+    let operation_limits = aggregate_run_limits_with_fixed_absolute(
+        request.haystack.len(),
+        regex.build_report(),
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        limits,
+    )?;
     let operation_limits = &operation_limits;
     let actual = regex
         .count_value(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate count refused execution: {error}");
-            aggregate_execution_error(&error.source, message)
+            aggregate_attempt_error(&error, message)
         })?;
     let plan = aggregate_single_plan_label("count", regex.build_report());
     Ok(FreReduction { actual, plan })
@@ -7907,14 +8945,33 @@ fn fre_aggregate_span_sum(
         request.unicode,
         LiteralAggregateOperation::SpanSum,
     )?;
-    let operation_limits =
-        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(request.haystack.len())
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE fixed absolute-domain span-sum preflight failed: {error}"
+            ))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(request.haystack.len())
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE fixed absolute-domain span-sum composite preflight failed: {error}"
+            ))
+        })?;
+    let operation_limits = aggregate_run_limits_with_fixed_absolute(
+        request.haystack.len(),
+        regex.build_report(),
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        limits,
+    )?;
     let operation_limits = &operation_limits;
     let actual = regex
         .span_sum_value(request.haystack, operation_limits)
         .map_err(|error| {
             let message = format!("FRE aggregate span-sum refused execution: {error}");
-            aggregate_execution_error(&error.source, message)
+            aggregate_attempt_error(&error, message)
         })?;
     let plan = aggregate_single_plan_label("count-spans", regex.build_report());
     Ok(FreReduction { actual, plan })
@@ -8448,8 +9505,8 @@ impl TimedFreAggregate {
                 if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
             {
                 let result = regex.count(haystack, limits).map_err(|error| {
-                    aggregate_execution_error(
-                        &error.source,
+                    aggregate_attempt_error(
+                        &error,
                         format!("FRE timed count refused execution: {error}"),
                     )
                 })?;
@@ -8463,8 +9520,8 @@ impl TimedFreAggregate {
                 if matches!(boundary, LiteralAggregateTimingBoundary::FullReport) =>
             {
                 let result = regex.span_sum(haystack, limits).map_err(|error| {
-                    aggregate_execution_error(
-                        &error.source,
+                    aggregate_attempt_error(
+                        &error,
                         format!("FRE timed span-sum refused execution: {error}"),
                     )
                 })?;
@@ -8473,15 +9530,15 @@ impl TimedFreAggregate {
                 Ok(value)
             }
             Self::Count { regex, limits } => regex.count_value(haystack, limits).map_err(|error| {
-                aggregate_execution_error(
-                    &error.source,
+                aggregate_attempt_error(
+                    &error,
                     format!("FRE timed value-only count refused execution: {error}"),
                 )
             }),
             Self::SpanSum { regex, limits } => {
                 regex.span_sum_value(haystack, limits).map_err(|error| {
-                    aggregate_execution_error(
-                        &error.source,
+                    aggregate_attempt_error(
+                        &error,
                         format!("FRE timed value-only span-sum refused execution: {error}"),
                     )
                 })
@@ -12486,6 +13543,484 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-driven test closes all six fixed-domain route contracts"
+    )]
+    fn current_fre_fixed_absolute_adapter_covers_all_six_generic_routes() {
+        struct Case {
+            model: &'static str,
+            pattern: &'static str,
+            haystack: Vec<u8>,
+            unicode: bool,
+            expected: u64,
+        }
+
+        let cases = [
+            Case {
+                model: "count-spans",
+                pattern: "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$",
+                haystack: b"XABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec(),
+                unicode: false,
+                expected: 27,
+            },
+            Case {
+                model: "count-spans",
+                pattern: r"\w$",
+                haystack: b"a".to_vec(),
+                unicode: false,
+                expected: 1,
+            },
+            Case {
+                model: "count",
+                pattern: r"^a{2,5}$",
+                haystack: b"aaaa".to_vec(),
+                unicode: false,
+                expected: 1,
+            },
+            Case {
+                model: "count",
+                pattern: r"^((aaa)|(aa))$",
+                haystack: b"aaa".to_vec(),
+                unicode: false,
+                expected: 1,
+            },
+            Case {
+                model: "count-spans",
+                pattern: r"^zbc(d|e)",
+                haystack: b"zbcd-tail".to_vec(),
+                unicode: false,
+                expected: 4,
+            },
+            Case {
+                model: "count",
+                pattern: r"^.{249}$",
+                haystack: vec![b'a'; 249],
+                unicode: true,
+                expected: 1,
+            },
+        ];
+
+        for case in cases {
+            let patterns = [case.pattern.to_string()];
+            assert_current_fre_execution(
+                current_fre(
+                    case.model,
+                    &patterns,
+                    &case.haystack,
+                    case.unicode,
+                    false,
+                    &RunLimits::default(),
+                ),
+                case.expected,
+                "aggregate-fixed-absolute-domain",
+            );
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                case.model,
+                &patterns,
+                case.unicode,
+                false,
+                case.haystack.len(),
+            )
+            .expect("fixed absolute-domain lifecycle builds");
+            assert_eq!(lifecycle.plan(), "aggregate-fixed-absolute-domain");
+            if case.pattern == r"^.{249}$" {
+                let CurrentFreAggregateOperationInner::CountSingle(regex, limits) =
+                    &lifecycle.inner
+                else {
+                    panic!("scalar fixed-domain lifecycle is not single-pattern Count")
+                };
+                let guard = regex
+                    .fixed_absolute_domain_full_window_prospective(case.haystack.len())
+                    .expect("scalar guard query")
+                    .expect("scalar guard prospective");
+                assert_eq!(
+                    guard.disposition,
+                    fre::FixedAbsoluteDomainDisposition::PrepublishedContinuation
+                );
+                let composite = regex
+                    .fixed_absolute_domain_full_window_composite_prospective(case.haystack.len())
+                    .expect("scalar composite query")
+                    .expect("scalar composite prospective");
+                assert_eq!(
+                    limits.fixed_absolute_residual,
+                    fre::AggregateFixedAbsoluteDomainResidualLimits {
+                        max_work: composite.total_work,
+                        max_allocations: composite.allocations,
+                        max_persistent_bytes: composite.persistent_bytes,
+                        max_peak_bytes: composite.peak_bytes,
+                    }
+                );
+                let execution = regex
+                    .count(&case.haystack, *limits)
+                    .expect("scalar residual execution");
+                let fre::AggregateExecutionDetails::FixedAbsoluteDomain(
+                    fre::AggregateFixedAbsoluteDomainExecutionDetails::Residual {
+                        composite: receipt,
+                        ..
+                    },
+                ) = &execution.report().details
+                else {
+                    panic!("in-envelope scalar execution lacks residual receipt")
+                };
+                assert_eq!(receipt.prospective, composite);
+                assert!(receipt.contains_actual());
+            }
+            assert_eq!(
+                lifecycle.execute(&case.haystack).expect("first"),
+                case.expected
+            );
+            assert_eq!(
+                lifecycle.execute(&case.haystack).expect("steady"),
+                case.expected
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated table keeps the exact thirteen imported Rebar shapes and lifecycle checks together"
+    )]
+    fn current_fre_fixed_absolute_adapter_covers_thirteen_target_lifecycle_shapes() {
+        struct Case {
+            id: &'static str,
+            model: &'static str,
+            pattern: &'static str,
+            haystack: Vec<u8>,
+            unicode: bool,
+            expected: u64,
+        }
+
+        fn endpoint(length: usize, suffix: &[u8]) -> Vec<u8> {
+            let mut haystack = vec![b'!'; length];
+            haystack[length - suffix.len()..].copy_from_slice(suffix);
+            haystack
+        }
+
+        fn assert_exact_limits(
+            limits: &fre::AggregateRunLimits,
+            prospective: fre::FixedAbsoluteDomainProspective,
+        ) {
+            assert_eq!(
+                limits.fixed_absolute,
+                fre::FixedAbsoluteDomainReduceLimits {
+                    max_byte_probes: prospective.byte_probes,
+                    max_branch_checks: prospective.branch_checks,
+                    max_match_events: prospective.match_events,
+                    max_count: prospective.count,
+                    max_span_sum: prospective.span_sum,
+                    max_reducer_steps: prospective.reducer_steps,
+                    max_total_work: prospective.total_work,
+                    max_scratch_bytes: prospective.scratch_bytes,
+                    max_persistent_bytes: prospective.persistent_bytes,
+                    max_peak_bytes: prospective.peak_bytes,
+                }
+            );
+        }
+
+        fn assert_guard(
+            details: &fre::AggregateExecutionDetails,
+            prospective: fre::FixedAbsoluteDomainProspective,
+            composite_prospective: Option<fre::AggregateFixedAbsoluteDomainResidualProspective>,
+            limits: &fre::AggregateRunLimits,
+            haystack_len: usize,
+        ) {
+            let fre::AggregateExecutionDetails::FixedAbsoluteDomain(details) = details else {
+                panic!("fixed absolute-domain lifecycle lacks fixed execution details")
+            };
+            match details {
+                fre::AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard } => {
+                    assert!(composite_prospective.is_none());
+                    assert_eq!(
+                        limits.fixed_absolute_residual,
+                        fre::AggregateFixedAbsoluteDomainResidualLimits::default()
+                    );
+                    assert_eq!(guard.prospective, prospective);
+                    assert!(guard.actual.fits(prospective));
+                    assert_eq!(guard.window.start(), 0);
+                    assert_eq!(guard.window.end(), haystack_len);
+                    assert_eq!(guard.haystack_len, haystack_len);
+                }
+                fre::AggregateFixedAbsoluteDomainExecutionDetails::Residual { composite } => {
+                    assert_eq!(
+                        prospective.disposition,
+                        fre::FixedAbsoluteDomainDisposition::PrepublishedContinuation
+                    );
+                    assert_eq!(composite_prospective, Some(composite.prospective));
+                    assert!(composite.contains_actual());
+                    assert_eq!(
+                        limits.fixed_absolute_residual,
+                        fre::AggregateFixedAbsoluteDomainResidualLimits {
+                            max_work: composite.prospective.total_work,
+                            max_allocations: composite.prospective.allocations,
+                            max_persistent_bytes: composite.prospective.persistent_bytes,
+                            max_peak_bytes: composite.prospective.peak_bytes,
+                        }
+                    );
+                }
+            }
+        }
+
+        const MEDIUM: &str = "[XYZ]ABCDEFGHIJKLMNOPQRSTUVWXYZ$";
+        const EASY_19: &str = "A[AB]B[BC]C[CD]D[DE]E[EF]F[FG]G[GH]H[HI]I[IJ]J$";
+        let cases = vec![
+            Case {
+                id: "imported/rsc/medium-1mb@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: MEDIUM,
+                haystack: endpoint(1_048_603, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                unicode: false,
+                expected: 27,
+            },
+            Case {
+                id: "imported/rsc/medium-1mb@rust/regex::first-public-operation",
+                model: "count-spans",
+                pattern: MEDIUM,
+                haystack: endpoint(1_048_603, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                unicode: false,
+                expected: 27,
+            },
+            Case {
+                id: "imported/rsc/easy1-1mb@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: EASY_19,
+                haystack: endpoint(1_048_595, b"AABCCCDEEEFGGHHHIJJ"),
+                unicode: false,
+                expected: 19,
+            },
+            Case {
+                id: "imported/rsc/easy1-1mb@rust/regex::first-public-operation",
+                model: "count-spans",
+                pattern: EASY_19,
+                haystack: endpoint(1_048_595, b"AABCCCDEEEFGGHHHIJJ"),
+                unicode: false,
+                expected: 19,
+            },
+            Case {
+                id: "opt/reverse-anchored/word-end@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: r"\w$",
+                haystack: endpoint(1_000_001, b"X"),
+                unicode: false,
+                expected: 1,
+            },
+            Case {
+                id: "imported/rsc/medium-32k@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: MEDIUM,
+                haystack: endpoint(32_795, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                unicode: false,
+                expected: 27,
+            },
+            Case {
+                id: "imported/rsc/easy1-32k@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: EASY_19,
+                haystack: endpoint(32_787, b"AABCCCDEEEFGGHHHIJJ"),
+                unicode: false,
+                expected: 19,
+            },
+            Case {
+                id: "imported/rsc/medium-1k@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: MEDIUM,
+                haystack: endpoint(1_051, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+                unicode: false,
+                expected: 27,
+            },
+            Case {
+                id: "imported/rsc/easy1-1k@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: EASY_19,
+                haystack: endpoint(1_043, b"AABCCCDEEEFGGHHHIJJ"),
+                unicode: false,
+                expected: 19,
+            },
+            Case {
+                id: "opt/fixed-length/go33484-1@rust/regex::steady-public-operation",
+                model: "count",
+                pattern: r"^a{2,5}$",
+                haystack: vec![b'a'; 10_000],
+                unicode: false,
+                expected: 0,
+            },
+            Case {
+                id: "opt/fixed-length/go33484-2@rust/regex::steady-public-operation",
+                model: "count",
+                pattern: r"^((aaa)|(aa))$",
+                haystack: vec![b'a'; 10_000],
+                unicode: false,
+                expected: 0,
+            },
+            Case {
+                id: "opt/fixed-length/go33484-3@rust/regex::steady-public-operation",
+                model: "count",
+                pattern: r"^.{249}$",
+                haystack: vec![b'a'; 1_000],
+                unicode: true,
+                expected: 0,
+            },
+            Case {
+                id: "imported/rsc/anchored-literal-long-non-match@rust/regex::steady-public-operation",
+                model: "count-spans",
+                pattern: r"^zbc(d|e)",
+                haystack: (b'a'..=b'z').cycle().take(390).collect(),
+                unicode: false,
+                expected: 0,
+            },
+        ];
+
+        assert_eq!(cases.len(), 13);
+        for case in cases {
+            let patterns = [case.pattern.to_string()];
+            assert_current_fre_execution(
+                current_fre(
+                    case.model,
+                    &patterns,
+                    &case.haystack,
+                    case.unicode,
+                    false,
+                    &RunLimits::default(),
+                ),
+                case.expected,
+                "aggregate-fixed-absolute-domain",
+            );
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                case.model,
+                &patterns,
+                case.unicode,
+                false,
+                case.haystack.len(),
+            )
+            .unwrap_or_else(|error| panic!("{} lifecycle build: {error}", case.id));
+            assert_eq!(
+                lifecycle.plan(),
+                "aggregate-fixed-absolute-domain",
+                "{}",
+                case.id
+            );
+            match &lifecycle.inner {
+                CurrentFreAggregateOperationInner::CountSingle(regex, limits) => {
+                    assert_eq!(case.model, "count", "{}", case.id);
+                    assert_eq!(
+                        current_fre_rebar_count_run_limits(case.haystack.len(), regex)
+                            .unwrap_or_else(|error| {
+                                panic!("{} non-raw runner limits: {error}", case.id)
+                            }),
+                        *limits,
+                        "{}",
+                        case.id
+                    );
+                    let prospective = regex
+                        .fixed_absolute_domain_full_window_prospective(case.haystack.len())
+                        .unwrap_or_else(|error| panic!("{} prospective: {error}", case.id))
+                        .unwrap_or_else(|| panic!("{} missing prospective", case.id));
+                    let composite_prospective = regex
+                        .fixed_absolute_domain_full_window_composite_prospective(
+                            case.haystack.len(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{} composite prospective: {error}", case.id)
+                        });
+                    assert_exact_limits(limits, prospective);
+                    let identity = regex.cache_identity(*limits);
+                    let first = regex
+                        .count(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} first: {error}", case.id));
+                    let steady = regex
+                        .count(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
+                    assert_eq!(first.value(), case.expected, "{}", case.id);
+                    assert_eq!(steady.value(), case.expected, "{}", case.id);
+                    assert_eq!(first.report().identity, identity, "{}", case.id);
+                    assert_eq!(steady.report(), first.report(), "{}", case.id);
+                    assert!(std::sync::Arc::ptr_eq(
+                        &identity.syntax_key,
+                        &first.report().identity.syntax_key
+                    ));
+                    assert_guard(
+                        &first.report().details,
+                        prospective,
+                        composite_prospective,
+                        limits,
+                        case.haystack.len(),
+                    );
+                }
+                CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
+                    assert_eq!(case.model, "count-spans", "{}", case.id);
+                    assert_eq!(
+                        current_fre_rebar_span_sum_run_limits(case.haystack.len(), regex)
+                            .unwrap_or_else(|error| {
+                                panic!("{} non-raw runner limits: {error}", case.id)
+                            }),
+                        *limits,
+                        "{}",
+                        case.id
+                    );
+                    let prospective = regex
+                        .fixed_absolute_domain_full_window_prospective(case.haystack.len())
+                        .unwrap_or_else(|error| panic!("{} prospective: {error}", case.id))
+                        .unwrap_or_else(|| panic!("{} missing prospective", case.id));
+                    let composite_prospective = regex
+                        .fixed_absolute_domain_full_window_composite_prospective(
+                            case.haystack.len(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("{} composite prospective: {error}", case.id)
+                        });
+                    assert_exact_limits(limits, prospective);
+                    let identity = regex.cache_identity(*limits);
+                    let first = regex
+                        .span_sum(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} first: {error}", case.id));
+                    let steady = regex
+                        .span_sum(&case.haystack, *limits)
+                        .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
+                    assert_eq!(first.value(), case.expected, "{}", case.id);
+                    assert_eq!(steady.value(), case.expected, "{}", case.id);
+                    assert_eq!(first.report().identity, identity, "{}", case.id);
+                    assert_eq!(steady.report(), first.report(), "{}", case.id);
+                    assert!(std::sync::Arc::ptr_eq(
+                        &identity.syntax_key,
+                        &first.report().identity.syntax_key
+                    ));
+                    assert_guard(
+                        &first.report().details,
+                        prospective,
+                        composite_prospective,
+                        limits,
+                        case.haystack.len(),
+                    );
+                }
+                CurrentFreAggregateOperationInner::CountMany(_, _)
+                | CurrentFreAggregateOperationInner::SpanSumMany(_, _) => {
+                    panic!(
+                        "{} unexpectedly selected a multi-pattern lifecycle",
+                        case.id
+                    )
+                }
+            }
+            assert_eq!(
+                lifecycle
+                    .execute(&case.haystack)
+                    .unwrap_or_else(|error| panic!("{} runner first: {error}", case.id)),
+                case.expected,
+                "{}",
+                case.id
+            );
+            assert_eq!(
+                lifecycle
+                    .execute(&case.haystack)
+                    .unwrap_or_else(|error| panic!("{} runner steady: {error}", case.id)),
+                case.expected,
+                "{}",
+                case.id
+            );
+        }
+    }
+
+    #[test]
     fn current_fre_bounded_affix_receipt_label_binds_kernel_route() {
         assert_current_fre_execution(
             current_fre(
@@ -13373,7 +14908,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

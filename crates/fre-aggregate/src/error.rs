@@ -52,6 +52,7 @@ pub enum Resource {
     OutputMatches,
     OutputBytes,
     SpanSum,
+    Allocations,
     PeakBytes,
     ExecutionWork,
 }

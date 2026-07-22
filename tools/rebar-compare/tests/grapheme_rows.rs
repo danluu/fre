@@ -9,7 +9,7 @@ use rebar_compare::{
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_validate_aggregate_identity,
 };
 
-const ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1";
+const ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1";
 
 const GRAPHEME: &str = r"(?x)
 \p{gcb=CR} \p{gcb=LF}
@@ -85,8 +85,20 @@ fn adapter_runner_and_typed_plan_identity_agree() {
             .count(),
         1,
     );
-    assert_eq!(runner.matches("aggregate-explain=22").count(), 1);
-    assert!(!runner.contains("aggregate-explain=21"));
+    assert_eq!(runner.matches("aggregate-explain=23").count(), 1);
+    assert!(!runner.contains("aggregate-explain=22"));
+    assert_eq!(
+        runner
+            .matches("current_fre_rebar_count_run_limits(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        runner
+            .matches("current_fre_rebar_span_sum_run_limits(")
+            .count(),
+        1
+    );
 
     let regex = current_fre_rebar_aggregate_builder(GRAPHEME, true, false)
         .build_count()

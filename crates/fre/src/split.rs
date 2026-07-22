@@ -150,6 +150,10 @@ impl<'h> Iterator for PortableSplit<'_, 'h> {
 
 impl core::iter::FusedIterator for PortableSplit<'_, '_> {}
 
+#[allow(
+    clippy::result_large_err,
+    reason = "split preserves the facade's exact lossless aggregate execution error without boxing"
+)]
 impl AggregateSpansRegex {
     /// Split a byte haystack around every complete non-overlapping match.
     ///

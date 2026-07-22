@@ -51,10 +51,16 @@ mod program;
 mod required_internal_anchor;
 
 pub use accounting::{CompileAccounting, ExecutionAccounting};
-pub use compile::{CompiledRegex, PlanId, RustByteProfile};
+pub use compile::{
+    CompileAttemptError, CompileAttemptIdentity, CompileAttemptKind, CompileAttemptReceipt,
+    CompiledRegex, PlanId, RustByteProfile,
+};
 pub use error::{Error, Resource, Unsupported};
 pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
-    AdmittedCount, AdmittedSpanSum, AdmittedSpans, MatchCount, OperationCertificate, OperationId,
-    RowStorage, Span, SpanIter, SpanIteration, SpanSum, Strategy,
+    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpans, CountValueAttempt,
+    MatchCount, OperationAttemptError, OperationAttemptIdentity, OperationAttemptKind,
+    OperationAttemptReceipt, OperationCertificate, OperationId, OperationInvocation,
+    OperationProspective, OperationWorkMode, RowStorage, Span, SpanIter, SpanIteration, SpanSum,
+    Strategy,
 };

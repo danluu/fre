@@ -14,6 +14,11 @@ pub(crate) struct Inspection {
     pub(crate) inspection_work: usize,
 }
 
+pub(crate) struct InspectionAttempt {
+    pub(crate) result: Result<Inspection, Error>,
+    pub(crate) inspection_work: usize,
+}
+
 impl Inspection {
     const fn refused(inspection_work: usize) -> Self {
         Self {
@@ -35,8 +40,30 @@ pub(crate) fn inspect(
     max_literal_bytes: usize,
     max_program_bytes: usize,
 ) -> Result<Inspection, Error> {
+    inspect_attempt(hir, max_work, max_literal_bytes, max_program_bytes).result
+}
+
+pub(crate) fn inspect_attempt(
+    hir: &Hir,
+    max_work: usize,
+    max_literal_bytes: usize,
+    max_program_bytes: usize,
+) -> InspectionAttempt {
     let mut budget = Budget::new(max_work);
-    let root = transparent(hir, &mut budget)?;
+    let result = inspect_with_budget(hir, max_literal_bytes, max_program_bytes, &mut budget);
+    InspectionAttempt {
+        result,
+        inspection_work: budget.work,
+    }
+}
+
+fn inspect_with_budget(
+    hir: &Hir,
+    max_literal_bytes: usize,
+    max_program_bytes: usize,
+    budget: &mut Budget,
+) -> Result<Inspection, Error> {
+    let root = transparent(hir, budget)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(Inspection::refused(budget.work));
     };
@@ -44,27 +71,27 @@ pub(crate) fn inspect(
         return Ok(Inspection::refused(budget.work));
     }
 
-    let Some(prefix) = one_or_more_class(&parts[0], &mut budget)? else {
+    let Some(prefix) = one_or_more_class(&parts[0], budget)? else {
         return Ok(Inspection::refused(budget.work));
     };
-    let anchor = transparent(&parts[1], &mut budget)?;
+    let anchor = transparent(&parts[1], budget)?;
     let HirKind::Literal(anchor) = anchor.kind() else {
         return Ok(Inspection::refused(budget.work));
     };
-    charge(&mut budget, anchor.0.len())?;
+    charge(budget, anchor.0.len())?;
     if anchor.0.is_empty() {
         return Ok(Inspection::refused(budget.work));
     }
-    let Some(head) = one_or_more_class(&parts[2], &mut budget)? else {
+    let Some(head) = one_or_more_class(&parts[2], budget)? else {
         return Ok(Inspection::refused(budget.work));
     };
-    let Some(tail) = one_or_more_class(&parts[3], &mut budget)? else {
+    let Some(tail) = one_or_more_class(&parts[3], budget)? else {
         return Ok(Inspection::refused(budget.work));
     };
 
     let mut continuation = ContinuationSource::new(head, tail);
     for (index, optional) in parts[4..].iter().enumerate() {
-        let Some(stage) = optional_stage(optional, &mut budget)? else {
+        let Some(stage) = optional_stage(optional, budget)? else {
             return Ok(Inspection::refused(budget.work));
         };
         continuation.optional[index] = Some(stage);
@@ -86,7 +113,7 @@ pub(crate) fn inspect(
                 _ => Error::InternalInvariant("required internal-anchor work derivation refused"),
             },
         )?;
-    charge(&mut budget, build_work_upper_bound)?;
+    charge(budget, build_work_upper_bound)?;
     let plan = build_plan(
         prefix,
         &anchor.0,

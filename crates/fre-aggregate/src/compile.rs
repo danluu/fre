@@ -87,6 +87,51 @@ pub(crate) mod url_pack_allocation_probe {
     }
 }
 
+/// Deterministic failure injection at compiler-owned allocation calls.
+///
+/// The probe is test-only and thread-local. Its branch is never active in an
+/// ordinary production compile. Receipt accounting itself remains scoped by
+/// [`CompileBudget::allocation_scope`].
+#[cfg(test)]
+pub(crate) mod compiler_allocation_probe {
+    use std::cell::Cell;
+
+    use crate::{Error, Resource};
+
+    std::thread_local! {
+        static FAIL_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct FaultGuard;
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            FAIL_AT.set(usize::MAX);
+            CALLS.set(0);
+        }
+    }
+
+    pub(crate) fn fail_at(ordinal: usize) -> FaultGuard {
+        FAIL_AT.set(ordinal);
+        CALLS.set(0);
+        FaultGuard
+    }
+
+    pub(crate) fn before(resource: Resource, items: usize) -> Result<(), Error> {
+        let ordinal = CALLS.get();
+        CALLS.set(ordinal.saturating_add(1));
+        if ordinal == FAIL_AT.get() {
+            return Err(Error::AllocationFailed { resource, items });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 /// Explicit semantic profile asserted by direct HIR callers.
 ///
 /// HIR intentionally does not retain every parser option. In particular, an
@@ -118,6 +163,96 @@ impl RustByteProfile {
             // Preserve the pre-existing Unicode-off identities exactly.
             b"fre.aggregate.rust.bytes.unicode-off.v2"
         }
+    }
+}
+
+/// Public semantic tag for a receipt-bearing compiler attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CompileAttemptKind {
+    /// Capture annotations are transparent because the caller observes only
+    /// whole-match values.
+    EraseCapturesForWholeMatch,
+}
+
+/// Immutable semantic identity of a receipt-bearing compiler attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompileAttemptIdentity {
+    pub profile: RustByteProfile,
+    pub kind: CompileAttemptKind,
+}
+
+/// Complete compiler envelope and exact cumulative ledger at a terminal
+/// construction failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompileAttemptReceipt {
+    pub identity: CompileAttemptIdentity,
+    /// The exact caller-supplied envelope bound before HIR traversal begins.
+    pub prospective: CompileLimits,
+    /// U1-scoped allocation ceiling supplied by the eager scalar residual;
+    /// absent on the ordinary receipt-bearing compiler entry point.
+    pub allocation_limit: Option<usize>,
+    /// Complete input-only allocation count when the caller supplied the
+    /// fixed-scalar residual census; absent on ordinary compiler attempts.
+    pub prospective_allocations: Option<usize>,
+    /// Exact counters committed through the last admitted compiler step.
+    pub actual: CompileAccounting,
+    /// Successful compiler-owned allocations committed through this attempt.
+    pub actual_allocations: Option<usize>,
+    /// Logical construction bytes live immediately before the failure
+    /// unwinds and drops unpublished compiler-owned values.
+    pub live_construction_bytes: usize,
+    /// A terminal error never publishes a partial continuation program.
+    pub published: bool,
+}
+
+impl CompileAttemptReceipt {
+    #[must_use]
+    pub const fn contains_actual(self) -> bool {
+        self.actual.hir_nodes <= self.prospective.max_hir_nodes
+            && self.actual.hir_depth <= self.prospective.max_hir_depth
+            && self.actual.peak_hir_stack_items <= self.prospective.max_hir_stack_items
+            && self.actual.literal_bytes <= self.prospective.max_literal_bytes
+            && self.actual.class_ranges <= self.prospective.max_class_ranges
+            && self.actual.utf8_sequences <= self.prospective.max_utf8_sequences
+            && self.actual.utf8_byte_ranges <= self.prospective.max_utf8_byte_ranges
+            && self.actual.look_assertions <= self.prospective.max_look_assertions
+            && self.actual.program_states <= self.prospective.max_program_states
+            && self.actual.temporary_states_peak <= self.prospective.max_temporary_states
+            && self.actual.program_bytes <= self.prospective.max_program_bytes
+            && self.actual.construction_peak_bytes <= self.prospective.max_program_bytes
+            && self.actual.work <= self.prospective.max_work
+            && self.actual.captures_erased <= self.actual.hir_nodes
+            && self.actual.capture_erasure_work <= self.actual.work
+            && match (
+                self.allocation_limit,
+                self.prospective_allocations,
+                self.actual_allocations,
+            ) {
+                (Some(limit), Some(upper), Some(actual)) => actual <= limit && actual <= upper,
+                (None, None, None) => true,
+                _ => false,
+            }
+            && self.live_construction_bytes <= self.actual.construction_peak_bytes
+            && !self.published
+    }
+}
+
+/// Terminal refusal from the U1-scoped receipt-bearing compiler entry point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileAttemptError {
+    pub source: Error,
+    pub receipt: CompileAttemptReceipt,
+}
+
+impl core::fmt::Display for CompileAttemptError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for CompileAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -291,6 +426,98 @@ impl CompiledRegex {
         Self::compile(hir, profile, limits, CapturePolicy::EraseForWholeMatch)
     }
 
+    /// Compile the whole-match-only program while retaining exact cumulative
+    /// P/A construction evidence on every terminal refusal.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the typed terminal receipt preserves the complete bounded compiler ledger"
+    )]
+    pub fn from_hir_erasing_captures_for_whole_match_with_receipt(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+    ) -> Result<Self, CompileAttemptError> {
+        Self::compile_with_optional_allocation_receipt(hir, profile, limits, None)
+            .map(|(compiled, _)| compiled)
+    }
+
+    /// U1-only whole-match compiler entry point with a prospective/allocation
+    /// receipt. Ordinary compiler entry points never enable this scope.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the typed terminal receipt preserves the complete bounded compiler ledger"
+    )]
+    pub fn from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+        allocation_limit: usize,
+        prospective_allocations: usize,
+    ) -> Result<(Self, usize), CompileAttemptError> {
+        Self::compile_with_optional_allocation_receipt(
+            hir,
+            profile,
+            limits,
+            Some((allocation_limit, prospective_allocations)),
+        )
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the typed terminal receipt preserves the complete bounded compiler ledger"
+    )]
+    fn compile_with_optional_allocation_receipt(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+        allocation: Option<(usize, usize)>,
+    ) -> Result<(Self, usize), CompileAttemptError> {
+        let identity = CompileAttemptIdentity {
+            profile,
+            kind: CompileAttemptKind::EraseCapturesForWholeMatch,
+        };
+        let scope = allocation.map(|(limit, prospective)| AllocationScope { limit, prospective });
+        let mut budget = CompileBudget::new_receipt(limits, scope);
+        let result = match scope {
+            Some(scope) => enforce(scope.prospective, scope.limit, Resource::Allocations),
+            None => Ok(()),
+        }
+        .and_then(|()| {
+            Self::compile_with_budget(
+                hir,
+                profile,
+                limits,
+                CapturePolicy::EraseForWholeMatch,
+                &mut budget,
+            )
+        });
+        match result {
+            Ok(compiled)
+                if scope.is_none_or(|scope| budget.actual_allocations == scope.prospective) =>
+            {
+                Ok((compiled, budget.actual_allocations))
+            }
+            Ok(_) => Err(CompileAttemptError {
+                source: Error::InternalInvariant(
+                    "fixed scalar allocation census differs from compilation",
+                ),
+                receipt: budget.failure_receipt(identity),
+            }),
+            Err(source) => {
+                let receipt = budget.failure_receipt(identity);
+                let source = if receipt.contains_actual() {
+                    source
+                } else {
+                    Error::InternalInvariant(
+                        "compile failure actual ledger exceeds its prospective envelope",
+                    )
+                };
+                Err(CompileAttemptError { source, receipt })
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "compile keeps resource lifetime and publication ordering in one auditable transaction"
@@ -302,16 +529,29 @@ impl CompiledRegex {
         capture_policy: CapturePolicy,
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
-        validate_hir(hir, profile, capture_policy, &mut budget)?;
-        let url_aggregate =
-            build_url_aggregate_plan(hir, profile, capture_policy, limits, &mut budget)?;
+        Self::compile_with_budget(hir, profile, limits, capture_policy, &mut budget)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "compile keeps resource lifetime and publication ordering in one auditable transaction"
+    )]
+    fn compile_with_budget(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+        capture_policy: CapturePolicy,
+        budget: &mut CompileBudget,
+    ) -> Result<Self, Error> {
+        validate_hir(hir, profile, capture_policy, budget)?;
+        let url_aggregate = build_url_aggregate_plan(hir, profile, capture_policy, limits, budget)?;
         let (
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
             retained_program_bytes,
-        ) = build_retained_components(hir, profile, limits, &mut budget)?;
-        let mut candidate = build_candidate_plan(hir, profile, &mut budget)?;
+        ) = build_retained_components(hir, profile, limits, budget)?;
+        let mut candidate = build_candidate_plan(hir, profile, budget)?;
         let candidate_bytes = candidate
             .as_ref()
             .map_or(Ok(0), candidate::Plan::retained_bytes)?;
@@ -336,7 +576,7 @@ impl CompiledRegex {
             profile,
             capture_policy,
             retained_program_bytes,
-            &mut budget,
+            budget,
         );
         let accept = builder.push(Inst::Match)?;
         let entry = if let Some(plan) = &mut candidate {
@@ -351,12 +591,8 @@ impl CompiledRegex {
             limits.max_program_states,
             Resource::ProgramStates,
         )?;
-        let certificate = certify_program(
-            &insts,
-            scalar_range_bytes,
-            retained_program_bytes,
-            &mut budget,
-        )?;
+        let certificate =
+            certify_program(&insts, scalar_range_bytes, retained_program_bytes, budget)?;
         // `program_bytes` visits every instruction to include each deeply
         // owned scalar-range box in the exact retained-byte total.
         budget.charge(insts.len())?;
@@ -393,22 +629,22 @@ impl CompiledRegex {
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
         };
-        let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, &mut budget)?;
+        let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, budget)?;
         if let Some(candidate) = &candidate {
-            plan_id = bind_candidate_identity(plan_id, candidate, &mut budget)?;
+            plan_id = bind_candidate_identity(plan_id, candidate, budget)?;
         }
         if let Some(plan) = &required_internal_anchor {
-            plan_id = bind_required_internal_anchor_identity(plan_id, plan, &mut budget)?;
+            plan_id = bind_required_internal_anchor_identity(plan_id, plan, budget)?;
         }
         if let Some(plan) = &url_aggregate {
-            plan_id = bind_url_aggregate_identity(plan_id, plan, &mut budget)?;
+            plan_id = bind_url_aggregate_identity(plan_id, plan, budget)?;
         }
         if budget.current_construction_bytes != program_bytes {
             return Err(Error::InternalInvariant(
                 "compiler retained bytes differ from construction accounting",
             ));
         }
-        let accounting = budget.finish();
+        let accounting = budget.accounting;
         Ok(Self {
             program,
             candidate,
@@ -435,6 +671,78 @@ impl CompiledRegex {
     pub fn state_count(&self) -> usize {
         self.program.insts.len()
     }
+
+    /// Capacity of the pinned Rust 1.93 base `Vec` HIR stack immediately
+    /// after its initial `try_reserve_exact(1)` allocation.
+    ///
+    /// This is exposed for the U1 input-only allocation census. Callers must
+    /// refuse that optional route when they are not using the pinned compiler
+    /// profile instead of guessing a different allocator graph.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pinned_hir_stack_initial_capacity() -> usize {
+        1
+    }
+
+    /// Model one capacity-changing `Vec<(&Hir, usize)>::try_reserve(1)` call
+    /// in the pinned Rust 1.93 compiler graph.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pinned_hir_stack_capacity_after_push(
+        current_capacity: usize,
+        required_len: usize,
+    ) -> Option<usize> {
+        pinned_vec_capacity_after_push(
+            current_capacity,
+            required_len,
+            core::mem::size_of::<(&Hir, usize)>(),
+        )
+    }
+
+    /// Model one capacity-changing `Vec<Inst>::try_reserve(1)` call in the
+    /// pinned Rust 1.93 compiler graph.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pinned_state_capacity_after_push(
+        current_capacity: usize,
+        required_len: usize,
+    ) -> Option<usize> {
+        pinned_vec_capacity_after_push(current_capacity, required_len, core::mem::size_of::<Inst>())
+    }
+}
+
+/// Rust 1.93's `RawVec` amortized growth rule for a non-ZST `Vec` whose
+/// caller requests exactly the one missing slot. The minimum non-zero
+/// capacity is 8 for one-byte elements, 4 for elements up to 1 KiB, and 1 for
+/// larger elements; subsequent growth doubles unless the required length is
+/// larger. Returning `None` makes overflow an authenticated census refusal.
+const fn pinned_vec_capacity_after_push(
+    current_capacity: usize,
+    required_len: usize,
+    element_size: usize,
+) -> Option<usize> {
+    if required_len <= current_capacity {
+        return Some(current_capacity);
+    }
+    if element_size == 0 {
+        return Some(usize::MAX);
+    }
+    let minimum = if element_size == 1 {
+        8
+    } else if element_size <= 1_024 {
+        4
+    } else {
+        1
+    };
+    let Some(doubled) = current_capacity.checked_mul(2) else {
+        return None;
+    };
+    let grown = if doubled > minimum { doubled } else { minimum };
+    Some(if required_len > grown {
+        required_len
+    } else {
+        grown
+    })
 }
 
 struct PackedUrlTlds {
@@ -573,8 +881,27 @@ fn build_url_aggregate_from_certificate(
     }
 }
 
+trait UrlTldSource {
+    fn tld(&self, index: usize) -> Option<&[u8]>;
+    fn tld_count(&self) -> Option<usize>;
+}
+
+impl UrlTldSource for crate::anchored_island::UrlCertificate<'_> {
+    fn tld(&self, index: usize) -> Option<&[u8]> {
+        crate::anchored_island::UrlCertificate::tld(self, index)
+    }
+
+    fn tld_count(&self) -> Option<usize> {
+        crate::anchored_island::UrlCertificate::tld_count(self)
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "URL packing keeps the two allocator commits and exact copy in one auditable transaction"
+)]
 fn pack_url_tlds(
-    certificate: &crate::anchored_island::UrlCertificate<'_>,
+    certificate: &impl UrlTldSource,
     budget: &mut CompileBudget,
 ) -> Result<PackedUrlTlds, Error> {
     #[cfg(test)]
@@ -607,17 +934,42 @@ fn pack_url_tlds(
     #[cfg(test)]
     url_pack_allocation_probe::record_preallocation_work(budget.accounting.work);
     budget.charge(4)?;
-    budget.acquire_checked_construction_bytes(allocated_bytes)?;
+    let receipt_scope = budget.receipt_scope;
+    if receipt_scope {
+        // Bind the full two-allocation P/peak before either allocator call.
+        budget.preflight_receipt_construction_bytes(allocated_bytes)?;
+    } else {
+        // Preserve the incumbent prepayment and error ordering exactly.
+        budget.acquire_checked_construction_bytes(allocated_bytes)?;
+    }
     let packed = (|| {
         #[cfg(test)]
         url_pack_allocation_probe::record_call();
-        let mut bytes = ExactVec::try_with_capacity(byte_count).map_err(|error| {
-            exact_url_allocation_error(error, Resource::ProgramBytes, byte_count)
-        })?;
+        let mut bytes = compiler_allocation(
+            budget,
+            byte_count > 0,
+            Resource::ProgramBytes,
+            byte_count,
+            || {
+                ExactVec::try_with_capacity(byte_count).map_err(|error| {
+                    exact_url_allocation_error(error, Resource::ProgramBytes, byte_count)
+                })
+            },
+        )?;
+        if receipt_scope {
+            budget.acquire_construction_bytes(byte_count)?;
+        }
         #[cfg(test)]
         url_pack_allocation_probe::record_call();
-        let mut ends = ExactVec::try_with_capacity(count)
-            .map_err(|error| exact_url_allocation_error(error, Resource::ProgramBytes, count))?;
+        let mut ends =
+            compiler_allocation(budget, count > 0, Resource::ProgramBytes, count, || {
+                ExactVec::try_with_capacity(count).map_err(|error| {
+                    exact_url_allocation_error(error, Resource::ProgramBytes, count)
+                })
+            })?;
+        if receipt_scope {
+            budget.acquire_construction_bytes(ends_bytes)?;
+        }
         for index in 0..count {
             budget.charge(1)?;
             let tld = certificate.tld(index).ok_or(Error::InternalInvariant(
@@ -657,7 +1009,7 @@ fn pack_url_tlds(
             allocated_bytes,
         })
     })();
-    if packed.is_err() {
+    if packed.is_err() && !receipt_scope {
         budget.release_construction_bytes(allocated_bytes)?;
     }
     packed
@@ -748,8 +1100,21 @@ fn build_candidate_plan(
         Resource::ProgramBytes,
     )?;
     budget.charge(branches.len())?;
-    budget.acquire_construction_bytes(draft_bytes)?;
-    let mut drafts = candidate::exact_drafts(branches.len())?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(draft_bytes)?;
+    } else {
+        budget.acquire_construction_bytes(draft_bytes)?;
+    }
+    let mut drafts = compiler_allocation(
+        budget,
+        !branches.is_empty(),
+        Resource::ProgramBytes,
+        branches.len(),
+        || candidate::exact_drafts(branches.len()),
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(draft_bytes)?;
+    }
     for branch in branches {
         budget.charge(1)?;
         let fallback = if let Some(draft) = required_candidate(branch, budget)? {
@@ -829,8 +1194,21 @@ fn build_candidate_plan(
         Resource::CompileWork,
     )?;
     budget.charge(initialization)?;
-    budget.acquire_construction_bytes(retained_bytes)?;
-    let mut entries = candidate::exact_entries(drafts.len())?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(retained_bytes)?;
+    } else {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    let mut entries = compiler_allocation(
+        budget,
+        !drafts.is_empty(),
+        Resource::ProgramBytes,
+        drafts.len(),
+        || candidate::exact_entries(drafts.len()),
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(entry_bytes)?;
+    }
     for draft in &*drafts {
         entries
             .try_push(CandidateEntry {
@@ -845,13 +1223,31 @@ fn build_candidate_plan(
             })
             .map_err(|_| Error::InternalInvariant("candidate entry allocation filled early"))?;
     }
-    let mut buckets = candidate::exact_buckets()?;
+    let mut buckets = compiler_allocation(
+        budget,
+        candidate::bucket_count() > 0,
+        Resource::ProgramBytes,
+        candidate::bucket_count(),
+        candidate::exact_buckets,
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(bucket_bytes)?;
+    }
     for _ in 0..candidate::bucket_count() {
         buckets
             .try_push(0)
             .map_err(|_| Error::InternalInvariant("candidate bucket allocation filled early"))?;
     }
-    let mut global_buckets = candidate::exact_buckets()?;
+    let mut global_buckets = compiler_allocation(
+        budget,
+        candidate::bucket_count() > 0,
+        Resource::ProgramBytes,
+        candidate::bucket_count(),
+        candidate::exact_buckets,
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(bucket_bytes)?;
+    }
     for _ in 0..candidate::bucket_count() {
         global_buckets.try_push(0).map_err(|_| {
             Error::InternalInvariant("candidate global bucket allocation filled early")
@@ -1587,6 +1983,7 @@ fn build_retained_components(
     ),
     Error,
 > {
+    let seed_start_bytes = budget.current_construction_bytes;
     let (required_suffixes, terminal_frontier) = execution_seeds(hir, profile, budget)?;
     budget.accounting.required_suffixes = required_suffixes.ends.len();
     budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
@@ -1597,12 +1994,22 @@ fn build_retained_components(
         TerminalFrontierSeed::retained_bytes(),
         Resource::ProgramBytes,
     )?;
-    budget.acquire_construction_bytes(seed_program_bytes)?;
-    enforce(
-        budget.current_construction_bytes,
-        limits.max_program_bytes,
-        Resource::ProgramBytes,
-    )?;
+    if budget.receipt_scope {
+        let expected_seed_bytes =
+            add(seed_start_bytes, seed_program_bytes, Resource::ProgramBytes)?;
+        if budget.current_construction_bytes != expected_seed_bytes {
+            return Err(Error::InternalInvariant(
+                "receipt seed allocations differ from retained seed bytes",
+            ));
+        }
+    } else {
+        budget.acquire_construction_bytes(seed_program_bytes)?;
+        enforce(
+            budget.current_construction_bytes,
+            limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )?;
+    }
     let required_internal_anchor = if profile.unicode {
         None
     } else {
@@ -1617,12 +2024,41 @@ fn build_retained_components(
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::ProgramBytes,
             })?;
-        let inspection = required_internal_anchor::inspect(
-            hir,
-            remaining_work,
-            limits.max_literal_bytes,
-            remaining_program_bytes,
-        )?;
+        let inspection = if budget.receipt_scope {
+            let outer_work = budget.accounting.work;
+            let attempt = required_internal_anchor::inspect_attempt(
+                hir,
+                remaining_work,
+                limits.max_literal_bytes,
+                remaining_program_bytes,
+            );
+            match attempt.result {
+                Ok(inspection) => inspection,
+                Err(source) => {
+                    budget.charge(attempt.inspection_work)?;
+                    let source = match source {
+                        Error::ResourceLimit {
+                            resource: Resource::CompileWork,
+                            required,
+                            limit,
+                        } if limit == remaining_work => Error::ResourceLimit {
+                            resource: Resource::CompileWork,
+                            required: add(outer_work, required, Resource::CompileWork)?,
+                            limit: limits.max_work,
+                        },
+                        source => source,
+                    };
+                    return Err(source);
+                }
+            }
+        } else {
+            required_internal_anchor::inspect(
+                hir,
+                remaining_work,
+                limits.max_literal_bytes,
+                remaining_program_bytes,
+            )?
+        };
         retain_required_internal_anchor(inspection, budget)?
     };
     let required_internal_anchor_program_bytes = required_internal_anchor
@@ -1676,12 +2112,33 @@ enum CapturePolicy {
 pub(crate) struct CompileBudget {
     limits: CompileLimits,
     accounting: CompileAccounting,
+    receipt_scope: bool,
+    allocation_scope: Option<AllocationScope>,
+    actual_allocations: usize,
     current_temporary_states: usize,
     current_construction_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+struct AllocationScope {
+    limit: usize,
+    prospective: usize,
+}
+
 impl CompileBudget {
     pub(crate) const fn new(limits: CompileLimits) -> Self {
+        Self::new_inner(limits, false, None)
+    }
+
+    const fn new_receipt(limits: CompileLimits, allocation_scope: Option<AllocationScope>) -> Self {
+        Self::new_inner(limits, true, allocation_scope)
+    }
+
+    const fn new_inner(
+        limits: CompileLimits,
+        receipt_scope: bool,
+        allocation_scope: Option<AllocationScope>,
+    ) -> Self {
         Self {
             limits,
             accounting: CompileAccounting {
@@ -1724,6 +2181,9 @@ impl CompileBudget {
                 requires_utf8_validation: false,
                 work: 0,
             },
+            receipt_scope,
+            allocation_scope,
+            actual_allocations: 0,
             current_temporary_states: 0,
             current_construction_bytes: 0,
         }
@@ -1734,6 +2194,62 @@ impl CompileBudget {
         enforce(required, self.limits.max_work, Resource::CompileWork)?;
         self.accounting.work = required;
         Ok(())
+    }
+
+    /// Preflight one physical allocation only when the U1 receipt scope is
+    /// active. The ordinary path returns before arithmetic or enforcement, so
+    /// this hook cannot alter its error ordering.
+    fn preflight_allocation(&self, needed: bool) -> Result<Option<usize>, Error> {
+        let Some(scope) = self.allocation_scope else {
+            return Ok(None);
+        };
+        if !needed {
+            return Ok(None);
+        }
+        let required = add(self.actual_allocations, 1, Resource::Allocations)?;
+        enforce(required, scope.limit, Resource::Allocations)?;
+        enforce(required, scope.prospective, Resource::Allocations)?;
+        Ok(Some(required))
+    }
+
+    /// Commit only after the allocator has succeeded and a capacity-bearing
+    /// object exists. An ordinary compile always supplies `None` and returns
+    /// immediately without inspecting allocator behavior.
+    fn commit_allocation(
+        &mut self,
+        preflight: Option<usize>,
+        allocated: bool,
+    ) -> Result<(), Error> {
+        let Some(required) = preflight else {
+            return Ok(());
+        };
+        if !allocated {
+            return Err(Error::InternalInvariant(
+                "preflighted compiler allocation did not change capacity",
+            ));
+        }
+        let expected = add(self.actual_allocations, 1, Resource::Allocations)?;
+        if required != expected {
+            return Err(Error::InternalInvariant(
+                "compiler allocation ledger changed between preflight and commit",
+            ));
+        }
+        self.actual_allocations = required;
+        Ok(())
+    }
+
+    fn failure_receipt(&self, identity: CompileAttemptIdentity) -> CompileAttemptReceipt {
+        debug_assert!(self.receipt_scope);
+        CompileAttemptReceipt {
+            identity,
+            prospective: self.limits,
+            allocation_limit: self.allocation_scope.map(|scope| scope.limit),
+            prospective_allocations: self.allocation_scope.map(|scope| scope.prospective),
+            actual: self.accounting,
+            actual_allocations: self.allocation_scope.map(|_| self.actual_allocations),
+            live_construction_bytes: self.current_construction_bytes,
+            published: false,
+        }
     }
 
     pub(crate) fn acquire_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
@@ -1764,6 +2280,24 @@ impl CompileBudget {
             Resource::ProgramBytes,
         )?;
         self.acquire_construction_bytes(amount)
+    }
+
+    /// Receipt-only P check. Ordinary compilation returns before arithmetic
+    /// or enforcement so its incumbent error and counter ordering is exact.
+    fn preflight_receipt_construction_bytes(&self, amount: usize) -> Result<(), Error> {
+        if !self.receipt_scope {
+            return Ok(());
+        }
+        let required = add(
+            self.current_construction_bytes,
+            amount,
+            Resource::ProgramBytes,
+        )?;
+        enforce(
+            required,
+            self.limits.max_program_bytes,
+            Resource::ProgramBytes,
+        )
     }
     pub(crate) fn release_construction_bytes(&mut self, amount: usize) -> Result<(), Error> {
         self.current_construction_bytes = self
@@ -1817,17 +2351,23 @@ impl CompileBudget {
     }
 
     fn record_look_assertion(&mut self) -> Result<(), Error> {
-        self.accounting.look_assertions =
-            add(self.accounting.look_assertions, 1, Resource::LookAssertions)?;
-        enforce(
-            self.accounting.look_assertions,
-            self.limits.max_look_assertions,
-            Resource::LookAssertions,
-        )
-    }
-
-    fn finish(self) -> CompileAccounting {
-        self.accounting
+        let required = add(self.accounting.look_assertions, 1, Resource::LookAssertions)?;
+        if self.receipt_scope {
+            enforce(
+                required,
+                self.limits.max_look_assertions,
+                Resource::LookAssertions,
+            )?;
+            self.accounting.look_assertions = required;
+            Ok(())
+        } else {
+            self.accounting.look_assertions = required;
+            enforce(
+                self.accounting.look_assertions,
+                self.limits.max_look_assertions,
+                Resource::LookAssertions,
+            )
+        }
     }
 }
 
@@ -1921,6 +2461,9 @@ fn execution_seeds(
 ) -> Result<(RequiredSuffixes, TerminalFrontierSeed), Error> {
     let analysis = analyze_required_suffixes(hir, budget)?;
     let terminal_frontier = terminal_frontier_seed(hir, profile, &analysis, budget)?;
+    if budget.receipt_scope {
+        budget.acquire_checked_construction_bytes(TerminalFrontierSeed::retained_bytes())?;
+    }
     let required_suffixes = materialize_required_suffixes(hir, analysis, budget)?;
     Ok((required_suffixes, terminal_frontier))
 }
@@ -1970,10 +2513,21 @@ fn materialize_required_suffixes(
         budget.limits.max_program_bytes,
         Resource::ProgramBytes,
     )?;
+    budget.preflight_receipt_construction_bytes(requested_program_bytes)?;
     // Preflight every retained endpoint and byte before allocation or copy.
     budget.charge(add(suffix_count, suffix_bytes, Resource::CompileWork)?)?;
-    let mut bytes = exact_program_vec(suffix_bytes)?;
-    let mut ends = exact_program_vec(suffix_count)?;
+    let mut bytes = exact_program_vec_metered(suffix_bytes, budget)?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(suffix_bytes)?;
+    }
+    let mut ends = exact_program_vec_metered(suffix_count, budget)?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(mul(
+            suffix_count,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?)?;
+    }
     match analysis {
         SuffixAnalysis::Literals(literals) => {
             for literal in literals.iter() {
@@ -2243,6 +2797,10 @@ fn analyze_required_suffixes<'a>(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "validation keeps incumbent traversal and receipt-only counter commits adjacent"
+)]
 fn validate_hir(
     hir: &Hir,
     profile: RustByteProfile,
@@ -2250,12 +2808,28 @@ fn validate_hir(
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
     let mut stack = Vec::new();
-    stack
-        .try_reserve_exact(1)
-        .map_err(|_| Error::AllocationFailed {
-            resource: Resource::HirStackItems,
-            items: 1,
-        })?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(mul(
+            CompiledRegex::pinned_hir_stack_initial_capacity(),
+            core::mem::size_of::<(&Hir, usize)>(),
+            Resource::ProgramBytes,
+        )?)?;
+    }
+    compiler_allocation(budget, true, Resource::HirStackItems, 1, || {
+        stack
+            .try_reserve_exact(1)
+            .map_err(|_| Error::AllocationFailed {
+                resource: Resource::HirStackItems,
+                items: 1,
+            })
+    })?;
+    if budget.receipt_scope
+        && stack.capacity() != CompiledRegex::pinned_hir_stack_initial_capacity()
+    {
+        return Err(Error::InternalInvariant(
+            "pinned initial HIR stack capacity profile differs from Rust Vec",
+        ));
+    }
     budget.acquire_construction_bytes(mul(
         stack.capacity(),
         core::mem::size_of::<(&Hir, usize)>(),
@@ -2270,28 +2844,44 @@ fn validate_hir(
     budget.accounting.peak_hir_stack_items = 1;
     while let Some((node, depth)) = stack.pop() {
         budget.charge(1)?;
-        budget.accounting.hir_nodes = add(budget.accounting.hir_nodes, 1, Resource::HirNodes)?;
-        enforce(
-            budget.accounting.hir_nodes,
-            budget.limits.max_hir_nodes,
-            Resource::HirNodes,
-        )?;
+        let hir_nodes = add(budget.accounting.hir_nodes, 1, Resource::HirNodes)?;
+        if budget.receipt_scope {
+            enforce(hir_nodes, budget.limits.max_hir_nodes, Resource::HirNodes)?;
+            budget.accounting.hir_nodes = hir_nodes;
+        } else {
+            budget.accounting.hir_nodes = hir_nodes;
+            enforce(
+                budget.accounting.hir_nodes,
+                budget.limits.max_hir_nodes,
+                Resource::HirNodes,
+            )?;
+        }
         enforce(depth, budget.limits.max_hir_depth, Resource::HirDepth)?;
         budget.accounting.hir_depth = budget.accounting.hir_depth.max(depth);
         match node.kind() {
             HirKind::Empty => {}
             HirKind::Literal(literal) => {
                 budget.charge(literal.0.len())?;
-                budget.accounting.literal_bytes = add(
+                let literal_bytes = add(
                     budget.accounting.literal_bytes,
                     literal.0.len(),
                     Resource::LiteralBytes,
                 )?;
-                enforce(
-                    budget.accounting.literal_bytes,
-                    budget.limits.max_literal_bytes,
-                    Resource::LiteralBytes,
-                )?;
+                if budget.receipt_scope {
+                    enforce(
+                        literal_bytes,
+                        budget.limits.max_literal_bytes,
+                        Resource::LiteralBytes,
+                    )?;
+                    budget.accounting.literal_bytes = literal_bytes;
+                } else {
+                    budget.accounting.literal_bytes = literal_bytes;
+                    enforce(
+                        budget.accounting.literal_bytes,
+                        budget.limits.max_literal_bytes,
+                        Resource::LiteralBytes,
+                    )?;
+                }
             }
             HirKind::Class(Class::Unicode(class)) => {
                 validate_unicode_class(class, profile, budget)?;
@@ -2299,16 +2889,26 @@ fn validate_hir(
             HirKind::Class(Class::Bytes(class)) => {
                 let ranges = class.ranges().len();
                 budget.charge(ranges)?;
-                budget.accounting.class_ranges = add(
+                let class_ranges = add(
                     budget.accounting.class_ranges,
                     ranges,
                     Resource::ClassRanges,
                 )?;
-                enforce(
-                    budget.accounting.class_ranges,
-                    budget.limits.max_class_ranges,
-                    Resource::ClassRanges,
-                )?;
+                if budget.receipt_scope {
+                    enforce(
+                        class_ranges,
+                        budget.limits.max_class_ranges,
+                        Resource::ClassRanges,
+                    )?;
+                    budget.accounting.class_ranges = class_ranges;
+                } else {
+                    budget.accounting.class_ranges = class_ranges;
+                    enforce(
+                        budget.accounting.class_ranges,
+                        budget.limits.max_class_ranges,
+                        Resource::ClassRanges,
+                    )?;
+                }
             }
             HirKind::Look(_) => {
                 budget.record_look_assertion()?;
@@ -2345,44 +2945,86 @@ fn validate_unicode_class(
     profile: RustByteProfile,
     budget: &mut CompileBudget,
 ) -> Result<(), Error> {
-    if !profile.unicode && class.ranges().iter().any(|range| !range.end().is_ascii()) {
-        return Err(Error::Unsupported(Unsupported::UnicodeClass));
+    let receipt_metered_unicode_off_scan = !profile.unicode && budget.receipt_scope;
+    if !profile.unicode {
+        if budget.receipt_scope {
+            for range in class.ranges() {
+                budget.charge(1)?;
+                if !range.end().is_ascii() {
+                    return Err(Error::Unsupported(Unsupported::UnicodeClass));
+                }
+            }
+        } else if class.ranges().iter().any(|range| !range.end().is_ascii()) {
+            return Err(Error::Unsupported(Unsupported::UnicodeClass));
+        }
     }
     let ranges = class.ranges().len();
-    budget.charge(ranges)?;
-    budget.accounting.class_ranges = add(
+    if !receipt_metered_unicode_off_scan {
+        budget.charge(ranges)?;
+    }
+    let class_ranges = add(
         budget.accounting.class_ranges,
         ranges,
         Resource::ClassRanges,
     )?;
-    enforce(
-        budget.accounting.class_ranges,
-        budget.limits.max_class_ranges,
-        Resource::ClassRanges,
-    )?;
+    if budget.receipt_scope {
+        enforce(
+            class_ranges,
+            budget.limits.max_class_ranges,
+            Resource::ClassRanges,
+        )?;
+        budget.accounting.class_ranges = class_ranges;
+    } else {
+        budget.accounting.class_ranges = class_ranges;
+        enforce(
+            budget.accounting.class_ranges,
+            budget.limits.max_class_ranges,
+            Resource::ClassRanges,
+        )?;
+    }
     if profile.unicode {
         for range in class.ranges() {
             for sequence in Utf8Sequences::new(range.start(), range.end()) {
                 budget.charge(1)?;
-                budget.accounting.utf8_sequences =
+                let utf8_sequences =
                     add(budget.accounting.utf8_sequences, 1, Resource::Utf8Sequences)?;
-                enforce(
-                    budget.accounting.utf8_sequences,
-                    budget.limits.max_utf8_sequences,
-                    Resource::Utf8Sequences,
-                )?;
+                if budget.receipt_scope {
+                    enforce(
+                        utf8_sequences,
+                        budget.limits.max_utf8_sequences,
+                        Resource::Utf8Sequences,
+                    )?;
+                    budget.accounting.utf8_sequences = utf8_sequences;
+                } else {
+                    budget.accounting.utf8_sequences = utf8_sequences;
+                    enforce(
+                        budget.accounting.utf8_sequences,
+                        budget.limits.max_utf8_sequences,
+                        Resource::Utf8Sequences,
+                    )?;
+                }
                 let byte_ranges = sequence.as_slice().len();
                 budget.charge(byte_ranges)?;
-                budget.accounting.utf8_byte_ranges = add(
+                let utf8_byte_ranges = add(
                     budget.accounting.utf8_byte_ranges,
                     byte_ranges,
                     Resource::Utf8ByteRanges,
                 )?;
-                enforce(
-                    budget.accounting.utf8_byte_ranges,
-                    budget.limits.max_utf8_byte_ranges,
-                    Resource::Utf8ByteRanges,
-                )?;
+                if budget.receipt_scope {
+                    enforce(
+                        utf8_byte_ranges,
+                        budget.limits.max_utf8_byte_ranges,
+                        Resource::Utf8ByteRanges,
+                    )?;
+                    budget.accounting.utf8_byte_ranges = utf8_byte_ranges;
+                } else {
+                    budget.accounting.utf8_byte_ranges = utf8_byte_ranges;
+                    enforce(
+                        budget.accounting.utf8_byte_ranges,
+                        budget.limits.max_utf8_byte_ranges,
+                        Resource::Utf8ByteRanges,
+                    )?;
+                }
             }
         }
     }
@@ -2403,11 +3045,42 @@ fn push_children<'a>(
             budget.limits.max_hir_stack_items,
             Resource::HirStackItems,
         )?;
+        if budget.receipt_scope {
+            budget.charge(1)?;
+        }
         let old_capacity = stack.capacity();
-        stack.try_reserve(1).map_err(|_| Error::AllocationFailed {
-            resource: Resource::HirStackItems,
-            items: 1,
+        let needs_allocation = stack.len() == stack.capacity();
+        let receipt_capacity = if budget.receipt_scope && needs_allocation {
+            let capacity =
+                CompiledRegex::pinned_hir_stack_capacity_after_push(old_capacity, required).ok_or(
+                    Error::ArithmeticOverflow {
+                        resource: Resource::ProgramBytes,
+                    },
+                )?;
+            budget.preflight_receipt_construction_bytes(mul(
+                capacity
+                    .checked_sub(old_capacity)
+                    .ok_or(Error::InternalInvariant(
+                        "pinned HIR stack capacity decreased",
+                    ))?,
+                core::mem::size_of::<(&Hir, usize)>(),
+                Resource::ProgramBytes,
+            )?)?;
+            Some(capacity)
+        } else {
+            None
+        };
+        compiler_allocation(budget, needs_allocation, Resource::HirStackItems, 1, || {
+            stack.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                resource: Resource::HirStackItems,
+                items: 1,
+            })
         })?;
+        if receipt_capacity.is_some_and(|capacity| capacity != stack.capacity()) {
+            return Err(Error::InternalInvariant(
+                "pinned HIR stack capacity profile differs from Rust Vec",
+            ));
+        }
         let added_capacity =
             stack
                 .capacity()
@@ -2423,7 +3096,9 @@ fn push_children<'a>(
         stack.push((child, next_depth));
         budget.accounting.peak_hir_stack_items =
             budget.accounting.peak_hir_stack_items.max(stack.len());
-        budget.charge(1)?;
+        if !budget.receipt_scope {
+            budget.charge(1)?;
+        }
     }
     Ok(())
 }
@@ -2499,11 +3174,28 @@ impl<'a> Builder<'a> {
     }
 
     fn push(&mut self, inst: Inst) -> Result<usize, Error> {
+        self.push_with_scalar_accounting(inst, false)
+    }
+
+    fn push_preaccounted_scalar(&mut self, inst: Inst) -> Result<usize, Error> {
+        self.push_with_scalar_accounting(inst, true)
+    }
+
+    fn push_with_scalar_accounting(
+        &mut self,
+        inst: Inst,
+        scalar_preaccounted: bool,
+    ) -> Result<usize, Error> {
         let required = add(self.slots.len(), 1, Resource::ProgramStates)?;
         let added_scalar_bytes = match &inst {
             Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
             _ => 0,
         };
+        if scalar_preaccounted != (self.budget.receipt_scope && added_scalar_bytes != 0) {
+            return Err(Error::InternalInvariant(
+                "compiler scalar state accounting scope differs from owned storage",
+            ));
+        }
         let scalar_range_bytes = add(
             self.scalar_range_bytes,
             added_scalar_bytes,
@@ -2512,12 +3204,44 @@ impl<'a> Builder<'a> {
         self.enforce_program_shape(required, scalar_range_bytes)?;
         self.budget.acquire_state()?;
         let old_capacity = self.slots.capacity();
-        self.slots
-            .try_reserve(1)
-            .map_err(|_| Error::AllocationFailed {
-                resource: Resource::TemporaryStates,
-                items: 1,
-            })?;
+        let needs_allocation = self.slots.len() == self.slots.capacity();
+        let receipt_capacity = if self.budget.receipt_scope && needs_allocation {
+            let capacity = CompiledRegex::pinned_state_capacity_after_push(old_capacity, required)
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::ProgramBytes,
+                })?;
+            self.budget.preflight_receipt_construction_bytes(mul(
+                capacity
+                    .checked_sub(old_capacity)
+                    .ok_or(Error::InternalInvariant(
+                        "pinned compiler state capacity decreased",
+                    ))?,
+                core::mem::size_of::<Inst>(),
+                Resource::ProgramBytes,
+            )?)?;
+            Some(capacity)
+        } else {
+            None
+        };
+        compiler_allocation(
+            self.budget,
+            needs_allocation,
+            Resource::TemporaryStates,
+            1,
+            || {
+                self.slots
+                    .try_reserve(1)
+                    .map_err(|_| Error::AllocationFailed {
+                        resource: Resource::TemporaryStates,
+                        items: 1,
+                    })
+            },
+        )?;
+        if receipt_capacity.is_some_and(|capacity| capacity != self.slots.capacity()) {
+            return Err(Error::InternalInvariant(
+                "pinned compiler state capacity profile differs from Rust Vec",
+            ));
+        }
         let added_capacity =
             self.slots
                 .capacity()
@@ -2530,11 +3254,16 @@ impl<'a> Builder<'a> {
             core::mem::size_of::<Inst>(),
             Resource::ProgramBytes,
         )?;
-        self.budget.acquire_construction_bytes(add(
-            state_capacity_bytes,
-            added_scalar_bytes,
-            Resource::ProgramBytes,
-        )?)?;
+        self.budget
+            .acquire_construction_bytes(if scalar_preaccounted {
+                state_capacity_bytes
+            } else {
+                add(
+                    state_capacity_bytes,
+                    added_scalar_bytes,
+                    Resource::ProgramBytes,
+                )?
+            })?;
         let index = self.slots.len();
         self.slots.push(inst);
         self.scalar_range_bytes = scalar_range_bytes;
@@ -2542,6 +3271,19 @@ impl<'a> Builder<'a> {
     }
 
     fn fill_unfilled(&mut self, index: usize, inst: Inst) -> Result<(), Error> {
+        self.fill_unfilled_with_scalar_accounting(index, inst, false)
+    }
+
+    fn fill_unfilled_preaccounted_scalar(&mut self, index: usize, inst: Inst) -> Result<(), Error> {
+        self.fill_unfilled_with_scalar_accounting(index, inst, true)
+    }
+
+    fn fill_unfilled_with_scalar_accounting(
+        &mut self,
+        index: usize,
+        inst: Inst,
+        scalar_preaccounted: bool,
+    ) -> Result<(), Error> {
         if !matches!(self.slots.get(index), Some(Inst::Unfilled)) {
             return Err(Error::InternalInvariant(
                 "compiler attempted to replace a filled state",
@@ -2551,13 +3293,20 @@ impl<'a> Builder<'a> {
             Inst::ConsumeScalar { scalars, .. } => scalars.allocated_bytes()?,
             _ => 0,
         };
+        if scalar_preaccounted != (self.budget.receipt_scope && added_scalar_bytes != 0) {
+            return Err(Error::InternalInvariant(
+                "compiler scalar fill accounting scope differs from owned storage",
+            ));
+        }
         let scalar_range_bytes = add(
             self.scalar_range_bytes,
             added_scalar_bytes,
             Resource::ProgramBytes,
         )?;
         self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
-        self.budget.acquire_construction_bytes(added_scalar_bytes)?;
+        if !scalar_preaccounted {
+            self.budget.acquire_construction_bytes(added_scalar_bytes)?;
+        }
         self.slots[index] = inst;
         self.scalar_range_bytes = scalar_range_bytes;
         Ok(())
@@ -2583,21 +3332,29 @@ impl<'a> Builder<'a> {
         self.enforce_program_shape(self.slots.len(), scalar_range_bytes)?;
         if let Inst::ConsumeScalar { scalars, .. } = source {
             self.budget.charge(scalars.len())?;
+            self.budget
+                .preflight_receipt_construction_bytes(added_scalar_bytes)?;
         }
         Ok(())
     }
 
     fn preflight_scalar_set(&self, range_count: usize) -> Result<(), Error> {
+        let allocation_bytes = ScalarSet::required_bytes(range_count)?;
         let states = add(self.slots.len(), 1, Resource::ProgramStates)?;
         let scalar_range_bytes = add(
             self.scalar_range_bytes,
-            ScalarSet::required_bytes(range_count)?,
+            allocation_bytes,
             Resource::ProgramBytes,
         )?;
-        self.enforce_program_shape(states, scalar_range_bytes)
+        self.enforce_program_shape(states, scalar_range_bytes)?;
+        self.budget
+            .preflight_receipt_construction_bytes(allocation_bytes)
     }
 
     fn finish(self) -> Result<ExactVec<Inst>, Error> {
+        if self.budget.receipt_scope {
+            self.budget.charge(self.slots.len())?;
+        }
         if self.slots.iter().any(|inst| matches!(inst, Inst::Unfilled)) {
             return Err(Error::InternalInvariant("unfilled compiler state"));
         }
@@ -2611,10 +3368,21 @@ impl<'a> Builder<'a> {
             core::mem::size_of::<Inst>(),
             Resource::ProgramBytes,
         )?;
-        self.budget.charge(self.slots.len())?;
-        self.budget
-            .acquire_construction_bytes(retained_state_bytes)?;
-        let retained = retain_exact_program_vec(self.slots)?;
+        if !self.budget.receipt_scope {
+            self.budget.charge(self.slots.len())?;
+        }
+        if self.budget.receipt_scope {
+            self.budget
+                .preflight_receipt_construction_bytes(retained_state_bytes)?;
+        } else {
+            self.budget
+                .acquire_construction_bytes(retained_state_bytes)?;
+        }
+        let retained = retain_exact_program_vec_metered(self.slots, self.budget)?;
+        if self.budget.receipt_scope {
+            self.budget
+                .acquire_construction_bytes(retained_state_bytes)?;
+        }
         self.budget
             .release_construction_bytes(construction_state_bytes)?;
         Ok(retained)
@@ -2755,11 +3523,26 @@ impl<'a> Builder<'a> {
                 *slot = tail;
             }
             self.preflight_scalar_set(class.ranges().len())?;
-            let scalars = ScalarSet::from_unicode_class(class)?;
-            return self.push(Inst::ConsumeScalar {
+            let scalars = compiler_allocation(
+                self.budget,
+                !class.ranges().is_empty(),
+                Resource::ProgramBytes,
+                class.ranges().len(),
+                || ScalarSet::from_unicode_class(class),
+            )?;
+            let scalar_bytes = scalars.allocated_bytes()?;
+            if self.budget.receipt_scope {
+                self.budget.acquire_construction_bytes(scalar_bytes)?;
+            }
+            let inst = Inst::ConsumeScalar {
                 scalars,
                 next_by_width,
-            });
+            };
+            return if self.budget.receipt_scope {
+                self.push_preaccounted_scalar(inst)
+            } else {
+                self.push(inst)
+            };
         }
 
         let mut entry = None;
@@ -2916,8 +3699,30 @@ impl<'a> Builder<'a> {
         zero_continuation: usize,
         consumed_continuation: usize,
     ) -> Result<usize, Error> {
-        let mut zero_map = reserved_vec(fragment.len(), Resource::TemporaryStates)?;
-        let mut consumed_map = reserved_vec(fragment.len(), Resource::TemporaryStates)?;
+        let prospective_map_bytes = if self.budget.receipt_scope {
+            let map_items = mul(2, fragment.len(), Resource::TemporaryStates)?;
+            let bytes = mul(
+                map_items,
+                core::mem::size_of::<usize>(),
+                Resource::ProgramBytes,
+            )?;
+            self.budget.preflight_receipt_construction_bytes(bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
+        let mut zero_map =
+            reserved_vec_metered(fragment.len(), Resource::TemporaryStates, self.budget)?;
+        if self.budget.receipt_scope {
+            self.budget
+                .acquire_construction_bytes(vector_capacity_bytes(&zero_map)?)?;
+        }
+        let mut consumed_map =
+            reserved_vec_metered(fragment.len(), Resource::TemporaryStates, self.budget)?;
+        if self.budget.receipt_scope {
+            self.budget
+                .acquire_construction_bytes(vector_capacity_bytes(&consumed_map)?)?;
+        }
         let map_bytes = add(
             mul(
                 zero_map.capacity(),
@@ -2931,7 +3736,13 @@ impl<'a> Builder<'a> {
             )?,
             Resource::ProgramBytes,
         )?;
-        self.budget.acquire_construction_bytes(map_bytes)?;
+        if !self.budget.receipt_scope {
+            self.budget.acquire_construction_bytes(map_bytes)?;
+        } else if prospective_map_bytes != Some(map_bytes) {
+            return Err(Error::InternalInvariant(
+                "pinned progress-map capacity profile differs from exact reserve",
+            ));
+        }
         for inst in fragment {
             if matches!(inst, Inst::Match) {
                 zero_map.push(zero_continuation);
@@ -2947,11 +3758,19 @@ impl<'a> Builder<'a> {
                 continue;
             }
             self.preflight_progress_fill(zero_map[pc], inst)?;
-            let zero = translate_progress(inst, &zero_map, &consumed_map, false)?;
-            self.fill_unfilled(zero_map[pc], zero)?;
+            let zero = translate_progress(inst, &zero_map, &consumed_map, false, self.budget)?;
+            if self.budget.receipt_scope && matches!(&zero, Inst::ConsumeScalar { .. }) {
+                self.fill_unfilled_preaccounted_scalar(zero_map[pc], zero)?;
+            } else {
+                self.fill_unfilled(zero_map[pc], zero)?;
+            }
             self.preflight_progress_fill(consumed_map[pc], inst)?;
-            let consumed = translate_progress(inst, &zero_map, &consumed_map, true)?;
-            self.fill_unfilled(consumed_map[pc], consumed)?;
+            let consumed = translate_progress(inst, &zero_map, &consumed_map, true, self.budget)?;
+            if self.budget.receipt_scope && matches!(&consumed, Inst::ConsumeScalar { .. }) {
+                self.fill_unfilled_preaccounted_scalar(consumed_map[pc], consumed)?;
+            } else {
+                self.fill_unfilled(consumed_map[pc], consumed)?;
+            }
         }
         let entry = zero_map
             .get(fragment_entry)
@@ -2969,6 +3788,7 @@ fn translate_progress(
     zero: &[usize],
     consumed: &[usize],
     has_consumed: bool,
+    budget: &mut CompileBudget,
 ) -> Result<Inst, Error> {
     let same = if has_consumed { consumed } else { zero };
     let mapped = |map: &[usize], pc: usize| {
@@ -2992,8 +3812,18 @@ fn translate_progress(
             for (destination, source) in translated.iter_mut().zip(next_by_width) {
                 *destination = mapped(consumed, *source)?;
             }
+            let scalars = compiler_allocation(
+                budget,
+                scalars.len() > 0,
+                Resource::ProgramBytes,
+                scalars.len(),
+                || scalars.try_clone(),
+            )?;
+            if budget.receipt_scope {
+                budget.acquire_construction_bytes(scalars.allocated_bytes()?)?;
+            }
             Ok(Inst::ConsumeScalar {
-                scalars: scalars.try_clone()?,
+                scalars,
                 next_by_width: translated,
             })
         }
@@ -3050,15 +3880,40 @@ fn build_epsilon_parent_index(
     budget: &mut CompileBudget,
 ) -> Result<EpsilonParentIndex, Error> {
     let states = insts.len();
-    let mut outgoing = zeroed_exact_program_vec(states)?;
-    let mut parent_counts = zeroed_vec(states, Resource::TemporaryStates)?;
+    let receipt_state_vector_bytes = if budget.receipt_scope {
+        let bytes = mul(
+            states,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?;
+        budget.preflight_receipt_construction_bytes(mul(2, bytes, Resource::ProgramBytes)?)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    let mut outgoing = zeroed_exact_program_vec_metered(states, budget)?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(exact_vector_bytes(&outgoing)?)?;
+    }
+    let mut parent_counts = zeroed_vec_metered(states, Resource::TemporaryStates, budget)?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(vector_capacity_bytes(&parent_counts)?)?;
+    }
     let outgoing_bytes = exact_vector_bytes(&outgoing)?;
     let parent_counts_bytes = vector_capacity_bytes(&parent_counts)?;
-    budget.acquire_construction_bytes(add(
-        outgoing_bytes,
-        parent_counts_bytes,
-        Resource::ProgramBytes,
-    )?)?;
+    if !budget.receipt_scope {
+        budget.acquire_construction_bytes(add(
+            outgoing_bytes,
+            parent_counts_bytes,
+            Resource::ProgramBytes,
+        )?)?;
+    } else if receipt_state_vector_bytes != Some(outgoing_bytes)
+        || receipt_state_vector_bytes != Some(parent_counts_bytes)
+    {
+        return Err(Error::InternalInvariant(
+            "pinned certification state-vector capacity differs from exact reserve",
+        ));
+    }
     let mut edge_count = 0_usize;
     for (parent, inst) in insts.iter().enumerate() {
         for child in epsilon_targets(inst) {
@@ -3071,10 +3926,15 @@ fn build_epsilon_parent_index(
             edge_count = add(edge_count, 1, Resource::TemporaryStates)?;
         }
     }
-    let mut offsets = zeroed_vec(
-        add(states, 1, Resource::TemporaryStates)?,
-        Resource::TemporaryStates,
-    )?;
+    let offset_items = add(states, 1, Resource::TemporaryStates)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(mul(
+            offset_items,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?)?;
+    }
+    let mut offsets = zeroed_vec_metered(offset_items, Resource::TemporaryStates, budget)?;
     let offsets_bytes = vector_capacity_bytes(&offsets)?;
     budget.acquire_construction_bytes(offsets_bytes)?;
     for index in 0..states {
@@ -3089,15 +3949,27 @@ fn build_epsilon_parent_index(
     // Reuse that exact allocation for the per-child insertion cursors.
     let mut cursor = parent_counts;
     cursor.copy_from_slice(&offsets[..states]);
-    let mut parents = zeroed_vec(edge_count, Resource::TemporaryStates)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(mul(
+            edge_count,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?)?;
+    }
+    let mut parents = zeroed_vec_metered(edge_count, Resource::TemporaryStates, budget)?;
     let parents_bytes = vector_capacity_bytes(&parents)?;
     budget.acquire_construction_bytes(parents_bytes)?;
     for (parent, inst) in insts.iter().enumerate() {
         for child in epsilon_targets(inst) {
+            if budget.receipt_scope {
+                budget.charge(1)?;
+            }
             let slot = cursor[child];
             parents[slot] = parent;
             cursor[child] = add(cursor[child], 1, Resource::TemporaryStates)?;
-            budget.charge(1)?;
+            if !budget.receipt_scope {
+                budget.charge(1)?;
+            }
         }
     }
     drop(cursor);
@@ -3121,19 +3993,45 @@ fn certify_program_admitted(
         parents,
         scratch_bytes,
     } = build_epsilon_parent_index(insts, budget)?;
-    let mut queue = reserved_queue(states)?;
+    let receipt_queue_capacity = if budget.receipt_scope {
+        let capacity = pinned_vec_capacity_after_push(0, states, core::mem::size_of::<usize>())
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::ProgramBytes,
+            })?;
+        budget.preflight_receipt_construction_bytes(mul(
+            capacity,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?)?;
+        Some(capacity)
+    } else {
+        None
+    };
+    let mut queue = reserved_queue_metered(states, budget)?;
     let queue_bytes = mul(
         queue.capacity(),
         core::mem::size_of::<usize>(),
         Resource::ProgramBytes,
     )?;
+    if receipt_queue_capacity.is_some_and(|capacity| queue.capacity() != capacity) {
+        return Err(Error::InternalInvariant(
+            "pinned certification queue capacity profile differs from VecDeque",
+        ));
+    }
     budget.acquire_construction_bytes(queue_bytes)?;
     for (state, count) in outgoing.iter().enumerate() {
         if *count == 0 {
             queue.push_back(state);
         }
     }
-    let mut order = exact_program_vec(states)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(mul(
+            states,
+            core::mem::size_of::<usize>(),
+            Resource::ProgramBytes,
+        )?)?;
+    }
+    let mut order = exact_program_vec_metered(states, budget)?;
     let order_bytes = exact_vector_bytes(&order)?;
     budget.acquire_construction_bytes(order_bytes)?;
     while let Some(child) = queue.pop_front() {
@@ -3732,6 +4630,69 @@ impl StableHash {
     }
 }
 
+/// Wrap one compiler-owned allocation without changing the incumbent
+/// allocation algorithm. When no U1 allocation scope is installed,
+/// `preflight_allocation` returns immediately and the original constructor is
+/// invoked unchanged. The receipt ledger commits only after success.
+fn compiler_allocation<T>(
+    budget: &mut CompileBudget,
+    needed: bool,
+    resource: Resource,
+    items: usize,
+    construct: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let preflight = budget.preflight_allocation(needed)?;
+    #[cfg(test)]
+    if preflight.is_some() {
+        compiler_allocation_probe::before(resource, items)?;
+    }
+    #[cfg(not(test))]
+    let _ = (resource, items);
+    let value = construct()?;
+    budget.commit_allocation(preflight, needed)?;
+    Ok(value)
+}
+
+fn exact_program_vec_metered<T>(
+    capacity: usize,
+    budget: &mut CompileBudget,
+) -> Result<ExactVec<T>, Error> {
+    compiler_allocation(
+        budget,
+        capacity > 0 && core::mem::size_of::<T>() > 0,
+        Resource::ProgramBytes,
+        capacity,
+        || exact_program_vec(capacity),
+    )
+}
+
+fn reserved_vec_metered<T>(
+    length: usize,
+    resource: Resource,
+    budget: &mut CompileBudget,
+) -> Result<Vec<T>, Error> {
+    compiler_allocation(
+        budget,
+        length > 0 && core::mem::size_of::<T>() > 0,
+        resource,
+        length,
+        || reserved_vec(length, resource),
+    )
+}
+
+fn reserved_queue_metered(
+    length: usize,
+    budget: &mut CompileBudget,
+) -> Result<VecDeque<usize>, Error> {
+    compiler_allocation(
+        budget,
+        length > 0,
+        Resource::TemporaryStates,
+        length,
+        || reserved_queue(length),
+    )
+}
+
 fn reserved_vec<T>(length: usize, resource: Resource) -> Result<Vec<T>, Error> {
     let mut values = Vec::new();
     values
@@ -3782,8 +4743,12 @@ fn exact_program_vec<T>(capacity: usize) -> Result<ExactVec<T>, Error> {
     })
 }
 
-fn retain_exact_program_vec<T>(values: Vec<T>) -> Result<ExactVec<T>, Error> {
-    let mut retained = exact_program_vec(values.len())?;
+fn retain_exact_program_vec_metered<T>(
+    values: Vec<T>,
+    budget: &mut CompileBudget,
+) -> Result<ExactVec<T>, Error> {
+    let length = values.len();
+    let mut retained = exact_program_vec_metered(length, budget)?;
     for value in values {
         retained.try_push(value).map_err(|_| {
             Error::InternalInvariant("exact retained program allocation changed capacity")
@@ -3792,8 +4757,11 @@ fn retain_exact_program_vec<T>(values: Vec<T>) -> Result<ExactVec<T>, Error> {
     Ok(retained)
 }
 
-fn zeroed_exact_program_vec(length: usize) -> Result<ExactVec<usize>, Error> {
-    let mut values = exact_program_vec(length)?;
+fn zeroed_exact_program_vec_metered(
+    length: usize,
+    budget: &mut CompileBudget,
+) -> Result<ExactVec<usize>, Error> {
+    let mut values = exact_program_vec_metered(length, budget)?;
     for _ in 0..length {
         values.try_push(0).map_err(|_| {
             Error::InternalInvariant("exact zeroed program allocation changed capacity")
@@ -3802,8 +4770,12 @@ fn zeroed_exact_program_vec(length: usize) -> Result<ExactVec<usize>, Error> {
     Ok(values)
 }
 
-fn zeroed_vec(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
-    let mut values = reserved_vec(length, resource)?;
+fn zeroed_vec_metered(
+    length: usize,
+    resource: Resource,
+    budget: &mut CompileBudget,
+) -> Result<Vec<usize>, Error> {
+    let mut values = reserved_vec_metered(length, resource, budget)?;
     values.resize(length, 0);
     Ok(values)
 }
@@ -3884,6 +4856,94 @@ mod tests {
             .build()
             .parse(pattern)
             .unwrap()
+    }
+
+    struct TestUrlTlds<'a>(&'a [&'a [u8]]);
+
+    impl UrlTldSource for TestUrlTlds<'_> {
+        fn tld(&self, index: usize) -> Option<&[u8]> {
+            self.0.get(index).copied()
+        }
+
+        fn tld_count(&self) -> Option<usize> {
+            Some(self.0.len())
+        }
+    }
+
+    #[test]
+    fn url_allocations_preflight_full_p_and_commit_each_successful_a() {
+        let words: &[&[u8]] = &[b"com", b"org"];
+        let source = TestUrlTlds(words);
+        let byte_count = words.iter().map(|word| word.len()).sum::<usize>();
+        let ends_bytes = words.len() * core::mem::size_of::<usize>();
+        let allocated_bytes = byte_count + ends_bytes;
+
+        let fault = compiler_allocation_probe::fail_at(0);
+        let mut one_below = CompileBudget::new_receipt(
+            CompileLimits {
+                max_program_bytes: allocated_bytes - 1,
+                ..CompileLimits::default()
+            },
+            Some(AllocationScope {
+                limit: 2,
+                prospective: 2,
+            }),
+        );
+        let Err(one_below_error) = pack_url_tlds(&source, &mut one_below) else {
+            panic!("one-below URL packing must refuse before allocation")
+        };
+        assert_eq!(
+            one_below_error,
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: allocated_bytes,
+                limit: allocated_bytes - 1,
+            }
+        );
+        assert_eq!(compiler_allocation_probe::calls(), 0);
+        drop(fault);
+        assert_eq!(one_below.actual_allocations, 0);
+        assert_eq!(one_below.current_construction_bytes, 0);
+        assert_eq!(one_below.accounting.construction_peak_bytes, 0);
+
+        for (ordinal, expected_live) in [(0, 0), (1, byte_count)] {
+            let mut budget = CompileBudget::new_receipt(
+                CompileLimits {
+                    max_program_bytes: allocated_bytes,
+                    ..CompileLimits::default()
+                },
+                Some(AllocationScope {
+                    limit: 2,
+                    prospective: 2,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let Err(error) = pack_url_tlds(&source, &mut budget) else {
+                panic!("injected URL allocation must refuse")
+            };
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+
+        let mut exact = CompileBudget::new_receipt(
+            CompileLimits {
+                max_program_bytes: allocated_bytes,
+                ..CompileLimits::default()
+            },
+            Some(AllocationScope {
+                limit: 2,
+                prospective: 2,
+            }),
+        );
+        let packed = pack_url_tlds(&source, &mut exact).unwrap();
+        assert_eq!(exact.actual_allocations, 2);
+        assert_eq!(exact.current_construction_bytes, allocated_bytes);
+        assert_eq!(exact.accounting.construction_peak_bytes, allocated_bytes);
+        packed.release(&mut exact).unwrap();
+        assert_eq!(exact.current_construction_bytes, 0);
     }
 
     #[test]
@@ -4068,6 +5128,56 @@ mod tests {
     }
 
     #[test]
+    fn candidate_allocation_failures_commit_only_successful_storage() {
+        let hir = parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z");
+        let HirKind::Alternation(branches) = hir.kind() else {
+            panic!("candidate fixture must remain a root alternation")
+        };
+        let draft_bytes = branches.len() * core::mem::size_of::<CandidateDraft>();
+        let entry_bytes = branches.len() * core::mem::size_of::<CandidateEntry>();
+        let bucket_bytes = candidate::bucket_count() * core::mem::size_of::<u128>();
+        let expected_live = [
+            0,
+            draft_bytes,
+            draft_bytes + entry_bytes,
+            draft_bytes + entry_bytes + bucket_bytes,
+        ];
+        for (ordinal, expected_live) in expected_live.into_iter().enumerate() {
+            let mut budget = CompileBudget::new_receipt(
+                CompileLimits::default(),
+                Some(AllocationScope {
+                    limit: 4,
+                    prospective: 4,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let error = build_candidate_plan(&hir, RustByteProfile::PINNED_1_12_4, &mut budget)
+                .unwrap_err();
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+
+        let mut budget = CompileBudget::new_receipt(
+            CompileLimits::default(),
+            Some(AllocationScope {
+                limit: 4,
+                prospective: 4,
+            }),
+        );
+        let plan = build_candidate_plan(&hir, RustByteProfile::PINNED_1_12_4, &mut budget)
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.actual_allocations, 4);
+        assert_eq!(
+            budget.current_construction_bytes,
+            plan.retained_bytes().unwrap()
+        );
+    }
+
+    #[test]
     fn scalar_construction_charges_ranges_and_one_continuation_set_exactly() {
         // Four canonical-range copies, 64 continuation-byte insertions, one
         // two-byte continuation state and one scalar state: 4 + 64 + 1 + 1.
@@ -4140,6 +5250,727 @@ mod tests {
     }
 
     #[test]
+    fn receipt_scalar_storage_remains_live_at_post_allocation_refusals() {
+        let ascii = ascii_unicode_class();
+        let HirKind::Class(Class::Unicode(class)) = ascii.kind() else {
+            panic!("fixture must remain one Unicode class")
+        };
+        let scalar_bytes = ScalarSet::required_bytes(class.ranges().len()).unwrap();
+        for (limits, expected) in [
+            (
+                CompileLimits {
+                    max_work: 1,
+                    ..CompileLimits::default()
+                },
+                Error::ResourceLimit {
+                    resource: Resource::CompileWork,
+                    required: 2,
+                    limit: 1,
+                },
+            ),
+            (
+                CompileLimits {
+                    max_temporary_states: 0,
+                    ..CompileLimits::default()
+                },
+                Error::ResourceLimit {
+                    resource: Resource::TemporaryStates,
+                    required: 1,
+                    limit: 0,
+                },
+            ),
+        ] {
+            let mut budget = CompileBudget::new_receipt(
+                limits,
+                Some(AllocationScope {
+                    limit: 2,
+                    prospective: 2,
+                }),
+            );
+            let error = Builder::new(
+                limits.max_program_states,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CapturePolicy::Reject,
+                0,
+                &mut budget,
+            )
+            .compile_unicode_class(class, 0)
+            .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(budget.actual_allocations, 1);
+            assert_eq!(budget.current_construction_bytes, scalar_bytes);
+            assert_eq!(budget.accounting.construction_peak_bytes, scalar_bytes);
+        }
+
+        for (ordinal, expected_live, expected_allocations) in [(0, 0, 0), (1, scalar_bytes, 1)] {
+            let limits = CompileLimits::default();
+            let mut budget = CompileBudget::new_receipt(
+                limits,
+                Some(AllocationScope {
+                    limit: 2,
+                    prospective: 2,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let error = Builder::new(
+                limits.max_program_states,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CapturePolicy::Reject,
+                0,
+                &mut budget,
+            )
+            .compile_unicode_class(class, 0)
+            .unwrap_err();
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, expected_allocations);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+    }
+
+    #[test]
+    fn receipt_retained_and_parent_failures_have_no_phantom_bytes() {
+        let limits = CompileLimits::default();
+        let mut budget = CompileBudget::new_receipt(
+            limits,
+            Some(AllocationScope {
+                limit: 2,
+                prospective: 2,
+            }),
+        );
+        let mut builder = Builder::new(
+            limits.max_program_states,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            0,
+            &mut budget,
+        );
+        builder.push(Inst::Match).unwrap();
+        let live_before = builder.budget.current_construction_bytes;
+        let peak_before = builder.budget.accounting.construction_peak_bytes;
+        let fault = compiler_allocation_probe::fail_at(0);
+        let error = builder.finish().unwrap_err();
+        drop(fault);
+        assert!(matches!(error, Error::AllocationFailed { .. }));
+        assert_eq!(budget.actual_allocations, 1);
+        assert_eq!(budget.current_construction_bytes, live_before);
+        assert_eq!(budget.accounting.construction_peak_bytes, peak_before);
+
+        let mut insts = exact_program_vec(1).unwrap();
+        insts.try_push(Inst::Match).unwrap();
+        let mut parent_budget = CompileBudget::new_receipt(
+            limits,
+            Some(AllocationScope {
+                limit: 4,
+                prospective: 4,
+            }),
+        );
+        let fault = compiler_allocation_probe::fail_at(1);
+        let Err(error) = build_epsilon_parent_index(&insts, &mut parent_budget) else {
+            panic!("injected parent-count allocation must fail")
+        };
+        drop(fault);
+        assert!(matches!(error, Error::AllocationFailed { .. }));
+        let outgoing_bytes = core::mem::size_of::<usize>();
+        assert_eq!(parent_budget.actual_allocations, 1);
+        assert_eq!(parent_budget.current_construction_bytes, outgoing_bytes);
+        assert_eq!(
+            parent_budget.accounting.construction_peak_bytes,
+            outgoing_bytes
+        );
+    }
+
+    #[test]
+    fn receipt_finish_slot_scan_is_exactly_charged_before_observation() {
+        let exact_limits = CompileLimits {
+            max_work: 2,
+            ..CompileLimits::default()
+        };
+        let mut exact_budget = CompileBudget::new_receipt(exact_limits, None);
+        let mut exact_builder = Builder::new(
+            exact_limits.max_program_states,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            0,
+            &mut exact_budget,
+        );
+        exact_builder.push(Inst::Match).unwrap();
+        let retained = exact_builder.finish().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(exact_budget.accounting.work, 2);
+
+        let one_below_limits = CompileLimits {
+            max_work: 1,
+            ..CompileLimits::default()
+        };
+        let mut one_below_budget = CompileBudget::new_receipt(one_below_limits, None);
+        let mut one_below_builder = Builder::new(
+            one_below_limits.max_program_states,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            0,
+            &mut one_below_budget,
+        );
+        one_below_builder.push(Inst::Match).unwrap();
+        assert_eq!(
+            one_below_builder.finish().unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: 2,
+                limit: 1,
+            }
+        );
+        assert_eq!(one_below_budget.accounting.work, 1);
+
+        let mut invalid_budget = CompileBudget::new_receipt(exact_limits, None);
+        let mut invalid_builder = Builder::new(
+            exact_limits.max_program_states,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            0,
+            &mut invalid_budget,
+        );
+        invalid_builder.push(Inst::Unfilled).unwrap();
+        assert_eq!(
+            invalid_builder.finish().unwrap_err(),
+            Error::InternalInvariant("unfilled compiler state")
+        );
+        assert_eq!(invalid_budget.accounting.work, 2);
+    }
+
+    #[test]
+    fn receipt_child_push_refuses_one_below_before_allocation_or_publication() {
+        let child = Hir::empty();
+        let exact_limits = CompileLimits {
+            max_work: 1,
+            ..CompileLimits::default()
+        };
+        let mut exact_budget = CompileBudget::new_receipt(
+            exact_limits,
+            Some(AllocationScope {
+                limit: 1,
+                prospective: 1,
+            }),
+        );
+        let mut exact_stack = Vec::new();
+        push_children(&mut exact_stack, [&child], 0, &mut exact_budget).unwrap();
+        assert_eq!(exact_stack, [(&child, 1)]);
+        assert_eq!(exact_budget.accounting.work, 1);
+        assert_eq!(exact_budget.actual_allocations, 1);
+
+        let one_below_limits = CompileLimits {
+            max_work: 0,
+            ..CompileLimits::default()
+        };
+        let mut one_below_budget = CompileBudget::new_receipt(
+            one_below_limits,
+            Some(AllocationScope {
+                limit: 1,
+                prospective: 1,
+            }),
+        );
+        let mut one_below_stack = Vec::new();
+        assert_eq!(
+            push_children(&mut one_below_stack, [&child], 0, &mut one_below_budget,).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: 1,
+                limit: 0,
+            }
+        );
+        assert!(one_below_stack.is_empty());
+        assert_eq!(one_below_stack.capacity(), 0);
+        assert_eq!(one_below_budget.accounting.work, 0);
+        assert_eq!(one_below_budget.actual_allocations, 0);
+        assert_eq!(one_below_budget.current_construction_bytes, 0);
+        assert_eq!(one_below_budget.accounting.peak_hir_stack_items, 0);
+    }
+
+    #[test]
+    fn receipt_epsilon_parent_write_refuses_one_below_at_prewrite_charge() {
+        let mut insts = exact_program_vec(2).unwrap();
+        insts
+            .try_push(Inst::Assert {
+                assertion: crate::program::Assertion::StartText,
+                next: 1,
+            })
+            .unwrap();
+        insts.try_push(Inst::Match).unwrap();
+        let exact_limits = CompileLimits {
+            max_work: 2,
+            ..CompileLimits::default()
+        };
+        let mut exact_budget = CompileBudget::new_receipt(
+            exact_limits,
+            Some(AllocationScope {
+                limit: 4,
+                prospective: 4,
+            }),
+        );
+        let index = build_epsilon_parent_index(&insts, &mut exact_budget).unwrap();
+        assert_eq!(index.outgoing.as_slice(), [1, 0]);
+        assert_eq!(index.offsets, [0, 0, 1]);
+        assert_eq!(index.parents, [0]);
+        assert_eq!(exact_budget.accounting.work, 2);
+        assert_eq!(exact_budget.actual_allocations, 4);
+
+        let one_below_limits = CompileLimits {
+            max_work: 1,
+            ..CompileLimits::default()
+        };
+        let mut one_below_budget = CompileBudget::new_receipt(
+            one_below_limits,
+            Some(AllocationScope {
+                limit: 4,
+                prospective: 4,
+            }),
+        );
+        let Err(error) = build_epsilon_parent_index(&insts, &mut one_below_budget) else {
+            panic!("one-below parent publication must refuse")
+        };
+        assert_eq!(
+            error,
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: 2,
+                limit: 1,
+            }
+        );
+        assert_eq!(one_below_budget.accounting.work, 1);
+        assert_eq!(one_below_budget.actual_allocations, 4);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact-limit and one-below receipt assertions share one authenticated setup"
+    )]
+    fn receipt_required_anchor_failure_commits_inspection_work_and_rebases_limit() {
+        let hir = parse_bytes(r"a+Xb+[ab]+");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        let default_limits = CompileLimits::default();
+
+        let mut prefix_budget = CompileBudget::new_receipt(default_limits, None);
+        validate_hir(
+            &hir,
+            profile,
+            CapturePolicy::EraseForWholeMatch,
+            &mut prefix_budget,
+        )
+        .unwrap();
+        assert!(
+            build_url_aggregate_plan(
+                &hir,
+                profile,
+                CapturePolicy::EraseForWholeMatch,
+                default_limits,
+                &mut prefix_budget,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let prefix_work = prefix_budget.accounting.work;
+
+        let mut seed_budget = CompileBudget::new_receipt(default_limits, None);
+        let _seeds = execution_seeds(&hir, profile, &mut seed_budget).unwrap();
+        let seed_work = seed_budget.accounting.work;
+        let inspection = required_internal_anchor::inspect(
+            &hir,
+            default_limits.max_work,
+            default_limits.max_literal_bytes,
+            default_limits.max_program_bytes,
+        )
+        .unwrap();
+        assert!(inspection.plan.is_some());
+        let exact_work = add(
+            add(prefix_work, seed_work, Resource::CompileWork).unwrap(),
+            inspection.inspection_work,
+            Resource::CompileWork,
+        )
+        .unwrap();
+
+        let exact_limits = CompileLimits {
+            max_work: exact_work,
+            ..default_limits
+        };
+        let mut exact_budget = CompileBudget::new_receipt(exact_limits, None);
+        validate_hir(
+            &hir,
+            profile,
+            CapturePolicy::EraseForWholeMatch,
+            &mut exact_budget,
+        )
+        .unwrap();
+        assert!(
+            build_url_aggregate_plan(
+                &hir,
+                profile,
+                CapturePolicy::EraseForWholeMatch,
+                exact_limits,
+                &mut exact_budget,
+            )
+            .unwrap()
+            .is_none()
+        );
+        build_retained_components(&hir, profile, exact_limits, &mut exact_budget).unwrap();
+        assert_eq!(exact_budget.accounting.work, exact_work);
+
+        let one_below_limit = exact_work - 1;
+        let local_limit = inspection.inspection_work - 1;
+        let local_attempt = required_internal_anchor::inspect_attempt(
+            &hir,
+            local_limit,
+            default_limits.max_literal_bytes,
+            default_limits.max_program_bytes,
+        );
+        assert!(matches!(
+            local_attempt.result,
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required,
+                limit,
+            }) if required == inspection.inspection_work && limit == local_limit
+        ));
+
+        let refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            profile,
+            CompileLimits {
+                max_work: one_below_limit,
+                ..default_limits
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: exact_work,
+                limit: one_below_limit,
+            }
+        );
+        assert_eq!(
+            refusal.receipt.actual.work,
+            prefix_work + seed_work + local_attempt.inspection_work
+        );
+        assert!(refusal.receipt.contains_actual());
+    }
+
+    #[test]
+    fn u1_receipt_scope_preserves_incumbent_compile_and_refuses_allocation_one_below_pre_source() {
+        let hir = ParserBuilder::new().build().parse(r"^.{3}$").unwrap();
+        let profile = RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE;
+        let limits = CompileLimits::default();
+        let ordinary =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(&hir, profile, limits)
+                .unwrap();
+
+        // A deliberately oversized prospective census yields its terminal
+        // actual ledger without changing the compiler algorithm. The exact
+        // replay must then produce the same plan and incumbent accounting.
+        let census =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                &hir,
+                profile,
+                limits,
+                usize::MAX,
+                usize::MAX,
+            )
+            .unwrap_err();
+        assert_eq!(
+            census.source,
+            Error::InternalInvariant("fixed scalar allocation census differs from compilation")
+        );
+        let allocations = census
+            .receipt
+            .actual_allocations
+            .expect("allocation-scoped receipt must retain its exact actual count");
+        assert_eq!(allocations, 15);
+        assert!(allocations > 0);
+        assert!(census.receipt.contains_actual());
+
+        let (scoped, actual) =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                &hir,
+                profile,
+                limits,
+                allocations,
+                allocations,
+            )
+            .unwrap();
+        assert_eq!(actual, allocations);
+        assert_eq!(scoped.plan_id(), ordinary.plan_id());
+        assert_eq!(scoped.compile_accounting(), ordinary.compile_accounting());
+        assert_eq!(scoped.state_count(), ordinary.state_count());
+
+        let fault = compiler_allocation_probe::fail_at(0);
+        let one_below =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                &hir,
+                profile,
+                limits,
+                allocations - 1,
+                allocations,
+            )
+            .unwrap_err();
+        assert_eq!(compiler_allocation_probe::calls(), 0);
+        drop(fault);
+        assert_eq!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::Allocations,
+                required: allocations,
+                limit: allocations - 1,
+            }
+        );
+        assert_eq!(one_below.receipt.actual_allocations, Some(0));
+        assert_eq!(one_below.receipt.actual.hir_nodes, 0);
+        assert_eq!(one_below.receipt.actual.work, 0);
+        assert_eq!(one_below.receipt.live_construction_bytes, 0);
+        assert!(one_below.receipt.contains_actual());
+
+        for ordinal in 0..allocations {
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let refusal =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    limits,
+                    allocations,
+                    allocations,
+                )
+                .unwrap_err();
+            drop(fault);
+            assert!(matches!(refusal.source, Error::AllocationFailed { .. }));
+            assert_eq!(refusal.receipt.actual_allocations, Some(ordinal));
+            assert!(refusal.receipt.contains_actual());
+            assert!(!refusal.receipt.published);
+        }
+    }
+
+    #[test]
+    fn pinned_base_vec_census_matches_small_and_large_scalar_compiles() {
+        let profile = RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE;
+        let limits = CompileLimits::default();
+        for (pattern, expected_allocations) in [(r"^.{3}$", 15), (r"^.{249}$", 267)] {
+            let hir = ParserBuilder::new().build().parse(pattern).unwrap();
+            let ordinary =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match(&hir, profile, limits)
+                    .unwrap();
+            let census =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    limits,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .unwrap_err();
+            assert_eq!(
+                census.source,
+                Error::InternalInvariant("fixed scalar allocation census differs from compilation")
+            );
+            assert_eq!(
+                census.receipt.actual_allocations,
+                Some(expected_allocations)
+            );
+            assert!(census.receipt.contains_actual());
+
+            let (scoped, actual) =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    limits,
+                    expected_allocations,
+                    expected_allocations,
+                )
+                .unwrap();
+            assert_eq!(actual, expected_allocations);
+            assert_eq!(scoped.plan_id(), ordinary.plan_id());
+            assert_eq!(scoped.compile_accounting(), ordinary.compile_accounting());
+            assert_eq!(scoped.state_count(), ordinary.state_count());
+
+            let fault = compiler_allocation_probe::fail_at(0);
+            let one_below =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    limits,
+                    expected_allocations - 1,
+                    expected_allocations,
+                )
+                .unwrap_err();
+            assert_eq!(compiler_allocation_probe::calls(), 0);
+            drop(fault);
+            assert_eq!(
+                one_below.source,
+                Error::ResourceLimit {
+                    resource: Resource::Allocations,
+                    required: expected_allocations,
+                    limit: expected_allocations - 1,
+                }
+            );
+            assert_eq!(one_below.receipt.actual_allocations, Some(0));
+            assert_eq!(one_below.receipt.actual.hir_nodes, 0);
+            assert_eq!(one_below.receipt.actual.work, 0);
+            assert_eq!(one_below.receipt.live_construction_bytes, 0);
+            assert!(one_below.receipt.contains_actual());
+        }
+    }
+
+    #[test]
+    fn generic_receipt_preserves_parity_and_omits_allocation_scope() {
+        let hir = ParserBuilder::new().build().parse(r"^.{3}$").unwrap();
+        let profile = RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE;
+        let ordinary = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            profile,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let receipt_compile =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+                &hir,
+                profile,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(receipt_compile.plan_id(), ordinary.plan_id());
+        assert_eq!(
+            receipt_compile.compile_accounting(),
+            ordinary.compile_accounting()
+        );
+        assert_eq!(receipt_compile.state_count(), ordinary.state_count());
+
+        let refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            profile,
+            CompileLimits {
+                max_hir_nodes: 0,
+                ..CompileLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::HirNodes,
+                required: 1,
+                limit: 0,
+            }
+        );
+        assert_eq!(refusal.receipt.allocation_limit, None);
+        assert_eq!(refusal.receipt.prospective_allocations, None);
+        assert_eq!(refusal.receipt.actual_allocations, None);
+        assert_eq!(refusal.receipt.actual.hir_nodes, 0);
+        assert!(refusal.receipt.live_construction_bytes > 0);
+        assert!(refusal.receipt.contains_actual());
+    }
+
+    #[test]
+    fn receipt_unicode_off_nonascii_class_scan_is_fully_metered() {
+        let hir = Hir::class(Class::Unicode(regex_syntax::hir::ClassUnicode::new([
+            regex_syntax::hir::ClassUnicodeRange::new('a', 'a'),
+            regex_syntax::hir::ClassUnicodeRange::new('c', 'c'),
+            regex_syntax::hir::ClassUnicodeRange::new('\u{100}', '\u{100}'),
+        ])));
+        let ranges = match hir.kind() {
+            HirKind::Class(Class::Unicode(class)) => class.ranges().len(),
+            _ => unreachable!("fixture must remain one Unicode class"),
+        };
+        assert_eq!(ranges, 3);
+
+        let refusal = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::Unsupported(Unsupported::UnicodeClass)
+        );
+        assert_eq!(refusal.receipt.actual.work, 1 + ranges);
+        assert_eq!(refusal.receipt.actual.class_ranges, 0);
+        assert!(refusal.receipt.contains_actual());
+
+        let limit = refusal.receipt.actual.work - 1;
+        let one_below = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits {
+                max_work: limit,
+                ..CompileLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: limit + 1,
+                limit,
+            }
+        );
+        assert_eq!(one_below.receipt.actual.work, limit);
+        assert_eq!(one_below.receipt.actual.class_ranges, 0);
+        assert!(one_below.receipt.contains_actual());
+    }
+
+    #[test]
+    fn scoped_receipt_preserves_literal_candidate_suffix_and_progress_parity() {
+        let cases = [
+            (parse_bytes("abc"), RustByteProfile::PINNED_1_12_4),
+            (
+                parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z"),
+                RustByteProfile::PINNED_1_12_4,
+            ),
+            (parse_bytes("a*"), RustByteProfile::PINNED_1_12_4),
+            (
+                ParserBuilder::new().build().parse(r"^.+$").unwrap(),
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            ),
+        ];
+        for (hir, profile) in cases {
+            let ordinary = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                profile,
+                CompileLimits::default(),
+            )
+            .unwrap();
+            let census =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    CompileLimits::default(),
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .unwrap_err();
+            let allocations = census
+                .receipt
+                .actual_allocations
+                .expect("allocation-scoped census must retain A");
+            assert!(allocations > 0);
+            assert!(census.receipt.contains_actual());
+            let (scoped, actual) =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    &hir,
+                    profile,
+                    CompileLimits::default(),
+                    allocations,
+                    allocations,
+                )
+                .unwrap();
+            assert_eq!(actual, allocations);
+            assert_eq!(scoped.plan_id(), ordinary.plan_id());
+            assert_eq!(scoped.compile_accounting(), ordinary.compile_accounting());
+            assert_eq!(scoped.state_count(), ordinary.state_count());
+        }
+    }
+
+    #[test]
     fn required_suffix_ineligible_analysis_exact_limit_and_one_below() {
         // 19 visited nodes + 9 alternation branches + 36 worst-case
         // 64-byte dedup comparisons, each charged as min(lengths) + 1.
@@ -4209,6 +6040,48 @@ mod tests {
                 limit: ADVERSARIAL_RETAINED_ONE_BELOW,
             },
             required_suffixes(&hir, &mut one_below).unwrap_err()
+        );
+    }
+
+    #[test]
+    fn required_suffix_allocations_commit_bytes_then_endpoints() {
+        let hir = parse_bytes("abc");
+        let suffix_bytes = 3;
+        let endpoint_bytes = core::mem::size_of::<usize>();
+        for (ordinal, expected_live) in [(0, 0), (1, suffix_bytes)] {
+            let mut budget = CompileBudget::new_receipt(
+                CompileLimits::default(),
+                Some(AllocationScope {
+                    limit: 2,
+                    prospective: 2,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let error = required_suffixes(&hir, &mut budget).unwrap_err();
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+
+        let mut exact = CompileBudget::new_receipt(
+            CompileLimits::default(),
+            Some(AllocationScope {
+                limit: 2,
+                prospective: 2,
+            }),
+        );
+        let suffixes = required_suffixes(&hir, &mut exact).unwrap();
+        assert_eq!(suffixes.iter().collect::<Vec<_>>(), [b"abc".as_slice()]);
+        assert_eq!(exact.actual_allocations, 2);
+        assert_eq!(
+            exact.current_construction_bytes,
+            suffix_bytes + endpoint_bytes
+        );
+        assert_eq!(
+            exact.accounting.construction_peak_bytes,
+            suffix_bytes + endpoint_bytes
         );
     }
 

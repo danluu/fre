@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 use core::ops::Range;
 
-use fre_exact_alloc::{CopyError, ExactVec};
+use fre_exact_alloc::{CopyError, ExactVec, zeroed_exact};
 use fre_kernels::{
     RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
     RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan, UrlAggregatePlan,
@@ -113,11 +113,332 @@ pub struct OperationCertificate {
     pub peak_bytes: usize,
 }
 
+/// Public operation tag retained by a receipt-bearing execution attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperationAttemptKind {
+    Count,
+}
+
+/// Work-admission mode used by a receipt-bearing execution attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperationWorkMode {
+    /// Reserve the complete conservative replay bound before execution.
+    ConservativeAdmission,
+    /// Enforce the caller's work limit against each exact observed charge.
+    Observed,
+}
+
+/// Immutable identity of a receipt-bearing continuation attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationAttemptIdentity {
+    pub regex_plan_id: PlanId,
+    /// Selected physical-operation identity. This is absent only when the
+    /// invocation is rejected before a route can be selected.
+    pub operation_id: Option<OperationId>,
+    pub strategy: Strategy,
+    pub operation: OperationAttemptKind,
+    pub work_mode: OperationWorkMode,
+}
+
+/// Original-haystack invocation bound to an operation attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationInvocation {
+    pub range: Range<usize>,
+    pub haystack_len: usize,
+}
+
+/// Complete input-only upper-bound certificate published before source access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationProspective {
+    pub states: usize,
+    pub boundaries: usize,
+    pub table_cells: usize,
+    pub row_storage: Option<RowStorage>,
+    pub row_record_bytes: usize,
+    pub terminal_frontier: bool,
+    pub work_bound: usize,
+    pub random_access_bytes: usize,
+    pub scratch_bytes: usize,
+    pub log_bytes: usize,
+    pub sequential_bytes: usize,
+    pub match_events: usize,
+    pub output_matches: usize,
+    pub output_bytes: usize,
+    pub span_sum: usize,
+    pub allocations: usize,
+    pub peak_bytes: usize,
+    /// Componentwise upper bounds for every public actual-accounting field.
+    pub accounting: ExecutionAccounting,
+}
+
+impl OperationProspective {
+    /// Admit every operation-limit dimension exposed by this certificate.
+    /// Structural metadata such as `states` and `row_record_bytes` is already
+    /// represented in the derived table, storage, byte, peak, and work
+    /// dimensions below.
+    fn enforce_limits(self, limits: OperationLimits) -> Result<(), Error> {
+        enforce(self.boundaries, limits.max_boundaries, Resource::Boundaries)?;
+        enforce(
+            self.table_cells,
+            limits.max_table_cells,
+            Resource::TableCells,
+        )?;
+        enforce(
+            self.random_access_bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            self.scratch_bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(self.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            self.sequential_bytes,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        enforce(
+            self.match_events,
+            limits.max_match_events,
+            Resource::MatchEvents,
+        )?;
+        enforce(
+            self.output_matches,
+            limits.max_output_matches,
+            Resource::OutputMatches,
+        )?;
+        enforce(
+            self.output_bytes,
+            limits.max_output_bytes,
+            Resource::OutputBytes,
+        )?;
+        enforce(self.span_sum, limits.max_span_sum, Resource::SpanSum)?;
+        enforce(self.peak_bytes, limits.max_peak_bytes, Resource::PeakBytes)?;
+        enforce(self.work_bound, limits.max_work, Resource::ExecutionWork)
+    }
+
+    /// Check every public execution-accounting dimension against this bound.
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the componentwise certificate check intentionally names every public accounting field"
+    )]
+    pub fn contains(self, actual: ExecutionAccounting) -> bool {
+        let ExecutionAccounting {
+            state_evaluations,
+            transition_checks,
+            assertion_checks,
+            root_probes,
+            required_anchor_candidates,
+            required_anchor_scan_windows,
+            required_anchor_anchor_comparisons,
+            required_anchor_prefix_steps,
+            required_anchor_continuation_steps,
+            required_anchor_source_accesses,
+            required_anchor_queue_peak,
+            required_anchor_frontier_peak,
+            url_segments,
+            url_dot_probes,
+            url_tld_transitions,
+            url_tld_candidates,
+            url_scheme_probes,
+            url_ipv4_candidates,
+            url_prefix_steps,
+            url_suffix_steps,
+            url_candidate_insertions,
+            url_candidate_visits,
+            replay_steps,
+            successful_paths,
+            suppressed_empty,
+            emitted_matches,
+            utf8_validation_work,
+            frontier_peak_states,
+            frontier_insertions,
+            frontier_evaluations,
+            frontier_source_bytes,
+            frontier_bytes,
+            frontier_bookkeeping,
+            sequential_bytes_written,
+            sequential_bytes_read,
+            random_access_bytes_read,
+            random_access_peak_bytes,
+            scratch_peak_bytes,
+            log_bytes,
+            output_bytes,
+            peak_bytes,
+            work,
+        } = actual;
+        let upper = self.accounting;
+        macro_rules! at_most {
+            ($($field:ident),+ $(,)?) => {
+                true $(&& $field <= upper.$field)+
+            };
+        }
+        let componentwise = at_most!(
+            state_evaluations,
+            transition_checks,
+            assertion_checks,
+            root_probes,
+            required_anchor_candidates,
+            required_anchor_scan_windows,
+            required_anchor_anchor_comparisons,
+            required_anchor_prefix_steps,
+            required_anchor_continuation_steps,
+            required_anchor_source_accesses,
+            required_anchor_queue_peak,
+            required_anchor_frontier_peak,
+            url_segments,
+            url_dot_probes,
+            url_tld_transitions,
+            url_tld_candidates,
+            url_scheme_probes,
+            url_ipv4_candidates,
+            url_prefix_steps,
+            url_suffix_steps,
+            url_candidate_insertions,
+            url_candidate_visits,
+            replay_steps,
+            successful_paths,
+            suppressed_empty,
+            emitted_matches,
+            utf8_validation_work,
+            frontier_peak_states,
+            frontier_insertions,
+            frontier_evaluations,
+            frontier_source_bytes,
+            frontier_bytes,
+            frontier_bookkeeping,
+            sequential_bytes_written,
+            sequential_bytes_read,
+            random_access_bytes_read,
+            random_access_peak_bytes,
+            scratch_peak_bytes,
+            log_bytes,
+            output_bytes,
+            peak_bytes,
+            work,
+        );
+        let sequential_total = sequential_bytes_written.checked_add(sequential_bytes_read);
+        componentwise
+            && sequential_total.is_some_and(|bytes| bytes <= self.sequential_bytes)
+            && random_access_peak_bytes <= self.random_access_bytes
+            && scratch_peak_bytes <= self.scratch_bytes
+            && log_bytes <= self.log_bytes
+            && successful_paths <= self.match_events
+            && emitted_matches <= self.output_matches
+            && output_bytes <= self.output_bytes
+            && peak_bytes <= self.peak_bytes
+            && work <= self.work_bound
+    }
+}
+
+/// Identity, invocation, prospective certificate, and cumulative actual
+/// counters for one receipt-bearing continuation attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationAttemptReceipt {
+    pub identity: OperationAttemptIdentity,
+    pub invocation: OperationInvocation,
+    pub prospective: Option<OperationProspective>,
+    pub actual: ExecutionAccounting,
+    /// U1-scoped allocation ceiling for the forced-generic scalar residual.
+    /// Ordinary receipt-bearing callers use `usize::MAX`.
+    pub allocation_limit: usize,
+    /// Successful operation-local allocations committed by this attempt.
+    pub actual_allocations: usize,
+}
+
+/// Terminal failure from a receipt-bearing continuation attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationAttemptError {
+    pub source: Error,
+    pub receipt: OperationAttemptReceipt,
+}
+
+impl core::fmt::Display for OperationAttemptError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for OperationAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug)]
 struct Common<K> {
     certificate: OperationCertificate,
     accounting: ExecutionAccounting,
     marker: PhantomData<K>,
+}
+
+struct AttemptPublication<'a> {
+    identity: &'a mut OperationAttemptIdentity,
+    prospective: &'a mut Option<OperationProspective>,
+}
+
+/// Receipt-bearing generic counts must derive one intrinsic route envelope
+/// before any caller resource limit can refuse it. These limits are used only
+/// while selecting and deriving that envelope; the published prospective is
+/// immediately checked against every caller limit before source access or
+/// allocation.
+const fn intrinsic_attempt_limits() -> OperationLimits {
+    OperationLimits {
+        max_boundaries: usize::MAX,
+        max_table_cells: usize::MAX,
+        max_random_access_bytes: usize::MAX,
+        max_scratch_bytes: usize::MAX,
+        max_log_bytes: usize::MAX,
+        max_sequential_bytes: usize::MAX,
+        max_match_events: usize::MAX,
+        max_output_matches: usize::MAX,
+        max_output_bytes: usize::MAX,
+        max_span_sum: usize::MAX,
+        max_peak_bytes: usize::MAX,
+        max_work: usize::MAX,
+    }
+}
+
+#[cfg(test)]
+mod allocation_fault {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static STATE: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Guard {
+        previous: Option<(usize, usize)>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STATE.with(|state| state.set(self.previous));
+        }
+    }
+
+    pub(super) fn arm(failing_ordinal: usize) -> Guard {
+        let previous = STATE.with(|state| state.replace(Some((failing_ordinal, 0))));
+        Guard { previous }
+    }
+
+    pub(super) fn calls() -> usize {
+        STATE.with(|state| state.get().map_or(0, |(_, calls)| calls))
+    }
+
+    pub(super) fn should_fail() -> bool {
+        STATE.with(|state| {
+            let Some((failing, next)) = state.get() else {
+                return false;
+            };
+            state.set(Some((failing, next.saturating_add(1))));
+            next == failing
+        })
+    }
 }
 
 /// Fully admitted immutable span sequence.
@@ -187,6 +508,21 @@ impl core::iter::FusedIterator for SpanIter<'_> {}
 pub struct AdmittedCount {
     common: Common<MatchCount>,
     value: usize,
+}
+
+/// Successfully admitted diagnostic Count together with the same P/A attempt
+/// receipt used for terminal failures.
+#[derive(Debug)]
+pub struct AdmittedCountAttempt {
+    pub admitted: AdmittedCount,
+    pub receipt: OperationAttemptReceipt,
+}
+
+/// Successfully evaluated value-only Count and its complete P/A receipt.
+#[derive(Debug)]
+pub struct CountValueAttempt {
+    pub value: usize,
+    pub receipt: OperationAttemptReceipt,
 }
 
 impl AdmittedCount {
@@ -294,6 +630,109 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit and evaluate a generic continuation count while retaining a
+    /// complete failure attempt receipt. This entry point deliberately uses
+    /// the shared continuation executor rather than an optional specialized
+    /// count accelerator, so every terminal error shares one P/A ledger.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_with_receipt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_count_with_receipt::<false>(
+            haystack,
+            range,
+            strategy,
+            limits,
+            usize::MAX,
+            None,
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
+    /// Forced-generic count attempt with an outer pre-source prospective
+    /// observer. This is the narrow seam used by the fixed scalar composite.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_with_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_count_with_receipt::<false>(
+            haystack,
+            range,
+            strategy,
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
+    /// Source- and allocation-free prospective for the exact dense generic
+    /// route used by the fixed scalar composite observer seam.
+    #[doc(hidden)]
+    pub fn fixed_scalar_dense_count_prospective(
+        &self,
+        haystack_len: usize,
+        strategy: Strategy,
+    ) -> Result<OperationProspective, Error> {
+        let prospective_limits = intrinsic_attempt_limits();
+        let utf8_validation =
+            preflight_unicode_word_utf8_bytes(&self.program, haystack_len, prospective_limits)?;
+        let boundaries = add(haystack_len, 1, Resource::Boundaries)?;
+        let mut engine_limits = prospective_limits;
+        engine_limits.max_work = engine_limits.max_work.checked_sub(utf8_validation).ok_or(
+            Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork,
+            },
+        )?;
+        engine_limits.max_sequential_bytes = engine_limits
+            .max_sequential_bytes
+            .checked_sub(utf8_validation)
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::SequentialBytes,
+            })?;
+        let requirements =
+            Requirements::new::<false>(&self.program, boundaries, strategy, 1, engine_limits)?
+                .with_prefix::<false>(utf8_validation, prospective_limits)?;
+        requirements.count_prospective(&self.program, haystack_len, boundaries, utf8_validation)
+    }
+
     /// Admit and evaluate a complete checked matched-byte sum reduction.
     pub fn admit_span_sum(
         &self,
@@ -328,6 +767,55 @@ impl CompiledRegex {
             .map(|result| result.summary.matches)
     }
 
+    /// Evaluate a generic continuation count with observed-work admission
+    /// while retaining a complete failure attempt receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn count_value_with_receipt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<CountValueAttempt, OperationAttemptError> {
+        self.execute_count_with_receipt::<true>(haystack, range, strategy, limits, usize::MAX, None)
+            .map(|(result, receipt)| CountValueAttempt {
+                value: result.summary.matches,
+                receipt,
+            })
+    }
+
+    /// Observed-work variant of the fixed scalar composite observer seam.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn count_value_with_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<CountValueAttempt, OperationAttemptError> {
+        self.execute_count_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )
+        .map(|(result, receipt)| CountValueAttempt {
+            value: result.summary.matches,
+            receipt,
+        })
+    }
+
     /// Evaluate a complete checked matched-byte sum while enforcing execution
     /// work against the exact observed charge instead of the conservative
     /// replay upper bound used by an admitted diagnostic result.
@@ -343,9 +831,90 @@ impl CompiledRegex {
     }
 
     #[allow(
-        clippy::too_many_lines,
-        reason = "whole-operation admission keeps failure-before-publication ordering auditable"
+        clippy::result_large_err,
+        reason = "the internal result preserves the complete fixed-layout P/A receipt for its public callers"
     )]
+    fn execute_count_with_receipt<const OBSERVED_WORK: bool>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+    ) -> Result<(ExecutionResult, OperationAttemptReceipt), OperationAttemptError> {
+        let mut receipt = OperationAttemptReceipt {
+            identity: OperationAttemptIdentity {
+                regex_plan_id: self.plan_id(),
+                operation_id: None,
+                strategy,
+                operation: OperationAttemptKind::Count,
+                work_mode: if OBSERVED_WORK {
+                    OperationWorkMode::Observed
+                } else {
+                    OperationWorkMode::ConservativeAdmission
+                },
+            },
+            invocation: OperationInvocation {
+                range: range.clone(),
+                haystack_len: haystack.len(),
+            },
+            prospective: None,
+            actual: ExecutionAccounting::default(),
+            allocation_limit,
+            actual_allocations: 0,
+        };
+        let result = {
+            let publication = AttemptPublication {
+                identity: &mut receipt.identity,
+                prospective: &mut receipt.prospective,
+            };
+            self.execute_tracked::<OBSERVED_WORK>(
+                haystack,
+                range,
+                strategy,
+                OperationKind::Count,
+                limits,
+                &mut receipt.actual,
+                &mut receipt.actual_allocations,
+                allocation_limit,
+                Some(publication),
+                true,
+                prospective_observer,
+            )
+        };
+        match result {
+            Ok(result) => {
+                let valid = receipt.prospective.is_some_and(|upper| {
+                    upper.contains(receipt.actual)
+                        && receipt.actual_allocations <= upper.allocations
+                        && receipt.actual_allocations <= receipt.allocation_limit
+                });
+                if !valid || receipt.actual != result.accounting {
+                    return Err(OperationAttemptError {
+                        source: Error::InternalInvariant(
+                            "continuation success actual counters exceed prospective certificate",
+                        ),
+                        receipt,
+                    });
+                }
+                Ok((result, receipt))
+            }
+            Err(mut source) => {
+                if receipt.prospective.is_some_and(|upper| {
+                    !upper.contains(receipt.actual)
+                        || receipt.actual_allocations > upper.allocations
+                        || receipt.actual_allocations > receipt.allocation_limit
+                }) {
+                    source = Error::InternalInvariant(
+                        "continuation attempt actual counters exceed prospective certificate",
+                    );
+                }
+                Err(OperationAttemptError { source, receipt })
+            }
+        }
+    }
+
     fn execute<const OBSERVED_WORK: bool>(
         &self,
         haystack: &[u8],
@@ -353,6 +922,42 @@ impl CompiledRegex {
         strategy: Strategy,
         kind: OperationKind,
         limits: OperationLimits,
+    ) -> Result<ExecutionResult, Error> {
+        let mut accounting = ExecutionAccounting::default();
+        let mut actual_allocations = 0_usize;
+        self.execute_tracked::<OBSERVED_WORK>(
+            haystack,
+            range,
+            strategy,
+            kind,
+            limits,
+            &mut accounting,
+            &mut actual_allocations,
+            usize::MAX,
+            None,
+            false,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "whole-operation admission keeps failure-before-publication ordering auditable"
+    )]
+    fn execute_tracked<const OBSERVED_WORK: bool>(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        limits: OperationLimits,
+        accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut attempt: Option<AttemptPublication<'_>>,
+        force_generic: bool,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
         if range.start > range.end || range.end > haystack.len() {
             return Err(Error::InvalidRange {
@@ -362,19 +967,22 @@ impl CompiledRegex {
             });
         }
         let local = &haystack[range.clone()];
-        if matches!(kind, OperationKind::Count | OperationKind::Sum)
+        if !force_generic
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.url_aggregate
         {
             return self.execute_url_aggregate(plan, local, range, strategy, kind, limits);
         }
-        if kind == OperationKind::Count
+        if !force_generic
+            && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.required_internal_anchor
         {
             return self.execute_required_internal_anchor(plan, local, range, strategy, limits);
         }
-        if OBSERVED_WORK
+        if !force_generic
+            && OBSERVED_WORK
             && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.candidate
@@ -382,10 +990,23 @@ impl CompiledRegex {
         {
             return self.execute_candidate(plan, haystack, range, strategy, limits);
         }
-        let mut accounting = ExecutionAccounting::default();
+        let receipt_bearing = attempt.is_some();
+        let force_intrinsic_dense = prospective_observer.is_some();
+        let prospective_limits = if receipt_bearing {
+            intrinsic_attempt_limits()
+        } else {
+            limits
+        };
         let utf8_validation =
-            preflight_unicode_word_utf8(&self.program, haystack, limits, &mut accounting)?;
-        let mut engine_limits = limits;
+            preflight_unicode_word_utf8_bytes(&self.program, haystack.len(), prospective_limits)?;
+        if !receipt_bearing {
+            // Preserve the incumbent continuation's established refusal
+            // ordering. Only the new receipt-bearing entry point delays this
+            // source read until after P is published and every represented
+            // caller limit has admitted it.
+            validate_unicode_word_utf8(haystack, utf8_validation, accounting)?;
+        }
+        let mut engine_limits = prospective_limits;
         engine_limits.max_work = engine_limits.max_work.checked_sub(utf8_validation).ok_or(
             Error::ArithmeticOverflow {
                 resource: Resource::ExecutionWork,
@@ -397,14 +1018,30 @@ impl CompiledRegex {
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::SequentialBytes,
             })?;
+        let mut selection_limits = limits;
+        if receipt_bearing {
+            // Selection predicates may observe the caller's remaining budget,
+            // but they cannot reject before the selected route publishes P.
+            selection_limits.max_work = selection_limits.max_work.saturating_sub(utf8_validation);
+            selection_limits.max_sequential_bytes = selection_limits
+                .max_sequential_bytes
+                .saturating_sub(utf8_validation);
+        } else {
+            selection_limits = engine_limits;
+        }
         let assertion_context = AssertionContext::new(haystack, range.start, local.len())?;
         let boundaries = add(local.len(), 1, Resource::Boundaries)?;
-        enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+        enforce(
+            boundaries,
+            prospective_limits.max_boundaries,
+            Resource::Boundaries,
+        )?;
         let passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let terminal_seed = (strategy == Strategy::ReverseSequentialRows
+        let terminal_seed = (!force_generic
+            && strategy == Strategy::ReverseSequentialRows
             && !self.terminal_frontier.is_empty())
         .then_some(SparseSeed::TerminalFrontier(&self.terminal_frontier));
-        let fallback_seed = if self.required_suffixes.is_empty() {
+        let fallback_seed = if force_generic || self.required_suffixes.is_empty() {
             None
         } else {
             Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
@@ -416,7 +1053,27 @@ impl CompiledRegex {
             passes,
             engine_limits,
         );
-        let (requirements, sparse_seed) = if let Some(seed) = terminal_seed {
+        let (requirements, sparse_seed) = if receipt_bearing {
+            if !force_generic {
+                return Err(Error::InternalInvariant(
+                    "receipt-bearing continuation did not force its generic route",
+                ));
+            }
+            let dense = dense?;
+            if !force_intrinsic_dense
+                && OBSERVED_WORK
+                && dense.work_bound > selection_limits.max_work
+                && strategy == Strategy::ReverseSequentialRows
+            {
+                (
+                    Requirements::cached(&self.program, boundaries, passes, selection_limits)?
+                        .unwrap_or(dense),
+                    None,
+                )
+            } else {
+                (dense, None)
+            }
+        } else if let Some(seed) = terminal_seed {
             match Requirements::new_for_seed(
                 &self.program,
                 boundaries,
@@ -439,7 +1096,7 @@ impl CompiledRegex {
             match dense {
                 Ok(requirements)
                     if OBSERVED_WORK
-                        && requirements.work_bound > engine_limits.max_work
+                        && requirements.work_bound > selection_limits.max_work
                         && strategy == Strategy::ReverseSequentialRows =>
                 {
                     if let Some(seed) = fallback_seed {
@@ -449,7 +1106,7 @@ impl CompiledRegex {
                                 boundaries,
                                 strategy,
                                 passes,
-                                engine_limits,
+                                selection_limits,
                                 seed,
                             )?,
                             Some(seed),
@@ -461,7 +1118,7 @@ impl CompiledRegex {
                                 boundaries,
                                 strategy,
                                 passes,
-                                engine_limits,
+                                selection_limits,
                             )?,
                             None,
                         )
@@ -481,7 +1138,7 @@ impl CompiledRegex {
                                 boundaries,
                                 strategy,
                                 passes,
-                                engine_limits,
+                                selection_limits,
                                 seed,
                             )?,
                             Some(seed),
@@ -493,7 +1150,7 @@ impl CompiledRegex {
                                 &self.program,
                                 boundaries,
                                 passes,
-                                engine_limits,
+                                selection_limits,
                             )?,
                             None,
                         )
@@ -502,7 +1159,36 @@ impl CompiledRegex {
                 Err(error) => return Err(error),
             }
         };
-        let requirements = requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, limits)?;
+        let requirements =
+            requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
+        if let Some(publication) = attempt.as_mut() {
+            let operation_id = operation_identity(
+                self.plan_id(),
+                strategy,
+                kind,
+                requirements.terminal_frontier,
+            );
+            publication.identity.operation_id = Some(operation_id);
+            let prospective = requirements.count_prospective(
+                &self.program,
+                local.len(),
+                boundaries,
+                utf8_validation,
+            )?;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+            enforce(
+                prospective.allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
+            prospective.enforce_limits(limits)?;
+        }
+        if receipt_bearing {
+            validate_unicode_word_utf8(haystack, utf8_validation, accounting)?;
+        }
         let mut engine = Engine::build::<OBSERVED_WORK>(
             &self.program,
             local,
@@ -511,7 +1197,9 @@ impl CompiledRegex {
             requirements,
             sparse_seed,
             limits,
-            &mut accounting,
+            receipt_bearing,
+            accounting,
+            actual_allocations,
         )?;
         let summary = engine.scan::<OBSERVED_WORK>(
             &self.program,
@@ -519,7 +1207,8 @@ impl CompiledRegex {
             assertion_context,
             requirements.work_bound,
             limits.max_work,
-            &mut accounting,
+            receipt_bearing,
+            accounting,
             |_| Ok(()),
         )?;
         enforce(
@@ -553,12 +1242,23 @@ impl CompiledRegex {
         enforce(requested_peak, limits.max_peak_bytes, Resource::PeakBytes)?;
         let mut spans = Vec::new();
         if kind == OperationKind::Spans {
+            let requested_allocations = (*actual_allocations)
+                .checked_add(usize::from(summary.matches != 0))
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::Allocations,
+                })?;
+            enforce(
+                requested_allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
             spans
                 .try_reserve_exact(summary.matches)
                 .map_err(|_| Error::AllocationFailed {
                     resource: Resource::OutputBytes,
                     items: summary.matches,
                 })?;
+            record_allocation(actual_allocations, spans.capacity())?;
             let allocated_output_bytes = mul(
                 spans.capacity(),
                 core::mem::size_of::<Span>(),
@@ -577,7 +1277,8 @@ impl CompiledRegex {
                 assertion_context,
                 requirements.work_bound,
                 limits.max_work,
-                &mut accounting,
+                receipt_bearing,
+                accounting,
                 |span| {
                     spans.push(span);
                     Ok(())
@@ -593,7 +1294,7 @@ impl CompiledRegex {
         } else {
             accounting.peak_bytes = engine.peak_with_output(0)?;
         }
-        validate_admitted_work(&accounting, requirements.work_bound, limits.max_work)?;
+        validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
         accounting.emitted_matches = summary.matches;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
@@ -624,7 +1325,7 @@ impl CompiledRegex {
         };
         Ok(ExecutionResult {
             certificate,
-            accounting,
+            accounting: *accounting,
             summary,
             spans,
         })
@@ -1052,29 +1753,39 @@ fn map_required_anchor_error(error: &RequiredInternalAnchorCountError) -> Error 
     }
 }
 
-fn preflight_unicode_word_utf8(
+fn preflight_unicode_word_utf8_bytes(
     program: &Program,
-    haystack: &[u8],
+    haystack_len: usize,
     limits: OperationLimits,
-    accounting: &mut ExecutionAccounting,
 ) -> Result<usize, Error> {
     if !program.contains_unicode_word_boundary() {
         return Ok(0);
     }
-    let bytes = haystack.len();
+    let bytes = haystack_len;
     enforce(bytes, limits.max_work, Resource::ExecutionWork)?;
     enforce(
         bytes,
         limits.max_sequential_bytes,
         Resource::SequentialBytes,
     )?;
+    Ok(bytes)
+}
+
+fn validate_unicode_word_utf8(
+    haystack: &[u8],
+    bytes: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(), Error> {
+    if bytes == 0 {
+        return Ok(());
+    }
     accounting.utf8_validation_work = bytes;
     accounting.work = bytes;
     accounting.sequential_bytes_read = bytes;
     if core::str::from_utf8(haystack).is_err() {
         return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
     }
-    Ok(bytes)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1115,7 +1826,11 @@ struct Requirements {
     row_storage: Option<RowStorage>,
     record_bytes: usize,
     requested_log_bytes: usize,
+    random_access_bound: usize,
+    scratch_bound: usize,
+    peak_bound: usize,
     sequential_bound: usize,
+    allocations: usize,
     work_bound: usize,
     terminal_frontier: bool,
     frontier: Option<terminal_frontier::FrontierRequirements>,
@@ -1124,6 +1839,86 @@ struct Requirements {
 }
 
 impl Requirements {
+    fn count_prospective(
+        self,
+        program: &Program,
+        _input_bytes: usize,
+        boundaries: usize,
+        utf8_validation: usize,
+    ) -> Result<OperationProspective, Error> {
+        let match_events = mul(boundaries, 2, Resource::MatchEvents)?;
+        let output_matches = boundaries;
+        let work = self.work_bound;
+        // Every generic logical source service is paired with admitted work;
+        // byte/scalar/assertion services inspect at most eight bytes per
+        // charged unit (two adjacent four-byte UTF-8 scalars).
+        let random_access_bytes_read = mul(work, 8, Resource::RandomAccessBytes)?;
+        let accounting = ExecutionAccounting {
+            state_evaluations: work,
+            transition_checks: work,
+            assertion_checks: work,
+            root_probes: work,
+            required_anchor_candidates: 0,
+            required_anchor_scan_windows: 0,
+            required_anchor_anchor_comparisons: 0,
+            required_anchor_prefix_steps: 0,
+            required_anchor_continuation_steps: 0,
+            required_anchor_source_accesses: 0,
+            required_anchor_queue_peak: 0,
+            required_anchor_frontier_peak: 0,
+            url_segments: 0,
+            url_dot_probes: 0,
+            url_tld_transitions: 0,
+            url_tld_candidates: 0,
+            url_scheme_probes: 0,
+            url_ipv4_candidates: 0,
+            url_prefix_steps: 0,
+            url_suffix_steps: 0,
+            url_candidate_insertions: 0,
+            url_candidate_visits: 0,
+            replay_steps: work,
+            successful_paths: match_events,
+            suppressed_empty: match_events,
+            emitted_matches: output_matches,
+            utf8_validation_work: utf8_validation,
+            frontier_peak_states: work,
+            frontier_insertions: work,
+            frontier_evaluations: work,
+            frontier_source_bytes: self.sequential_bound,
+            frontier_bytes: self.random_access_bound,
+            frontier_bookkeeping: work,
+            sequential_bytes_written: self.sequential_bound,
+            sequential_bytes_read: self.sequential_bound,
+            random_access_bytes_read,
+            random_access_peak_bytes: self.random_access_bound,
+            scratch_peak_bytes: self.scratch_bound,
+            log_bytes: self.requested_log_bytes,
+            output_bytes: 0,
+            peak_bytes: self.peak_bound,
+            work,
+        };
+        Ok(OperationProspective {
+            states: program.insts.len(),
+            boundaries,
+            table_cells: self.table_cells,
+            row_storage: self.row_storage,
+            row_record_bytes: self.record_bytes,
+            terminal_frontier: self.terminal_frontier,
+            work_bound: self.work_bound,
+            random_access_bytes: self.random_access_bound,
+            scratch_bytes: self.scratch_bound,
+            log_bytes: self.requested_log_bytes,
+            sequential_bytes: self.sequential_bound,
+            match_events,
+            output_matches,
+            output_bytes: 0,
+            span_sum: 0,
+            allocations: self.allocations,
+            peak_bytes: self.peak_bound,
+            accounting,
+        })
+    }
+
     fn new_for_seed(
         program: &Program,
         boundaries: usize,
@@ -1186,32 +1981,56 @@ impl Requirements {
             passes,
             Resource::ExecutionWork,
         )?;
-        let (table_cells, row_storage, record_bytes, random, scratch, log, sequential, replay) =
-            match strategy {
-                Strategy::FullTable => {
-                    let cells = mul(states, boundaries, Resource::TableCells)?;
-                    enforce(cells, limits.max_table_cells, Resource::TableCells)?;
-                    let bytes = mul(
-                        cells,
-                        core::mem::size_of::<usize>(),
-                        Resource::RandomAccessBytes,
-                    )?;
-                    (cells, None, 0, bytes, bytes, 0, 0, 0)
-                }
-                Strategy::ReverseSequentialRows => {
-                    let rows = ReverseRowRequirements::new(program, boundaries, passes)?;
-                    (
-                        0,
-                        Some(rows.storage),
-                        rows.record_bytes,
-                        rows.row_bytes,
-                        rows.row_bytes,
-                        rows.log_bytes,
-                        rows.sequential_bound,
-                        rows.replay_bound,
-                    )
-                }
-            };
+        let (
+            table_cells,
+            row_storage,
+            record_bytes,
+            random,
+            scratch,
+            log,
+            sequential,
+            replay,
+            allocations,
+        ) = match strategy {
+            Strategy::FullTable => {
+                let cells = mul(states, boundaries, Resource::TableCells)?;
+                enforce(cells, limits.max_table_cells, Resource::TableCells)?;
+                let bytes = mul(
+                    cells,
+                    core::mem::size_of::<usize>(),
+                    Resource::RandomAccessBytes,
+                )?;
+                (
+                    cells,
+                    None,
+                    0,
+                    bytes,
+                    bytes,
+                    0,
+                    0,
+                    0,
+                    usize::from(cells != 0),
+                )
+            }
+            Strategy::ReverseSequentialRows => {
+                let rows = ReverseRowRequirements::new(program, boundaries, passes)?;
+                (
+                    0,
+                    Some(rows.storage),
+                    rows.record_bytes,
+                    rows.row_bytes,
+                    rows.row_bytes,
+                    rows.log_bytes,
+                    rows.sequential_bound,
+                    rows.replay_bound,
+                    usize::from(rows.log_bytes != 0)
+                        .checked_add(usize::from(states != 0).saturating_mul(2))
+                        .ok_or(Error::ArithmeticOverflow {
+                            resource: Resource::Allocations,
+                        })?,
+                )
+            }
+        };
         enforce(
             random,
             limits.max_random_access_bytes,
@@ -1219,6 +2038,7 @@ impl Requirements {
         )?;
         enforce(scratch, limits.max_scratch_bytes, Resource::ScratchBytes)?;
         enforce(log, limits.max_log_bytes, Resource::LogBytes)?;
+        let peak = add(log, scratch, Resource::PeakBytes)?;
         enforce(
             sequential,
             limits.max_sequential_bytes,
@@ -1237,7 +2057,11 @@ impl Requirements {
             row_storage,
             record_bytes,
             requested_log_bytes: log,
+            random_access_bound: random,
+            scratch_bound: scratch,
+            peak_bound: peak,
             sequential_bound: sequential,
+            allocations,
             work_bound,
             terminal_frontier: false,
             frontier: None,
@@ -1266,7 +2090,11 @@ impl Requirements {
             row_storage: None,
             record_bytes: cache.record_bytes,
             requested_log_bytes: cache.log_bytes,
+            random_access_bound: cache.random_bytes,
+            scratch_bound: cache.scratch_bytes,
+            peak_bound: cache.peak_bytes,
             sequential_bound: cache.sequential_bound,
+            allocations: cache.allocations(),
             work_bound: limits.max_work,
             terminal_frontier: false,
             frontier: None,
@@ -1322,6 +2150,12 @@ impl Requirements {
             Resource::ScratchBytes,
         )?;
         enforce(rows.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        let peak = add(rows.log_bytes, rows.row_bytes, Resource::PeakBytes)?;
+        let allocations = usize::from(rows.log_bytes != 0)
+            .checked_add(usize::from(!program.insts.is_empty()))
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::Allocations,
+            })?;
         enforce(
             rows.sequential_bound,
             limits.max_sequential_bytes,
@@ -1332,7 +2166,11 @@ impl Requirements {
             row_storage: Some(rows.storage),
             record_bytes: rows.record_bytes,
             requested_log_bytes: rows.log_bytes,
+            random_access_bound: rows.row_bytes,
+            scratch_bound: rows.row_bytes,
+            peak_bound: peak,
             sequential_bound: rows.sequential_bound,
+            allocations,
             // Sparse construction charges every observed unit before it is
             // performed, so the caller's limit is its explicit admission cap.
             work_bound: limits.max_work,
@@ -1394,12 +2232,18 @@ impl Requirements {
             limits.max_peak_bytes,
             Resource::PeakBytes,
         )?;
+        let peak = add(rows.log_bytes, frontier.bytes, Resource::PeakBytes)?;
+        let allocations = terminal_frontier::allocation_count(program, rows.log_bytes)?;
         Ok(Self {
             table_cells: 0,
             row_storage: Some(rows.storage),
             record_bytes: rows.record_bytes,
             requested_log_bytes: rows.log_bytes,
+            random_access_bound: frontier.bytes,
+            scratch_bound: frontier.bytes,
+            peak_bound: peak,
             sequential_bound: sequential,
+            allocations,
             work_bound: limits.max_work,
             terminal_frontier: true,
             frontier: Some(frontier),
@@ -1442,6 +2286,20 @@ struct CachedFrontierRequirements {
 }
 
 impl CachedFrontierRequirements {
+    fn allocations(self) -> usize {
+        [
+            self.boundary_count,
+            self.state_word_capacity,
+            MAX_CACHED_FRONTIERS,
+            CACHED_TRANSITION_SLOTS,
+            self.words,
+            self.words,
+        ]
+        .into_iter()
+        .filter(|length| *length != 0)
+        .count()
+    }
+
     fn new(states: usize, boundaries: usize, passes: usize) -> Result<Self, Error> {
         let words = cached_frontier_words(states)?;
         let record_bytes = core::mem::size_of::<u16>();
@@ -1669,7 +2527,9 @@ impl Engine {
         requirements: Requirements,
         sparse_seed: Option<SparseSeed<'_>>,
         limits: OperationLimits,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
         if requirements.cache_attempt_work != 0 {
             try_charge_frontier_amount(
@@ -1686,7 +2546,9 @@ impl Engine {
                 requirements,
                 cache,
                 limits,
+                track_source,
                 accounting,
+                actual_allocations,
             )
             .map(Self::CachedFrontiers);
         }
@@ -1697,7 +2559,9 @@ impl Engine {
                 assertions,
                 requirements,
                 limits,
+                track_source,
                 accounting,
+                actual_allocations,
             )
             .map(Self::Full),
             Strategy::ReverseSequentialRows => match sparse_seed {
@@ -1709,6 +2573,7 @@ impl Engine {
                     seed,
                     limits,
                     accounting,
+                    actual_allocations,
                 )
                 .map(Self::SparseRows),
                 Some(SparseSeed::TerminalFrontier(seed)) => terminal_frontier::build(
@@ -1719,6 +2584,7 @@ impl Engine {
                     seed,
                     limits,
                     accounting,
+                    actual_allocations,
                 )
                 .map(Self::TerminalFrontier),
                 None => RowStore::build::<OBSERVED_WORK>(
@@ -1727,7 +2593,9 @@ impl Engine {
                     assertions,
                     requirements,
                     limits,
+                    track_source,
                     accounting,
+                    actual_allocations,
                 )
                 .map(Self::Rows),
             },
@@ -1745,6 +2613,7 @@ impl Engine {
         assertions: AssertionContext<'_>,
         admitted_work_bound: usize,
         caller_work_limit: usize,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
         mut emit: impl FnMut(Span) -> Result<(), Error>,
     ) -> Result<ScanSummary, Error> {
@@ -1782,6 +2651,7 @@ impl Engine {
                             accounting,
                             admitted_work_bound,
                             caller_work_limit,
+                            track_source,
                         )
                         .map(Some)
                     },
@@ -1822,6 +2692,7 @@ impl Engine {
                 assertions,
                 accounting,
                 admitted_work_bound,
+                track_source,
                 &mut emit,
             ),
         }
@@ -1852,12 +2723,13 @@ impl Engine {
 }
 
 struct FullTable {
-    values: Vec<usize>,
+    values: ExactVec<usize>,
     allocated_bytes: usize,
 }
 
 impl FullTable {
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "the table construction loop keeps every exact work charge beside its transition"
     )]
@@ -1867,9 +2739,12 @@ impl FullTable {
         assertions: AssertionContext<'_>,
         requirements: Requirements,
         limits: OperationLimits,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
         let mut values = zeroed_usizes(requirements.table_cells, Resource::RandomAccessBytes)?;
+        record_allocation(actual_allocations, values.capacity())?;
         let allocated_bytes = mul(
             values.capacity(),
             core::mem::size_of::<usize>(),
@@ -1888,6 +2763,7 @@ impl FullTable {
         enforce(allocated_bytes, limits.max_peak_bytes, Resource::PeakBytes)?;
         accounting.random_access_peak_bytes = allocated_bytes;
         accounting.scratch_peak_bytes = allocated_bytes;
+        accounting.peak_bytes = allocated_bytes;
         let states = program.insts.len();
         let boundaries = add(haystack.len(), 1, Resource::Boundaries)?;
         let mut row_end = values.len();
@@ -1903,13 +2779,20 @@ impl FullTable {
             // no input byte and therefore cannot follow a Consume edge.
             let next_row = later_rows.get(..states).unwrap_or(&[]);
             let input = haystack.get(position).copied();
+            record_source_accesses(accounting, usize::from(input.is_some()), track_source)?;
             let scalar = if program.contains_scalar_transition() {
                 charge_transition::<OBSERVED_WORK>(
                     accounting,
                     requirements.work_bound,
                     limits.max_work,
                 )?;
-                haystack.get(position..).and_then(decode_first_scalar)
+                let source = haystack.get(position..).unwrap_or_default();
+                record_source_accesses(
+                    accounting,
+                    cached_scalar_source_accesses(source),
+                    track_source,
+                )?;
+                decode_first_scalar(source)
             } else {
                 None
             };
@@ -1980,7 +2863,13 @@ impl FullTable {
                             requirements.work_bound,
                             limits.max_work,
                         )?;
-                        if assertions.is_match(*assertion, position)? {
+                        if assertion_matches(
+                            assertions,
+                            *assertion,
+                            position,
+                            accounting,
+                            track_source,
+                        )? {
                             row[*next]
                         } else {
                             0
@@ -2048,6 +2937,7 @@ fn exact_allocation_error(error: CopyError, resource: Resource, items: usize) ->
     }
 }
 
+#[cfg(test)]
 fn exact_filled<T: Copy>(
     length: usize,
     value: T,
@@ -2061,6 +2951,34 @@ fn exact_filled<T: Copy>(
             .map_err(|_| Error::InternalInvariant("exact allocation changed capacity"))?;
     }
     Ok(values)
+}
+
+fn exact_reserved<T>(length: usize, resource: Resource) -> Result<ExactVec<T>, Error> {
+    #[cfg(test)]
+    if length != 0 && allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
+            resource,
+            items: length,
+        });
+    }
+    ExactVec::try_with_capacity(length)
+        .map_err(|error| exact_allocation_error(error, resource, length))
+}
+
+fn initialize_exact_accounted<T: Copy>(
+    values: &mut ExactVec<T>,
+    length: usize,
+    value: T,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<(), Error> {
+    for _ in 0..length {
+        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+        values
+            .try_push(value)
+            .map_err(|_| Error::InternalInvariant("exact allocation changed capacity"))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2165,13 +3083,17 @@ fn cached_replay_scalar(
     position: usize,
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
+    track_source: bool,
 ) -> Result<usize, Error> {
-    let scalar = haystack
-        .get(position..)
-        .and_then(decode_first_scalar)
-        .ok_or(Error::InternalInvariant(
-            "cached frontier replay selected invalid Unicode scalar",
-        ))?;
+    let source = haystack.get(position..).unwrap_or_default();
+    record_source_accesses(
+        accounting,
+        cached_scalar_source_accesses(source),
+        track_source,
+    )?;
+    let scalar = decode_first_scalar(source).ok_or(Error::InternalInvariant(
+        "cached frontier replay selected invalid Unicode scalar",
+    ))?;
     if !scalars.contains_with(scalar, || {
         try_charge_replay(accounting, admitted_work_bound)
     })? {
@@ -2211,6 +3133,7 @@ struct CachedFrontierStore {
 
 impl CachedFrontierStore {
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "cached-frontier construction keeps its fixed capacity, semantic key, and exact charges together"
     )]
@@ -2221,28 +3144,130 @@ impl CachedFrontierStore {
         requirements: Requirements,
         cache: CachedFrontierRequirements,
         limits: OperationLimits,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
         cache.enforce(limits)?;
-        try_charge_frontier_amount(
+        let mut boundary_states = exact_reserved(cache.boundary_count, Resource::LogBytes)?;
+        record_allocation(actual_allocations, boundary_states.capacity())?;
+        accounting.log_bytes = cache.log_bytes;
+        accounting.peak_bytes = cache.log_bytes;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut boundary_states,
+            cache.boundary_count,
+            0_u16,
             accounting,
             requirements.work_bound,
-            cache.initialization_work()?,
         )?;
-        let mut boundary_states = exact_filled(cache.boundary_count, 0_u16, Resource::LogBytes)?;
-        let mut state_bits = exact_filled(
+        let mut state_bits =
+            exact_reserved(cache.state_word_capacity, Resource::RandomAccessBytes)?;
+        record_allocation(actual_allocations, state_bits.capacity())?;
+        let mut allocated_random = mul(
             cache.state_word_capacity,
-            0_u64,
+            core::mem::size_of::<u64>(),
             Resource::RandomAccessBytes,
         )?;
-        let mut state_hashes = exact_filled(MAX_CACHED_FRONTIERS, 0_u64, Resource::ScratchBytes)?;
-        let mut transitions = exact_filled(
-            CACHED_TRANSITION_SLOTS,
-            CachedTransitionSlot::EMPTY,
+        accounting.random_access_peak_bytes = allocated_random;
+        accounting.scratch_peak_bytes = allocated_random;
+        accounting.peak_bytes = add(cache.log_bytes, allocated_random, Resource::PeakBytes)?;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut state_bits,
+            cache.state_word_capacity,
+            0_u64,
+            accounting,
+            requirements.work_bound,
+        )?;
+        let mut state_hashes = exact_reserved(MAX_CACHED_FRONTIERS, Resource::ScratchBytes)?;
+        record_allocation(actual_allocations, state_hashes.capacity())?;
+        allocated_random = add(
+            allocated_random,
+            mul(
+                MAX_CACHED_FRONTIERS,
+                core::mem::size_of::<u64>(),
+                Resource::ScratchBytes,
+            )?,
             Resource::ScratchBytes,
         )?;
-        let mut candidate = exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?;
-        let mut next_frontier = exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?;
+        accounting.random_access_peak_bytes = allocated_random;
+        accounting.scratch_peak_bytes = allocated_random;
+        accounting.peak_bytes = add(cache.log_bytes, allocated_random, Resource::PeakBytes)?;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut state_hashes,
+            MAX_CACHED_FRONTIERS,
+            0_u64,
+            accounting,
+            requirements.work_bound,
+        )?;
+        let mut transitions = exact_reserved(CACHED_TRANSITION_SLOTS, Resource::ScratchBytes)?;
+        record_allocation(actual_allocations, transitions.capacity())?;
+        allocated_random = add(
+            allocated_random,
+            mul(
+                CACHED_TRANSITION_SLOTS,
+                core::mem::size_of::<CachedTransitionSlot>(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
+        accounting.random_access_peak_bytes = allocated_random;
+        accounting.scratch_peak_bytes = allocated_random;
+        accounting.peak_bytes = add(cache.log_bytes, allocated_random, Resource::PeakBytes)?;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut transitions,
+            CACHED_TRANSITION_SLOTS,
+            CachedTransitionSlot::EMPTY,
+            accounting,
+            requirements.work_bound,
+        )?;
+        let mut candidate = exact_reserved(cache.words, Resource::ScratchBytes)?;
+        record_allocation(actual_allocations, candidate.capacity())?;
+        allocated_random = add(
+            allocated_random,
+            mul(
+                cache.words,
+                core::mem::size_of::<u64>(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
+        accounting.random_access_peak_bytes = allocated_random;
+        accounting.scratch_peak_bytes = allocated_random;
+        accounting.peak_bytes = add(cache.log_bytes, allocated_random, Resource::PeakBytes)?;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut candidate,
+            cache.words,
+            0_u64,
+            accounting,
+            requirements.work_bound,
+        )?;
+        let mut next_frontier = exact_reserved(cache.words, Resource::ScratchBytes)?;
+        record_allocation(actual_allocations, next_frontier.capacity())?;
+        allocated_random = add(
+            allocated_random,
+            mul(
+                cache.words,
+                core::mem::size_of::<u64>(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
+        accounting.random_access_peak_bytes = allocated_random;
+        accounting.scratch_peak_bytes = allocated_random;
+        accounting.peak_bytes = add(cache.log_bytes, allocated_random, Resource::PeakBytes)?;
+        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+        initialize_exact_accounted(
+            &mut next_frontier,
+            cache.words,
+            0_u64,
+            accounting,
+            requirements.work_bound,
+        )?;
 
         // State zero is the all-failing successor beyond the terminal row.
         let mut state_count = 1_usize;
@@ -2261,6 +3286,7 @@ impl CachedFrontierStore {
                 used_assertions,
                 accounting,
                 requirements.work_bound,
+                track_source,
             )?;
             let (cached, slot) = if let Some(state) = next_state {
                 let (cached, slot) = cached_transition_lookup(
@@ -2403,6 +3429,10 @@ impl CachedFrontierStore {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cached scan carries one explicit immutable execution context and its audited ledger"
+    )]
     fn scan(
         &mut self,
         program: &Program,
@@ -2410,6 +3440,7 @@ impl CachedFrontierStore {
         assertions: AssertionContext<'_>,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        track_source: bool,
         mut emit: impl FnMut(Span) -> Result<(), Error>,
     ) -> Result<ScanSummary, Error> {
         scan_sequence_sparse(
@@ -2425,12 +3456,17 @@ impl CachedFrontierStore {
                     start,
                     accounting,
                     admitted_work_bound,
+                    track_source,
                 )
             },
             &mut emit,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cached replay keeps its source context and accounting ledger explicit at selection"
+    )]
     fn selected(
         &mut self,
         program: &Program,
@@ -2439,6 +3475,7 @@ impl CachedFrontierStore {
         start: usize,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        track_source: bool,
     ) -> Result<Option<usize>, Error> {
         self.load_boundary(
             program,
@@ -2447,6 +3484,7 @@ impl CachedFrontierStore {
             start,
             accounting,
             admitted_work_bound,
+            track_source,
         )?;
         if !cached_candidate_bit(&self.replay_current, program.entry)? {
             return Ok(None);
@@ -2468,7 +3506,9 @@ impl CachedFrontierStore {
                 }
                 Inst::Match => return Ok(Some(position)),
                 Inst::Consume { bytes, next } => {
-                    if position >= haystack.len() || !bytes.contains(haystack[position]) {
+                    let input = haystack.get(position).copied();
+                    record_source_accesses(accounting, usize::from(input.is_some()), track_source)?;
+                    if !input.is_some_and(|byte| bytes.contains(byte)) {
                         return Err(Error::InternalInvariant(
                             "cached frontier replay selected failing byte",
                         ));
@@ -2481,6 +3521,7 @@ impl CachedFrontierStore {
                         position,
                         accounting,
                         admitted_work_bound,
+                        track_source,
                     )?;
                     pc = *next;
                 }
@@ -2495,6 +3536,7 @@ impl CachedFrontierStore {
                         position,
                         accounting,
                         admitted_work_bound,
+                        track_source,
                     )?;
                     position = add(position, 1, Resource::Boundaries)?;
                     self.load_boundary(
@@ -2504,11 +3546,18 @@ impl CachedFrontierStore {
                         position,
                         accounting,
                         admitted_work_bound,
+                        track_source,
                     )?;
                 }
                 Inst::Assert { assertion, next } => {
                     try_charge_assertion(accounting, admitted_work_bound)?;
-                    if !assertions.is_match(*assertion, position)? {
+                    if !assertion_matches(
+                        assertions,
+                        *assertion,
+                        position,
+                        accounting,
+                        track_source,
+                    )? {
                         return Err(Error::InternalInvariant(
                             "cached frontier replay selected failing assertion",
                         ));
@@ -2529,6 +3578,10 @@ impl CachedFrontierStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "boundary loading keeps every cache input and accounting ledger explicit"
+    )]
     fn load_boundary(
         &mut self,
         program: &Program,
@@ -2537,6 +3590,7 @@ impl CachedFrontierStore {
         position: usize,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        track_source: bool,
     ) -> Result<(), Error> {
         accounting.sequential_bytes_read = add(
             accounting.sequential_bytes_read,
@@ -2608,6 +3662,7 @@ impl CachedFrontierStore {
                 self.used_assertions,
                 accounting,
                 admitted_work_bound,
+                track_source,
             )?;
             cached_compute_row(
                 program,
@@ -2697,6 +3752,10 @@ const CACHED_SEED_SHIFT: u32 = CACHED_ASSERTION_SHIFT + 18;
 const CACHED_SCALAR_SHIFT: u32 = CACHED_SEED_SHIFT + 1;
 const CACHED_SCALAR_NONE: u32 = 0x11_0000;
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "symbol construction keeps assertion/source charging adjacent to every inspected input"
+)]
 fn cached_boundary_symbol(
     program: &Program,
     assertions: AssertionContext<'_>,
@@ -2705,6 +3764,7 @@ fn cached_boundary_symbol(
     used_assertions: u32,
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
+    track_source: bool,
 ) -> Result<u64, Error> {
     try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
     let mut assertion_mask = 0_u64;
@@ -2715,7 +3775,7 @@ fn cached_boundary_symbol(
             continue;
         }
         try_charge_assertion(accounting, admitted_work_bound)?;
-        if assertions.is_match(assertion, position)? {
+        if assertion_matches(assertions, assertion, position, accounting, track_source)? {
             assertion_mask |= 1_u64 << assertion.identity_tag();
         }
     }
@@ -2832,6 +3892,7 @@ fn cached_set_candidate_bit(row: &mut [u64], pc: usize) -> Result<(), Error> {
 
 impl RowStore {
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "row construction keeps fixed-buffer lifetime and accounting in one audit unit"
     )]
@@ -2841,21 +3902,35 @@ impl RowStore {
         assertions: AssertionContext<'_>,
         requirements: Requirements,
         limits: OperationLimits,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
         let storage = requirements.row_storage.ok_or(Error::InternalInvariant(
             "reverse rows have no selected record storage",
         ))?;
         let mut store = zeroed_bytes(requirements.requested_log_bytes, Resource::LogBytes)?;
         let allocated_store = store.capacity();
+        record_allocation(actual_allocations, allocated_store)?;
+        accounting.log_bytes = allocated_store;
+        accounting.peak_bytes = allocated_store;
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
         let states = program.insts.len();
         let row_count = 2;
-        let mut rows = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut rows: [ExactVec<usize>; 5] = core::array::from_fn(|_| ExactVec::default());
         let mut row_words = 0_usize;
         for row in &mut rows[..row_count] {
             *row = zeroed_usizes(states, Resource::RandomAccessBytes)?;
+            record_allocation(actual_allocations, row.capacity())?;
             row_words = add(row_words, row.capacity(), Resource::RandomAccessBytes)?;
+            let allocated_row_bytes = mul(
+                row_words,
+                core::mem::size_of::<usize>(),
+                Resource::RandomAccessBytes,
+            )?;
+            accounting.random_access_peak_bytes = allocated_row_bytes;
+            accounting.scratch_peak_bytes = allocated_row_bytes;
+            accounting.peak_bytes = add(allocated_store, allocated_row_bytes, Resource::PeakBytes)?;
         }
         let row_bytes = mul(
             row_words,
@@ -2902,6 +3977,7 @@ impl RowStore {
                 accounting,
                 requirements.work_bound,
                 limits.max_work,
+                track_source,
             )?;
         }
         accounting.sequential_bytes_written = add(
@@ -2912,6 +3988,7 @@ impl RowStore {
         rows[..row_count].rotate_right(1);
 
         for (position, input) in haystack.iter().copied().enumerate().rev() {
+            record_source_accesses(accounting, 1, track_source)?;
             let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
             let record = store
                 .get_mut(write_offset..end)
@@ -2932,6 +4009,7 @@ impl RowStore {
                 accounting,
                 requirements.work_bound,
                 limits.max_work,
+                track_source,
             )?;
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
@@ -2958,6 +4036,7 @@ impl RowStore {
     }
 
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "sparse reverse construction keeps its complete storage and work certificate local"
     )]
@@ -2969,6 +4048,7 @@ impl RowStore {
         seed: &RequiredSuffixes,
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
         if seed.is_empty() {
             return Err(Error::InternalInvariant("sparse continuation has no seed"));
@@ -2978,15 +4058,22 @@ impl RowStore {
         ))?;
         let mut store = zeroed_bytes(requirements.requested_log_bytes, Resource::LogBytes)?;
         let allocated_store = store.capacity();
+        record_allocation(actual_allocations, allocated_store)?;
+        accounting.log_bytes = allocated_store;
+        accounting.peak_bytes = allocated_store;
         enforce(allocated_store, limits.max_log_bytes, Resource::LogBytes)?;
         let states = program.insts.len();
         let row_words = add(states, states, Resource::RandomAccessBytes)?;
         let mut rows = zeroed_usizes(row_words, Resource::RandomAccessBytes)?;
+        record_allocation(actual_allocations, rows.capacity())?;
         let row_bytes = mul(
             rows.capacity(),
             core::mem::size_of::<usize>(),
             Resource::RandomAccessBytes,
         )?;
+        accounting.random_access_peak_bytes = row_bytes;
+        accounting.scratch_peak_bytes = row_bytes;
+        accounting.peak_bytes = add(allocated_store, row_bytes, Resource::PeakBytes)?;
         let (mut row, mut next_row) = rows.split_at_mut(states);
         let build_scratch = row_bytes;
         enforce(
@@ -3234,24 +4321,34 @@ impl RowStore {
         position: usize,
         input: u8,
         row: &mut [usize],
-        future_rows: &[Vec<usize>],
+        future_rows: &[ExactVec<usize>],
         record: &mut [u8],
         storage: RowStorage,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
         caller_work_limit: usize,
+        track_source: bool,
     ) -> Result<(), Error> {
         let scalar = if program.contains_scalar_transition() {
             charge_transition::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             if HAS_INPUT {
-                haystack.get(position..).and_then(decode_first_scalar)
+                let source = haystack.get(position..).unwrap_or_default();
+                record_source_accesses(
+                    accounting,
+                    cached_scalar_source_accesses(source),
+                    track_source,
+                )?;
+                decode_first_scalar(source)
             } else {
                 None
             }
         } else {
             None
         };
-        let next_row = future_rows.first().map(Vec::as_slice).unwrap_or_default();
+        let next_row = future_rows
+            .first()
+            .map(ExactVec::as_slice)
+            .unwrap_or_default();
         for &pc in &program.epsilon_order {
             charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             let value =
@@ -3316,7 +4413,13 @@ impl RowStore {
                             admitted_work_bound,
                             caller_work_limit,
                         )?;
-                        if assertions.is_match(*assertion, position)? {
+                        if assertion_matches(
+                            assertions,
+                            *assertion,
+                            position,
+                            accounting,
+                            track_source,
+                        )? {
                             row[*next]
                         } else {
                             0
@@ -3391,6 +4494,7 @@ impl RowStore {
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
         caller_work_limit: usize,
+        track_source: bool,
     ) -> Result<usize, Error> {
         let mut pc = program.entry;
         let mut position = start;
@@ -3405,7 +4509,9 @@ impl RowStore {
                 }
                 Inst::Match => return Ok(position),
                 Inst::Consume { bytes, next } => {
-                    if position >= haystack.len() || !bytes.contains(haystack[position]) {
+                    let input = haystack.get(position).copied();
+                    record_source_accesses(accounting, usize::from(input.is_some()), track_source)?;
+                    if !input.is_some_and(|byte| bytes.contains(byte)) {
                         return Err(Error::InternalInvariant(
                             "row log selected failing byte path",
                         ));
@@ -3417,12 +4523,15 @@ impl RowStore {
                     scalars,
                     next_by_width,
                 } => {
-                    let scalar = haystack
-                        .get(position..)
-                        .and_then(decode_first_scalar)
-                        .ok_or(Error::InternalInvariant(
-                            "row log selected invalid Unicode scalar path",
-                        ))?;
+                    let source = haystack.get(position..).unwrap_or_default();
+                    record_source_accesses(
+                        accounting,
+                        cached_scalar_source_accesses(source),
+                        track_source,
+                    )?;
+                    let scalar = decode_first_scalar(source).ok_or(Error::InternalInvariant(
+                        "row log selected invalid Unicode scalar path",
+                    ))?;
                     let matches = scalars.contains_with(scalar, || {
                         charge_replay::<OBSERVED_WORK>(
                             accounting,
@@ -3455,7 +4564,13 @@ impl RowStore {
                         admitted_work_bound,
                         caller_work_limit,
                     )?;
-                    if !assertions.is_match(*assertion, position)? {
+                    if !assertion_matches(
+                        assertions,
+                        *assertion,
+                        position,
+                        accounting,
+                        track_source,
+                    )? {
                         return Err(Error::InternalInvariant(
                             "row log selected failing assertion",
                         ));
@@ -3949,25 +5064,61 @@ fn try_charge_amount(
     Ok(())
 }
 
+fn record_source_accesses(
+    accounting: &mut ExecutionAccounting,
+    amount: usize,
+    track_source: bool,
+) -> Result<(), Error> {
+    if track_source {
+        accounting.random_access_bytes_read = add(
+            accounting.random_access_bytes_read,
+            amount,
+            Resource::RandomAccessBytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn record_allocation(actual_allocations: &mut usize, allocated_items: usize) -> Result<(), Error> {
+    if allocated_items != 0 {
+        *actual_allocations = add(*actual_allocations, 1, Resource::Allocations)?;
+    }
+    Ok(())
+}
+
+fn assertion_matches(
+    assertions: AssertionContext<'_>,
+    assertion: Assertion,
+    position: usize,
+    accounting: &mut ExecutionAccounting,
+    track_source: bool,
+) -> Result<bool, Error> {
+    assertions.is_match_with_source_accesses(assertion, position, |amount| {
+        record_source_accesses(accounting, amount, track_source)
+    })
+}
+
 fn try_charge_frontier_amount(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
     amount: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, amount)?;
     accounting.frontier_bookkeeping = add(
         accounting.frontier_bookkeeping,
         amount,
         Resource::ExecutionWork,
     )?;
-    try_charge_amount(accounting, admitted_work_bound, amount)
+    Ok(())
 }
 
 fn try_charge_state(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, 1)?;
     accounting.state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
-    try_charge_amount(accounting, admitted_work_bound, 1)
+    Ok(())
 }
 
 fn try_charge_transition(
@@ -3982,44 +5133,49 @@ fn try_charge_transition_amount(
     admitted_work_bound: usize,
     amount: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, amount)?;
     accounting.transition_checks = add(
         accounting.transition_checks,
         amount,
         Resource::ExecutionWork,
     )?;
-    try_charge_amount(accounting, admitted_work_bound, amount)
+    Ok(())
 }
 
 fn try_charge_assertion(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
 ) -> Result<(), Error> {
+    try_charge_transition(accounting, admitted_work_bound)?;
     accounting.assertion_checks = add(accounting.assertion_checks, 1, Resource::ExecutionWork)?;
-    try_charge_transition(accounting, admitted_work_bound)
+    Ok(())
 }
 
 fn try_charge_root(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, 1)?;
     accounting.root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
-    try_charge_amount(accounting, admitted_work_bound, 1)
+    Ok(())
 }
 
 fn try_charge_replay(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, 1)?;
     accounting.replay_steps = add(accounting.replay_steps, 1, Resource::ExecutionWork)?;
-    try_charge_amount(accounting, admitted_work_bound, 1)
+    Ok(())
 }
 
 fn try_charge_event(
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
 ) -> Result<(), Error> {
+    try_charge_amount(accounting, admitted_work_bound, 1)?;
     accounting.successful_paths = add(accounting.successful_paths, 1, Resource::ExecutionWork)?;
-    try_charge_amount(accounting, admitted_work_bound, 1)
+    Ok(())
 }
 
 fn validate_admitted_work(
@@ -4141,28 +5297,33 @@ fn read_bit(bytes: &[u8], index: usize) -> Result<bool, Error> {
     Ok(byte & (1_u8 << (index % 8)) != 0)
 }
 
-fn zeroed_usizes(length: usize, resource: Resource) -> Result<Vec<usize>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
+fn zeroed_usizes(length: usize, resource: Resource) -> Result<ExactVec<usize>, Error> {
+    #[cfg(test)]
+    if length != 0 && allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
             resource,
             items: length,
-        })?;
-    values.resize(length, 0);
+        });
+    }
+    let mut values = ExactVec::try_with_capacity(length)
+        .map_err(|error| exact_allocation_error(error, resource, length))?;
+    for _ in 0..length {
+        values
+            .try_push(0)
+            .map_err(|_| Error::InternalInvariant("exact zeroed allocation changed capacity"))?;
+    }
     Ok(values)
 }
 
 fn zeroed_bytes(length: usize, resource: Resource) -> Result<Vec<u8>, Error> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(length)
-        .map_err(|_| Error::AllocationFailed {
+    #[cfg(test)]
+    if length != 0 && allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
             resource,
             items: length,
-        })?;
-    values.resize(length, 0);
-    Ok(values)
+        });
+    }
+    zeroed_exact(length).map_err(|error| exact_allocation_error(error, resource, length))
 }
 
 fn operation_identity(
@@ -4205,11 +5366,661 @@ mod tests {
     };
 
     use super::{
-        CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot, RowReader,
-        RowStorage, UNCACHED_FRONTIER, cached_boundary_symbol, cached_compute_row,
+        CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
+        MAX_CACHED_FRONTIERS, OperationProspective, Requirements, RowReader, RowStorage,
+        UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
         cached_frontier_words, cached_program_assertion_mask, decode, encoded_width, exact_filled,
         read_encoded, write_encoded,
     };
+
+    fn endpoint_scalar_repeat() -> CompiledRegex {
+        let hir = ParserBuilder::new().build().parse(r"^.{249}$").unwrap();
+        CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn operation_prospective_enforces_every_operation_limit_dimension() {
+        let prospective = OperationProspective {
+            states: 2,
+            boundaries: 3,
+            table_cells: 5,
+            row_storage: Some(RowStorage::ReachableEndpoints),
+            row_record_bytes: 7,
+            terminal_frontier: true,
+            work_bound: 11,
+            random_access_bytes: 13,
+            scratch_bytes: 17,
+            log_bytes: 19,
+            sequential_bytes: 23,
+            match_events: 29,
+            output_matches: 31,
+            output_bytes: 37,
+            span_sum: 41,
+            allocations: 42,
+            peak_bytes: 43,
+            accounting: ExecutionAccounting::default(),
+        };
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: prospective.work_bound,
+        };
+        prospective.enforce_limits(exact).unwrap();
+
+        macro_rules! assert_one_below {
+            ($field:ident, $prospective:ident, $resource:expr) => {{
+                let mut one_below = exact;
+                one_below.$field = prospective.$prospective - 1;
+                assert_eq!(
+                    prospective.enforce_limits(one_below),
+                    Err(Error::ResourceLimit {
+                        resource: $resource,
+                        required: prospective.$prospective,
+                        limit: prospective.$prospective - 1,
+                    })
+                );
+            }};
+        }
+        assert_one_below!(max_boundaries, boundaries, Resource::Boundaries);
+        assert_one_below!(max_table_cells, table_cells, Resource::TableCells);
+        assert_one_below!(
+            max_random_access_bytes,
+            random_access_bytes,
+            Resource::RandomAccessBytes
+        );
+        assert_one_below!(max_scratch_bytes, scratch_bytes, Resource::ScratchBytes);
+        assert_one_below!(max_log_bytes, log_bytes, Resource::LogBytes);
+        assert_one_below!(
+            max_sequential_bytes,
+            sequential_bytes,
+            Resource::SequentialBytes
+        );
+        assert_one_below!(max_match_events, match_events, Resource::MatchEvents);
+        assert_one_below!(max_output_matches, output_matches, Resource::OutputMatches);
+        assert_one_below!(max_output_bytes, output_bytes, Resource::OutputBytes);
+        assert_one_below!(max_span_sum, span_sum, Resource::SpanSum);
+        assert_one_below!(max_peak_bytes, peak_bytes, Resource::PeakBytes);
+        assert_one_below!(max_work, work_bound, Resource::ExecutionWork);
+    }
+
+    #[test]
+    fn endpoint_count_attempt_invalid_range_has_no_prospective_or_actual_work() {
+        let compiled = endpoint_scalar_repeat();
+        let failure = compiled
+            .admit_count_with_receipt(
+                b"short",
+                0..6,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.source,
+            Error::InvalidRange {
+                start: 0,
+                end: 6,
+                haystack_len: 5,
+            }
+        );
+        assert_eq!(failure.receipt.invocation.range, 0..6);
+        assert_eq!(failure.receipt.invocation.haystack_len, 5);
+        assert_eq!(failure.receipt.identity.regex_plan_id, compiled.plan_id());
+        assert_eq!(failure.receipt.identity.operation_id, None);
+        assert_eq!(failure.receipt.prospective, None);
+        assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+    }
+
+    #[test]
+    fn endpoint_count_attempt_limit_refuses_prepublished_prospective_before_source() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let failure = compiled
+            .admit_count_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_output_matches: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        let prospective = failure
+            .receipt
+            .prospective
+            .expect("generic route must publish P before source access");
+        assert_eq!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputMatches,
+                required: prospective.output_matches,
+                limit: 0,
+            }
+        );
+        assert!(failure.receipt.identity.operation_id.is_some());
+        assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+        assert!(prospective.contains(failure.receipt.actual));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact-and-every-one-below test enumerates every public P dimension in one audit unit"
+    )]
+    fn endpoint_count_attempt_exact_and_every_positive_one_below_share_one_p_before_effects() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let baseline = compiled
+            .admit_count_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let prospective = baseline
+            .receipt
+            .prospective
+            .expect("successful generic count must retain P");
+        assert_eq!(prospective.span_sum, 0);
+        assert!(
+            compiled
+                .admit_count_with_receipt(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_span_sum: 0,
+                        ..OperationLimits::default()
+                    },
+                )
+                .is_ok()
+        );
+        let identity = baseline.receipt.identity;
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: prospective.work_bound,
+        };
+        let exact_success = compiled
+            .admit_count_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact,
+            )
+            .unwrap();
+        assert_eq!(exact_success.receipt.prospective, Some(prospective));
+        assert_eq!(exact_success.receipt.identity, identity);
+
+        macro_rules! assert_one_below {
+            ($limit:ident, $field:ident, $resource:expr) => {
+                if prospective.$field > 0 {
+                    let mut one_below = exact;
+                    one_below.$limit = prospective.$field - 1;
+                    let allocation = allocation_fault::arm(0);
+                    let failure = compiled
+                        .admit_count_with_receipt(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            one_below,
+                        )
+                        .unwrap_err();
+                    assert_eq!(
+                        failure.source,
+                        Error::ResourceLimit {
+                            resource: $resource,
+                            required: prospective.$field,
+                            limit: prospective.$field - 1,
+                        }
+                    );
+                    assert_eq!(failure.receipt.identity, identity);
+                    assert_eq!(failure.receipt.prospective, Some(prospective));
+                    assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+                    assert_eq!(allocation_fault::calls(), 0);
+                    drop(allocation);
+                }
+            };
+        }
+        assert_one_below!(max_boundaries, boundaries, Resource::Boundaries);
+        assert_one_below!(max_table_cells, table_cells, Resource::TableCells);
+        assert_one_below!(
+            max_random_access_bytes,
+            random_access_bytes,
+            Resource::RandomAccessBytes
+        );
+        assert_one_below!(max_scratch_bytes, scratch_bytes, Resource::ScratchBytes);
+        assert_one_below!(max_log_bytes, log_bytes, Resource::LogBytes);
+        assert_one_below!(
+            max_sequential_bytes,
+            sequential_bytes,
+            Resource::SequentialBytes
+        );
+        assert_one_below!(max_match_events, match_events, Resource::MatchEvents);
+        assert_one_below!(max_output_matches, output_matches, Resource::OutputMatches);
+        assert_one_below!(max_output_bytes, output_bytes, Resource::OutputBytes);
+        assert_one_below!(max_span_sum, span_sum, Resource::SpanSum);
+        assert_one_below!(max_peak_bytes, peak_bytes, Resource::PeakBytes);
+        assert_one_below!(max_work, work_bound, Resource::ExecutionWork);
+    }
+
+    #[test]
+    fn endpoint_count_attempt_success_retains_release_checked_prospective_and_actual() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let success = compiled
+            .admit_count_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(success.admitted.value(), 1);
+        assert_eq!(success.receipt.actual, success.admitted.accounting());
+        assert!(success.receipt.actual.random_access_bytes_read > 0);
+        assert!(
+            success
+                .receipt
+                .prospective
+                .is_some_and(|upper| upper.contains(success.receipt.actual))
+        );
+
+        let value = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(value.value, 1);
+        assert!(
+            value
+                .receipt
+                .prospective
+                .is_some_and(|upper| upper.contains(value.receipt.actual))
+        );
+    }
+
+    #[test]
+    fn endpoint_forced_dense_allocation_faults_retain_exact_scoped_ordinals() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        for (strategy, ordinals) in [
+            (Strategy::FullTable, 0..1),
+            (Strategy::ReverseSequentialRows, 0..3),
+        ] {
+            let prospective = compiled
+                .fixed_scalar_dense_count_prospective(haystack.len(), strategy)
+                .unwrap();
+            assert_eq!(prospective.allocations, ordinals.end);
+            for ordinal in ordinals {
+                let fault = allocation_fault::arm(ordinal);
+                let mut observed = None;
+                let failure = compiled
+                    .admit_count_with_receipt_observer(
+                        &haystack,
+                        0..haystack.len(),
+                        strategy,
+                        OperationLimits::default(),
+                        prospective.allocations,
+                        |published| {
+                            observed = Some(published);
+                            Ok(())
+                        },
+                    )
+                    .unwrap_err();
+                assert!(matches!(failure.source, Error::AllocationFailed { .. }));
+                assert_eq!(observed, Some(prospective));
+                assert_eq!(failure.receipt.prospective, Some(prospective));
+                assert_eq!(failure.receipt.identity.strategy, strategy);
+                assert_eq!(failure.receipt.actual_allocations, ordinal);
+                assert!(prospective.contains(failure.receipt.actual));
+                assert!(failure.receipt.actual_allocations <= prospective.allocations);
+                assert_eq!(failure.receipt.actual.random_access_bytes_read, 0);
+                assert_eq!(failure.receipt.actual.sequential_bytes_read, 0);
+                assert_eq!(allocation_fault::calls(), ordinal + 1);
+                drop(fault);
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_count_value_attempt_limit_refuses_before_source() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let failure = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_output_matches: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        let prospective = failure
+            .receipt
+            .prospective
+            .expect("generic route must publish P before source access");
+        assert_eq!(prospective.output_matches, haystack.len() + 1);
+        assert!(prospective.output_matches > 0);
+        assert_eq!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputMatches,
+                required: prospective.output_matches,
+                limit: 0,
+            }
+        );
+        assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(failure.receipt.actual.random_access_bytes_read, 0);
+        assert_eq!(failure.receipt.actual.sequential_bytes_read, 0);
+        assert!(prospective.contains(failure.receipt.actual));
+    }
+
+    #[test]
+    fn endpoint_count_value_attempt_preserves_generic_cached_policy() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let boundaries = haystack.len() + 1;
+        let dense = Requirements::new::<true>(
+            &compiled.program,
+            boundaries,
+            Strategy::ReverseSequentialRows,
+            1,
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert!(dense.row_storage.is_some());
+        let limits = OperationLimits {
+            max_work: dense.work_bound.checked_sub(1).unwrap(),
+            ..OperationLimits::default()
+        };
+        let cached = Requirements::cached(&compiled.program, boundaries, 1, limits)
+            .unwrap()
+            .expect("one-below-dense observed policy must admit the generic cache");
+
+        let incumbent = compiled
+            .count_value(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        let attempt = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        assert_eq!(attempt.value, incumbent);
+        let prospective = attempt.receipt.prospective.unwrap();
+        assert_eq!(prospective.table_cells, 0);
+        assert_eq!(prospective.row_storage, None);
+        assert_eq!(prospective.random_access_bytes, cached.random_access_bound);
+        assert!(prospective.contains(attempt.receipt.actual));
+    }
+
+    #[test]
+    fn endpoint_cached_assertion_source_is_receipt_tracked_without_re_evaluation() {
+        let hir = ParserBuilder::new().build().parse(r"\b").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = "éx".as_bytes();
+        let assertions = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let admitted = usize::MAX;
+        let mut mask_accounting = ExecutionAccounting::default();
+        let used_assertions =
+            cached_program_assertion_mask(&compiled.program, &mut mask_accounting, admitted)
+                .unwrap();
+
+        let mut untracked = ExecutionAccounting::default();
+        let untracked_symbol = cached_boundary_symbol(
+            &compiled.program,
+            assertions,
+            haystack,
+            "é".len(),
+            used_assertions,
+            &mut untracked,
+            admitted,
+            false,
+        )
+        .unwrap();
+        let mut tracked = ExecutionAccounting::default();
+        let tracked_symbol = cached_boundary_symbol(
+            &compiled.program,
+            assertions,
+            haystack,
+            "é".len(),
+            used_assertions,
+            &mut tracked,
+            admitted,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(tracked_symbol, untracked_symbol);
+        assert_eq!(untracked.random_access_bytes_read, 1);
+        assert_eq!(tracked.random_access_bytes_read, 4);
+    }
+
+    #[test]
+    fn endpoint_incumbent_unicode_word_keeps_malformed_utf8_before_limit_precedence() {
+        let hir = ParserBuilder::new().build().parse(r"\b.").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.admit_count(
+                b"\xff",
+                0..1,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_boundaries: 0,
+                    ..OperationLimits::default()
+                },
+            ),
+            Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+        ));
+    }
+
+    #[test]
+    fn endpoint_receipt_limit_precedes_unicode_word_utf8_validation_and_source() {
+        let hir = ParserBuilder::new().build().parse(r"\b.").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let failure = compiled
+            .count_value_with_receipt(
+                b"\xff",
+                0..1,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_output_matches: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        let prospective = failure.receipt.prospective.unwrap();
+        assert_eq!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputMatches,
+                required: prospective.output_matches,
+                limit: 0,
+            }
+        );
+        assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+    }
+
+    #[test]
+    fn endpoint_cached_mid_allocation_failure_retains_exact_partial_ledger() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = b"a";
+        let boundaries = haystack.len() + 1;
+        let limits = OperationLimits::default();
+        let cache =
+            CachedFrontierRequirements::new(compiled.program.insts.len(), boundaries, 1).unwrap();
+        let requirements = Requirements::cached(&compiled.program, boundaries, 1, limits)
+            .unwrap()
+            .expect("default limits admit the fixed cached frontier");
+        let assertions = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let mut accounting = ExecutionAccounting::default();
+        let mut actual_allocations = 0;
+        let _fault = allocation_fault::arm(2);
+        let Err(error) = CachedFrontierStore::build(
+            &compiled.program,
+            haystack,
+            assertions,
+            requirements,
+            cache,
+            limits,
+            false,
+            &mut accounting,
+            &mut actual_allocations,
+        ) else {
+            panic!("third cached allocation must fail");
+        };
+        assert_eq!(
+            error,
+            Error::AllocationFailed {
+                resource: Resource::ScratchBytes,
+                items: MAX_CACHED_FRONTIERS,
+            }
+        );
+        let state_bytes = cache.state_word_capacity * core::mem::size_of::<u64>();
+        let initialized = 2 + cache.boundary_count + cache.state_word_capacity;
+        assert_eq!(accounting.log_bytes, cache.log_bytes);
+        assert_eq!(accounting.random_access_peak_bytes, state_bytes);
+        assert_eq!(accounting.scratch_peak_bytes, state_bytes);
+        assert_eq!(accounting.peak_bytes, cache.log_bytes + state_bytes);
+        assert_eq!(accounting.frontier_bookkeeping, initialized);
+        assert_eq!(accounting.work, initialized);
+        assert_eq!(actual_allocations, 2);
+    }
+
+    #[test]
+    fn endpoint_terminal_mid_allocation_failure_retains_exact_partial_ledger() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("a|ab")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let states = compiled.program.insts.len();
+        let edges = compiled.program.predecessor_edges();
+        let live_words = (states + 1) + edges + states;
+        let live_bytes = live_words * core::mem::size_of::<usize>();
+        let mut accounting = ExecutionAccounting::default();
+        let _fault = allocation_fault::arm(3);
+        let error = super::terminal_frontier::test_allocated_composite(
+            &compiled.program,
+            OperationLimits::default(),
+            &mut accounting,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::AllocationFailed {
+                resource: Resource::ScratchBytes,
+                items: states,
+            }
+        );
+        assert_eq!(accounting.random_access_peak_bytes, live_bytes);
+        assert_eq!(accounting.scratch_peak_bytes, live_bytes);
+        assert_eq!(accounting.frontier_bytes, live_bytes);
+        assert_eq!(accounting.peak_bytes, live_bytes);
+        assert_eq!(accounting.frontier_bookkeeping, live_words);
+        assert_eq!(accounting.work, live_words);
+    }
+
+    #[test]
+    fn endpoint_terminal_log_allocation_failure_retains_frontier_only_ledger() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("a|ab")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let (total_words, frontier_bytes) =
+            super::terminal_frontier::test_allocation_shape(&compiled.program).unwrap();
+        let log_bytes = 17;
+        let mut accounting = ExecutionAccounting::default();
+        let _fault = allocation_fault::arm(7);
+        let error = super::terminal_frontier::test_allocated_then_log(
+            &compiled.program,
+            log_bytes,
+            OperationLimits::default(),
+            &mut accounting,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::AllocationFailed {
+                resource: Resource::LogBytes,
+                items: log_bytes,
+            }
+        );
+        assert_eq!(accounting.log_bytes, 0);
+        assert_eq!(accounting.random_access_peak_bytes, frontier_bytes);
+        assert_eq!(accounting.scratch_peak_bytes, frontier_bytes);
+        assert_eq!(accounting.frontier_bytes, frontier_bytes);
+        assert_eq!(accounting.peak_bytes, frontier_bytes);
+        assert_eq!(accounting.frontier_bookkeeping, total_words);
+        assert_eq!(accounting.work, total_words);
+    }
 
     #[test]
     fn uncached_checkpoint_recomputes_and_preserves_preferred_alternation() {
@@ -4244,6 +6055,7 @@ mod tests {
             used_assertions,
             &mut accounting,
             admitted,
+            false,
         )
         .unwrap();
         cached_compute_row(
@@ -4264,6 +6076,7 @@ mod tests {
             used_assertions,
             &mut accounting,
             admitted,
+            false,
         )
         .unwrap();
         cached_compute_row(
@@ -4296,7 +6109,15 @@ mod tests {
         let before_random = accounting.random_access_bytes_read;
         assert_eq!(
             store
-                .selected(program, haystack, assertions, 0, &mut accounting, admitted,)
+                .selected(
+                    program,
+                    haystack,
+                    assertions,
+                    0,
+                    &mut accounting,
+                    admitted,
+                    false,
+                )
                 .unwrap(),
             Some(1)
         );

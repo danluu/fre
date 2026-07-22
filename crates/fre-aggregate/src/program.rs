@@ -358,6 +358,24 @@ impl<'h> AssertionContext<'h> {
         assertion: Assertion,
         local_position: usize,
     ) -> Result<bool, Error> {
+        self.is_match_with_source_accesses(assertion, local_position, |_| Ok(()))
+    }
+
+    /// Evaluate one assertion and report each logical adjacent source byte as
+    /// part of that same traversal. Keeping the census inside the predicate
+    /// prevents receipt accounting from decoding Unicode neighbors a second
+    /// time merely to discover their widths.
+    #[inline]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive assertion dispatch keeps every source charge adjacent to its corresponding read"
+    )]
+    pub(crate) fn is_match_with_source_accesses(
+        self,
+        assertion: Assertion,
+        local_position: usize,
+        mut record_source_accesses: impl FnMut(usize) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
         if local_position > self.local_len {
             return Err(Error::InternalInvariant(
                 "assertion position outside operation range",
@@ -375,47 +393,77 @@ impl<'h> AssertionContext<'h> {
             Assertion::StartText => absolute == 0,
             Assertion::EndText => absolute == self.haystack.len(),
             Assertion::StartLf => {
-                absolute == 0
-                    || absolute
+                if absolute == 0 {
+                    true
+                } else {
+                    record_source_accesses(1)?;
+                    absolute
                         .checked_sub(1)
                         .and_then(|index| self.haystack.get(index))
                         .is_some_and(|&byte| byte == b'\n')
+                }
             }
             Assertion::EndLf => {
-                absolute == self.haystack.len()
-                    || self
-                        .haystack
+                if absolute == self.haystack.len() {
+                    true
+                } else {
+                    record_source_accesses(1)?;
+                    self.haystack
                         .get(absolute)
                         .is_some_and(|&byte| byte == b'\n')
+                }
             }
             Assertion::StartCrlf => {
                 if absolute == 0 {
                     true
                 } else {
+                    record_source_accesses(1)?;
                     let left_byte = absolute
                         .checked_sub(1)
                         .and_then(|index| self.haystack.get(index));
-                    let right_byte = self.haystack.get(absolute);
-                    left_byte == Some(&b'\n')
-                        || (left_byte == Some(&b'\r') && right_byte != Some(&b'\n'))
+                    if left_byte == Some(&b'\n') {
+                        true
+                    } else if left_byte == Some(&b'\r') {
+                        if absolute < self.haystack.len() {
+                            record_source_accesses(1)?;
+                        }
+                        self.haystack.get(absolute) != Some(&b'\n')
+                    } else {
+                        false
+                    }
                 }
             }
             Assertion::EndCrlf => {
                 if absolute == self.haystack.len() {
                     true
                 } else {
-                    let left_byte = absolute
-                        .checked_sub(1)
-                        .and_then(|index| self.haystack.get(index));
+                    record_source_accesses(1)?;
                     let right_byte = self.haystack.get(absolute);
-                    right_byte == Some(&b'\r')
-                        || (right_byte == Some(&b'\n') && left_byte != Some(&b'\r'))
+                    if right_byte == Some(&b'\r') {
+                        true
+                    } else if right_byte == Some(&b'\n') {
+                        if absolute > 0 {
+                            record_source_accesses(1)?;
+                        }
+                        absolute
+                            .checked_sub(1)
+                            .and_then(|index| self.haystack.get(index))
+                            != Some(&b'\r')
+                    } else {
+                        false
+                    }
                 }
             }
             assertion @ (Assertion::WordAscii
             | Assertion::WordAsciiNegate
             | Assertion::WordStartAscii
             | Assertion::WordEndAscii) => {
+                let source_bytes = usize::from(absolute > 0)
+                    .checked_add(usize::from(absolute < self.haystack.len()))
+                    .ok_or(Error::ArithmeticOverflow {
+                        resource: crate::Resource::RandomAccessBytes,
+                    })?;
+                record_source_accesses(source_bytes)?;
                 let left_word = absolute
                     .checked_sub(1)
                     .and_then(|index| self.haystack.get(index))
@@ -436,14 +484,20 @@ impl<'h> AssertionContext<'h> {
                     }
                 }
             }
-            Assertion::WordStartHalfAscii => !absolute
-                .checked_sub(1)
-                .and_then(|index| self.haystack.get(index))
-                .is_some_and(|&byte| is_ascii_word(byte)),
-            Assertion::WordEndHalfAscii => !self
-                .haystack
-                .get(absolute)
-                .is_some_and(|&byte| is_ascii_word(byte)),
+            Assertion::WordStartHalfAscii => {
+                record_source_accesses(usize::from(absolute > 0))?;
+                !absolute
+                    .checked_sub(1)
+                    .and_then(|index| self.haystack.get(index))
+                    .is_some_and(|&byte| is_ascii_word(byte))
+            }
+            Assertion::WordEndHalfAscii => {
+                record_source_accesses(usize::from(absolute < self.haystack.len()))?;
+                !self
+                    .haystack
+                    .get(absolute)
+                    .is_some_and(|&byte| is_ascii_word(byte))
+            }
             assertion @ (Assertion::WordUnicode
             | Assertion::WordUnicodeNegate
             | Assertion::WordStartUnicode
@@ -458,13 +512,29 @@ impl<'h> AssertionContext<'h> {
                     .haystack
                     .get(absolute..)
                     .ok_or(Error::InternalInvariant("Unicode assertion suffix missing"))?;
-                unicode_assertion_matches(assertion, before, after)?
+                let left_scalar = decode_last_scalar(before);
+                let right_scalar = decode_first_scalar(after);
+                let source_bytes = left_scalar
+                    .map_or(0, char::len_utf8)
+                    .checked_add(right_scalar.map_or(0, char::len_utf8))
+                    .ok_or(Error::ArithmeticOverflow {
+                        resource: crate::Resource::RandomAccessBytes,
+                    })?;
+                record_source_accesses(source_bytes)?;
+                unicode_assertion_matches(
+                    assertion,
+                    before.is_empty(),
+                    after.is_empty(),
+                    left_scalar,
+                    right_scalar,
+                )?
             }
         })
     }
 
-    /// Exact adjacent haystack bytes inspected by the byte-only candidate
-    /// executor for one assertion evaluation at `local_position`.
+    /// Exact logical adjacent haystack bytes inspected by one assertion.
+    /// Specialized executors use this census when their predicate and meter
+    /// cannot share the generic receipt evaluator above.
     pub(crate) fn candidate_source_bytes(
         self,
         assertion: Assertion,
@@ -500,9 +570,21 @@ impl<'h> AssertionContext<'h> {
             | Assertion::WordStartUnicode
             | Assertion::WordEndUnicode
             | Assertion::WordStartHalfUnicode
-            | Assertion::WordEndHalfUnicode => Err(Error::InternalInvariant(
-                "candidate source census reached Unicode assertion",
-            )),
+            | Assertion::WordEndHalfUnicode => {
+                let before = self
+                    .haystack
+                    .get(..absolute)
+                    .ok_or(Error::InternalInvariant("Unicode assertion prefix missing"))?;
+                let after = self
+                    .haystack
+                    .get(absolute..)
+                    .ok_or(Error::InternalInvariant("Unicode assertion suffix missing"))?;
+                let left = decode_last_scalar(before).map_or(0, char::len_utf8);
+                let right = decode_first_scalar(after).map_or(0, char::len_utf8);
+                left.checked_add(right).ok_or(Error::ArithmeticOverflow {
+                    resource: crate::Resource::RandomAccessBytes,
+                })
+            }
         }
     }
 
@@ -515,6 +597,17 @@ impl<'h> AssertionContext<'h> {
 mod assertion_source_tests {
     use super::{Assertion, AssertionContext};
 
+    fn source_bytes(context: AssertionContext<'_>, assertion: Assertion, position: usize) -> usize {
+        let mut bytes = 0_usize;
+        context
+            .is_match_with_source_accesses(assertion, position, |amount| {
+                bytes = bytes.checked_add(amount).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        bytes
+    }
+
     #[test]
     fn candidate_assertion_source_bytes_are_exact_at_edges_and_interior() {
         let context = AssertionContext::new(b"ab", 0, 2).unwrap();
@@ -525,33 +618,23 @@ mod assertion_source_tests {
             Assertion::StartCrlf,
             Assertion::WordStartHalfAscii,
         ] {
-            assert_eq!(context.candidate_source_bytes(assertion, 0).unwrap(), 0);
+            assert_eq!(source_bytes(context, assertion, 0), 0);
         }
         for assertion in [
             Assertion::EndLf,
             Assertion::EndCrlf,
             Assertion::WordEndHalfAscii,
         ] {
-            assert_eq!(context.candidate_source_bytes(assertion, 0).unwrap(), 1);
+            assert_eq!(source_bytes(context, assertion, 0), 1);
         }
-        assert_eq!(
-            context
-                .candidate_source_bytes(Assertion::WordAscii, 0)
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            context
-                .candidate_source_bytes(Assertion::WordAscii, 1)
-                .unwrap(),
-            2
-        );
+        assert_eq!(source_bytes(context, Assertion::WordAscii, 0), 1);
+        assert_eq!(source_bytes(context, Assertion::WordAscii, 1), 2);
         for assertion in [
             Assertion::StartLf,
             Assertion::StartCrlf,
             Assertion::WordStartHalfAscii,
         ] {
-            assert_eq!(context.candidate_source_bytes(assertion, 2).unwrap(), 1);
+            assert_eq!(source_bytes(context, assertion, 2), 1);
         }
         for assertion in [
             Assertion::StartText,
@@ -560,8 +643,16 @@ mod assertion_source_tests {
             Assertion::EndCrlf,
             Assertion::WordEndHalfAscii,
         ] {
-            assert_eq!(context.candidate_source_bytes(assertion, 2).unwrap(), 0);
+            assert_eq!(source_bytes(context, assertion, 2), 0);
         }
+    }
+
+    #[test]
+    fn unicode_assertion_source_bytes_are_censused_during_one_evaluation() {
+        let haystack = "aé🦀z".as_bytes();
+        let context = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let position = "aé".len();
+        assert_eq!(source_bytes(context, Assertion::WordUnicode, position), 6);
     }
 }
 
@@ -579,13 +670,13 @@ fn unicode_word_scalar(scalar: Option<char>) -> Result<bool, Error> {
 
 fn unicode_assertion_matches(
     assertion: Assertion,
-    before: &[u8],
-    after: &[u8],
+    before_empty: bool,
+    after_empty: bool,
+    left_scalar: Option<char>,
+    right_scalar: Option<char>,
 ) -> Result<bool, Error> {
-    let left_scalar = decode_last_scalar(before);
-    let right_scalar = decode_first_scalar(after);
-    let left_valid = before.is_empty() || left_scalar.is_some();
-    let right_valid = after.is_empty() || right_scalar.is_some();
+    let left_valid = before_empty || left_scalar.is_some();
+    let right_valid = after_empty || right_scalar.is_some();
     let left_word = unicode_word_scalar(left_scalar)?;
     let right_word = unicode_word_scalar(right_scalar)?;
     Ok(match assertion {

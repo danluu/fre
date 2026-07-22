@@ -2,7 +2,8 @@ use core::{fmt, ops::Range};
 use std::sync::Arc;
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompiledRegex, RustByteProfile, SpanIter,
+    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpans, CompiledRegex,
+    OperationAttemptError, OperationProspective, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
@@ -20,8 +21,17 @@ use fre_kernels::{
     BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
-    FixedClassSandwichBuildAccounting, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
-    FixedClassSandwichCountResult, FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
+    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
+    FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
+    FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainCountOutcome,
+    FixedAbsoluteDomainDescriptorKind, FixedAbsoluteDomainDisposition,
+    FixedAbsoluteDomainOperation, FixedAbsoluteDomainOperationIdentity, FixedAbsoluteDomainPlan,
+    FixedAbsoluteDomainProspective, FixedAbsoluteDomainReduceAccounting,
+    FixedAbsoluteDomainReduceError, FixedAbsoluteDomainReduceLimits, FixedAbsoluteDomainResidual,
+    FixedAbsoluteDomainSpanSumResult, FixedClassSandwichBuildAccounting,
+    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichCountResult,
+    FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
@@ -52,7 +62,7 @@ use fre_kernels::{
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSpanSumResult,
+    UnicodeScalarAggregateSpanSumResult, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -63,15 +73,16 @@ use regex_syntax::hir::{
 };
 
 use crate::{
-    AggregateCompileAccounting, AggregateCompileLimits, AggregateEngineError,
-    AggregateExecutionAccounting, AggregateOperationCertificate, AggregateOperationLimits,
-    AggregatePlanId, BuildError, Match, finite, finite_root, grapheme_scalar,
+    AggregateCompileAccounting, AggregateCompileAttemptError, AggregateCompileLimits,
+    AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
+    AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match, finite,
+    finite_root, fixed_absolute, grapheme_scalar,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 22;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 23;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -125,6 +136,9 @@ pub enum AggregatePlanKind {
     PrefixClassAlternation,
     /// Linear literal-interval stream for a fixed-class/bounded-gap context.
     BoundedContext,
+    /// Fixed candidate derived from absolute StartText/EndText over the
+    /// original haystack, with an eager residual only for scalar envelopes.
+    FixedAbsoluteDomain,
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
@@ -151,6 +165,8 @@ pub enum AggregatePlanIdentity {
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Bounded byte-context proof plus native count identity.
     BoundedContext(AggregateBoundedContextIdentity),
+    /// Closed fixed absolute-domain descriptor and declared residual identity.
+    FixedAbsoluteDomain(AggregateFixedAbsoluteDomainIdentity),
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
@@ -288,6 +304,406 @@ pub struct AggregateBoundedContextIdentity {
     pub kernel: BoundedContextOperationIdentity,
 }
 
+/// Facade closure for one fixed absolute-domain operation. The continuation
+/// identity is present only for the rejection-only scalar envelope and is
+/// eagerly constructed before this identity is published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainIdentity {
+    pub kernel: FixedAbsoluteDomainOperationIdentity,
+    pub residual: Option<AggregateContinuationIdentity>,
+    pub residual_strategy: Option<AggregateStrategy>,
+}
+
+/// Owner-local construction receipt. Direct descriptors have no residual;
+/// the scalar envelope reports both co-live immutable artifacts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainBuildAccounting {
+    /// Kernel-local construction receipt before the facade owner exists.
+    pub kernel: FixedAbsoluteDomainBuildAccounting,
+    /// The same guard construction with the construction-owner allocation
+    /// included in every applicable fixed-domain build dimension.
+    pub guard_with_owner: FixedAbsoluteDomainBuildAccounting,
+    pub residual: Option<AggregateCompileAccounting>,
+    pub prospective: AggregateFixedAbsoluteDomainResidualBuildProspective,
+    pub actual: AggregateFixedAbsoluteDomainResidualBuildActual,
+}
+
+/// Compact inline projection for the fixed-domain owner. The complete kernel
+/// and residual receipts live once in the construction-owned seal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainBuildSummary {
+    pub prospective: AggregateFixedAbsoluteDomainResidualBuildProspective,
+    pub actual: AggregateFixedAbsoluteDomainResidualBuildActual,
+    pub has_residual: bool,
+}
+
+impl AggregateFixedAbsoluteDomainBuildAccounting {
+    const fn summary(self) -> AggregateFixedAbsoluteDomainBuildSummary {
+        AggregateFixedAbsoluteDomainBuildSummary {
+            prospective: self.prospective,
+            actual: self.actual,
+            has_residual: self.residual.is_some(),
+        }
+    }
+}
+
+/// Input-only construction envelope for a fixed guard and optional eager
+/// scalar continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualBuildProspective {
+    pub work: u64,
+    pub allocations: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Exact cumulative construction ledger for the fixed composite.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualBuildActual {
+    pub work: u64,
+    pub allocations: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+    pub published: bool,
+}
+
+/// Outer receipt retained when eager scalar construction fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+    pub prospective: AggregateFixedAbsoluteDomainResidualBuildProspective,
+    pub actual: AggregateFixedAbsoluteDomainResidualBuildActual,
+}
+
+impl AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+    #[must_use]
+    pub const fn contains_actual(self) -> bool {
+        self.actual.work <= self.prospective.work
+            && self.actual.allocations <= self.prospective.allocations
+            && self.actual.persistent_bytes <= self.prospective.persistent_bytes
+            && self.actual.peak_bytes <= self.prospective.peak_bytes
+            && !self.actual.published
+    }
+}
+
+/// Separately enforced U1 composite construction dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateFixedAbsoluteDomainResidualBuildResource {
+    Work,
+    Allocations,
+    PersistentBytes,
+    PeakBytes,
+}
+
+fn compose_fixed_residual_build_prospective(
+    guard: fre_kernels::FixedAbsoluteDomainBuildProspective,
+    continuation: AggregateCompileLimits,
+    residual_allocations: usize,
+) -> Result<AggregateFixedAbsoluteDomainResidualBuildProspective, &'static str> {
+    let continuation_work =
+        u64::try_from(continuation.max_work).map_err(|_| "residual work does not fit u64")?;
+    let work = guard
+        .build_work
+        .checked_add(continuation_work)
+        .ok_or("fixed residual prospective work overflow")?;
+    let allocations = guard
+        .allocations
+        .checked_add(residual_allocations)
+        .ok_or("fixed residual prospective allocations overflow")?;
+    let persistent_bytes = guard
+        .persistent_bytes
+        .checked_add(continuation.max_program_bytes)
+        .ok_or("fixed residual prospective persistent bytes overflow")?;
+    let peak_bytes = guard
+        .persistent_bytes
+        .checked_add(continuation.max_program_bytes)
+        .map(|co_live| co_live.max(guard.peak_bytes))
+        .ok_or("fixed residual prospective peak bytes overflow")?;
+    Ok(AggregateFixedAbsoluteDomainResidualBuildProspective {
+        work,
+        allocations,
+        persistent_bytes,
+        peak_bytes,
+    })
+}
+
+fn fixed_absolute_owner_bytes() -> Result<usize, &'static str> {
+    let pointer_metadata_bytes = core::mem::size_of::<usize>()
+        .checked_mul(2)
+        .ok_or("fixed absolute owner metadata bytes overflow")?;
+    core::mem::size_of::<AggregateExecutionIdentityInner>()
+        .checked_add(pointer_metadata_bytes)
+        .ok_or("fixed absolute owner allocation bytes overflow")
+}
+
+fn include_fixed_absolute_owner_guard_prospective(
+    prospective: FixedAbsoluteDomainBuildProspective,
+) -> Result<FixedAbsoluteDomainBuildProspective, &'static str> {
+    let owner_bytes = fixed_absolute_owner_bytes()?;
+    let owner_work = u64::try_from(owner_bytes)
+        .map_err(|_| "fixed absolute owner initialization work does not fit u64")?;
+    let persistent_bytes = prospective
+        .persistent_bytes
+        .checked_add(owner_bytes)
+        .ok_or("fixed absolute owner persistent bytes overflow")?;
+    Ok(FixedAbsoluteDomainBuildProspective {
+        descriptor: prospective.descriptor,
+        items: prospective
+            .items
+            .checked_add(1)
+            .ok_or("fixed absolute owner items overflow")?,
+        payload_bytes: prospective
+            .payload_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner payload bytes overflow")?,
+        identity_bytes: prospective
+            .identity_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner identity bytes overflow")?,
+        retained_heap_bytes: prospective
+            .retained_heap_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner retained bytes overflow")?,
+        copied_bytes: prospective
+            .copied_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner copied bytes overflow")?,
+        allocations: prospective
+            .allocations
+            .checked_add(1)
+            .ok_or("fixed absolute owner allocations overflow")?,
+        initialized_bytes: prospective
+            .initialized_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner initialized bytes overflow")?,
+        build_work: prospective
+            .build_work
+            .checked_add(owner_work)
+            .ok_or("fixed absolute owner build work overflow")?,
+        scratch_bytes: prospective.scratch_bytes,
+        persistent_bytes,
+        peak_bytes: prospective.peak_bytes.max(persistent_bytes),
+    })
+}
+
+fn include_fixed_absolute_owner_guard_actual(
+    actual: FixedAbsoluteDomainBuildActual,
+) -> Result<FixedAbsoluteDomainBuildActual, &'static str> {
+    let owner_bytes = fixed_absolute_owner_bytes()?;
+    let owner_work = u64::try_from(owner_bytes)
+        .map_err(|_| "fixed absolute owner initialization work does not fit u64")?;
+    let persistent_bytes = actual
+        .persistent_bytes
+        .checked_add(owner_bytes)
+        .ok_or("fixed absolute owner actual persistent bytes overflow")?;
+    Ok(FixedAbsoluteDomainBuildActual {
+        items: actual
+            .items
+            .checked_add(1)
+            .ok_or("fixed absolute owner actual items overflow")?,
+        payload_bytes: actual
+            .payload_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner actual payload bytes overflow")?,
+        identity_bytes: actual
+            .identity_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner actual identity bytes overflow")?,
+        retained_heap_bytes: actual
+            .retained_heap_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner actual retained bytes overflow")?,
+        copied_bytes: actual
+            .copied_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner actual copied bytes overflow")?,
+        allocations: actual
+            .allocations
+            .checked_add(1)
+            .ok_or("fixed absolute owner actual allocations overflow")?,
+        initialized_bytes: actual
+            .initialized_bytes
+            .checked_add(owner_bytes)
+            .ok_or("fixed absolute owner actual initialized bytes overflow")?,
+        build_work: actual
+            .build_work
+            .checked_add(owner_work)
+            .ok_or("fixed absolute owner actual build work overflow")?,
+        scratch_bytes: actual.scratch_bytes,
+        persistent_bytes,
+        peak_bytes: actual.peak_bytes.max(persistent_bytes),
+        published: actual.published,
+    })
+}
+
+fn fixed_guard_build_limit_refusal(
+    prospective: FixedAbsoluteDomainBuildProspective,
+    limits: FixedAbsoluteDomainBuildLimits,
+) -> Option<(FixedAbsoluteDomainBuildResource, u64, u64)> {
+    let checks = [
+        (
+            FixedAbsoluteDomainBuildResource::Items,
+            u64::try_from(prospective.items).ok()?,
+            u64::try_from(limits.max_items).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::PayloadBytes,
+            u64::try_from(prospective.payload_bytes).ok()?,
+            u64::try_from(limits.max_payload_bytes).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::IdentityBytes,
+            u64::try_from(prospective.identity_bytes).ok()?,
+            u64::try_from(limits.max_identity_bytes).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::CopiedBytes,
+            u64::try_from(prospective.copied_bytes).ok()?,
+            u64::try_from(limits.max_copied_bytes).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::Allocations,
+            u64::try_from(prospective.allocations).ok()?,
+            u64::try_from(limits.max_allocations).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::InitializedBytes,
+            u64::try_from(prospective.initialized_bytes).ok()?,
+            u64::try_from(limits.max_initialized_bytes).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::Work,
+            prospective.build_work,
+            limits.max_build_work,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::PersistentBytes,
+            u64::try_from(prospective.persistent_bytes).ok()?,
+            u64::try_from(limits.max_persistent_bytes).ok()?,
+        ),
+        (
+            FixedAbsoluteDomainBuildResource::PeakBytes,
+            u64::try_from(prospective.peak_bytes).ok()?,
+            u64::try_from(limits.max_peak_bytes).ok()?,
+        ),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, required, limit)| required > limit)
+}
+
+fn fixed_guard_build_preflight_error(
+    prospective: FixedAbsoluteDomainBuildProspective,
+    resource: FixedAbsoluteDomainBuildResource,
+    needed: u64,
+    limit: u64,
+) -> FixedAbsoluteDomainBuildError {
+    FixedAbsoluteDomainBuildError {
+        kind: FixedAbsoluteDomainBuildErrorKind::ResourceLimit {
+            resource,
+            needed,
+            limit,
+        },
+        prospective: Some(prospective),
+        actual: FixedAbsoluteDomainBuildActual::default(),
+    }
+}
+
+fn bind_fixed_owner_to_guard_build_error(
+    mut source: FixedAbsoluteDomainBuildError,
+    prospective: FixedAbsoluteDomainBuildProspective,
+) -> FixedAbsoluteDomainBuildError {
+    if source.prospective.is_some() {
+        source.prospective = Some(prospective);
+    }
+    source
+}
+
+fn include_fixed_absolute_owner_prospective(
+    prospective: AggregateFixedAbsoluteDomainResidualBuildProspective,
+) -> Result<AggregateFixedAbsoluteDomainResidualBuildProspective, &'static str> {
+    let owner_bytes = fixed_absolute_owner_bytes()?;
+    let owner_work = u64::try_from(owner_bytes)
+        .map_err(|_| "fixed absolute owner initialization work does not fit u64")?;
+    let work = prospective
+        .work
+        .checked_add(owner_work)
+        .ok_or("fixed absolute owner prospective work overflow")?;
+    let allocations = prospective
+        .allocations
+        .checked_add(1)
+        .ok_or("fixed absolute owner prospective allocations overflow")?;
+    let persistent_bytes = prospective
+        .persistent_bytes
+        .checked_add(owner_bytes)
+        .ok_or("fixed absolute owner prospective persistent bytes overflow")?;
+    let peak_bytes = prospective.peak_bytes.max(persistent_bytes);
+    Ok(AggregateFixedAbsoluteDomainResidualBuildProspective {
+        work,
+        allocations,
+        persistent_bytes,
+        peak_bytes,
+    })
+}
+
+fn fixed_residual_build_limit_refusal(
+    prospective: AggregateFixedAbsoluteDomainResidualBuildProspective,
+    limits: AggregateFixedAbsoluteDomainResidualBuildLimits,
+) -> Option<(AggregateFixedAbsoluteDomainResidualBuildResource, u64, u64)> {
+    let checks = [
+        (
+            AggregateFixedAbsoluteDomainResidualBuildResource::Work,
+            prospective.work,
+            limits.max_work,
+        ),
+        (
+            AggregateFixedAbsoluteDomainResidualBuildResource::Allocations,
+            u64::try_from(prospective.allocations).ok()?,
+            u64::try_from(limits.max_allocations).ok()?,
+        ),
+        (
+            AggregateFixedAbsoluteDomainResidualBuildResource::PersistentBytes,
+            u64::try_from(prospective.persistent_bytes).ok()?,
+            u64::try_from(limits.max_persistent_bytes).ok()?,
+        ),
+        (
+            AggregateFixedAbsoluteDomainResidualBuildResource::PeakBytes,
+            u64::try_from(prospective.peak_bytes).ok()?,
+            u64::try_from(limits.max_peak_bytes).ok()?,
+        ),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, required, limit)| required > limit)
+}
+
+fn compose_fixed_residual_build_failure_actual(
+    guard: FixedAbsoluteDomainBuildAccounting,
+    residual: &crate::AggregateCompileAttemptReceipt,
+) -> Option<AggregateFixedAbsoluteDomainResidualBuildActual> {
+    let residual_work = u64::try_from(residual.actual.work).ok()?;
+    let work = guard.actual.build_work.checked_add(residual_work)?;
+    let allocations = guard
+        .actual
+        .allocations
+        .checked_add(residual.actual_allocations?)?;
+    let persistent_bytes = guard
+        .actual
+        .persistent_bytes
+        .checked_add(residual.live_construction_bytes)?;
+    let peak_bytes = guard
+        .actual
+        .persistent_bytes
+        .checked_add(residual.actual.construction_peak_bytes)?
+        .max(guard.actual.peak_bytes);
+    Some(AggregateFixedAbsoluteDomainResidualBuildActual {
+        work,
+        allocations,
+        persistent_bytes,
+        peak_bytes,
+        published: false,
+    })
+}
+
 /// Profile proof attached to a continuation-program facade identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateContinuationSemantics {
@@ -339,6 +755,8 @@ pub enum AggregateBuildAccounting {
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
     /// Bounded-context construction certificate.
     BoundedContext(BoundedContextBuildAccounting),
+    /// Fixed absolute-domain guard and optional eager residual certificate.
+    FixedAbsoluteDomain(AggregateFixedAbsoluteDomainBuildSummary),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
     /// Sparse shared reversed automaton construction certificate. This is the
@@ -386,6 +804,9 @@ pub struct AggregateBuildLimits {
     pub max_prefix_class_alternation_planner_work: usize,
     /// Maximum allocation-free HIR/range inspection work for bounded context.
     pub max_bounded_context_planner_work: usize,
+    /// Maximum canonical-HIR work for closed fixed absolute-domain proofs.
+    /// This quota is independent of every incumbent selector.
+    pub max_fixed_absolute_planner_work: usize,
     /// Maximum checked work for finite-language shape analysis and expansion.
     pub max_finite_planner_work: u64,
     /// Complete exact-literal kernel construction limits.
@@ -404,6 +825,11 @@ pub struct AggregateBuildLimits {
     pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
     /// Complete bounded-context construction limits.
     pub bounded_context: BoundedContextBuildLimits,
+    /// Complete fixed absolute-domain guard construction limits.
+    pub fixed_absolute: FixedAbsoluteDomainBuildLimits,
+    /// U1-only composite construction caps for the scalar guard plus eager
+    /// continuation residual.
+    pub fixed_absolute_residual: AggregateFixedAbsoluteDomainResidualBuildLimits,
     /// Complete bounded reversed-DFA construction limits.
     pub finite_literal: OrderedLiteralAggregateBuildLimits,
     /// Complete bounded continuation-program compiler limits.
@@ -424,6 +850,7 @@ impl Default for AggregateBuildLimits {
             max_bounded_separated_fields_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
             max_bounded_context_planner_work: 4_096,
+            max_fixed_absolute_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
@@ -433,8 +860,80 @@ impl Default for AggregateBuildLimits {
             bounded_separated_fields: BoundedSeparatedFieldsBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             bounded_context: BoundedContextBuildLimits::default(),
+            fixed_absolute: FixedAbsoluteDomainBuildLimits::default(),
+            fixed_absolute_residual: AggregateFixedAbsoluteDomainResidualBuildLimits::default(),
             finite_literal: OrderedLiteralAggregateBuildLimits::default(),
             continuation: AggregateCompileLimits::default(),
+        }
+    }
+}
+
+/// Composite construction ceilings for the scalar fixed-domain route. These
+/// do not alter the guard's independent kernel limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualBuildLimits {
+    pub max_work: u64,
+    pub max_allocations: usize,
+    pub max_persistent_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl Default for AggregateFixedAbsoluteDomainResidualBuildLimits {
+    fn default() -> Self {
+        let guard = FixedAbsoluteDomainBuildLimits::default();
+        let continuation = AggregateCompileLimits::default();
+        let continuation_work =
+            u64::try_from(continuation.max_work).expect("default continuation work fits u64");
+        let max_work = guard
+            .max_build_work
+            .checked_add(continuation_work)
+            .expect("default fixed residual construction work fits u64");
+        let max_persistent_bytes = guard
+            .max_persistent_bytes
+            .checked_add(continuation.max_program_bytes)
+            .expect("default fixed residual construction bytes fit usize");
+        let max_peak_bytes = guard.max_peak_bytes.max(max_persistent_bytes);
+        Self {
+            max_work,
+            max_allocations: 4_096,
+            max_persistent_bytes,
+            max_peak_bytes,
+        }
+    }
+}
+
+/// U1-only composite ceilings for the fixed-scalar guard plus its eager
+/// continuation. Other aggregate plan families do not consult these limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualLimits {
+    pub max_work: usize,
+    pub max_allocations: usize,
+    pub max_persistent_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl Default for AggregateFixedAbsoluteDomainResidualLimits {
+    fn default() -> Self {
+        let guard_run = FixedAbsoluteDomainReduceLimits::default();
+        let continuation_run = AggregateOperationLimits::default();
+        let guard_build = FixedAbsoluteDomainBuildLimits::default();
+        let continuation_build = AggregateCompileLimits::default();
+        let max_work = guard_run
+            .max_total_work
+            .checked_add(continuation_run.max_work)
+            .expect("default fixed residual work caps fit usize");
+        let max_persistent_bytes = guard_build
+            .max_persistent_bytes
+            .checked_add(continuation_build.max_program_bytes)
+            .expect("default fixed residual persistent caps fit usize");
+        let max_peak_bytes = max_persistent_bytes
+            .checked_add(continuation_run.max_peak_bytes)
+            .expect("default fixed residual peak caps fit usize");
+        Self {
+            max_work,
+            max_allocations: 16,
+            max_persistent_bytes,
+            max_peak_bytes,
         }
     }
 }
@@ -459,6 +958,11 @@ pub struct AggregateRunLimits {
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Direct bounded-context literal interval-stream limits.
     pub bounded_context: BoundedContextReduceLimits,
+    /// Fixed absolute-domain guard limits. Scalar residuals additionally use
+    /// the unchanged continuation limits below.
+    pub fixed_absolute: FixedAbsoluteDomainReduceLimits,
+    /// Composite-only caps for a scalar fixed-domain residual.
+    pub fixed_absolute_residual: AggregateFixedAbsoluteDomainResidualLimits,
     /// Shared finite-language dense/sparse reducer limits. For sparse plans,
     /// `max_total_work` also bounds edge lookups, edge comparisons and failure
     /// steps individually because each is a component of that total.
@@ -485,7 +989,9 @@ pub struct AggregateBuildReport {
     pub selection: AggregatePlanSelection,
     /// Plan family selected before publication.
     pub plan: AggregatePlanKind,
-    /// Continuation storage strategy, absent for an exact-literal plan.
+    /// Continuation storage strategy, present for continuation plans and the
+    /// scalar fixed-domain composite's eager residual; absent for direct-only
+    /// plans.
     pub continuation_strategy: Option<AggregateStrategy>,
     /// The only capture treatment admitted by these whole-match APIs.
     pub capture_semantics: AggregateCaptureSemantics,
@@ -516,6 +1022,8 @@ pub struct AggregateBuildReport {
     pub prefix_class_alternation_planner_work: usize,
     /// Bounded-context structural inspection work.
     pub bounded_context_planner_work: usize,
+    /// Fixed absolute-domain canonical-HIR inspection work.
+    pub fixed_absolute_planner_work: u32,
     /// Checked finite-language root inspection and, for the dense route,
     /// analysis/expansion work; zero when finite inspection is skipped.
     /// This remains nonzero when `Auto` proves a finite language but a typed
@@ -525,6 +1033,8 @@ pub struct AggregateBuildReport {
     /// double-counted as work of the selected continuation artifact.
     pub finite_planner_work: u64,
     /// Transparent capture-node visits charged by the selected plan builder.
+    /// A scalar fixed-domain composite includes both guard inspection and its
+    /// eagerly compiled residual's capture-erasure work.
     pub capture_erasure_work: usize,
     /// Capture annotations removed without changing whole-match semantics.
     pub captures_erased: usize,
@@ -537,7 +1047,7 @@ pub struct AggregateBuildReport {
     /// report while retaining the original compiled artifact.
     sealed_bounded_separated_fields_identity: Option<AggregateBoundedSeparatedFieldsIdentity>,
     sealed_required_internal_anchor_identity: Option<AggregateRequiredInternalAnchorSeal>,
-    sealed_url_aggregate_identity: Option<AggregateUrlAggregateSeal>,
+    sealed_url_aggregate_identity: Option<AggregateUrlOrFixedSeal>,
     /// Selected plan's retained capacity/persistent bytes.
     pub retained_capacity_bytes: usize,
 }
@@ -554,21 +1064,366 @@ struct AggregateUrlAggregateSeal {
     compile: AggregateCompileAccounting,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the fixed owner seal remains allocation-free and pointer-exact; boxing would add an unbudgeted allocation"
+)]
+enum AggregateUrlOrFixedSeal {
+    Url(AggregateUrlAggregateSeal),
+    Fixed(AggregateExecutionIdentity),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AggregateFixedAbsoluteDomainSeal {
+    schema_version: u32,
+    syntax_key: Arc<CacheKey>,
+    admission: AdmissionStatus,
+    syntax: ParseSummary,
+    operation: AggregateOperation,
+    selection: AggregatePlanSelection,
+    plan: AggregatePlanKind,
+    continuation_strategy: Option<AggregateStrategy>,
+    capture_semantics: AggregateCaptureSemantics,
+    planner_work: usize,
+    unicode_scalar_planner_work: usize,
+    fixed_class_sandwich_planner_work: usize,
+    bounded_affix_planner_work: usize,
+    grapheme_scalar_dfa_planner_work: usize,
+    bounded_class_sequence_planner_work: usize,
+    bounded_separated_fields_planner_work: usize,
+    prefix_class_alternation_planner_work: usize,
+    bounded_context_planner_work: usize,
+    fixed_absolute_planner_work: usize,
+    max_fixed_absolute_planner_work: usize,
+    finite_planner_work: u64,
+    capture_erasure_work: usize,
+    captures_erased: usize,
+    identity: AggregateFixedAbsoluteDomainIdentity,
+    build: AggregateFixedAbsoluteDomainBuildAccounting,
+    admission_policy: AdmissionPolicy,
+    syntax_safety: SafetyEnvelope,
+    guard_build_limits: FixedAbsoluteDomainBuildLimits,
+    residual_build_limits: AggregateFixedAbsoluteDomainResidualBuildLimits,
+    continuation_build_limits: AggregateCompileLimits,
+    residual_allocation_census: Option<usize>,
+    retained_capacity_bytes: usize,
+}
+
+impl AggregateFixedAbsoluteDomainSeal {
+    fn matches_build_inputs(&self, limits: &AggregateBuildLimits) -> bool {
+        let scalar = self.identity.kernel.descriptor.kind()
+            == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
+        self.admission_policy == limits.admission
+            && self.syntax_safety == limits.syntax_safety
+            && self.max_fixed_absolute_planner_work == limits.max_fixed_absolute_planner_work
+            && self.guard_build_limits == limits.fixed_absolute
+            && (!scalar
+                || self.residual_build_limits == limits.fixed_absolute_residual
+                    && self.continuation_build_limits == limits.continuation)
+    }
+
+    fn matches_public_report(&self, report: &AggregateBuildReport) -> bool {
+        self.schema_version == report.schema_version
+            && self.syntax_key == report.syntax_key
+            && self.admission == report.admission
+            && self.syntax == report.syntax
+            && self.operation == report.operation
+            && self.selection == report.selection
+            && self.plan == report.plan
+            && self.continuation_strategy == report.continuation_strategy
+            && self.capture_semantics == report.capture_semantics
+            && self.planner_work == report.planner_work
+            && self.unicode_scalar_planner_work == report.unicode_scalar_planner_work
+            && self.fixed_class_sandwich_planner_work == report.fixed_class_sandwich_planner_work
+            && self.bounded_affix_planner_work == report.bounded_affix_planner_work
+            && self.grapheme_scalar_dfa_planner_work == report.grapheme_scalar_dfa_planner_work
+            && self.bounded_class_sequence_planner_work
+                == report.bounded_class_sequence_planner_work
+            && self.bounded_separated_fields_planner_work
+                == report.bounded_separated_fields_planner_work
+            && self.prefix_class_alternation_planner_work
+                == report.prefix_class_alternation_planner_work
+            && self.bounded_context_planner_work == report.bounded_context_planner_work
+            && u32::try_from(self.fixed_absolute_planner_work).ok()
+                == Some(report.fixed_absolute_planner_work)
+            && self.finite_planner_work == report.finite_planner_work
+            && self.capture_erasure_work == report.capture_erasure_work
+            && self.captures_erased == report.captures_erased
+            && matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::FixedAbsoluteDomain(identity)
+                    if identity == self.identity
+            )
+            && matches!(
+                report.build,
+                AggregateBuildAccounting::FixedAbsoluteDomain(summary)
+                    if summary == self.build.summary()
+            )
+            && self.retained_capacity_bytes == report.retained_capacity_bytes
+    }
+}
+
 impl AggregateBuildReport {
+    fn fixed_absolute_domain_owner(&self) -> Option<&AggregateExecutionIdentity> {
+        match self.sealed_url_aggregate_identity.as_ref() {
+            Some(AggregateUrlOrFixedSeal::Fixed(owner)) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// Check that all public fixed-route discriminators and resource receipts
+    /// are the exact owner-local values sealed with the immutable artifacts.
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closure proof intentionally keeps every route, owner and accounting invariant in one audit boundary"
+    )]
+    pub fn has_closed_fixed_absolute_domain_identity(&self) -> bool {
+        match (
+            self.plan,
+            self.build,
+            self.plan_identity,
+            self.fixed_absolute_domain_owner(),
+        ) {
+            (
+                AggregatePlanKind::FixedAbsoluteDomain,
+                AggregateBuildAccounting::FixedAbsoluteDomain(summary),
+                AggregatePlanIdentity::FixedAbsoluteDomain(identity),
+                Some(owner),
+            ) => {
+                let sealed = owner.fixed_absolute_domain_seal();
+                if summary != sealed.build.summary() {
+                    return false;
+                }
+                let build = sealed.build;
+                let scalar = identity.kernel.descriptor.kind()
+                    == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
+                let operation_closed = matches!(
+                    (
+                        self.operation,
+                        identity.kernel.operation,
+                        identity.kernel.descriptor.kind(),
+                    ),
+                    (
+                        AggregateOperation::Count,
+                        fre_kernels::FixedAbsoluteDomainOperation::Count,
+                        FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
+                            | FixedAbsoluteDomainDescriptorKind::WholeOrderedWords
+                            | FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope,
+                    ) | (
+                        AggregateOperation::SpanSum,
+                        fre_kernels::FixedAbsoluteDomainOperation::SpanSum,
+                        FixedAbsoluteDomainDescriptorKind::EndMaskSequence
+                            | FixedAbsoluteDomainDescriptorKind::EndOneByteMask
+                            | FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix,
+                    )
+                );
+                let residual_closed = match (
+                    scalar,
+                    identity.residual,
+                    identity.residual_strategy,
+                    build.residual,
+                    identity.kernel.residual,
+                    self.continuation_strategy,
+                ) {
+                    (false, None, None, None, FixedAbsoluteDomainResidual::None, None) => true,
+                    (
+                        true,
+                        Some(AggregateContinuationIdentity {
+                            semantics: AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir,
+                            ..
+                        }),
+                        Some(identity_strategy),
+                        Some(_),
+                        FixedAbsoluteDomainResidual::PrepublishedContinuation,
+                        Some(report_strategy),
+                    ) => identity_strategy == report_strategy,
+                    _ => false,
+                };
+                let Some(owner_bytes) = fixed_absolute_owner_bytes().ok() else {
+                    return false;
+                };
+                let Some(owner_work) = u64::try_from(owner_bytes).ok() else {
+                    return false;
+                };
+                let expected_guard_with_owner =
+                    include_fixed_absolute_owner_guard_prospective(build.kernel.prospective)
+                        .ok()
+                        .zip(include_fixed_absolute_owner_guard_actual(build.kernel.actual).ok());
+                let guard_with_owner_closed =
+                    expected_guard_with_owner.is_some_and(|(prospective, actual)| {
+                        build.guard_with_owner
+                            == FixedAbsoluteDomainBuildAccounting {
+                                prospective,
+                                actual,
+                            }
+                            && fixed_guard_build_actual_fits(actual, prospective)
+                            && fixed_guard_build_limit_refusal(
+                                prospective,
+                                sealed.guard_build_limits,
+                            )
+                            .is_none()
+                    });
+                let artifact_persistent = build.residual.map_or_else(
+                    || Some(build.kernel.actual.persistent_bytes),
+                    |residual| {
+                        build
+                            .kernel
+                            .actual
+                            .persistent_bytes
+                            .checked_add(residual.program_bytes)
+                    },
+                );
+                let artifact_peak = build.residual.map_or_else(
+                    || Some(build.kernel.actual.peak_bytes),
+                    |residual| {
+                        build
+                            .kernel
+                            .actual
+                            .persistent_bytes
+                            .checked_add(residual.construction_peak_bytes)
+                            .map(|co_live| co_live.max(build.kernel.actual.peak_bytes))
+                    },
+                );
+                let expected_persistent =
+                    artifact_persistent.and_then(|bytes| bytes.checked_add(owner_bytes));
+                let expected_peak = artifact_peak
+                    .zip(expected_persistent)
+                    .map(|(peak, persistent)| peak.max(persistent));
+                let expected_prospective = if scalar {
+                    sealed.residual_allocation_census.and_then(|allocations| {
+                        compose_fixed_residual_build_prospective(
+                            build.kernel.prospective,
+                            sealed.continuation_build_limits,
+                            allocations,
+                        )
+                        .and_then(include_fixed_absolute_owner_prospective)
+                        .ok()
+                    })
+                } else {
+                    include_fixed_absolute_owner_prospective(
+                        AggregateFixedAbsoluteDomainResidualBuildProspective {
+                            work: build.kernel.prospective.build_work,
+                            allocations: build.kernel.prospective.allocations,
+                            persistent_bytes: build.kernel.prospective.persistent_bytes,
+                            peak_bytes: build.kernel.prospective.peak_bytes,
+                        },
+                    )
+                    .ok()
+                };
+                let expected_actual_work = build
+                    .residual
+                    .and_then(|residual| {
+                        u64::try_from(residual.work)
+                            .ok()
+                            .and_then(|work| build.kernel.actual.build_work.checked_add(work))
+                    })
+                    .or_else(|| (!scalar).then_some(build.kernel.actual.build_work))
+                    .and_then(|work| work.checked_add(owner_work));
+                let expected_actual_allocations = sealed
+                    .residual_allocation_census
+                    .map_or_else(
+                        || Some(build.kernel.actual.allocations),
+                        |allocations| build.kernel.actual.allocations.checked_add(allocations),
+                    )
+                    .and_then(|allocations| allocations.checked_add(1));
+                let prospective_admitted = fixed_residual_build_limit_refusal(
+                    build.prospective,
+                    sealed.residual_build_limits,
+                )
+                .is_none();
+                operation_closed
+                    && residual_closed
+                    && self.schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+                    && self.selection == AggregatePlanSelection::Auto
+                    && self.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+                    && self.finite_planner_work == 0
+                    && usize::try_from(self.fixed_absolute_planner_work)
+                        .is_ok_and(|work| work <= sealed.max_fixed_absolute_planner_work)
+                    && matches!(
+                        &self.syntax_key.profile,
+                        CompatibilityProfile::RustBytes(profile) if {
+                            let mut expected = RustProfile::rebar_1_12_4();
+                            expected.options.unicode = profile.options.unicode;
+                            profile == &expected
+                        }
+                    )
+                    && sealed.matches_public_report(self)
+                    && identity == sealed.identity
+                    && build == sealed.build
+                    && fixed_guard_build_actual_fits(build.kernel.actual, build.kernel.prospective)
+                    && guard_with_owner_closed
+                    && build.kernel.prospective.descriptor == identity.kernel.descriptor
+                    && expected_prospective == Some(build.prospective)
+                    && expected_actual_work == Some(build.actual.work)
+                    && expected_actual_allocations == Some(build.actual.allocations)
+                    && expected_persistent == Some(build.actual.persistent_bytes)
+                    && expected_peak == Some(build.actual.peak_bytes)
+                    && prospective_admitted
+                    && build.actual.published
+                    && build.actual.work <= build.prospective.work
+                    && build.actual.allocations <= build.prospective.allocations
+                    && build.actual.persistent_bytes <= build.prospective.persistent_bytes
+                    && build.actual.peak_bytes <= build.prospective.peak_bytes
+                    && self.retained_capacity_bytes == build.actual.persistent_bytes
+            }
+            (plan, build, identity, None) => {
+                plan != AggregatePlanKind::FixedAbsoluteDomain
+                    && !matches!(build, AggregateBuildAccounting::FixedAbsoluteDomain(_))
+                    && !matches!(identity, AggregatePlanIdentity::FixedAbsoluteDomain(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// Authenticate one fixed absolute-domain facade identity against the
+    /// construction-owned seal.
+    #[must_use]
+    pub fn authenticates_fixed_absolute_domain_identity(
+        &self,
+        identity: AggregateFixedAbsoluteDomainIdentity,
+    ) -> bool {
+        self.has_closed_fixed_absolute_domain_identity()
+            && matches!(
+                self.fixed_absolute_domain_owner(),
+                Some(owner)
+                    if owner.fixed_absolute_domain_seal().identity == identity
+            )
+    }
+
+    /// Complete fixed-domain construction receipt retained once behind the
+    /// authenticated construction owner.
+    #[must_use]
+    pub fn fixed_absolute_domain_build_accounting(
+        &self,
+    ) -> Option<&AggregateFixedAbsoluteDomainBuildAccounting> {
+        let AggregateBuildAccounting::FixedAbsoluteDomain(summary) = self.build else {
+            return None;
+        };
+        let sealed = self
+            .fixed_absolute_domain_owner()?
+            .fixed_absolute_domain_seal();
+        (summary == sealed.build.summary()).then_some(&sealed.build)
+    }
+
     /// Require the public URL-aggregate accounting and the private compiled
     /// artifact to be either coherently active or coherently absent.
     #[must_use]
     pub fn has_closed_url_aggregate_identity(&self) -> bool {
         let AggregateBuildAccounting::Continuation(compile) = self.build else {
-            return self.sealed_url_aggregate_identity.is_none();
+            return !matches!(
+                self.sealed_url_aggregate_identity,
+                Some(AggregateUrlOrFixedSeal::Url(_))
+            );
         };
         let absent = compile.url_aggregate_plans == 0
             && compile.url_aggregate_tlds == 0
             && compile.url_aggregate_tld_bytes == 0
             && compile.url_aggregate_build_work == 0
             && compile.url_aggregate_persistent_bytes == 0;
-        match self.sealed_url_aggregate_identity {
-            Some(sealed) => {
+        match self.sealed_url_aggregate_identity.as_ref() {
+            Some(AggregateUrlOrFixedSeal::Url(sealed)) => {
                 compile.url_aggregate_plans == 1
                     && compile.url_aggregate_tlds > 0
                     && compile.url_aggregate_tld_bytes > 0
@@ -585,13 +1440,18 @@ impl AggregateBuildReport {
                     && self.plan == AggregatePlanKind::ContinuationProgram
                     && self.retained_capacity_bytes == compile.program_bytes
             }
+            Some(AggregateUrlOrFixedSeal::Fixed(_)) => false,
             None => absent,
         }
     }
 
     #[must_use]
     pub fn authenticates_url_aggregate_identity(&self) -> bool {
-        self.has_closed_url_aggregate_identity() && self.sealed_url_aggregate_identity.is_some()
+        self.has_closed_url_aggregate_identity()
+            && matches!(
+                self.sealed_url_aggregate_identity,
+                Some(AggregateUrlOrFixedSeal::Url(_))
+            )
     }
 
     /// Require the public required-anchor discriminators and private compiled
@@ -695,6 +1555,210 @@ pub struct AggregateCacheIdentity {
     pub execution_limits: AggregateRunLimits,
 }
 
+/// Allocation-free error identity for the U1 fixed-domain route. Only the
+/// limits that authenticate its nested guard/continuation receipts are kept;
+/// construction accounting lives once in the colocated owner seal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainErrorIdentity {
+    pub schema_version: u32,
+    pub syntax_key: Arc<CacheKey>,
+    pub operation: AggregateOperation,
+    pub selection: AggregatePlanSelection,
+    pub continuation_strategy: Option<AggregateStrategy>,
+    pub capture_semantics: AggregateCaptureSemantics,
+    pub admission: AdmissionPolicy,
+    pub syntax_safety: SafetyEnvelope,
+    pub max_fixed_absolute_planner_work: usize,
+    pub fixed_absolute_planner_work: usize,
+    pub plan_identity: AggregateFixedAbsoluteDomainIdentity,
+    pub guard_build_limits: FixedAbsoluteDomainBuildLimits,
+    pub residual_build_limits: AggregateFixedAbsoluteDomainResidualBuildLimits,
+    pub continuation_build_limits: AggregateCompileLimits,
+    pub residual_allocation_census: Option<usize>,
+}
+
+fn fixed_guard_build_actual_fits(
+    actual: FixedAbsoluteDomainBuildActual,
+    prospective: FixedAbsoluteDomainBuildProspective,
+) -> bool {
+    actual.items <= prospective.items
+        && actual.payload_bytes <= prospective.payload_bytes
+        && actual.identity_bytes <= prospective.identity_bytes
+        && actual.retained_heap_bytes <= prospective.retained_heap_bytes
+        && actual.copied_bytes <= prospective.copied_bytes
+        && actual.allocations <= prospective.allocations
+        && actual.initialized_bytes <= prospective.initialized_bytes
+        && actual.build_work <= prospective.build_work
+        && actual.scratch_bytes <= prospective.scratch_bytes
+        && actual.persistent_bytes <= prospective.persistent_bytes
+        && actual.peak_bytes <= prospective.peak_bytes
+        && actual.published
+}
+
+/// One-pointer construction owner for a successfully published fixed-domain
+/// artifact. Equality is exact owner provenance, not structural Arc contents.
+#[derive(Clone, Debug)]
+pub struct AggregateExecutionIdentity(Arc<AggregateExecutionIdentityInner>);
+
+#[derive(Debug)]
+struct AggregateExecutionIdentityInner {
+    seal: AggregateFixedAbsoluteDomainSeal,
+    identity: AggregateFixedAbsoluteDomainErrorIdentity,
+}
+
+impl PartialEq for AggregateExecutionIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AggregateExecutionIdentity {}
+
+impl AggregateExecutionIdentity {
+    fn fixed_absolute_domain(
+        seal: AggregateFixedAbsoluteDomainSeal,
+        identity: AggregateFixedAbsoluteDomainErrorIdentity,
+    ) -> Self {
+        Self(Arc::new(AggregateExecutionIdentityInner { seal, identity }))
+    }
+
+    #[must_use]
+    pub fn as_fixed_absolute_domain(&self) -> &AggregateFixedAbsoluteDomainErrorIdentity {
+        &self.0.identity
+    }
+
+    fn fixed_absolute_domain_seal(&self) -> &AggregateFixedAbsoluteDomainSeal {
+        &self.0.seal
+    }
+}
+
+/// Opaque fixed-domain attempt identity. Construction provenance and its one
+/// lossless terminal receipt cannot be separated or reassembled by callers.
+#[derive(Clone, Debug)]
+pub struct AggregateFixedAbsoluteDomainAttemptIdentity {
+    owner: AggregateExecutionIdentity,
+    receipt: AggregateFixedAbsoluteDomainAttemptReceipt,
+}
+
+impl PartialEq for AggregateFixedAbsoluteDomainAttemptIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.receipt == other.receipt
+    }
+}
+
+impl Eq for AggregateFixedAbsoluteDomainAttemptIdentity {}
+
+impl AggregateFixedAbsoluteDomainAttemptIdentity {
+    fn new(
+        owner: AggregateExecutionIdentity,
+        receipt: AggregateFixedAbsoluteDomainAttemptReceipt,
+    ) -> Self {
+        Self { owner, receipt }
+    }
+
+    /// Exact construction-owned fixed-route identity for this attempt.
+    #[must_use]
+    pub fn owner_identity(&self) -> &AggregateFixedAbsoluteDomainErrorIdentity {
+        self.owner.as_fixed_absolute_domain()
+    }
+
+    /// Construction accounting retained once by this attempt's exact owner.
+    #[must_use]
+    pub fn owner_build_accounting(&self) -> &AggregateFixedAbsoluteDomainBuildAccounting {
+        &self.owner.fixed_absolute_domain_seal().build
+    }
+
+    /// The one complete terminal receipt paired with this construction owner.
+    #[must_use]
+    pub const fn receipt(&self) -> &AggregateFixedAbsoluteDomainAttemptReceipt {
+        &self.receipt
+    }
+}
+
+/// Exact attempted execution identity. Incumbent failures preserve their
+/// pre-U1 boxed cache identity. Fixed failures retain one opaque owner/receipt
+/// pair, with no duplicate P/A payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "fixed failures retain one allocation-free lossless owner/receipt identity; boxing would change that contract"
+)]
+pub enum AggregateExecutionAttemptIdentity {
+    Incumbent(Box<AggregateCacheIdentity>),
+    FixedAbsoluteDomain(AggregateFixedAbsoluteDomainAttemptIdentity),
+}
+
+impl AggregateExecutionAttemptIdentity {
+    fn incumbent(identity: Box<AggregateCacheIdentity>) -> Self {
+        Self::Incumbent(identity)
+    }
+
+    fn fixed_absolute_domain(
+        owner: AggregateExecutionIdentity,
+        receipt: AggregateFixedAbsoluteDomainAttemptReceipt,
+    ) -> Self {
+        Self::FixedAbsoluteDomain(AggregateFixedAbsoluteDomainAttemptIdentity::new(
+            owner, receipt,
+        ))
+    }
+
+    #[must_use]
+    pub fn as_cache_identity(&self) -> Option<&AggregateCacheIdentity> {
+        match self {
+            Self::Incumbent(identity) => Some(identity),
+            Self::FixedAbsoluteDomain(_) => None,
+        }
+    }
+
+    /// The opaque fixed-domain owner/receipt pair for this attempt.
+    #[must_use]
+    pub const fn as_fixed_absolute_domain_attempt(
+        &self,
+    ) -> Option<&AggregateFixedAbsoluteDomainAttemptIdentity> {
+        match self {
+            Self::Incumbent(_) => None,
+            Self::FixedAbsoluteDomain(attempt) => Some(attempt),
+        }
+    }
+
+    #[must_use]
+    pub fn as_fixed_absolute_domain(&self) -> Option<&AggregateFixedAbsoluteDomainErrorIdentity> {
+        match self {
+            Self::Incumbent(_) => None,
+            Self::FixedAbsoluteDomain(attempt) => Some(attempt.owner_identity()),
+        }
+    }
+
+    /// The one complete fixed-domain attempt receipt retained by this failure.
+    #[must_use]
+    pub const fn fixed_absolute_domain_receipt(
+        &self,
+    ) -> Option<&AggregateFixedAbsoluteDomainAttemptReceipt> {
+        match self {
+            Self::Incumbent(_) => None,
+            Self::FixedAbsoluteDomain(attempt) => Some(attempt.receipt()),
+        }
+    }
+
+    fn closes_fixed_source_kind(&self, source: &AggregateExecutionSource) -> bool {
+        match (self, source) {
+            (Self::FixedAbsoluteDomain(attempt), AggregateExecutionSource::FixedAbsoluteDomain) => {
+                attempt.receipt().guard_error().is_some()
+            }
+            (
+                Self::FixedAbsoluteDomain(attempt),
+                AggregateExecutionSource::FixedAbsoluteDomainResidual,
+            ) => attempt
+                .receipt()
+                .residual_error()
+                .is_some_and(|(continuation, composite)| {
+                    composite.contains_actual_with(&continuation.receipt)
+                }),
+            _ => false,
+        }
+    }
+}
+
 /// Why a forced exact-literal construction was semantically ineligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregateLiteralIneligibility {
@@ -719,6 +1783,10 @@ pub enum AggregateLiteralIneligibility {
 /// Aggregate construction failure retaining the requested operation/policy.
 #[derive(Debug)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "typed build refusals retain complete lossless accounting without post-failure allocation"
+)]
 pub enum AggregateBuildError {
     /// Syntax/profile/admission failure.
     Syntax {
@@ -793,6 +1861,15 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Fixed absolute-domain canonical-HIR inspection crossed its independent
+    /// work cap.
+    FixedAbsoluteDomainPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
     /// Finite-language extraction crossed its explicit work cap.
     FinitePlannerWorkLimit {
         operation: AggregateOperation,
@@ -860,6 +1937,57 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: BoundedContextBuildError,
+    },
+    /// Fixed absolute-domain guard construction failed after route selection.
+    FixedAbsoluteDomainBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        /// Classifier, structural inspection, and scalar census work already
+        /// consumed before the selected guard construction failed.
+        planner_work: usize,
+        source: FixedAbsoluteDomainBuildError,
+    },
+    /// Scalar guard construction failed after the outer composite P was
+    /// published but before either artifact became publishable.
+    FixedAbsoluteDomainResidualGuardBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        /// Classifier, structural inspection, and allocation-census work
+        /// already consumed before guard construction failed.
+        planner_work: usize,
+        source: FixedAbsoluteDomainBuildError,
+        composite: AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
+    },
+    /// The complete scalar guard-plus-residual envelope exceeded its U1-only
+    /// cap before either artifact was constructed.
+    FixedAbsoluteDomainResidualPreflight {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        /// Classifier, structural inspection, and allocation-census work
+        /// already consumed before this outer preflight refusal.
+        planner_work: usize,
+        resource: AggregateFixedAbsoluteDomainResidualBuildResource,
+        needed: u64,
+        limit: u64,
+        receipt: AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
+    },
+    /// The scalar guard was selected, but its required eager continuation
+    /// residual failed before composite publication.
+    FixedAbsoluteDomainResidualCompile {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        /// Classifier, structural inspection, and allocation-census work
+        /// already consumed before eager residual compilation began.
+        planner_work: usize,
+        strategy: AggregateStrategy,
+        /// Completed, still-owner-local guard construction receipt.
+        guard: FixedAbsoluteDomainBuildAccounting,
+        /// Partial residual compiler ledger. Its receipt is unpublished and
+        /// binds the exact continuation limits/profile used by this attempt.
+        source: AggregateCompileAttemptError,
+        /// Cumulative outer P/A; `published` remains false on this terminal
+        /// construction failure.
+        composite: AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
     },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
@@ -987,6 +2115,16 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded-context inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::FixedAbsoluteDomainPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+                consumed,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed absolute-domain inspection needs {needed} structural work units, limit is {limit}, consumed {consumed}"
+            ),
             Self::FinitePlannerWorkLimit {
                 operation,
                 selection,
@@ -1077,6 +2215,45 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} bounded-context construction failed: {source}"
             ),
+            Self::FixedAbsoluteDomainBuild {
+                operation,
+                selection,
+                source,
+                ..
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed absolute-domain construction failed: {source}"
+            ),
+            Self::FixedAbsoluteDomainResidualGuardBuild {
+                operation,
+                selection,
+                source,
+                ..
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} scalar fixed guard construction failed: {source}"
+            ),
+            Self::FixedAbsoluteDomainResidualPreflight {
+                operation,
+                selection,
+                resource,
+                needed,
+                limit,
+                ..
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed residual {resource:?} needs {needed}, limit is {limit}"
+            ),
+            Self::FixedAbsoluteDomainResidualCompile {
+                operation,
+                selection,
+                strategy,
+                source,
+                ..
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?}/{strategy:?} fixed absolute-domain residual compilation failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -1126,6 +2303,9 @@ impl std::error::Error for AggregateBuildError {
             Self::BoundedSeparatedFieldsBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::BoundedContextBuild { source, .. } => Some(source),
+            Self::FixedAbsoluteDomainBuild { source, .. }
+            | Self::FixedAbsoluteDomainResidualGuardBuild { source, .. } => Some(source),
+            Self::FixedAbsoluteDomainResidualCompile { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
@@ -1138,10 +2318,137 @@ impl std::error::Error for AggregateBuildError {
             | Self::BoundedSeparatedFieldsPlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
             | Self::BoundedContextPlannerWorkLimit { .. }
+            | Self::FixedAbsoluteDomainPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
             | Self::FinitePlannerAllocationFailed { .. }
             | Self::ExactLiteralIneligible { .. }
+            | Self::FixedAbsoluteDomainResidualPreflight { .. }
             | Self::InternalInvariant { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AggregateFixedAbsoluteDomainAttemptKind {
+    Guard,
+    Residual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the terminal is a complete allocation-free P/A receipt and must not lose or separately allocate either branch"
+)]
+enum AggregateFixedAbsoluteDomainAttemptTerminal {
+    Guard(FixedAbsoluteDomainReduceError),
+    Residual {
+        continuation: OperationAttemptError,
+        composite: AggregateFixedAbsoluteDomainResidualReceipt,
+    },
+}
+
+/// Lossless, allocation-free fixed-domain terminal receipt. The three limit
+/// envelopes and typed terminal retain every invocation input and
+/// prospective/actual counter without probabilistic hashing or a post-terminal
+/// diagnostic traversal. Its enclosing attempt identity separately retains the
+/// exact construction owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainAttemptReceipt {
+    fixed_absolute: FixedAbsoluteDomainReduceLimits,
+    fixed_absolute_residual: AggregateFixedAbsoluteDomainResidualLimits,
+    continuation: AggregateOperationLimits,
+    terminal: AggregateFixedAbsoluteDomainAttemptTerminal,
+}
+
+impl AggregateFixedAbsoluteDomainAttemptReceipt {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the Copy limit envelope is captured by value as an immutable terminal snapshot"
+    )]
+    fn new(
+        limits: AggregateRunLimits,
+        failure: AggregateFixedAbsoluteDomainAttemptFailure,
+    ) -> Self {
+        let terminal = match failure {
+            AggregateFixedAbsoluteDomainAttemptFailure::Guard(source) => {
+                AggregateFixedAbsoluteDomainAttemptTerminal::Guard(source)
+            }
+            AggregateFixedAbsoluteDomainAttemptFailure::Residual {
+                continuation,
+                composite,
+            } => AggregateFixedAbsoluteDomainAttemptTerminal::Residual {
+                continuation,
+                composite,
+            },
+        };
+        Self {
+            fixed_absolute: limits.fixed_absolute,
+            fixed_absolute_residual: limits.fixed_absolute_residual,
+            continuation: limits.continuation,
+            terminal,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> AggregateFixedAbsoluteDomainAttemptKind {
+        match self.terminal {
+            AggregateFixedAbsoluteDomainAttemptTerminal::Guard(_) => {
+                AggregateFixedAbsoluteDomainAttemptKind::Guard
+            }
+            AggregateFixedAbsoluteDomainAttemptTerminal::Residual { .. } => {
+                AggregateFixedAbsoluteDomainAttemptKind::Residual
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn fixed_absolute_limits(&self) -> FixedAbsoluteDomainReduceLimits {
+        self.fixed_absolute
+    }
+
+    #[must_use]
+    pub const fn fixed_absolute_residual_limits(
+        &self,
+    ) -> AggregateFixedAbsoluteDomainResidualLimits {
+        self.fixed_absolute_residual
+    }
+
+    #[must_use]
+    pub const fn continuation_limits(&self) -> AggregateOperationLimits {
+        self.continuation
+    }
+
+    #[must_use]
+    pub const fn guard_error(&self) -> Option<&FixedAbsoluteDomainReduceError> {
+        match &self.terminal {
+            AggregateFixedAbsoluteDomainAttemptTerminal::Guard(source) => Some(source),
+            AggregateFixedAbsoluteDomainAttemptTerminal::Residual { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn residual_error(
+        &self,
+    ) -> Option<(
+        &OperationAttemptError,
+        &AggregateFixedAbsoluteDomainResidualReceipt,
+    )> {
+        match &self.terminal {
+            AggregateFixedAbsoluteDomainAttemptTerminal::Guard(_) => None,
+            AggregateFixedAbsoluteDomainAttemptTerminal::Residual {
+                continuation,
+                composite,
+            } => Some((continuation, composite)),
+        }
+    }
+
+    fn terminal_error(&self) -> &(dyn std::error::Error + 'static) {
+        match &self.terminal {
+            AggregateFixedAbsoluteDomainAttemptTerminal::Guard(source) => source,
+            AggregateFixedAbsoluteDomainAttemptTerminal::Residual { continuation, .. } => {
+                continuation
+            }
         }
     }
 }
@@ -1165,6 +2472,12 @@ pub enum AggregateExecutionSource {
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Direct bounded-context refusal.
     BoundedContext(BoundedContextReduceError),
+    /// Unit tag for a fixed absolute-domain guard refusal. The enclosing
+    /// execution identity owns its one complete receipt.
+    FixedAbsoluteDomain,
+    /// Unit tag for a scalar residual refusal. The enclosing execution
+    /// identity owns its construction provenance and complete receipt.
+    FixedAbsoluteDomainResidual,
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
@@ -1186,6 +2499,10 @@ impl fmt::Display for AggregateExecutionSource {
             Self::BoundedSeparatedFields(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::BoundedContext(source) => source.fmt(f),
+            Self::FixedAbsoluteDomain => f.write_str("fixed absolute-domain guard attempt failed"),
+            Self::FixedAbsoluteDomainResidual => {
+                f.write_str("fixed absolute-domain residual attempt failed")
+            }
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
@@ -1207,10 +2524,12 @@ impl std::error::Error for AggregateExecutionSource {
             Self::BoundedSeparatedFields(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
             Self::BoundedContext(source) => Some(source),
+            Self::FixedAbsoluteDomain
+            | Self::FixedAbsoluteDomainResidual
+            | Self::InternalInvariant(_) => None,
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::Continuation(source) => Some(source),
-            Self::InternalInvariant(_) => None,
         }
     }
 }
@@ -1219,25 +2538,61 @@ impl std::error::Error for AggregateExecutionSource {
 /// this error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateExecutionError {
-    /// Complete attempted cache identity, including every execution limit.
-    pub identity: Box<AggregateCacheIdentity>,
+    /// Complete route-relevant attempted identity. Incumbents retain the full
+    /// cache key; U1 retains one construction owner and one lossless receipt.
+    pub identity: AggregateExecutionAttemptIdentity,
     /// Typed bounded selected-plan failure.
     pub source: AggregateExecutionSource,
 }
 
+impl AggregateExecutionError {
+    /// The one complete receipt for a fixed-domain terminal attempt.
+    #[must_use]
+    pub const fn fixed_absolute_domain_receipt(
+        &self,
+    ) -> Option<&AggregateFixedAbsoluteDomainAttemptReceipt> {
+        self.identity.fixed_absolute_domain_receipt()
+    }
+
+    /// Check that a fixed attempt identity and its compact source tag agree on
+    /// the terminal kind. The identity itself is the sole receipt authority.
+    #[must_use]
+    pub fn has_closed_fixed_attempt(&self) -> bool {
+        self.identity.closes_fixed_source_kind(&self.source)
+    }
+}
+
 impl fmt::Display for AggregateExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "aggregate {:?}/{:?}/{:?} execution failed: {}",
-            self.identity.operation, self.identity.plan, self.identity.plan_identity, self.source
-        )
+        match &self.identity {
+            AggregateExecutionAttemptIdentity::Incumbent(identity) => write!(
+                f,
+                "aggregate {:?}/{:?}/{:?} execution failed: {}",
+                identity.operation, identity.plan, identity.plan_identity, self.source
+            ),
+            AggregateExecutionAttemptIdentity::FixedAbsoluteDomain(attempt) => {
+                let identity = attempt.owner_identity();
+                write!(
+                    f,
+                    "aggregate {:?}/{:?}/{:?} execution failed: {}",
+                    identity.operation,
+                    AggregatePlanKind::FixedAbsoluteDomain,
+                    AggregatePlanIdentity::FixedAbsoluteDomain(identity.plan_identity),
+                    attempt.receipt().terminal_error()
+                )
+            }
+        }
     }
 }
 
 impl std::error::Error for AggregateExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        match &self.identity {
+            AggregateExecutionAttemptIdentity::Incumbent(_) => Some(&self.source),
+            AggregateExecutionAttemptIdentity::FixedAbsoluteDomain(attempt) => {
+                Some(attempt.receipt().terminal_error())
+            }
+        }
     }
 }
 
@@ -1260,6 +2615,9 @@ pub enum AggregateExecutionDetails {
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Bounded-context bounds, counters, and operation identity.
     BoundedContext(BoundedContextReduceAccounting),
+    /// Fixed absolute-domain guard proof and, when the scalar envelope admits
+    /// its residual, the nested continuation certificate/accounting.
+    FixedAbsoluteDomain(AggregateFixedAbsoluteDomainExecutionDetails),
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -1278,11 +2636,252 @@ pub enum AggregateExecutionDetails {
     },
 }
 
+/// Branch-explicit execution evidence for the fixed absolute-domain route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AggregateFixedAbsoluteDomainExecutionDetails {
+    /// The guard completed the operation without invoking a residual.
+    Direct {
+        guard: FixedAbsoluteDomainReduceAccounting,
+    },
+    /// The scalar envelope selected its prepublished continuation before any
+    /// source access; both branch and residual receipts are retained.
+    Residual {
+        composite: AggregateFixedAbsoluteDomainResidualExecutionSummary,
+    },
+}
+
+/// Nonduplicated public projection of a successful scalar residual. The
+/// guard and continuation identities/prospectives are derivable from the
+/// authenticated build owner and invocation; exact continuation counters and
+/// the checked outer envelope are retained once here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualExecutionSummary {
+    pub prospective: AggregateFixedAbsoluteDomainResidualProspective,
+    pub actual: AggregateFixedAbsoluteDomainResidualActual,
+    pub continuation_actual: AggregateExecutionAccounting,
+    pub continuation_actual_allocations: usize,
+}
+
+impl AggregateFixedAbsoluteDomainResidualExecutionSummary {
+    #[must_use]
+    pub const fn contains_actual(&self) -> bool {
+        self.actual.total_work <= self.prospective.total_work
+            && self.actual.allocations <= self.prospective.allocations
+            && self.actual.persistent_bytes <= self.prospective.persistent_bytes
+            && self.actual.peak_bytes <= self.prospective.peak_bytes
+            && self.continuation_actual_allocations <= self.prospective.allocations
+            && self.continuation_actual.work <= self.prospective.total_work
+            && self.continuation_actual.peak_bytes <= self.prospective.peak_bytes
+    }
+}
+
+/// Complete pre-source envelope for the scalar fixed-domain guard and its
+/// prepublished continuation, including co-live retained state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualProspective {
+    pub total_work: usize,
+    pub allocations: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Exact cumulative scalar-composite counters through a terminal outcome.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualActual {
+    pub total_work: usize,
+    pub allocations: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Guard evidence plus the checked cumulative envelope. The enclosing success
+/// or failure owns the one continuation attempt receipt used to validate it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateFixedAbsoluteDomainResidualReceipt {
+    pub guard: FixedAbsoluteDomainReduceAccounting,
+    pub prospective: AggregateFixedAbsoluteDomainResidualProspective,
+    pub actual: AggregateFixedAbsoluteDomainResidualActual,
+}
+
+impl AggregateFixedAbsoluteDomainResidualReceipt {
+    /// Check both nested receipts, their exact composition, and cumulative A≤P
+    /// against the enclosing attempt's sole continuation receipt.
+    #[must_use]
+    pub fn contains_actual_with(
+        &self,
+        continuation: &crate::AggregateOperationAttemptReceipt,
+    ) -> bool {
+        let Some(continuation_upper) = continuation.prospective else {
+            return false;
+        };
+        if !self.guard.actual.fits(self.guard.prospective)
+            || !continuation_upper.contains(continuation.actual)
+            || continuation.actual_allocations > continuation_upper.allocations
+            || continuation.actual_allocations > continuation.allocation_limit
+        {
+            return false;
+        }
+        let prospective = compose_fixed_residual_prospective(
+            self.guard.prospective,
+            continuation_upper,
+            self.prospective.persistent_bytes,
+        );
+        let actual = compose_fixed_residual_actual(
+            self.guard.actual,
+            continuation.actual,
+            continuation.actual_allocations,
+            self.actual.persistent_bytes,
+        );
+        prospective.is_ok_and(|prospective| prospective == self.prospective)
+            && actual.is_ok_and(|actual| actual == self.actual)
+            && self.actual.total_work <= self.prospective.total_work
+            && self.actual.allocations <= self.prospective.allocations
+            && self.actual.persistent_bytes <= self.prospective.persistent_bytes
+            && self.actual.peak_bytes <= self.prospective.peak_bytes
+    }
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the Copy continuation prospective is folded into one exact composite snapshot"
+)]
+fn compose_fixed_residual_prospective(
+    guard: FixedAbsoluteDomainProspective,
+    continuation: OperationProspective,
+    persistent_bytes: usize,
+) -> Result<AggregateFixedAbsoluteDomainResidualProspective, AggregateEngineError> {
+    let total_work = guard
+        .total_work
+        .checked_add(continuation.work_bound)
+        .ok_or(AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::ExecutionWork,
+        })?;
+    let allocations = guard
+        .allocations
+        .checked_add(continuation.allocations)
+        .ok_or(AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::Allocations,
+        })?;
+    let peak_bytes = persistent_bytes
+        .checked_add(continuation.peak_bytes)
+        .ok_or(AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::PeakBytes,
+        })?;
+    Ok(AggregateFixedAbsoluteDomainResidualProspective {
+        total_work,
+        allocations,
+        persistent_bytes,
+        peak_bytes,
+    })
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the Copy continuation accounting is folded into one exact composite snapshot"
+)]
+fn compose_fixed_residual_actual(
+    guard: FixedAbsoluteDomainActual,
+    continuation: AggregateExecutionAccounting,
+    continuation_allocations: usize,
+    persistent_bytes: usize,
+) -> Result<AggregateFixedAbsoluteDomainResidualActual, AggregateEngineError> {
+    let total_work = guard.total_work.checked_add(continuation.work).ok_or(
+        AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::ExecutionWork,
+        },
+    )?;
+    let allocations = guard
+        .allocations
+        .checked_add(continuation_allocations)
+        .ok_or(AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::Allocations,
+        })?;
+    let peak_bytes = persistent_bytes
+        .checked_add(continuation.peak_bytes)
+        .ok_or(AggregateEngineError::ArithmeticOverflow {
+            resource: AggregateResource::PeakBytes,
+        })?;
+    Ok(AggregateFixedAbsoluteDomainResidualActual {
+        total_work,
+        allocations,
+        persistent_bytes,
+        peak_bytes,
+    })
+}
+
+fn enforce_fixed_residual_prospective(
+    prospective: AggregateFixedAbsoluteDomainResidualProspective,
+    limits: &AggregateRunLimits,
+) -> Result<(), AggregateEngineError> {
+    for (resource, required, limit) in [
+        (
+            AggregateResource::ExecutionWork,
+            prospective.total_work,
+            limits.fixed_absolute_residual.max_work,
+        ),
+        (
+            AggregateResource::Allocations,
+            prospective.allocations,
+            limits.fixed_absolute_residual.max_allocations,
+        ),
+        (
+            AggregateResource::ProgramBytes,
+            prospective.persistent_bytes,
+            limits.fixed_absolute_residual.max_persistent_bytes,
+        ),
+        (
+            AggregateResource::PeakBytes,
+            prospective.peak_bytes,
+            limits.fixed_absolute_residual.max_peak_bytes,
+        ),
+    ] {
+        if required > limit {
+            return Err(AggregateEngineError::ResourceLimit {
+                resource,
+                required,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the Copy guard accounting is consumed into the lossless terminal receipt"
+)]
+fn fixed_residual_composite(
+    guard: FixedAbsoluteDomainReduceAccounting,
+    continuation: &crate::AggregateOperationAttemptReceipt,
+    prospective: AggregateFixedAbsoluteDomainResidualProspective,
+    persistent_bytes: usize,
+) -> Result<AggregateFixedAbsoluteDomainResidualReceipt, AggregateEngineError> {
+    let actual = compose_fixed_residual_actual(
+        guard.actual,
+        continuation.actual,
+        continuation.actual_allocations,
+        persistent_bytes,
+    )?;
+    Ok(AggregateFixedAbsoluteDomainResidualReceipt {
+        guard,
+        prospective,
+        actual,
+    })
+}
+
 /// Exact execution facts and the complete cache identity used for the call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateExecutionReport {
     pub identity: AggregateCacheIdentity,
     pub details: AggregateExecutionDetails,
+}
+
+impl AggregateExecutionReport {
+    /// Clone the complete public cache certificate without allocation.
+    #[must_use]
+    pub fn cache_identity(&self) -> AggregateCacheIdentity {
+        self.identity.clone()
+    }
 }
 
 /// Builder shared by all whole-match aggregate operations.
@@ -1351,6 +2950,13 @@ fn sparse_finite_build_limit_allows_continuation(
     )
 }
 
+fn fixed_absolute_build_limit_allows_continuation(source: &FixedAbsoluteDomainBuildError) -> bool {
+    matches!(
+        source.kind,
+        FixedAbsoluteDomainBuildErrorKind::ResourceLimit { .. }
+    )
+}
+
 /// Execution also stays inside the existing finite-language quota envelope.
 /// Every sparse structural counter is a component of total work, so the
 /// ordered reducer's total-work ceiling is a safe ceiling for components that
@@ -1376,6 +2982,10 @@ fn sparse_finite_reduce_limits(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "builder errors preserve complete typed P/A evidence without boxing or a post-failure allocation"
+)]
 impl AggregateBuilder {
     /// Start from the pinned Rust byte profile. Unicode defaults to enabled;
     /// exact literals and bounded UTF-8 scalar continuation HIR are admitted
@@ -1473,6 +3083,9 @@ impl AggregateBuilder {
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
         let grapheme_profile = self.profile == RustProfile::rebar_1_12_4();
+        let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
+        expected_fixed_absolute_profile.options.unicode = unicode;
+        let fixed_absolute_profile = self.profile == expected_fixed_absolute_profile;
         if selection == AggregatePlanSelection::ForceExactLiteral
             && operation == AggregateOperation::Spans
         {
@@ -1619,6 +3232,7 @@ impl AggregateBuilder {
                 bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
+                fixed_absolute_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: captures,
                 captures_erased: captures,
@@ -1798,6 +3412,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -1924,6 +3539,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -2112,6 +3728,7 @@ impl AggregateBuilder {
                 bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
                 bounded_context_planner_work: 0,
+                fixed_absolute_planner_work: 0,
                 finite_planner_work: 0,
                 capture_erasure_work: inspection.captures,
                 captures_erased: inspection.captures,
@@ -2233,6 +3850,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -2345,6 +3963,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work: work,
                     prefix_class_alternation_planner_work: 0,
                     bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -2460,6 +4079,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work: work,
                     bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -2568,6 +4188,7 @@ impl AggregateBuilder {
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work: 0,
+                        fixed_absolute_planner_work: 0,
                         finite_planner_work: 0,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -2691,6 +4312,7 @@ impl AggregateBuilder {
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
                     bounded_context_planner_work: work,
+                    fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
                     capture_erasure_work: captures,
                     captures_erased: captures,
@@ -2715,6 +4337,741 @@ impl AggregateBuilder {
             Some(BoundedContextInspection::Ineligible { work }) => work,
             None => 0,
         };
+        let fixed_absolute_candidate = if fixed_absolute_profile
+            && selection == AggregatePlanSelection::Auto
+            && matches!(
+                operation,
+                AggregateOperation::Count | AggregateOperation::SpanSum
+            ) {
+            Some(fixed_absolute::classify_candidate_with_limit(
+                &rust.hir,
+                unicode,
+                operation,
+                limits.max_fixed_absolute_planner_work,
+            ))
+        } else {
+            None
+        };
+        let fixed_absolute_optional = fixed_absolute_candidate
+            .is_some_and(|candidate| candidate.candidate == fixed_absolute::Candidate::Possible);
+        let fixed_absolute_inspection = if let Some(candidate) = fixed_absolute_candidate {
+            if candidate.exhausted || candidate.candidate == fixed_absolute::Candidate::Ineligible {
+                Some(fixed_absolute::Inspection::Ineligible {
+                    work: candidate.work,
+                })
+            } else {
+                let remaining = limits
+                    .max_fixed_absolute_planner_work
+                    .checked_sub(candidate.work)
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed absolute classifier exceeded its planner cap",
+                    })?;
+                match fixed_absolute::inspect(&rust.hir, unicode, operation, remaining) {
+                    Ok(fixed_absolute::Inspection::Eligible {
+                        shape,
+                        work,
+                        hir_nodes,
+                        captures,
+                    }) => Some(fixed_absolute::Inspection::Eligible {
+                        shape,
+                        work: candidate.work.checked_add(work).ok_or(
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed absolute planner work overflow",
+                            },
+                        )?,
+                        hir_nodes,
+                        captures,
+                    }),
+                    Ok(fixed_absolute::Inspection::Ineligible { work }) => {
+                        Some(fixed_absolute::Inspection::Ineligible {
+                            work: candidate.work.checked_add(work).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed absolute planner work overflow",
+                                },
+                            )?,
+                        })
+                    }
+                    Err(fixed_absolute::InspectionError::WorkLimit { consumed, .. })
+                        if candidate.candidate == fixed_absolute::Candidate::Possible =>
+                    {
+                        Some(fixed_absolute::Inspection::Ineligible {
+                            work: candidate.work.checked_add(consumed).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed absolute planner work overflow",
+                                },
+                            )?,
+                        })
+                    }
+                    Err(fixed_absolute::InspectionError::WorkLimit { needed, consumed }) => {
+                        let needed = candidate.work.checked_add(needed).ok_or(
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed absolute planner refusal overflow",
+                            },
+                        )?;
+                        let consumed = candidate.work.checked_add(consumed).ok_or(
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed absolute planner consumed work overflow",
+                            },
+                        )?;
+                        return Err(AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit: limits.max_fixed_absolute_planner_work,
+                            consumed,
+                        });
+                    }
+                    Err(fixed_absolute::InspectionError::Overflow) => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed absolute-domain inspection accounting overflow",
+                        });
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let fixed_absolute_planner_work = u32::try_from('fixed_absolute: {
+            match fixed_absolute_inspection {
+            Some(fixed_absolute::Inspection::Eligible {
+                shape,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from fixed absolute-domain inspection",
+                    });
+                }
+                let census_limit = limits
+                    .max_fixed_absolute_planner_work
+                    .checked_sub(work)
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed scalar census began outside its planner cap",
+                    })?;
+                let (residual_prospective_allocations, census_work) =
+                    match shape.scalar_residual_compile_allocations(&rust.hir, census_limit) {
+                        Ok(Some((allocations, census_work))) => (Some(allocations), census_work),
+                        Ok(None) => (None, 0),
+                        Err(fixed_absolute::InspectionError::WorkLimit { consumed, .. })
+                            if fixed_absolute_optional =>
+                        {
+                            break 'fixed_absolute work.checked_add(consumed).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "optional fixed scalar census work overflow",
+                                },
+                            )?;
+                        }
+                        Err(fixed_absolute::InspectionError::WorkLimit { needed, consumed }) => {
+                            let needed = work.checked_add(needed).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed scalar census refusal overflow",
+                                },
+                            )?;
+                            let consumed = work.checked_add(consumed).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed scalar census consumed work overflow",
+                                },
+                            )?;
+                            return Err(AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit: limits.max_fixed_absolute_planner_work,
+                                consumed,
+                            });
+                        }
+                        Err(fixed_absolute::InspectionError::Overflow) => {
+                            return Err(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed scalar residual allocation census overflow",
+                            });
+                        }
+                    };
+                let work = work.checked_add(census_work).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed scalar census work overflow",
+                    },
+                )?;
+                let guard_prospective = shape.guard_prospective().map_err(|source| {
+                    AggregateBuildError::FixedAbsoluteDomainBuild {
+                        operation,
+                        selection,
+                        planner_work: work,
+                        source,
+                    }
+                })?;
+                let guard_with_owner_prospective =
+                    include_fixed_absolute_owner_guard_prospective(guard_prospective).map_err(
+                        |detail| AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail,
+                        },
+                    )?;
+                let scalar_guard_prospective = shape.scalar_guard_prospective().map_err(|source| {
+                        AggregateBuildError::FixedAbsoluteDomainBuild {
+                            operation,
+                            selection,
+                            planner_work: work,
+                            source,
+                        }
+                    })?;
+                if scalar_guard_prospective.is_some_and(|scalar| scalar != guard_prospective) {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed scalar and general guard prospectives disagree",
+                    });
+                }
+                let scalar_build_prospective = match (
+                    scalar_guard_prospective,
+                    residual_prospective_allocations,
+                ) {
+                    (Some(guard), Some(allocations)) => {
+                        let prospective = compose_fixed_residual_build_prospective(
+                            guard,
+                            limits.continuation,
+                            allocations,
+                        )
+                        .and_then(include_fixed_absolute_owner_prospective)
+                        .map_err(|detail| AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail,
+                        })?;
+                        if let Some((resource, needed, limit)) = fixed_residual_build_limit_refusal(
+                            prospective,
+                            limits.fixed_absolute_residual,
+                        ) {
+                            if fixed_absolute_optional {
+                                break 'fixed_absolute work;
+                            }
+                            return Err(
+                                AggregateBuildError::FixedAbsoluteDomainResidualPreflight {
+                                    operation,
+                                    selection,
+                                    planner_work: work,
+                                    resource,
+                                    needed,
+                                    limit,
+                                    receipt:
+                                        AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+                                            prospective,
+                                            actual:
+                                                AggregateFixedAbsoluteDomainResidualBuildActual::default(),
+                                        },
+                                },
+                            );
+                        }
+                        Some(prospective)
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "scalar guard and residual census presence disagree",
+                        });
+                    }
+                };
+                if let Some((resource, needed, limit)) = fixed_guard_build_limit_refusal(
+                    guard_with_owner_prospective,
+                    limits.fixed_absolute,
+                ) {
+                    if fixed_absolute_optional {
+                        break 'fixed_absolute work;
+                    }
+                    let source = fixed_guard_build_preflight_error(
+                        guard_with_owner_prospective,
+                        resource,
+                        needed,
+                        limit,
+                    );
+                    return Err(scalar_build_prospective.map_or(
+                        AggregateBuildError::FixedAbsoluteDomainBuild {
+                            operation,
+                            selection,
+                            planner_work: work,
+                            source: source.clone(),
+                        },
+                        |prospective| {
+                            AggregateBuildError::FixedAbsoluteDomainResidualGuardBuild {
+                                operation,
+                                selection,
+                                planner_work: work,
+                                source,
+                                composite:
+                                    AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+                                        prospective,
+                                        actual:
+                                            AggregateFixedAbsoluteDomainResidualBuildActual::default(),
+                                    },
+                            }
+                        },
+                    ));
+                }
+                let guard = match shape.build(limits.fixed_absolute) {
+                    Ok(guard) => guard,
+                    Err(source)
+                        if fixed_absolute_optional
+                            && fixed_absolute_build_limit_allows_continuation(&source) =>
+                    {
+                        break 'fixed_absolute work;
+                    }
+                    Err(source) => {
+                        let source = bind_fixed_owner_to_guard_build_error(
+                            source,
+                            guard_with_owner_prospective,
+                        );
+                        return Err(scalar_build_prospective.map_or(
+                            AggregateBuildError::FixedAbsoluteDomainBuild {
+                                operation,
+                                selection,
+                                planner_work: work,
+                                source: source.clone(),
+                            },
+                            |prospective| {
+                                AggregateBuildError::FixedAbsoluteDomainResidualGuardBuild {
+                                    operation,
+                                    selection,
+                                    planner_work: work,
+                                    source,
+                                    composite:
+                                        AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+                                            prospective,
+                                            actual:
+                                                AggregateFixedAbsoluteDomainResidualBuildActual::default(),
+                                        },
+                                }
+                            },
+                        ));
+                    }
+                };
+                let kernel = match operation {
+                    AggregateOperation::Count => guard.count_identity(),
+                    AggregateOperation::SpanSum => guard.span_sum_identity(),
+                    AggregateOperation::Compile | AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "unsupported operation selected fixed absolute-domain route",
+                        });
+                    }
+                };
+                let scalar = guard.descriptor_identity().kind()
+                    == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
+                let guard_build = guard.build_accounting();
+                let guard_with_owner = FixedAbsoluteDomainBuildAccounting {
+                    prospective: guard_with_owner_prospective,
+                    actual: include_fixed_absolute_owner_guard_actual(guard_build.actual).map_err(
+                        |detail| AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail,
+                        },
+                    )?,
+                };
+                if !fixed_guard_build_actual_fits(
+                    guard_with_owner.actual,
+                    guard_with_owner.prospective,
+                ) {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed guard with owner actual exceeds prospective",
+                    });
+                }
+                if scalar && operation != AggregateOperation::Count {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "scalar fixed-domain envelope selected a non-count operation",
+                    });
+                }
+                let continuation_profile = if unicode {
+                    RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
+                } else {
+                    RustByteProfile::PINNED_1_12_4
+                };
+                let residual_allocation_limit = limits
+                    .fixed_absolute_residual
+                    .max_allocations
+                    .checked_sub(guard_build.prospective.allocations)
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed guard allocations exceed admitted composite cap",
+                    })?;
+                let (residual, residual_actual_allocations) = if scalar {
+                    let prospective_allocations = residual_prospective_allocations.ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "scalar fixed-domain route lacks residual allocation census",
+                        },
+                    )?;
+                    let (residual, actual_allocations) =
+                        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                            &rust.hir,
+                            continuation_profile,
+                            limits.continuation,
+                            residual_allocation_limit,
+                            prospective_allocations,
+                        )
+                        .map_err(|source| {
+                            let Some(prospective) = scalar_build_prospective else {
+                                return AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "scalar compile failure lacks composite P",
+                                };
+                            };
+                            let Some(actual) = compose_fixed_residual_build_failure_actual(
+                                guard_build,
+                                &source.receipt,
+                            ) else {
+                                return AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "scalar compile failure composite A overflowed",
+                                };
+                            };
+                            let composite =
+                                AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
+                                    prospective,
+                                    actual,
+                                };
+                            if !composite.contains_actual() {
+                                return AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "scalar compile failure A exceeds composite P",
+                                };
+                            }
+                            AggregateBuildError::FixedAbsoluteDomainResidualCompile {
+                                operation,
+                                selection,
+                                planner_work: work,
+                                strategy,
+                                guard: guard_build,
+                                composite,
+                                source,
+                            }
+                        })?;
+                    (Some(residual), Some(actual_allocations))
+                } else {
+                    (None, None)
+                };
+                let residual_compile = residual.as_ref().map(CompiledRegex::compile_accounting);
+                if let Some(compile) = residual_compile
+                    && (compile.hir_nodes != expected_nodes
+                        || compile.captures_erased != expected_captures)
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from fixed-domain residual traversal",
+                    });
+                }
+                let residual_identity =
+                    residual
+                        .as_ref()
+                        .map(|engine| AggregateContinuationIdentity {
+                            semantics: AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir,
+                            program: engine.plan_id(),
+                        });
+                let artifact_persistent_bytes = residual_compile.map_or_else(
+                    || Ok(guard_build.actual.persistent_bytes),
+                    |compile| {
+                        guard_build
+                            .actual
+                            .persistent_bytes
+                            .checked_add(compile.program_bytes)
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed-domain composite persistent bytes overflow",
+                            })
+                    },
+                )?;
+                let artifact_construction_peak_bytes = residual_compile.map_or_else(
+                    || Ok(guard_build.actual.peak_bytes),
+                    |compile| {
+                        guard_build
+                            .actual
+                            .persistent_bytes
+                            .checked_add(compile.construction_peak_bytes)
+                            .map(|co_live| co_live.max(guard_build.actual.peak_bytes))
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed-domain composite construction peak overflow",
+                            })
+                    },
+                )?;
+                let capture_erasure_work = residual_compile.map_or_else(
+                    || Ok(captures),
+                    |compile| {
+                        captures.checked_add(compile.capture_erasure_work).ok_or(
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed-domain composite capture-erasure work overflow",
+                            },
+                        )
+                    },
+                )?;
+                let compile_work = residual_compile.map_or(0_u64, |compile| {
+                    u64::try_from(compile.work).unwrap_or(u64::MAX)
+                });
+                if residual_compile.is_some() && compile_work == u64::MAX {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-domain residual compile work does not fit u64",
+                    });
+                }
+                let owner_bytes = fixed_absolute_owner_bytes().map_err(|detail| {
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail,
+                    }
+                })?;
+                let owner_work = u64::try_from(owner_bytes).map_err(|_| {
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed absolute owner work does not fit u64",
+                    }
+                })?;
+                let actual_work = guard_build
+                    .actual
+                    .build_work
+                    .checked_add(compile_work)
+                    .and_then(|work| work.checked_add(owner_work))
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-domain composite actual work overflow",
+                    })?;
+                let actual_allocations = guard_build
+                    .actual
+                    .allocations
+                    .checked_add(residual_actual_allocations.unwrap_or(0))
+                    .and_then(|allocations| allocations.checked_add(1))
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-domain composite actual allocations overflow",
+                    })?;
+                let prospective = match scalar_build_prospective {
+                    Some(prospective) => prospective,
+                    None => include_fixed_absolute_owner_prospective(
+                        AggregateFixedAbsoluteDomainResidualBuildProspective {
+                        work: guard_build.prospective.build_work,
+                        allocations: guard_build.prospective.allocations,
+                        persistent_bytes: guard_build.prospective.persistent_bytes,
+                        peak_bytes: guard_build.prospective.peak_bytes,
+                        },
+                    )
+                    .map_err(|detail| AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail,
+                    })?,
+                };
+                let persistent_bytes = artifact_persistent_bytes.checked_add(owner_bytes).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed absolute owner persistent bytes overflow",
+                    },
+                )?;
+                let construction_peak_bytes =
+                    artifact_construction_peak_bytes.max(persistent_bytes);
+                let actual = AggregateFixedAbsoluteDomainResidualBuildActual {
+                    work: actual_work,
+                    allocations: actual_allocations,
+                    persistent_bytes,
+                    peak_bytes: construction_peak_bytes,
+                    published: true,
+                };
+                if actual.work > prospective.work
+                    || actual.allocations > prospective.allocations
+                    || actual.persistent_bytes > prospective.persistent_bytes
+                    || actual.peak_bytes > prospective.peak_bytes
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-domain composite actual exceeds prospective",
+                    });
+                }
+                let build = AggregateFixedAbsoluteDomainBuildAccounting {
+                    kernel: guard_build,
+                    guard_with_owner,
+                    residual: residual_compile,
+                    prospective,
+                    actual,
+                };
+                let identity = AggregateFixedAbsoluteDomainIdentity {
+                    kernel,
+                    residual: residual_identity,
+                    residual_strategy: scalar.then_some(strategy),
+                };
+                let seal = AggregateFixedAbsoluteDomainSeal {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key: Arc::clone(&syntax_key),
+                    admission,
+                    syntax: syntax.clone(),
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::FixedAbsoluteDomain,
+                    continuation_strategy: scalar.then_some(strategy),
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    bounded_context_planner_work,
+                    fixed_absolute_planner_work: work,
+                    max_fixed_absolute_planner_work: limits.max_fixed_absolute_planner_work,
+                    finite_planner_work: 0,
+                    capture_erasure_work,
+                    captures_erased: captures,
+                    identity,
+                    build,
+                    admission_policy: limits.admission,
+                    syntax_safety: limits.syntax_safety,
+                    guard_build_limits: limits.fixed_absolute,
+                    residual_build_limits: if scalar {
+                        limits.fixed_absolute_residual
+                    } else {
+                        AggregateFixedAbsoluteDomainResidualBuildLimits::default()
+                    },
+                    continuation_build_limits: if scalar {
+                        limits.continuation
+                    } else {
+                        AggregateCompileLimits::default()
+                    },
+                    residual_allocation_census: residual_prospective_allocations,
+                    retained_capacity_bytes: persistent_bytes,
+                };
+                let error_identity = AggregateFixedAbsoluteDomainErrorIdentity {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key: Arc::clone(&syntax_key),
+                    operation,
+                    selection,
+                    continuation_strategy: scalar.then_some(strategy),
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    admission: limits.admission,
+                    syntax_safety: limits.syntax_safety,
+                    max_fixed_absolute_planner_work: limits.max_fixed_absolute_planner_work,
+                    fixed_absolute_planner_work: work,
+                    plan_identity: identity,
+                    guard_build_limits: limits.fixed_absolute,
+                    residual_build_limits: if scalar {
+                        limits.fixed_absolute_residual
+                    } else {
+                        AggregateFixedAbsoluteDomainResidualBuildLimits::default()
+                    },
+                    continuation_build_limits: if scalar {
+                        limits.continuation
+                    } else {
+                        AggregateCompileLimits::default()
+                    },
+                    residual_allocation_census: residual_prospective_allocations,
+                };
+                let owner =
+                    AggregateExecutionIdentity::fixed_absolute_domain(seal, error_identity);
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::FixedAbsoluteDomain,
+                    continuation_strategy: scalar.then_some(strategy),
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    bounded_context_planner_work,
+                    fixed_absolute_planner_work: u32::try_from(work).map_err(|_| {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed absolute planner work does not fit report field",
+                        }
+                    })?,
+                    finite_planner_work: 0,
+                    capture_erasure_work,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::FixedAbsoluteDomain(build.summary()),
+                    plan_identity: AggregatePlanIdentity::FixedAbsoluteDomain(identity),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: Some(AggregateUrlOrFixedSeal::Fixed(owner)),
+                    retained_capacity_bytes: persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::FixedAbsoluteDomain(
+                        AggregateFixedAbsoluteDomainEngine { guard, residual },
+                    ),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(fixed_absolute::Inspection::Ineligible { work }) => work,
+            None => 0,
+            }
+        })
+        .map_err(|_| AggregateBuildError::InternalInvariant {
+            operation,
+            selection,
+            detail: "fixed absolute planner work does not fit report field",
+        })?;
         let inspect_finite =
             selection == AggregatePlanSelection::Auto && operation != AggregateOperation::Spans;
         let root_finite = if inspect_finite {
@@ -2855,6 +5212,7 @@ impl AggregateBuilder {
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
+                        fixed_absolute_planner_work,
                         finite_planner_work,
                         capture_erasure_work: 0,
                         captures_erased: 0,
@@ -2996,6 +5354,7 @@ impl AggregateBuilder {
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
                         bounded_context_planner_work,
+                        fixed_absolute_planner_work,
                         finite_planner_work,
                         capture_erasure_work,
                         captures_erased: expected_captures,
@@ -3060,8 +5419,9 @@ impl AggregateBuilder {
         let program = engine.plan_id();
         let sealed_required_internal_anchor_identity = (compile.required_internal_anchors == 1)
             .then_some(AggregateRequiredInternalAnchorSeal { program, compile });
-        let sealed_url_aggregate_identity = (compile.url_aggregate_plans == 1)
-            .then_some(AggregateUrlAggregateSeal { program, compile });
+        let sealed_url_aggregate_identity = (compile.url_aggregate_plans == 1).then_some(
+            AggregateUrlOrFixedSeal::Url(AggregateUrlAggregateSeal { program, compile }),
+        );
         let report = AggregateBuildReport {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
             syntax_key,
@@ -3081,6 +5441,7 @@ impl AggregateBuilder {
             bounded_separated_fields_planner_work,
             prefix_class_alternation_planner_work,
             bounded_context_planner_work,
+            fixed_absolute_planner_work,
             finite_planner_work,
             capture_erasure_work: compile.capture_erasure_work,
             captures_erased: compile.captures_erased,
@@ -3125,6 +5486,10 @@ fn tagged_grapheme_ranges(
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "selected engines retain their already-budgeted artifacts inline; boxing would add an unaccounted allocation"
+)]
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
@@ -3134,11 +5499,18 @@ enum AggregateEngine {
     BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
     BoundedContext(BoundedContextPlan),
+    FixedAbsoluteDomain(AggregateFixedAbsoluteDomainEngine),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
     SparseFiniteSpanSum(SparseOrderedLiteralSpanSumPlan),
     Continuation(CompiledRegex),
+}
+
+#[derive(Debug)]
+struct AggregateFixedAbsoluteDomainEngine {
+    guard: FixedAbsoluteDomainPlan,
+    residual: Option<CompiledRegex>,
 }
 
 #[derive(Debug)]
@@ -3149,6 +5521,38 @@ struct AggregatePlan {
     report: AggregateBuildReport,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "fixed terminal failures retain one lossless allocation-free continuation/composite receipt"
+)]
+enum AggregateFixedAbsoluteDomainAttemptFailure {
+    Guard(FixedAbsoluteDomainReduceError),
+    Residual {
+        continuation: OperationAttemptError,
+        composite: AggregateFixedAbsoluteDomainResidualReceipt,
+    },
+}
+
+impl fmt::Debug for AggregateFixedAbsoluteDomainAttemptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Guard(error) => formatter.debug_tuple("Guard").field(error).finish(),
+            Self::Residual {
+                continuation,
+                composite,
+            } => formatter
+                .debug_struct("Residual")
+                .field("continuation", continuation)
+                .field("composite", composite)
+                .finish(),
+        }
+    }
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "execution errors preserve one complete allocation-free fixed-domain owner/receipt identity"
+)]
 impl AggregatePlan {
     const fn operation(&self) -> AggregateOperation {
         self.report.operation
@@ -3160,6 +5564,14 @@ impl AggregatePlan {
 
     const fn minimum_match_bytes(&self) -> Option<usize> {
         self.minimum_match_bytes
+    }
+
+    fn fixed_absolute_domain_seal(&self) -> Option<&AggregateFixedAbsoluteDomainSeal> {
+        let owner = self.report.fixed_absolute_domain_owner()?;
+        let sealed = owner.fixed_absolute_domain_seal();
+        (self.report.has_closed_fixed_absolute_domain_identity()
+            && sealed.matches_build_inputs(&self.limits))
+        .then_some(sealed)
     }
 
     fn cache_identity(&self, execution_limits: &AggregateRunLimits) -> AggregateCacheIdentity {
@@ -3177,15 +5589,167 @@ impl AggregatePlan {
         }
     }
 
+    /// Return the exact fixed-domain guard envelope for a complete original
+    /// haystack without borrowing or inspecting that haystack.
+    ///
+    /// `None` proves that the retained artifact and its private construction
+    /// seal do not jointly authenticate a fixed absolute-domain route. The
+    /// scalar-envelope route returns only its fixed guard envelope; its eager
+    /// continuation remains governed by `AggregateRunLimits::continuation`.
+    fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        let AggregateEngine::FixedAbsoluteDomain(engine) = &self.engine else {
+            return Ok(None);
+        };
+        if self.fixed_absolute_domain_seal().is_none() {
+            return Ok(None);
+        }
+        let AggregatePlanIdentity::FixedAbsoluteDomain(identity) = self.report.plan_identity else {
+            return Ok(None);
+        };
+        let Some(build) = self.report.fixed_absolute_domain_build_accounting() else {
+            return Ok(None);
+        };
+        let operation = match self.operation() {
+            AggregateOperation::Count => FixedAbsoluteDomainOperation::Count,
+            AggregateOperation::SpanSum => FixedAbsoluteDomainOperation::SpanSum,
+            AggregateOperation::Compile | AggregateOperation::Spans => return Ok(None),
+        };
+        let guard_identity = match operation {
+            FixedAbsoluteDomainOperation::Count => engine.guard.count_identity(),
+            FixedAbsoluteDomainOperation::SpanSum => engine.guard.span_sum_identity(),
+        };
+        if identity.kernel != guard_identity || build.kernel != engine.guard.build_accounting() {
+            return Ok(None);
+        }
+        let limits = FixedAbsoluteDomainReduceLimits {
+            max_byte_probes: usize::MAX,
+            max_branch_checks: usize::MAX,
+            max_match_events: usize::MAX,
+            max_count: u64::MAX,
+            max_span_sum: u64::MAX,
+            max_reducer_steps: usize::MAX,
+            max_total_work: usize::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+        engine
+            .guard
+            .preflight(
+                haystack_len,
+                Window::new(0, haystack_len),
+                operation,
+                limits,
+            )
+            .map(|admission| Some(admission.prospective()))
+    }
+
+    fn fixed_absolute_domain_full_window_composite_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<AggregateFixedAbsoluteDomainResidualProspective>, AggregateExecutionSource>
+    {
+        let AggregateEngine::FixedAbsoluteDomain(engine) = &self.engine else {
+            return Ok(None);
+        };
+        if self.fixed_absolute_domain_seal().is_none() {
+            return Ok(None);
+        }
+        let AggregatePlanIdentity::FixedAbsoluteDomain(identity) = self.report.plan_identity else {
+            return Ok(None);
+        };
+        if identity.kernel.descriptor.kind()
+            != FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+        {
+            return Ok(None);
+        }
+        let residual =
+            engine
+                .residual
+                .as_ref()
+                .ok_or(AggregateExecutionSource::InternalInvariant(
+                    "scalar fixed-domain query lacks its eager residual",
+                ))?;
+        let strategy = self.report.continuation_strategy.ok_or(
+            AggregateExecutionSource::InternalInvariant(
+                "scalar fixed-domain query lacks its continuation strategy",
+            ),
+        )?;
+        let guard = self
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+            .map_err(|_| {
+                AggregateExecutionSource::InternalInvariant(
+                    "authenticated fixed guard prospective derivation failed",
+                )
+            })?
+            .ok_or(AggregateExecutionSource::InternalInvariant(
+                "scalar fixed-domain query lost its authenticated guard",
+            ))?;
+        if guard.disposition != FixedAbsoluteDomainDisposition::PrepublishedContinuation {
+            return Ok(None);
+        }
+        let continuation = residual
+            .fixed_scalar_dense_count_prospective(haystack_len, strategy)
+            .map_err(AggregateExecutionSource::Continuation)?;
+        let persistent_bytes = self
+            .report
+            .fixed_absolute_domain_build_accounting()
+            .ok_or(AggregateExecutionSource::InternalInvariant(
+                "scalar fixed-domain query lacks composite build accounting",
+            ))?
+            .actual
+            .persistent_bytes;
+        compose_fixed_residual_prospective(guard, continuation, persistent_bytes)
+            .map(Some)
+            .map_err(AggregateExecutionSource::Continuation)
+    }
+
     fn execution_error(
         &self,
         execution_limits: &AggregateRunLimits,
         source: AggregateExecutionSource,
     ) -> AggregateExecutionError {
         AggregateExecutionError {
-            identity: Box::new(self.cache_identity(execution_limits)),
+            identity: AggregateExecutionAttemptIdentity::incumbent(Box::new(
+                self.cache_identity(execution_limits),
+            )),
             source,
         }
+    }
+
+    fn fixed_execution_error(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        failure: AggregateFixedAbsoluteDomainAttemptFailure,
+    ) -> AggregateExecutionError {
+        let Some(owner) = self
+            .report
+            .fixed_absolute_domain_owner()
+            .filter(|_| self.fixed_absolute_domain_seal().is_some())
+            .cloned()
+        else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "fixed terminal failure lacks its authenticated construction owner",
+                ),
+            );
+        };
+        let receipt = AggregateFixedAbsoluteDomainAttemptReceipt::new(*execution_limits, failure);
+        let kind = receipt.kind();
+        let identity = AggregateExecutionAttemptIdentity::fixed_absolute_domain(owner, receipt);
+        let source = match kind {
+            AggregateFixedAbsoluteDomainAttemptKind::Guard => {
+                AggregateExecutionSource::FixedAbsoluteDomain
+            }
+            AggregateFixedAbsoluteDomainAttemptKind::Residual => {
+                AggregateExecutionSource::FixedAbsoluteDomainResidual
+            }
+        };
+        AggregateExecutionError { identity, source }
     }
 
     fn execution_report(
@@ -3196,6 +5760,21 @@ impl AggregatePlan {
         AggregateExecutionReport {
             identity: self.cache_identity(execution_limits),
             details,
+        }
+    }
+
+    fn fixed_residual_persistent_bytes(
+        &self,
+        execution_limits: &AggregateRunLimits,
+    ) -> Result<usize, AggregateExecutionError> {
+        match self.report.fixed_absolute_domain_build_accounting() {
+            Some(build) if build.residual.is_some() => Ok(build.actual.persistent_bytes),
+            _ => Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "fixed-domain residual lacks sealed composite build accounting",
+                ),
+            )),
         }
     }
 
@@ -3276,6 +5855,142 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::BoundedContext(source))
                 }),
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                let guard = engine
+                    .guard
+                    .count(haystack, limits.fixed_absolute)
+                    .map_err(|source| {
+                        self.fixed_execution_error(
+                            limits,
+                            AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                        )
+                    })?;
+                match guard.outcome {
+                    FixedAbsoluteDomainCountOutcome::Complete { count } => {
+                        Ok(AggregateCountExecution::FixedAbsoluteDirect {
+                            value: count,
+                            guard: guard.accounting,
+                        })
+                    }
+                    FixedAbsoluteDomainCountOutcome::PrepublishedContinuation => {
+                        let residual = engine.residual.as_ref().ok_or_else(|| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed-domain continuation branch lacks its eager residual",
+                                ),
+                            )
+                        })?;
+                        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed-domain continuation branch lacks its strategy",
+                                ),
+                            )
+                        })?;
+                        let persistent_bytes = self.fixed_residual_persistent_bytes(limits)?;
+                        let residual_allocation_limit = limits
+                            .fixed_absolute_residual
+                            .max_allocations
+                            .saturating_sub(guard.accounting.prospective.allocations);
+                        let mut published_prospective = None;
+                        let attempt = residual.admit_count_with_receipt_observer(
+                            haystack,
+                            Self::full_range(haystack),
+                            strategy,
+                            limits.continuation,
+                            residual_allocation_limit,
+                            |continuation| {
+                                let prospective = compose_fixed_residual_prospective(
+                                    guard.accounting.prospective,
+                                    continuation,
+                                    persistent_bytes,
+                                )?;
+                                published_prospective = Some(prospective);
+                                enforce_fixed_residual_prospective(prospective, limits)
+                            },
+                        );
+                        let admitted = match attempt {
+                            Ok(admitted) => admitted,
+                            Err(continuation) => {
+                                let Some(prospective) = published_prospective else {
+                                    return Err(self.execution_error(
+                                        limits,
+                                        AggregateExecutionSource::InternalInvariant(
+                                            "fixed residual failed before publishing composite P",
+                                        ),
+                                    ));
+                                };
+                                let composite = fixed_residual_composite(
+                                    guard.accounting,
+                                    &continuation.receipt,
+                                    prospective,
+                                    persistent_bytes,
+                                )
+                                .map_err(|_| {
+                                    self.execution_error(
+                                        limits,
+                                        AggregateExecutionSource::InternalInvariant(
+                                            "fixed residual failure composite overflowed",
+                                        ),
+                                    )
+                                })?;
+                                return Err(self.fixed_execution_error(
+                                    limits,
+                                    AggregateFixedAbsoluteDomainAttemptFailure::Residual {
+                                        continuation,
+                                        composite,
+                                    },
+                                ));
+                            }
+                        };
+                        let prospective = published_prospective.ok_or_else(|| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed residual succeeded without publishing composite P",
+                                ),
+                            )
+                        })?;
+                        let composite = fixed_residual_composite(
+                            guard.accounting,
+                            &admitted.receipt,
+                            prospective,
+                            persistent_bytes,
+                        )
+                        .map_err(|_| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed residual success composite overflowed",
+                                ),
+                            )
+                        })?;
+                        if !composite.contains_actual_with(&admitted.receipt) {
+                            return Err(self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed residual success escaped its composite P",
+                                ),
+                            ));
+                        }
+                        let value = u64::try_from(admitted.admitted.value()).map_err(|_| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed-domain residual count does not fit u64",
+                                ),
+                            )
+                        })?;
+                        Ok(AggregateCountExecution::FixedAbsoluteResidual {
+                            value,
+                            admitted,
+                            composite,
+                        })
+                    }
+                }
+            }
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| AggregateCountExecution::FiniteLiteral {
@@ -3343,6 +6058,10 @@ impl AggregatePlan {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive engine dispatch keeps every typed span-sum error mapping adjacent"
+    )]
     fn execute_span_sum(
         &self,
         haystack: &[u8],
@@ -3400,6 +6119,26 @@ impl AggregatePlan {
                     "span-sum operation retained a bounded-context count plan",
                 ),
             )),
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                if engine.residual.is_some() {
+                    return Err(self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "span-sum fixed-domain route retained a residual",
+                        ),
+                    ));
+                }
+                engine
+                    .guard
+                    .span_sum(haystack, limits.fixed_absolute)
+                    .map(AggregateSpanSumExecution::FixedAbsoluteDomain)
+                    .map_err(|source| {
+                        self.fixed_execution_error(
+                            limits,
+                            AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                        )
+                    })
+            }
             AggregateEngine::FiniteSpanSum(engine) => engine
                 .span_sum(haystack, limits.finite_literal)
                 .map(|result| AggregateSpanSumExecution::FiniteLiteral {
@@ -3476,11 +6215,141 @@ impl AggregatePlan {
         Ok(AggregateSpanSumExecution::Continuation { admitted, value })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the value-only fixed/residual path keeps publication and terminal P/A checks in one audit boundary"
+    )]
     fn execute_count_value(
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
+        if let AggregateEngine::FixedAbsoluteDomain(engine) = &self.engine {
+            let guard = engine
+                .guard
+                .count(haystack, limits.fixed_absolute)
+                .map_err(|source| {
+                    self.fixed_execution_error(
+                        limits,
+                        AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                    )
+                })?;
+            return match guard.outcome {
+                FixedAbsoluteDomainCountOutcome::Complete { count } => Ok(count),
+                FixedAbsoluteDomainCountOutcome::PrepublishedContinuation => {
+                    let residual = engine.residual.as_ref().ok_or_else(|| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed-domain value branch lacks its eager residual",
+                            ),
+                        )
+                    })?;
+                    let strategy = self.report.continuation_strategy.ok_or_else(|| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed-domain value branch lacks its strategy",
+                            ),
+                        )
+                    })?;
+                    let persistent_bytes = self.fixed_residual_persistent_bytes(limits)?;
+                    let residual_allocation_limit = limits
+                        .fixed_absolute_residual
+                        .max_allocations
+                        .saturating_sub(guard.accounting.prospective.allocations);
+                    let mut published_prospective = None;
+                    let result = residual.count_value_with_receipt_observer(
+                        haystack,
+                        Self::full_range(haystack),
+                        strategy,
+                        limits.continuation,
+                        residual_allocation_limit,
+                        |continuation| {
+                            let prospective = compose_fixed_residual_prospective(
+                                guard.accounting.prospective,
+                                continuation,
+                                persistent_bytes,
+                            )?;
+                            published_prospective = Some(prospective);
+                            enforce_fixed_residual_prospective(prospective, limits)
+                        },
+                    );
+                    let attempt = match result {
+                        Ok(attempt) => attempt,
+                        Err(continuation) => {
+                            let Some(prospective) = published_prospective else {
+                                return Err(self.execution_error(
+                                    limits,
+                                    AggregateExecutionSource::InternalInvariant(
+                                        "fixed residual value failed before publishing composite P",
+                                    ),
+                                ));
+                            };
+                            let composite = fixed_residual_composite(
+                                guard.accounting,
+                                &continuation.receipt,
+                                prospective,
+                                persistent_bytes,
+                            )
+                            .map_err(|_| {
+                                self.execution_error(
+                                    limits,
+                                    AggregateExecutionSource::InternalInvariant(
+                                        "fixed residual value failure composite overflowed",
+                                    ),
+                                )
+                            })?;
+                            return Err(self.fixed_execution_error(
+                                limits,
+                                AggregateFixedAbsoluteDomainAttemptFailure::Residual {
+                                    continuation,
+                                    composite,
+                                },
+                            ));
+                        }
+                    };
+                    let prospective = published_prospective.ok_or_else(|| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed residual value succeeded without publishing composite P",
+                            ),
+                        )
+                    })?;
+                    let composite = fixed_residual_composite(
+                        guard.accounting,
+                        &attempt.receipt,
+                        prospective,
+                        persistent_bytes,
+                    )
+                    .map_err(|_| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed residual value success composite overflowed",
+                            ),
+                        )
+                    })?;
+                    if !composite.contains_actual_with(&attempt.receipt) {
+                        return Err(self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed residual value success escaped its composite P",
+                            ),
+                        ));
+                    }
+                    u64::try_from(attempt.value).map_err(|_| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "fixed-domain residual count does not fit u64",
+                            ),
+                        )
+                    })
+                }
+            };
+        }
         let AggregateEngine::Continuation(engine) = &self.engine else {
             return self
                 .execute_count(haystack, limits)
@@ -3551,6 +6420,10 @@ impl AggregatePlan {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "execution variants retain already-budgeted result receipts inline without a new allocation"
+)]
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
@@ -3560,6 +6433,15 @@ enum AggregateCountExecution {
     BoundedSeparatedFields(BoundedSeparatedFieldsCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
     BoundedContext(BoundedContextCountResult),
+    FixedAbsoluteDirect {
+        value: u64,
+        guard: FixedAbsoluteDomainReduceAccounting,
+    },
+    FixedAbsoluteResidual {
+        value: u64,
+        admitted: AdmittedCountAttempt,
+        composite: AggregateFixedAbsoluteDomainResidualReceipt,
+    },
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -3587,6 +6469,9 @@ impl AggregateCountExecution {
             Self::BoundedSeparatedFields(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
             Self::BoundedContext(result) => result.count,
+            Self::FixedAbsoluteDirect { value, .. } | Self::FixedAbsoluteResidual { value, .. } => {
+                *value
+            }
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -3619,6 +6504,25 @@ impl AggregateCountExecution {
             Self::BoundedContext(result) => {
                 AggregateExecutionDetails::BoundedContext(result.accounting)
             }
+            Self::FixedAbsoluteDirect { guard, .. } => {
+                AggregateExecutionDetails::FixedAbsoluteDomain(
+                    AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
+                )
+            }
+            Self::FixedAbsoluteResidual {
+                admitted,
+                composite,
+                ..
+            } => AggregateExecutionDetails::FixedAbsoluteDomain(
+                AggregateFixedAbsoluteDomainExecutionDetails::Residual {
+                    composite: AggregateFixedAbsoluteDomainResidualExecutionSummary {
+                        prospective: composite.prospective,
+                        actual: composite.actual,
+                        continuation_actual: admitted.admitted.accounting(),
+                        continuation_actual_allocations: admitted.receipt.actual_allocations,
+                    },
+                },
+            ),
             Self::FiniteLiteral {
                 upper_bounds,
                 actual,
@@ -3651,6 +6555,7 @@ enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
     FixedClassSandwich(FixedClassSandwichSpanSumResult),
+    FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -3673,6 +6578,7 @@ impl AggregateSpanSumExecution {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
+            Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -3690,6 +6596,11 @@ impl AggregateSpanSumExecution {
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
+            Self::FixedAbsoluteDomain(result) => AggregateExecutionDetails::FixedAbsoluteDomain(
+                AggregateFixedAbsoluteDomainExecutionDetails::Direct {
+                    guard: result.accounting,
+                },
+            ),
             Self::FiniteLiteral {
                 upper_bounds,
                 actual,
@@ -5448,6 +8359,10 @@ fn inspect_exact_literal(
 #[derive(Debug)]
 pub struct AggregateCompileRegex(AggregatePlan);
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public verification returns the exact lossless aggregate execution error by contract"
+)]
 impl AggregateCompileRegex {
     /// Complete construction report and retained-plan identity.
     #[must_use]
@@ -5462,6 +8377,30 @@ impl AggregateCompileRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> AggregateCacheIdentity {
         self.0.cache_identity(limits.borrow())
+    }
+
+    /// Exact intrinsic fixed-domain guard envelope for complete-haystack
+    /// verification, computed without source access or allocation.
+    ///
+    /// Returns `None` unless this artifact authenticates a fixed absolute-
+    /// domain count guard. This common query lets verification code avoid
+    /// reconstructing descriptor details from public summary identities.
+    pub fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        self.0
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+    }
+
+    /// Full scalar guard-plus-intrinsic-dense continuation prospective.
+    pub fn fixed_absolute_domain_full_window_composite_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<AggregateFixedAbsoluteDomainResidualProspective>, AggregateExecutionSource>
+    {
+        self.0
+            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
     }
 
     /// Untimed semantic verification for compile-model qualification.
@@ -5486,6 +8425,10 @@ impl AggregateCompileRegex {
 #[derive(Debug)]
 pub struct AggregateSpansRegex(AggregatePlan);
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public execution returns the exact lossless aggregate execution error by contract"
+)]
 impl AggregateSpansRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateBuildReport {
@@ -5743,6 +8686,10 @@ impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 #[derive(Debug)]
 pub struct AggregateCountRegex(AggregatePlan);
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public execution returns the exact lossless aggregate execution error by contract"
+)]
 impl AggregateCountRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateBuildReport {
@@ -5761,6 +8708,32 @@ impl AggregateCountRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> AggregateCacheIdentity {
         self.0.cache_identity(limits.borrow())
+    }
+
+    /// Exact intrinsic fixed-domain guard envelope for a complete haystack of
+    /// `haystack_len` bytes, computed without source access or allocation.
+    ///
+    /// Returns `None` unless the private construction seal, retained guard,
+    /// build receipt, and count-operation identity all authenticate the same
+    /// fixed absolute-domain artifact. This does not apply caller run limits.
+    /// For the scalar-envelope route it describes the guard only; the eager
+    /// residual uses the independently published continuation envelope.
+    pub fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        self.0
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+    }
+
+    /// Full scalar guard-plus-intrinsic-dense continuation prospective.
+    pub fn fixed_absolute_domain_full_window_composite_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<AggregateFixedAbsoluteDomainResidualProspective>, AggregateExecutionSource>
+    {
+        self.0
+            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
     }
 
     /// Count the complete non-overlapping sequence on the original haystack.
@@ -5817,6 +8790,10 @@ impl AggregateCountResult {
 #[derive(Debug)]
 pub struct AggregateSpanSumRegex(AggregatePlan);
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public execution returns the exact lossless aggregate execution error by contract"
+)]
 impl AggregateSpanSumRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateBuildReport {
@@ -5829,6 +8806,30 @@ impl AggregateSpanSumRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> AggregateCacheIdentity {
         self.0.cache_identity(limits.borrow())
+    }
+
+    /// Exact intrinsic fixed-domain guard envelope for a complete haystack of
+    /// `haystack_len` bytes, computed without source access or allocation.
+    ///
+    /// Returns `None` unless the private construction seal, retained guard,
+    /// build receipt, and span-sum identity all authenticate the same fixed
+    /// absolute-domain artifact. This does not apply caller run limits.
+    pub fn fixed_absolute_domain_full_window_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<FixedAbsoluteDomainProspective>, FixedAbsoluteDomainReduceError> {
+        self.0
+            .fixed_absolute_domain_full_window_prospective(haystack_len)
+    }
+
+    /// Full scalar guard-plus-intrinsic-dense continuation prospective.
+    pub fn fixed_absolute_domain_full_window_composite_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<AggregateFixedAbsoluteDomainResidualProspective>, AggregateExecutionSource>
+    {
+        self.0
+            .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
     }
 
     /// Sum complete non-overlapping match lengths on the original haystack.

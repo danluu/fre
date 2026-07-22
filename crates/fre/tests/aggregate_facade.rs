@@ -281,7 +281,7 @@ fn compile_artifact_is_complete_isolated_and_verifiable_across_pattern_families(
             .expect("untimed verification");
         assert_eq!(verified.value(), expected);
         assert_eq!(
-            verified.report().identity.operation,
+            verified.report().cache_identity().operation,
             AggregateOperation::Compile
         );
     }
@@ -437,6 +437,7 @@ fn continuation_details(
         | AggregateExecutionDetails::BoundedSeparatedFields(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::BoundedContext(_)
+        | AggregateExecutionDetails::FixedAbsoluteDomain(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
@@ -1070,7 +1071,7 @@ fn unicode_byte_stable_continuations_match_pinned_bytes_oracle_for_all_operation
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "spans {pattern:?}/{strategy:?}");
             assert!(matches!(
-                spans.report().identity.plan_identity,
+                spans.report().cache_identity().plan_identity,
                 AggregatePlanIdentity::Continuation(identity)
                     if identity.semantics
                         == AggregateContinuationSemantics::UnicodeOnUtf8ScalarHir
@@ -2581,7 +2582,12 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
             UnicodeScalarAggregateReduceError::RangeComparisonsLimit { .. }
         )
     ));
-    assert_eq!(error.identity.plan, AggregatePlanKind::UnicodeScalarClass);
+    assert!(
+        error
+            .identity
+            .as_cache_identity()
+            .is_some_and(|identity| identity.plan == AggregatePlanKind::UnicodeScalarClass)
+    );
 }
 
 #[test]
@@ -2752,12 +2758,16 @@ fn unicode_exact_count_error(
     let value = regex.count_value(haystack, *limits).unwrap_err();
     assert_eq!(value.identity, audited.identity);
     assert_eq!(value.source, audited.source);
-    assert!(matches!(
-        audited.identity.plan_identity,
-        AggregatePlanIdentity::ExactLiteral(identity)
-            if identity.semantics
-                == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
-    ));
+    assert!(
+        audited
+            .identity
+            .as_cache_identity()
+            .is_some_and(|identity| {
+                matches!(identity.plan_identity, AggregatePlanIdentity::ExactLiteral(plan)
+                if plan.semantics
+                    == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal)
+            })
+    );
     match audited.source {
         AggregateExecutionSource::ExactLiteral(source) => source,
         source => panic!("Unicode exact literal attempted another engine: {source:?}"),
@@ -3185,7 +3195,10 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
     let admitted = full.count(b"aaaa", limits).unwrap();
     assert_eq!(admitted.value(), 4);
     assert_eq!(full.count_value(b"aaaa", limits).unwrap(), 4);
-    assert_eq!(admitted.report().identity, full.cache_identity(limits));
+    assert_eq!(
+        admitted.report().cache_identity(),
+        full.cache_identity(limits)
+    );
     let (certificate, accounting) = continuation_details(&admitted.report().details);
     assert_eq!(certificate.strategy, AggregateStrategy::FullTable);
     assert_eq!(certificate.range, 0..4);
@@ -3197,14 +3210,14 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
     refused_limits.continuation.max_random_access_bytes = required - 1;
     let error = full.count(b"aaaa", refused_limits).unwrap_err();
     let value_error = full.count_value(b"aaaa", refused_limits).unwrap_err();
-    assert_eq!(
-        error.identity.as_ref(),
-        &full.cache_identity(refused_limits)
-    );
+    let Some(identity) = error.identity.as_cache_identity() else {
+        panic!("continuation incumbent must retain its boxed cache identity");
+    };
+    assert_eq!(identity, &full.cache_identity(refused_limits));
     assert_eq!(value_error.identity, error.identity);
     assert_eq!(value_error.source, error.source);
     assert_eq!(
-        error.identity.continuation_strategy,
+        identity.continuation_strategy,
         Some(AggregateStrategy::FullTable)
     );
     assert!(matches!(
@@ -3385,7 +3398,12 @@ fn exact_reduce_error(
     limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
     let error = regex.count(b"needleneedleXneedle", *limits).unwrap_err();
-    assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
+    assert!(
+        error
+            .identity
+            .as_cache_identity()
+            .is_some_and(|identity| identity.plan == AggregatePlanKind::ExactLiteral)
+    );
     match error.source {
         AggregateExecutionSource::ExactLiteral(source) => source,
         source => panic!("selected exact plan attempted another engine: {source:?}"),
@@ -3399,7 +3417,12 @@ fn exact_reduce_value_error(
     let error = regex
         .count_value(b"needleneedleXneedle", *limits)
         .unwrap_err();
-    assert_eq!(error.identity.plan, AggregatePlanKind::ExactLiteral);
+    assert!(
+        error
+            .identity
+            .as_cache_identity()
+            .is_some_and(|identity| identity.plan == AggregatePlanKind::ExactLiteral)
+    );
     match error.source {
         AggregateExecutionSource::ExactLiteral(source) => source,
         source => panic!("selected exact plan attempted another engine: {source:?}"),

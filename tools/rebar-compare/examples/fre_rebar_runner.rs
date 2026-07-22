@@ -26,7 +26,8 @@ use rebar_compare::{
     current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
     current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
     current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
+    current_fre_rebar_count_run_limits, current_fre_rebar_portable_builder,
+    current_fre_rebar_search_limits, current_fre_rebar_span_sum_run_limits,
     current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
@@ -71,7 +72,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1 report={REPORT_SCHEMA} aggregate-explain=22 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1 report={REPORT_SCHEMA} aggregate-explain=23 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -185,9 +186,12 @@ fn main() -> Result<(), DynError> {
         "grep" => model_grep(&benchmark, &expectations)?,
         model => return Err(format!("unsupported FRE Rebar model {model:?}").into()),
     };
-    if let Some(expected) = expectations.count
-        && let Some(sample) = samples.iter().find(|sample| sample.count != expected)
-    {
+    if let Some((expected, sample)) = expectations.count.and_then(|expected| {
+        samples
+            .iter()
+            .find(|sample| sample.count != expected)
+            .map(|sample| (expected, sample))
+    }) {
         return Err(format!(
             "FRE sample count {} differs from expected {expected}",
             sample.count
@@ -535,6 +539,9 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
             "compile-aggregate-prefix-class-alternation"
         }
         ("compile", AggregatePlanKind::BoundedContext, _) => "compile-aggregate-bounded-context",
+        ("compile", AggregatePlanKind::FixedAbsoluteDomain, _) => {
+            "compile-aggregate-fixed-absolute-domain"
+        }
         ("compile", AggregatePlanKind::FiniteLiteralDfa, true) => {
             "compile-aggregate-finite-literal-sparse"
         }
@@ -552,6 +559,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::BoundedSeparatedFields, _) => "aggregate-bounded-separated-fields",
         (_, AggregatePlanKind::PrefixClassAlternation, _) => "aggregate-prefix-class-alternation",
         (_, AggregatePlanKind::BoundedContext, _) => "aggregate-bounded-context",
+        (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -704,8 +712,7 @@ fn model_count(
         benchmark.unicode,
         expectations,
     )?;
-    let limits =
-        current_fre_rebar_aggregate_run_limits(benchmark.haystack.len(), regex.build_report())?;
+    let limits = current_fre_rebar_count_run_limits(benchmark.haystack.len(), &regex)?;
     let limits = &limits;
     run(
         benchmark,
@@ -753,8 +760,7 @@ fn model_count_spans(
         benchmark.unicode,
         expectations,
     )?;
-    let limits =
-        current_fre_rebar_aggregate_run_limits(benchmark.haystack.len(), regex.build_report())?;
+    let limits = current_fre_rebar_span_sum_run_limits(benchmark.haystack.len(), &regex)?;
     let limits = &limits;
     run(
         benchmark,

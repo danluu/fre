@@ -693,19 +693,31 @@ impl AggregateSpansRegex {
         R: LiteralReplacer,
     {
         let limits = *limits.borrow();
-        let spans =
-            self.spans(haystack, limits.aggregate)
-                .map_err(|error| FunctionalReplacementError {
-                    identity: Box::new(FunctionalReplacementIdentity {
-                        selector: *error.identity,
-                        limit,
-                        max_output_bytes: limits.max_output_bytes,
-                    }),
-                    source: FunctionalReplacementErrorSource::Selector(error.source),
-                })?;
+        let spans = self.spans(haystack, limits.aggregate).map_err(|error| {
+            let (selector, source) = match error.identity.as_cache_identity() {
+                Some(identity) => (
+                    identity.clone(),
+                    FunctionalReplacementErrorSource::Selector(error.source),
+                ),
+                None => (
+                    self.cache_identity(limits.aggregate),
+                    FunctionalReplacementErrorSource::InternalInvariant(
+                        "span selector returned a count-only fixed-domain identity",
+                    ),
+                ),
+            };
+            FunctionalReplacementError {
+                identity: Box::new(FunctionalReplacementIdentity {
+                    selector,
+                    limit,
+                    max_output_bytes: limits.max_output_bytes,
+                }),
+                source,
+            }
+        })?;
         let selector_report = spans.report().clone();
         let identity = FunctionalReplacementIdentity {
-            selector: selector_report.identity,
+            selector: selector_report.cache_identity(),
             limit,
             max_output_bytes: limits.max_output_bytes,
         };
@@ -813,6 +825,10 @@ impl AggregateSpansRegex {
     /// It selects all spans once, computes the exact output length without
     /// allocation, enforces the caller's byte ceiling, reserves once and then
     /// copies the unchanged gaps and literal replacement.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the replacement transaction keeps selection, exact sizing, one reservation and copy accounting together"
+    )]
     pub fn replacen_literal<R: LiteralReplacer>(
         &self,
         haystack: &[u8],
@@ -822,21 +838,33 @@ impl AggregateSpansRegex {
     ) -> Result<LiteralReplacementResult, LiteralReplacementError> {
         let replacement = replacement.literal_bytes();
         let limits = *limits.borrow();
-        let spans =
-            self.spans(haystack, limits.aggregate)
-                .map_err(|error| LiteralReplacementError {
-                    identity: Box::new(LiteralReplacementIdentity {
-                        selector: *error.identity,
-                        limit,
-                        replacement_bytes: replacement.len(),
-                        max_output_bytes: limits.max_output_bytes,
-                        max_output_capacity_bytes: limits.max_output_capacity_bytes,
-                    }),
-                    source: LiteralReplacementErrorSource::Selector(error.source),
-                })?;
+        let spans = self.spans(haystack, limits.aggregate).map_err(|error| {
+            let (selector, source) = match error.identity.as_cache_identity() {
+                Some(identity) => (
+                    identity.clone(),
+                    LiteralReplacementErrorSource::Selector(error.source),
+                ),
+                None => (
+                    self.cache_identity(limits.aggregate),
+                    LiteralReplacementErrorSource::InternalInvariant(
+                        "span selector returned a count-only fixed-domain identity",
+                    ),
+                ),
+            };
+            LiteralReplacementError {
+                identity: Box::new(LiteralReplacementIdentity {
+                    selector,
+                    limit,
+                    replacement_bytes: replacement.len(),
+                    max_output_bytes: limits.max_output_bytes,
+                    max_output_capacity_bytes: limits.max_output_capacity_bytes,
+                }),
+                source,
+            }
+        })?;
         let selector_report = spans.report().clone();
         let identity = LiteralReplacementIdentity {
-            selector: selector_report.identity,
+            selector: selector_report.cache_identity(),
             limit,
             replacement_bytes: replacement.len(),
             max_output_bytes: limits.max_output_bytes,
