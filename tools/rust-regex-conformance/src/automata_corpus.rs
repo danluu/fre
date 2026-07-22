@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{InventoryError, sha256};
 
+pub mod start_mode;
+
 /// Schema for the sealed inventory-only report.
 pub const REGEX_AUTOMATA_CORPUS_REPORT_SCHEMA: &str =
     "fre.regex-automata-0.4.14.package-corpus-inventory.v1";

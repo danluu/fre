@@ -37,6 +37,22 @@ pub use adapter::{
     FreRegexAdapter, SearchBounds, authenticate_candidate_source, build_adapter_report,
     load_executable_cases, read_adapter_report, write_adapter_report,
 };
+pub use automata_corpus::start_mode;
+pub use automata_corpus::start_mode::{
+    REGEX_AUTOMATA_START_MODE_COUNT, REGEX_AUTOMATA_START_MODE_GAINED_MEMBERSHIPS,
+    REGEX_AUTOMATA_START_MODE_MATRIX_SCHEMA, REGEX_AUTOMATA_START_MODE_MEMBERSHIPS,
+    REGEX_AUTOMATA_START_MODE_RETAINED_MEMBERSHIPS, RegexAutomataStartArtifactIdentity,
+    RegexAutomataStartAssertionContract, RegexAutomataStartBaseline,
+    RegexAutomataStartCaseAccounting, RegexAutomataStartCaseReceipt,
+    RegexAutomataStartCommandReceipt, RegexAutomataStartHarnessLimits,
+    RegexAutomataStartHarnessResources, RegexAutomataStartModeMatrixCounts,
+    RegexAutomataStartModeMatrixPayload, RegexAutomataStartModeMatrixReport,
+    RegexAutomataStartModeOutputTarget, RegexAutomataStartModeReceipt,
+    RegexAutomataStartQualification, RegexAutomataStartSelftestAccounting,
+    RegexAutomataStartSourceContract, build_regex_automata_start_mode_matrix,
+    preflight_regex_automata_start_mode_output, read_regex_automata_start_baseline,
+    read_regex_automata_start_mode_matrix, write_regex_automata_start_mode_matrix,
+};
 pub use automata_corpus::{
     REGEX_AUTOMATA_CORPUS_REPORT_SCHEMA, REGEX_AUTOMATA_LOOK_MODE_CONTRACT_SHA256,
     REGEX_AUTOMATA_LOOK_MODE_MATRIX_SCHEMA, RegexAutomataCorpusReport,
