@@ -156,6 +156,13 @@ pub(crate) struct CountAttemptError {
     clippy::too_many_lines,
     reason = "candidate execution keeps validation, metering, scheduling and ordered draining visible"
 )]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the legacy internal entry point remains as a compatibility delegate"
+    )
+)]
 pub(crate) fn count(
     plan: &Plan,
     program: &Program,

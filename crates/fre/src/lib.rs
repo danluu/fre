@@ -114,6 +114,7 @@ pub use captures::{
 pub use fre_aggregate::{
     CONTINUATION_OPERATION_ACCOUNTING_VERSION as AGGREGATE_CONTINUATION_ACCOUNTING_VERSION,
     CONTINUATION_OPERATION_ALGORITHM_VERSION as AGGREGATE_CONTINUATION_ALGORITHM_VERSION,
+    CONTINUATION_OPERATION_MAX_ALLOCATIONS as AGGREGATE_CONTINUATION_MAX_ALLOCATIONS,
     CompileAccounting as AggregateCompileAccounting,
     CompileAttemptError as AggregateCompileAttemptError,
     CompileAttemptIdentity as AggregateCompileAttemptIdentity,

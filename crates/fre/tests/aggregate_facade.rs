@@ -452,7 +452,7 @@ fn assert_continuation_certificate_preserves_prospective(
     prospective: &fre::AggregateOperationProspective,
 ) {
     assert_eq!(certificate.states, prospective.states);
-    assert_eq!(certificate.boundaries, prospective.boundaries);
+    assert_eq!(certificate.boundaries(), prospective.boundaries);
     assert_eq!(certificate.table_cells, prospective.table_cells);
     assert_eq!(certificate.row_storage, prospective.row_storage);
     assert_eq!(certificate.row_record_bytes, prospective.row_record_bytes);

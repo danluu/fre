@@ -1389,10 +1389,10 @@ fn scalar_native_unicode_classes_bound_states_rows_and_search_work() {
         .unwrap();
     assert_eq!(rows.value(), 1);
     let certificate = rows.certificate();
-    let expected_work_bound = certificate.boundaries
+    let expected_work_bound = certificate.boundaries()
         * (compile.execution_state_work + usize::from(compile.has_scalar_transitions))
-        + certificate.boundaries * 4
-        + certificate.states * certificate.boundaries * (4 + compile.max_scalar_search_checks);
+        + certificate.boundaries() * 4
+        + certificate.states * certificate.boundaries() * (4 + compile.max_scalar_search_checks);
     assert_eq!(certificate.work_bound, expected_work_bound);
     assert_eq!(
         certificate.random_access_bytes,
@@ -1732,12 +1732,12 @@ fn late_priority_fallback_sequence_has_linear_whole_operation_certificate() {
                 .unwrap();
             assert_eq!(expected, admitted.as_slice(), "{strategy:?}");
             let certificate = admitted.certificate();
-            assert_eq!(length + 1, certificate.boundaries);
+            assert_eq!(length + 1, certificate.boundaries());
             assert_eq!(length, certificate.output_matches);
             assert_eq!(length, certificate.span_sum);
             if strategy == Strategy::FullTable {
                 assert_eq!(
-                    certificate.states * certificate.boundaries,
+                    certificate.states * certificate.boundaries(),
                     certificate.table_cells
                 );
             } else {
@@ -2029,7 +2029,7 @@ fn assertion_execution_accounting_and_work_limits_are_exact() {
             )
             .unwrap();
         let accounting = baseline.accounting();
-        let construction_checks = 2 * baseline.certificate().boundaries;
+        let construction_checks = 2 * baseline.certificate().boundaries();
         if strategy == Strategy::FullTable {
             assert_eq!(construction_checks, accounting.assertion_checks);
         } else {
@@ -2513,7 +2513,7 @@ fn plan_and_operation_identities_are_deterministic_and_typed() {
     assert!(rows.certificate().row_storage.is_some());
     assert_eq!(
         rows.certificate().log_bytes,
-        rows.certificate().row_record_bytes * rows.certificate().boundaries
+        rows.certificate().row_record_bytes * rows.certificate().boundaries()
     );
     assert_eq!(
         spans.certificate().operation_id(),
@@ -2678,7 +2678,7 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
             .admit_spans(b"aab", 0..3, strategy, OperationLimits::default())
             .unwrap();
         let certificate = baseline.certificate();
-        let expected_evaluations = certificate.states * certificate.boundaries;
+        let expected_evaluations = certificate.states * certificate.boundaries();
         assert_eq!(
             expected_evaluations,
             baseline.accounting().state_evaluations
@@ -2690,7 +2690,7 @@ fn operation_exact_limits_succeed_and_one_below_refuses() {
                 <= certificate.sequential_bytes_bound
         );
         let exact = OperationLimits {
-            max_boundaries: certificate.boundaries,
+            max_boundaries: certificate.boundaries(),
             max_table_cells: certificate.table_cells,
             max_random_access_bytes: certificate.random_access_bytes,
             max_scratch_bytes: certificate.scratch_bytes,
@@ -2979,7 +2979,7 @@ fn reverse_rows_choose_narrow_reachable_endpoints_without_changing_selection() {
             certificate.row_storage
         );
         assert_eq!(1, certificate.row_record_bytes);
-        assert_eq!(certificate.boundaries, certificate.log_bytes);
+        assert_eq!(certificate.boundaries(), certificate.log_bytes);
         assert_eq!(0, rows.accounting().replay_steps);
         assert!(
             rows.accounting().sequential_bytes_written + rows.accounting().sequential_bytes_read
@@ -3044,11 +3044,14 @@ fn reverse_rows_select_sparse_reachable_endpoints_without_semantic_changes() {
         rows.certificate().row_storage
     );
     assert_eq!(1, rows.certificate().row_record_bytes);
-    assert_eq!(rows.certificate().boundaries, rows.certificate().log_bytes);
+    assert_eq!(
+        rows.certificate().boundaries(),
+        rows.certificate().log_bytes
+    );
     let accounting = rows.accounting();
     assert_eq!(0, accounting.replay_steps);
     assert_eq!(
-        rows.certificate().states * rows.certificate().boundaries,
+        rows.certificate().states * rows.certificate().boundaries(),
         accounting.state_evaluations
     );
     assert_eq!(
@@ -3088,7 +3091,7 @@ fn reachable_endpoint_exact_limits_succeed_and_one_below_refuses() {
         .unwrap();
     let certificate = rows.certificate();
     let exact = OperationLimits {
-        max_boundaries: certificate.boundaries,
+        max_boundaries: certificate.boundaries(),
         max_table_cells: certificate.table_cells,
         max_random_access_bytes: certificate.random_access_bytes,
         max_scratch_bytes: certificate.scratch_bytes,

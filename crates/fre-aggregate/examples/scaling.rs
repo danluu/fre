@@ -70,7 +70,7 @@ fn run(series: &str, repeats: usize, length: usize) {
                 repeats
             },
             certificate.states,
-            certificate.boundaries,
+            certificate.boundaries(),
             accounting.state_evaluations,
             accounting.work,
             certificate.work_bound,

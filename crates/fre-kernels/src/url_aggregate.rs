@@ -315,33 +315,42 @@ impl Meter {
     }
 
     fn work(&mut self, amount: usize) -> Result<(), ReduceError> {
-        self.accounting.work = reduce_add(self.accounting.work, amount, "work")?;
-        reduce_enforce("work", self.accounting.work, self.limits.max_work)
+        let required = reduce_add(self.accounting.work, amount, "work")?;
+        reduce_enforce("work", required, self.limits.max_work)?;
+        self.accounting.work = required;
+        Ok(())
     }
 
     fn sequential(&mut self, amount: usize) -> Result<(), ReduceError> {
-        self.accounting.sequential_bytes =
-            reduce_add(self.accounting.sequential_bytes, amount, "sequential bytes")?;
+        let sequential = reduce_add(self.accounting.sequential_bytes, amount, "sequential bytes")?;
         reduce_enforce(
             "sequential bytes",
-            self.accounting.sequential_bytes,
+            sequential,
             self.limits.max_sequential_bytes,
         )?;
-        self.work(amount)
+        let work = reduce_add(self.accounting.work, amount, "work")?;
+        reduce_enforce("work", work, self.limits.max_work)?;
+        self.accounting.sequential_bytes = sequential;
+        self.accounting.work = work;
+        Ok(())
     }
 
     fn random(&mut self, amount: usize) -> Result<(), ReduceError> {
-        self.accounting.random_access_bytes = reduce_add(
+        let random_access = reduce_add(
             self.accounting.random_access_bytes,
             amount,
             "random access bytes",
         )?;
         reduce_enforce(
             "random access bytes",
-            self.accounting.random_access_bytes,
+            random_access,
             self.limits.max_random_access_bytes,
         )?;
-        self.work(amount)
+        let work = reduce_add(self.accounting.work, amount, "work")?;
+        reduce_enforce("work", work, self.limits.max_work)?;
+        self.accounting.random_access_bytes = random_access;
+        self.accounting.work = work;
+        Ok(())
     }
 }
 

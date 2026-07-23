@@ -3,8 +3,9 @@ use core::ops::Range;
 
 use fre_exact_alloc::{CopyError, ExactVec, zeroed_exact};
 use fre_kernels::{
-    RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
-    RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan, UrlAggregatePlan,
+    RequiredInternalAnchorCountActual, RequiredInternalAnchorCountError,
+    RequiredInternalAnchorCountLimits, RequiredInternalAnchorCountUpperBounds,
+    RequiredInternalAnchorPlan, UrlAggregatePlan, UrlAggregateReduceAccounting,
     UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
 };
 use sha2::{Digest, Sha256};
@@ -144,9 +145,13 @@ pub struct OperationCertificate {
     /// Construction- and invocation-derived route-selection edge exhausted
     /// before the physical route and prospective were published.
     pub prepublication_fallback: OperationPrepublicationFallback,
+    /// Allocation upper bound published before source access, compact under
+    /// the accounting-version structural route theorem.
+    pub prospective_allocations: u8,
+    /// Exact successful operation-local allocations committed on success.
+    pub actual_allocations: u8,
     pub range: Range<usize>,
     pub states: usize,
-    pub boundaries: usize,
     pub table_cells: usize,
     pub row_storage: Option<RowStorage>,
     pub row_record_bytes: usize,
@@ -166,9 +171,14 @@ pub struct OperationCertificate {
 }
 
 impl OperationCertificate {
-    fn retain_published_prospective(&mut self, prospective: &OperationProspective) {
+    fn retain_published_prospective(
+        &mut self,
+        prospective: &OperationProspective,
+        actual_allocations: usize,
+    ) -> Result<(), Error> {
+        self.prospective_allocations = compact_operation_allocation_count(prospective.allocations)?;
+        self.actual_allocations = compact_operation_allocation_count(actual_allocations)?;
         self.states = prospective.states;
-        self.boundaries = prospective.boundaries;
         self.table_cells = prospective.table_cells;
         self.row_storage = prospective.row_storage;
         self.row_record_bytes = prospective.row_record_bytes;
@@ -183,11 +193,12 @@ impl OperationCertificate {
         self.output_bytes = prospective.output_bytes;
         self.span_sum = prospective.span_sum;
         self.peak_bytes = prospective.peak_bytes;
+        Ok(())
     }
 
     fn retains_published_prospective(&self, prospective: &OperationProspective) -> bool {
         self.states == prospective.states
-            && self.boundaries == prospective.boundaries
+            && self.boundaries() == prospective.boundaries
             && self.table_cells == prospective.table_cells
             && self.row_storage == prospective.row_storage
             && self.row_record_bytes == prospective.row_record_bytes
@@ -201,7 +212,18 @@ impl OperationCertificate {
             && self.output_matches == prospective.output_matches
             && self.output_bytes == prospective.output_bytes
             && self.span_sum == prospective.span_sum
+            && usize::from(self.prospective_allocations) == prospective.allocations
             && self.peak_bytes == prospective.peak_bytes
+    }
+
+    /// Number of input boundaries certified by this valid half-open range.
+    #[must_use]
+    pub fn boundaries(&self) -> usize {
+        self.range
+            .end
+            .checked_sub(self.range.start)
+            .and_then(|bytes| bytes.checked_add(1))
+            .expect("valid published operation certificate range must have a boundary count")
     }
 
     /// Derive the physical operation identity from the retained plan, logical
@@ -251,7 +273,28 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 1;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 2;
+
+/// Maximum allocation count representable by every route in accounting v2.
+///
+/// Terminal-frontier execution owns at most eight nonempty operation-local
+/// buffers; a receipt-bearing Spans result can add one exact output buffer.
+/// Adding a route with a larger structural maximum requires a new accounting
+/// schema and certificate layout.
+pub const CONTINUATION_OPERATION_MAX_ALLOCATIONS: u8 = 9;
+
+fn compact_operation_allocation_count(allocations: usize) -> Result<u8, Error> {
+    if allocations > usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
+        return Err(Error::InternalInvariant(
+            "continuation allocation count exceeds its accounting-version structural maximum",
+        ));
+    }
+    u8::try_from(allocations).map_err(|_| {
+        Error::InternalInvariant(
+            "continuation allocation count does not fit its certificate encoding",
+        )
+    })
+}
 
 /// Physical executor selected before a continuation attempt reads its source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1383,13 +1426,20 @@ impl CompiledRegex {
         match result {
             Ok(mut result) => {
                 if let Some(prospective) = receipt.prospective.as_ref() {
-                    result.certificate.retain_published_prospective(prospective);
+                    if let Err(source) = result
+                        .certificate
+                        .retain_published_prospective(prospective, receipt.actual_allocations)
+                    {
+                        return Err(OperationAttemptError { source, receipt });
+                    }
                 }
                 let valid = receipt.prospective.as_ref().is_some_and(|upper| {
                     (*upper).contains(receipt.actual)
                         && result.certificate.retains_published_prospective(upper)
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
+                        && usize::from(result.certificate.actual_allocations)
+                            == receipt.actual_allocations
                 }) && receipt.identity.authenticates_limits(limits)
                     && result.certificate.authenticates_limits(limits)
                     && receipt.identity.operation_limits_id
@@ -1979,9 +2029,12 @@ impl CompiledRegex {
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             prepublication_fallback,
+            prospective_allocations: compact_operation_allocation_count(
+                requirements.operation_allocation_bound(kind)?,
+            )?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
             range,
             states: self.program.insts.len(),
-            boundaries,
             table_cells: requirements.table_cells,
             row_storage: requirements.row_storage,
             row_record_bytes: requirements.record_bytes,
@@ -2046,52 +2099,37 @@ impl CompiledRegex {
         } else {
             enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
         }
-        let result = plan
-            .span_sum(
-                local,
-                0..local.len(),
-                UrlAggregateReduceLimits {
-                    max_input_bytes: local.len(),
-                    max_boundaries: limits.max_boundaries,
-                    max_candidates: limits.max_work,
-                    max_match_events: limits.max_match_events,
-                    max_output_matches: limits.max_output_matches,
-                    max_span_sum: if kind == OperationKind::Sum {
-                        limits.max_span_sum
-                    } else {
-                        usize::MAX
-                    },
-                    max_sequential_bytes: limits.max_sequential_bytes,
-                    max_random_access_bytes: usize::MAX,
-                    max_random_access_storage_bytes: limits.max_random_access_bytes,
-                    max_work: limits.max_work,
-                    max_scratch_bytes: limits.max_scratch_bytes,
-                    max_peak_bytes: limits.max_peak_bytes,
+        let result = match plan.span_sum_attempt(
+            local,
+            0..local.len(),
+            UrlAggregateReduceLimits {
+                max_input_bytes: local.len(),
+                max_boundaries: limits.max_boundaries,
+                max_candidates: limits.max_work,
+                max_match_events: limits.max_match_events,
+                max_output_matches: limits.max_output_matches,
+                max_span_sum: if kind == OperationKind::Sum {
+                    limits.max_span_sum
+                } else {
+                    usize::MAX
                 },
-            )
-            .map_err(|error| map_url_reduce_error(&error))?;
-        let actual = result.accounting;
-        let accounting = ExecutionAccounting {
-            successful_paths: result.matches,
-            emitted_matches: result.matches,
-            sequential_bytes_read: actual.sequential_bytes,
-            random_access_bytes_read: actual.random_access_bytes,
-            random_access_peak_bytes: actual.random_access_storage_bytes,
-            scratch_peak_bytes: actual.scratch_bytes,
-            peak_bytes: actual.peak_bytes,
-            work: actual.work,
-            url_segments: actual.segments,
-            url_dot_probes: actual.dot_probes,
-            url_tld_transitions: actual.tld_transitions,
-            url_tld_candidates: actual.tld_candidates,
-            url_scheme_probes: actual.scheme_probes,
-            url_ipv4_candidates: actual.ipv4_candidates,
-            url_prefix_steps: actual.prefix_steps,
-            url_suffix_steps: actual.suffix_steps,
-            url_candidate_insertions: actual.candidate_insertions,
-            url_candidate_visits: actual.candidate_visits,
-            ..ExecutionAccounting::default()
+                max_sequential_bytes: limits.max_sequential_bytes,
+                max_random_access_bytes: usize::MAX,
+                max_random_access_storage_bytes: limits.max_random_access_bytes,
+                max_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+                max_peak_bytes: limits.max_peak_bytes,
+            },
+        ) {
+            Ok(result) => result,
+            Err(failure) => {
+                *attempt_accounting = url_aggregate_execution_accounting(failure.accounting);
+                *actual_allocations = failure.actual_allocations;
+                return Err(map_url_reduce_error(&failure.source));
+            }
         };
+        let actual = result.accounting;
+        let accounting = url_aggregate_execution_accounting(actual);
         *attempt_accounting = accounting;
         *actual_allocations = usize::from(upper.candidate_records != 0);
         let span_sum = if kind == OperationKind::Sum {
@@ -2108,9 +2146,12 @@ impl CompiledRegex {
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: compact_operation_allocation_count(usize::from(
+                upper.candidate_records != 0,
+            ))?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
             range,
             states: self.program.insts.len(),
-            boundaries,
             table_cells: 0,
             row_storage: None,
             row_record_bytes: 0,
@@ -2180,32 +2221,20 @@ impl CompiledRegex {
             )?;
             prospective.enforce_limits(limits)?;
         }
-        let result = plan
-            .count(local, exact_required_anchor_limits(upper, limits))
-            .map_err(|error| map_required_anchor_error(&error))?;
+        let result = match plan.count_attempt(local, exact_required_anchor_limits(upper, limits)) {
+            Ok(result) => result,
+            Err(failure) => {
+                *actual_allocations = failure.actual.allocations;
+                *attempt_accounting =
+                    required_internal_anchor_execution_accounting(failure.actual)?;
+                return Err(map_required_anchor_error(&failure.source));
+            }
+        };
         let matches = usize::try_from(result.count).map_err(|_| Error::ArithmeticOverflow {
             resource: Resource::OutputMatches,
         })?;
         let actual = result.accounting.actual;
-        let accounting = ExecutionAccounting {
-            transition_checks: actual.continuation_steps,
-            root_probes: actual.candidate_visits,
-            successful_paths: matches,
-            emitted_matches: matches,
-            sequential_bytes_read: actual.sequential_bytes,
-            random_access_bytes_read: actual.random_access_bytes,
-            peak_bytes: actual.peak_bytes,
-            work: actual.work,
-            required_anchor_candidates: actual.candidate_visits,
-            required_anchor_scan_windows: actual.anchor_window_attempts,
-            required_anchor_anchor_comparisons: actual.finder_source_accesses,
-            required_anchor_prefix_steps: actual.prefix_steps,
-            required_anchor_continuation_steps: actual.continuation_steps,
-            required_anchor_source_accesses: actual.source_accesses,
-            required_anchor_queue_peak: actual.queue_entries,
-            required_anchor_frontier_peak: actual.frontier_entries,
-            ..ExecutionAccounting::default()
-        };
+        let accounting = required_internal_anchor_execution_accounting(actual)?;
         *attempt_accounting = accounting;
         *actual_allocations = actual.allocations;
         let certificate = OperationCertificate {
@@ -2217,9 +2246,10 @@ impl CompiledRegex {
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: compact_operation_allocation_count(upper.allocations)?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
             range,
             states: self.program.insts.len(),
-            boundaries,
             table_cells: 0,
             row_storage: None,
             row_record_bytes: 0,
@@ -2297,7 +2327,15 @@ impl CompiledRegex {
             )?;
             prospective.enforce_limits(limits)?;
         }
-        let result = candidate::count(plan, &self.program, haystack, range.clone(), limits)?;
+        let result =
+            match candidate::count_attempt(plan, &self.program, haystack, range.clone(), limits) {
+                Ok(result) => result,
+                Err(failure) => {
+                    *attempt_accounting = failure.accounting;
+                    *actual_allocations = failure.actual_allocations;
+                    return Err(failure.source);
+                }
+            };
         *attempt_accounting = result.accounting;
         *actual_allocations = CANDIDATE_EXECUTION_ALLOCATIONS;
         let certificate = OperationCertificate {
@@ -2309,9 +2347,12 @@ impl CompiledRegex {
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: compact_operation_allocation_count(
+                CANDIDATE_EXECUTION_ALLOCATIONS,
+            )?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
             range,
             states: self.program.insts.len(),
-            boundaries,
             table_cells: 0,
             row_storage: None,
             row_record_bytes: 0,
@@ -2420,6 +2461,30 @@ fn candidate_prospective(
         peak_bytes: scratch_bytes,
         accounting,
     })
+}
+
+fn url_aggregate_execution_accounting(actual: UrlAggregateReduceAccounting) -> ExecutionAccounting {
+    ExecutionAccounting {
+        successful_paths: actual.matches,
+        emitted_matches: actual.matches,
+        sequential_bytes_read: actual.sequential_bytes,
+        random_access_bytes_read: actual.random_access_bytes,
+        random_access_peak_bytes: actual.random_access_storage_bytes,
+        scratch_peak_bytes: actual.scratch_bytes,
+        peak_bytes: actual.peak_bytes,
+        work: actual.work,
+        url_segments: actual.segments,
+        url_dot_probes: actual.dot_probes,
+        url_tld_transitions: actual.tld_transitions,
+        url_tld_candidates: actual.tld_candidates,
+        url_scheme_probes: actual.scheme_probes,
+        url_ipv4_candidates: actual.ipv4_candidates,
+        url_prefix_steps: actual.prefix_steps,
+        url_suffix_steps: actual.suffix_steps,
+        url_candidate_insertions: actual.candidate_insertions,
+        url_candidate_visits: actual.candidate_visits,
+        ..ExecutionAccounting::default()
+    }
 }
 
 #[allow(
@@ -2714,6 +2779,33 @@ fn exact_required_anchor_limits(
     }
 }
 
+fn required_internal_anchor_execution_accounting(
+    actual: RequiredInternalAnchorCountActual,
+) -> Result<ExecutionAccounting, Error> {
+    let matches = usize::try_from(actual.matches).map_err(|_| Error::ArithmeticOverflow {
+        resource: Resource::OutputMatches,
+    })?;
+    Ok(ExecutionAccounting {
+        transition_checks: actual.continuation_steps,
+        root_probes: actual.candidate_visits,
+        successful_paths: matches,
+        emitted_matches: matches,
+        sequential_bytes_read: actual.sequential_bytes,
+        random_access_bytes_read: actual.random_access_bytes,
+        peak_bytes: actual.peak_bytes,
+        work: actual.work,
+        required_anchor_candidates: actual.candidate_visits,
+        required_anchor_scan_windows: actual.anchor_window_attempts,
+        required_anchor_anchor_comparisons: actual.finder_source_accesses,
+        required_anchor_prefix_steps: actual.prefix_steps,
+        required_anchor_continuation_steps: actual.continuation_steps,
+        required_anchor_source_accesses: actual.source_accesses,
+        required_anchor_queue_peak: actual.queue_entries,
+        required_anchor_frontier_peak: actual.frontier_entries,
+        ..ExecutionAccounting::default()
+    })
+}
+
 fn map_required_anchor_error(error: &RequiredInternalAnchorCountError) -> Error {
     match error {
         RequiredInternalAnchorCountError::Overflow(_) => Error::ArithmeticOverflow {
@@ -2814,6 +2906,14 @@ struct Requirements {
 }
 
 impl Requirements {
+    fn operation_allocation_bound(self, kind: OperationKind) -> Result<usize, Error> {
+        self.allocations
+            .checked_add(usize::from(kind == OperationKind::Spans))
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::Allocations,
+            })
+    }
+
     fn operation_prospective(
         self,
         program: &Program,
@@ -2843,14 +2943,7 @@ impl Requirements {
         } else {
             0
         };
-        let allocations = self
-            .allocations
-            .checked_add(usize::from(
-                kind == OperationKind::Spans && output_matches != 0,
-            ))
-            .ok_or(Error::ArithmeticOverflow {
-                resource: Resource::Allocations,
-            })?;
+        let allocations = self.operation_allocation_bound(kind)?;
         let peak_bytes = add(self.peak_bound, output_bytes, Resource::PeakBytes)?;
         let work = self.work_bound;
         // Every generic logical source service is paired with admitted work;
@@ -8266,7 +8359,7 @@ mod tests {
         assert_eq!(url.frontier_insertions, 0);
         assert_eq!(url.frontier_evaluations, 0);
         let exact_run = OperationLimits {
-            max_boundaries: sum.certificate().boundaries,
+            max_boundaries: sum.certificate().boundaries(),
             max_table_cells: 0,
             max_random_access_bytes: sum.certificate().random_access_bytes,
             max_scratch_bytes: sum.certificate().scratch_bytes,

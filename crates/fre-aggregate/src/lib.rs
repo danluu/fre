@@ -60,9 +60,10 @@ pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
     AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpanSumAttempt, AdmittedSpans,
     AdmittedSpansAttempt, CONTINUATION_OPERATION_ACCOUNTING_VERSION,
-    CONTINUATION_OPERATION_ALGORITHM_VERSION, CountValueAttempt, MatchCount, OperationAttemptError,
-    OperationAttemptIdentity, OperationAttemptKind, OperationAttemptReceipt, OperationCertificate,
-    OperationId, OperationInvocation, OperationLimitsId, OperationPhysicalRoute,
+    CONTINUATION_OPERATION_ALGORITHM_VERSION, CONTINUATION_OPERATION_MAX_ALLOCATIONS,
+    CountValueAttempt, MatchCount, OperationAttemptError, OperationAttemptIdentity,
+    OperationAttemptKind, OperationAttemptReceipt, OperationCertificate, OperationId,
+    OperationInvocation, OperationLimitsId, OperationPhysicalRoute,
     OperationPrepublicationFallback, OperationProspective, OperationWorkMode, RowStorage, Span,
     SpanIter, SpanIteration, SpanSum, SpanSumValueAttempt, Strategy,
 };
