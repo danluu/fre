@@ -348,8 +348,9 @@ pub enum CaptureExecutionSource {
     /// Direct prefix/class participation route refused or faulted. Once its
     /// prospective is published this is terminal and never selects U3.
     PrefixClassParticipation(PrefixClassUniformParticipationError),
-    /// Immutable selector/history/direct plans plus direct operation state
-    /// exceed the caller's co-live peak before source access.
+    /// Immutable selector/history/direct plans plus direct operation state, or
+    /// the mandatory U3 control envelope, exceed the caller's peak before
+    /// source access.
     CombinedPeak {
         /// Required co-live bytes.
         needed: usize,
@@ -439,8 +440,9 @@ pub struct CaptureExecutionReport {
     pub prefix_class_participation: Option<PrefixClassUniformParticipationAccounting>,
     /// Complete capture-schema entries logically inspected by the reducer.
     pub capture_events: usize,
-    /// Conservative co-live retained and operation peak for the selected
-    /// route. Selector routes retain their existing dynamic interpretation.
+    /// Conservative retained/operation peak for the selected route, never
+    /// below the mandatory U3 control envelope. Selector routes retain their
+    /// existing dynamic interpretation.
     pub combined_peak_bytes: usize,
 }
 
@@ -2020,14 +2022,6 @@ impl CaptureRegex {
             selector_receipt: None,
             prefix_class_participation_prospective: Some(prospective),
         })?;
-        enforce_selector_control(selector_control.selector, selector_limits).map_err(|source| {
-            CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::Selector(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            }
-        })?;
         if selector_control.selector.terminal_frontier
             || selector_control.matches != prospective.results
             || selector_control.capture_count != prospective.capture_count
@@ -2055,7 +2049,7 @@ impl CaptureRegex {
                 selector_receipt: None,
                 prefix_class_participation_prospective: Some(prospective),
             })?;
-        let combined_peak_bytes = retained_fallback_bytes
+        let direct_peak_bytes = retained_fallback_bytes
             .checked_add(prospective.peak_bytes)
             .ok_or_else(|| CaptureExecutionError {
                 identity: Box::new(identity.clone()),
@@ -2065,6 +2059,7 @@ impl CaptureRegex {
                 selector_receipt: None,
                 prefix_class_participation_prospective: Some(prospective),
             })?;
+        let combined_peak_bytes = direct_peak_bytes.max(selector_control.selector.peak_bytes);
         if combined_peak_bytes > limits.max_combined_peak_bytes {
             return Err(CaptureExecutionError {
                 identity: Box::new(identity),
@@ -2076,6 +2071,14 @@ impl CaptureRegex {
                 prefix_class_participation_prospective: Some(prospective),
             });
         }
+        enforce_selector_control(selector_control.selector, selector_limits).map_err(|source| {
+            CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::Selector(source),
+                selector_receipt: None,
+                prefix_class_participation_prospective: Some(prospective),
+            }
+        })?;
         let result = plan
             .engine
             .count_uniform_participation(haystack, plan.schema, limits.prefix_class_participation)

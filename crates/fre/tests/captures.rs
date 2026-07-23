@@ -1861,41 +1861,102 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         fre::PrefixClassUniformParticipationError::PeakLimit { .. }
     );
 
-    let mut selector_one_below = exact_limits;
-    selector_one_below.selector.max_work = u3_control_prospective.work_bound - 1;
-    let selector_error = regex
-        .count_captures(haystack, selector_one_below)
-        .expect_err("retained U3 selector one below must still refuse");
-    assert!(matches!(
-        selector_error.source,
-        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
-            resource: AggregateResource::ExecutionWork,
-            required,
-            limit,
-        }) if required == u3_control_prospective.work_bound
-            && limit == u3_control_prospective.work_bound - 1
-    ));
-    assert_eq!(
-        selector_error.prefix_class_participation_prospective,
-        Some(prospective)
+    macro_rules! assert_control_selector_one_below {
+        ($limit:ident, $field:ident, $resource:expr) => {
+            if u3_control_prospective.$field > 0 {
+                let mut one_below = exact_limits;
+                one_below.selector.$limit = u3_control_prospective.$field - 1;
+                let error = regex
+                    .count_captures(haystack, one_below)
+                    .expect_err("retained U3 selector one below must still refuse");
+                assert!(matches!(
+                    error.source,
+                    CaptureExecutionSource::Selector(
+                        fre::AggregateEngineError::ResourceLimit {
+                            resource,
+                            required,
+                            limit,
+                        }
+                    ) if resource == $resource
+                        && required == u3_control_prospective.$field
+                        && limit == u3_control_prospective.$field - 1
+                ));
+                assert_eq!(
+                    error.prefix_class_participation_prospective,
+                    Some(prospective)
+                );
+            }
+        };
+    }
+    assert_control_selector_one_below!(max_boundaries, boundaries, AggregateResource::Boundaries);
+    assert_control_selector_one_below!(max_table_cells, table_cells, AggregateResource::TableCells);
+    assert_control_selector_one_below!(
+        max_random_access_bytes,
+        random_access_bytes,
+        AggregateResource::RandomAccessBytes
     );
+    assert_control_selector_one_below!(
+        max_scratch_bytes,
+        scratch_bytes,
+        AggregateResource::ScratchBytes
+    );
+    assert_control_selector_one_below!(max_log_bytes, log_bytes, AggregateResource::LogBytes);
+    assert_control_selector_one_below!(
+        max_sequential_bytes,
+        sequential_bytes,
+        AggregateResource::SequentialBytes
+    );
+    assert_control_selector_one_below!(
+        max_match_events,
+        match_events,
+        AggregateResource::MatchEvents
+    );
+    assert_control_selector_one_below!(
+        max_output_matches,
+        output_matches,
+        AggregateResource::OutputMatches
+    );
+    assert_control_selector_one_below!(
+        max_output_bytes,
+        output_bytes,
+        AggregateResource::OutputBytes
+    );
+    assert_control_selector_one_below!(max_span_sum, span_sum, AggregateResource::SpanSum);
+    assert_control_selector_one_below!(max_peak_bytes, peak_bytes, AggregateResource::PeakBytes);
+    assert_control_selector_one_below!(max_work, work_bound, AggregateResource::ExecutionWork);
 
-    let mut aggregate_one_below = exact_limits;
-    aggregate_one_below.aggregate.max_capture_count = prospective.capture_count - 1;
-    let aggregate_error = regex
-        .count_captures(haystack, aggregate_one_below)
-        .expect_err("retained U3 capture owner one below must still refuse");
-    assert_eq!(
-        aggregate_error.source,
-        CaptureExecutionSource::History(CaptureSearchError::Resource {
-            kind: CaptureResource::CaptureCount,
-            required: prospective.capture_count,
-            limit: prospective.capture_count - 1,
-        })
+    macro_rules! assert_control_owner_one_below {
+        ($limit:ident, $field:ident, $resource:expr) => {{
+            assert!(prospective.$field > 0);
+            let mut one_below = exact_limits;
+            one_below.aggregate.$limit = prospective.$field - 1;
+            let error = regex
+                .count_captures(haystack, one_below)
+                .expect_err("retained U3 capture owner one below must still refuse");
+            assert_eq!(
+                error.source,
+                CaptureExecutionSource::History(CaptureSearchError::Resource {
+                    kind: $resource,
+                    required: prospective.$field,
+                    limit: prospective.$field - 1,
+                })
+            );
+            assert_eq!(
+                error.prefix_class_participation_prospective,
+                Some(prospective)
+            );
+        }};
+    }
+    assert_control_owner_one_below!(max_results, results, CaptureResource::Results);
+    assert_control_owner_one_below!(
+        max_capture_count,
+        capture_count,
+        CaptureResource::CaptureCount
     );
-    assert_eq!(
-        aggregate_error.prefix_class_participation_prospective,
-        Some(prospective)
+    assert_control_owner_one_below!(
+        max_capture_events,
+        capture_events,
+        CaptureResource::CaptureEvents
     );
 
     let mut combined_one_below = exact_limits;
