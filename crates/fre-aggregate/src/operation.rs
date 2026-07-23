@@ -76,6 +76,8 @@ enum GenericCountRoute {
     Dense,
     TerminalFrontier,
     OrderedRoot,
+    RequiredSuffix,
+    Candidate,
 }
 
 /// Stable identity of a regex plan, forced strategy and operation type.
@@ -833,6 +835,33 @@ impl CompiledRegex {
         !self.terminal_frontier.is_empty()
     }
 
+    /// Construction-selected bounded route for a receipt-bearing observed
+    /// Count used by the uniform capture reducer.
+    ///
+    /// The result depends only on retained compiler proofs. Calling the
+    /// corresponding forced entry point therefore cannot introduce a
+    /// source-dependent fallback after the enclosing capture owner is sealed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn uniform_capture_count_route(&self) -> OperationPhysicalRoute {
+        if !self.terminal_frontier.is_empty() {
+            OperationPhysicalRoute::TerminalFrontierRows
+        } else if !self.required_suffixes.is_empty() {
+            if self.minimum_match_bytes.is_some_and(|minimum| minimum > 1)
+                && self
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|_| candidate::executable_for(&self.program))
+            {
+                OperationPhysicalRoute::Candidate
+            } else {
+                OperationPhysicalRoute::RequiredSuffixRows
+            }
+        } else {
+            OperationPhysicalRoute::DenseRows
+        }
+    }
+
     /// Admit and evaluate a complete non-overlapping span sequence.
     pub fn admit_spans(
         &self,
@@ -1402,6 +1431,86 @@ impl CompiledRegex {
         })
     }
 
+    /// Observed-work Count forced onto the compiler-retained required-suffix
+    /// rows, with a complete admitted result, P/A receipt, and outer
+    /// pre-source observer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_required_suffix_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::RequiredSuffix),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
+    /// Observed-work Count forced onto the compiler-retained candidate
+    /// scheduler, with a complete admitted result, P/A receipt, and outer
+    /// pre-source observer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_candidate_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::Candidate),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
     /// Observed-work Count for a compiler-proved ordered root alternation,
     /// retaining the complete admitted result and nested P/A receipt.
     #[doc(hidden)]
@@ -1667,6 +1776,24 @@ impl CompiledRegex {
                     "terminal-frontier Count requires its compiled HIR proof",
                 ));
             }
+            Some(GenericCountRoute::RequiredSuffix)
+                if strategy != Strategy::ReverseSequentialRows
+                    || self.required_suffixes.is_empty() =>
+            {
+                return Err(Error::InternalInvariant(
+                    "required-suffix Count requires its compiled HIR proof and reverse rows",
+                ));
+            }
+            Some(GenericCountRoute::Candidate)
+                if !OBSERVED_WORK
+                    || strategy != Strategy::ReverseSequentialRows
+                    || self.candidate.is_none()
+                    || !candidate::executable_for(&self.program) =>
+            {
+                return Err(Error::InternalInvariant(
+                    "candidate Count requires its compiled HIR proof and observed reverse execution",
+                ));
+            }
             Some(GenericCountRoute::OrderedRoot)
                 if strategy != Strategy::ReverseSequentialRows
                     || self.program.root_alternation_arms() < 2
@@ -1717,8 +1844,10 @@ impl CompiledRegex {
                 prospective_observer,
             );
         }
-        if forced_generic_count_route.is_none()
-            && OBSERVED_WORK
+        if matches!(
+            forced_generic_count_route,
+            None | Some(GenericCountRoute::Candidate)
+        ) && OBSERVED_WORK
             && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.candidate
@@ -1794,14 +1923,22 @@ impl CompiledRegex {
             {
                 Some(SparseSeed::TerminalFrontier(&self.terminal_frontier))
             }
-            Some(GenericCountRoute::Dense | GenericCountRoute::OrderedRoot) | None => None,
+            Some(
+                GenericCountRoute::Dense
+                | GenericCountRoute::OrderedRoot
+                | GenericCountRoute::RequiredSuffix
+                | GenericCountRoute::Candidate,
+            )
+            | None => None,
         };
-        let fallback_seed =
-            if forced_generic_count_route.is_some() || self.required_suffixes.is_empty() {
-                None
-            } else {
-                Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
-            };
+        let fallback_seed = if forced_generic_count_route == Some(GenericCountRoute::RequiredSuffix)
+        {
+            Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
+        } else if forced_generic_count_route.is_some() || self.required_suffixes.is_empty() {
+            None
+        } else {
+            Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
+        };
         let dense = || {
             Requirements::new::<OBSERVED_WORK>(
                 &self.program,
@@ -1842,6 +1979,21 @@ impl CompiledRegex {
                     seed,
                 )?,
                 Some(SparseSeed::TerminalFrontier(seed)),
+            )
+        } else if forced_generic_count_route == Some(GenericCountRoute::RequiredSuffix) {
+            let seed = fallback_seed.ok_or(Error::InternalInvariant(
+                "required-suffix Count lost its compiled HIR proof",
+            ))?;
+            (
+                Requirements::new_for_seed(
+                    &self.program,
+                    boundaries,
+                    strategy,
+                    passes,
+                    engine_limits,
+                    seed,
+                )?,
+                Some(seed),
             )
         } else if receipt_bearing && forced_generic_count_route == Some(GenericCountRoute::Dense) {
             let dense = dense()?;

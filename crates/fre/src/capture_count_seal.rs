@@ -27,7 +27,7 @@ use crate::captures::{
 };
 
 /// Version of the positive-width uniform-participation Count algorithm.
-pub const CAPTURE_COUNT_ALGORITHM_VERSION: u32 = 2;
+pub const CAPTURE_COUNT_ALGORITHM_VERSION: u32 = 3;
 
 /// Version of the owner-local capture Count prospective/actual ledger.
 pub const CAPTURE_COUNT_ACCOUNTING_VERSION: u32 = 1;
@@ -492,7 +492,9 @@ impl CaptureCountAttemptReceipt {
                 ) | (
                     CapturePlanKind::LinearSelectorUniformParticipation,
                     SelectorOperationPhysicalRoute::DenseRows
-                        | SelectorOperationPhysicalRoute::TerminalFrontierRows,
+                        | SelectorOperationPhysicalRoute::TerminalFrontierRows
+                        | SelectorOperationPhysicalRoute::RequiredSuffixRows
+                        | SelectorOperationPhysicalRoute::Candidate,
                 ) | (
                     CapturePlanKind::UniformPrefixClassParticipation,
                     SelectorOperationPhysicalRoute::DenseRows,

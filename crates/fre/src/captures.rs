@@ -1823,14 +1823,17 @@ impl CaptureBuilder {
                     build_limits: limits,
                     branch,
                     selector_route: CaptureCountSelectorRoute {
-                        physical_route: if plan_identity.plan
-                            == CapturePlanKind::OrderedRootCaptureManyCount
-                        {
-                            fre_aggregate::OperationPhysicalRoute::OrderedRootRows
-                        } else if selector.has_terminal_frontier() {
-                            fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows
-                        } else {
-                            fre_aggregate::OperationPhysicalRoute::DenseRows
+                        physical_route: match plan_identity.plan {
+                            CapturePlanKind::OrderedRootCaptureManyCount => {
+                                fre_aggregate::OperationPhysicalRoute::OrderedRootRows
+                            }
+                            CapturePlanKind::LinearSelectorUniformParticipation => {
+                                selector.uniform_capture_count_route()
+                            }
+                            CapturePlanKind::UniformPrefixClassParticipation
+                            | CapturePlanKind::LinearSelectorPersistentHistory => {
+                                fre_aggregate::OperationPhysicalRoute::DenseRows
+                            }
                         },
                         algorithm_version: fre_aggregate::CONTINUATION_OPERATION_ALGORITHM_VERSION,
                         accounting_version:
@@ -2838,29 +2841,24 @@ impl CaptureRegex {
                 count_receipt: None,
             });
         }
-        let terminal_frontier = match (ordered_root, selector_route) {
-            (true, fre_aggregate::OperationPhysicalRoute::OrderedRootRows)
-            | (false, fre_aggregate::OperationPhysicalRoute::DenseRows) => false,
-            (false, fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows) => true,
-            _ => {
-                return Err(CaptureExecutionError {
-                    identity,
-                    source: CaptureExecutionSource::InternalInvariant(
-                        "selector Count owner retained a non-generic physical route",
-                    ),
-                    selector_receipt: None,
-                    prefix_class_participation_receipt: None,
-                    count_receipt: None,
-                });
-            }
+        let terminal_frontier =
+            selector_route == fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows;
+        let route_is_coherent = if ordered_root {
+            selector_route == fre_aggregate::OperationPhysicalRoute::OrderedRootRows
+        } else {
+            matches!(
+                selector_route,
+                fre_aggregate::OperationPhysicalRoute::DenseRows
+                    | fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows
+                    | fre_aggregate::OperationPhysicalRoute::RequiredSuffixRows
+                    | fre_aggregate::OperationPhysicalRoute::Candidate
+            ) && selector_route == self.selector.uniform_capture_count_route()
         };
-        if (!ordered_root && terminal_frontier != self.selector.has_terminal_frontier())
-            || (ordered_root && terminal_frontier)
-        {
+        if !route_is_coherent {
             return Err(CaptureExecutionError {
                 identity,
                 source: CaptureExecutionSource::InternalInvariant(
-                    "selector Count owner diverged from its retained frontier",
+                    "selector Count owner diverged from its retained physical route",
                 ),
                 selector_receipt: None,
                 prefix_class_participation_receipt: None,
@@ -2896,8 +2894,9 @@ impl CaptureRegex {
                     ))
                 }
             };
-        let attempt = if ordered_root {
-            self.selector
+        let attempt = match selector_route {
+            fre_aggregate::OperationPhysicalRoute::OrderedRootRows if ordered_root => self
+                .selector
                 .admit_ordered_root_count_observed_with_receipt_observer(
                     haystack,
                     0..haystack.len(),
@@ -2905,9 +2904,9 @@ impl CaptureRegex {
                     selector_limits,
                     usize::MAX,
                     &mut observer,
-                )
-        } else if terminal_frontier {
-            self.selector
+                ),
+            fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows if !ordered_root => self
+                .selector
                 .admit_count_observed_with_terminal_frontier_receipt_observer(
                     haystack,
                     0..haystack.len(),
@@ -2915,16 +2914,48 @@ impl CaptureRegex {
                     selector_limits,
                     usize::MAX,
                     &mut observer,
+                ),
+            fre_aggregate::OperationPhysicalRoute::RequiredSuffixRows if !ordered_root => self
+                .selector
+                .admit_count_observed_with_required_suffix_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
+                ),
+            fre_aggregate::OperationPhysicalRoute::Candidate if !ordered_root => self
+                .selector
+                .admit_count_observed_with_candidate_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
+                ),
+            fre_aggregate::OperationPhysicalRoute::DenseRows if !ordered_root => {
+                self.selector.admit_count_observed_with_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
                 )
-        } else {
-            self.selector.admit_count_observed_with_receipt_observer(
-                haystack,
-                0..haystack.len(),
-                SelectorStrategy::ReverseSequentialRows,
-                selector_limits,
-                usize::MAX,
-                &mut observer,
-            )
+            }
+            _ => {
+                return Err(CaptureExecutionError {
+                    identity,
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "selector Count owner selected an uncallable physical route",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                });
+            }
         };
         let attempt = match attempt {
             Ok(attempt) => attempt,

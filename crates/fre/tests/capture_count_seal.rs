@@ -70,7 +70,7 @@ fn selector_builder() -> fre::CaptureBuilder {
 )]
 fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
     assert_eq!(AGGREGATE_CONTINUATION_ACCOUNTING_VERSION, 3);
-    assert_eq!(CAPTURE_COUNT_ALGORITHM_VERSION, 2);
+    assert_eq!(CAPTURE_COUNT_ALGORITHM_VERSION, 3);
     let regex = selector_builder().build().expect("selector Count build");
     let cloned = regex.clone();
     let limits = CaptureRunLimits::default();
@@ -936,4 +936,109 @@ fn nullable_and_history_count_routes_remain_outside_the_owner_seal() {
     assert!(error.identity.count_seal.is_none());
     assert!(error.count_receipt.is_none());
     assert!(!error.has_closed_count_attempt());
+}
+
+#[test]
+fn retained_suffix_and_candidate_capture_routes_close_exact_and_one_below_work() {
+    let cases = [
+        (
+            r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/",
+            b"xcargo/registry/src/hash/name-1.2.3/ nope cargo/registry/src/x/bad/".as_slice(),
+            AggregateOperationPhysicalRoute::RequiredSuffixRows,
+            3,
+        ),
+        (
+            r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/|cargo\\registry\\src\\[^\\]+\\([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)\\",
+            b"cargo\\registry\\src\\hash\\win-2.0.1\\ cargo/registry/src/hash/unix-1.2.3/ \xFF",
+            AggregateOperationPhysicalRoute::Candidate,
+            6,
+        ),
+    ];
+    for (pattern, haystack, route, expected) in cases {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("bounded uniform capture build");
+        let baseline = regex
+            .count_captures(haystack, CaptureRunLimits::default())
+            .expect("bounded uniform capture baseline");
+        assert!(baseline.has_closed_count_attempt());
+        assert_eq!(baseline.accounting.count, expected);
+        let seal = baseline
+            .identity
+            .count_seal
+            .as_ref()
+            .expect("positive-width capture owner");
+        assert_eq!(seal.route_identity().selector_route.physical_route, route);
+        let prospective = baseline
+            .count_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.prospective)
+            .expect("whole-operation capture prospective");
+        let actual_work = baseline
+            .selector_receipt
+            .as_ref()
+            .expect("nested selector receipt")
+            .actual
+            .work;
+        assert!(actual_work > 0);
+
+        let mut selector = exact_selector_limits(&prospective.selector);
+        selector.max_work = actual_work;
+        let exact_limits = CaptureRunLimits {
+            aggregate: CaptureAggregateLimits {
+                max_results: prospective.matches,
+                max_capture_count: prospective.capture_count,
+                max_capture_events: prospective.capture_events,
+                ..CaptureAggregateLimits::default()
+            },
+            selector,
+            max_combined_peak_bytes: prospective.combined_peak_bytes,
+            prefix_class_participation: PrefixClassUniformParticipationLimits::default(),
+        };
+        let exact = regex
+            .count_captures(haystack, exact_limits)
+            .expect("exact observed work admits");
+        assert!(exact.has_closed_count_attempt());
+        assert_eq!(exact.accounting, baseline.accounting);
+        assert_eq!(
+            exact
+                .selector_receipt
+                .as_ref()
+                .expect("exact nested receipt")
+                .identity
+                .physical_route,
+            Some(route)
+        );
+
+        let mut one_below = exact_limits;
+        one_below.selector.max_work = actual_work - 1;
+        let failure = regex
+            .count_captures(haystack, one_below)
+            .expect_err("one-below observed work refuses");
+        assert!(failure.has_closed_count_attempt());
+        assert!(matches!(
+            failure.source,
+            CaptureExecutionSource::Selector(
+                fre::AggregateEngineError::ResourceLimit {
+                    resource: AggregateResource::ExecutionWork,
+                    required,
+                    limit,
+                }
+            ) if required == actual_work && limit == actual_work - 1
+        ));
+        let nested = failure
+            .selector_receipt
+            .as_ref()
+            .expect("bounded partial selector receipt");
+        assert_eq!(nested.identity.physical_route, Some(route));
+        assert_eq!(
+            nested
+                .prospective
+                .expect("published one-below prospective")
+                .work_bound,
+            actual_work - 1
+        );
+        assert!(nested.actual.work < actual_work);
+    }
 }

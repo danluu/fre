@@ -164,7 +164,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v2-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -12332,6 +12332,142 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the authenticated three-row canary keeps corpus identity, route proof, exact work, and semantic parity in one audit boundary"
+    )]
+    fn authenticated_rustsec_three_row_bounded_capture_routes_canary() {
+        struct Case {
+            job_id: &'static str,
+            pattern_sha256: &'static str,
+            haystack_sha256: &'static str,
+            haystack_bytes: usize,
+            expected: u64,
+            route: fre::AggregateOperationPhysicalRoute,
+            selector_work: usize,
+        }
+        const CASES: [Case; 3] = [
+            Case {
+                job_id: "wild/rustsec-cargo-audit/original-unix@rust/regex",
+                pattern_sha256: "06edd4d491861350d45e366072f015f1228cdc280e1bd86ac7a522b586c4637b",
+                haystack_sha256: "4ef156371199b3ddac1bf584e0e52b1828279af82e4ea864b4d9c816adb5db40",
+                haystack_bytes: 5_266_960,
+                expected: 471,
+                route: fre::AggregateOperationPhysicalRoute::RequiredSuffixRows,
+                selector_work: 23_129_890,
+            },
+            Case {
+                job_id: "wild/rustsec-cargo-audit/original-windows@rust/regex",
+                pattern_sha256: "483e1e7639635ae8643c81307688e573e8cdb3021a161ddf392a029a53c2df1a",
+                haystack_sha256: "ab5595a4f7a6b918cece0e7e22ebc883ead6163948571419a1dd5cd3c7f37972",
+                haystack_bytes: 4_644_864,
+                expected: 462,
+                route: fre::AggregateOperationPhysicalRoute::RequiredSuffixRows,
+                selector_work: 24_820_280,
+            },
+            Case {
+                job_id: "wild/rustsec-cargo-audit/both-alternate@rust/regex",
+                pattern_sha256: "38550f6dc85c967348ff9aee3acd6ba9300ca3142604cdb6d4e620899258977f",
+                haystack_sha256: "4ef156371199b3ddac1bf584e0e52b1828279af82e4ea864b4d9c816adb5db40",
+                haystack_bytes: 5_266_960,
+                expected: 471,
+                route: fre::AggregateOperationPhysicalRoute::Candidate,
+                selector_work: 16_091_646,
+            },
+        ];
+
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        for case in CASES {
+            let mut matching = manifest.jobs.iter().filter(|job| job.id == case.job_id);
+            let job = matching.next().expect("exact rustsec row");
+            assert!(matching.next().is_none(), "duplicate rustsec row");
+            assert_eq!(job.model, "count-captures");
+            assert!(!job.regex.unicode);
+            assert!(!job.regex.case_insensitive);
+            assert_eq!(job.expected.count, case.expected);
+
+            let input = loader.load(job).expect("load authenticated rustsec row");
+            assert_eq!(input.patterns.len(), 1);
+            assert_eq!(sha256(input.patterns[0].as_bytes()), case.pattern_sha256);
+            assert_eq!(input.haystack.len(), case.haystack_bytes);
+            assert_eq!(sha256(&input.haystack), case.haystack_sha256);
+
+            let regex = capture_regex_one(&input.patterns[0], false, false, &limits)
+                .expect("build authenticated capture reducer");
+            assert_eq!(
+                regex.build_report().plan_identity.plan,
+                CapturePlanKind::LinearSelectorUniformParticipation
+            );
+            let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+                .expect("derive authenticated capture limits");
+            let identity = regex.cache_identity(run_limits);
+            let seal = identity
+                .count_seal
+                .as_ref()
+                .expect("positive uniform capture Count seal");
+            assert_eq!(
+                seal.route_identity().selector_route.physical_route,
+                case.route
+            );
+
+            let report = regex
+                .count_captures(&input.haystack, run_limits)
+                .expect("bounded rustsec capture Count");
+            assert!(report.has_closed_count_attempt());
+            assert_eq!(
+                u64::try_from(report.accounting.count).expect("capture count fits u64"),
+                case.expected
+            );
+            assert_eq!(report.accounting.matches * 3, report.accounting.count);
+            let selector = report
+                .selector_receipt
+                .as_ref()
+                .expect("receipt-bearing selector route");
+            assert_eq!(selector.identity.physical_route, Some(case.route));
+            assert_eq!(selector.actual.work, case.selector_work);
+            assert!(selector.actual.work < limits.fre_aggregate_operation_work);
+
+            let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+            assert_eq!(rust, case.expected);
+            let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+                .expect("FRE bounded capture result");
+            assert_eq!(candidate.actual, rust);
+            assert_eq!(
+                candidate.plan.as_deref(),
+                Some(CURRENT_FRE_CAPTURE_UNIFORM_PLAN)
+            );
+            println!(
+                "rustsec-bounded-capture-canary manifest_sha256={manifest_hash} job={} rust={rust} fre={} route={:?} work={}",
+                case.job_id, candidate.actual, case.route, selector.actual.work,
+            );
+        }
+    }
+
     const CONTINUATION_FAMILY_SCREEN_JOB_IDS: [&str; 7] = [
         "curated/03-date/ascii@rust/regex",
         "curated/03-date/unicode@rust/regex",
@@ -15431,7 +15567,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v2-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
