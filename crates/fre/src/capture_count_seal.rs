@@ -139,10 +139,10 @@ impl CaptureCountOwnerSeal {
         &self.0
     }
 
-    pub(crate) fn for_limits(&self, run_limits: CaptureRunLimits) -> CaptureCountSeal {
+    pub(crate) fn for_limits(&self, run_limits: &CaptureRunLimits) -> CaptureCountSeal {
         CaptureCountSeal {
             owner: self.clone(),
-            run_limits,
+            run_limits: *run_limits,
         }
     }
 }
@@ -336,13 +336,13 @@ impl CaptureCountAttemptReceipt {
     }
 
     pub(crate) fn direct_failure(
-        direct: DirectAttemptReceipt,
+        direct: &DirectAttemptReceipt,
         prospective: Option<&CaptureCountProspective>,
         actual: &CaptureCountActual,
     ) -> Self {
         Self {
             selector: None,
-            direct: Some(direct),
+            direct: Some(*direct),
             prospective: prospective.copied(),
             actual: *actual,
             terminal: CaptureCountTerminal::Failure,
@@ -350,13 +350,13 @@ impl CaptureCountAttemptReceipt {
     }
 
     pub(crate) fn direct_success(
-        direct: DirectAttemptReceipt,
+        direct: &DirectAttemptReceipt,
         prospective: &CaptureCountProspective,
         actual: &CaptureCountActual,
     ) -> Self {
         Self {
             selector: None,
-            direct: Some(direct),
+            direct: Some(*direct),
             prospective: Some(*prospective),
             actual: *actual,
             terminal: CaptureCountTerminal::Success,
@@ -366,6 +366,10 @@ impl CaptureCountAttemptReceipt {
     /// Validate route identity, exact input-derived P, nested P/A, limits, and
     /// cumulative A≤P against the construction-owned seal.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the branch-aware closure intentionally authenticates every selector, direct, capture, limit, version, fallback, and P/A field in one audit boundary"
+    )]
     pub fn closes(&self, seal: &CaptureCountSeal) -> bool {
         let route = seal.route_identity();
         if route.selector_operation != SelectorOperationAttemptKind::Count
@@ -548,10 +552,10 @@ impl CaptureCountAttemptReceipt {
                     CaptureCountBranch::SelectorUniformParticipation => {
                         self.selector.as_ref().is_some_and(|selector| {
                             self.actual.matches == selector.actual.emitted_matches
-                                && self.actual.capture_count
-                                    == capture_count_for_actual(route, self)
-                                && self.actual.capture_events
-                                    == capture_events_for_actual(route, self)
+                                && capture_count_for_actual(route, self)
+                                    == Some(self.actual.capture_count)
+                                && capture_events_for_actual(route, self)
+                                    == Some(self.actual.capture_events)
                         })
                     }
                     CaptureCountBranch::DirectPrefixClassParticipation => {
@@ -604,23 +608,21 @@ fn selector_closes(
 fn capture_count_for_actual(
     route: &CaptureCountRouteIdentity,
     receipt: &CaptureCountAttemptReceipt,
-) -> usize {
+) -> Option<usize> {
     receipt
         .actual
         .matches
         .checked_mul(route.participating_captures_per_match)
-        .unwrap_or(usize::MAX)
 }
 
 fn capture_events_for_actual(
     route: &CaptureCountRouteIdentity,
     receipt: &CaptureCountAttemptReceipt,
-) -> usize {
+) -> Option<usize> {
     receipt
         .actual
         .matches
         .checked_mul(route.capture_schema_entries_per_match)
-        .unwrap_or(usize::MAX)
 }
 
 fn selector_fits_limits(

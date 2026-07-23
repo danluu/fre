@@ -1773,7 +1773,7 @@ impl CaptureRegex {
             count_seal: self
                 .count_owner
                 .as_ref()
-                .map(|owner| owner.for_limits(run_limits)),
+                .map(|owner| owner.for_limits(&run_limits)),
         }
     }
 
@@ -2490,7 +2490,7 @@ impl CaptureRegex {
             ));
         }
         let count_receipt =
-            CaptureCountAttemptReceipt::direct_success(receipt, &owner_prospective, &actual);
+            CaptureCountAttemptReceipt::direct_success(&receipt, &owner_prospective, &actual);
         if !identity
             .count_seal
             .as_ref()
@@ -2916,7 +2916,7 @@ impl CaptureRegex {
         let count_receipt = identity.count_seal.as_ref().and_then(|seal| {
             let retained_fallback_bytes = seal.route_identity().retained_fallback_bytes;
             CaptureCountActual::from_direct(&receipt, retained_fallback_bytes).map(|actual| {
-                CaptureCountAttemptReceipt::direct_failure(receipt, prospective, &actual)
+                CaptureCountAttemptReceipt::direct_failure(&receipt, prospective, &actual)
             })
         });
         CaptureExecutionError {
