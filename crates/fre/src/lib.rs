@@ -27,6 +27,7 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_many;
+mod capture_count_seal;
 mod capture_noqa;
 mod capture_required_literal;
 mod captures;
@@ -86,6 +87,12 @@ pub use aggregate_many::{
     AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
     AggregateManySpanIter, AggregateManySpanSumRegex, AggregateManySpanSumResult,
     AggregateManySpans, AggregateManySpansRegex,
+};
+pub use capture_count_seal::{
+    CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
+    CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
+    CaptureCountOwnerSeal, CaptureCountProspective, CaptureCountRouteIdentity, CaptureCountSeal,
+    CaptureCountSelectorRoute, CaptureCountTerminal,
 };
 pub use capture_noqa::{
     NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,
