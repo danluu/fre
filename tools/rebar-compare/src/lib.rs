@@ -4835,6 +4835,14 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
         max_hir_work: limits.fre_aggregate_compile_work,
         engine,
         selector,
+        max_prefix_class_participation_planner_work: limits.fre_literal_planner_work,
+        prefix_class_participation: PrefixClassAlternationBuildLimits {
+            max_shape_units: limits.pattern_bytes_per_job,
+            max_build_work: limits.fre_aggregate_compile_work,
+            max_scratch_bytes: 0,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
         ..defaults
     }
 }
