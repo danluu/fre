@@ -34,9 +34,9 @@ fn without_allocations<T>(operation: impl FnOnce() -> T) -> T {
     reason = "one allocator census keeps all prebuilt direct terminal variants under the same global measurement boundary"
 )]
 fn direct_terminal_packaging_has_a_zero_allocation_census() {
-    // The complete inline cache identity and both optional fixed-layout
-    // receipts remain bounded without restoring an error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 2_376);
+    // The complete inline cache identity, route receipt, and owner receipt
+    // remain bounded without restoring an error-path Box.
+    assert_eq!(size_of::<CaptureExecutionError>(), 5_312);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";
@@ -138,6 +138,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
         ),
         selector_receipt: None,
         prefix_class_participation_receipt: Some(prepublication_receipt),
+        count_receipt: None,
     });
     assert!(
         prepublication
@@ -155,6 +156,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
         ),
         selector_receipt: None,
         prefix_class_participation_receipt: Some(success_receipt),
+        count_receipt: None,
     });
     assert_eq!(
         injected

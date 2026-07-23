@@ -91,8 +91,8 @@ pub use aggregate_many::{
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
     CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
-    CaptureCountOwnerSeal, CaptureCountProspective, CaptureCountRouteIdentity, CaptureCountSeal,
-    CaptureCountSelectorRoute, CaptureCountTerminal,
+    CaptureCountOwnerSeal, CaptureCountPrepublicationFallback, CaptureCountProspective,
+    CaptureCountRouteIdentity, CaptureCountSeal, CaptureCountSelectorRoute, CaptureCountTerminal,
 };
 pub use capture_noqa::{
     NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,

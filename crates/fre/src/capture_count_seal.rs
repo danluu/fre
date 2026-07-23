@@ -52,9 +52,16 @@ pub struct CaptureCountSelectorRoute {
     pub prepublication_fallback: SelectorOperationPrepublicationFallback,
 }
 
-/// Permitted construction-time action before the sealed route is published.
+/// Permitted action after the sealed route is published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureCountDeclaredFallback {
+    /// A refusal or fault is terminal; no other route may inspect the source.
+    None,
+}
+
+/// Permitted construction-time action before the sealed route is published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureCountPrepublicationFallback {
     /// No alternate capture Count route is permitted.
     None,
     /// U4 direct construction may refuse into the already-built U3 selector.
@@ -91,6 +98,8 @@ pub struct CaptureCountRouteIdentity {
     /// Capture Count prospective/actual ledger version.
     pub accounting_version: u32,
     /// Only permitted construction-time fallback.
+    pub declared_prepublication_fallback: CaptureCountPrepublicationFallback,
+    /// Only permitted action after route publication.
     pub declared_fallback: CaptureCountDeclaredFallback,
 }
 
@@ -361,10 +370,8 @@ impl CaptureCountAttemptReceipt {
         let route = seal.route_identity();
         if route.selector_operation != SelectorOperationAttemptKind::Count
             || route.selector_work_mode != SelectorOperationWorkMode::ConservativeAdmission
-            || route.selector_route.algorithm_version
-                != CONTINUATION_OPERATION_ALGORITHM_VERSION
-            || route.selector_route.accounting_version
-                != CONTINUATION_OPERATION_ACCOUNTING_VERSION
+            || route.selector_route.algorithm_version != CONTINUATION_OPERATION_ALGORITHM_VERSION
+            || route.selector_route.accounting_version != CONTINUATION_OPERATION_ACCOUNTING_VERSION
             || route.selector_route.prepublication_fallback
                 != SelectorOperationPrepublicationFallback::None
             || route.algorithm_version != CAPTURE_COUNT_ALGORITHM_VERSION
@@ -379,6 +386,8 @@ impl CaptureCountAttemptReceipt {
                 if route.plan.plan != CapturePlanKind::LinearSelectorUniformParticipation
                     || route.plan.prefix_class_participation.is_some()
                     || route.retained_fallback_bytes != 0
+                    || route.declared_prepublication_fallback
+                        != CaptureCountPrepublicationFallback::None
                     || route.declared_fallback != CaptureCountDeclaredFallback::None
                     || self.direct.is_some()
                 {
@@ -399,8 +408,9 @@ impl CaptureCountAttemptReceipt {
             }
             CaptureCountBranch::DirectPrefixClassParticipation => {
                 if route.plan.plan != CapturePlanKind::UniformPrefixClassParticipation
-                    || route.declared_fallback
-                        != CaptureCountDeclaredFallback::SelectorUniformParticipation
+                    || route.declared_prepublication_fallback
+                        != CaptureCountPrepublicationFallback::SelectorUniformParticipation
+                    || route.declared_fallback != CaptureCountDeclaredFallback::None
                     || self.selector.is_some()
                     || self.actual.selector != SelectorExecutionAccounting::default()
                     || self.actual.selector_allocations != 0
@@ -416,6 +426,8 @@ impl CaptureCountAttemptReceipt {
                 };
                 if plan.declared_prepublication_fallback
                     != CapturePlanKind::LinearSelectorUniformParticipation
+                    || route.selector_route.physical_route
+                        != SelectorOperationPhysicalRoute::DenseRows
                     || plan.kernel.algorithm_version
                         != PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION
                     || plan.kernel.accounting_version
@@ -429,6 +441,13 @@ impl CaptureCountAttemptReceipt {
                     || direct.actual != actual
                     || direct.actual_allocations != self.actual.direct_allocations
                     || !direct.retains_bounded_actual()
+                    || self.actual.matches != direct.actual.results
+                    || self.actual.capture_count != direct.actual.capture_count
+                    || self.actual.capture_events != direct.actual.capture_events
+                    || route
+                        .retained_fallback_bytes
+                        .checked_add(direct.actual.peak_bytes)
+                        != Some(self.actual.combined_peak_bytes)
                 {
                     return false;
                 }
@@ -446,6 +465,7 @@ impl CaptureCountAttemptReceipt {
                         self.actual
                             == CaptureCountActual {
                                 direct: Some(DirectExecutionActual::default()),
+                                combined_peak_bytes: route.retained_fallback_bytes,
                                 ..CaptureCountActual::default()
                             }
                     }
@@ -454,7 +474,8 @@ impl CaptureCountAttemptReceipt {
         let Some(matches) = haystack_len.checked_div(route.minimum_match_bytes) else {
             return false;
         };
-        let Some(capture_count) = matches.checked_mul(route.participating_captures_per_match) else {
+        let Some(capture_count) = matches.checked_mul(route.participating_captures_per_match)
+        else {
             return false;
         };
         let Some(capture_events) = matches.checked_mul(route.capture_schema_entries_per_match)
@@ -476,8 +497,11 @@ impl CaptureCountAttemptReceipt {
                 let Some(selector) = self.selector.as_ref() else {
                     return false;
                 };
+                let expected_terminal_frontier = route.selector_route.physical_route
+                    == SelectorOperationPhysicalRoute::TerminalFrontierRows;
                 if prospective.direct.is_some()
                     || selector.prospective != Some(prospective.selector)
+                    || prospective.selector.terminal_frontier != expected_terminal_frontier
                     || prospective.allocations != prospective.selector.allocations
                     || prospective.combined_peak_bytes != prospective.selector.peak_bytes
                     || self.actual.combined_peak_bytes != selector.actual.peak_bytes
@@ -492,6 +516,9 @@ impl CaptureCountAttemptReceipt {
                 let Some(direct_prospective) = prospective.direct else {
                     return false;
                 };
+                let Some(boundaries) = haystack_len.checked_add(1) else {
+                    return false;
+                };
                 let Some(direct_peak) = route
                     .retained_fallback_bytes
                     .checked_add(direct_prospective.peak_bytes)
@@ -499,11 +526,14 @@ impl CaptureCountAttemptReceipt {
                     return false;
                 };
                 if direct.prospective != Some(direct_prospective)
+                    || direct_prospective.haystack_bytes != haystack_len
                     || direct_prospective.minimum_match_bytes != route.minimum_match_bytes
                     || direct_prospective.results != matches
                     || direct_prospective.capture_count != capture_count
                     || direct_prospective.capture_events != capture_events
                     || prospective.allocations != direct_prospective.operation_allocations
+                    || prospective.selector.boundaries != boundaries
+                    || prospective.selector.terminal_frontier
                     || prospective.combined_peak_bytes
                         != direct_peak.max(prospective.selector.peak_bytes)
                 {
@@ -515,22 +545,22 @@ impl CaptureCountAttemptReceipt {
         if self.terminal == CaptureCountTerminal::Success {
             prospective.fits_limits(route, seal)
                 && match route.branch {
-                    CaptureCountBranch::SelectorUniformParticipation => self
-                        .selector
-                        .as_ref()
-                        .is_some_and(|selector| {
+                    CaptureCountBranch::SelectorUniformParticipation => {
+                        self.selector.as_ref().is_some_and(|selector| {
                             self.actual.matches == selector.actual.emitted_matches
-                                && self.actual.capture_count == capture_count_for_actual(route, self)
-                                && self.actual.capture_events == capture_events_for_actual(route, self)
-                        }),
-                    CaptureCountBranch::DirectPrefixClassParticipation => self
-                        .direct
-                        .as_ref()
-                        .is_some_and(|direct| {
+                                && self.actual.capture_count
+                                    == capture_count_for_actual(route, self)
+                                && self.actual.capture_events
+                                    == capture_events_for_actual(route, self)
+                        })
+                    }
+                    CaptureCountBranch::DirectPrefixClassParticipation => {
+                        self.direct.as_ref().is_some_and(|direct| {
                             self.actual.matches == direct.actual.results
                                 && self.actual.capture_count == direct.actual.capture_count
                                 && self.actual.capture_events == direct.actual.capture_events
-                        }),
+                        })
+                    }
                 }
         } else {
             true
@@ -556,8 +586,7 @@ fn selector_closes(
         && physical_route_closes
         && selector.identity.algorithm_version == route.selector_route.algorithm_version
         && selector.identity.accounting_version == route.selector_route.accounting_version
-        && selector.identity.prepublication_fallback
-            == route.selector_route.prepublication_fallback
+        && selector.identity.prepublication_fallback == route.selector_route.prepublication_fallback
         && selector
             .identity
             .authenticates_limits(seal.effective_selector_limits())
