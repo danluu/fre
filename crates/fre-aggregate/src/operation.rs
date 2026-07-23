@@ -166,7 +166,7 @@ pub struct OperationCertificate {
 }
 
 impl OperationCertificate {
-    fn retain_published_prospective(&mut self, prospective: OperationProspective) {
+    fn retain_published_prospective(&mut self, prospective: &OperationProspective) {
         self.states = prospective.states;
         self.boundaries = prospective.boundaries;
         self.table_cells = prospective.table_cells;
@@ -185,7 +185,7 @@ impl OperationCertificate {
         self.peak_bytes = prospective.peak_bytes;
     }
 
-    fn retains_published_prospective(&self, prospective: OperationProspective) -> bool {
+    fn retains_published_prospective(&self, prospective: &OperationProspective) -> bool {
         self.states == prospective.states
             && self.boundaries == prospective.boundaries
             && self.table_cells == prospective.table_cells
@@ -1382,11 +1382,11 @@ impl CompiledRegex {
         };
         match result {
             Ok(mut result) => {
-                if let Some(prospective) = receipt.prospective {
+                if let Some(prospective) = receipt.prospective.as_ref() {
                     result.certificate.retain_published_prospective(prospective);
                 }
-                let valid = receipt.prospective.is_some_and(|upper| {
-                    upper.contains(receipt.actual)
+                let valid = receipt.prospective.as_ref().is_some_and(|upper| {
+                    (*upper).contains(receipt.actual)
                         && result.certificate.retains_published_prospective(upper)
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
@@ -6741,6 +6741,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one route-identity regression keeps incumbent, explicit, and ordinary receipt comparisons together"
+    )]
     fn terminal_frontier_count_is_explicit_and_ordinary_receipt_count_is_unchanged() {
         let compiled = terminal_frontier_count();
         let haystack = b"xx cargo/registry/src/name/ yy cargo\\other\\ tail";
@@ -6831,7 +6835,7 @@ mod tests {
             terminal
                 .admitted
                 .certificate()
-                .retains_published_prospective(terminal.receipt.prospective.unwrap())
+                .retains_published_prospective(terminal.receipt.prospective.as_ref().unwrap())
         );
         assert_eq!(incumbent.accounting(), terminal.admitted.accounting());
 

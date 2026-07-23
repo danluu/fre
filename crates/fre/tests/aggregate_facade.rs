@@ -449,7 +449,7 @@ fn continuation_details(
 
 fn assert_continuation_certificate_preserves_prospective(
     certificate: &fre::AggregateOperationCertificate,
-    prospective: fre::AggregateOperationProspective,
+    prospective: &fre::AggregateOperationProspective,
 ) {
     assert_eq!(certificate.states, prospective.states);
     assert_eq!(certificate.boundaries, prospective.boundaries);
@@ -3353,7 +3353,7 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
         spans_failure_receipt.identity.prepublication_fallback,
         spans_certificate.prepublication_fallback
     );
-    assert_continuation_certificate_preserves_prospective(spans_certificate, spans_upper);
+    assert_continuation_certificate_preserves_prospective(spans_certificate, &spans_upper);
     assert!(spans_upper.contains(*spans_accounting));
     assert_eq!(
         spans_error
@@ -3462,7 +3462,7 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
         sum_failure_receipt.identity.prepublication_fallback,
         sum_certificate.prepublication_fallback
     );
-    assert_continuation_certificate_preserves_prospective(sum_certificate, sum_upper);
+    assert_continuation_certificate_preserves_prospective(sum_certificate, &sum_upper);
     assert_eq!(sum_upper.span_sum, haystack.len());
     assert!(sum_upper.contains(*sum_accounting));
     assert!(matches!(

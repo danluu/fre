@@ -1869,7 +1869,7 @@ fn adversarial_operation_work(size: usize) -> (usize, usize) {
     assert_eq!(size, result.accounting.count);
     assert_eq!(size, result.selector_accounting.emitted_matches);
     assert_eq!(
-        size + 1,
+        size.checked_add(1).expect("test input boundary count"),
         result.selector_certificate.output_matches,
         "the compact selector certificate retains its published input-only bound"
     );
