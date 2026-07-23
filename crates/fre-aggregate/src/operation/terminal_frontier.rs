@@ -172,6 +172,36 @@ pub(super) fn requirements(
     })
 }
 
+/// Derive the fixed typed frontier envelope used by an explicit
+/// receipt-bearing route. Unlike [`requirements`], this construction does not
+/// use the invocation's caller limits to choose its physical shape. The
+/// established default whole-operation work ceiling is the owner-local route
+/// cap, so default callers preserve the incumbent terminal-frontier shape and
+/// lower callers compare against one immutable prospective before source.
+pub(super) fn receipt_requirements(
+    program: &Program,
+    seed: &TerminalFrontierSeed,
+    boundaries: usize,
+    log_bytes: usize,
+    post_build_work: usize,
+) -> Result<(FrontierRequirements, usize), Error> {
+    if seed.is_empty() {
+        return Err(Error::InternalInvariant(
+            "terminal frontier requirements have no compiled HIR proof",
+        ));
+    }
+    let limits = OperationLimits::default();
+    let frontier = requirements(
+        program,
+        seed,
+        boundaries,
+        log_bytes,
+        post_build_work,
+        limits,
+    )?;
+    Ok((frontier, limits.max_work))
+}
+
 pub(super) fn allocation_count(program: &Program, log_bytes: usize) -> Result<usize, Error> {
     let layout = Layout::new(program)?;
     let offsets = add(layout.states, 1, Resource::Allocations)?;
