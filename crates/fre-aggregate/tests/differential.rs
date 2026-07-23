@@ -2801,19 +2801,31 @@ fn span_diagnostics_can_use_observed_work_without_losing_evidence() {
             .unwrap();
         let span_work = diagnostic_spans.accounting().work;
         assert!(span_work < diagnostic_spans.certificate().work_bound);
+        let observed_limits = OperationLimits {
+            max_work: span_work,
+            ..OperationLimits::default()
+        };
         let observed_spans = regex
-            .admit_spans_observed(
-                haystack,
-                0..haystack.len(),
-                strategy,
-                OperationLimits {
-                    max_work: span_work,
-                    ..OperationLimits::default()
-                },
-            )
+            .admit_spans_observed(haystack, 0..haystack.len(), strategy, observed_limits)
             .unwrap();
         assert_eq!(diagnostic_spans.as_slice(), observed_spans.as_slice());
-        assert_eq!(diagnostic_spans.certificate(), observed_spans.certificate());
+        assert!(
+            diagnostic_spans
+                .certificate()
+                .authenticates_limits(OperationLimits::default())
+        );
+        assert!(
+            observed_spans
+                .certificate()
+                .authenticates_limits(observed_limits)
+        );
+        let mut normalized_observed_certificate = observed_spans.certificate().clone();
+        normalized_observed_certificate.operation_limits_id =
+            diagnostic_spans.certificate().operation_limits_id;
+        assert_eq!(
+            diagnostic_spans.certificate(),
+            &normalized_observed_certificate
+        );
         assert_eq!(diagnostic_spans.accounting(), observed_spans.accounting());
         expect_resource(
             regex.admit_spans(
