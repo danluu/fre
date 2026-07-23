@@ -24,9 +24,9 @@ use fre_capture_lab::{
     Window,
 };
 use fre_kernels::{
-    LiteralSetError, PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationPlan,
-    PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationError,
+    LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationPlan, PrefixClassUniformParticipationAccounting,
+    PrefixClassUniformParticipationBuildAccounting, PrefixClassUniformParticipationError,
     PrefixClassUniformParticipationIdentity, PrefixClassUniformParticipationLimits,
     PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationSchema,
 };
@@ -241,7 +241,7 @@ pub struct CaptureBuildReport {
     /// direct prefix/class route.
     pub prefix_class_participation_planner_work: usize,
     /// Successful direct-kernel construction accounting.
-    pub prefix_class_participation: Option<PrefixClassAlternationBuildAccounting>,
+    pub prefix_class_participation: Option<PrefixClassUniformParticipationBuildAccounting>,
     /// Complete immutable plan identity.
     pub plan_identity: CapturePlanIdentity,
 }
@@ -1469,7 +1469,7 @@ impl CaptureBuilder {
         let prefix_class_participation_build = prefix_class_participation
             .plan
             .as_ref()
-            .map(|plan| plan.engine.build_accounting());
+            .map(|plan| plan.engine.uniform_participation_build_accounting());
         let report = CaptureBuildReport {
             admission,
             syntax,

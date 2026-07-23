@@ -118,6 +118,19 @@ pub struct BuildAccounting {
     pub class_ranges: usize,
     pub shape_units: usize,
     pub work_upper_bound: usize,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Construction receipt exposed only by the distinct capture-aware operation.
+/// The incumbent aggregate build accounting remains unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationBuildAccounting {
+    pub prefix_bytes: usize,
+    pub class_ranges: usize,
+    pub shape_units: usize,
+    pub work_upper_bound: usize,
     pub allocations: usize,
     pub copied_prefix_bytes: usize,
     pub finder_preprocess_bytes: usize,
@@ -657,13 +670,8 @@ impl PrefixClassAlternationPlan {
                 class_ranges,
                 shape_units,
                 work_upper_bound: work.used(),
-                allocations: 2,
-                copied_prefix_bytes: prefix_bytes,
-                finder_preprocess_bytes: prefix_bytes,
-                initialized_bitmap_bytes: size_of::<[u64; 8]>(),
                 scratch_bytes,
                 persistent_bytes,
-                retained_capacity_bytes: prefix_bytes,
                 peak_bytes,
             },
         })
@@ -672,6 +680,26 @@ impl PrefixClassAlternationPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    #[must_use]
+    pub const fn uniform_participation_build_accounting(
+        &self,
+    ) -> UniformParticipationBuildAccounting {
+        UniformParticipationBuildAccounting {
+            prefix_bytes: self.build.prefix_bytes,
+            class_ranges: self.build.class_ranges,
+            shape_units: self.build.shape_units,
+            work_upper_bound: self.build.work_upper_bound,
+            allocations: 2,
+            copied_prefix_bytes: self.build.prefix_bytes,
+            finder_preprocess_bytes: self.build.prefix_bytes,
+            initialized_bitmap_bytes: size_of::<[u64; 8]>(),
+            scratch_bytes: self.build.scratch_bytes,
+            persistent_bytes: self.build.persistent_bytes,
+            retained_capacity_bytes: self.build.prefix_bytes,
+            peak_bytes: self.build.peak_bytes,
+        }
     }
 
     #[must_use]

@@ -249,6 +249,7 @@ pub use prefix_class_alternation::{
     UNIFORM_PARTICIPATION_PLAN_ID as PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
     UniformParticipationAccounting as PrefixClassUniformParticipationAccounting,
     UniformParticipationActual as PrefixClassUniformParticipationActual,
+    UniformParticipationBuildAccounting as PrefixClassUniformParticipationBuildAccounting,
     UniformParticipationError as PrefixClassUniformParticipationError,
     UniformParticipationIdentity as PrefixClassUniformParticipationIdentity,
     UniformParticipationLimits as PrefixClassUniformParticipationLimits,
