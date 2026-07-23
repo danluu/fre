@@ -16353,9 +16353,12 @@ mod tests {
     #[test]
     fn capture_limits_preserve_facade_cardinality_and_selector_ceilings() {
         let run = RunLimits {
+            pattern_bytes_per_job: 31,
             fre_aggregate_compile_work: 17,
             fre_aggregate_program_bytes: 19,
+            fre_aggregate_peak_bytes: 37,
             fre_capture_selector_program_bytes: 23,
+            fre_literal_planner_work: 29,
             ..RunLimits::default()
         };
         let defaults = CaptureBuildLimits::default();
@@ -16374,6 +16377,35 @@ mod tests {
         );
         assert_eq!(mapped.selector.max_work, 17);
         assert_eq!(mapped.selector.max_program_bytes, 23);
+        assert_eq!(mapped.max_prefix_class_participation_planner_work, 29);
+        assert_eq!(mapped.prefix_class_participation.max_shape_units, 31);
+        assert_eq!(mapped.prefix_class_participation.max_build_work, 17);
+        assert_eq!(mapped.prefix_class_participation.max_scratch_bytes, 0);
+        assert_eq!(mapped.prefix_class_participation.max_persistent_bytes, 19);
+        assert_eq!(mapped.prefix_class_participation.max_peak_bytes, 37);
+        assert_eq!(mapped.prefix_class_participation.max_allocations, 2);
+        assert_eq!(
+            mapped.prefix_class_participation.max_copied_prefix_bytes,
+            31
+        );
+        assert_eq!(
+            mapped
+                .prefix_class_participation
+                .max_finder_preprocess_input_bytes,
+            31
+        );
+        assert_eq!(
+            mapped
+                .prefix_class_participation
+                .max_initialized_bitmap_bytes,
+            64
+        );
+        assert_eq!(
+            mapped
+                .prefix_class_participation
+                .max_retained_capacity_bytes,
+            19
+        );
 
         let pattern = "(a)".repeat(65);
         let patterns = [pattern];
