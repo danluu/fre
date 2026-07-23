@@ -45,6 +45,11 @@ fn assert_bounded_fixed_optional_miss(report: &AggregateBuildReport) {
 #[test]
 fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionIdentity>(), 8);
+    assert_eq!(
+        core::mem::size_of::<fre::AggregateOperationCertificate>(),
+        168
+    );
+    assert_eq!(fre::AGGREGATE_CONTINUATION_MAX_ALLOCATIONS, 9);
     // Exact typed fixed failures retain owner provenance, route limits, and
     // complete nested P/A without a terminal-path allocation.
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_552);

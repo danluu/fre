@@ -581,6 +581,9 @@ mod tests {
         );
         assert!(admitted.accounting().work <= admitted.certificate().work_bound);
         assert_eq!(admitted.certificate().work_bound, upper.work);
+        assert_eq!(admitted.certificate().prospective_allocations, 0);
+        assert_eq!(admitted.certificate().actual_allocations, 0);
+        assert_eq!(admitted.certificate().boundaries(), haystack.len() + 1);
         assert_eq!(
             admitted.certificate().random_access_bytes,
             upper.random_access_bytes

@@ -6556,13 +6556,14 @@ mod tests {
     };
 
     use super::{
-        CONTINUATION_OPERATION_ACCOUNTING_VERSION, CONTINUATION_OPERATION_ALGORITHM_VERSION,
+        CANDIDATE_EXECUTION_ALLOCATIONS, CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+        CONTINUATION_OPERATION_ALGORITHM_VERSION, CONTINUATION_OPERATION_MAX_ALLOCATIONS,
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
         OperationPhysicalRoute, OperationProspective, Requirements, RowReader, RowStorage,
         UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
-        cached_frontier_words, cached_program_assertion_mask, decode, encoded_width, exact_filled,
-        operation_identity, read_encoded, write_encoded,
+        cached_frontier_words, cached_program_assertion_mask, compact_operation_allocation_count,
+        decode, encoded_width, exact_filled, operation_identity, read_encoded, write_encoded,
     };
 
     fn endpoint_scalar_repeat() -> CompiledRegex {
@@ -6956,6 +6957,239 @@ mod tests {
             ordinary_after.receipt.actual,
             ordinary_before.receipt.actual
         );
+    }
+
+    #[test]
+    fn accounting_v2_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+        let compiled = terminal_frontier_count();
+        let haystack = b"no terminal prefix here";
+        let limits = OperationLimits::default();
+
+        let count = compiled
+            .admit_count_with_terminal_frontier_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        let count_p = count.receipt.prospective.unwrap();
+        assert_eq!(count.admitted.value(), 0);
+        assert_eq!(count_p.allocations, 8);
+        assert!(count.receipt.actual_allocations < count_p.allocations);
+        assert_eq!(count.admitted.certificate().prospective_allocations, 8);
+        assert_eq!(
+            usize::from(count.admitted.certificate().actual_allocations),
+            count.receipt.actual_allocations
+        );
+
+        let spans = compiled
+            .admit_spans(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        assert_eq!(
+            spans.certificate().physical_route,
+            OperationPhysicalRoute::TerminalFrontierRows
+        );
+        assert!(spans.as_slice().is_empty());
+        assert_eq!(
+            spans.certificate().prospective_allocations,
+            CONTINUATION_OPERATION_MAX_ALLOCATIONS
+        );
+        assert_eq!(
+            usize::from(spans.certificate().actual_allocations),
+            count.receipt.actual_allocations
+        );
+        assert_eq!(
+            usize::from(spans.certificate().prospective_allocations),
+            count_p.allocations + 1
+        );
+        assert!(
+            spans.certificate().actual_allocations < spans.certificate().prospective_allocations
+        );
+
+        let matching = b"cargo/registry/";
+        let matching_spans = compiled
+            .admit_spans(
+                matching,
+                0..matching.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap();
+        assert_eq!(matching_spans.as_slice().len(), 1);
+        assert_eq!(
+            matching_spans.certificate().prospective_allocations,
+            CONTINUATION_OPERATION_MAX_ALLOCATIONS
+        );
+        assert_eq!(
+            matching_spans.certificate().actual_allocations,
+            CONTINUATION_OPERATION_MAX_ALLOCATIONS
+        );
+
+        // The incumbent intrinsic receipt envelope still overflows while
+        // deriving its random-read P before publication. This is effect-free
+        // and is deliberately recorded separately from the v2 compact
+        // allocation projection.
+        let receipt_failure = compiled
+            .admit_spans_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap_err();
+        assert_eq!(
+            receipt_failure.source,
+            Error::ArithmeticOverflow {
+                resource: Resource::RandomAccessBytes
+            }
+        );
+        assert_eq!(receipt_failure.receipt.prospective, None);
+        assert_eq!(
+            receipt_failure.receipt.actual,
+            ExecutionAccounting::default()
+        );
+        assert_eq!(receipt_failure.receipt.actual_allocations, 0);
+    }
+
+    #[test]
+    fn accounting_v2_allocation_encoding_is_checked_at_its_route_maximum() {
+        for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
+            assert_eq!(
+                compact_operation_allocation_count(allocations).unwrap(),
+                u8::try_from(allocations).unwrap()
+            );
+        }
+        assert_eq!(
+            compact_operation_allocation_count(
+                usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) + 1
+            ),
+            Err(Error::InternalInvariant(
+                "continuation allocation count exceeds its accounting-version structural maximum"
+            ))
+        );
+    }
+
+    #[test]
+    fn url_route_projects_success_allocations_and_terminal_partial_a() {
+        let plan = fre_kernels::UrlAggregatePlan::build(
+            b"COM",
+            &[3],
+            fre_kernels::UrlAggregateBuildLimits::default(),
+        )
+        .unwrap();
+        let mut compiled = candidate_count();
+        compiled.url_aggregate = Some(plan);
+        let haystack = b"a.com";
+
+        let success = compiled
+            .admit_span_sum_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            success.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::UrlAggregate)
+        );
+        assert_eq!(success.receipt.prospective.unwrap().allocations, 1);
+        assert_eq!(success.receipt.actual_allocations, 1);
+        assert_eq!(success.admitted.certificate().prospective_allocations, 1);
+        assert_eq!(success.admitted.certificate().actual_allocations, 1);
+
+        let limits = OperationLimits {
+            max_work: haystack.len() + 3,
+            ..OperationLimits::default()
+        };
+        let failure = compiled
+            .admit_span_sum_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
+        let prospective = failure.receipt.prospective.unwrap();
+        assert_eq!(prospective.allocations, 1);
+        assert_eq!(failure.receipt.actual_allocations, 1);
+        assert_eq!(failure.receipt.actual.sequential_bytes_read, haystack.len());
+        assert!(failure.receipt.actual.scratch_peak_bytes > 0);
+        assert!(prospective.contains(failure.receipt.actual));
+    }
+
+    #[test]
+    fn certificate_derives_boundaries_and_rejects_malformed_internal_ranges() {
+        let compiled = endpoint_scalar_repeat();
+        let empty = compiled
+            .admit_count(
+                b"",
+                0..0,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(empty.certificate().boundaries(), 1);
+
+        let haystack = [b'a'; 249];
+        let normal = compiled
+            .admit_count(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(normal.certificate().boundaries(), haystack.len() + 1);
+
+        let mut reversed = normal.certificate().clone();
+        reversed.range = 2..1;
+        assert!(std::panic::catch_unwind(|| reversed.boundaries()).is_err());
+
+        let mut overflowing = normal.certificate().clone();
+        overflowing.range = 0..usize::MAX;
+        assert!(std::panic::catch_unwind(|| overflowing.boundaries()).is_err());
+    }
+
+    #[test]
+    fn nonreceipt_span_sum_certificate_retains_actual_sum_not_range_length() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("a")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"abbbbb";
+        let admitted = compiled
+            .admit_span_sum(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(admitted.value(), 1);
+        assert_eq!(admitted.certificate().span_sum, admitted.value());
+        assert_ne!(admitted.certificate().span_sum, haystack.len());
     }
 
     #[test]
@@ -7523,6 +7757,28 @@ mod tests {
         );
         assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(refusal.receipt.actual_allocations, 0);
+
+        let mut terminal_limits = limits;
+        terminal_limits.max_work = first.receipt.actual.work - 1;
+        let terminal = compiled
+            .count_value_attempt(haystack, 0..haystack.len(), strategy, terminal_limits)
+            .unwrap_err();
+        assert!(matches!(
+            terminal.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
+        let terminal_p = terminal.receipt.prospective.unwrap();
+        assert_eq!(terminal_p.allocations, CANDIDATE_EXECUTION_ALLOCATIONS);
+        assert_eq!(
+            terminal.receipt.actual_allocations,
+            CANDIDATE_EXECUTION_ALLOCATIONS
+        );
+        assert!(terminal.receipt.actual.work > 0);
+        assert!(terminal.receipt.actual.sequential_bytes_read > 0);
+        assert!(terminal_p.contains(terminal.receipt.actual));
     }
 
     #[test]
