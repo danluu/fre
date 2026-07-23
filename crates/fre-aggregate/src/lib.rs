@@ -58,9 +58,11 @@ pub use compile::{
 pub use error::{Error, Resource, Unsupported};
 pub use limits::{CompileLimits, OperationLimits};
 pub use operation::{
-    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpans, CountValueAttempt,
-    MatchCount, OperationAttemptError, OperationAttemptIdentity, OperationAttemptKind,
-    OperationAttemptReceipt, OperationCertificate, OperationId, OperationInvocation,
+    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpanSumAttempt, AdmittedSpans,
+    AdmittedSpansAttempt, CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+    CONTINUATION_OPERATION_ALGORITHM_VERSION, CountValueAttempt, MatchCount, OperationAttemptError,
+    OperationAttemptIdentity, OperationAttemptKind, OperationAttemptReceipt, OperationCertificate,
+    OperationId, OperationInvocation, OperationPhysicalRoute, OperationPrepublicationFallback,
     OperationProspective, OperationWorkMode, RowStorage, Span, SpanIter, SpanIteration, SpanSum,
-    Strategy,
+    SpanSumValueAttempt, Strategy,
 };

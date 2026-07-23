@@ -101,6 +101,12 @@ pub struct OperationCertificate {
     pub regex_plan_id: PlanId,
     pub operation_id: OperationId,
     pub strategy: Strategy,
+    /// Exact executor selected before source access.
+    pub physical_route: OperationPhysicalRoute,
+    /// Explicit implementation version for the selected continuation route.
+    pub algorithm_version: u32,
+    /// Explicit schema version for prospective/actual accounting.
+    pub accounting_version: u32,
     pub range: Range<usize>,
     pub states: usize,
     pub boundaries: usize,
@@ -125,7 +131,45 @@ pub struct OperationCertificate {
 /// Public operation tag retained by a receipt-bearing execution attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OperationAttemptKind {
+    Spans,
     Count,
+    SpanSum,
+}
+
+/// Version of the continuation execution algorithm bound into every attempt.
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u32 = 1;
+
+/// Version of the continuation prospective/actual accounting schema.
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u32 = 1;
+
+/// Physical executor selected before a continuation attempt reads its source.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperationPhysicalRoute {
+    /// Complete endpoint table or reverse sequential rows.
+    DenseRows,
+    /// Reverse rows seeded by the construction-retained required suffixes.
+    RequiredSuffixRows,
+    /// Reverse rows seeded by the construction-retained terminal frontier.
+    TerminalFrontierRows,
+    /// Bounded observed-work frontier cache.
+    CachedFrontier,
+    /// Certified required-internal-anchor candidate stream.
+    RequiredInternalAnchor,
+    /// Certified URL aggregate executor.
+    UrlAggregate,
+    /// Construction-retained byte candidate scheduler.
+    Candidate,
+}
+
+/// The only route-selection edge allowed before an attempt publishes its
+/// selected route and prospective. Once publication occurs, no fallback is
+/// permitted.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OperationPrepublicationFallback {
+    None,
+    TerminalFrontierThenDense,
+    DenseThenRequiredSuffix,
+    DenseThenCachedFrontier,
 }
 
 /// Work-admission mode used by a receipt-bearing execution attempt.
@@ -147,6 +191,13 @@ pub struct OperationAttemptIdentity {
     pub strategy: Strategy,
     pub operation: OperationAttemptKind,
     pub work_mode: OperationWorkMode,
+    /// Selected physical route. This is absent only before route publication.
+    pub physical_route: Option<OperationPhysicalRoute>,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+    /// Construction- and invocation-derived route selection edge. This edge
+    /// is exhausted before `physical_route` and P are published.
+    pub prepublication_fallback: OperationPrepublicationFallback,
 }
 
 /// Original-haystack invocation bound to an operation attempt.
@@ -457,6 +508,14 @@ pub struct AdmittedSpans {
     spans: Vec<Span>,
 }
 
+/// Successfully admitted complete spans and their complete P/A attempt
+/// receipt.
+#[derive(Debug)]
+pub struct AdmittedSpansAttempt {
+    pub admitted: AdmittedSpans,
+    pub receipt: OperationAttemptReceipt,
+}
+
 impl AdmittedSpans {
     #[must_use]
     pub fn iter(&self) -> SpanIter<'_> {
@@ -558,6 +617,20 @@ pub struct AdmittedSpanSum {
     value: usize,
 }
 
+/// Successfully admitted SpanSum and its complete P/A attempt receipt.
+#[derive(Debug)]
+pub struct AdmittedSpanSumAttempt {
+    pub admitted: AdmittedSpanSum,
+    pub receipt: OperationAttemptReceipt,
+}
+
+/// Successfully evaluated value-only SpanSum and its complete P/A receipt.
+#[derive(Debug)]
+pub struct SpanSumValueAttempt {
+    pub value: usize,
+    pub receipt: OperationAttemptReceipt,
+}
+
 impl AdmittedSpanSum {
     #[must_use]
     pub const fn value(&self) -> usize {
@@ -627,6 +700,43 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit and evaluate the ordinary construction-selected continuation
+    /// Spans route while retaining one complete success or terminal P/A
+    /// receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_spans_with_receipt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedSpansAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<false>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Spans,
+            None,
+            limits,
+            usize::MAX,
+            None,
+        )?;
+        Ok(AdmittedSpansAttempt {
+            admitted: AdmittedSpans {
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+                spans: result.spans,
+            },
+            receipt,
+        })
+    }
+
     /// Admit and evaluate a complete match-count reduction.
     pub fn admit_count(
         &self,
@@ -647,6 +757,44 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit and evaluate the ordinary construction-selected continuation
+    /// Count route while retaining one complete success or terminal P/A
+    /// receipt. Unlike [`Self::admit_count_with_receipt`], this preserves
+    /// construction-selected specialized and frontier routes.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<false>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            None,
+            limits,
+            usize::MAX,
+            None,
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
     /// Admit and evaluate a generic continuation count while retaining a
     /// complete failure attempt receipt. This entry point deliberately uses
     /// the shared continuation executor rather than an optional specialized
@@ -662,11 +810,12 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
-        let (result, receipt) = self.execute_count_with_receipt::<false>(
+        let (result, receipt) = self.execute_with_receipt::<false>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::Dense,
+            OperationKind::Count,
+            Some(GenericCountRoute::Dense),
             limits,
             usize::MAX,
             None,
@@ -700,11 +849,12 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
     ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
-        let (result, receipt) = self.execute_count_with_receipt::<false>(
+        let (result, receipt) = self.execute_with_receipt::<false>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::Dense,
+            OperationKind::Count,
+            Some(GenericCountRoute::Dense),
             limits,
             allocation_limit,
             Some(&mut observer),
@@ -738,11 +888,12 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
-        let (result, receipt) = self.execute_count_with_receipt::<false>(
+        let (result, receipt) = self.execute_with_receipt::<false>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::TerminalFrontier,
+            OperationKind::Count,
+            Some(GenericCountRoute::TerminalFrontier),
             limits,
             usize::MAX,
             None,
@@ -776,11 +927,12 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
     ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
-        let (result, receipt) = self.execute_count_with_receipt::<false>(
+        let (result, receipt) = self.execute_with_receipt::<false>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::TerminalFrontier,
+            OperationKind::Count,
+            Some(GenericCountRoute::TerminalFrontier),
             limits,
             allocation_limit,
             Some(&mut observer),
@@ -825,7 +977,13 @@ impl CompiledRegex {
         let requirements =
             Requirements::new::<false>(&self.program, boundaries, strategy, 1, engine_limits)?
                 .with_prefix::<false>(utf8_validation, prospective_limits)?;
-        requirements.count_prospective(&self.program, haystack_len, boundaries, utf8_validation)
+        requirements.operation_prospective(
+            &self.program,
+            haystack_len,
+            boundaries,
+            utf8_validation,
+            OperationKind::Count,
+        )
     }
 
     /// Admit and evaluate a complete checked matched-byte sum reduction.
@@ -848,6 +1006,43 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit and evaluate the ordinary construction-selected continuation
+    /// SpanSum route while retaining one complete success or terminal P/A
+    /// receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_span_sum_with_receipt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedSpanSumAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<false>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Sum,
+            None,
+            limits,
+            usize::MAX,
+            None,
+        )?;
+        Ok(AdmittedSpanSumAttempt {
+            admitted: AdmittedSpanSum {
+                value: result.summary.span_sum,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
     /// Evaluate a complete match-count reduction while enforcing execution
     /// work against the exact observed charge instead of the conservative
     /// replay upper bound used by an admitted diagnostic result.
@@ -860,6 +1055,35 @@ impl CompiledRegex {
     ) -> Result<usize, Error> {
         self.execute::<true>(haystack, range, strategy, OperationKind::Count, limits)
             .map(|result| result.summary.matches)
+    }
+
+    /// Evaluate the ordinary construction-selected continuation Count route
+    /// with observed-work admission and a complete P/A receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn count_value_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<CountValueAttempt, OperationAttemptError> {
+        self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            None,
+            limits,
+            usize::MAX,
+            None,
+        )
+        .map(|(result, receipt)| CountValueAttempt {
+            value: result.summary.matches,
+            receipt,
+        })
     }
 
     /// Evaluate a generic continuation count with observed-work admission
@@ -875,11 +1099,12 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<CountValueAttempt, OperationAttemptError> {
-        self.execute_count_with_receipt::<true>(
+        self.execute_with_receipt::<true>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::Dense,
+            OperationKind::Count,
+            Some(GenericCountRoute::Dense),
             limits,
             usize::MAX,
             None,
@@ -905,11 +1130,12 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
     ) -> Result<CountValueAttempt, OperationAttemptError> {
-        self.execute_count_with_receipt::<true>(
+        self.execute_with_receipt::<true>(
             haystack,
             range,
             strategy,
-            GenericCountRoute::Dense,
+            OperationKind::Count,
+            Some(GenericCountRoute::Dense),
             limits,
             allocation_limit,
             Some(&mut observer),
@@ -934,17 +1160,47 @@ impl CompiledRegex {
             .map(|result| result.summary.span_sum)
     }
 
+    /// Evaluate the ordinary construction-selected continuation SpanSum route
+    /// with observed-work admission and a complete P/A receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn span_sum_value_with_receipt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<SpanSumValueAttempt, OperationAttemptError> {
+        self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Sum,
+            None,
+            limits,
+            usize::MAX,
+            None,
+        )
+        .map(|(result, receipt)| SpanSumValueAttempt {
+            value: result.summary.span_sum,
+            receipt,
+        })
+    }
+
     #[allow(
         clippy::result_large_err,
         clippy::too_many_arguments,
         reason = "the internal result preserves the complete fixed-layout P/A receipt for its public callers"
     )]
-    fn execute_count_with_receipt<const OBSERVED_WORK: bool>(
+    fn execute_with_receipt<const OBSERVED_WORK: bool>(
         &self,
         haystack: &[u8],
         range: Range<usize>,
         strategy: Strategy,
-        generic_count_route: GenericCountRoute,
+        kind: OperationKind,
+        forced_generic_count_route: Option<GenericCountRoute>,
         limits: OperationLimits,
         allocation_limit: usize,
         prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
@@ -954,12 +1210,20 @@ impl CompiledRegex {
                 regex_plan_id: self.plan_id(),
                 operation_id: None,
                 strategy,
-                operation: OperationAttemptKind::Count,
+                operation: match kind {
+                    OperationKind::Spans => OperationAttemptKind::Spans,
+                    OperationKind::Count => OperationAttemptKind::Count,
+                    OperationKind::Sum => OperationAttemptKind::SpanSum,
+                },
                 work_mode: if OBSERVED_WORK {
                     OperationWorkMode::Observed
                 } else {
                     OperationWorkMode::ConservativeAdmission
                 },
+                physical_route: None,
+                algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+                accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+                prepublication_fallback: OperationPrepublicationFallback::None,
             },
             invocation: OperationInvocation {
                 range: range.clone(),
@@ -979,8 +1243,8 @@ impl CompiledRegex {
                 haystack,
                 range,
                 strategy,
-                OperationKind::Count,
-                Some(generic_count_route),
+                kind,
+                forced_generic_count_route,
                 limits,
                 &mut receipt.actual,
                 &mut receipt.actual_allocations,
@@ -991,15 +1255,15 @@ impl CompiledRegex {
         };
         match result {
             Ok(result) => {
-                let expected_terminal = generic_count_route == GenericCountRoute::TerminalFrontier;
                 let valid = receipt.prospective.is_some_and(|upper| {
                     upper.contains(receipt.actual)
-                        && upper.terminal_frontier == expected_terminal
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
                 }) && receipt.identity.operation_id
                     == Some(result.certificate.operation_id)
-                    && result.certificate.terminal_frontier == expected_terminal;
+                    && receipt.identity.physical_route == Some(result.certificate.physical_route)
+                    && receipt.identity.algorithm_version == result.certificate.algorithm_version
+                    && receipt.identity.accounting_version == result.certificate.accounting_version;
                 if !valid || receipt.actual != result.accounting {
                     return Err(OperationAttemptError {
                         source: Error::InternalInvariant(
@@ -1011,10 +1275,8 @@ impl CompiledRegex {
                 Ok((result, receipt))
             }
             Err(mut source) => {
-                let expected_terminal = generic_count_route == GenericCountRoute::TerminalFrontier;
                 if receipt.prospective.is_some_and(|upper| {
                     !upper.contains(receipt.actual)
-                        || upper.terminal_frontier != expected_terminal
                         || receipt.actual_allocations > upper.allocations
                         || receipt.actual_allocations > receipt.allocation_limit
                 }) {
@@ -1063,7 +1325,7 @@ impl CompiledRegex {
         range: Range<usize>,
         strategy: Strategy,
         kind: OperationKind,
-        generic_count_route: Option<GenericCountRoute>,
+        forced_generic_count_route: Option<GenericCountRoute>,
         limits: OperationLimits,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
@@ -1078,15 +1340,10 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
-        match generic_count_route {
+        match forced_generic_count_route {
             Some(_) if kind != OperationKind::Count || attempt.is_none() => {
                 return Err(Error::InternalInvariant(
                     "generic Count route requires a receipt-bearing Count attempt",
-                ));
-            }
-            None if attempt.is_some() => {
-                return Err(Error::InternalInvariant(
-                    "receipt-bearing Count attempt has no generic route",
                 ));
             }
             Some(GenericCountRoute::TerminalFrontier)
@@ -1104,21 +1361,21 @@ impl CompiledRegex {
             Some(_) | None => {}
         }
         let local = &haystack[range.clone()];
-        if generic_count_route.is_none()
+        if forced_generic_count_route.is_none()
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.url_aggregate
         {
             return self.execute_url_aggregate(plan, local, range, strategy, kind, limits);
         }
-        if generic_count_route.is_none()
+        if forced_generic_count_route.is_none()
             && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.required_internal_anchor
         {
             return self.execute_required_internal_anchor(plan, local, range, strategy, limits);
         }
-        if generic_count_route.is_none()
+        if forced_generic_count_route.is_none()
             && OBSERVED_WORK
             && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
@@ -1128,8 +1385,8 @@ impl CompiledRegex {
             return self.execute_candidate(plan, haystack, range, strategy, limits);
         }
         let receipt_bearing = attempt.is_some();
-        let force_intrinsic_dense =
-            prospective_observer.is_some() && generic_count_route == Some(GenericCountRoute::Dense);
+        let force_intrinsic_dense = prospective_observer.is_some()
+            && forced_generic_count_route == Some(GenericCountRoute::Dense);
         let prospective_limits = if receipt_bearing {
             intrinsic_attempt_limits()
         } else {
@@ -1175,7 +1432,7 @@ impl CompiledRegex {
             Resource::Boundaries,
         )?;
         let passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let terminal_seed = match generic_count_route {
+        let terminal_seed = match forced_generic_count_route {
             Some(GenericCountRoute::TerminalFrontier) => {
                 Some(SparseSeed::TerminalFrontier(&self.terminal_frontier))
             }
@@ -1186,11 +1443,12 @@ impl CompiledRegex {
             }
             Some(GenericCountRoute::Dense) | None => None,
         };
-        let fallback_seed = if generic_count_route.is_some() || self.required_suffixes.is_empty() {
-            None
-        } else {
-            Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
-        };
+        let fallback_seed =
+            if forced_generic_count_route.is_some() || self.required_suffixes.is_empty() {
+                None
+            } else {
+                Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
+            };
         let dense = || {
             Requirements::new::<OBSERVED_WORK>(
                 &self.program,
@@ -1200,7 +1458,7 @@ impl CompiledRegex {
                 engine_limits,
             )
         };
-        let (requirements, sparse_seed) = if generic_count_route
+        let (requirements, sparse_seed) = if forced_generic_count_route
             == Some(GenericCountRoute::TerminalFrontier)
         {
             let seed = terminal_seed.ok_or(Error::InternalInvariant(
@@ -1221,7 +1479,7 @@ impl CompiledRegex {
                 )?,
                 Some(SparseSeed::TerminalFrontier(seed)),
             )
-        } else if receipt_bearing {
+        } else if receipt_bearing && forced_generic_count_route == Some(GenericCountRoute::Dense) {
             let dense = dense()?;
             if !force_intrinsic_dense
                 && OBSERVED_WORK
@@ -1235,6 +1493,52 @@ impl CompiledRegex {
                 )
             } else {
                 (dense, None)
+            }
+        } else if receipt_bearing {
+            if let Some(seed) = terminal_seed {
+                (
+                    Requirements::new_for_seed(
+                        &self.program,
+                        boundaries,
+                        strategy,
+                        passes,
+                        engine_limits,
+                        seed,
+                    )?,
+                    Some(seed),
+                )
+            } else {
+                let dense = dense()?;
+                if dense.work_bound > selection_limits.max_work
+                    && strategy == Strategy::ReverseSequentialRows
+                {
+                    if let Some(seed) = fallback_seed {
+                        (
+                            Requirements::new_for_seed(
+                                &self.program,
+                                boundaries,
+                                strategy,
+                                passes,
+                                engine_limits,
+                                seed,
+                            )?,
+                            Some(seed),
+                        )
+                    } else {
+                        (
+                            Requirements::cached(
+                                &self.program,
+                                boundaries,
+                                passes,
+                                selection_limits,
+                            )?
+                            .unwrap_or(dense),
+                            None,
+                        )
+                    }
+                } else {
+                    (dense, None)
+                }
             }
         } else if let Some(seed) = terminal_seed {
             let dense = dense();
@@ -1327,18 +1631,35 @@ impl CompiledRegex {
         let requirements =
             requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
         if let Some(publication) = attempt.as_mut() {
-            let operation_id = operation_identity(
-                self.plan_id(),
-                strategy,
-                kind,
-                requirements.generic_count_route(),
-            );
+            let physical_route = if requirements.terminal_frontier {
+                OperationPhysicalRoute::TerminalFrontierRows
+            } else if requirements.cached_frontier.is_some() {
+                OperationPhysicalRoute::CachedFrontier
+            } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
+                OperationPhysicalRoute::RequiredSuffixRows
+            } else {
+                OperationPhysicalRoute::DenseRows
+            };
+            let operation_id = operation_identity(self.plan_id(), strategy, kind, physical_route);
             publication.identity.operation_id = Some(operation_id);
-            let prospective = requirements.count_prospective(
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = if forced_generic_count_route.is_some() {
+                OperationPrepublicationFallback::None
+            } else if terminal_seed.is_some() {
+                OperationPrepublicationFallback::TerminalFrontierThenDense
+            } else if fallback_seed.is_some() {
+                OperationPrepublicationFallback::DenseThenRequiredSuffix
+            } else if strategy == Strategy::ReverseSequentialRows {
+                OperationPrepublicationFallback::DenseThenCachedFrontier
+            } else {
+                OperationPrepublicationFallback::None
+            };
+            let prospective = requirements.operation_prospective(
                 &self.program,
                 local.len(),
                 boundaries,
                 utf8_validation,
+                kind,
             )?;
             *publication.prospective = Some(prospective);
             if let Some(observer) = prospective_observer.as_mut() {
@@ -1461,15 +1782,22 @@ impl CompiledRegex {
         }
         validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
         accounting.emitted_matches = summary.matches;
+        let physical_route = if requirements.terminal_frontier {
+            OperationPhysicalRoute::TerminalFrontierRows
+        } else if requirements.cached_frontier.is_some() {
+            OperationPhysicalRoute::CachedFrontier
+        } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
+            OperationPhysicalRoute::RequiredSuffixRows
+        } else {
+            OperationPhysicalRoute::DenseRows
+        };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(
-                self.plan_id(),
-                strategy,
-                kind,
-                requirements.generic_count_route(),
-            ),
+            operation_id: operation_identity(self.plan_id(), strategy, kind, physical_route),
             strategy,
+            physical_route,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -1564,9 +1892,12 @@ impl CompiledRegex {
                 self.plan_id(),
                 strategy,
                 kind,
-                GenericCountRoute::Dense,
+                OperationPhysicalRoute::UrlAggregate,
             ),
             strategy,
+            physical_route: OperationPhysicalRoute::UrlAggregate,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -1639,9 +1970,12 @@ impl CompiledRegex {
                 self.plan_id(),
                 strategy,
                 OperationKind::Count,
-                GenericCountRoute::Dense,
+                OperationPhysicalRoute::RequiredInternalAnchor,
             ),
             strategy,
+            physical_route: OperationPhysicalRoute::RequiredInternalAnchor,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -1696,9 +2030,12 @@ impl CompiledRegex {
                 self.plan_id(),
                 strategy,
                 OperationKind::Count,
-                GenericCountRoute::Dense,
+                OperationPhysicalRoute::Candidate,
             ),
             strategy,
+            physical_route: OperationPhysicalRoute::Candidate,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -2019,23 +2356,39 @@ struct Requirements {
 }
 
 impl Requirements {
-    const fn generic_count_route(self) -> GenericCountRoute {
-        if self.terminal_frontier {
-            GenericCountRoute::TerminalFrontier
-        } else {
-            GenericCountRoute::Dense
-        }
-    }
-
-    fn count_prospective(
+    fn operation_prospective(
         self,
         program: &Program,
-        _input_bytes: usize,
+        input_bytes: usize,
         boundaries: usize,
         utf8_validation: usize,
+        kind: OperationKind,
     ) -> Result<OperationProspective, Error> {
         let match_events = mul(boundaries, 2, Resource::MatchEvents)?;
         let output_matches = boundaries;
+        let output_bytes = if kind == OperationKind::Spans {
+            mul(
+                output_matches,
+                core::mem::size_of::<Span>(),
+                Resource::OutputBytes,
+            )?
+        } else {
+            0
+        };
+        let span_sum = if kind == OperationKind::Sum {
+            input_bytes
+        } else {
+            0
+        };
+        let allocations = self
+            .allocations
+            .checked_add(usize::from(
+                kind == OperationKind::Spans && output_matches != 0,
+            ))
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::Allocations,
+            })?;
+        let peak_bytes = add(self.peak_bound, output_bytes, Resource::PeakBytes)?;
         let work = self.work_bound;
         // Every generic logical source service is paired with admitted work;
         // byte/scalar/assertion services inspect at most eight bytes per
@@ -2081,8 +2434,8 @@ impl Requirements {
             random_access_peak_bytes: self.random_access_bound,
             scratch_peak_bytes: self.scratch_bound,
             log_bytes: self.requested_log_bytes,
-            output_bytes: 0,
-            peak_bytes: self.peak_bound,
+            output_bytes,
+            peak_bytes,
             work,
         };
         Ok(OperationProspective {
@@ -2099,10 +2452,10 @@ impl Requirements {
             sequential_bytes: self.sequential_bound,
             match_events,
             output_matches,
-            output_bytes: 0,
-            span_sum: 0,
-            allocations: self.allocations,
-            peak_bytes: self.peak_bound,
+            output_bytes,
+            span_sum,
+            allocations,
+            peak_bytes,
             accounting,
         })
     }
@@ -5570,7 +5923,7 @@ fn operation_identity(
     plan: PlanId,
     strategy: Strategy,
     kind: OperationKind,
-    generic_count_route: GenericCountRoute,
+    physical_route: OperationPhysicalRoute,
 ) -> OperationId {
     let strategy_tag = match strategy {
         Strategy::FullTable => 1_u8,
@@ -5581,11 +5934,16 @@ fn operation_identity(
         OperationKind::Count => 2,
         OperationKind::Sum => 3,
     };
-    // Preserve the incumbent dense tag exactly while assigning the retained
-    // terminal-frontier proof its existing physical-route discriminator.
-    let route_tag = match generic_count_route {
-        GenericCountRoute::Dense => 0,
-        GenericCountRoute::TerminalFrontier => 43,
+    // Preserve the incumbent dense and terminal-frontier tags exactly while
+    // assigning every other selected physical executor its own discriminator.
+    let route_tag = match physical_route {
+        OperationPhysicalRoute::DenseRows => 0,
+        OperationPhysicalRoute::RequiredSuffixRows => 17,
+        OperationPhysicalRoute::TerminalFrontierRows => 43,
+        OperationPhysicalRoute::CachedFrontier => 61,
+        OperationPhysicalRoute::RequiredInternalAnchor => 79,
+        OperationPhysicalRoute::UrlAggregate => 97,
+        OperationPhysicalRoute::Candidate => 113,
     };
     let mut bytes = plan.bytes();
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -5612,10 +5970,11 @@ mod tests {
 
     use super::{
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot, GenericCountRoute,
-        MAX_CACHED_FRONTIERS, OperationKind, OperationProspective, Requirements, RowReader,
-        RowStorage, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol,
-        cached_compute_row, cached_frontier_words, cached_program_assertion_mask, decode,
-        encoded_width, exact_filled, operation_identity, read_encoded, write_encoded,
+        MAX_CACHED_FRONTIERS, OperationKind, OperationPhysicalRoute, OperationProspective,
+        Requirements, RowReader, RowStorage, UNCACHED_FRONTIER, allocation_fault,
+        cached_boundary_symbol, cached_compute_row, cached_frontier_words,
+        cached_program_assertion_mask, decode, encoded_width, exact_filled, operation_identity,
+        read_encoded, write_encoded,
     };
 
     fn endpoint_scalar_repeat() -> CompiledRegex {
@@ -5799,7 +6158,7 @@ mod tests {
                 compiled.plan_id(),
                 Strategy::ReverseSequentialRows,
                 OperationKind::Count,
-                GenericCountRoute::Dense,
+                OperationPhysicalRoute::DenseRows,
             ))
         );
         assert!(
@@ -5825,7 +6184,7 @@ mod tests {
                 compiled.plan_id(),
                 Strategy::ReverseSequentialRows,
                 OperationKind::Count,
-                GenericCountRoute::TerminalFrontier,
+                OperationPhysicalRoute::TerminalFrontierRows,
             ))
         );
         assert_eq!(
