@@ -8207,7 +8207,7 @@ fn fixed_absolute_residual_refusal_is_closed(
         && guard.actual.allocations == 0
         && guard.actual.fits(guard.prospective)
         && continuation.receipt.identity.operation == fre::AggregateOperationAttemptKind::Count
-        && continuation.receipt.identity.operation_id.is_some()
+        && continuation.receipt.identity.operation_id().is_some()
         && invocation.range.start == 0
         && invocation.range.end == invocation.haystack_len
         && invocation.haystack_len == guard.haystack_len
