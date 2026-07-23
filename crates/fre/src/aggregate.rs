@@ -4103,6 +4103,7 @@ impl AggregateBuilder {
                 work,
                 hir_nodes,
                 captures,
+                uniform_participating_capture_indices: _,
             }) => {
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
@@ -8013,20 +8014,24 @@ fn charge_fixed_class_inspection_work(
     Ok(())
 }
 
-enum PrefixClassInspection<'a> {
+pub(crate) enum PrefixClassInspection<'a> {
     Eligible {
         prefixes: [&'a [u8]; 2],
         classes: [&'a ClassBytes; 2],
         work: usize,
         hir_nodes: usize,
         captures: usize,
+        /// Exact user-capture index around each greedy repeated class. `None`
+        /// means the whole-match aggregate shape remains eligible but the
+        /// capture-aware direct route must retain its incumbent fallback.
+        uniform_participating_capture_indices: Option<[u32; 2]>,
     },
     Ineligible {
         work: usize,
     },
 }
 
-enum PrefixClassInspectionError {
+pub(crate) enum PrefixClassInspectionError {
     WorkLimit { needed: usize, limit: usize },
     Overflow,
 }
@@ -8034,18 +8039,24 @@ enum PrefixClassInspectionError {
 struct PrefixClassBranch<'a> {
     prefix: &'a [u8],
     class: &'a ClassBytes,
+    participating_capture_index: Option<u32>,
 }
 
-fn inspect_prefix_class_alternation(
+struct PrefixClassPeel<'a> {
+    hir: &'a Hir,
+    captures: usize,
+    single_capture_index: Option<u32>,
+}
+
+pub(crate) fn inspect_prefix_class_alternation(
     hir: &Hir,
     limit: usize,
 ) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
     let mut work = 0_usize;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
-    let (_, root_kind) =
-        peel_prefix_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
-    let HirKind::Alternation(branches) = root_kind else {
+    let root = peel_prefix_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Alternation(branches) = root.hir.kind() else {
         return Ok(PrefixClassInspection::Ineligible { work });
     };
     charge_prefix_class_work(&mut work, 2, limit)?;
@@ -8062,12 +8073,23 @@ fn inspect_prefix_class_alternation(
     else {
         return Ok(PrefixClassInspection::Ineligible { work });
     };
+    let uniform_participating_capture_indices = match (
+        root.captures,
+        first.participating_capture_index,
+        second.participating_capture_index,
+    ) {
+        (0, Some(first), Some(second)) if first != 0 && first != second && second != 0 => {
+            Some([first, second])
+        }
+        _ => None,
+    };
     Ok(PrefixClassInspection::Eligible {
         prefixes: [first.prefix, second.prefix],
         classes: [first.class, second.class],
         work,
         hir_nodes,
         captures,
+        uniform_participating_capture_indices,
     })
 }
 
@@ -8078,16 +8100,15 @@ fn inspect_prefix_class_branch<'a>(
     captures: &mut usize,
     limit: usize,
 ) -> Result<Option<PrefixClassBranch<'a>>, PrefixClassInspectionError> {
-    let (_, branch_kind) = peel_prefix_class_captures(hir, work, hir_nodes, captures, limit)?;
-    let HirKind::Concat(parts) = branch_kind else {
+    let branch = peel_prefix_class_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Concat(parts) = branch.hir.kind() else {
         return Ok(None);
     };
     let [prefix_hir, repeated_hir] = parts.as_slice() else {
         return Ok(None);
     };
-    let (_, prefix_kind) =
-        peel_prefix_class_captures(prefix_hir, work, hir_nodes, captures, limit)?;
-    let HirKind::Literal(literal) = prefix_kind else {
+    let prefix_peel = peel_prefix_class_captures(prefix_hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Literal(literal) = prefix_peel.hir.kind() else {
         return Ok(None);
     };
     let prefix = literal.0.as_ref();
@@ -8103,24 +8124,36 @@ fn inspect_prefix_class_branch<'a>(
         return Ok(None);
     }
 
-    let (_, repeated_kind) =
-        peel_prefix_class_captures(repeated_hir, work, hir_nodes, captures, limit)?;
-    let HirKind::Repetition(repetition) = repeated_kind else {
+    let repeated = peel_prefix_class_captures(repeated_hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Repetition(repetition) = repeated.hir.kind() else {
         return Ok(None);
     };
     if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
         return Ok(None);
     }
-    let (_, class_kind) =
+    let class_peel =
         peel_prefix_class_captures(repetition.sub.as_ref(), work, hir_nodes, captures, limit)?;
-    let HirKind::Class(Class::Bytes(class)) = class_kind else {
+    let HirKind::Class(Class::Bytes(class)) = class_peel.hir.kind() else {
         return Ok(None);
     };
     charge_prefix_class_work(work, class.ranges().len(), limit)?;
     if class.ranges().is_empty() {
         return Ok(None);
     }
-    Ok(Some(PrefixClassBranch { prefix, class }))
+    let participating_capture_index = if branch.captures == 0
+        && prefix_peel.captures == 0
+        && repeated.captures == 1
+        && class_peel.captures == 0
+    {
+        repeated.single_capture_index
+    } else {
+        None
+    };
+    Ok(Some(PrefixClassBranch {
+        prefix,
+        class,
+        participating_capture_index,
+    }))
 }
 
 fn peel_prefix_class_captures<'a>(
@@ -8129,7 +8162,9 @@ fn peel_prefix_class_captures<'a>(
     hir_nodes: &mut usize,
     captures: &mut usize,
     limit: usize,
-) -> Result<(&'a Hir, &'a HirKind), PrefixClassInspectionError> {
+) -> Result<PrefixClassPeel<'a>, PrefixClassInspectionError> {
+    let mut local_captures = 0_usize;
+    let mut single_capture_index = None;
     loop {
         charge_prefix_class_work(work, 1, limit)?;
         *hir_nodes = hir_nodes
@@ -8137,11 +8172,23 @@ fn peel_prefix_class_captures<'a>(
             .ok_or(PrefixClassInspectionError::Overflow)?;
         let kind = hir.kind();
         let HirKind::Capture(capture) = kind else {
-            return Ok((hir, kind));
+            return Ok(PrefixClassPeel {
+                hir,
+                captures: local_captures,
+                single_capture_index,
+            });
         };
         *captures = captures
             .checked_add(1)
             .ok_or(PrefixClassInspectionError::Overflow)?;
+        local_captures = local_captures
+            .checked_add(1)
+            .ok_or(PrefixClassInspectionError::Overflow)?;
+        single_capture_index = if local_captures == 1 {
+            Some(capture.index)
+        } else {
+            None
+        };
         hir = capture.sub.as_ref();
     }
 }
@@ -8165,7 +8212,7 @@ fn class_bytes_range_tuple(range: ClassBytesRange) -> (u8, u8) {
     (range.start(), range.end())
 }
 
-fn prefix_class_selection_work(summary: &ParseSummary) -> Option<usize> {
+pub(crate) fn prefix_class_selection_work(summary: &ParseSummary) -> Option<usize> {
     let hir_nodes = usize::try_from(summary.hir_nodes).ok()?;
     let literal_bytes = usize::try_from(summary.literal_bytes).ok()?;
     let class_ranges = usize::try_from(summary.class_ranges).ok()?;
