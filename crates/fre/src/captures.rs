@@ -1996,14 +1996,6 @@ impl CaptureRegex {
                 selector_receipt: None,
                 prefix_class_participation_prospective: Some(prospective),
             })?;
-        enforce_selector_control(selector_control, selector_limits).map_err(|source| {
-            CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::Selector(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            }
-        })?;
         let minimum_match_bytes =
             self.uniform_count_minimum_match_bytes
                 .ok_or_else(|| CaptureExecutionError {
@@ -2027,6 +2019,14 @@ impl CaptureRegex {
             source: CaptureExecutionSource::History(source),
             selector_receipt: None,
             prefix_class_participation_prospective: Some(prospective),
+        })?;
+        enforce_selector_control(selector_control.selector, selector_limits).map_err(|source| {
+            CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::Selector(source),
+                selector_receipt: None,
+                prefix_class_participation_prospective: Some(prospective),
+            }
         })?;
         if selector_control.selector.terminal_frontier
             || selector_control.matches != prospective.results

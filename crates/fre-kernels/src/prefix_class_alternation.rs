@@ -914,7 +914,8 @@ impl PrefixClassAlternationPlan {
         limits: UniformParticipationLimits,
     ) -> Result<UniformParticipationResult, UniformParticipationError> {
         let prospective = self.uniform_participation_prospective(haystack.len(), schema, limits)?;
-        let (matches, actual) = self.scan_uniform_participation(haystack, schema, prospective)?;
+        let (matches, actual) =
+            self.scan_uniform_participation(haystack, schema, prospective, |_| {})?;
         Ok(UniformParticipationResult {
             matches,
             capture_count: actual.capture_count,
@@ -936,6 +937,7 @@ impl PrefixClassAlternationPlan {
         haystack: &[u8],
         schema: UniformParticipationSchema,
         prospective: UniformParticipationProspective,
+        mut emit: impl FnMut(Range<usize>),
     ) -> Result<(usize, UniformParticipationActual), UniformParticipationError> {
         let mut streams = [
             self.alternatives[0].finder.find_iter(haystack),
@@ -1029,6 +1031,7 @@ impl PrefixClassAlternationPlan {
                     .ok_or(UniformParticipationError::ArithmeticOverflow {
                         computation: "direct match count",
                     })?;
+            emit(start..end);
             cursor = end;
         }
         let prefix_candidates = finder_candidates[0]
@@ -1581,6 +1584,22 @@ mod tests {
             b"fn is_azAZ09_fn as_0__ fn is_\x80",
         ] {
             let spans = reference_spans(pattern, haystack);
+            let prospective = plan
+                .uniform_participation_prospective(
+                    haystack.len(),
+                    rust_functions_schema(),
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap();
+            let mut direct_spans = Vec::new();
+            plan.scan_uniform_participation(
+                haystack,
+                rust_functions_schema(),
+                prospective,
+                |span| direct_spans.push(span),
+            )
+            .unwrap();
+            assert_eq!(spans, direct_spans, "haystack={haystack:?}");
             let result = plan
                 .count_uniform_participation(
                     haystack,
@@ -1597,6 +1616,35 @@ mod tests {
             ensure_uniform_actual(&result.accounting.actual, &result.accounting.prospective)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn uniform_participation_preserves_branch_zero_on_equal_start() {
+        let plan = PrefixClassAlternationPlan::build(
+            [b"ab", b"abc"],
+            [[(b'c', b'c')].into_iter(), [(b'd', b'd')].into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let schema = UniformParticipationSchema {
+            participating_with_overall: 2,
+            capture_schema_slots: 3,
+        };
+        let haystack = b"abcd abcdd abcc";
+        let expected = reference_spans(r"ab[c]+|abc[d]+", haystack);
+        let prospective = plan
+            .uniform_participation_prospective(
+                haystack.len(),
+                schema,
+                UniformParticipationLimits::unlimited(),
+            )
+            .unwrap();
+        let mut actual = Vec::new();
+        let (matches, _) = plan
+            .scan_uniform_participation(haystack, schema, prospective, |span| actual.push(span))
+            .unwrap();
+        assert_eq!(expected, actual);
+        assert_eq!(expected.len(), matches);
     }
 
     #[test]
