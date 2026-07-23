@@ -428,6 +428,7 @@ fn continuation_details(
         AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
+            ..
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
@@ -3211,10 +3212,15 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
     let error = full.count(b"aaaa", refused_limits).unwrap_err();
     let value_error = full.count_value(b"aaaa", refused_limits).unwrap_err();
     let Some(identity) = error.identity.as_cache_identity() else {
-        panic!("continuation incumbent must retain its boxed cache identity");
+        panic!("continuation attempt must retain its cache identity");
     };
     assert_eq!(identity, &full.cache_identity(refused_limits));
-    assert_eq!(value_error.identity, error.identity);
+    assert_eq!(
+        value_error.identity.as_cache_identity(),
+        error.identity.as_cache_identity()
+    );
+    assert!(error.has_closed_continuation_attempt());
+    assert!(value_error.has_closed_continuation_attempt());
     assert_eq!(value_error.source, error.source);
     assert_eq!(
         identity.continuation_strategy,

@@ -2,8 +2,9 @@ use core::{fmt, ops::Range};
 use std::sync::Arc;
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedCountAttempt, AdmittedSpanSum, AdmittedSpans, CompiledRegex,
-    OperationAttemptError, OperationProspective, RustByteProfile, SpanIter,
+    AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
+    OperationAttemptError, OperationAttemptReceipt, OperationProspective, RustByteProfile,
+    SpanIter,
 };
 use fre_kernels::{
     BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
@@ -1686,6 +1687,12 @@ impl AggregateFixedAbsoluteDomainAttemptIdentity {
 )]
 pub enum AggregateExecutionAttemptIdentity {
     Incumbent(Box<AggregateCacheIdentity>),
+    /// Continuation construction identity plus the one complete selected-route
+    /// execution receipt.
+    Continuation {
+        cache: Box<AggregateCacheIdentity>,
+        receipt: OperationAttemptReceipt,
+    },
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainAttemptIdentity),
 }
 
@@ -1703,10 +1710,15 @@ impl AggregateExecutionAttemptIdentity {
         ))
     }
 
+    fn continuation(cache: Box<AggregateCacheIdentity>, receipt: OperationAttemptReceipt) -> Self {
+        Self::Continuation { cache, receipt }
+    }
+
     #[must_use]
     pub fn as_cache_identity(&self) -> Option<&AggregateCacheIdentity> {
         match self {
             Self::Incumbent(identity) => Some(identity),
+            Self::Continuation { cache, .. } => Some(cache),
             Self::FixedAbsoluteDomain(_) => None,
         }
     }
@@ -1717,7 +1729,7 @@ impl AggregateExecutionAttemptIdentity {
         &self,
     ) -> Option<&AggregateFixedAbsoluteDomainAttemptIdentity> {
         match self {
-            Self::Incumbent(_) => None,
+            Self::Incumbent(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt),
         }
     }
@@ -1725,7 +1737,7 @@ impl AggregateExecutionAttemptIdentity {
     #[must_use]
     pub fn as_fixed_absolute_domain(&self) -> Option<&AggregateFixedAbsoluteDomainErrorIdentity> {
         match self {
-            Self::Incumbent(_) => None,
+            Self::Incumbent(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt.owner_identity()),
         }
     }
@@ -1736,8 +1748,17 @@ impl AggregateExecutionAttemptIdentity {
         &self,
     ) -> Option<&AggregateFixedAbsoluteDomainAttemptReceipt> {
         match self {
-            Self::Incumbent(_) => None,
+            Self::Incumbent(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt.receipt()),
+        }
+    }
+
+    /// Complete selected-route continuation receipt retained by this attempt.
+    #[must_use]
+    pub const fn continuation_receipt(&self) -> Option<&OperationAttemptReceipt> {
+        match self {
+            Self::Continuation { receipt, .. } => Some(receipt),
+            Self::Incumbent(_) | Self::FixedAbsoluteDomain(_) => None,
         }
     }
 
@@ -1755,6 +1776,13 @@ impl AggregateExecutionAttemptIdentity {
                 .is_some_and(|(continuation, composite)| {
                     composite.contains_actual_with(&continuation.receipt)
                 }),
+            (Self::Continuation { receipt, .. }, AggregateExecutionSource::Continuation(_)) => {
+                receipt.prospective.is_some_and(|upper| {
+                    upper.contains(receipt.actual)
+                        && receipt.actual_allocations <= upper.allocations
+                        && receipt.actual_allocations <= receipt.allocation_limit
+                })
+            }
             _ => false,
         }
     }
@@ -2547,6 +2575,13 @@ pub struct AggregateExecutionError {
 }
 
 impl AggregateExecutionError {
+    /// Complete selected-route continuation receipt retained on a
+    /// continuation terminal outcome.
+    #[must_use]
+    pub const fn continuation_receipt(&self) -> Option<&OperationAttemptReceipt> {
+        self.identity.continuation_receipt()
+    }
+
     /// The one complete receipt for a fixed-domain terminal attempt.
     #[must_use]
     pub const fn fixed_absolute_domain_receipt(
@@ -2559,7 +2594,19 @@ impl AggregateExecutionError {
     /// the terminal kind. The identity itself is the sole receipt authority.
     #[must_use]
     pub fn has_closed_fixed_attempt(&self) -> bool {
-        self.identity.closes_fixed_source_kind(&self.source)
+        matches!(
+            self.source,
+            AggregateExecutionSource::FixedAbsoluteDomain
+                | AggregateExecutionSource::FixedAbsoluteDomainResidual
+        ) && self.identity.closes_fixed_source_kind(&self.source)
+    }
+
+    /// Check that a continuation source error retains a published route whose
+    /// cumulative actual counters fit its prospective.
+    #[must_use]
+    pub fn has_closed_continuation_attempt(&self) -> bool {
+        matches!(self.source, AggregateExecutionSource::Continuation(_))
+            && self.identity.closes_fixed_source_kind(&self.source)
     }
 }
 
@@ -2570,6 +2617,11 @@ impl fmt::Display for AggregateExecutionError {
                 f,
                 "aggregate {:?}/{:?}/{:?} execution failed: {}",
                 identity.operation, identity.plan, identity.plan_identity, self.source
+            ),
+            AggregateExecutionAttemptIdentity::Continuation { cache, .. } => write!(
+                f,
+                "aggregate {:?}/{:?}/{:?} execution failed: {}",
+                cache.operation, cache.plan, cache.plan_identity, self.source
             ),
             AggregateExecutionAttemptIdentity::FixedAbsoluteDomain(attempt) => {
                 let identity = attempt.owner_identity();
@@ -2589,7 +2641,8 @@ impl fmt::Display for AggregateExecutionError {
 impl std::error::Error for AggregateExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.identity {
-            AggregateExecutionAttemptIdentity::Incumbent(_) => Some(&self.source),
+            AggregateExecutionAttemptIdentity::Incumbent(_)
+            | AggregateExecutionAttemptIdentity::Continuation { .. } => Some(&self.source),
             AggregateExecutionAttemptIdentity::FixedAbsoluteDomain(attempt) => {
                 Some(attempt.receipt().terminal_error())
             }
@@ -2634,6 +2687,7 @@ pub enum AggregateExecutionDetails {
     Continuation {
         certificate: AggregateOperationCertificate,
         accounting: AggregateExecutionAccounting,
+        receipt: OperationAttemptReceipt,
     },
 }
 
@@ -5721,6 +5775,34 @@ impl AggregatePlan {
         }
     }
 
+    fn continuation_execution_error(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        attempt: OperationAttemptError,
+    ) -> AggregateExecutionError {
+        let OperationAttemptError { source, receipt } = attempt;
+        self.continuation_error_from_receipt(
+            execution_limits,
+            receipt,
+            AggregateExecutionSource::Continuation(source),
+        )
+    }
+
+    fn continuation_error_from_receipt(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        receipt: OperationAttemptReceipt,
+        source: AggregateExecutionSource,
+    ) -> AggregateExecutionError {
+        AggregateExecutionError {
+            identity: AggregateExecutionAttemptIdentity::continuation(
+                Box::new(self.cache_identity(execution_limits)),
+                receipt,
+            ),
+            source,
+        }
+    }
+
     fn fixed_execution_error(
         &self,
         execution_limits: &AggregateRunLimits,
@@ -6037,23 +6119,25 @@ impl AggregatePlan {
                     )
                 })?;
                 let admitted = engine
-                    .admit_count(
+                    .admit_count_attempt(
                         haystack,
                         Self::full_range(haystack),
                         strategy,
                         limits.continuation,
                     )
-                    .map_err(|source| {
-                        self.execution_error(limits, AggregateExecutionSource::Continuation(source))
-                    })?;
-                let value = u64::try_from(admitted.value()).map_err(|_| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation count does not fit u64",
-                        ),
-                    )
-                })?;
+                    .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+                let value = match u64::try_from(admitted.admitted.value()) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Err(self.continuation_error_from_receipt(
+                            limits,
+                            admitted.receipt,
+                            AggregateExecutionSource::InternalInvariant(
+                                "continuation count does not fit u64",
+                            ),
+                        ));
+                    }
+                };
                 Ok(AggregateCountExecution::Continuation { admitted, value })
             }
         }
@@ -6196,23 +6280,25 @@ impl AggregatePlan {
             )
         })?;
         let admitted = engine
-            .admit_span_sum(
+            .admit_span_sum_with_receipt(
                 haystack,
                 Self::full_range(haystack),
                 strategy,
                 limits.continuation,
             )
-            .map_err(|source| {
-                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
-            })?;
-        let value = u64::try_from(admitted.value()).map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span sum does not fit u64",
-                ),
-            )
-        })?;
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        let value = match u64::try_from(admitted.admitted.value()) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(self.continuation_error_from_receipt(
+                    limits,
+                    admitted.receipt,
+                    AggregateExecutionSource::InternalInvariant(
+                        "continuation span sum does not fit u64",
+                    ),
+                ));
+            }
+        };
         Ok(AggregateSpanSumExecution::Continuation { admitted, value })
     }
 
@@ -6364,22 +6450,22 @@ impl AggregatePlan {
                 ),
             )
         })?;
-        let value = engine
-            .count_value(
+        let attempt = engine
+            .count_value_attempt(
                 haystack,
                 Self::full_range(haystack),
                 strategy,
                 limits.continuation,
             )
-            .map_err(|source| {
-                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
-            })?;
-        u64::try_from(value).map_err(|_| {
-            self.execution_error(
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        match u64::try_from(attempt.value) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(self.continuation_error_from_receipt(
                 limits,
+                attempt.receipt,
                 AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
-            )
-        })
+            )),
+        }
     }
 
     fn execute_span_sum_value(
@@ -6400,24 +6486,24 @@ impl AggregatePlan {
                 ),
             )
         })?;
-        let value = engine
-            .span_sum_value(
+        let attempt = engine
+            .span_sum_value_with_receipt(
                 haystack,
                 Self::full_range(haystack),
                 strategy,
                 limits.continuation,
             )
-            .map_err(|source| {
-                self.execution_error(limits, AggregateExecutionSource::Continuation(source))
-            })?;
-        u64::try_from(value).map_err(|_| {
-            self.execution_error(
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        match u64::try_from(attempt.value) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(self.continuation_error_from_receipt(
                 limits,
+                attempt.receipt,
                 AggregateExecutionSource::InternalInvariant(
                     "continuation span sum does not fit u64",
                 ),
-            )
-        })
+            )),
+        }
     }
 }
 
@@ -6454,7 +6540,7 @@ enum AggregateCountExecution {
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
     Continuation {
-        admitted: AdmittedCount,
+        admitted: AdmittedCountAttempt,
         value: u64,
     },
 }
@@ -6540,10 +6626,15 @@ impl AggregateCountExecution {
                 upper_bounds,
                 actual,
             },
-            Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
-                certificate: admitted.certificate().clone(),
-                accounting: admitted.accounting(),
-            },
+            Self::Continuation { admitted, .. } => {
+                let certificate = admitted.admitted.certificate().clone();
+                let accounting = admitted.admitted.accounting();
+                AggregateExecutionDetails::Continuation {
+                    certificate,
+                    accounting,
+                    receipt: admitted.receipt,
+                }
+            }
         }
     }
 }
@@ -6568,7 +6659,7 @@ enum AggregateSpanSumExecution {
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
     Continuation {
-        admitted: AdmittedSpanSum,
+        admitted: AdmittedSpanSumAttempt,
         value: u64,
     },
 }
@@ -6618,10 +6709,15 @@ impl AggregateSpanSumExecution {
                 upper_bounds,
                 actual,
             },
-            Self::Continuation { admitted, .. } => AggregateExecutionDetails::Continuation {
-                certificate: admitted.certificate().clone(),
-                accounting: admitted.accounting(),
-            },
+            Self::Continuation { admitted, .. } => {
+                let certificate = admitted.admitted.certificate().clone();
+                let accounting = admitted.admitted.accounting();
+                AggregateExecutionDetails::Continuation {
+                    certificate,
+                    accounting,
+                    receipt: admitted.receipt,
+                }
+            }
         }
     }
 }
@@ -8474,20 +8570,21 @@ impl AggregateSpansRegex {
                 ),
             )
         })?;
-        let admitted = engine
-            .admit_spans(
+        let attempt = engine
+            .admit_spans_with_receipt(
                 haystack,
                 AggregatePlan::full_range(haystack),
                 strategy,
                 limits.continuation,
             )
-            .map_err(|source| {
-                self.0
-                    .execution_error(limits, AggregateExecutionSource::Continuation(source))
-            })?;
+            .map_err(|attempt| self.0.continuation_execution_error(limits, attempt))?;
+        let certificate = attempt.admitted.certificate().clone();
+        let accounting = attempt.admitted.accounting();
+        let admitted = attempt.admitted;
         let details = AggregateExecutionDetails::Continuation {
-            certificate: admitted.certificate().clone(),
-            accounting: admitted.accounting(),
+            certificate,
+            accounting,
+            receipt: attempt.receipt,
         };
         let report = self.0.execution_report(limits, details);
         Ok(AggregateSpans {

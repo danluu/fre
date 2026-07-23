@@ -5,7 +5,7 @@ use fre_exact_alloc::{CopyError, ExactVec, zeroed_exact};
 use fre_kernels::{
     RequiredInternalAnchorCountError, RequiredInternalAnchorCountLimits,
     RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan, UrlAggregatePlan,
-    UrlAggregateReduceError, UrlAggregateReduceLimits,
+    UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
 };
 
 use crate::accounting::ExecutionAccounting;
@@ -191,6 +191,8 @@ pub struct OperationAttemptIdentity {
     pub strategy: Strategy,
     pub operation: OperationAttemptKind,
     pub work_mode: OperationWorkMode,
+    /// Exact caller limits authenticated by this attempt.
+    pub limits: OperationLimits,
     /// Selected physical route. This is absent only before route publication.
     pub physical_route: Option<OperationPhysicalRoute>,
     pub algorithm_version: u32,
@@ -1220,6 +1222,7 @@ impl CompiledRegex {
                 } else {
                     OperationWorkMode::ConservativeAdmission
                 },
+                limits,
                 physical_route: None,
                 algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
                 accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
@@ -1366,14 +1369,37 @@ impl CompiledRegex {
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.url_aggregate
         {
-            return self.execute_url_aggregate(plan, local, range, strategy, kind, limits);
+            return self.execute_url_aggregate(
+                plan,
+                local,
+                range,
+                strategy,
+                kind,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
         }
         if forced_generic_count_route.is_none()
             && kind == OperationKind::Count
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.required_internal_anchor
         {
-            return self.execute_required_internal_anchor(plan, local, range, strategy, limits);
+            return self.execute_required_internal_anchor(
+                plan,
+                local,
+                range,
+                strategy,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
         }
         if forced_generic_count_route.is_none()
             && OBSERVED_WORK
@@ -1382,7 +1408,18 @@ impl CompiledRegex {
             && let Some(plan) = &self.candidate
             && candidate::executable_for(&self.program)
         {
-            return self.execute_candidate(plan, haystack, range, strategy, limits);
+            return self.execute_candidate(
+                plan,
+                haystack,
+                range,
+                strategy,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
         }
         let receipt_bearing = attempt.is_some();
         let force_intrinsic_dense = prospective_observer.is_some()
@@ -1654,13 +1691,20 @@ impl CompiledRegex {
             } else {
                 OperationPrepublicationFallback::None
             };
-            let prospective = requirements.operation_prospective(
+            let mut prospective = requirements.operation_prospective(
                 &self.program,
                 local.len(),
                 boundaries,
                 utf8_validation,
                 kind,
             )?;
+            if OBSERVED_WORK && prospective.work_bound > limits.max_work {
+                // Observed-work admission authorizes the exact metered work
+                // up to the caller ceiling. All other structural/component
+                // bounds remain input-only and conservative.
+                prospective.work_bound = limits.max_work;
+                prospective.accounting.work = limits.max_work;
+            }
             *publication.prospective = Some(prospective);
             if let Some(observer) = prospective_observer.as_mut() {
                 observer(prospective)?;
@@ -1832,9 +1876,40 @@ impl CompiledRegex {
         strategy: Strategy,
         kind: OperationKind,
         limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let boundaries = add(local.len(), 1, Resource::Boundaries)?;
-        enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+        let upper = UrlAggregatePlan::reduce_upper_bounds(local.len())
+            .map_err(|error| map_url_reduce_error(&error))?;
+        let boundaries = upper.boundaries;
+        if let Some(publication) = attempt.as_mut() {
+            let prospective =
+                url_aggregate_prospective(&self.program, upper, kind, limits.max_work);
+            let physical_route = OperationPhysicalRoute::UrlAggregate;
+            publication.identity.operation_id = Some(operation_identity(
+                self.plan_id(),
+                strategy,
+                kind,
+                physical_route,
+            ));
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+            enforce(
+                prospective.allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
+            prospective.enforce_limits(limits)?;
+        } else {
+            enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+        }
         let result = plan
             .span_sum(
                 local,
@@ -1881,6 +1956,8 @@ impl CompiledRegex {
             url_candidate_visits: actual.candidate_visits,
             ..ExecutionAccounting::default()
         };
+        *attempt_accounting = accounting;
+        *actual_allocations = usize::from(upper.candidate_records != 0);
         let span_sum = if kind == OperationKind::Sum {
             result.value
         } else {
@@ -1936,8 +2013,42 @@ impl CompiledRegex {
         range: Range<usize>,
         strategy: Strategy,
         limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let (boundaries, upper) = preflight_required_internal_anchor(plan, local.len(), limits)?;
+        let prospective_limits = if attempt.is_some() {
+            intrinsic_attempt_limits()
+        } else {
+            limits
+        };
+        let (boundaries, upper) =
+            preflight_required_internal_anchor(plan, local.len(), prospective_limits)?;
+        if let Some(publication) = attempt.as_mut() {
+            let prospective =
+                required_internal_anchor_prospective(&self.program, boundaries, upper)?;
+            let physical_route = OperationPhysicalRoute::RequiredInternalAnchor;
+            publication.identity.operation_id = Some(operation_identity(
+                self.plan_id(),
+                strategy,
+                OperationKind::Count,
+                physical_route,
+            ));
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+            enforce(
+                prospective.allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
+            prospective.enforce_limits(limits)?;
+        }
         let result = plan
             .count(local, exact_required_anchor_limits(upper, limits))
             .map_err(|error| map_required_anchor_error(&error))?;
@@ -1964,6 +2075,8 @@ impl CompiledRegex {
             required_anchor_frontier_peak: actual.frontier_entries,
             ..ExecutionAccounting::default()
         };
+        *attempt_accounting = accounting;
+        *actual_allocations = actual.allocations;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
             operation_id: operation_identity(
@@ -2014,8 +2127,12 @@ impl CompiledRegex {
         range: Range<usize>,
         strategy: Strategy,
         limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let result = candidate::count(plan, &self.program, haystack, range.clone(), limits)?;
         let boundaries = add(
             range
                 .end
@@ -2024,6 +2141,39 @@ impl CompiledRegex {
             1,
             Resource::Boundaries,
         )?;
+        if let Some(publication) = attempt.as_mut() {
+            let input_bytes =
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .ok_or(Error::InternalInvariant(
+                        "candidate range reversed before publication",
+                    ))?;
+            let prospective =
+                candidate_prospective(plan, &self.program, input_bytes, boundaries, limits)?;
+            let physical_route = OperationPhysicalRoute::Candidate;
+            publication.identity.operation_id = Some(operation_identity(
+                self.plan_id(),
+                strategy,
+                OperationKind::Count,
+                physical_route,
+            ));
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+            enforce(
+                prospective.allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
+            prospective.enforce_limits(limits)?;
+        }
+        let result = candidate::count(plan, &self.program, haystack, range.clone(), limits)?;
+        *attempt_accounting = result.accounting;
+        *actual_allocations = CANDIDATE_EXECUTION_ALLOCATIONS;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
             operation_id: operation_identity(
@@ -2066,6 +2216,87 @@ impl CompiledRegex {
             spans: Vec::new(),
         })
     }
+}
+
+const CANDIDATE_EXECUTION_ALLOCATIONS: usize = 5;
+
+fn candidate_prospective(
+    plan: &candidate::Plan,
+    program: &Program,
+    input_bytes: usize,
+    boundaries: usize,
+    limits: OperationLimits,
+) -> Result<OperationProspective, Error> {
+    let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
+    let states = program.insts.len();
+    let stack = add(
+        mul(states, 2, Resource::ScratchBytes)?,
+        1,
+        Resource::ScratchBytes,
+    )?;
+    let scratch_bytes = add(
+        mul(
+            schedule,
+            core::mem::size_of::<u128>(),
+            Resource::ScratchBytes,
+        )?,
+        add(
+            mul(
+                add(
+                    stack,
+                    mul(states, 2, Resource::ScratchBytes)?,
+                    Resource::ScratchBytes,
+                )?,
+                core::mem::size_of::<u16>(),
+                Resource::ScratchBytes,
+            )?,
+            mul(states, core::mem::size_of::<u32>(), Resource::ScratchBytes)?,
+            Resource::ScratchBytes,
+        )?,
+        Resource::ScratchBytes,
+    )?;
+    let sequential_bytes = mul(input_bytes, 2, Resource::SequentialBytes)?;
+    // Candidate verification meters every state, transition, assertion, root
+    // probe and source service against this attempt's immutable work ceiling.
+    // The ceiling is part of the attempt identity, so it is a valid
+    // pre-source bound even though candidate density is source-dependent.
+    let work_bound = limits.max_work;
+    let random_access_bytes_read = work_bound.saturating_mul(8);
+    let accounting = ExecutionAccounting {
+        state_evaluations: work_bound,
+        transition_checks: work_bound,
+        assertion_checks: work_bound,
+        root_probes: limits.max_match_events,
+        successful_paths: limits.max_output_matches,
+        emitted_matches: limits.max_output_matches,
+        sequential_bytes_read: sequential_bytes,
+        random_access_bytes_read,
+        random_access_peak_bytes: scratch_bytes,
+        scratch_peak_bytes: scratch_bytes,
+        peak_bytes: scratch_bytes,
+        work: work_bound,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states,
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound,
+        random_access_bytes: scratch_bytes,
+        scratch_bytes,
+        log_bytes: 0,
+        sequential_bytes,
+        match_events: limits.max_match_events,
+        output_matches: limits.max_output_matches,
+        output_bytes: 0,
+        span_sum: 0,
+        allocations: CANDIDATE_EXECUTION_ALLOCATIONS,
+        peak_bytes: scratch_bytes,
+        accounting,
+    })
 }
 
 #[allow(
@@ -2174,6 +2405,60 @@ fn map_url_reduce_error(error: &UrlAggregateReduceError) -> Error {
     }
 }
 
+fn url_aggregate_prospective(
+    program: &Program,
+    upper: UrlAggregateReduceUpperBounds,
+    kind: OperationKind,
+    work_bound: usize,
+) -> OperationProspective {
+    let accounting = ExecutionAccounting {
+        successful_paths: upper.output_matches,
+        emitted_matches: upper.output_matches,
+        sequential_bytes_read: upper.sequential_bytes,
+        // Every URL random read is charged to the same bounded work meter.
+        random_access_bytes_read: work_bound,
+        random_access_peak_bytes: upper.random_access_storage_bytes,
+        scratch_peak_bytes: upper.scratch_bytes,
+        peak_bytes: upper.peak_bytes,
+        work: work_bound,
+        url_segments: upper.boundaries,
+        url_dot_probes: work_bound,
+        url_tld_transitions: work_bound,
+        url_tld_candidates: work_bound,
+        url_scheme_probes: work_bound,
+        url_ipv4_candidates: work_bound,
+        url_prefix_steps: work_bound,
+        url_suffix_steps: work_bound,
+        url_candidate_insertions: work_bound,
+        url_candidate_visits: work_bound,
+        ..ExecutionAccounting::default()
+    };
+    OperationProspective {
+        states: program.insts.len(),
+        boundaries: upper.boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: upper.candidate_record_bytes,
+        terminal_frontier: false,
+        work_bound,
+        random_access_bytes: upper.random_access_storage_bytes,
+        scratch_bytes: upper.scratch_bytes,
+        log_bytes: 0,
+        sequential_bytes: upper.sequential_bytes,
+        match_events: upper.match_events,
+        output_matches: upper.output_matches,
+        output_bytes: 0,
+        span_sum: if kind == OperationKind::Sum {
+            upper.span_sum
+        } else {
+            0
+        },
+        allocations: usize::from(upper.candidate_records != 0),
+        peak_bytes: upper.peak_bytes,
+        accounting,
+    }
+}
+
 #[allow(
     clippy::match_same_arms,
     reason = "named random-read overflow is proved work-dominated; unknown future counters also fail closed as execution work"
@@ -2230,6 +2515,56 @@ fn preflight_required_internal_anchor(
     )?;
     enforce(upper.peak_bytes, limits.max_peak_bytes, Resource::PeakBytes)?;
     Ok((boundaries, upper))
+}
+
+fn required_internal_anchor_prospective(
+    program: &Program,
+    boundaries: usize,
+    upper: RequiredInternalAnchorCountUpperBounds,
+) -> Result<OperationProspective, Error> {
+    let output_matches = usize::try_from(upper.count).map_err(|_| Error::ArithmeticOverflow {
+        resource: Resource::OutputMatches,
+    })?;
+    let accounting = ExecutionAccounting {
+        transition_checks: upper.continuation_steps,
+        root_probes: upper.candidate_visits,
+        required_anchor_candidates: upper.candidate_visits,
+        required_anchor_scan_windows: upper.anchor_window_attempts,
+        required_anchor_anchor_comparisons: upper.finder_source_accesses,
+        required_anchor_prefix_steps: upper.prefix_steps,
+        required_anchor_continuation_steps: upper.continuation_steps,
+        required_anchor_source_accesses: upper.source_accesses,
+        required_anchor_queue_peak: upper.queue_entries,
+        required_anchor_frontier_peak: upper.frontier_entries,
+        successful_paths: output_matches,
+        emitted_matches: output_matches,
+        sequential_bytes_read: upper.sequential_bytes,
+        random_access_bytes_read: upper.random_access_bytes,
+        scratch_peak_bytes: upper.scratch_bytes,
+        peak_bytes: upper.peak_bytes,
+        work: upper.work,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states: program.insts.len(),
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound: upper.work,
+        random_access_bytes: upper.random_access_bytes,
+        scratch_bytes: upper.scratch_bytes,
+        log_bytes: 0,
+        sequential_bytes: upper.sequential_bytes,
+        match_events: upper.candidate_visits,
+        output_matches,
+        output_bytes: 0,
+        span_sum: 0,
+        allocations: upper.allocations,
+        peak_bytes: upper.peak_bytes,
+        accounting,
+    })
 }
 
 fn exact_required_anchor_limits(
@@ -2364,7 +2699,12 @@ impl Requirements {
         utf8_validation: usize,
         kind: OperationKind,
     ) -> Result<OperationProspective, Error> {
-        let match_events = mul(boundaries, 2, Resource::MatchEvents)?;
+        let event_passes = if kind == OperationKind::Spans { 2 } else { 1 };
+        let match_events = mul(
+            mul(boundaries, 2, Resource::MatchEvents)?,
+            event_passes,
+            Resource::MatchEvents,
+        )?;
         let output_matches = boundaries;
         let output_bytes = if kind == OperationKind::Spans {
             mul(
@@ -5969,10 +6309,11 @@ mod tests {
     };
 
     use super::{
-        CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot, GenericCountRoute,
-        MAX_CACHED_FRONTIERS, OperationKind, OperationPhysicalRoute, OperationProspective,
-        Requirements, RowReader, RowStorage, UNCACHED_FRONTIER, allocation_fault,
-        cached_boundary_symbol, cached_compute_row, cached_frontier_words,
+        CONTINUATION_OPERATION_ACCOUNTING_VERSION, CONTINUATION_OPERATION_ALGORITHM_VERSION,
+        CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
+        MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationPhysicalRoute,
+        OperationProspective, Requirements, RowReader, RowStorage, UNCACHED_FRONTIER,
+        allocation_fault, cached_boundary_symbol, cached_compute_row, cached_frontier_words,
         cached_program_assertion_mask, decode, encoded_width, exact_filled, operation_identity,
         read_encoded, write_encoded,
     };
@@ -6001,6 +6342,23 @@ mod tests {
         )
         .unwrap();
         assert!(!compiled.terminal_frontier.is_empty());
+        compiled
+    }
+
+    fn candidate_count() -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"a|ab|x{1,3}z|q.r|[0-9]+-x")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(compiled.candidate.is_some());
         compiled
     }
 
@@ -6300,7 +6658,9 @@ mod tests {
             .unwrap();
         assert_eq!(observed, Some(prospective));
         assert_eq!(exact_success.receipt.prospective, Some(prospective));
-        assert_eq!(exact_success.receipt.identity, identity);
+        let mut exact_identity = identity;
+        exact_identity.limits = exact;
+        assert_eq!(exact_success.receipt.identity, exact_identity);
         assert_eq!(exact_success.admitted.value(), baseline.admitted.value());
         assert!(prospective.contains(exact_success.receipt.actual));
         assert_eq!(
@@ -6330,7 +6690,9 @@ mod tests {
                             limit: prospective.$field - 1,
                         }
                     );
-                    assert_eq!(failure.receipt.identity, identity);
+                    let mut one_below_identity = identity;
+                    one_below_identity.limits = one_below;
+                    assert_eq!(failure.receipt.identity, one_below_identity);
                     assert_eq!(failure.receipt.prospective, Some(prospective));
                     assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
                     assert_eq!(failure.receipt.actual_allocations, 0);
@@ -6384,6 +6746,7 @@ mod tests {
                 limit: prospective.allocations - 1,
             }
         );
+        assert_eq!(failure.receipt.identity, exact_identity);
         assert_eq!(failure.receipt.prospective, Some(prospective));
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
         assert_eq!(failure.receipt.actual_allocations, 0);
@@ -6494,7 +6857,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exact_success.receipt.prospective, Some(prospective));
-        assert_eq!(exact_success.receipt.identity, identity);
+        let mut exact_identity = identity;
+        exact_identity.limits = exact;
+        assert_eq!(exact_success.receipt.identity, exact_identity);
 
         macro_rules! assert_one_below {
             ($limit:ident, $field:ident, $resource:expr) => {
@@ -6518,7 +6883,9 @@ mod tests {
                             limit: prospective.$field - 1,
                         }
                     );
-                    assert_eq!(failure.receipt.identity, identity);
+                    let mut one_below_identity = identity;
+                    one_below_identity.limits = one_below;
+                    assert_eq!(failure.receipt.identity, one_below_identity);
                     assert_eq!(failure.receipt.prospective, Some(prospective));
                     assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
                     assert_eq!(allocation_fault::calls(), 0);
@@ -6585,6 +6952,207 @@ mod tests {
                 .prospective
                 .is_some_and(|upper| upper.contains(value.receipt.actual))
         );
+    }
+
+    #[test]
+    fn ordinary_operations_publish_stable_distinct_closed_receipts_and_never_late_fallback() {
+        let compiled = endpoint_scalar_repeat();
+        let haystack = [b'a'; 249];
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let limits = OperationLimits::default();
+
+        let spans_first = compiled
+            .admit_spans_with_receipt(&haystack, range.clone(), strategy, limits)
+            .unwrap();
+        let spans_steady = compiled
+            .admit_spans_with_receipt(&haystack, range.clone(), strategy, limits)
+            .unwrap();
+        assert_eq!(
+            spans_first.admitted.as_slice(),
+            spans_steady.admitted.as_slice()
+        );
+        assert_eq!(spans_first.receipt.identity, spans_steady.receipt.identity);
+        assert_eq!(
+            spans_first.receipt.prospective,
+            spans_steady.receipt.prospective
+        );
+        assert_eq!(
+            spans_first.receipt.identity.operation,
+            OperationAttemptKind::Spans
+        );
+        let spans_upper = spans_first.receipt.prospective.unwrap();
+        assert!(spans_upper.output_bytes > 0);
+        assert_eq!(spans_upper.span_sum, 0);
+        assert!(spans_upper.contains(spans_first.receipt.actual));
+        assert_eq!(
+            spans_first.receipt.actual,
+            spans_first.admitted.accounting()
+        );
+        assert_eq!(
+            spans_first.receipt.identity.operation_id,
+            Some(spans_first.admitted.certificate().operation_id)
+        );
+        assert_eq!(
+            spans_first.receipt.identity.physical_route,
+            Some(spans_first.admitted.certificate().physical_route)
+        );
+        assert_eq!(
+            spans_first.receipt.identity.algorithm_version,
+            CONTINUATION_OPERATION_ALGORITHM_VERSION
+        );
+        assert_eq!(
+            spans_first.receipt.identity.accounting_version,
+            CONTINUATION_OPERATION_ACCOUNTING_VERSION
+        );
+
+        let count = compiled
+            .admit_count_attempt(&haystack, range.clone(), strategy, limits)
+            .unwrap();
+        let sum_first = compiled
+            .admit_span_sum_with_receipt(&haystack, range.clone(), strategy, limits)
+            .unwrap();
+        let sum_steady = compiled
+            .admit_span_sum_with_receipt(&haystack, range.clone(), strategy, limits)
+            .unwrap();
+        assert_eq!(sum_first.admitted.value(), 249);
+        assert_eq!(sum_first.admitted.value(), sum_steady.admitted.value());
+        assert_eq!(sum_first.receipt.identity, sum_steady.receipt.identity);
+        assert_eq!(
+            sum_first.receipt.prospective,
+            sum_steady.receipt.prospective
+        );
+        assert_eq!(
+            sum_first.receipt.identity.operation,
+            OperationAttemptKind::SpanSum
+        );
+        assert_eq!(
+            count.receipt.identity.operation,
+            OperationAttemptKind::Count
+        );
+        assert_ne!(
+            spans_first.receipt.identity.operation_id,
+            count.receipt.identity.operation_id
+        );
+        assert_ne!(
+            count.receipt.identity.operation_id,
+            sum_first.receipt.identity.operation_id
+        );
+        let sum_upper = sum_first.receipt.prospective.unwrap();
+        assert_eq!(sum_upper.output_bytes, 0);
+        assert_eq!(sum_upper.span_sum, haystack.len());
+        assert!(sum_upper.contains(sum_first.receipt.actual));
+        assert_eq!(sum_first.receipt.actual, sum_first.admitted.accounting());
+
+        let mut spans_below = limits;
+        spans_below.max_output_bytes = spans_upper.output_bytes - 1;
+        let spans_refusal = compiled
+            .admit_spans_with_receipt(&haystack, range.clone(), strategy, spans_below)
+            .unwrap_err();
+        assert_eq!(
+            spans_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::OutputBytes,
+                required: spans_upper.output_bytes,
+                limit: spans_upper.output_bytes - 1,
+            }
+        );
+        assert_eq!(spans_refusal.receipt.prospective, Some(spans_upper));
+        assert_eq!(
+            spans_refusal.receipt.identity.physical_route,
+            spans_first.receipt.identity.physical_route
+        );
+        assert_eq!(
+            spans_refusal.receipt.identity.prepublication_fallback,
+            spans_first.receipt.identity.prepublication_fallback
+        );
+        assert_eq!(spans_refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(spans_refusal.receipt.actual_allocations, 0);
+
+        let mut sum_below = limits;
+        sum_below.max_span_sum = sum_upper.span_sum - 1;
+        let sum_refusal = compiled
+            .admit_span_sum_with_receipt(&haystack, range.clone(), strategy, sum_below)
+            .unwrap_err();
+        assert_eq!(
+            sum_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::SpanSum,
+                required: sum_upper.span_sum,
+                limit: sum_upper.span_sum - 1,
+            }
+        );
+        assert_eq!(sum_refusal.receipt.prospective, Some(sum_upper));
+        assert_eq!(sum_refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(sum_refusal.receipt.actual_allocations, 0);
+
+        let fault = allocation_fault::arm(0);
+        let terminal = compiled
+            .admit_spans_with_receipt(&haystack, range, strategy, limits)
+            .unwrap_err();
+        assert!(matches!(terminal.source, Error::AllocationFailed { .. }));
+        assert_eq!(terminal.receipt.identity, spans_first.receipt.identity);
+        assert_eq!(terminal.receipt.prospective, Some(spans_upper));
+        assert_eq!(terminal.receipt.actual_allocations, 0);
+        assert!(spans_upper.contains(terminal.receipt.actual));
+        assert_eq!(allocation_fault::calls(), 1);
+        drop(fault);
+    }
+
+    #[test]
+    fn observed_candidate_route_publishes_once_and_closes_success_and_refusal() {
+        let compiled = candidate_count();
+        let haystack = b"ab xxz q0r 123-x a";
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let limits = OperationLimits::default();
+        let first = compiled
+            .count_value_attempt(haystack, range.clone(), strategy, limits)
+            .unwrap();
+        let steady = compiled
+            .count_value_attempt(haystack, range.clone(), strategy, limits)
+            .unwrap();
+        assert_eq!(first.value, steady.value);
+        assert_eq!(first.receipt.identity, steady.receipt.identity);
+        assert_eq!(first.receipt.prospective, steady.receipt.prospective);
+        assert_eq!(
+            first.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::Candidate)
+        );
+        assert_eq!(
+            first.receipt.identity.operation,
+            OperationAttemptKind::Count
+        );
+        let prospective = first.receipt.prospective.unwrap();
+        assert_eq!(prospective.allocations, 5);
+        assert_eq!(first.receipt.actual_allocations, prospective.allocations);
+        assert!(prospective.contains(first.receipt.actual));
+
+        let mut one_below = limits;
+        one_below.max_scratch_bytes = prospective.scratch_bytes - 1;
+        let refusal = compiled
+            .count_value_attempt(haystack, range, strategy, one_below)
+            .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::ScratchBytes,
+                required: prospective.scratch_bytes,
+                limit: prospective.scratch_bytes - 1,
+            }
+        );
+        assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert_eq!(
+            refusal.receipt.identity.physical_route,
+            first.receipt.identity.physical_route
+        );
+        assert_eq!(
+            refusal.receipt.identity.prepublication_fallback,
+            first.receipt.identity.prepublication_fallback
+        );
+        assert_eq!(refusal.receipt.identity.limits, one_below);
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
     }
 
     #[test]

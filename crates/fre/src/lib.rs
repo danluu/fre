@@ -112,6 +112,8 @@ pub use captures::{
     PortableTextCaptureSearchError, PortableTextCaptures,
 };
 pub use fre_aggregate::{
+    CONTINUATION_OPERATION_ACCOUNTING_VERSION as AGGREGATE_CONTINUATION_ACCOUNTING_VERSION,
+    CONTINUATION_OPERATION_ALGORITHM_VERSION as AGGREGATE_CONTINUATION_ALGORITHM_VERSION,
     CompileAccounting as AggregateCompileAccounting,
     CompileAttemptError as AggregateCompileAttemptError,
     CompileAttemptIdentity as AggregateCompileAttemptIdentity,
@@ -126,6 +128,8 @@ pub use fre_aggregate::{
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
     OperationInvocation as AggregateOperationInvocation,
     OperationLimits as AggregateOperationLimits,
+    OperationPhysicalRoute as AggregateOperationPhysicalRoute,
+    OperationPrepublicationFallback as AggregateOperationPrepublicationFallback,
     OperationProspective as AggregateOperationProspective,
     OperationWorkMode as AggregateOperationWorkMode, PlanId as AggregatePlanId,
     Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
