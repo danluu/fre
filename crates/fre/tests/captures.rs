@@ -75,6 +75,39 @@ const fn exact_prefix_class_participation_limits(
     }
 }
 
+fn assert_direct_zero_actual_receipt(
+    error: &fre::CaptureExecutionError,
+    kernel_identity: fre::PrefixClassUniformParticipationIdentity,
+    haystack_len: usize,
+    limits: &CaptureRunLimits,
+    prospective: fre::PrefixClassUniformParticipationProspective,
+) {
+    assert_eq!(error.identity.run_limits, *limits);
+    let receipt = error
+        .prefix_class_participation_receipt
+        .as_ref()
+        .expect("direct terminal receipt");
+    let schema = fre::PrefixClassUniformParticipationSchema {
+        participating_with_overall: kernel_identity.participating_with_overall,
+        capture_schema_slots: kernel_identity.capture_schema_slots,
+    };
+    assert!(receipt.authenticates(
+        kernel_identity,
+        fre::PrefixClassUniformParticipationInvocation {
+            haystack_bytes: haystack_len,
+            schema,
+            limits: limits.prefix_class_participation,
+        }
+    ));
+    assert_eq!(receipt.prospective, Some(prospective));
+    assert_eq!(
+        receipt.actual,
+        fre::PrefixClassUniformParticipationActual::default()
+    );
+    assert_eq!(receipt.actual_allocations, 0);
+    assert!(receipt.retains_bounded_actual());
+}
+
 #[test]
 fn required_ascii_class_prefilter_does_not_bypass_aggregate_result_limits() {
     let regex = CaptureBuilder::new(r"([0-9])|x(?:[0-9])")
@@ -1605,6 +1638,14 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
     assert!(prospective.terminal_frontier);
     assert_eq!(&receipt.actual, selector_accounting);
     assert_eq!(
+        usize::from(certificate.prospective_allocations),
+        prospective.allocations
+    );
+    assert_eq!(
+        usize::from(certificate.actual_allocations),
+        receipt.actual_allocations
+    );
+    assert_eq!(
         receipt.identity.operation_id(),
         Some(certificate.operation_id())
     );
@@ -1666,9 +1707,14 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         direct_identity.kernel.algorithm_version,
         fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION
     );
+    assert_eq!(fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION, 1);
     assert_eq!(
         direct_identity.kernel.accounting_version,
         fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION
+    );
+    assert_eq!(
+        fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
+        2
     );
     assert_eq!(direct_identity.kernel.participating_with_overall, 2);
     assert_eq!(direct_identity.kernel.capture_schema_slots, 3);
@@ -1702,7 +1748,24 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         let accounting = result
             .prefix_class_participation
             .expect("direct P/A accounting");
+        let receipt = result
+            .prefix_class_participation_receipt
+            .as_ref()
+            .expect("direct success receipt");
         assert_eq!(accounting.identity, direct_identity.kernel);
+        assert!(accounting.closes_receipt(receipt));
+        assert!(receipt.authenticates(
+            direct_identity.kernel,
+            fre::PrefixClassUniformParticipationInvocation {
+                haystack_bytes: haystack.len(),
+                schema: fre::PrefixClassUniformParticipationSchema {
+                    participating_with_overall: 2,
+                    capture_schema_slots: 3,
+                },
+                limits: CaptureRunLimits::default().prefix_class_participation,
+            }
+        ));
+        assert_eq!(receipt.actual_allocations, 0);
         assert_eq!(accounting.actual.results, result.accounting.matches);
         assert_eq!(accounting.actual.capture_count, result.accounting.count);
         assert_eq!(accounting.actual.capture_events, result.capture_events);
@@ -1710,6 +1773,14 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         assert_eq!(accounting.actual.operation_bytes, 0);
         assert_eq!(accounting.actual.scratch_bytes, 0);
         assert!(accounting.actual.work <= accounting.prospective.work);
+        assert!(
+            accounting.actual.first_finder_candidates
+                <= accounting.prospective.first_finder_candidates
+        );
+        assert!(
+            accounting.actual.second_finder_candidates
+                <= accounting.prospective.second_finder_candidates
+        );
         assert!(accounting.actual.prefix_candidates <= accounting.prospective.prefix_candidates);
         assert!(accounting.actual.start_arbitrations <= accounting.prospective.start_arbitrations);
         assert!(accounting.actual.first_class_probes <= accounting.prospective.first_class_probes);
@@ -1749,6 +1820,10 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         baseline.prefix_class_participation,
         steady.prefix_class_participation
     );
+    assert_eq!(
+        baseline.prefix_class_participation_receipt,
+        steady.prefix_class_participation_receipt
+    );
     assert_eq!(baseline.identity, steady.identity);
     let prospective = baseline
         .prefix_class_participation
@@ -1772,6 +1847,22 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         .as_ref()
         .and_then(|receipt| receipt.prospective)
         .expect("retained U3 control prospective");
+    let u3_control_receipt = u3_control_result
+        .selector_receipt
+        .as_ref()
+        .expect("retained U3 control receipt");
+    let u3_control_certificate = u3_control_result
+        .selector_certificate
+        .as_ref()
+        .expect("retained U3 control certificate");
+    assert_eq!(
+        usize::from(u3_control_certificate.prospective_allocations),
+        u3_control_prospective.allocations
+    );
+    assert_eq!(
+        usize::from(u3_control_certificate.actual_allocations),
+        u3_control_receipt.actual_allocations
+    );
     let exact_limits = CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             max_results: prospective.results,
@@ -1794,6 +1885,23 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
             .prospective,
         prospective
     );
+    let exact_receipt = exact
+        .prefix_class_participation_receipt
+        .as_ref()
+        .expect("exact direct receipt");
+    assert_eq!(exact_receipt.prospective, Some(prospective));
+    assert!(exact_receipt.authenticates(
+        direct_identity.kernel,
+        fre::PrefixClassUniformParticipationInvocation {
+            haystack_bytes: haystack.len(),
+            schema: fre::PrefixClassUniformParticipationSchema {
+                participating_with_overall: 2,
+                capture_schema_slots: 3,
+            },
+            limits: exact_limits.prefix_class_participation,
+        }
+    ));
+    assert!(exact_receipt.retains_bounded_actual());
 
     macro_rules! assert_direct_one_below {
         ($limit:ident, $prospective:ident, $pattern:pat) => {{
@@ -1808,6 +1916,13 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
                 CaptureExecutionSource::PrefixClassParticipation($pattern)
             ));
             assert!(error.selector_receipt.is_none());
+            assert_direct_zero_actual_receipt(
+                &error,
+                direct_identity.kernel,
+                haystack.len(),
+                &one_below,
+                prospective,
+            );
         }};
     }
     assert_direct_one_below!(
@@ -1886,9 +2001,12 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
                         && required == u3_control_prospective.$field
                         && limit == u3_control_prospective.$field - 1
                 ));
-                assert_eq!(
-                    error.prefix_class_participation_prospective,
-                    Some(prospective)
+                assert_direct_zero_actual_receipt(
+                    &error,
+                    direct_identity.kernel,
+                    haystack.len(),
+                    &one_below,
+                    prospective,
                 );
             }
         };
@@ -1946,9 +2064,12 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
                     limit: prospective.$field - 1,
                 })
             );
-            assert_eq!(
-                error.prefix_class_participation_prospective,
-                Some(prospective)
+            assert_direct_zero_actual_receipt(
+                &error,
+                direct_identity.kernel,
+                haystack.len(),
+                &one_below,
+                prospective,
             );
         }};
     }
@@ -1976,9 +2097,12 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
             limit: baseline.combined_peak_bytes - 1,
         }
     );
-    assert_eq!(
-        combined_error.prefix_class_participation_prospective,
-        Some(prospective)
+    assert_direct_zero_actual_receipt(
+        &combined_error,
+        direct_identity.kernel,
+        haystack.len(),
+        &combined_one_below,
+        prospective,
     );
 
     // Exact construction limits admit; every positive direct dimension one

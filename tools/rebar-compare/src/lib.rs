@@ -160,7 +160,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -1888,7 +1888,7 @@ impl CurrentFreCaptureLifecycle {
             (
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::Count(run_limits),
-            ) => execute_count_captures_with_limits(regex, haystack, **run_limits),
+            ) => execute_count_captures_with_limits(regex, haystack, run_limits),
             (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_grep_captures(regex, haystack, &self.limits)
             }
@@ -4679,8 +4679,116 @@ fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
     }
 }
 
-fn capture_execution_error(source: &CaptureExecutionSource, message: String) -> ExecutionError {
-    match source {
+fn direct_capture_invocation(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: &CaptureRunLimits,
+) -> Option<(
+    fre::PrefixClassUniformParticipationIdentity,
+    fre::PrefixClassUniformParticipationInvocation,
+)> {
+    let identity = regex
+        .build_report()
+        .plan_identity
+        .prefix_class_participation?;
+    let schema = fre::PrefixClassUniformParticipationSchema {
+        participating_with_overall: identity.kernel.participating_with_overall,
+        capture_schema_slots: identity.kernel.capture_schema_slots,
+    };
+    Some((
+        identity.kernel,
+        fre::PrefixClassUniformParticipationInvocation {
+            haystack_bytes: haystack_len,
+            schema,
+            limits: run_limits.prefix_class_participation,
+        },
+    ))
+}
+
+fn authenticates_direct_capture_error(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: &CaptureRunLimits,
+    error: &fre::CaptureExecutionError,
+) -> bool {
+    if error.identity != regex.cache_identity(*run_limits) {
+        return false;
+    }
+    let Some((identity, invocation)) = direct_capture_invocation(regex, haystack_len, run_limits)
+    else {
+        return error.prefix_class_participation_receipt.is_none();
+    };
+    let Some(receipt) = error.prefix_class_participation_receipt.as_ref() else {
+        return false;
+    };
+    let Ok(Some(expected_prospective)) = regex.prefix_class_participation_prospective(haystack_len)
+    else {
+        return false;
+    };
+    identity.algorithm_version == 1
+        && identity.accounting_version == 2
+        && receipt.authenticates(identity, invocation)
+        && receipt.retains_bounded_actual()
+        && receipt.prospective == Some(expected_prospective)
+        && receipt.actual_allocations
+            <= receipt
+                .prospective
+                .map_or(0, |prospective| prospective.operation_allocations)
+}
+
+fn authenticates_direct_capture_success(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: &CaptureRunLimits,
+    result: &fre::CaptureExecutionReport,
+) -> bool {
+    if result.identity != regex.cache_identity(*run_limits) {
+        return false;
+    }
+    let Some((identity, invocation)) = direct_capture_invocation(regex, haystack_len, run_limits)
+    else {
+        return result.prefix_class_participation.is_none()
+            && result.prefix_class_participation_receipt.is_none();
+    };
+    let (Some(accounting), Some(receipt)) = (
+        result.prefix_class_participation.as_ref(),
+        result.prefix_class_participation_receipt.as_ref(),
+    ) else {
+        return false;
+    };
+    let Ok(Some(expected_prospective)) = regex.prefix_class_participation_prospective(haystack_len)
+    else {
+        return false;
+    };
+    identity.algorithm_version == 1
+        && identity.accounting_version == 2
+        && receipt.authenticates(identity, invocation)
+        && accounting.closes_receipt(receipt)
+        && result.accounting.matches == receipt.actual.results
+        && result.accounting.count == receipt.actual.capture_count
+        && result.capture_events == receipt.actual.capture_events
+        && receipt.prospective.is_some_and(|prospective| {
+            prospective == expected_prospective
+                && prospective.haystack_bytes == haystack_len
+                && prospective.operation_allocations == 0
+                && receipt.actual.operation_allocations == 0
+                && receipt.actual_allocations == 0
+        })
+}
+
+fn capture_execution_error(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: &CaptureRunLimits,
+    error: &fre::CaptureExecutionError,
+    message: String,
+) -> ExecutionError {
+    if !authenticates_direct_capture_error(regex, haystack_len, run_limits, error) {
+        return ExecutionError::fault(format!(
+            "{message}; FRE capture terminal receipt failed identity/P/A authentication"
+        ));
+    }
+    match &error.source {
         CaptureExecutionSource::PrefixClassParticipation(
             fre::PrefixClassUniformParticipationError::WorkLimit { .. }
             | fre::PrefixClassUniformParticipationError::FirstFinderBytesLimit { .. }
@@ -5067,7 +5175,7 @@ fn execute_count_captures(
     limits: &RunLimits,
 ) -> Result<u64, ExecutionError> {
     let run_limits = capture_count_run_limits(regex, haystack.len(), limits)?;
-    execute_count_captures_with_limits(regex, haystack, run_limits)
+    execute_count_captures_with_limits(regex, haystack, &run_limits)
 }
 
 fn capture_count_run_limits(
@@ -5093,16 +5201,24 @@ fn capture_count_run_limits(
 fn execute_count_captures_with_limits(
     regex: &CaptureRegex,
     haystack: &[u8],
-    run_limits: CaptureRunLimits,
+    run_limits: &CaptureRunLimits,
 ) -> Result<u64, ExecutionError> {
     let result = regex
-        .count_captures(haystack, run_limits)
+        .count_captures(haystack, *run_limits)
         .map_err(|error| {
             capture_execution_error(
-                &error.source,
+                regex,
+                haystack.len(),
+                run_limits,
+                &error,
                 format!("FRE capture reducer refused execution: {error}"),
             )
         })?;
+    if !authenticates_direct_capture_success(regex, haystack.len(), run_limits, &result) {
+        return Err(ExecutionError::fault(
+            "FRE capture result failed identity/P/A authentication",
+        ));
+    }
     u64::try_from(result.accounting.count)
         .map_err(|_| ExecutionError::fault("FRE capture count does not fit u64"))
 }
@@ -5712,10 +5828,18 @@ fn execute_grep_captures_inner(
         )?;
         let result = regex.count_captures(line, run_limits).map_err(|error| {
             capture_execution_error(
-                &error.source,
+                regex,
+                line.len(),
+                &run_limits,
+                &error,
                 format!("FRE grep-capture reducer refused execution: {error}"),
             )
         })?;
+        if !authenticates_direct_capture_success(regex, line.len(), &run_limits, &result) {
+            return Err(ExecutionError::fault(
+                "FRE grep-capture result failed identity/P/A authentication",
+            ));
+        }
         let group_events = result
             .accounting
             .matches
@@ -13088,7 +13212,7 @@ mod tests {
     #[test]
     fn rust_functions_direct_capture_lifecycle_is_eager_and_stable() {
         let pattern = r"fn is_(\w+)|fn as_(\w+)";
-        let first = b"fn is_alpha fn as_beta";
+        let first = b"fn is_alpha fn as_beta ";
         let mutated = b"fn as_9 fn is_Z fn is_\xff";
         let reference = rust_compile_options(&[pattern.to_string()], false, false)
             .expect("Rust-functions reference build");
@@ -13117,6 +13241,88 @@ mod tests {
             count_captures(&reference, mutated, u64::MAX).expect("Rust-functions reference steady"),
         );
         assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN);
+    }
+
+    #[test]
+    fn rust_functions_direct_receipts_fail_closed_in_adapter() {
+        let pattern = r"fn is_(\w+)|fn as_(\w+)";
+        let haystack = b"fn is_alpha fn as_beta";
+        let adapter_limits = RunLimits::default();
+        let regex = capture_regex_one(pattern, false, false, &adapter_limits)
+            .expect("direct capture artifact");
+        let run_limits = capture_count_run_limits(&regex, haystack.len(), &adapter_limits)
+            .expect("direct run limits");
+        let result = regex
+            .count_captures(haystack, run_limits)
+            .expect("direct capture result");
+        assert!(authenticates_direct_capture_success(
+            &regex,
+            haystack.len(),
+            &run_limits,
+            &result
+        ));
+        let mut forged_success = result.clone();
+        forged_success
+            .prefix_class_participation_receipt
+            .as_mut()
+            .expect("direct success receipt")
+            .actual_allocations = 1;
+        assert!(!authenticates_direct_capture_success(
+            &regex,
+            haystack.len(),
+            &run_limits,
+            &forged_success
+        ));
+
+        let prospective = result
+            .prefix_class_participation
+            .expect("direct success accounting")
+            .prospective;
+        let mut one_below = run_limits;
+        one_below.prefix_class_participation.max_work = prospective.work - 1;
+        let terminal = regex
+            .count_captures(haystack, one_below)
+            .expect_err("direct one-below");
+        assert!(authenticates_direct_capture_error(
+            &regex,
+            haystack.len(),
+            &one_below,
+            &terminal
+        ));
+        assert_eq!(
+            capture_execution_error(
+                &regex,
+                haystack.len(),
+                &one_below,
+                &terminal,
+                "valid direct refusal".to_string(),
+            )
+            .status,
+            Status::Unsupported
+        );
+        let mut forged_terminal = terminal;
+        forged_terminal
+            .prefix_class_participation_receipt
+            .as_mut()
+            .expect("direct terminal receipt")
+            .prospective = None;
+        assert!(!authenticates_direct_capture_error(
+            &regex,
+            haystack.len(),
+            &one_below,
+            &forged_terminal
+        ));
+        assert_eq!(
+            capture_execution_error(
+                &regex,
+                haystack.len(),
+                &one_below,
+                &forged_terminal,
+                "forged direct refusal".to_string(),
+            )
+            .status,
+            Status::Fault
+        );
     }
 
     #[test]
@@ -15028,7 +15234,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -16351,6 +16557,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one mapping gate keeps direct cardinality, selector ceilings, and exact refusal behavior together"
+    )]
     fn capture_limits_preserve_facade_cardinality_and_selector_ceilings() {
         let run = RunLimits {
             pattern_bytes_per_job: 31,

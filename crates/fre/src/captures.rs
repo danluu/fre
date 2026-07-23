@@ -25,11 +25,12 @@ use fre_capture_lab::{
 };
 use fre_kernels::{
     LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
-    PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationBuildAccounting,
+    PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationAttemptError,
+    PrefixClassUniformParticipationAttemptReceipt, PrefixClassUniformParticipationBuildAccounting,
     PrefixClassUniformParticipationBuildError, PrefixClassUniformParticipationBuildLimits,
     PrefixClassUniformParticipationError, PrefixClassUniformParticipationIdentity,
-    PrefixClassUniformParticipationLimits, PrefixClassUniformParticipationProspective,
-    PrefixClassUniformParticipationSchema,
+    PrefixClassUniformParticipationInvocation, PrefixClassUniformParticipationLimits,
+    PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationSchema,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
@@ -387,10 +388,9 @@ impl std::error::Error for CaptureExecutionSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PrefixClassParticipation(error) => Some(error),
-            Self::CombinedPeak { .. } => None,
+            Self::CombinedPeak { .. } | Self::InternalInvariant(_) => None,
             Self::Selector(error) => Some(error),
             Self::History(error) => Some(error),
-            Self::InternalInvariant(_) => None,
         }
     }
 }
@@ -399,15 +399,15 @@ impl std::error::Error for CaptureExecutionSource {
 #[derive(Debug)]
 pub struct CaptureExecutionError {
     /// Complete invocation identity.
-    pub identity: Box<CaptureCacheIdentity>,
+    pub identity: CaptureCacheIdentity,
     /// Typed selector/history/reducer failure.
     pub source: CaptureExecutionSource,
     /// Complete Count-attempt receipt when the uniform-participation route
     /// reached its prospective selector boundary.
     pub selector_receipt: Option<SelectorOperationAttemptReceipt>,
-    /// Published direct-operation prospective when failure occurred after its
-    /// owner-local publication boundary.
-    pub prefix_class_participation_prospective: Option<PrefixClassUniformParticipationProspective>,
+    /// Complete direct attempt receipt, including optional P, cumulative A and
+    /// successful allocation count.
+    pub prefix_class_participation_receipt: Option<PrefixClassUniformParticipationAttemptReceipt>,
 }
 
 impl fmt::Display for CaptureExecutionError {
@@ -439,6 +439,9 @@ pub struct CaptureExecutionReport {
     /// Complete direct prefix/class P/A accounting. Selector-backed routes
     /// retain `None`.
     pub prefix_class_participation: Option<PrefixClassUniformParticipationAccounting>,
+    /// Complete direct identity/invocation/P/A receipt. Selector-backed routes
+    /// retain `None`.
+    pub prefix_class_participation_receipt: Option<PrefixClassUniformParticipationAttemptReceipt>,
     /// Complete capture-schema entries logically inspected by the reducer.
     pub capture_events: usize,
     /// Conservative retained/operation peak for the selected route, never
@@ -1176,6 +1179,11 @@ fn optional_prefix_class_build_refusal(error: &PrefixClassUniformParticipationBu
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "direct eligibility and fallible construction retain all canonical-HIR inputs and accounting in one transactional helper"
+)]
 fn build_prefix_class_participation(
     hir: &Hir,
     syntax: &ParseSummary,
@@ -1531,6 +1539,24 @@ impl CaptureRegex {
         &self.report
     }
 
+    /// Recompute the exact source-free direct-operation P for adapter/cache
+    /// authentication. Non-direct plans return `Ok(None)`.
+    pub fn prefix_class_participation_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<
+        Option<PrefixClassUniformParticipationProspective>,
+        PrefixClassUniformParticipationError,
+    > {
+        self.prefix_class_participation
+            .as_ref()
+            .map(|plan| {
+                plan.engine
+                    .uniform_participation_prospective(haystack_len, plan.schema)
+            })
+            .transpose()
+    }
+
     /// Optional generic line-candidate proof built from this exact capture HIR.
     #[must_use]
     pub const fn required_literal_plan(&self) -> Option<&CaptureRequiredLiteralPlan> {
@@ -1733,10 +1759,10 @@ impl CaptureRegex {
                     selector_limits,
                 )
                 .map_err(|source| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::Selector(source),
                     selector_receipt: None,
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 })?;
             let selector_accounting = selected.accounting();
             let mut matches = 0_usize;
@@ -1759,12 +1785,12 @@ impl CaptureRegex {
                 participating
                     .checked_add(1)
                     .ok_or_else(|| CaptureExecutionError {
-                        identity: Box::new(identity.clone()),
+                        identity: identity.clone(),
                         source: CaptureExecutionSource::InternalInvariant(
                             "uniform capture participation overflowed usize",
                         ),
                         selector_receipt: None,
-                        prefix_class_participation_prospective: None,
+                        prefix_class_participation_receipt: None,
                     })?;
             let count = checked_capture_mul(
                 &identity,
@@ -1775,12 +1801,12 @@ impl CaptureRegex {
             )?;
             let all_groups = self.report.engine.captures.checked_add(1).ok_or_else(|| {
                 CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::InternalInvariant(
                         "capture schema overflowed usize",
                     ),
                     selector_receipt: None,
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 }
             })?;
             let capture_events = checked_capture_mul(
@@ -1805,6 +1831,7 @@ impl CaptureRegex {
                 selector_accounting: Some(selector_accounting),
                 selector_receipt: None,
                 prefix_class_participation: None,
+                prefix_class_participation_receipt: None,
                 capture_events,
                 combined_peak_bytes: selector_accounting.peak_bytes,
             });
@@ -1818,22 +1845,22 @@ impl CaptureRegex {
                 selector_limits,
             )
             .map_err(|source| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
+                identity: identity.clone(),
                 source: CaptureExecutionSource::Selector(source),
                 selector_receipt: None,
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             })?;
         let selector_accounting = selected.accounting();
         let replay_scratch_limit = limits
             .max_combined_peak_bytes
             .checked_sub(selector_accounting.output_bytes)
             .ok_or_else(|| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
+                identity: identity.clone(),
                 source: CaptureExecutionSource::InternalInvariant(
                     "selector output exceeded the admitted combined peak",
                 ),
                 selector_receipt: None,
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             })?;
         let mut combined_peak_bytes = selector_accounting.peak_bytes;
         let mut accounting = CaptureCountOutcome {
@@ -1900,21 +1927,21 @@ impl CaptureRegex {
                 .output_bytes
                 .checked_add(replay.report.admitted_scratch_bytes)
                 .ok_or_else(|| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::InternalInvariant(
                         "combined selector/replay peak overflowed usize",
                     ),
                     selector_receipt: None,
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 })?;
             combined_peak_bytes = combined_peak_bytes.max(replay_combined_peak);
             let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
+                identity: identity.clone(),
                 source: CaptureExecutionSource::InternalInvariant(
                     "selector-certified span produced no tagged winner",
                 ),
                 selector_receipt: None,
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             })?;
             accounting.total_state_visits = checked_capture_add(
                 &identity,
@@ -1964,15 +1991,17 @@ impl CaptureRegex {
             selector_accounting: Some(selector_accounting),
             selector_receipt: None,
             prefix_class_participation: None,
+            prefix_class_participation_receipt: None,
             capture_events,
             combined_peak_bytes,
         })
     }
 
     #[allow(
+        clippy::large_types_passed_by_value,
         clippy::result_large_err,
         clippy::too_many_lines,
-        reason = "direct terminals retain the complete fixed-layout prospective inline beside source-free U3-control admission and co-live publication"
+        reason = "the Copy run-limit snapshot and direct terminals retain the complete fixed-layout invocation and prospective inline beside source-free U3-control admission"
     )]
     fn count_prefix_class_participation(
         &self,
@@ -1982,18 +2011,30 @@ impl CaptureRegex {
         selector_limits: SelectorOperationLimits,
         identity: CaptureCacheIdentity,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        let mut receipt = plan.engine.uniform_participation_attempt_receipt(
+            haystack.len(),
+            plan.schema,
+            limits.prefix_class_participation,
+        );
         let prospective = plan
             .engine
-            .uniform_participation_prospective(
-                haystack.len(),
-                plan.schema,
-                limits.prefix_class_participation,
-            )
-            .map_err(|source| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::PrefixClassParticipation(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: None,
+            .uniform_participation_prospective(haystack.len(), plan.schema)
+            .map_err(|source| {
+                Self::prefix_class_error(
+                    &identity,
+                    CaptureExecutionSource::PrefixClassParticipation(source),
+                    receipt,
+                )
+            })?;
+        receipt.prospective = Some(prospective);
+        plan.engine
+            .enforce_uniform_participation(prospective, limits.prefix_class_participation)
+            .map_err(|source| {
+                Self::prefix_class_error(
+                    &identity,
+                    CaptureExecutionSource::PrefixClassParticipation(source),
+                    receipt,
+                )
             })?;
         let selector_control = self
             .selector
@@ -2001,22 +2042,22 @@ impl CaptureRegex {
                 haystack.len(),
                 SelectorStrategy::ReverseSequentialRows,
             )
-            .map_err(|source| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::Selector(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
+            .map_err(|source| {
+                Self::prefix_class_error(
+                    &identity,
+                    CaptureExecutionSource::Selector(source),
+                    receipt,
+                )
             })?;
-        let minimum_match_bytes =
-            self.uniform_count_minimum_match_bytes
-                .ok_or_else(|| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
-                    source: CaptureExecutionSource::InternalInvariant(
-                        "direct prefix/class plan lost its positive minimum width",
-                    ),
-                    selector_receipt: None,
-                    prefix_class_participation_prospective: Some(prospective),
-                })?;
+        let minimum_match_bytes = self.uniform_count_minimum_match_bytes.ok_or_else(|| {
+            Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
+                    "direct prefix/class plan lost its positive minimum width",
+                ),
+                receipt,
+            )
+        })?;
         let selector_control = uniform_capture_prospective(
             &selector_control,
             haystack.len(),
@@ -2025,90 +2066,120 @@ impl CaptureRegex {
             plan.schema.capture_schema_slots,
             limits.aggregate,
         )
-        .map_err(|source| CaptureExecutionError {
-            identity: Box::new(identity.clone()),
-            source: CaptureExecutionSource::History(source),
-            selector_receipt: None,
-            prefix_class_participation_prospective: Some(prospective),
+        .map_err(|source| {
+            Self::prefix_class_error(&identity, CaptureExecutionSource::History(source), receipt)
         })?;
         if selector_control.selector.terminal_frontier
             || selector_control.matches != prospective.results
             || selector_control.capture_count != prospective.capture_count
             || selector_control.capture_events != prospective.capture_events
         {
-            return Err(CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::InternalInvariant(
+            return Err(Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
                     "direct prefix/class envelope diverged from its retained U3 control",
                 ),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            });
+                receipt,
+            ));
         }
         let retained_fallback_bytes = self
             .report
             .engine
             .program_bytes
             .checked_add(self.report.selector.program_bytes)
-            .ok_or_else(|| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::InternalInvariant(
-                    "capture retained fallback bytes overflowed usize",
-                ),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
+            .ok_or_else(|| {
+                Self::prefix_class_error(
+                    &identity,
+                    CaptureExecutionSource::InternalInvariant(
+                        "capture retained fallback bytes overflowed usize",
+                    ),
+                    receipt,
+                )
             })?;
         let direct_peak_bytes = retained_fallback_bytes
             .checked_add(prospective.peak_bytes)
-            .ok_or_else(|| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::InternalInvariant(
-                    "capture direct co-live peak overflowed usize",
-                ),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
+            .ok_or_else(|| {
+                Self::prefix_class_error(
+                    &identity,
+                    CaptureExecutionSource::InternalInvariant(
+                        "capture direct co-live peak overflowed usize",
+                    ),
+                    receipt,
+                )
             })?;
         let combined_peak_bytes = direct_peak_bytes.max(selector_control.selector.peak_bytes);
         if combined_peak_bytes > limits.max_combined_peak_bytes {
-            return Err(CaptureExecutionError {
-                identity: Box::new(identity),
-                source: CaptureExecutionSource::CombinedPeak {
+            return Err(Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::CombinedPeak {
                     needed: combined_peak_bytes,
                     limit: limits.max_combined_peak_bytes,
                 },
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            });
+                receipt,
+            ));
         }
         enforce_selector_control(selector_control.selector, selector_limits).map_err(|source| {
-            CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::Selector(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            }
+            Self::prefix_class_error(&identity, CaptureExecutionSource::Selector(source), receipt)
         })?;
-        let result = plan
+        let attempt = plan
             .engine
-            .count_uniform_participation(haystack, plan.schema, limits.prefix_class_participation)
-            .map_err(|source| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
-                source: CaptureExecutionSource::PrefixClassParticipation(source),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            })?;
-        if result.accounting.prospective != prospective
+            .count_uniform_participation_attempt(
+                haystack,
+                plan.schema,
+                limits.prefix_class_participation,
+            )
+            .map_err(
+                |PrefixClassUniformParticipationAttemptError { source, receipt }| {
+                    Self::prefix_class_error(
+                        &identity,
+                        CaptureExecutionSource::PrefixClassParticipation(source),
+                        receipt,
+                    )
+                },
+            )?;
+        let expected_kernel_identity = plan.engine.uniform_participation_identity(plan.schema);
+        let expected_invocation = PrefixClassUniformParticipationInvocation {
+            haystack_bytes: haystack.len(),
+            schema: plan.schema,
+            limits: limits.prefix_class_participation,
+        };
+        if attempt.receipt.prospective != Some(prospective)
+            || !attempt.authenticates(expected_kernel_identity, expected_invocation)
             || identity.plan.prefix_class_participation != Some(plan.identity())
             || identity.plan.plan != CapturePlanKind::UniformPrefixClassParticipation
         {
-            return Err(CaptureExecutionError {
-                identity: Box::new(identity),
-                source: CaptureExecutionSource::InternalInvariant(
+            return Err(Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
                     "direct prefix/class execution diverged from its published plan",
                 ),
-                selector_receipt: None,
-                prefix_class_participation_prospective: Some(prospective),
-            });
+                attempt.receipt,
+            ));
+        }
+        let result = attempt.result;
+        if !result.accounting.closes_receipt(&attempt.receipt)
+            || result.accounting.prospective != prospective
+        {
+            return Err(Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
+                    "direct prefix/class result did not close its P/A receipt",
+                ),
+                attempt.receipt,
+            ));
+        }
+        receipt = attempt.receipt;
+        if receipt.actual_allocations != 0
+            || receipt.actual.operation_allocations != 0
+            || prospective.operation_allocations != 0
+        {
+            return Err(Self::prefix_class_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
+                    "allocation-free direct route reported an allocation",
+                ),
+                receipt,
+            ));
         }
         Ok(CaptureExecutionReport {
             identity,
@@ -2125,15 +2196,17 @@ impl CaptureRegex {
             selector_accounting: None,
             selector_receipt: None,
             prefix_class_participation: Some(result.accounting),
+            prefix_class_participation_receipt: Some(receipt),
             capture_events: result.accounting.actual.capture_events,
             combined_peak_bytes,
         })
     }
 
     #[allow(
+        clippy::large_types_passed_by_value,
         clippy::result_large_err,
         clippy::too_many_lines,
-        reason = "the uniform route preserves its complete selector P/A receipt on every terminal and keeps prospective publication adjacent to reduction"
+        reason = "the Copy run-limit snapshot and uniform route preserve complete selector P/A on every terminal"
     )]
     fn count_uniform_captures(
         &self,
@@ -2148,12 +2221,12 @@ impl CaptureRegex {
             participating
                 .checked_add(1)
                 .ok_or_else(|| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::InternalInvariant(
                         "uniform capture participation overflowed usize",
                     ),
                     selector_receipt: None,
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 })?;
         let all_groups =
             self.report
@@ -2161,12 +2234,12 @@ impl CaptureRegex {
                 .captures
                 .checked_add(1)
                 .ok_or_else(|| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::InternalInvariant(
                         "capture schema overflowed usize",
                     ),
                     selector_receipt: None,
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 })?;
         let terminal_frontier = self.selector.has_terminal_frontier();
         let mut published = None;
@@ -2219,89 +2292,95 @@ impl CaptureRegex {
                     CaptureExecutionSource::History,
                 );
                 return Err(CaptureExecutionError {
-                    identity: Box::new(identity),
+                    identity,
                     source,
                     selector_receipt: Some(receipt),
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 });
             }
         };
         if owner_refusal.is_some() {
             return Err(CaptureExecutionError {
-                identity: Box::new(identity),
+                identity,
                 source: CaptureExecutionSource::InternalInvariant(
                     "selector succeeded after capture owner refused its prospective",
                 ),
                 selector_receipt: Some(attempt.receipt),
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             });
         }
         let prospective = published.ok_or_else(|| CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::InternalInvariant(
                 "uniform Count succeeded without publishing its prospective",
             ),
             selector_receipt: Some(attempt.receipt.clone()),
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         })?;
         if prospective.selector.terminal_frontier != terminal_frontier
             || attempt.receipt.prospective != Some(prospective.selector)
         {
             return Err(CaptureExecutionError {
-                identity: Box::new(identity),
+                identity,
                 source: CaptureExecutionSource::InternalInvariant(
                     "uniform Count route diverged from its published prospective",
                 ),
                 selector_receipt: Some(attempt.receipt),
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             });
         }
         let selected = attempt.admitted;
         let selector_receipt = attempt.receipt;
+        let selector_certificate = selected.certificate();
         let selector_accounting = selected.accounting();
         let matches = selected.value();
         if matches > prospective.matches
             || selector_accounting.emitted_matches != matches
             || selector_accounting.output_bytes != 0
+            || selector_receipt.prospective.is_none_or(|published| {
+                usize::from(selector_certificate.prospective_allocations) != published.allocations
+                    || usize::from(selector_certificate.actual_allocations)
+                        != selector_receipt.actual_allocations
+            })
         {
             return Err(CaptureExecutionError {
-                identity: Box::new(identity),
+                identity,
                 source: CaptureExecutionSource::InternalInvariant(
                     "uniform Count actual escaped its positive-width prospective",
                 ),
                 selector_receipt: Some(selector_receipt),
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             });
         }
         let count = matches
             .checked_mul(participating_with_overall)
             .ok_or_else(|| CaptureExecutionError {
-                identity: Box::new(identity.clone()),
+                identity: identity.clone(),
                 source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(
                     EngineResource::CaptureCount,
                 )),
                 selector_receipt: Some(selector_receipt.clone()),
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             })?;
         let capture_events =
             matches
                 .checked_mul(all_groups)
                 .ok_or_else(|| CaptureExecutionError {
-                    identity: Box::new(identity.clone()),
+                    identity: identity.clone(),
                     source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(
                         EngineResource::CaptureEvents,
                     )),
                     selector_receipt: Some(selector_receipt.clone()),
-                    prefix_class_participation_prospective: None,
+                    prefix_class_participation_receipt: None,
                 })?;
         if count > prospective.capture_count || capture_events > prospective.capture_events {
             return Err(CaptureExecutionError {
-                identity: Box::new(identity),
+                identity,
                 source: CaptureExecutionSource::InternalInvariant(
                     "uniform capture arithmetic escaped its prospective",
                 ),
                 selector_receipt: Some(selector_receipt),
-                prefix_class_participation_prospective: None,
+                prefix_class_participation_receipt: None,
             });
         }
         Ok(CaptureExecutionReport {
@@ -2315,10 +2394,11 @@ impl CaptureRegex {
                 total_history_walk: 0,
                 peak_threads: 0,
             },
-            selector_certificate: Some(selected.certificate().clone()),
+            selector_certificate: Some(selector_certificate.clone()),
             selector_accounting: Some(selector_accounting),
             selector_receipt: Some(selector_receipt),
             prefix_class_participation: None,
+            prefix_class_participation_receipt: None,
             capture_events,
             combined_peak_bytes: selector_accounting.peak_bytes,
         })
@@ -2329,10 +2409,27 @@ impl CaptureRegex {
         source: EngineSearchError,
     ) -> CaptureExecutionError {
         CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(source),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
+        }
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the Copy receipt is moved into the terminal error as one immutable fixed-layout snapshot"
+    )]
+    fn prefix_class_error(
+        identity: &CaptureCacheIdentity,
+        source: CaptureExecutionSource,
+        receipt: PrefixClassUniformParticipationAttemptReceipt,
+    ) -> CaptureExecutionError {
+        CaptureExecutionError {
+            identity: identity.clone(),
+            source,
+            selector_receipt: None,
+            prefix_class_participation_receipt: Some(receipt),
         }
     }
 }
@@ -2345,6 +2442,10 @@ struct UniformCaptureProspective {
     capture_events: usize,
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the Copy prospective is admitted as one immutable source-free selector-control snapshot"
+)]
 fn enforce_selector_control(
     prospective: SelectorOperationProspective,
     limits: SelectorOperationLimits,
@@ -2498,10 +2599,10 @@ fn capture_remaining(
     limit
         .checked_sub(used)
         .ok_or_else(|| CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         })
 }
 
@@ -2519,21 +2620,21 @@ fn checked_capture_add(
     let required = current
         .checked_add(amount)
         .ok_or_else(|| CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         })?;
     if required > limit {
         return Err(CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(EngineSearchError::Resource {
                 kind: resource,
                 required,
                 limit,
             }),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         });
     }
     Ok(required)
@@ -2553,21 +2654,21 @@ fn checked_capture_mul(
     let required = left
         .checked_mul(right)
         .ok_or_else(|| CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         })?;
     if required > limit {
         return Err(CaptureExecutionError {
-            identity: Box::new(identity.clone()),
+            identity: identity.clone(),
             source: CaptureExecutionSource::History(EngineSearchError::Resource {
                 kind: resource,
                 required,
                 limit,
             }),
             selector_receipt: None,
-            prefix_class_participation_prospective: None,
+            prefix_class_participation_receipt: None,
         });
     }
     Ok(required)

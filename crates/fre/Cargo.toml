@@ -20,6 +20,7 @@ regex-syntax = { version = "=0.8.11", default-features = false, features = ["std
 [dev-dependencies]
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 regex-automata = "=0.4.14"
+stats_alloc = "=0.1.10"
 
 [[bench]]
 name = "portable_baseline"
