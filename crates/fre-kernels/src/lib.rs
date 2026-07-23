@@ -243,6 +243,18 @@ pub use prefix_class_alternation::{
     ReduceError as PrefixClassAlternationReduceError,
     ReduceLimits as PrefixClassAlternationReduceLimits,
     ReduceUpperBounds as PrefixClassAlternationUpperBounds,
+    UNIFORM_PARTICIPATION_ACCOUNTING_VERSION as PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
+    UNIFORM_PARTICIPATION_ALGORITHM_VERSION as PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
+    UNIFORM_PARTICIPATION_OPERATION_ID as PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID,
+    UNIFORM_PARTICIPATION_PLAN_ID as PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
+    UniformParticipationAccounting as PrefixClassUniformParticipationAccounting,
+    UniformParticipationActual as PrefixClassUniformParticipationActual,
+    UniformParticipationError as PrefixClassUniformParticipationError,
+    UniformParticipationIdentity as PrefixClassUniformParticipationIdentity,
+    UniformParticipationLimits as PrefixClassUniformParticipationLimits,
+    UniformParticipationProspective as PrefixClassUniformParticipationProspective,
+    UniformParticipationResult as PrefixClassUniformParticipationResult,
+    UniformParticipationSchema as PrefixClassUniformParticipationSchema,
 };
 pub use required_internal_anchor::{
     BuildAccounting as RequiredInternalAnchorBuildAccounting,

@@ -49,6 +49,12 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
+pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
+    "prefix-class-alternation.uniform-participation.two-finder.v1";
+pub const UNIFORM_PARTICIPATION_OPERATION_ID: &str =
+    "prefix-class-alternation.capture-participation.unicode-off.v1";
+pub const UNIFORM_PARTICIPATION_ALGORITHM_VERSION: u32 = 1;
+pub const UNIFORM_PARTICIPATION_ACCOUNTING_VERSION: u32 = 1;
 
 const FIXED_BUILD_WORK: usize = 64;
 const PREFIX_BUILD_WORK_PER_BYTE: usize = 8;
@@ -175,6 +181,236 @@ pub struct CountResult {
     pub count: u64,
     pub accounting: ReduceAccounting,
 }
+
+/// Capture-aware identity for the direct uniform-participation operation.
+///
+/// This is deliberately distinct from [`OperationIdentity`]: whole-match
+/// aggregate Count and capture participation have different outputs, ledgers,
+/// and fallback contracts even when they share the immutable prefix/class
+/// plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationIdentity {
+    pub plan_id: &'static str,
+    pub operation_id: &'static str,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+    pub alternatives: usize,
+    pub unicode: bool,
+    pub case_insensitive: bool,
+    pub ordered_branch_priority: bool,
+    pub greedy_class: bool,
+    pub non_overlapping: bool,
+    pub participating_with_overall: usize,
+    pub capture_schema_slots: usize,
+}
+
+/// Capture schema proved from the same canonical HIR as the prefix/class plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationSchema {
+    /// Group zero plus the fixed number of participating user groups.
+    pub participating_with_overall: usize,
+    /// Group zero plus every user slot, including unmatched branch siblings.
+    pub capture_schema_slots: usize,
+}
+
+/// Independent direct-operation limits. Every positive dimension is checked
+/// before iterator creation or haystack inspection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationLimits {
+    pub max_work: usize,
+    pub max_first_finder_bytes: usize,
+    pub max_second_finder_bytes: usize,
+    pub max_prefix_candidates: usize,
+    pub max_start_arbitrations: usize,
+    pub max_first_class_probes: usize,
+    pub max_greedy_extension_reads: usize,
+    pub max_results: usize,
+    pub max_capture_count: usize,
+    pub max_capture_events: usize,
+    pub max_operation_allocations: usize,
+    pub max_operation_bytes: usize,
+    pub max_scratch_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl UniformParticipationLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_work: usize::MAX,
+            max_first_finder_bytes: usize::MAX,
+            max_second_finder_bytes: usize::MAX,
+            max_prefix_candidates: usize::MAX,
+            max_start_arbitrations: usize::MAX,
+            max_first_class_probes: usize::MAX,
+            max_greedy_extension_reads: usize::MAX,
+            max_results: usize::MAX,
+            max_capture_count: usize::MAX,
+            max_capture_events: usize::MAX,
+            max_operation_allocations: usize::MAX,
+            max_operation_bytes: usize::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for UniformParticipationLimits {
+    fn default() -> Self {
+        Self {
+            max_work: 512 * 1024 * 1024,
+            max_first_finder_bytes: 64 * 1024 * 1024,
+            max_second_finder_bytes: 64 * 1024 * 1024,
+            max_prefix_candidates: 128 * 1024 * 1024,
+            max_start_arbitrations: 256 * 1024 * 1024,
+            max_first_class_probes: 128 * 1024 * 1024,
+            max_greedy_extension_reads: 128 * 1024 * 1024,
+            max_results: 64 * 1024 * 1024,
+            max_capture_count: 128 * 1024 * 1024,
+            max_capture_events: 192 * 1024 * 1024,
+            max_operation_allocations: 0,
+            max_operation_bytes: 0,
+            max_scratch_bytes: 0,
+            max_peak_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// Complete prospective ledger published before direct source access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationProspective {
+    pub haystack_bytes: usize,
+    pub shape_units: usize,
+    pub first_finder_bytes: usize,
+    pub second_finder_bytes: usize,
+    pub prefix_candidates: usize,
+    pub start_arbitrations: usize,
+    pub first_class_probes: usize,
+    pub greedy_extension_reads: usize,
+    pub results: usize,
+    pub capture_count: usize,
+    pub capture_events: usize,
+    pub work: usize,
+    pub operation_allocations: usize,
+    pub operation_bytes: usize,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Complete actual direct-operation ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationActual {
+    pub first_finder_bytes: usize,
+    pub second_finder_bytes: usize,
+    pub first_finder_candidates: usize,
+    pub second_finder_candidates: usize,
+    pub prefix_candidates: usize,
+    pub start_arbitrations: usize,
+    pub first_class_probes: usize,
+    pub greedy_extension_reads: usize,
+    pub results: usize,
+    pub capture_count: usize,
+    pub capture_events: usize,
+    pub work: usize,
+    pub operation_allocations: usize,
+    pub operation_bytes: usize,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationAccounting {
+    pub identity: UniformParticipationIdentity,
+    pub prospective: UniformParticipationProspective,
+    pub actual: UniformParticipationActual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationResult {
+    pub matches: usize,
+    pub capture_count: usize,
+    pub accounting: UniformParticipationAccounting,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UniformParticipationError {
+    InvalidSchema,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+    },
+    FirstFinderBytesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    SecondFinderBytesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PrefixCandidatesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    StartArbitrationsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    FirstClassProbesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    GreedyExtensionReadsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    ResultsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    CaptureCountLimit {
+        needed: usize,
+        limit: usize,
+    },
+    CaptureEventsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    OperationAllocationsLimit {
+        needed: usize,
+        limit: usize,
+    },
+    OperationBytesLimit {
+        needed: usize,
+        limit: usize,
+    },
+    ScratchLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PeakLimit {
+        needed: usize,
+        limit: usize,
+    },
+    ActualEscapedProspective {
+        dimension: &'static str,
+        actual: usize,
+        prospective: usize,
+    },
+    ArithmeticOverflow {
+        computation: &'static str,
+    },
+}
+
+impl fmt::Display for UniformParticipationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "prefix/class uniform participation failed: {self:?}")
+    }
+}
+
+impl std::error::Error for UniformParticipationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -443,6 +679,396 @@ impl PrefixClassAlternationPlan {
         })
     }
 
+    #[must_use]
+    pub const fn uniform_participation_identity(
+        &self,
+        schema: UniformParticipationSchema,
+    ) -> UniformParticipationIdentity {
+        UniformParticipationIdentity {
+            plan_id: UNIFORM_PARTICIPATION_PLAN_ID,
+            operation_id: UNIFORM_PARTICIPATION_OPERATION_ID,
+            algorithm_version: UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
+            accounting_version: UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
+            alternatives: 2,
+            unicode: false,
+            case_insensitive: false,
+            ordered_branch_priority: true,
+            greedy_class: true,
+            non_overlapping: true,
+            participating_with_overall: schema.participating_with_overall,
+            capture_schema_slots: schema.capture_schema_slots,
+        }
+    }
+
+    /// Publish the complete direct capture-operation envelope without source
+    /// access. Callers can use this for transactional owner-local admission.
+    pub fn uniform_participation_prospective(
+        &self,
+        haystack_len: usize,
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+    ) -> Result<UniformParticipationProspective, UniformParticipationError> {
+        if schema.participating_with_overall == 0
+            || schema.capture_schema_slots < schema.participating_with_overall
+        {
+            return Err(UniformParticipationError::InvalidSchema);
+        }
+        let first_finder_bytes = haystack_len;
+        let second_finder_bytes = haystack_len;
+        let prefix_candidates =
+            haystack_len
+                .checked_mul(2)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "two complete prefix candidate streams",
+                })?;
+        let start_arbitrations =
+            haystack_len
+                .checked_mul(4)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "candidate and selected-start arbitration",
+                })?;
+        let first_class_probes =
+            haystack_len
+                .checked_mul(2)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "first-class probes",
+                })?;
+        let greedy_extension_reads =
+            haystack_len
+                .checked_mul(2)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "greedy extension reads",
+                })?;
+        let results = haystack_len;
+        let capture_count = results
+            .checked_mul(schema.participating_with_overall)
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "prospective participating capture count",
+            })?;
+        let capture_events = results.checked_mul(schema.capture_schema_slots).ok_or(
+            UniformParticipationError::ArithmeticOverflow {
+                computation: "prospective capture schema events",
+            },
+        )?;
+        let shape_work = self
+            .build
+            .shape_units
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(64))
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "uniform participation shape work",
+            })?;
+        let work = [
+            first_finder_bytes,
+            second_finder_bytes,
+            prefix_candidates,
+            start_arbitrations,
+            first_class_probes,
+            greedy_extension_reads,
+            results,
+            capture_count,
+            capture_events,
+            shape_work,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, value| {
+            sum.checked_add(value)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "uniform participation total work",
+                })
+        })?;
+        let operation_allocations = 0;
+        let operation_bytes = 0;
+        let scratch_bytes = 0;
+        let persistent_bytes = self.build.persistent_bytes;
+        let peak_bytes = persistent_bytes;
+
+        // Preserve reducer precedence independently of source-service limits.
+        enforce_uniform(
+            results,
+            limits.max_results,
+            UniformParticipationResource::Results,
+        )?;
+        enforce_uniform(
+            capture_count,
+            limits.max_capture_count,
+            UniformParticipationResource::CaptureCount,
+        )?;
+        enforce_uniform(
+            capture_events,
+            limits.max_capture_events,
+            UniformParticipationResource::CaptureEvents,
+        )?;
+        enforce_uniform(
+            first_finder_bytes,
+            limits.max_first_finder_bytes,
+            UniformParticipationResource::FirstFinderBytes,
+        )?;
+        enforce_uniform(
+            second_finder_bytes,
+            limits.max_second_finder_bytes,
+            UniformParticipationResource::SecondFinderBytes,
+        )?;
+        enforce_uniform(
+            prefix_candidates,
+            limits.max_prefix_candidates,
+            UniformParticipationResource::PrefixCandidates,
+        )?;
+        enforce_uniform(
+            start_arbitrations,
+            limits.max_start_arbitrations,
+            UniformParticipationResource::StartArbitrations,
+        )?;
+        enforce_uniform(
+            first_class_probes,
+            limits.max_first_class_probes,
+            UniformParticipationResource::FirstClassProbes,
+        )?;
+        enforce_uniform(
+            greedy_extension_reads,
+            limits.max_greedy_extension_reads,
+            UniformParticipationResource::GreedyExtensionReads,
+        )?;
+        enforce_uniform(work, limits.max_work, UniformParticipationResource::Work)?;
+        enforce_uniform(
+            operation_allocations,
+            limits.max_operation_allocations,
+            UniformParticipationResource::OperationAllocations,
+        )?;
+        enforce_uniform(
+            operation_bytes,
+            limits.max_operation_bytes,
+            UniformParticipationResource::OperationBytes,
+        )?;
+        enforce_uniform(
+            scratch_bytes,
+            limits.max_scratch_bytes,
+            UniformParticipationResource::Scratch,
+        )?;
+        enforce_uniform(
+            peak_bytes,
+            limits.max_peak_bytes,
+            UniformParticipationResource::Peak,
+        )?;
+        Ok(UniformParticipationProspective {
+            haystack_bytes: haystack_len,
+            shape_units: self.build.shape_units,
+            first_finder_bytes,
+            second_finder_bytes,
+            prefix_candidates,
+            start_arbitrations,
+            first_class_probes,
+            greedy_extension_reads,
+            results,
+            capture_count,
+            capture_events,
+            work,
+            operation_allocations,
+            operation_bytes,
+            scratch_bytes,
+            persistent_bytes,
+            peak_bytes,
+        })
+    }
+
+    /// Count fixed capture participation using the direct prefix/class route.
+    ///
+    /// Preflight completes before either Finder iterator is created. Any
+    /// failure after that publication is terminal and never invokes another
+    /// route.
+    pub fn count_uniform_participation(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+    ) -> Result<UniformParticipationResult, UniformParticipationError> {
+        let prospective = self.uniform_participation_prospective(haystack.len(), schema, limits)?;
+        let (matches, actual) = self.scan_uniform_participation(haystack, schema, prospective)?;
+        Ok(UniformParticipationResult {
+            matches,
+            capture_count: actual.capture_count,
+            accounting: UniformParticipationAccounting {
+                identity: self.uniform_participation_identity(schema),
+                prospective,
+                actual,
+            },
+        })
+    }
+
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the fixed two-stream scan keeps each source read and its checked direct-operation counter adjacent"
+    )]
+    fn scan_uniform_participation(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        prospective: UniformParticipationProspective,
+    ) -> Result<(usize, UniformParticipationActual), UniformParticipationError> {
+        let mut streams = [
+            self.alternatives[0].finder.find_iter(haystack),
+            self.alternatives[1].finder.find_iter(haystack),
+        ];
+        let mut next = [streams[0].next(), streams[1].next()];
+        let mut finder_candidates = [
+            usize::from(next[0].is_some()),
+            usize::from(next[1].is_some()),
+        ];
+        let mut selected_candidates = 0_usize;
+        let mut first_class_probes = 0_usize;
+        let mut greedy_extension_reads = 0_usize;
+        let mut matches = 0_usize;
+        let mut cursor = 0_usize;
+        loop {
+            for alternative in 0..2 {
+                while next[alternative].is_some_and(|start| start < cursor) {
+                    next[alternative] = streams[alternative].next();
+                    finder_candidates[alternative] = finder_candidates[alternative]
+                        .checked_add(usize::from(next[alternative].is_some()))
+                        .ok_or(UniformParticipationError::ArithmeticOverflow {
+                            computation: "actual finder candidates",
+                        })?;
+                }
+            }
+            let alternative = match (next[0], next[1]) {
+                (None, None) => break,
+                (Some(_), None) => 0,
+                (None, Some(_)) => 1,
+                // Alternative zero wins an equal-start tie.
+                (Some(left), Some(right)) => usize::from(right < left),
+            };
+            let start = next[alternative].ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "selected direct prefix candidate",
+            })?;
+            selected_candidates = selected_candidates.checked_add(1).ok_or(
+                UniformParticipationError::ArithmeticOverflow {
+                    computation: "selected direct prefix candidates",
+                },
+            )?;
+            next[alternative] = streams[alternative].next();
+            finder_candidates[alternative] = finder_candidates[alternative]
+                .checked_add(usize::from(next[alternative].is_some()))
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "actual finder candidates",
+                })?;
+            let prefix_end = start
+                .checked_add(self.alternatives[alternative].finder.needle().len())
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "direct prefix end",
+                })?;
+            let Some(&first_class_byte) = haystack.get(prefix_end) else {
+                continue;
+            };
+            first_class_probes = first_class_probes.checked_add(1).ok_or(
+                UniformParticipationError::ArithmeticOverflow {
+                    computation: "actual first-class probes",
+                },
+            )?;
+            if !self.alternatives[alternative]
+                .class
+                .contains(first_class_byte)
+            {
+                continue;
+            }
+            let mut end =
+                prefix_end
+                    .checked_add(1)
+                    .ok_or(UniformParticipationError::ArithmeticOverflow {
+                        computation: "direct first class byte end",
+                    })?;
+            while let Some(&byte) = haystack.get(end) {
+                greedy_extension_reads = greedy_extension_reads.checked_add(1).ok_or(
+                    UniformParticipationError::ArithmeticOverflow {
+                        computation: "actual greedy extension reads",
+                    },
+                )?;
+                if !self.alternatives[alternative].class.contains(byte) {
+                    break;
+                }
+                end = end
+                    .checked_add(1)
+                    .ok_or(UniformParticipationError::ArithmeticOverflow {
+                        computation: "direct greedy class end",
+                    })?;
+            }
+            matches =
+                matches
+                    .checked_add(1)
+                    .ok_or(UniformParticipationError::ArithmeticOverflow {
+                        computation: "direct match count",
+                    })?;
+            cursor = end;
+        }
+        let prefix_candidates = finder_candidates[0]
+            .checked_add(finder_candidates[1])
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "actual prefix candidate total",
+            })?;
+        let start_arbitrations = prefix_candidates.checked_add(selected_candidates).ok_or(
+            UniformParticipationError::ArithmeticOverflow {
+                computation: "actual start arbitration total",
+            },
+        )?;
+        let capture_count = matches
+            .checked_mul(schema.participating_with_overall)
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "actual participating capture count",
+            })?;
+        let capture_events = matches.checked_mul(schema.capture_schema_slots).ok_or(
+            UniformParticipationError::ArithmeticOverflow {
+                computation: "actual capture schema events",
+            },
+        )?;
+        let shape_work = prospective
+            .shape_units
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(64))
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "actual direct shape work",
+            })?;
+        let work = [
+            haystack.len(),
+            haystack.len(),
+            prefix_candidates,
+            start_arbitrations,
+            first_class_probes,
+            greedy_extension_reads,
+            matches,
+            capture_count,
+            capture_events,
+            shape_work,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, value| {
+            sum.checked_add(value)
+                .ok_or(UniformParticipationError::ArithmeticOverflow {
+                    computation: "actual direct total work",
+                })
+        })?;
+        let actual = UniformParticipationActual {
+            first_finder_bytes: haystack.len(),
+            second_finder_bytes: haystack.len(),
+            first_finder_candidates: finder_candidates[0],
+            second_finder_candidates: finder_candidates[1],
+            prefix_candidates,
+            start_arbitrations,
+            first_class_probes,
+            greedy_extension_reads,
+            results: matches,
+            capture_count,
+            capture_events,
+            work,
+            operation_allocations: 0,
+            operation_bytes: 0,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        ensure_uniform_actual(&actual, &prospective)?;
+        Ok((matches, actual))
+    }
+
     fn preflight(
         &self,
         haystack_len: usize,
@@ -685,6 +1311,158 @@ fn enforce_reduce(
     })
 }
 
+#[derive(Clone, Copy)]
+enum UniformParticipationResource {
+    Work,
+    FirstFinderBytes,
+    SecondFinderBytes,
+    PrefixCandidates,
+    StartArbitrations,
+    FirstClassProbes,
+    GreedyExtensionReads,
+    Results,
+    CaptureCount,
+    CaptureEvents,
+    OperationAllocations,
+    OperationBytes,
+    Scratch,
+    Peak,
+}
+
+fn enforce_uniform(
+    needed: usize,
+    limit: usize,
+    resource: UniformParticipationResource,
+) -> Result<(), UniformParticipationError> {
+    if needed <= limit {
+        return Ok(());
+    }
+    Err(match resource {
+        UniformParticipationResource::Work => {
+            UniformParticipationError::WorkLimit { needed, limit }
+        }
+        UniformParticipationResource::FirstFinderBytes => {
+            UniformParticipationError::FirstFinderBytesLimit { needed, limit }
+        }
+        UniformParticipationResource::SecondFinderBytes => {
+            UniformParticipationError::SecondFinderBytesLimit { needed, limit }
+        }
+        UniformParticipationResource::PrefixCandidates => {
+            UniformParticipationError::PrefixCandidatesLimit { needed, limit }
+        }
+        UniformParticipationResource::StartArbitrations => {
+            UniformParticipationError::StartArbitrationsLimit { needed, limit }
+        }
+        UniformParticipationResource::FirstClassProbes => {
+            UniformParticipationError::FirstClassProbesLimit { needed, limit }
+        }
+        UniformParticipationResource::GreedyExtensionReads => {
+            UniformParticipationError::GreedyExtensionReadsLimit { needed, limit }
+        }
+        UniformParticipationResource::Results => {
+            UniformParticipationError::ResultsLimit { needed, limit }
+        }
+        UniformParticipationResource::CaptureCount => {
+            UniformParticipationError::CaptureCountLimit { needed, limit }
+        }
+        UniformParticipationResource::CaptureEvents => {
+            UniformParticipationError::CaptureEventsLimit { needed, limit }
+        }
+        UniformParticipationResource::OperationAllocations => {
+            UniformParticipationError::OperationAllocationsLimit { needed, limit }
+        }
+        UniformParticipationResource::OperationBytes => {
+            UniformParticipationError::OperationBytesLimit { needed, limit }
+        }
+        UniformParticipationResource::Scratch => {
+            UniformParticipationError::ScratchLimit { needed, limit }
+        }
+        UniformParticipationResource::Peak => {
+            UniformParticipationError::PeakLimit { needed, limit }
+        }
+    })
+}
+
+fn ensure_uniform_actual(
+    actual: &UniformParticipationActual,
+    prospective: &UniformParticipationProspective,
+) -> Result<(), UniformParticipationError> {
+    for (dimension, actual, prospective) in [
+        (
+            "first finder bytes",
+            actual.first_finder_bytes,
+            prospective.first_finder_bytes,
+        ),
+        (
+            "second finder bytes",
+            actual.second_finder_bytes,
+            prospective.second_finder_bytes,
+        ),
+        (
+            "prefix candidates",
+            actual.prefix_candidates,
+            prospective.prefix_candidates,
+        ),
+        (
+            "start arbitrations",
+            actual.start_arbitrations,
+            prospective.start_arbitrations,
+        ),
+        (
+            "first class probes",
+            actual.first_class_probes,
+            prospective.first_class_probes,
+        ),
+        (
+            "greedy extension reads",
+            actual.greedy_extension_reads,
+            prospective.greedy_extension_reads,
+        ),
+        ("results", actual.results, prospective.results),
+        (
+            "capture count",
+            actual.capture_count,
+            prospective.capture_count,
+        ),
+        (
+            "capture events",
+            actual.capture_events,
+            prospective.capture_events,
+        ),
+        ("work", actual.work, prospective.work),
+        (
+            "operation allocations",
+            actual.operation_allocations,
+            prospective.operation_allocations,
+        ),
+        (
+            "operation bytes",
+            actual.operation_bytes,
+            prospective.operation_bytes,
+        ),
+        (
+            "scratch bytes",
+            actual.scratch_bytes,
+            prospective.scratch_bytes,
+        ),
+        (
+            "persistent bytes",
+            actual.persistent_bytes,
+            prospective.persistent_bytes,
+        ),
+        ("peak bytes", actual.peak_bytes, prospective.peak_bytes),
+    ] {
+        if actual > prospective {
+            return Err(UniformParticipationError::ActualEscapedProspective {
+                dimension,
+                actual,
+                prospective,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::Cell, rc::Rc};
@@ -719,6 +1497,190 @@ mod tests {
             .find_iter(haystack)
             .map(|matched| matched.start()..matched.end())
             .collect()
+    }
+
+    fn rust_functions_plan() -> PrefixClassAlternationPlan {
+        let word = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
+        PrefixClassAlternationPlan::build(
+            [b"fn is_", b"fn as_"],
+            [word.into_iter(), word.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+    }
+
+    const fn rust_functions_schema() -> UniformParticipationSchema {
+        UniformParticipationSchema {
+            participating_with_overall: 2,
+            capture_schema_slots: 3,
+        }
+    }
+
+    fn exact_uniform_limits(
+        prospective: UniformParticipationProspective,
+    ) -> UniformParticipationLimits {
+        UniformParticipationLimits {
+            max_work: prospective.work,
+            max_first_finder_bytes: prospective.first_finder_bytes,
+            max_second_finder_bytes: prospective.second_finder_bytes,
+            max_prefix_candidates: prospective.prefix_candidates,
+            max_start_arbitrations: prospective.start_arbitrations,
+            max_first_class_probes: prospective.first_class_probes,
+            max_greedy_extension_reads: prospective.greedy_extension_reads,
+            max_results: prospective.results,
+            max_capture_count: prospective.capture_count,
+            max_capture_events: prospective.capture_events,
+            max_operation_allocations: prospective.operation_allocations,
+            max_operation_bytes: prospective.operation_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_peak_bytes: prospective.peak_bytes,
+        }
+    }
+
+    #[test]
+    fn rust_functions_uniform_participation_matches_complete_reference_spans() {
+        let plan = rust_functions_plan();
+        let pattern = r"fn is_(\w+)|fn as_(\w+)";
+        for haystack in [
+            b"".as_slice(),
+            b"fn is_alpha fn as_beta",
+            b"fn is_ fn as_",
+            b"fn as_9fn is_Z",
+            b"fn is_a\x00fn as_b\xfffn is_c",
+            b"fn is_azAZ09_fn as_0__ fn is_\x80",
+        ] {
+            let spans = reference_spans(pattern, haystack);
+            let result = plan
+                .count_uniform_participation(
+                    haystack,
+                    rust_functions_schema(),
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(spans.len(), result.matches, "haystack={haystack:?}");
+            assert_eq!(spans.len() * 2, result.capture_count);
+            assert_eq!(spans.len() * 3, result.accounting.actual.capture_events);
+            assert_eq!(0, result.accounting.actual.operation_allocations);
+            assert_eq!(0, result.accounting.actual.operation_bytes);
+            assert_eq!(0, result.accounting.actual.scratch_bytes);
+            ensure_uniform_actual(&result.accounting.actual, &result.accounting.prospective)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn rust_functions_uniform_participation_exact_and_every_positive_one_below() {
+        let plan = rust_functions_plan();
+        let haystack = b"fn is_alpha fn as_beta";
+        let schema = rust_functions_schema();
+        let prospective = plan
+            .uniform_participation_prospective(
+                haystack.len(),
+                schema,
+                UniformParticipationLimits::unlimited(),
+            )
+            .unwrap();
+        let exact = exact_uniform_limits(prospective);
+        assert_eq!(
+            4,
+            plan.count_uniform_participation(haystack, schema, exact)
+                .unwrap()
+                .capture_count
+        );
+
+        macro_rules! one_below {
+            ($limit_field:ident, $prospective_field:ident, $pattern:pat) => {{
+                assert!(prospective.$prospective_field > 0);
+                let mut limits = exact;
+                limits.$limit_field = prospective.$prospective_field - 1;
+                assert!(matches!(
+                    plan.count_uniform_participation(haystack, schema, limits),
+                    Err($pattern)
+                ));
+            }};
+        }
+        one_below!(
+            max_results,
+            results,
+            UniformParticipationError::ResultsLimit { .. }
+        );
+        one_below!(
+            max_capture_count,
+            capture_count,
+            UniformParticipationError::CaptureCountLimit { .. }
+        );
+        one_below!(
+            max_capture_events,
+            capture_events,
+            UniformParticipationError::CaptureEventsLimit { .. }
+        );
+        one_below!(
+            max_first_finder_bytes,
+            first_finder_bytes,
+            UniformParticipationError::FirstFinderBytesLimit { .. }
+        );
+        one_below!(
+            max_second_finder_bytes,
+            second_finder_bytes,
+            UniformParticipationError::SecondFinderBytesLimit { .. }
+        );
+        one_below!(
+            max_prefix_candidates,
+            prefix_candidates,
+            UniformParticipationError::PrefixCandidatesLimit { .. }
+        );
+        one_below!(
+            max_start_arbitrations,
+            start_arbitrations,
+            UniformParticipationError::StartArbitrationsLimit { .. }
+        );
+        one_below!(
+            max_first_class_probes,
+            first_class_probes,
+            UniformParticipationError::FirstClassProbesLimit { .. }
+        );
+        one_below!(
+            max_greedy_extension_reads,
+            greedy_extension_reads,
+            UniformParticipationError::GreedyExtensionReadsLimit { .. }
+        );
+        one_below!(max_work, work, UniformParticipationError::WorkLimit { .. });
+        one_below!(
+            max_peak_bytes,
+            peak_bytes,
+            UniformParticipationError::PeakLimit { .. }
+        );
+    }
+
+    #[test]
+    fn rust_functions_uniform_participation_n_2n_4n_is_deterministic() {
+        let plan = rust_functions_plan();
+        let schema = rust_functions_schema();
+        let mut previous = None;
+        for n in [128, 256, 512] {
+            let prospective = plan
+                .uniform_participation_prospective(
+                    n,
+                    schema,
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(n, prospective.first_finder_bytes);
+            assert_eq!(n, prospective.second_finder_bytes);
+            assert_eq!(2 * n, prospective.prefix_candidates);
+            assert_eq!(4 * n, prospective.start_arbitrations);
+            assert_eq!(2 * n, prospective.first_class_probes);
+            assert_eq!(2 * n, prospective.greedy_extension_reads);
+            assert_eq!(n, prospective.results);
+            assert_eq!(2 * n, prospective.capture_count);
+            assert_eq!(3 * n, prospective.capture_events);
+            if let Some((previous_n, previous_work)) = previous {
+                let fixed = plan.build_accounting().shape_units * 8 + 64;
+                assert_eq!((n - previous_n) * 18, prospective.work - previous_work);
+                assert_eq!(fixed + 18 * n, prospective.work);
+            }
+            previous = Some((n, prospective.work));
+        }
     }
 
     struct DeceptiveExactRanges {
