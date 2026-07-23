@@ -3,12 +3,13 @@ use fre::{
     AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateLiteralIneligibility, AggregateOperation,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID,
-    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
-    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    AggregateOperationAttemptKind, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateStrategy,
+    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
+    PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -443,6 +444,15 @@ fn continuation_details(
         | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
             panic!("expected continuation execution details")
         }
+    }
+}
+
+fn continuation_receipt(
+    details: &AggregateExecutionDetails,
+) -> &fre::AggregateOperationAttemptReceipt {
+    match details {
+        AggregateExecutionDetails::Continuation { receipt, .. } => receipt,
+        _ => panic!("expected continuation execution receipt"),
     }
 }
 
@@ -3233,6 +3243,120 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
             required: actual,
             limit,
         }) if actual == required && limit == required - 1
+    ));
+}
+
+#[test]
+fn continuation_facades_retain_closed_operation_specific_success_and_failure_receipts() {
+    let pattern = r"(?:a+b|a)";
+    let haystack = b"aaaab a";
+    let builder = || {
+        aggregate_builder(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::FullTable)
+    };
+    let limits = AggregateRunLimits::default();
+
+    let spans_regex = builder().build_spans().unwrap();
+    let spans = spans_regex.spans(haystack, limits).unwrap();
+    let spans_receipt = continuation_receipt(&spans.report().details);
+    let (spans_certificate, spans_accounting) = continuation_details(&spans.report().details);
+    assert_eq!(
+        spans_receipt.identity.operation,
+        AggregateOperationAttemptKind::Spans
+    );
+    assert_eq!(spans_receipt.identity.limits, limits.continuation);
+    assert_eq!(
+        spans_receipt.identity.operation_id,
+        Some(spans_certificate.operation_id)
+    );
+    assert_eq!(
+        spans_receipt.identity.physical_route,
+        Some(spans_certificate.physical_route)
+    );
+    assert_eq!(spans_receipt.actual, *spans_accounting);
+    let spans_upper = spans_receipt.prospective.unwrap();
+    assert!(spans_upper.output_bytes > 0);
+    assert!(spans_upper.contains(spans_receipt.actual));
+
+    let count_regex = builder().build_count().unwrap();
+    let count = count_regex.count(haystack, limits).unwrap();
+    let count_receipt = continuation_receipt(&count.report().details);
+    assert_eq!(
+        count_receipt.identity.operation,
+        AggregateOperationAttemptKind::Count
+    );
+    assert!(
+        count_receipt
+            .prospective
+            .is_some_and(|upper| upper.contains(count_receipt.actual))
+    );
+    let count_steady = count_regex.count(haystack, limits).unwrap();
+    let count_steady_receipt = continuation_receipt(&count_steady.report().details);
+    assert_eq!(count_steady_receipt.identity, count_receipt.identity);
+    assert_eq!(count_steady_receipt.prospective, count_receipt.prospective);
+
+    let sum_regex = builder().build_span_sum().unwrap();
+    let sum = sum_regex.span_sum(haystack, limits).unwrap();
+    let sum_receipt = continuation_receipt(&sum.report().details);
+    assert_eq!(
+        sum_receipt.identity.operation,
+        AggregateOperationAttemptKind::SpanSum
+    );
+    let sum_upper = sum_receipt.prospective.unwrap();
+    assert_eq!(sum_upper.span_sum, haystack.len());
+    assert!(sum_upper.contains(sum_receipt.actual));
+    assert_ne!(
+        spans_receipt.identity.operation_id,
+        count_receipt.identity.operation_id
+    );
+    assert_ne!(
+        count_receipt.identity.operation_id,
+        sum_receipt.identity.operation_id
+    );
+
+    let mut spans_below = limits;
+    spans_below.continuation.max_output_bytes = spans_upper.output_bytes - 1;
+    let spans_error = spans_regex.spans(haystack, spans_below).unwrap_err();
+    assert!(spans_error.has_closed_continuation_attempt());
+    let spans_failure_receipt = spans_error.continuation_receipt().unwrap();
+    assert_eq!(
+        spans_failure_receipt.identity.operation,
+        AggregateOperationAttemptKind::Spans
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.limits,
+        spans_below.continuation
+    );
+    assert_eq!(spans_failure_receipt.prospective, Some(spans_upper));
+    assert!(matches!(
+        spans_error.source,
+        AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::OutputBytes,
+            required,
+            limit,
+        }) if required == spans_upper.output_bytes && limit + 1 == required
+    ));
+
+    let mut sum_below = limits;
+    sum_below.continuation.max_span_sum = sum_upper.span_sum - 1;
+    let sum_error = sum_regex.span_sum(haystack, sum_below).unwrap_err();
+    assert!(sum_error.has_closed_continuation_attempt());
+    let sum_failure_receipt = sum_error.continuation_receipt().unwrap();
+    assert_eq!(
+        sum_failure_receipt.identity.operation,
+        AggregateOperationAttemptKind::SpanSum
+    );
+    assert_eq!(sum_failure_receipt.identity.limits, sum_below.continuation);
+    assert_eq!(sum_failure_receipt.prospective, Some(sum_upper));
+    assert!(matches!(
+        sum_error.source,
+        AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::SpanSum,
+            required,
+            limit,
+        }) if required == sum_upper.span_sum && limit + 1 == required
     ));
 }
 
