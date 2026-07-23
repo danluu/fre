@@ -275,6 +275,26 @@ impl fmt::Display for CountError {
 
 impl std::error::Error for CountError {}
 
+/// Terminal count refusal together with every execution effect committed
+/// before that refusal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CountAttemptError {
+    pub source: CountError,
+    pub actual: CountActual,
+}
+
+impl fmt::Display for CountAttemptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for CountAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug)]
 pub struct RequiredInternalAnchorPlan {
     prefix: ByteClass,
@@ -436,46 +456,76 @@ impl RequiredInternalAnchorPlan {
 
     /// Count leftmost-first non-overlapping matches after complete preflight.
     pub fn count(&self, haystack: &[u8], limits: CountLimits) -> Result<CountResult, CountError> {
-        let upper = self.count_upper_bounds(haystack.len())?;
-        enforce(&upper, limits)?;
+        self.count_attempt(haystack, limits)
+            .map_err(|error| error.source)
+    }
+
+    /// Count while retaining exact terminal accounting when an invariant or
+    /// arithmetic refusal occurs after source access.
+    pub fn count_attempt(
+        &self,
+        haystack: &[u8],
+        limits: CountLimits,
+    ) -> Result<CountResult, CountAttemptError> {
+        let upper =
+            self.count_upper_bounds(haystack.len())
+                .map_err(|source| CountAttemptError {
+                    source,
+                    actual: CountActual::default(),
+                })?;
+        enforce(&upper, limits).map_err(|source| CountAttemptError {
+            source,
+            actual: CountActual::default(),
+        })?;
         let mut actual = CountActual::default();
-        actual.control_work = add(actual.control_work, 1, "operation initialization")?;
-        let mut search = 0_usize;
-        let mut match_floor = 0_usize;
-        while search <= haystack.len() {
-            actual.control_work = add(actual.control_work, 1, "finder dispatch")?;
-            actual.finder_calls = add(actual.finder_calls, 1, "finder calls")?;
-            let Some(candidate) = self.find_anchor(haystack, search, &mut actual)? else {
-                actual.control_work = add(actual.control_work, 1, "terminal finder miss")?;
-                break;
-            };
-            actual.control_work = add(actual.control_work, 1, "candidate dispatch")?;
-            actual.candidate_visits = add(actual.candidate_visits, 1, "candidate visits")?;
-            let after_anchor = add(candidate, self.anchor().len(), "after anchor")?;
-            let prefix_start = self.prefix_start(haystack, candidate, match_floor, &mut actual)?;
-            actual.control_work = add(actual.control_work, 1, "prefix result")?;
-            let Some(start) = prefix_start else {
-                search = after_anchor;
-                continue;
-            };
-            let continuation = self.verify_continuation(haystack, after_anchor, &mut actual)?;
-            actual.control_work = add(actual.control_work, 1, "continuation result")?;
-            let Some(end) = continuation else {
-                search = after_anchor;
-                continue;
-            };
-            actual.control_work = add(actual.control_work, 1, "match reduction")?;
-            debug_assert!(start < end);
-            actual.matches = actual
-                .matches
-                .checked_add(1)
-                .ok_or(CountError::Overflow("matches"))?;
-            search = end;
-            match_floor = end;
+        let execution = (|| {
+            actual.control_work = add(actual.control_work, 1, "operation initialization")?;
+            let mut search = 0_usize;
+            let mut match_floor = 0_usize;
+            while search <= haystack.len() {
+                actual.control_work = add(actual.control_work, 1, "finder dispatch")?;
+                actual.finder_calls = add(actual.finder_calls, 1, "finder calls")?;
+                let Some(candidate) = self.find_anchor(haystack, search, &mut actual)? else {
+                    actual.control_work = add(actual.control_work, 1, "terminal finder miss")?;
+                    break;
+                };
+                actual.control_work = add(actual.control_work, 1, "candidate dispatch")?;
+                actual.candidate_visits = add(actual.candidate_visits, 1, "candidate visits")?;
+                let after_anchor = add(candidate, self.anchor().len(), "after anchor")?;
+                let prefix_start =
+                    self.prefix_start(haystack, candidate, match_floor, &mut actual)?;
+                actual.control_work = add(actual.control_work, 1, "prefix result")?;
+                let Some(start) = prefix_start else {
+                    search = after_anchor;
+                    continue;
+                };
+                let continuation = self.verify_continuation(haystack, after_anchor, &mut actual)?;
+                actual.control_work = add(actual.control_work, 1, "continuation result")?;
+                let Some(end) = continuation else {
+                    search = after_anchor;
+                    continue;
+                };
+                actual.control_work = add(actual.control_work, 1, "match reduction")?;
+                debug_assert!(start < end);
+                actual.matches = actual
+                    .matches
+                    .checked_add(1)
+                    .ok_or(CountError::Overflow("matches"))?;
+                search = end;
+                match_floor = end;
+            }
+            actual.control_work = add(actual.control_work, 1, "operation finalization")?;
+            Ok(())
+        })();
+        if let Err(source) = execution {
+            if let Err(source) = finish_actual(&mut actual, self.build.persistent_bytes) {
+                return Err(CountAttemptError { source, actual });
+            }
+            return Err(CountAttemptError { source, actual });
         }
-        actual.control_work = add(actual.control_work, 1, "operation finalization")?;
-        finish_actual(&mut actual, self.build.persistent_bytes)?;
-        check_actual(&actual, &upper)?;
+        finish_actual(&mut actual, self.build.persistent_bytes)
+            .map_err(|source| CountAttemptError { source, actual })?;
+        check_actual(&actual, &upper).map_err(|source| CountAttemptError { source, actual })?;
         Ok(CountResult {
             count: actual.matches,
             accounting: CountAccounting {
@@ -1251,6 +1301,29 @@ mod tests {
             assert_eq!(result.accounting.upper_bounds.allocations, 0);
             assert_eq!(result.accounting.upper_bounds.scratch_bytes, 0);
         }
+    }
+
+    #[test]
+    fn terminal_attempt_retains_source_effects_and_legacy_error() {
+        let mut plan = uri_plan();
+        // Simulate a post-construction descriptor-integrity failure that is
+        // reachable only after the finder, prefix and two valid optional
+        // stages have consumed source.
+        plan.continuation.optional_count = 3;
+        let haystack = b"x://a/b?q=x#f";
+        let legacy = plan
+            .count(haystack, CountLimits::default())
+            .expect_err("missing sealed third stage must refuse");
+        let failure = plan
+            .count_attempt(haystack, CountLimits::default())
+            .expect_err("audited attempt must preserve the same refusal");
+        assert_eq!(failure.source, legacy);
+        assert!(failure.actual.finder_source_accesses > 0);
+        assert!(failure.actual.prefix_steps > 0);
+        assert!(failure.actual.continuation_steps > 0);
+        assert!(failure.actual.source_accesses > 0);
+        assert!(failure.actual.work > 0);
+        assert_eq!(failure.actual.allocations, 0);
     }
 
     fn exact_count_limits(upper: CountUpperBounds) -> CountLimits {

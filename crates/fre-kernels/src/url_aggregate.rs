@@ -165,6 +165,27 @@ pub struct SpanSumResult {
     pub accounting: ReduceAccounting,
 }
 
+/// Terminal URL-reduction refusal together with every effect committed before
+/// that refusal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReduceAttemptError {
+    pub source: ReduceError,
+    pub accounting: ReduceAccounting,
+    pub actual_allocations: usize,
+}
+
+impl fmt::Display for ReduceAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for ReduceAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -603,89 +624,135 @@ impl UrlAggregatePlan {
         range: Range<usize>,
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
+        self.span_sum_attempt(haystack, range, limits)
+            .map_err(|error| error.source)
+    }
+
+    /// Return count and matched-byte sum while retaining exact terminal
+    /// accounting when execution refuses after source access or allocation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps exact candidate ordering, metering, output publication and terminal accounting auditable"
+    )]
+    pub fn span_sum_attempt(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceAttemptError> {
         if range.start > range.end || range.end > haystack.len() {
-            return Err(ReduceError::InvalidRange {
-                start: range.start,
-                end: range.end,
-                haystack_len: haystack.len(),
+            return Err(ReduceAttemptError {
+                source: ReduceError::InvalidRange {
+                    start: range.start,
+                    end: range.end,
+                    haystack_len: haystack.len(),
+                },
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
             });
         }
         let input_bytes = range.end - range.start;
-        reduce_enforce("input bytes", input_bytes, limits.max_input_bytes)?;
-        let boundaries = reduce_add(input_bytes, 1, "boundaries")?;
-        reduce_enforce("boundaries", boundaries, limits.max_boundaries)?;
-        let mut meter = Meter::new(limits, input_bytes, boundaries);
-
-        // First pass determines the one exact reusable per-segment workspace.
-        let mut segment_bytes = 0_usize;
-        let mut segment_peak = 0_usize;
-        for position in range.clone() {
-            let byte = sequential_read(haystack, position, &mut meter)?;
-            if is_delimiter(byte) {
-                segment_peak = segment_peak.max(segment_bytes);
-                segment_bytes = 0;
-            } else {
-                segment_bytes = reduce_add(segment_bytes, 1, "segment bytes")?;
+        reduce_enforce("input bytes", input_bytes, limits.max_input_bytes).map_err(|source| {
+            ReduceAttemptError {
+                source,
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
             }
-        }
-        segment_peak = segment_peak.max(segment_bytes);
-        meter.accounting.segment_peak_bytes = segment_peak;
-        let record_count = reduce_add(segment_peak, 1, "candidate records")?;
-        let scratch_bytes =
-            reduce_mul(record_count, size_of::<CandidateRecord>(), "scratch bytes")?;
-        reduce_enforce(
-            "random access storage bytes",
-            scratch_bytes,
-            limits.max_random_access_storage_bytes,
-        )?;
-        reduce_enforce("scratch bytes", scratch_bytes, limits.max_scratch_bytes)?;
-        let peak_bytes = scratch_bytes;
-        reduce_enforce("peak bytes", peak_bytes, limits.max_peak_bytes)?;
-        // Prepay the allocator call and eventual deallocation before the
-        // exact candidate-record allocation is attempted.
-        meter.work(2)?;
-        let mut records = exact_reduce_vec(record_count, "candidate records")?;
-        for _ in 0..record_count {
-            meter.work(1)?;
-            records.try_push(CandidateRecord::EMPTY).map_err(|_| {
-                ReduceError::Invariant("candidate initialization exceeded exact capacity")
+        })?;
+        let boundaries =
+            reduce_add(input_bytes, 1, "boundaries").map_err(|source| ReduceAttemptError {
+                source,
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
             })?;
-        }
-        meter.accounting.scratch_bytes = scratch_bytes;
-        meter.accounting.random_access_storage_bytes = scratch_bytes;
-        meter.accounting.peak_bytes = peak_bytes;
-
-        let mut cursor = range.start;
-        let mut segment_start = range.start;
-        let mut position = range.start;
-        while position <= range.end {
-            let at_end = position == range.end;
-            let byte = if at_end {
-                None
-            } else {
-                Some(sequential_read(haystack, position, &mut meter)?)
-            };
-            if at_end || byte.is_some_and(is_delimiter) {
-                if segment_start < position {
-                    meter.accounting.segments =
-                        reduce_add(meter.accounting.segments, 1, "segments")?;
-                    self.process_segment(
-                        haystack,
-                        segment_start,
-                        position,
-                        &mut cursor,
-                        &mut records,
-                        &mut meter,
-                    )?;
-                }
-                segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
+        reduce_enforce("boundaries", boundaries, limits.max_boundaries).map_err(|source| {
+            ReduceAttemptError {
+                source,
+                accounting: ReduceAccounting::default(),
+                actual_allocations: 0,
             }
-            position = reduce_add(position, 1, "input cursor")?;
-        }
-        Ok(SpanSumResult {
-            value: meter.accounting.span_sum,
-            matches: meter.accounting.matches,
+        })?;
+        let mut meter = Meter::new(limits, input_bytes, boundaries);
+        let mut actual_allocations = 0_usize;
+
+        let result = (|| {
+            // First pass determines the one exact reusable per-segment workspace.
+            let mut segment_bytes = 0_usize;
+            let mut segment_peak = 0_usize;
+            for position in range.clone() {
+                let byte = sequential_read(haystack, position, &mut meter)?;
+                if is_delimiter(byte) {
+                    segment_peak = segment_peak.max(segment_bytes);
+                    segment_bytes = 0;
+                } else {
+                    segment_bytes = reduce_add(segment_bytes, 1, "segment bytes")?;
+                }
+            }
+            segment_peak = segment_peak.max(segment_bytes);
+            meter.accounting.segment_peak_bytes = segment_peak;
+            let record_count = reduce_add(segment_peak, 1, "candidate records")?;
+            let scratch_bytes =
+                reduce_mul(record_count, size_of::<CandidateRecord>(), "scratch bytes")?;
+            reduce_enforce(
+                "random access storage bytes",
+                scratch_bytes,
+                limits.max_random_access_storage_bytes,
+            )?;
+            reduce_enforce("scratch bytes", scratch_bytes, limits.max_scratch_bytes)?;
+            let peak_bytes = scratch_bytes;
+            reduce_enforce("peak bytes", peak_bytes, limits.max_peak_bytes)?;
+            // Prepay the allocator call and eventual deallocation before the
+            // exact candidate-record allocation is attempted.
+            meter.work(2)?;
+            let mut records = exact_reduce_vec(record_count, "candidate records")?;
+            actual_allocations = usize::from(record_count != 0);
+            meter.accounting.scratch_bytes = scratch_bytes;
+            meter.accounting.random_access_storage_bytes = scratch_bytes;
+            meter.accounting.peak_bytes = peak_bytes;
+            for _ in 0..record_count {
+                meter.work(1)?;
+                records.try_push(CandidateRecord::EMPTY).map_err(|_| {
+                    ReduceError::Invariant("candidate initialization exceeded exact capacity")
+                })?;
+            }
+
+            let mut cursor = range.start;
+            let mut segment_start = range.start;
+            let mut position = range.start;
+            while position <= range.end {
+                let at_end = position == range.end;
+                let byte = if at_end {
+                    None
+                } else {
+                    Some(sequential_read(haystack, position, &mut meter)?)
+                };
+                if at_end || byte.is_some_and(is_delimiter) {
+                    if segment_start < position {
+                        meter.accounting.segments =
+                            reduce_add(meter.accounting.segments, 1, "segments")?;
+                        self.process_segment(
+                            haystack,
+                            segment_start,
+                            position,
+                            &mut cursor,
+                            &mut records,
+                            &mut meter,
+                        )?;
+                    }
+                    segment_start = reduce_add(position, usize::from(!at_end), "segment start")?;
+                }
+                position = reduce_add(position, 1, "input cursor")?;
+            }
+            Ok(SpanSumResult {
+                value: meter.accounting.span_sum,
+                matches: meter.accounting.matches,
+                accounting: meter.accounting,
+            })
+        })();
+        result.map_err(|source| ReduceAttemptError {
+            source,
             accounting: meter.accounting,
+            actual_allocations,
         })
     }
 
@@ -1765,6 +1832,38 @@ mod tests {
                 Err(ReduceError::Resource { .. })
             ));
         }
+    }
+
+    #[test]
+    fn terminal_attempt_retains_reads_and_committed_workspace_allocation() {
+        let plan = plan(&["COM"]);
+        let haystack = b"a.com";
+        // The first census costs one work unit per byte, allocator
+        // bookkeeping costs two, and this ceiling admits exactly one record
+        // initialization before the next one refuses.
+        let limits = ReduceLimits {
+            max_work: haystack.len() + 3,
+            ..ReduceLimits::default()
+        };
+        let legacy = plan
+            .span_sum(haystack, 0..haystack.len(), limits)
+            .expect_err("record initialization must hit the work ceiling");
+        let failure = plan
+            .span_sum_attempt(haystack, 0..haystack.len(), limits)
+            .expect_err("audited attempt must preserve the same refusal");
+        assert_eq!(failure.source, legacy);
+        assert_eq!(failure.actual_allocations, 1);
+        assert_eq!(failure.accounting.sequential_bytes, haystack.len());
+        assert!(failure.accounting.work > haystack.len());
+        assert!(failure.accounting.scratch_bytes > 0);
+        assert_eq!(
+            failure.accounting.random_access_storage_bytes,
+            failure.accounting.scratch_bytes
+        );
+        assert_eq!(
+            failure.accounting.peak_bytes,
+            failure.accounting.scratch_bytes
+        );
     }
 
     #[test]

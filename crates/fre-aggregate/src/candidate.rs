@@ -145,6 +145,13 @@ pub(crate) struct CountResult {
     pub(crate) accounting: ExecutionAccounting,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CountAttemptError {
+    pub(crate) source: Error,
+    pub(crate) accounting: ExecutionAccounting,
+    pub(crate) actual_allocations: usize,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "candidate execution keeps validation, metering, scheduling and ordered draining visible"
@@ -156,11 +163,29 @@ pub(crate) fn count(
     range: Range<usize>,
     limits: OperationLimits,
 ) -> Result<CountResult, Error> {
+    count_attempt(plan, program, haystack, range, limits).map_err(|error| error.source)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "candidate execution keeps validation, metering, scheduling, ordered draining and terminal accounting visible"
+)]
+pub(crate) fn count_attempt(
+    plan: &Plan,
+    program: &Program,
+    haystack: &[u8],
+    range: Range<usize>,
+    limits: OperationLimits,
+) -> Result<CountResult, CountAttemptError> {
     if range.start > range.end || range.end > haystack.len() {
-        return Err(Error::InvalidRange {
-            start: range.start,
-            end: range.end,
-            haystack_len: haystack.len(),
+        return Err(CountAttemptError {
+            source: Error::InvalidRange {
+                start: range.start,
+                end: range.end,
+                haystack_len: haystack.len(),
+            },
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
         });
     }
     if plan.entries.len() < 2
@@ -169,139 +194,163 @@ pub(crate) fn count(
         || plan.global_buckets.len() != BUCKETS
         || !executable_for(program)
     {
-        return Err(Error::InternalInvariant(
-            "candidate plan no longer matches its byte-program proof",
-        ));
+        return Err(CountAttemptError {
+            source: Error::InternalInvariant(
+                "candidate plan no longer matches its byte-program proof",
+            ),
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        });
     }
     let local = &haystack[range.clone()];
-    let boundaries = add(local.len(), 1, Resource::Boundaries)?;
-    enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
-    let assertions = AssertionContext::new(haystack, range.start, local.len())?;
+    let boundaries =
+        add(local.len(), 1, Resource::Boundaries).map_err(|source| CountAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        })?;
+    enforce(boundaries, limits.max_boundaries, Resource::Boundaries).map_err(|source| {
+        CountAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        }
+    })?;
+    let assertions =
+        AssertionContext::new(haystack, range.start, local.len()).map_err(|source| {
+            CountAttemptError {
+                source,
+                accounting: ExecutionAccounting::default(),
+                actual_allocations: 0,
+            }
+        })?;
     let mut meter = Meter::new(limits);
-    let mut workspace = Workspace::new(
-        program.insts.len(),
-        add(plan.max_offset, 1, Resource::ScratchBytes)?,
-        &mut meter,
-    )?;
-    let mut next_start = 0_usize;
-    let mut cursor = 0_usize;
+    let mut allocations = AllocationLedger::default();
     let mut matches = 0_usize;
     let mut candidates = 0_usize;
-    let eligible = globally_present_owners(plan, local, &mut meter)?;
+    let result = (|| {
+        let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
+        let mut workspace =
+            Workspace::new(program.insts.len(), schedule, &mut meter, &mut allocations)?;
+        let mut next_start = 0_usize;
+        let mut cursor = 0_usize;
+        let eligible = globally_present_owners(plan, local, &mut meter)?;
 
-    for position in 0..local.len() {
-        meter.charge_work(1)?; // one source/bucket visit
-        meter.charge_sequential(1)?;
-        let byte = *local.get(position).ok_or(Error::InternalInvariant(
-            "candidate source position outside range",
-        ))?;
-        let mut owners = *plan
-            .buckets
-            .get(usize::from(byte))
-            .ok_or(Error::InternalInvariant("candidate bucket outside table"))?;
-        owners &= eligible;
-        while owners != 0 {
-            meter.charge_work(1)?; // one owner selection
-            let ordinal = take_owner(&mut owners)?;
-            let entry = plan
-                .entries
-                .get(ordinal)
-                .ok_or(Error::InternalInvariant("candidate owner outside entries"))?;
-            if !filter_matches(entry, local, position, &mut meter)? {
-                continue;
-            }
-            if position < entry.min_offset {
-                continue;
-            }
-            let first = position.saturating_sub(entry.max_offset);
-            let last = position
-                .checked_sub(entry.min_offset)
-                .ok_or(Error::InternalInvariant(
-                    "candidate minimum offset underflow",
-                ))?;
-            for start in first.max(next_start)..=last {
-                meter.charge_work(1)?; // one candidate-interval publication attempt
-                if let Some(assertion) = entry.leading_assertion {
-                    meter.charge_assertion()?;
-                    meter.charge_random(assertions.candidate_source_bytes(assertion, start)?)?;
-                    if !assertions.is_match(assertion, start)? {
-                        continue;
+        for position in 0..local.len() {
+            meter.charge_work(1)?; // one source/bucket visit
+            meter.charge_sequential(1)?;
+            let byte = *local.get(position).ok_or(Error::InternalInvariant(
+                "candidate source position outside range",
+            ))?;
+            let mut owners = *plan
+                .buckets
+                .get(usize::from(byte))
+                .ok_or(Error::InternalInvariant("candidate bucket outside table"))?;
+            owners &= eligible;
+            while owners != 0 {
+                meter.charge_work(1)?; // one owner selection
+                let ordinal = take_owner(&mut owners)?;
+                let entry = plan
+                    .entries
+                    .get(ordinal)
+                    .ok_or(Error::InternalInvariant("candidate owner outside entries"))?;
+                if !filter_matches(entry, local, position, &mut meter)? {
+                    continue;
+                }
+                if position < entry.min_offset {
+                    continue;
+                }
+                let first = position.saturating_sub(entry.max_offset);
+                let last =
+                    position
+                        .checked_sub(entry.min_offset)
+                        .ok_or(Error::InternalInvariant(
+                            "candidate minimum offset underflow",
+                        ))?;
+                for start in first.max(next_start)..=last {
+                    meter.charge_work(1)?; // one candidate-interval publication attempt
+                    if let Some(assertion) = entry.leading_assertion {
+                        meter.charge_assertion()?;
+                        meter
+                            .charge_random(assertions.candidate_source_bytes(assertion, start)?)?;
+                        if !assertions.is_match(assertion, start)? {
+                            continue;
+                        }
+                    }
+                    let slot = ring_slot(start, workspace.schedule.len())?;
+                    let owner = owner_bit(ordinal)?;
+                    let scheduled =
+                        workspace
+                            .schedule
+                            .get_mut(slot)
+                            .ok_or(Error::InternalInvariant(
+                                "candidate schedule slot outside ring",
+                            ))?;
+                    if *scheduled & owner == 0 {
+                        let required = add(candidates, 1, Resource::MatchEvents)?;
+                        enforce(required, limits.max_match_events, Resource::MatchEvents)?;
+                        candidates = required;
+                        *scheduled |= owner;
                     }
                 }
-                let slot = ring_slot(start, workspace.schedule.len())?;
-                let owner = owner_bit(ordinal)?;
-                let scheduled =
-                    workspace
-                        .schedule
-                        .get_mut(slot)
+            }
+            if position >= plan.max_offset {
+                let safe_through =
+                    position
+                        .checked_sub(plan.max_offset)
                         .ok_or(Error::InternalInvariant(
-                            "candidate schedule slot outside ring",
+                            "candidate safe frontier underflow",
                         ))?;
-                if *scheduled & owner == 0 {
-                    let required = add(candidates, 1, Resource::MatchEvents)?;
-                    enforce(required, limits.max_match_events, Resource::MatchEvents)?;
-                    candidates = required;
-                    *scheduled |= owner;
+                while next_start <= safe_through {
+                    process_start(
+                        plan,
+                        program,
+                        local,
+                        assertions,
+                        next_start,
+                        &mut cursor,
+                        &mut matches,
+                        &mut workspace,
+                        &mut meter,
+                    )?;
+                    next_start = add(next_start, 1, Resource::Boundaries)?;
                 }
             }
         }
-        if position >= plan.max_offset {
-            let safe_through =
-                position
-                    .checked_sub(plan.max_offset)
-                    .ok_or(Error::InternalInvariant(
-                        "candidate safe frontier underflow",
-                    ))?;
-            while next_start <= safe_through {
-                process_start(
-                    plan,
-                    program,
-                    local,
-                    assertions,
-                    next_start,
-                    &mut cursor,
-                    &mut matches,
-                    &mut workspace,
-                    &mut meter,
-                )?;
-                next_start = add(next_start, 1, Resource::Boundaries)?;
-            }
+        while next_start < local.len() {
+            process_start(
+                plan,
+                program,
+                local,
+                assertions,
+                next_start,
+                &mut cursor,
+                &mut matches,
+                &mut workspace,
+                &mut meter,
+            )?;
+            next_start = add(next_start, 1, Resource::Boundaries)?;
         }
+        if workspace.bytes != allocations.bytes {
+            return Err(Error::InternalInvariant(
+                "candidate workspace diverged from allocation ledger",
+            ));
+        }
+        Ok(())
+    })();
+    let accounting = candidate_attempt_accounting(&meter, allocations.bytes, candidates, matches);
+    match result {
+        Ok(()) => Ok(CountResult {
+            value: matches,
+            candidates,
+            accounting,
+        }),
+        Err(source) => Err(CountAttemptError {
+            source,
+            accounting,
+            actual_allocations: allocations.count,
+        }),
     }
-    while next_start < local.len() {
-        process_start(
-            plan,
-            program,
-            local,
-            assertions,
-            next_start,
-            &mut cursor,
-            &mut matches,
-            &mut workspace,
-            &mut meter,
-        )?;
-        next_start = add(next_start, 1, Resource::Boundaries)?;
-    }
-    let accounting = ExecutionAccounting {
-        root_probes: candidates,
-        successful_paths: matches,
-        emitted_matches: matches,
-        sequential_bytes_read: meter.sequential,
-        random_access_bytes_read: meter.random,
-        random_access_peak_bytes: workspace.bytes,
-        scratch_peak_bytes: workspace.bytes,
-        peak_bytes: workspace.bytes,
-        state_evaluations: meter.states,
-        transition_checks: meter.transitions,
-        assertion_checks: meter.assertions,
-        work: meter.work,
-        ..ExecutionAccounting::default()
-    };
-    Ok(CountResult {
-        value: matches,
-        candidates,
-        accounting,
-    })
 }
 
 fn filter_matches(
@@ -453,6 +502,50 @@ fn process_start(
     Ok(())
 }
 
+#[derive(Default)]
+struct AllocationLedger {
+    count: usize,
+    bytes: usize,
+}
+
+impl AllocationLedger {
+    fn record<T>(&mut self, capacity: usize) -> Result<(), Error> {
+        if capacity == 0 {
+            return Ok(());
+        }
+        self.count = add(self.count, 1, Resource::Allocations)?;
+        self.bytes = add(
+            self.bytes,
+            mul(capacity, size_of::<T>(), Resource::ScratchBytes)?,
+            Resource::ScratchBytes,
+        )?;
+        Ok(())
+    }
+}
+
+fn candidate_attempt_accounting(
+    meter: &Meter,
+    workspace_bytes: usize,
+    candidates: usize,
+    matches: usize,
+) -> ExecutionAccounting {
+    ExecutionAccounting {
+        root_probes: candidates,
+        successful_paths: matches,
+        emitted_matches: matches,
+        sequential_bytes_read: meter.sequential,
+        random_access_bytes_read: meter.random,
+        random_access_peak_bytes: workspace_bytes,
+        scratch_peak_bytes: workspace_bytes,
+        peak_bytes: workspace_bytes,
+        state_evaluations: meter.states,
+        transition_checks: meter.transitions,
+        assertion_checks: meter.assertions,
+        work: meter.work,
+        ..ExecutionAccounting::default()
+    }
+}
+
 struct Workspace {
     schedule: ExactVec<u128>,
     stack: ExactVec<u16>,
@@ -464,7 +557,12 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(states: usize, schedule: usize, meter: &mut Meter) -> Result<Self, Error> {
+    fn new(
+        states: usize,
+        schedule: usize,
+        meter: &mut Meter,
+        allocations: &mut AllocationLedger,
+    ) -> Result<Self, Error> {
         if states == 0 || states > usize::from(u16::MAX) {
             return Err(Error::InternalInvariant(
                 "candidate verifier state count outside compact workspace",
@@ -510,11 +608,11 @@ impl Workspace {
         )?;
         meter.charge_work(initialized)?;
         Ok(Self {
-            schedule: exact_filled(schedule, 0_u128, Resource::ScratchBytes)?,
-            stack: exact_filled(stack, 0_u16, Resource::ScratchBytes)?,
-            current: exact_filled(states, 0_u16, Resource::ScratchBytes)?,
-            next: exact_filled(states, 0_u16, Resource::ScratchBytes)?,
-            seen: exact_filled(states, 0_u32, Resource::ScratchBytes)?,
+            schedule: exact_filled(schedule, 0_u128, Resource::ScratchBytes, allocations)?,
+            stack: exact_filled(stack, 0_u16, Resource::ScratchBytes, allocations)?,
+            current: exact_filled(states, 0_u16, Resource::ScratchBytes, allocations)?,
+            next: exact_filled(states, 0_u16, Resource::ScratchBytes, allocations)?,
+            seen: exact_filled(states, 0_u32, Resource::ScratchBytes, allocations)?,
             generation: 0,
             bytes,
         })
@@ -540,9 +638,11 @@ fn exact_filled<T: Copy>(
     length: usize,
     value: T,
     resource: Resource,
+    allocations: &mut AllocationLedger,
 ) -> Result<ExactVec<T>, Error> {
     let mut output = ExactVec::try_with_capacity(length)
         .map_err(|error| allocation_error(error, resource, length))?;
+    allocations.record::<T>(output.capacity())?;
     for _ in 0..length {
         output
             .try_push(value)
@@ -1042,6 +1142,33 @@ mod tests {
                 "one-below {resource:?} did not refuse"
             );
         }
+    }
+
+    #[test]
+    fn terminal_attempt_retains_all_workspace_allocations_and_legacy_error() {
+        let compiled = compiled(r"\bprefix.{0,4}Z|[0-9]{1,3}-x|ab+");
+        let plan = compiled.candidate.as_ref().unwrap();
+        let haystack = b"prefix12Z";
+        let limits = OperationLimits {
+            max_sequential_bytes: 0,
+            ..OperationLimits::default()
+        };
+        let legacy = count(plan, &compiled.program, haystack, 0..haystack.len(), limits)
+            .expect_err("first source census must hit the sequential ceiling");
+        let failure = count_attempt(plan, &compiled.program, haystack, 0..haystack.len(), limits)
+            .expect_err("audited attempt must preserve the same refusal");
+        assert_eq!(failure.source, legacy);
+        assert_eq!(failure.actual_allocations, 5);
+        assert!(failure.accounting.work > 0);
+        assert!(failure.accounting.random_access_peak_bytes > 0);
+        assert_eq!(
+            failure.accounting.random_access_peak_bytes,
+            failure.accounting.scratch_peak_bytes
+        );
+        assert_eq!(
+            failure.accounting.peak_bytes,
+            failure.accounting.scratch_peak_bytes
+        );
     }
 
     #[test]
