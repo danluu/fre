@@ -1731,6 +1731,11 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
             reference_count(pattern, &haystack),
             "byte={byte:#04x}"
         );
+        assert_eq!(
+            capture_records(&regex, &haystack),
+            reference_records(pattern, &haystack),
+            "capture shadow byte={byte:#04x}"
+        );
     }
 
     let haystack = b"fn is_alpha fn as_beta";
