@@ -56,8 +56,8 @@ use fre::{
     OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
     PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder, PrefixClassAlternationBuildError,
     PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, RustProfile, SHEBANG_CAPTURE_PATTERN,
-    SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits, RustProfile,
+    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
     SPACE_AROUND_OPERATOR_INSPECTION_WORK, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits,
@@ -4836,12 +4836,17 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
         engine,
         selector,
         max_prefix_class_participation_planner_work: limits.fre_literal_planner_work,
-        prefix_class_participation: PrefixClassAlternationBuildLimits {
+        prefix_class_participation: PrefixClassUniformParticipationBuildLimits {
             max_shape_units: limits.pattern_bytes_per_job,
             max_build_work: limits.fre_aggregate_compile_work,
             max_scratch_bytes: 0,
             max_persistent_bytes: limits.fre_aggregate_program_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
+            max_allocations: 2,
+            max_copied_prefix_bytes: limits.pattern_bytes_per_job,
+            max_finder_preprocess_input_bytes: limits.pattern_bytes_per_job,
+            max_initialized_bitmap_bytes: 64,
+            max_retained_capacity_bytes: limits.fre_aggregate_program_bytes,
         },
         ..defaults
     }

@@ -1636,7 +1636,7 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
     assert_eq!(direct_build.allocations, 2);
     assert_eq!(direct_build.copied_prefix_bytes, direct_build.prefix_bytes);
     assert_eq!(
-        direct_build.finder_preprocess_bytes,
+        direct_build.finder_preprocess_input_bytes,
         direct_build.prefix_bytes
     );
     assert_eq!(direct_build.initialized_bitmap_bytes, 64);
@@ -1980,12 +1980,17 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
     // below retains the already-built U3 route before publication.
     let exact_build_limits = CaptureBuildLimits {
         max_prefix_class_participation_planner_work: build.prefix_class_participation_planner_work,
-        prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+        prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
             max_shape_units: direct_build.shape_units,
             max_build_work: direct_build.work_upper_bound,
             max_scratch_bytes: direct_build.scratch_bytes,
             max_persistent_bytes: direct_build.persistent_bytes,
             max_peak_bytes: direct_build.peak_bytes,
+            max_allocations: direct_build.allocations,
+            max_copied_prefix_bytes: direct_build.copied_prefix_bytes,
+            max_finder_preprocess_input_bytes: direct_build.finder_preprocess_input_bytes,
+            max_initialized_bitmap_bytes: direct_build.initialized_bitmap_bytes,
+            max_retained_capacity_bytes: direct_build.retained_capacity_bytes,
         },
         ..CaptureBuildLimits::default()
     };
@@ -2008,29 +2013,64 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
             ..exact_build_limits
         },
         CaptureBuildLimits {
-            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
                 max_shape_units: direct_build.shape_units - 1,
                 ..exact_build_limits.prefix_class_participation
             },
             ..exact_build_limits
         },
         CaptureBuildLimits {
-            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
                 max_build_work: direct_build.work_upper_bound - 1,
                 ..exact_build_limits.prefix_class_participation
             },
             ..exact_build_limits
         },
         CaptureBuildLimits {
-            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
                 max_persistent_bytes: direct_build.persistent_bytes - 1,
                 ..exact_build_limits.prefix_class_participation
             },
             ..exact_build_limits
         },
         CaptureBuildLimits {
-            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
                 max_peak_bytes: direct_build.peak_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
+                max_allocations: direct_build.allocations - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
+                max_copied_prefix_bytes: direct_build.copied_prefix_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
+                max_finder_preprocess_input_bytes: direct_build.finder_preprocess_input_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
+                max_initialized_bitmap_bytes: direct_build.initialized_bitmap_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassUniformParticipationBuildLimits {
+                max_retained_capacity_bytes: direct_build.retained_capacity_bytes - 1,
                 ..exact_build_limits.prefix_class_participation
             },
             ..exact_build_limits

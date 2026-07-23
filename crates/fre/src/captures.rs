@@ -24,11 +24,12 @@ use fre_capture_lab::{
     Window,
 };
 use fre_kernels::{
-    LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
-    PrefixClassAlternationPlan, PrefixClassUniformParticipationAccounting,
-    PrefixClassUniformParticipationBuildAccounting, PrefixClassUniformParticipationError,
-    PrefixClassUniformParticipationIdentity, PrefixClassUniformParticipationLimits,
-    PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationSchema,
+    LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
+    PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationBuildAccounting,
+    PrefixClassUniformParticipationBuildError, PrefixClassUniformParticipationBuildLimits,
+    PrefixClassUniformParticipationError, PrefixClassUniformParticipationIdentity,
+    PrefixClassUniformParticipationLimits, PrefixClassUniformParticipationProspective,
+    PrefixClassUniformParticipationSchema,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
@@ -117,7 +118,7 @@ pub struct CaptureBuildLimits {
     /// two-arm prefix/class capture route.
     pub max_prefix_class_participation_planner_work: usize,
     /// Construction limits for the optional direct prefix/class kernel.
-    pub prefix_class_participation: PrefixClassAlternationBuildLimits,
+    pub prefix_class_participation: PrefixClassUniformParticipationBuildLimits,
 }
 
 impl Default for CaptureBuildLimits {
@@ -157,7 +158,7 @@ impl Default for CaptureBuildLimits {
             selector,
             required_literal: None,
             max_prefix_class_participation_planner_work: 4_096,
-            prefix_class_participation: PrefixClassAlternationBuildLimits::default(),
+            prefix_class_participation: PrefixClassUniformParticipationBuildLimits::default(),
         }
     }
 }
@@ -286,7 +287,7 @@ pub enum CaptureBuildError {
     /// Operation-wide capture-erased span selector refused or faulted.
     Selector(SelectorError),
     /// Direct prefix/class construction reached a non-optional terminal.
-    PrefixClassParticipation(PrefixClassAlternationBuildError),
+    PrefixClassParticipation(PrefixClassUniformParticipationBuildError),
     /// Optional required-literal proof or DFA construction refused.
     RequiredLiteral(CaptureRequiredLiteralBuildError),
     /// Facade invariant failure.
@@ -1152,19 +1153,27 @@ struct CapturePrefixClassParticipationBuild {
     planner_work: usize,
 }
 
-fn optional_prefix_class_build_refusal(error: &PrefixClassAlternationBuildError) -> bool {
-    matches!(
-        error,
-        PrefixClassAlternationBuildError::EmptyPrefix { .. }
-            | PrefixClassAlternationBuildError::SelfOverlappingPrefix { .. }
-            | PrefixClassAlternationBuildError::EmptyClass { .. }
-            | PrefixClassAlternationBuildError::NonCanonicalClass { .. }
-            | PrefixClassAlternationBuildError::ShapeLimit { .. }
-            | PrefixClassAlternationBuildError::WorkLimit { .. }
-            | PrefixClassAlternationBuildError::ScratchLimit { .. }
-            | PrefixClassAlternationBuildError::PersistentLimit { .. }
-            | PrefixClassAlternationBuildError::PeakLimit { .. }
-    )
+fn optional_prefix_class_build_refusal(error: &PrefixClassUniformParticipationBuildError) -> bool {
+    match error {
+        PrefixClassUniformParticipationBuildError::Kernel(error) => matches!(
+            error,
+            PrefixClassAlternationBuildError::EmptyPrefix { .. }
+                | PrefixClassAlternationBuildError::SelfOverlappingPrefix { .. }
+                | PrefixClassAlternationBuildError::EmptyClass { .. }
+                | PrefixClassAlternationBuildError::NonCanonicalClass { .. }
+                | PrefixClassAlternationBuildError::ShapeLimit { .. }
+                | PrefixClassAlternationBuildError::WorkLimit { .. }
+                | PrefixClassAlternationBuildError::ScratchLimit { .. }
+                | PrefixClassAlternationBuildError::PersistentLimit { .. }
+                | PrefixClassAlternationBuildError::PeakLimit { .. }
+        ),
+        PrefixClassUniformParticipationBuildError::AllocationsLimit { .. }
+        | PrefixClassUniformParticipationBuildError::CopiedPrefixBytesLimit { .. }
+        | PrefixClassUniformParticipationBuildError::FinderPreprocessInputBytesLimit { .. }
+        | PrefixClassUniformParticipationBuildError::InitializedBitmapBytesLimit { .. }
+        | PrefixClassUniformParticipationBuildError::RetainedCapacityBytesLimit { .. } => true,
+        _ => false,
+    }
 }
 
 fn build_prefix_class_participation(
@@ -1254,7 +1263,7 @@ fn build_prefix_class_participation(
                     planner_work: work,
                 });
             };
-            let engine = match PrefixClassAlternationPlan::build(
+            let engine = match PrefixClassAlternationPlan::build_uniform_participation(
                 prefixes,
                 [
                     classes[0]

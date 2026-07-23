@@ -133,12 +133,105 @@ pub struct UniformParticipationBuildAccounting {
     pub work_upper_bound: usize,
     pub allocations: usize,
     pub copied_prefix_bytes: usize,
-    pub finder_preprocess_bytes: usize,
+    pub finder_preprocess_input_bytes: usize,
     pub initialized_bitmap_bytes: usize,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub retained_capacity_bytes: usize,
     pub peak_bytes: usize,
+}
+
+/// Construction limits owned only by the direct capture-aware route. The
+/// first five dimensions preserve the incumbent kernel's admission, while
+/// the remaining dimensions close every direct construction side effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UniformParticipationBuildLimits {
+    pub max_shape_units: usize,
+    pub max_build_work: usize,
+    pub max_scratch_bytes: usize,
+    pub max_persistent_bytes: usize,
+    pub max_peak_bytes: usize,
+    pub max_allocations: usize,
+    pub max_copied_prefix_bytes: usize,
+    pub max_finder_preprocess_input_bytes: usize,
+    pub max_initialized_bitmap_bytes: usize,
+    pub max_retained_capacity_bytes: usize,
+}
+
+impl UniformParticipationBuildLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_shape_units: usize::MAX,
+            max_build_work: usize::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+            max_allocations: usize::MAX,
+            max_copied_prefix_bytes: usize::MAX,
+            max_finder_preprocess_input_bytes: usize::MAX,
+            max_initialized_bitmap_bytes: usize::MAX,
+            max_retained_capacity_bytes: usize::MAX,
+        }
+    }
+
+    const fn kernel(self) -> BuildLimits {
+        BuildLimits {
+            max_shape_units: self.max_shape_units,
+            max_build_work: self.max_build_work,
+            max_scratch_bytes: self.max_scratch_bytes,
+            max_persistent_bytes: self.max_persistent_bytes,
+            max_peak_bytes: self.max_peak_bytes,
+        }
+    }
+}
+
+impl Default for UniformParticipationBuildLimits {
+    fn default() -> Self {
+        let kernel = BuildLimits::default();
+        Self {
+            max_shape_units: kernel.max_shape_units,
+            max_build_work: kernel.max_build_work,
+            max_scratch_bytes: kernel.max_scratch_bytes,
+            max_persistent_bytes: kernel.max_persistent_bytes,
+            max_peak_bytes: kernel.max_peak_bytes,
+            max_allocations: 2,
+            max_copied_prefix_bytes: 4 * 1024 * 1024,
+            max_finder_preprocess_input_bytes: 4 * 1024 * 1024,
+            max_initialized_bitmap_bytes: size_of::<[u64; 8]>(),
+            max_retained_capacity_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UniformParticipationBuildError {
+    Kernel(BuildError),
+    AllocationsLimit { needed: usize, limit: usize },
+    CopiedPrefixBytesLimit { needed: usize, limit: usize },
+    FinderPreprocessInputBytesLimit { needed: usize, limit: usize },
+    InitializedBitmapBytesLimit { needed: usize, limit: usize },
+    RetainedCapacityBytesLimit { needed: usize, limit: usize },
+    ArithmeticOverflow { computation: &'static str },
+}
+
+impl fmt::Display for UniformParticipationBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "prefix/class uniform-participation build failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for UniformParticipationBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Kernel(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,6 +628,62 @@ pub struct PrefixClassAlternationPlan {
 }
 
 impl PrefixClassAlternationPlan {
+    /// Build the shared kernel under the capture-aware construction envelope.
+    /// Every direct-only construction limit is checked before range traversal,
+    /// allocation, copying, bitmap initialization, or Finder preprocessing.
+    pub fn build_uniform_participation<I>(
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: UniformParticipationBuildLimits,
+    ) -> Result<Self, UniformParticipationBuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
+            UniformParticipationBuildError::ArithmeticOverflow {
+                computation: "direct prefix byte total",
+            },
+        )?;
+        let allocations = 2;
+        let initialized_bitmap_bytes = size_of::<[u64; 8]>();
+        if allocations > limits.max_allocations {
+            return Err(UniformParticipationBuildError::AllocationsLimit {
+                needed: allocations,
+                limit: limits.max_allocations,
+            });
+        }
+        if prefix_bytes > limits.max_copied_prefix_bytes {
+            return Err(UniformParticipationBuildError::CopiedPrefixBytesLimit {
+                needed: prefix_bytes,
+                limit: limits.max_copied_prefix_bytes,
+            });
+        }
+        if prefix_bytes > limits.max_finder_preprocess_input_bytes {
+            return Err(
+                UniformParticipationBuildError::FinderPreprocessInputBytesLimit {
+                    needed: prefix_bytes,
+                    limit: limits.max_finder_preprocess_input_bytes,
+                },
+            );
+        }
+        if initialized_bitmap_bytes > limits.max_initialized_bitmap_bytes {
+            return Err(
+                UniformParticipationBuildError::InitializedBitmapBytesLimit {
+                    needed: initialized_bitmap_bytes,
+                    limit: limits.max_initialized_bitmap_bytes,
+                },
+            );
+        }
+        if prefix_bytes > limits.max_retained_capacity_bytes {
+            return Err(UniformParticipationBuildError::RetainedCapacityBytesLimit {
+                needed: prefix_bytes,
+                limit: limits.max_retained_capacity_bytes,
+            });
+        }
+        Self::build(prefixes, ranges, limits.kernel())
+            .map_err(UniformParticipationBuildError::Kernel)
+    }
+
     #[allow(
         clippy::needless_range_loop,
         clippy::too_many_lines,
@@ -693,7 +842,7 @@ impl PrefixClassAlternationPlan {
             work_upper_bound: self.build.work_upper_bound,
             allocations: 2,
             copied_prefix_bytes: self.build.prefix_bytes,
-            finder_preprocess_bytes: self.build.prefix_bytes,
+            finder_preprocess_input_bytes: self.build.prefix_bytes,
             initialized_bitmap_bytes: size_of::<[u64; 8]>(),
             scratch_bytes: self.build.scratch_bytes,
             persistent_bytes: self.build.persistent_bytes,
@@ -1563,10 +1712,10 @@ mod tests {
 
     fn rust_functions_plan() -> PrefixClassAlternationPlan {
         let word = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
-        PrefixClassAlternationPlan::build(
+        PrefixClassAlternationPlan::build_uniform_participation(
             [b"fn is_", b"fn as_"],
             [word.into_iter(), word.into_iter()],
-            BuildLimits::unlimited(),
+            UniformParticipationBuildLimits::unlimited(),
         )
         .unwrap()
     }
@@ -1648,10 +1797,10 @@ mod tests {
 
     #[test]
     fn uniform_participation_preserves_branch_zero_on_equal_start() {
-        let plan = PrefixClassAlternationPlan::build(
+        let plan = PrefixClassAlternationPlan::build_uniform_participation(
             [b"ab", b"abc"],
             [[(b'c', b'c')].into_iter(), [(b'd', b'd')].into_iter()],
-            BuildLimits::unlimited(),
+            UniformParticipationBuildLimits::unlimited(),
         )
         .unwrap();
         let schema = UniformParticipationSchema {
@@ -1930,6 +2079,32 @@ mod tests {
             next_calls,
             len_calls,
         )
+    }
+
+    #[test]
+    fn direct_construction_refuses_before_observing_range_sources() {
+        let (first, first_next, first_len) = deceptive_ranges(&[(b'a', b'z')]);
+        let (second, second_next, second_len) = deceptive_ranges(&[(b'0', b'9')]);
+        let error = PrefixClassAlternationPlan::build_uniform_participation(
+            [b"ab", b"xy"],
+            [first, second],
+            UniformParticipationBuildLimits {
+                max_allocations: 1,
+                ..UniformParticipationBuildLimits::unlimited()
+            },
+        )
+        .expect_err("direct allocation one-below must preflight");
+        assert_eq!(
+            error,
+            UniformParticipationBuildError::AllocationsLimit {
+                needed: 2,
+                limit: 1,
+            }
+        );
+        assert_eq!(first_next.get(), 0);
+        assert_eq!(second_next.get(), 0);
+        assert_eq!(first_len.get(), 0);
+        assert_eq!(second_len.get(), 0);
     }
 
     #[test]

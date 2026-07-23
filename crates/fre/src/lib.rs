@@ -206,6 +206,7 @@ pub use fre_kernels::{
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassAlternationUpperBounds, PrefixClassUniformParticipationAccounting,
     PrefixClassUniformParticipationActual, PrefixClassUniformParticipationBuildAccounting,
+    PrefixClassUniformParticipationBuildError, PrefixClassUniformParticipationBuildLimits,
     PrefixClassUniformParticipationError, PrefixClassUniformParticipationIdentity,
     PrefixClassUniformParticipationLimits, PrefixClassUniformParticipationProspective,
     PrefixClassUniformParticipationResult, PrefixClassUniformParticipationSchema,

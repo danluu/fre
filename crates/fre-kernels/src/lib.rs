@@ -250,6 +250,8 @@ pub use prefix_class_alternation::{
     UniformParticipationAccounting as PrefixClassUniformParticipationAccounting,
     UniformParticipationActual as PrefixClassUniformParticipationActual,
     UniformParticipationBuildAccounting as PrefixClassUniformParticipationBuildAccounting,
+    UniformParticipationBuildError as PrefixClassUniformParticipationBuildError,
+    UniformParticipationBuildLimits as PrefixClassUniformParticipationBuildLimits,
     UniformParticipationError as PrefixClassUniformParticipationError,
     UniformParticipationIdentity as PrefixClassUniformParticipationIdentity,
     UniformParticipationLimits as PrefixClassUniformParticipationLimits,
