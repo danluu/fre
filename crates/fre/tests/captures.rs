@@ -1867,7 +1867,12 @@ fn adversarial_operation_work(size: usize) -> (usize, usize) {
         .expect("operation-wide capture reduction");
     assert_eq!(size, result.accounting.matches);
     assert_eq!(size, result.accounting.count);
-    assert_eq!(size, result.selector_certificate.output_matches);
+    assert_eq!(size, result.selector_accounting.emitted_matches);
+    assert_eq!(
+        size + 1,
+        result.selector_certificate.output_matches,
+        "the compact selector certificate retains its published input-only bound"
+    );
     let state_visits = result
         .selector_accounting
         .state_evaluations

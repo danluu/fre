@@ -185,6 +185,25 @@ impl OperationCertificate {
         self.peak_bytes = prospective.peak_bytes;
     }
 
+    fn retains_published_prospective(&self, prospective: OperationProspective) -> bool {
+        self.states == prospective.states
+            && self.boundaries == prospective.boundaries
+            && self.table_cells == prospective.table_cells
+            && self.row_storage == prospective.row_storage
+            && self.row_record_bytes == prospective.row_record_bytes
+            && self.terminal_frontier == prospective.terminal_frontier
+            && self.work_bound == prospective.work_bound
+            && self.random_access_bytes == prospective.random_access_bytes
+            && self.scratch_bytes == prospective.scratch_bytes
+            && self.log_bytes == prospective.log_bytes
+            && self.sequential_bytes_bound == prospective.sequential_bytes
+            && self.match_events == prospective.match_events
+            && self.output_matches == prospective.output_matches
+            && self.output_bytes == prospective.output_bytes
+            && self.span_sum == prospective.span_sum
+            && self.peak_bytes == prospective.peak_bytes
+    }
+
     /// Derive the physical operation identity from the retained plan, logical
     /// operation, strategy, and selected physical route.
     #[must_use]
@@ -1368,6 +1387,7 @@ impl CompiledRegex {
                 }
                 let valid = receipt.prospective.is_some_and(|upper| {
                     upper.contains(receipt.actual)
+                        && result.certificate.retains_published_prospective(upper)
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
                 }) && receipt.identity.authenticates_limits(limits)
@@ -6799,7 +6819,20 @@ mod tests {
             .unwrap();
         assert_eq!(incumbent.value(), terminal.admitted.value());
         assert!(incumbent.certificate().terminal_frontier);
-        assert_eq!(incumbent.certificate(), terminal.admitted.certificate());
+        assert_eq!(
+            incumbent.certificate().operation_id(),
+            terminal.admitted.certificate().operation_id()
+        );
+        assert_eq!(
+            incumbent.certificate().physical_route,
+            terminal.admitted.certificate().physical_route
+        );
+        assert!(
+            terminal
+                .admitted
+                .certificate()
+                .retains_published_prospective(terminal.receipt.prospective.unwrap())
+        );
         assert_eq!(incumbent.accounting(), terminal.admitted.accounting());
 
         let ordinary_after = compiled
