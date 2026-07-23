@@ -2041,6 +2041,28 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         );
     }
 
+    let equal_start_pattern = r"ab([c-e]+)|abc([a-d]+)";
+    let equal_start = CaptureBuilder::new(equal_start_pattern)
+        .unicode(false)
+        .build()
+        .expect("generic equal-start direct plan");
+    assert_eq!(
+        equal_start.build_report().plan_identity.plan,
+        fre::CapturePlanKind::UniformPrefixClassParticipation
+    );
+    let equal_start_haystack = b"abcabc!abcddd";
+    let equal_start_result = equal_start
+        .count_captures(equal_start_haystack, CaptureRunLimits::default())
+        .expect("equal-start direct Count");
+    assert_eq!(
+        equal_start_result.accounting.count,
+        reference_count(equal_start_pattern, equal_start_haystack)
+    );
+    assert_eq!(
+        capture_records(&equal_start, equal_start_haystack),
+        reference_records(equal_start_pattern, equal_start_haystack)
+    );
+
     // Plan identity is immutable across mutation and concurrent first/steady
     // calls; no haystack-derived state is retained.
     let identity = regex.cache_identity(CaptureRunLimits::default());
