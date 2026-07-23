@@ -69,6 +69,8 @@ fn selector_builder() -> fre::CaptureBuilder {
     reason = "one identity audit intentionally names every nested U0-A selector field and construction-provenance invariant"
 )]
 fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
+    assert_eq!(AGGREGATE_CONTINUATION_ACCOUNTING_VERSION, 3);
+    assert_eq!(CAPTURE_COUNT_ALGORITHM_VERSION, 2);
     let regex = selector_builder().build().expect("selector Count build");
     let cloned = regex.clone();
     let limits = CaptureRunLimits::default();
@@ -152,7 +154,7 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
     );
     assert_eq!(
         route.selector_work_mode,
-        AggregateOperationWorkMode::ConservativeAdmission
+        AggregateOperationWorkMode::Observed
     );
     assert_eq!(route.minimum_match_bytes, 7);
     assert_eq!(route.participating_captures_per_match, 2);
@@ -457,13 +459,15 @@ fn public_identity_certificate_provenance_and_publication_mutations_fail_closed(
         .expect("selector Count");
     assert_report_cache_identity_mutations_are_rejected(&selector_report);
     assert_selector_certificate_mutations_are_rejected(&selector_report);
-    let selector_prospective = selector_report
-        .count_receipt
+    let selector_actual_work = selector_report
+        .selector_receipt
         .as_ref()
-        .and_then(|receipt| receipt.prospective)
-        .expect("selector P");
+        .expect("selector receipt")
+        .actual
+        .work;
+    assert!(selector_actual_work > 0);
     let mut selector_one_below = CaptureRunLimits::default();
-    selector_one_below.selector.max_work = selector_prospective.selector.work_bound - 1;
+    selector_one_below.selector.max_work = selector_actual_work - 1;
     let mut selector_error = selector
         .count_captures(DENSE_HAYSTACK, selector_one_below)
         .expect_err("selector one-below");
@@ -675,7 +679,41 @@ fn selector_exact_limits_accept_and_one_below_refuses_with_zero_actual() {
     );
     assert_selector_one_below!(max_span_sum, span_sum, AggregateResource::SpanSum);
     assert_selector_one_below!(max_peak_bytes, peak_bytes, AggregateResource::PeakBytes);
-    assert_selector_one_below!(max_work, work_bound, AggregateResource::ExecutionWork);
+
+    // Selector Count observes work. Falling below the conservative bound can
+    // still succeed, but one below the successful actual must fail closed
+    // with the bounded partial receipt accumulated before refusal.
+    let actual_work = exact
+        .selector_receipt
+        .as_ref()
+        .expect("exact selector receipt")
+        .actual
+        .work;
+    assert!(actual_work > 0);
+    let mut one_below_work = exact_limits;
+    one_below_work.selector.max_work = actual_work - 1;
+    let error = regex
+        .count_captures(DENSE_HAYSTACK, one_below_work)
+        .expect_err("observed selector work one below actual must refuse");
+    assert!(error.has_closed_count_attempt());
+    assert!(matches!(
+        error.source,
+        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::ExecutionWork,
+            required,
+            limit,
+        }) if required > limit && limit == actual_work - 1
+    ));
+    let selector_receipt = error
+        .selector_receipt
+        .as_ref()
+        .expect("bounded partial selector receipt");
+    let observed_prospective = selector_receipt
+        .prospective
+        .expect("observed-work prospective");
+    assert_eq!(observed_prospective.work_bound, actual_work - 1);
+    assert!(selector_receipt.actual.work < actual_work);
+    assert!(selector_receipt.actual_allocations <= observed_prospective.allocations);
 
     if prospective.combined_peak_bytes > 0 {
         let mut one_below = exact_limits;
@@ -793,17 +831,13 @@ fn direct_exact_and_one_below_paths_retain_closed_owner_receipts() {
 
     let mut control_one_below = exact_limits;
     control_one_below.selector.max_work = prospective.selector.work_bound - 1;
-    let control_error = regex
+    let control = regex
         .count_captures(DENSE_HAYSTACK, control_one_below)
-        .expect_err("U3 control one-below");
-    assert!(matches!(
-        control_error.source,
-        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
-            resource: AggregateResource::ExecutionWork,
-            ..
-        })
-    ));
-    assert_direct_zero_effect_refusal(&control_error, &prospective);
+        .expect("inactive U3 control work does not block selected U4");
+    assert!(control.has_closed_count_attempt());
+    assert_eq!(control.accounting, exact.accounting);
+    assert_eq!(control.capture_events, exact.capture_events);
+    assert!(control.selector_receipt.is_none());
 
     let mut combined_one_below = exact_limits;
     combined_one_below.max_combined_peak_bytes = prospective.combined_peak_bytes - 1;

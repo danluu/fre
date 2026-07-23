@@ -34,9 +34,10 @@ fn without_allocations<T>(operation: impl FnOnce() -> T) -> T {
     reason = "one allocator census keeps all prebuilt direct terminal variants under the same global measurement boundary"
 )]
 fn direct_terminal_packaging_has_a_zero_allocation_census() {
-    // The complete inline cache identity, route receipt, and owner receipt
-    // remain bounded without restoring an error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 5_640);
+    // The complete inline cache identity, ordered-root proof slot, route
+    // receipt, and owner receipt remain bounded without restoring an
+    // error-path Box.
+    assert_eq!(size_of::<CaptureExecutionError>(), 5_680);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";
@@ -95,14 +96,18 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
         .expect("U3 control prospective");
     let mut control_one_below = baseline_limits;
     control_one_below.selector.max_work = control_prospective.work_bound - 1;
-    let control_error = without_allocations(|| {
+    let direct_with_inactive_control_limit = without_allocations(|| {
         regex
             .count_captures(haystack, control_one_below)
-            .expect_err("U3 control one-below must refuse")
+            .expect("inactive U3 ExecutionWork must not refuse direct U4")
     });
-    assert!(control_error.has_closed_count_attempt());
+    assert!(direct_with_inactive_control_limit.has_closed_count_attempt());
     assert_eq!(
-        control_error
+        direct_with_inactive_control_limit.accounting,
+        baseline.accounting
+    );
+    assert_eq!(
+        direct_with_inactive_control_limit
             .prefix_class_participation_receipt
             .as_ref()
             .and_then(|receipt| receipt.prospective),

@@ -51,6 +51,11 @@ pub struct CompileAccounting {
     pub candidate_entries: usize,
     /// Exact retained bytes for candidate entries and first-byte buckets.
     pub candidate_bytes: usize,
+    /// Bytes in the retained inline whole-match minimum-width proof.
+    ///
+    /// The `Option<usize>` representation preserves the empty-language,
+    /// nullable, and positive-width distinction used by operation admission.
+    pub minimum_match_bytes_proof_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,

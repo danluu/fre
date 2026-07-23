@@ -740,6 +740,15 @@ pub(crate) enum Inst {
         preferred: usize,
         fallback: usize,
     },
+    /// A split in a compiler-proved ordered top-level alternation.
+    ///
+    /// Generic execution preserves ordinary split semantics. The dedicated
+    /// ordered-root Count route can instead probe the complete source-ordered
+    /// chain once per row without materializing these intermediate states.
+    RootSplit {
+        preferred: usize,
+        fallback: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -749,6 +758,8 @@ pub(crate) struct Program {
     pub(crate) epsilon_order: ExactVec<usize>,
     pub(crate) split_rank: ExactVec<usize>,
     pub(crate) split_count: usize,
+    pub(crate) root_split_count: usize,
+    pub(crate) root_alternation_arms: usize,
     pub(crate) execution_state_work: usize,
     pub(crate) predecessor_edges: usize,
     pub(crate) has_scalar_transition: bool,
@@ -773,6 +784,14 @@ impl Program {
 
     pub(crate) const fn predecessor_edges(&self) -> usize {
         self.predecessor_edges
+    }
+
+    pub(crate) const fn root_split_count(&self) -> usize {
+        self.root_split_count
+    }
+
+    pub(crate) const fn root_alternation_arms(&self) -> usize {
+        self.root_alternation_arms
     }
 
     pub(crate) const fn contains_scalar_transition(&self) -> bool {

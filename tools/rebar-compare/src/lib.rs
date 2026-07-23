@@ -98,6 +98,9 @@ pub const RE2_VERSION: &str = "2025-11-05";
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
 /// Stable plan label for capture-erased selection with proved participation.
 pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-uniform-participation";
+/// Stable plan label for one-pass source-ordered root capture-many counting.
+pub const CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN: &str =
+    "capture-ordered-root-capture-many-count-v1";
 /// Stable plan label for direct Unicode-off two-arm prefix/class participation.
 pub const CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN: &str =
     fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID;
@@ -122,6 +125,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
         plan,
         CURRENT_FRE_CAPTURE_PLAN
             | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
+            | CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN
             | CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN
             | CURRENT_FRE_CAPTURE_SCALAR_PLAN
             | CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
@@ -160,7 +164,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v2-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4857,6 +4861,7 @@ fn capture_regex_one_with_build_limits(
         || !matches!(
             identity.plan,
             CapturePlanKind::UniformPrefixClassParticipation
+                | CapturePlanKind::OrderedRootCaptureManyCount
                 | CapturePlanKind::LinearSelectorUniformParticipation
                 | CapturePlanKind::LinearSelectorPersistentHistory
         )
@@ -4915,6 +4920,7 @@ fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
         return CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN;
     }
     match regex.build_report().plan_identity.plan {
+        CapturePlanKind::OrderedRootCaptureManyCount => CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN,
         CapturePlanKind::UniformPrefixClassParticipation => CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN,
         CapturePlanKind::LinearSelectorUniformParticipation => CURRENT_FRE_CAPTURE_UNIFORM_PLAN,
         CapturePlanKind::LinearSelectorPersistentHistory => CURRENT_FRE_CAPTURE_PLAN,
@@ -11932,6 +11938,197 @@ mod tests {
 
     #[test]
     #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_parol_veryl_ordered_root_capture_many_real_row_canary() {
+        const JOB_ID: &str = "wild/parol-veryl/unicode@rust/regex";
+        const PATTERN_SHA256: &str =
+            "67e843247dab802f1b298e8ecb7180581ee8ec71b9d13aaac57d5817f649adfe";
+        const HAYSTACK_SHA256: &str =
+            "adf5fcdfb6071e5470b77a45b33826ccf6a0cb8709e5157697d5a9838a4e0b81";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact Parol/Veryl hard row");
+        assert!(matching.next().is_none(), "duplicate Parol/Veryl row");
+        assert_eq!(job.model, "count-captures");
+        assert!(job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 124_800);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader
+            .load(job)
+            .expect("load authenticated Parol/Veryl row");
+        assert_eq!(input.patterns.len(), 1);
+        assert_eq!(input.patterns[0].len(), 1_509);
+        assert_eq!(sha256(input.patterns[0].as_bytes()), PATTERN_SHA256);
+        assert_eq!(input.haystack.len(), 150_600);
+        assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
+
+        let regex = capture_regex_one(&input.patterns[0], true, false, &limits)
+            .expect("build authenticated Parol/Veryl capture plan");
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            CapturePlanKind::OrderedRootCaptureManyCount
+        );
+        let proof = regex
+            .build_report()
+            .ordered_root_capture_many
+            .expect("authenticated ordered-root proof");
+        assert_eq!(proof.root_arms, 88);
+        assert_eq!(proof.root_arms, regex.build_report().engine.captures);
+        assert_eq!(proof.participating_captures, 1);
+        assert_eq!(proof.groups_per_match, 2);
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("derive authenticated capture limits");
+        let report = regex
+            .count_captures(&input.haystack, run_limits)
+            .expect("authenticated ordered-root Count");
+        assert!(report.has_closed_count_attempt());
+        assert_eq!(report.accounting.count, 124_800);
+        assert_eq!(
+            report.accounting.count,
+            usize::try_from(job.expected.count).expect("expected count fits usize")
+        );
+
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE ordered-root capture-many result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN)
+        );
+        println!(
+            "parol-veryl-ordered-root-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} arms={} plan={}",
+            candidate.actual,
+            proof.root_arms,
+            candidate.plan.as_deref().expect("candidate plan")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    fn authenticated_rust_functions_direct_capture_real_row_canary() {
+        const JOB_ID: &str = "opt/prefilter/rust-functions@rust/regex";
+        const PATTERN_SHA256: &str =
+            "7b4393482afc22bece95e43688b5ecceb1e2ec5cd62369cc27cea25dc5f4461b";
+        const HAYSTACK_SHA256: &str =
+            "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36";
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        assert_eq!(limits.fre_aggregate_operation_work, 536_870_912);
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        assert_eq!(manifest.source.revision, AUDITED_REBAR_REVISION);
+
+        let mut matching = manifest.jobs.iter().filter(|job| job.id == JOB_ID);
+        let job = matching.next().expect("exact Rust-functions row");
+        assert!(matching.next().is_none(), "duplicate Rust-functions row");
+        assert_eq!(job.model, "count-captures");
+        assert!(!job.regex.unicode);
+        assert!(!job.regex.case_insensitive);
+        assert_eq!(job.expected.count, 948);
+
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let input = loader
+            .load(job)
+            .expect("load authenticated Rust-functions row");
+        assert_eq!(input.patterns, [r"fn is_(\w+)|fn as_(\w+)".to_string()]);
+        assert_eq!(input.patterns[0].len(), 23);
+        assert_eq!(sha256(input.patterns[0].as_bytes()), PATTERN_SHA256);
+        assert_eq!(input.haystack.len(), 7_384_531);
+        assert_eq!(sha256(&input.haystack), HAYSTACK_SHA256);
+
+        let regex = capture_regex_one(&input.patterns[0], false, false, &limits)
+            .expect("build authenticated Rust-functions capture plan");
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            CapturePlanKind::UniformPrefixClassParticipation
+        );
+        assert!(
+            regex
+                .build_report()
+                .plan_identity
+                .prefix_class_participation
+                .is_some()
+        );
+        let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
+            .expect("derive authenticated direct-capture limits");
+        let report = regex
+            .count_captures(&input.haystack, run_limits)
+            .expect("authenticated direct capture Count");
+        assert!(report.has_closed_count_attempt());
+        assert!(report.selector_receipt.is_none());
+        assert!(report.prefix_class_participation.is_some());
+        assert!(report.prefix_class_participation_receipt.is_some());
+        assert!(authenticates_direct_capture_success(
+            &regex,
+            input.haystack.len(),
+            &run_limits,
+            &report
+        ));
+        assert_eq!(report.accounting.count, 948);
+        assert_eq!(
+            report.accounting.count,
+            usize::try_from(job.expected.count).expect("expected count fits usize")
+        );
+
+        let rust = rust_reducer(job, &input, &limits).expect("pinned Rust semantic result");
+        assert_eq!(rust, job.expected.count);
+        let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
+            .expect("FRE direct Rust-functions result");
+        assert_eq!(candidate.actual, rust);
+        assert_eq!(
+            candidate.plan.as_deref(),
+            Some(CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN)
+        );
+        println!(
+            "rust-functions-direct-canary manifest_sha256={manifest_hash} job={JOB_ID} rust={rust} fre={} plan={}",
+            candidate.actual,
+            candidate.plan.as_deref().expect("candidate plan")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
     fn authenticated_quotes_bounded_terminal_class_real_row_canary() {
         const JOB_ID: &str = "imported/leipzig/quotes-bounded@rust/regex";
         const PATTERN_SHA256: &str =
@@ -15234,7 +15431,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v2-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -16661,7 +16858,7 @@ mod tests {
 
         let selector_starved = RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 542_655,
+            fre_capture_selector_program_bytes: 542_671,
             ..RunLimits::default()
         };
         let refusal = current_fre(
@@ -16674,7 +16871,7 @@ mod tests {
         );
         assert!(
             matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 542656, limit is 542655")),
+                if reason.contains("ProgramBytes requires 542672, limit is 542671")),
             "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }

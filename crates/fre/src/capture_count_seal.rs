@@ -27,7 +27,7 @@ use crate::captures::{
 };
 
 /// Version of the positive-width uniform-participation Count algorithm.
-pub const CAPTURE_COUNT_ALGORITHM_VERSION: u32 = 1;
+pub const CAPTURE_COUNT_ALGORITHM_VERSION: u32 = 2;
 
 /// Version of the owner-local capture Count prospective/actual ledger.
 pub const CAPTURE_COUNT_ACCOUNTING_VERSION: u32 = 1;
@@ -127,6 +127,7 @@ impl CaptureCountOwnerSeal {
             (
                 CaptureCountBranch::SelectorUniformParticipation,
                 CapturePlanKind::LinearSelectorUniformParticipation
+                    | CapturePlanKind::OrderedRootCaptureManyCount
             ) | (
                 CaptureCountBranch::DirectPrefixClassParticipation,
                 CapturePlanKind::UniformPrefixClassParticipation
@@ -200,7 +201,18 @@ pub struct CaptureCountProspective {
 
 impl CaptureCountProspective {
     fn fits_limits(self, route: &CaptureCountRouteIdentity, seal: &CaptureCountSeal) -> bool {
-        selector_fits_limits(&self.selector, seal.effective_selector_limits())
+        let selector_fits = match route.branch {
+            CaptureCountBranch::SelectorUniformParticipation => {
+                selector_fits_limits(&self.selector, seal.effective_selector_limits())
+            }
+            CaptureCountBranch::DirectPrefixClassParticipation => {
+                retained_selector_control_fits_limits(
+                    &self.selector,
+                    seal.effective_selector_limits(),
+                )
+            }
+        };
+        selector_fits
             && self.matches <= seal.run_limits.aggregate.max_results
             && self.capture_count <= seal.run_limits.aggregate.max_capture_count
             && self.capture_events <= seal.run_limits.aggregate.max_capture_events
@@ -456,7 +468,15 @@ impl CaptureCountAttemptReceipt {
             || route.plan.operation != CaptureOperation::CountParticipatingNonempty
             || route.selector_strategy != SelectorStrategy::ReverseSequentialRows
             || route.selector_operation != SelectorOperationAttemptKind::Count
-            || route.selector_work_mode != SelectorOperationWorkMode::ConservativeAdmission
+            || route.selector_work_mode
+                != match route.branch {
+                    CaptureCountBranch::SelectorUniformParticipation => {
+                        SelectorOperationWorkMode::Observed
+                    }
+                    CaptureCountBranch::DirectPrefixClassParticipation => {
+                        SelectorOperationWorkMode::ConservativeAdmission
+                    }
+                }
             || route.selector_route.algorithm_version != CONTINUATION_OPERATION_ALGORITHM_VERSION
             || route.selector_route.accounting_version != CONTINUATION_OPERATION_ACCOUNTING_VERSION
             || route.selector_route.prepublication_fallback
@@ -464,14 +484,41 @@ impl CaptureCountAttemptReceipt {
             || route.algorithm_version != CAPTURE_COUNT_ALGORITHM_VERSION
             || route.accounting_version != CAPTURE_COUNT_ACCOUNTING_VERSION
             || route.minimum_match_bytes == 0
+            || !matches!(
+                (route.plan.plan, route.selector_route.physical_route),
+                (
+                    CapturePlanKind::OrderedRootCaptureManyCount,
+                    SelectorOperationPhysicalRoute::OrderedRootRows,
+                ) | (
+                    CapturePlanKind::LinearSelectorUniformParticipation,
+                    SelectorOperationPhysicalRoute::DenseRows
+                        | SelectorOperationPhysicalRoute::TerminalFrontierRows,
+                ) | (
+                    CapturePlanKind::UniformPrefixClassParticipation,
+                    SelectorOperationPhysicalRoute::DenseRows,
+                )
+            )
+            || match (route.plan.plan, route.plan.ordered_root_capture_many) {
+                (CapturePlanKind::OrderedRootCaptureManyCount, Some(proof)) => {
+                    proof.root_arms.checked_add(1) != Some(route.capture_schema_entries_per_match)
+                        || proof.participating_captures.checked_add(1)
+                            != Some(route.participating_captures_per_match)
+                        || proof.groups_per_match != route.participating_captures_per_match
+                }
+                (CapturePlanKind::OrderedRootCaptureManyCount, None) | (_, Some(_)) => true,
+                (_, None) => false,
+            }
         {
             return false;
         }
 
         let haystack_len = match route.branch {
             CaptureCountBranch::SelectorUniformParticipation => {
-                if route.plan.plan != CapturePlanKind::LinearSelectorUniformParticipation
-                    || route.plan.prefix_class_participation.is_some()
+                if !matches!(
+                    route.plan.plan,
+                    CapturePlanKind::LinearSelectorUniformParticipation
+                        | CapturePlanKind::OrderedRootCaptureManyCount
+                ) || route.plan.prefix_class_participation.is_some()
                     || route.retained_fallback_bytes != 0
                     || route.declared_prepublication_fallback
                         != CaptureCountPrepublicationFallback::None
@@ -724,6 +771,23 @@ fn selector_fits_limits(
         && prospective.span_sum <= limits.max_span_sum
         && prospective.peak_bytes <= limits.max_peak_bytes
         && prospective.work_bound <= limits.max_work
+}
+
+fn retained_selector_control_fits_limits(
+    prospective: &SelectorOperationProspective,
+    limits: SelectorOperationLimits,
+) -> bool {
+    prospective.boundaries <= limits.max_boundaries
+        && prospective.table_cells <= limits.max_table_cells
+        && prospective.random_access_bytes <= limits.max_random_access_bytes
+        && prospective.scratch_bytes <= limits.max_scratch_bytes
+        && prospective.log_bytes <= limits.max_log_bytes
+        && prospective.sequential_bytes <= limits.max_sequential_bytes
+        && prospective.match_events <= limits.max_match_events
+        && prospective.output_matches <= limits.max_output_matches
+        && prospective.output_bytes <= limits.max_output_bytes
+        && prospective.span_sum <= limits.max_span_sum
+        && prospective.peak_bytes <= limits.max_peak_bytes
 }
 
 fn direct_fits_limits(

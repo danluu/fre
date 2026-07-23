@@ -114,9 +114,10 @@ pub use captures::{
     CaptureHirAccounting, CaptureIterationError, CaptureIterationIdentity,
     CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation, CapturePlanIdentity,
     CapturePlanKind, CapturePrefixClassParticipationIdentity, CaptureRegex, CaptureRunLimits,
-    CaptureUnsupported, PortableTextCaptureBuildError, PortableTextCaptureBuildReport,
-    PortableTextCaptureBuilder, PortableTextCaptureIterationError, PortableTextCaptureMatch,
-    PortableTextCaptureRegex, PortableTextCaptureSearchError, PortableTextCaptures,
+    CaptureUnsupported, OrderedRootCaptureManyProof, PortableTextCaptureBuildError,
+    PortableTextCaptureBuildReport, PortableTextCaptureBuilder, PortableTextCaptureIterationError,
+    PortableTextCaptureMatch, PortableTextCaptureRegex, PortableTextCaptureSearchError,
+    PortableTextCaptures,
 };
 pub use fre_aggregate::{
     CONTINUATION_OPERATION_ACCOUNTING_VERSION as AGGREGATE_CONTINUATION_ACCOUNTING_VERSION,

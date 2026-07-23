@@ -285,6 +285,12 @@ pub struct CompiledRegex {
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     pub(crate) terminal_frontier: TerminalFrontierSeed,
+    /// Authenticated whole-match byte minimum from the same canonical HIR.
+    ///
+    /// A positive value bounds the number of selected non-overlapping
+    /// matches without inspecting the source. Nullable and empty-language
+    /// programs retain their exact `Some(0)` / `None` distinction.
+    pub(crate) minimum_match_bytes: Option<usize>,
     plan_id: PlanId,
     accounting: CompileAccounting,
 }
@@ -406,7 +412,7 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
     ) -> Result<Self, Error> {
-        Self::compile(hir, profile, limits, CapturePolicy::Reject)
+        Self::compile(hir, profile, limits, CapturePolicy::Reject, false)
     }
 
     /// Compile canonical HIR for an API that exposes whole-match values only.
@@ -423,7 +429,34 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
     ) -> Result<Self, Error> {
-        Self::compile(hir, profile, limits, CapturePolicy::EraseForWholeMatch)
+        Self::compile(
+            hir,
+            profile,
+            limits,
+            CapturePolicy::EraseForWholeMatch,
+            false,
+        )
+    }
+
+    /// Compile a capture-erased selector whose proved top-level ordered
+    /// alternation is retained as one batched root-choice program.
+    ///
+    /// This constructor exposes whole-match Count only through the dedicated
+    /// ordered-root operation. Its caller must independently prove fixed
+    /// capture participation from this same canonical HIR.
+    #[doc(hidden)]
+    pub fn from_hir_erasing_captures_for_ordered_root_count(
+        hir: &Hir,
+        profile: RustByteProfile,
+        limits: CompileLimits,
+    ) -> Result<Self, Error> {
+        Self::compile(
+            hir,
+            profile,
+            limits,
+            CapturePolicy::EraseForWholeMatch,
+            true,
+        )
     }
 
     /// Compile the whole-match-only program while retaining exact cumulative
@@ -489,6 +522,7 @@ impl CompiledRegex {
                 profile,
                 limits,
                 CapturePolicy::EraseForWholeMatch,
+                false,
                 &mut budget,
             )
         });
@@ -527,9 +561,17 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
         capture_policy: CapturePolicy,
+        ordered_root: bool,
     ) -> Result<Self, Error> {
         let mut budget = CompileBudget::new(limits);
-        Self::compile_with_budget(hir, profile, limits, capture_policy, &mut budget)
+        Self::compile_with_budget(
+            hir,
+            profile,
+            limits,
+            capture_policy,
+            ordered_root,
+            &mut budget,
+        )
     }
 
     #[allow(
@@ -541,17 +583,27 @@ impl CompiledRegex {
         profile: RustByteProfile,
         limits: CompileLimits,
         capture_policy: CapturePolicy,
+        ordered_root: bool,
         budget: &mut CompileBudget,
     ) -> Result<Self, Error> {
         validate_hir(hir, profile, capture_policy, budget)?;
-        let url_aggregate = build_url_aggregate_plan(hir, profile, capture_policy, limits, budget)?;
+        let minimum_match_bytes = hir.properties().minimum_len();
+        let url_aggregate = if ordered_root {
+            None
+        } else {
+            build_url_aggregate_plan(hir, profile, capture_policy, limits, budget)?
+        };
         let (
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
             retained_program_bytes,
         ) = build_retained_components(hir, profile, limits, budget)?;
-        let mut candidate = build_candidate_plan(hir, profile, budget)?;
+        let mut candidate = if ordered_root {
+            None
+        } else {
+            build_candidate_plan(hir, profile, budget)?
+        };
         let candidate_bytes = candidate
             .as_ref()
             .map_or(Ok(0), candidate::Plan::retained_bytes)?;
@@ -579,10 +631,15 @@ impl CompiledRegex {
             budget,
         );
         let accept = builder.push(Inst::Match)?;
-        let entry = if let Some(plan) = &mut candidate {
-            builder.compile_candidate_root(hir, accept, &mut plan.entries)?
+        let (entry, root_alternation_arms) = if ordered_root {
+            builder.compile_ordered_root(hir, accept, 1)?
+        } else if let Some(plan) = &mut candidate {
+            (
+                builder.compile_candidate_root(hir, accept, &mut plan.entries)?,
+                0,
+            )
         } else {
-            builder.compile_node(hir, accept, 1)?
+            (builder.compile_node(hir, accept, 1)?, 0)
         };
         let scalar_range_bytes = builder.scalar_range_bytes;
         let insts = builder.finish()?;
@@ -623,6 +680,8 @@ impl CompiledRegex {
             epsilon_order: certificate.epsilon_order,
             split_rank: certificate.split_rank,
             split_count: certificate.split_count,
+            root_split_count: certificate.root_split_count,
+            root_alternation_arms,
             execution_state_work: certificate.execution_state_work,
             predecessor_edges: certificate.predecessor_edges,
             has_scalar_transition: certificate.has_scalar_transition,
@@ -652,6 +711,7 @@ impl CompiledRegex {
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
+            minimum_match_bytes,
             plan_id,
             accounting,
         })
@@ -1969,6 +2029,10 @@ const fn candidate_byte_weight(byte: u8) -> u8 {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "retained execution seeds are constructed and charged in one auditable accounting scope"
+)]
 fn build_retained_components(
     hir: &Hir,
     profile: RustByteProfile,
@@ -1989,9 +2053,19 @@ fn build_retained_components(
     budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
     budget.accounting.terminal_frontier_prefix_bytes = terminal_frontier.prefix_len;
     budget.accounting.terminal_frontier_bytes = terminal_frontier.terminals.len;
+    let minimum_match_bytes_proof_bytes = core::mem::size_of::<Option<usize>>();
+    budget.accounting.minimum_match_bytes_proof_bytes = minimum_match_bytes_proof_bytes;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(minimum_match_bytes_proof_bytes)?;
+        budget.acquire_checked_construction_bytes(minimum_match_bytes_proof_bytes)?;
+    }
     let seed_program_bytes = add(
-        required_suffixes.retained_bytes()?,
-        TerminalFrontierSeed::retained_bytes(),
+        add(
+            required_suffixes.retained_bytes()?,
+            TerminalFrontierSeed::retained_bytes(),
+            Resource::ProgramBytes,
+        )?,
+        minimum_match_bytes_proof_bytes,
         Resource::ProgramBytes,
     )?;
     if budget.receipt_scope {
@@ -2169,6 +2243,7 @@ impl CompileBudget {
                 terminal_frontier_bytes: 0,
                 candidate_entries: 0,
                 candidate_bytes: 0,
+                minimum_match_bytes_proof_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -3464,6 +3539,35 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn compile_ordered_root(
+        &mut self,
+        hir: &Hir,
+        continuation: usize,
+        depth: usize,
+    ) -> Result<(usize, usize), Error> {
+        enforce(depth, self.budget.limits.max_hir_depth, Resource::HirDepth)?;
+        self.budget.charge(1)?;
+        let child_depth = add(depth, 1, Resource::HirDepth)?;
+        let HirKind::Alternation(children) = hir.kind() else {
+            return Err(Error::Unsupported(Unsupported::OrderedRootCaptureManyShape));
+        };
+        let Some((last, preceding)) = children.split_last() else {
+            return Err(Error::EmptyAlternation);
+        };
+        if preceding.is_empty() {
+            return Err(Error::Unsupported(Unsupported::OrderedRootCaptureManyShape));
+        }
+        let mut fallback = self.compile_node(last, continuation, child_depth)?;
+        for child in preceding.iter().rev() {
+            let preferred = self.compile_node(child, continuation, child_depth)?;
+            fallback = self.push(Inst::RootSplit {
+                preferred,
+                fallback,
+            })?;
+        }
+        Ok((fallback, children.len()))
+    }
+
     fn compile_candidate_root(
         &mut self,
         hir: &Hir,
@@ -3838,6 +3942,13 @@ fn translate_progress(
             preferred: mapped(same, *preferred)?,
             fallback: mapped(same, *fallback)?,
         }),
+        Inst::RootSplit {
+            preferred,
+            fallback,
+        } => Ok(Inst::RootSplit {
+            preferred: mapped(same, *preferred)?,
+            fallback: mapped(same, *fallback)?,
+        }),
     }
 }
 
@@ -3845,6 +3956,7 @@ struct ProgramCertificate {
     epsilon_order: ExactVec<usize>,
     split_rank: ExactVec<usize>,
     split_count: usize,
+    root_split_count: usize,
     execution_state_work: usize,
     predecessor_edges: usize,
     has_scalar_transition: bool,
@@ -4064,6 +4176,7 @@ fn certify_program_admitted(
         epsilon_order: order,
         split_rank,
         split_count: metadata.split_count,
+        root_split_count: metadata.root_split_count,
         execution_state_work: metadata.state_work,
         predecessor_edges: metadata.predecessor_edges,
         has_scalar_transition: metadata.has_scalar_transition,
@@ -4104,6 +4217,7 @@ fn preflight_certification_program_bytes(
 
 struct ExecutionMetadata {
     split_count: usize,
+    root_split_count: usize,
     state_work: usize,
     predecessor_edges: usize,
     has_scalar_transition: bool,
@@ -4117,6 +4231,7 @@ fn certify_execution_metadata(
 ) -> Result<ExecutionMetadata, Error> {
     let mut metadata = ExecutionMetadata {
         split_count: 0,
+        root_split_count: 0,
         state_work: 0,
         predecessor_edges: 0,
         has_scalar_transition: false,
@@ -4124,11 +4239,14 @@ fn certify_execution_metadata(
     };
     for (rank, inst) in split_rank.iter_mut().zip(insts) {
         budget.charge(1)?;
-        if matches!(inst, Inst::Split { .. }) {
+        if matches!(inst, Inst::Split { .. } | Inst::RootSplit { .. }) {
             *rank = metadata.split_count;
             metadata.split_count = add(metadata.split_count, 1, Resource::ProgramStates)?;
         } else {
             *rank = NO_SPLIT_RANK;
+        }
+        if matches!(inst, Inst::RootSplit { .. }) {
+            metadata.root_split_count = add(metadata.root_split_count, 1, Resource::ProgramStates)?;
         }
         let transitions = execution_transitions(
             inst,
@@ -4153,7 +4271,7 @@ const fn predecessor_edge_count(inst: &Inst) -> usize {
     match inst {
         Inst::Unfilled | Inst::Fail | Inst::Match => 0,
         Inst::Consume { .. } | Inst::Assert { .. } => 1,
-        Inst::Split { .. } => 2,
+        Inst::Split { .. } | Inst::RootSplit { .. } => 2,
         Inst::ConsumeScalar { .. } => 4,
     }
 }
@@ -4173,7 +4291,7 @@ fn execution_transitions(
             *max_scalar_search_checks = (*max_scalar_search_checks).max(checks);
             add(1, checks, Resource::ExecutionWork)
         }
-        Inst::Split { .. } => Ok(2),
+        Inst::Split { .. } | Inst::RootSplit { .. } => Ok(2),
     }
 }
 
@@ -4181,6 +4299,10 @@ fn epsilon_targets(inst: &Inst) -> impl Iterator<Item = usize> {
     let targets = match inst {
         Inst::Assert { next, .. } => [Some(*next), None],
         Inst::Split {
+            preferred,
+            fallback,
+        }
+        | Inst::RootSplit {
             preferred,
             fallback,
         } => [Some(*preferred), Some(*fallback)],
@@ -4589,6 +4711,14 @@ fn hash_inst(hash: &mut StableHash, inst: &Inst) {
             fallback,
         } => {
             hash.byte(5);
+            hash_usize(hash, *preferred);
+            hash_usize(hash, *fallback);
+        }
+        Inst::RootSplit {
+            preferred,
+            fallback,
+        } => {
+            hash.byte(7);
             hash_usize(hash, *preferred);
             hash_usize(hash, *fallback);
         }
@@ -5064,6 +5194,89 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn minimum_match_width_proof_is_retained_and_program_bounded() {
+        let hir = parse_bytes(r"a{4}");
+        let baseline = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = baseline.compile_accounting();
+        assert_eq!(baseline.minimum_match_bytes, Some(4));
+        assert_eq!(
+            accounting.minimum_match_bytes_proof_bytes,
+            core::mem::size_of::<Option<usize>>()
+        );
+        let exact = CompileLimits {
+            max_program_bytes: accounting.program_bytes,
+            ..CompileLimits::default()
+        };
+        let replay = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            exact,
+        )
+        .unwrap();
+        assert_eq!(replay.compile_accounting(), accounting);
+        let one_below = CompileLimits {
+            max_program_bytes: accounting.program_bytes - 1,
+            ..exact
+        };
+        assert_eq!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                one_below,
+            )
+            .unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: accounting.program_bytes,
+                limit: accounting.program_bytes - 1,
+            }
+        );
+        let receipt_exact = CompileLimits {
+            max_program_bytes: accounting.construction_peak_bytes,
+            ..CompileLimits::default()
+        };
+        let receipt_replay = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            receipt_exact,
+        )
+        .unwrap();
+        assert_eq!(receipt_replay.compile_accounting(), accounting);
+        let receipt_one_below = CompileLimits {
+            max_program_bytes: accounting.construction_peak_bytes - 1,
+            ..receipt_exact
+        };
+        let receipt_failure =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                receipt_one_below,
+            )
+            .unwrap_err();
+        assert_eq!(
+            receipt_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: accounting.construction_peak_bytes,
+                limit: accounting.construction_peak_bytes - 1,
+            }
+        );
+        assert_eq!(
+            receipt_failure
+                .receipt
+                .actual
+                .minimum_match_bytes_proof_bytes,
+            core::mem::size_of::<Option<usize>>()
+        );
+        assert!(receipt_failure.receipt.contains_actual());
     }
 
     #[test]

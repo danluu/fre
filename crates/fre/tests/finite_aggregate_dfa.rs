@@ -417,7 +417,7 @@ fn finite_dfa_n_2n_and_query_scaling_rejects_input_times_alternatives() {
 }
 
 #[test]
-fn spans_anchors_and_unbounded_neighbors_keep_the_continuation_route() {
+fn spans_and_unbounded_neighbors_keep_continuation_while_anchored_count_is_fixed() {
     for pattern in [r"(?:cat|dog)", r"\A(?:cat|dog)\z", r"(?:cat|dog)+"] {
         let regex = builder(pattern)
             .strategy(AggregateStrategy::ReverseSequentialRows)
@@ -425,14 +425,18 @@ fn spans_anchors_and_unbounded_neighbors_keep_the_continuation_route() {
             .unwrap();
         assert_eq!(
             regex.build_report().plan,
-            AggregatePlanKind::ContinuationProgram
+            AggregatePlanKind::ContinuationProgram,
+            "{pattern}"
         );
     }
-    for pattern in [r"\A(?:cat|dog)\z", r"(?:cat|dog)+"] {
-        let regex = builder(pattern).build_count().unwrap();
-        assert_eq!(
-            regex.build_report().plan,
-            AggregatePlanKind::ContinuationProgram
-        );
-    }
+    let anchored = builder(r"\A(?:cat|dog)\z").build_count().unwrap();
+    assert_eq!(
+        anchored.build_report().plan,
+        AggregatePlanKind::FixedAbsoluteDomain
+    );
+    let unbounded = builder(r"(?:cat|dog)+").build_count().unwrap();
+    assert_eq!(
+        unbounded.build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
 }

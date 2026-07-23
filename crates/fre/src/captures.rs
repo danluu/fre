@@ -67,6 +67,9 @@ pub enum CaptureOperation {
 /// Production plan selected for the admitted capture operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturePlanKind {
+    /// A proved ordered root alternation whose direct arms each contain one
+    /// distinct capture; the selector batches root choice once per row.
+    OrderedRootCaptureManyCount,
     /// Direct capture Count for two ordered `LITERAL BYTE_CLASS+` arms, with
     /// one canonical-HIR-proved participating group per selected match.
     UniformPrefixClassParticipation,
@@ -102,6 +105,19 @@ pub struct CaptureHirAccounting {
     pub capture_slots: usize,
     /// Metered conversion work.
     pub work: usize,
+}
+
+/// Construction proof for the ordered-root capture-many Count route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedRootCaptureManyProof {
+    /// Source-ordered root alternatives and explicit capture slots.
+    pub root_arms: usize,
+    /// Participating user captures per selected match.
+    pub participating_captures: usize,
+    /// Participating groups including group zero.
+    pub groups_per_match: usize,
+    /// Exact work charged while classifying the canonical capture HIR.
+    pub proof_work: usize,
 }
 
 /// Construction limits whose exact values participate in cache identity.
@@ -222,6 +238,8 @@ pub struct CapturePlanIdentity {
     pub capture_profile: CaptureProfile,
     /// Exact capture-erased selector program identity.
     pub selector_plan_id: SelectorPlanId,
+    /// Ordered-root theorem dimensions for the dedicated capture-many route.
+    pub ordered_root_capture_many: Option<OrderedRootCaptureManyProof>,
     /// Optional generic required-any-literal proof sharing this exact syntax.
     pub required_literal: Option<CaptureRequiredLiteralIdentity>,
     /// Direct physical route and its declared U3 fallback, when selected.
@@ -244,6 +262,8 @@ pub struct CaptureBuildReport {
     /// Exact explicit-capture participation per selected match when the HIR
     /// proves that cardinality independent of input and branch choice.
     pub uniform_participating_captures: Option<usize>,
+    /// Proof attached only to the ordered-root capture-many route.
+    pub ordered_root_capture_many: Option<OrderedRootCaptureManyProof>,
     /// Optional bounded required-literal construction receipt.
     pub required_literal: Option<CaptureRequiredLiteralBuildAccounting>,
     /// Additional canonical-HIR work used to accept or refuse the optional
@@ -1674,15 +1694,34 @@ impl CaptureBuilder {
         } else {
             SelectorProfile::PINNED_1_12_4
         };
-        let selector = SelectorRegex::from_hir_erasing_captures_for_whole_match(
+        let ordered_root_capture_many = ordered_root_capture_many_proof(
             &rust.hir,
-            selector_profile,
-            limits.selector,
-        )
+            explicit_captures,
+            &limits,
+            &mut accounting,
+        )?;
+        let selector = if ordered_root_capture_many.is_some() {
+            SelectorRegex::from_hir_erasing_captures_for_ordered_root_count(
+                &rust.hir,
+                selector_profile,
+                limits.selector,
+            )
+        } else {
+            SelectorRegex::from_hir_erasing_captures_for_whole_match(
+                &rust.hir,
+                selector_profile,
+                limits.selector,
+            )
+        }
         .map_err(CaptureBuildError::Selector)?;
         let selector_accounting = selector.compile_accounting();
         let uniform_participating_captures =
             capture_participation(&rust.hir, 1, &limits, &mut accounting)?.uniform;
+        if ordered_root_capture_many.is_some() && uniform_participating_captures != Some(1) {
+            return Err(CaptureBuildError::InternalInvariant(
+                "ordered-root proof disagrees with participation analysis",
+            ));
+        }
         let prefix_class_participation = build_prefix_class_participation(
             &rust.hir,
             &syntax,
@@ -1705,7 +1744,9 @@ impl CaptureBuilder {
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
-            plan: if prefix_class_participation.plan.is_some() {
+            plan: if ordered_root_capture_many.is_some() {
+                CapturePlanKind::OrderedRootCaptureManyCount
+            } else if prefix_class_participation.plan.is_some() {
                 CapturePlanKind::UniformPrefixClassParticipation
             } else if uniform_participating_captures.is_some() {
                 CapturePlanKind::LinearSelectorUniformParticipation
@@ -1714,6 +1755,7 @@ impl CaptureBuilder {
             },
             capture_profile: CaptureProfile::RustRegexBytes1_12_4,
             selector_plan_id: selector.plan_id(),
+            ordered_root_capture_many,
             required_literal: required_literal
                 .as_ref()
                 .map(|plan| plan.build_report().identity.clone()),
@@ -1746,7 +1788,8 @@ impl CaptureBuilder {
                     )?;
                 let (branch, retained_fallback_bytes, declared_prepublication_fallback) =
                     match plan_identity.plan {
-                        CapturePlanKind::LinearSelectorUniformParticipation => (
+                        CapturePlanKind::OrderedRootCaptureManyCount
+                        | CapturePlanKind::LinearSelectorUniformParticipation => (
                             CaptureCountBranch::SelectorUniformParticipation,
                             0,
                             CaptureCountPrepublicationFallback::None,
@@ -1780,7 +1823,11 @@ impl CaptureBuilder {
                     build_limits: limits,
                     branch,
                     selector_route: CaptureCountSelectorRoute {
-                        physical_route: if selector.has_terminal_frontier() {
+                        physical_route: if plan_identity.plan
+                            == CapturePlanKind::OrderedRootCaptureManyCount
+                        {
+                            fre_aggregate::OperationPhysicalRoute::OrderedRootRows
+                        } else if selector.has_terminal_frontier() {
                             fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows
                         } else {
                             fre_aggregate::OperationPhysicalRoute::DenseRows
@@ -1793,7 +1840,14 @@ impl CaptureBuilder {
                     },
                     selector_strategy: SelectorStrategy::ReverseSequentialRows,
                     selector_operation: fre_aggregate::OperationAttemptKind::Count,
-                    selector_work_mode: fre_aggregate::OperationWorkMode::ConservativeAdmission,
+                    selector_work_mode: match branch {
+                        CaptureCountBranch::SelectorUniformParticipation => {
+                            fre_aggregate::OperationWorkMode::Observed
+                        }
+                        CaptureCountBranch::DirectPrefixClassParticipation => {
+                            fre_aggregate::OperationWorkMode::ConservativeAdmission
+                        }
+                    },
                     minimum_match_bytes,
                     participating_captures_per_match,
                     capture_schema_entries_per_match,
@@ -1813,6 +1867,7 @@ impl CaptureBuilder {
             engine: engine_report,
             selector: selector_accounting,
             uniform_participating_captures,
+            ordered_root_capture_many,
             required_literal: required_literal
                 .as_ref()
                 .map(|plan| plan.build_report().accounting),
@@ -2527,7 +2582,7 @@ impl CaptureRegex {
                 Some(&owner_prospective),
             ));
         }
-        enforce_selector_control(owner_prospective.selector, selector_limits).map_err(
+        enforce_retained_selector_control(owner_prospective.selector, selector_limits).map_err(
             |source| {
                 Self::direct_count_error(
                     &identity,
@@ -2712,6 +2767,35 @@ impl CaptureRegex {
                     prefix_class_participation_receipt: None,
                     count_receipt: None,
                 })?;
+        let ordered_root = identity.plan.plan == CapturePlanKind::OrderedRootCaptureManyCount;
+        if ordered_root {
+            let Some(proof) = identity.plan.ordered_root_capture_many else {
+                return Err(CaptureExecutionError {
+                    identity,
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "ordered-root Count lost its construction proof",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                });
+            };
+            if proof.participating_captures != participating
+                || proof.groups_per_match != participating_with_overall
+                || proof.root_arms != self.report.engine.captures
+                || self.report.ordered_root_capture_many != Some(proof)
+            {
+                return Err(CaptureExecutionError {
+                    identity,
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "ordered-root Count proof diverged from capture schema",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                });
+            }
+        }
         let sealed_route = identity.count_seal.as_ref().map(|seal| {
             let route = seal.route_identity();
             (
@@ -2754,9 +2838,10 @@ impl CaptureRegex {
                 count_receipt: None,
             });
         }
-        let terminal_frontier = match selector_route {
-            fre_aggregate::OperationPhysicalRoute::DenseRows => false,
-            fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows => true,
+        let terminal_frontier = match (ordered_root, selector_route) {
+            (true, fre_aggregate::OperationPhysicalRoute::OrderedRootRows)
+            | (false, fre_aggregate::OperationPhysicalRoute::DenseRows) => false,
+            (false, fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows) => true,
             _ => {
                 return Err(CaptureExecutionError {
                     identity,
@@ -2769,7 +2854,9 @@ impl CaptureRegex {
                 });
             }
         };
-        if terminal_frontier != self.selector.has_terminal_frontier() {
+        if (!ordered_root && terminal_frontier != self.selector.has_terminal_frontier())
+            || (ordered_root && terminal_frontier)
+        {
             return Err(CaptureExecutionError {
                 identity,
                 source: CaptureExecutionSource::InternalInvariant(
@@ -2809,9 +2896,19 @@ impl CaptureRegex {
                     ))
                 }
             };
-        let attempt = if terminal_frontier {
+        let attempt = if ordered_root {
             self.selector
-                .admit_count_with_terminal_frontier_receipt_observer(
+                .admit_ordered_root_count_observed_with_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
+                )
+        } else if terminal_frontier {
+            self.selector
+                .admit_count_observed_with_terminal_frontier_receipt_observer(
                     haystack,
                     0..haystack.len(),
                     SelectorStrategy::ReverseSequentialRows,
@@ -2820,7 +2917,7 @@ impl CaptureRegex {
                     &mut observer,
                 )
         } else {
-            self.selector.admit_count_with_receipt_observer(
+            self.selector.admit_count_observed_with_receipt_observer(
                 haystack,
                 0..haystack.len(),
                 SelectorStrategy::ReverseSequentialRows,
@@ -3082,7 +3179,7 @@ impl CaptureRegex {
     clippy::large_types_passed_by_value,
     reason = "the Copy prospective is admitted as one immutable source-free selector-control snapshot"
 )]
-fn enforce_selector_control(
+fn enforce_retained_selector_control(
     prospective: SelectorOperationProspective,
     limits: SelectorOperationLimits,
 ) -> Result<(), SelectorError> {
@@ -3141,11 +3238,6 @@ fn enforce_selector_control(
             prospective.peak_bytes,
             limits.max_peak_bytes,
             SelectorResource::PeakBytes,
-        ),
-        (
-            prospective.work_bound,
-            limits.max_work,
-            SelectorResource::ExecutionWork,
         ),
     ] {
         if required > limit {
@@ -3340,6 +3432,59 @@ impl CaptureParticipation {
         stable_set: true,
         can_participate: false,
     };
+}
+
+fn ordered_root_capture_many_proof(
+    hir: &Hir,
+    explicit_captures: usize,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Option<OrderedRootCaptureManyProof>, CaptureBuildError> {
+    let work_before = accounting.work;
+    charge_hir(accounting, 1, limits.max_hir_work)?;
+    let HirKind::Alternation(children) = hir.kind() else {
+        return Ok(None);
+    };
+    charge_hir(accounting, 3, limits.max_hir_work)?;
+    if children.len() < 2
+        || children.len() != explicit_captures
+        || hir.properties().explicit_captures_len() != explicit_captures
+    {
+        return Ok(None);
+    }
+    for (index, child) in children.iter().enumerate() {
+        charge_hir(accounting, 4, limits.max_hir_work)?;
+        let HirKind::Capture(capture) = child.kind() else {
+            return Ok(None);
+        };
+        let expected_index = index
+            .checked_add(1)
+            .ok_or(CaptureBuildError::InternalInvariant(
+                "ordered-root capture index overflowed usize",
+            ))?;
+        let expected_index = u32::try_from(expected_index).map_err(|_| {
+            CaptureBuildError::InternalInvariant("ordered-root capture index exceeded u32")
+        })?;
+        if capture.index != expected_index
+            || capture.sub.properties().explicit_captures_len() != 0
+            || !matches!(capture.sub.properties().minimum_len(), Some(minimum) if minimum > 0)
+        {
+            return Ok(None);
+        }
+    }
+    let proof_work =
+        accounting
+            .work
+            .checked_sub(work_before)
+            .ok_or(CaptureBuildError::InternalInvariant(
+                "ordered-root proof work moved backward",
+            ))?;
+    Ok(Some(OrderedRootCaptureManyProof {
+        root_arms: children.len(),
+        participating_captures: 1,
+        groups_per_match: 2,
+        proof_work,
+    }))
 }
 
 /// Prove only the cardinality needed by the reducer while charging this

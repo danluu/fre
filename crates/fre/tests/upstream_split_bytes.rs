@@ -375,7 +375,7 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
         .expect("split selector");
     let exact = AggregateRunLimits {
         continuation: AggregateOperationLimits {
-            max_output_matches: 4,
+            max_output_matches: 3,
             ..AggregateOperationLimits::default()
         },
         ..AggregateRunLimits::default()
@@ -386,7 +386,7 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
 
     let below = AggregateRunLimits {
         continuation: AggregateOperationLimits {
-            max_output_matches: 3,
+            max_output_matches: 2,
             ..AggregateOperationLimits::default()
         },
         ..AggregateRunLimits::default()
@@ -398,8 +398,8 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
         error.source,
         AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
             resource: AggregateResource::OutputMatches,
-            required: 4,
-            limit: 3,
+            required: 3,
+            limit: 2,
         })
     ));
 }

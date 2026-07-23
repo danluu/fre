@@ -19,6 +19,20 @@ pub(super) struct FrontierRequirements {
     minimum_work: usize,
 }
 
+impl FrontierRequirements {
+    pub(super) const fn minimum_work(self) -> usize {
+        self.minimum_work
+    }
+
+    pub(super) const fn with_observed_work_limit(mut self, work_limit: usize) -> Self {
+        // Observed execution can let the census use the complete published
+        // operation quota: `preflight_completion` checks the measured census
+        // and its identical production replay before the replay starts.
+        self.sweep_work_limit = work_limit;
+        self
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Layout {
     states: usize,
@@ -225,7 +239,7 @@ pub(super) fn allocation_count(program: &Program, log_bytes: usize) -> Result<us
     clippy::too_many_lines,
     reason = "terminal-frontier construction keeps its two-pass P/A ordering and allocation ledger in one audit unit"
 )]
-pub(super) fn build(
+pub(super) fn build<const OBSERVED_WORK: bool>(
     program: &Program,
     haystack: &[u8],
     assertions: AssertionContext<'_>,
@@ -244,7 +258,7 @@ pub(super) fn build(
         accounting,
     )?
     else {
-        return build_zero_log(
+        return build_zero_log::<OBSERVED_WORK>(
             program,
             requirements,
             storage,
@@ -287,7 +301,8 @@ pub(super) fn build(
             accounting.work,
             frontier.sweep_work_limit,
             Resource::ExecutionWork,
-        )?,
+        )?
+        .min(requirements.work_bound),
     };
     enforce(
         machine.work_bound,
@@ -303,7 +318,7 @@ pub(super) fn build(
         ));
     }
     machine.work_bound = requirements.work_bound;
-    preflight_completion(
+    preflight_completion::<OBSERVED_WORK>(
         *accounting,
         census,
         allocated.active.len(),
@@ -438,7 +453,7 @@ fn earliest_required_prefix(
     Ok(None)
 }
 
-fn build_zero_log(
+fn build_zero_log<const OBSERVED_WORK: bool>(
     program: &Program,
     requirements: Requirements,
     storage: RowStorage,
@@ -449,7 +464,11 @@ fn build_zero_log(
 ) -> Result<RowStore, Error> {
     let future = add(
         requirements.requested_log_bytes,
-        frontier.post_build_work,
+        if OBSERVED_WORK {
+            0
+        } else {
+            frontier.post_build_work
+        },
         Resource::ExecutionWork,
     )?;
     enforce(
@@ -504,7 +523,7 @@ fn preflight_frontier_bytes(
     clippy::large_types_passed_by_value,
     reason = "the fixed accounting snapshot is copied deliberately before admission publication"
 )]
-fn preflight_completion(
+fn preflight_completion<const OBSERVED_WORK: bool>(
     accounting: ExecutionAccounting,
     census: Delta,
     reset_states: usize,
@@ -515,7 +534,11 @@ fn preflight_completion(
     let log_work = mul(requirements.requested_log_bytes, 2, Resource::ExecutionWork)?;
     let future = add(
         add(census.work, reset_states, Resource::ExecutionWork)?,
-        add(log_work, post_build_work, Resource::ExecutionWork)?,
+        add(
+            log_work,
+            if OBSERVED_WORK { 0 } else { post_build_work },
+            Resource::ExecutionWork,
+        )?,
         Resource::ExecutionWork,
     )?;
     enforce(
@@ -794,6 +817,10 @@ fn targets(inst: &Inst) -> Result<impl Iterator<Item = usize>, Error> {
     let targets = match inst {
         Inst::Consume { next, .. } | Inst::Assert { next, .. } => [Some(*next), None, None, None],
         Inst::Split {
+            preferred,
+            fallback,
+        }
+        | Inst::RootSplit {
             preferred,
             fallback,
         } => [Some(*preferred), Some(*fallback), None, None],
@@ -1316,6 +1343,10 @@ impl Machine<'_> {
             Inst::Split {
                 preferred,
                 fallback,
+            }
+            | Inst::RootSplit {
+                preferred,
+                fallback,
             } => self.evaluate_split(pc, *preferred, *fallback, row, record, accounting),
         }
     }
@@ -1384,6 +1415,10 @@ impl Machine<'_> {
                     candidates.insert(parent_rank, accounting, self.work_bound)?;
                 }
                 Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
                     preferred,
                     fallback,
                 } if *preferred == pc || *fallback == pc => {
@@ -1617,6 +1652,61 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn ordered_compiled(pattern: &str) -> crate::CompiledRegex {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        crate::CompiledRegex::from_hir_erasing_captures_for_ordered_root_count(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_frontier_raises_live_children_through_root_splits() {
+        // The ordinary expression owns the terminal seed; the equivalent
+        // ordered-root expression supplies RootSplit instructions. Keeping
+        // those concerns separate lets this private executor regression reach
+        // the parent-propagation edge even though public ordered-root Count
+        // deliberately uses its dedicated row route.
+        let seed_owner = compiled(r"cargo[\\/].*[\\/]");
+        let ordered = ordered_compiled(r"(?P<slash>cargo/.*[/])|(?P<backslash>cargo\\.*[\\])");
+        assert_eq!(ordered.program.root_split_count(), 1);
+        let haystack = b"cargo/path/";
+        let boundaries = haystack.len() + 1;
+        let requirements = super::super::Requirements::new_terminal_frontier(
+            &ordered.program,
+            boundaries,
+            super::super::Strategy::ReverseSequentialRows,
+            1,
+            &seed_owner.terminal_frontier,
+            OperationLimits::default(),
+        )
+        .unwrap();
+        let assertions = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let mut accounting = ExecutionAccounting::default();
+        let mut actual_allocations = 0;
+        let store = build::<false>(
+            &ordered.program,
+            haystack,
+            assertions,
+            requirements,
+            &seed_owner.terminal_frontier,
+            OperationLimits::default(),
+            &mut accounting,
+            &mut actual_allocations,
+        )
+        .unwrap();
+        assert!(store.allocated_store_bytes > 0);
+        assert!(accounting.transition_checks > 0);
+        assert!(actual_allocations > 0);
     }
 
     #[test]

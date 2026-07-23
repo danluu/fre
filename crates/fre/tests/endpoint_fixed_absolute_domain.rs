@@ -53,8 +53,8 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     // Exact typed fixed failures retain owner provenance, route limits, and
     // complete nested P/A without a terminal-path allocation.
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_552);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_552);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 296);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_576);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 504);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 40);

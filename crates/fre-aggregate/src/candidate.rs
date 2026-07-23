@@ -749,7 +749,11 @@ fn verify_entry_at(
                         "candidate verifier reached a scalar transition",
                     ));
                 }
-                Inst::Unfilled | Inst::Fail | Inst::Assert { .. } | Inst::Split { .. } => {
+                Inst::Unfilled
+                | Inst::Fail
+                | Inst::Assert { .. }
+                | Inst::Split { .. }
+                | Inst::RootSplit { .. } => {
                     return Err(Error::InternalInvariant(
                         "candidate closure published an epsilon state",
                     ));
@@ -830,6 +834,10 @@ fn add_closure(
                 }
             }
             Inst::Split {
+                preferred,
+                fallback,
+            }
+            | Inst::RootSplit {
                 preferred,
                 fallback,
             } => {

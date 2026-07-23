@@ -75,6 +75,7 @@ enum OperationKind {
 enum GenericCountRoute {
     Dense,
     TerminalFrontier,
+    OrderedRoot,
 }
 
 /// Stable identity of a regex plan, forced strategy and operation type.
@@ -273,9 +274,9 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 2;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 3;
 
-/// Maximum allocation count representable by every route in accounting v2.
+/// Maximum allocation count representable by every route in accounting v3.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -301,6 +302,8 @@ fn compact_operation_allocation_count(allocations: usize) -> Result<u8, Error> {
 pub enum OperationPhysicalRoute {
     /// Complete endpoint table or reverse sequential rows.
     DenseRows,
+    /// Reverse rows with source-ordered root-arm selection batched per row.
+    OrderedRootRows,
     /// Reverse rows seeded by the construction-retained required suffixes.
     RequiredSuffixRows,
     /// Reverse rows seeded by the construction-retained terminal frontier.
@@ -560,7 +563,6 @@ impl OperationProspective {
             && random_access_peak_bytes <= self.random_access_bytes
             && scratch_peak_bytes <= self.scratch_bytes
             && log_bytes <= self.log_bytes
-            && successful_paths <= self.match_events
             && emitted_matches <= self.output_matches
             && output_bytes <= self.output_bytes
             && peak_bytes <= self.peak_bytes
@@ -1157,6 +1159,7 @@ impl CompiledRegex {
             boundaries,
             utf8_validation,
             OperationKind::Count,
+            self.minimum_match_bytes,
         )
     }
 
@@ -1316,6 +1319,124 @@ impl CompiledRegex {
         )
         .map(|(result, receipt)| CountValueAttempt {
             value: result.summary.matches,
+            receipt,
+        })
+    }
+
+    /// Observed-work generic continuation count that retains the complete
+    /// admitted result and P/A receipt for an enclosing receipt-bearing
+    /// reducer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::Dense),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
+    /// Observed-work terminal-frontier Count with a complete admitted result,
+    /// P/A receipt, and outer pre-source observer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_terminal_frontier_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::TerminalFrontier),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
+    /// Observed-work Count for a compiler-proved ordered root alternation,
+    /// retaining the complete admitted result and nested P/A receipt.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_ordered_root_count_observed_with_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::OrderedRoot),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
             receipt,
         })
     }
@@ -1546,6 +1667,16 @@ impl CompiledRegex {
                     "terminal-frontier Count requires its compiled HIR proof",
                 ));
             }
+            Some(GenericCountRoute::OrderedRoot)
+                if strategy != Strategy::ReverseSequentialRows
+                    || self.program.root_alternation_arms() < 2
+                    || self.program.root_split_count().checked_add(1)
+                        != Some(self.program.root_alternation_arms()) =>
+            {
+                return Err(Error::InternalInvariant(
+                    "ordered-root Count requires its compiled root proof",
+                ));
+            }
             Some(_) | None => {}
         }
         let local = &haystack[range.clone()];
@@ -1663,7 +1794,7 @@ impl CompiledRegex {
             {
                 Some(SparseSeed::TerminalFrontier(&self.terminal_frontier))
             }
-            Some(GenericCountRoute::Dense) | None => None,
+            Some(GenericCountRoute::Dense | GenericCountRoute::OrderedRoot) | None => None,
         };
         let fallback_seed =
             if forced_generic_count_route.is_some() || self.required_suffixes.is_empty() {
@@ -1681,8 +1812,19 @@ impl CompiledRegex {
             )
         };
         let (requirements, sparse_seed) = if forced_generic_count_route
-            == Some(GenericCountRoute::TerminalFrontier)
+            == Some(GenericCountRoute::OrderedRoot)
         {
+            (
+                Requirements::new_ordered_root::<OBSERVED_WORK>(
+                    &self.program,
+                    boundaries,
+                    strategy,
+                    passes,
+                    engine_limits,
+                )?,
+                None,
+            )
+        } else if forced_generic_count_route == Some(GenericCountRoute::TerminalFrontier) {
             let seed = terminal_seed.ok_or(Error::InternalInvariant(
                 "terminal-frontier Count lost its compiled HIR proof",
             ))?;
@@ -1850,8 +1992,43 @@ impl CompiledRegex {
                 Err(error) => return Err(error),
             }
         };
-        let requirements =
+        let mut requirements =
             requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
+        if receipt_bearing && OBSERVED_WORK {
+            // Every receipt-bearing observed route executes against the same
+            // work ceiling it publishes. This includes sparse, terminal, and
+            // cached builders whose internal meters use `Requirements`
+            // directly rather than the generic per-charge caller argument.
+            //
+            // UTF-8 validation is a mandatory pre-engine prefix. Preserve it
+            // in P even when the caller cannot admit it, so the limit refuses
+            // before validation reads source bytes. Only the residual engine
+            // work is clamped to the caller's residual quota.
+            let engine_work = requirements.work_bound.checked_sub(utf8_validation).ok_or(
+                Error::InternalInvariant("operation work prefix exceeds its prospective total"),
+            )?;
+            let caller_engine_work = limits.max_work.saturating_sub(utf8_validation);
+            let mandatory_engine_work = requirements
+                .frontier
+                .map_or(0, terminal_frontier::FrontierRequirements::minimum_work);
+            let admitted_engine_work = if caller_engine_work < mandatory_engine_work {
+                // A selected terminal frontier has a fixed minimum census.
+                // Retain that mandatory amount in P so a lower caller refuses
+                // before any source access or allocation.
+                mandatory_engine_work
+            } else {
+                engine_work.min(caller_engine_work)
+            };
+            if let Some(frontier) = requirements.frontier {
+                requirements.frontier =
+                    Some(frontier.with_observed_work_limit(admitted_engine_work));
+            }
+            requirements.work_bound = add(
+                utf8_validation,
+                admitted_engine_work,
+                Resource::ExecutionWork,
+            )?;
+        }
         let prepublication_fallback = if forced_generic_count_route.is_some() {
             OperationPrepublicationFallback::None
         } else if terminal_seed.is_some() {
@@ -1864,31 +2041,28 @@ impl CompiledRegex {
             OperationPrepublicationFallback::None
         };
         if let Some(publication) = attempt.as_mut() {
-            let physical_route = if requirements.terminal_frontier {
-                OperationPhysicalRoute::TerminalFrontierRows
-            } else if requirements.cached_frontier.is_some() {
-                OperationPhysicalRoute::CachedFrontier
-            } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
-                OperationPhysicalRoute::RequiredSuffixRows
-            } else {
-                OperationPhysicalRoute::DenseRows
-            };
+            let physical_route =
+                if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
+                    OperationPhysicalRoute::OrderedRootRows
+                } else if requirements.terminal_frontier {
+                    OperationPhysicalRoute::TerminalFrontierRows
+                } else if requirements.cached_frontier.is_some() {
+                    OperationPhysicalRoute::CachedFrontier
+                } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
+                    OperationPhysicalRoute::RequiredSuffixRows
+                } else {
+                    OperationPhysicalRoute::DenseRows
+                };
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = prepublication_fallback;
-            let mut prospective = requirements.operation_prospective(
+            let prospective = requirements.operation_prospective(
                 &self.program,
                 local.len(),
                 boundaries,
                 utf8_validation,
                 kind,
+                self.minimum_match_bytes,
             )?;
-            if OBSERVED_WORK && prospective.work_bound > limits.max_work {
-                // Observed-work admission authorizes the exact metered work
-                // up to the caller ceiling. All other structural/component
-                // bounds remain input-only and conservative.
-                prospective.work_bound = limits.max_work;
-                prospective.accounting.work = limits.max_work;
-            }
             *publication.prospective = Some(prospective);
             if let Some(observer) = prospective_observer.as_mut() {
                 observer(prospective)?;
@@ -1903,18 +2077,32 @@ impl CompiledRegex {
         if receipt_bearing {
             validate_unicode_word_utf8(haystack, utf8_validation, accounting)?;
         }
-        let mut engine = Engine::build::<OBSERVED_WORK>(
-            &self.program,
-            local,
-            assertion_context,
-            strategy,
-            requirements,
-            sparse_seed,
-            limits,
-            receipt_bearing,
-            accounting,
-            actual_allocations,
-        )?;
+        let mut engine = if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
+            Engine::build_ordered_root::<OBSERVED_WORK>(
+                &self.program,
+                local,
+                assertion_context,
+                strategy,
+                requirements,
+                limits,
+                receipt_bearing,
+                accounting,
+                actual_allocations,
+            )?
+        } else {
+            Engine::build::<OBSERVED_WORK>(
+                &self.program,
+                local,
+                assertion_context,
+                strategy,
+                requirements,
+                sparse_seed,
+                limits,
+                receipt_bearing,
+                accounting,
+                actual_allocations,
+            )?
+        };
         let summary = engine.scan::<OBSERVED_WORK>(
             &self.program,
             local,
@@ -2010,7 +2198,9 @@ impl CompiledRegex {
         }
         validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
         accounting.emitted_matches = summary.matches;
-        let physical_route = if requirements.terminal_frontier {
+        let physical_route = if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
+            OperationPhysicalRoute::OrderedRootRows
+        } else if requirements.terminal_frontier {
             OperationPhysicalRoute::TerminalFrontierRows
         } else if requirements.cached_frontier.is_some() {
             OperationPhysicalRoute::CachedFrontier
@@ -2913,6 +3103,10 @@ impl Requirements {
             })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete prospective receipt is assembled in one auditable accounting scope"
+    )]
     fn operation_prospective(
         self,
         program: &Program,
@@ -2920,14 +3114,30 @@ impl Requirements {
         boundaries: usize,
         utf8_validation: usize,
         kind: OperationKind,
+        minimum_match_bytes: Option<usize>,
     ) -> Result<OperationProspective, Error> {
         let event_passes = if kind == OperationKind::Spans { 2 } else { 1 };
-        let match_events = mul(
-            mul(boundaries, 2, Resource::MatchEvents)?,
-            event_passes,
-            Resource::MatchEvents,
-        )?;
-        let output_matches = boundaries;
+        let nonempty_span_matches = match (kind, minimum_match_bytes) {
+            (OperationKind::Spans, Some(minimum)) if minimum > 0 => Some(
+                input_bytes
+                    .checked_div(minimum)
+                    .ok_or(Error::InternalInvariant(
+                        "positive minimum match width rejected checked division",
+                    ))?,
+            ),
+            _ => None,
+        };
+        // The public event limit applies independently to each complete
+        // selector pass. A construction-authenticated positive minimum
+        // tightens non-overlapping Spans to floor(N / minimum); nullable and
+        // non-Spans operations retain the pre-existing boundary envelope.
+        let match_events = if let Some(matches) = nonempty_span_matches {
+            matches
+        } else {
+            mul(boundaries, 2, Resource::MatchEvents)?
+        };
+        let accounting_match_events = mul(match_events, event_passes, Resource::MatchEvents)?;
+        let output_matches = nonempty_span_matches.unwrap_or(boundaries);
         let output_bytes = if kind == OperationKind::Spans {
             mul(
                 output_matches,
@@ -2943,12 +3153,36 @@ impl Requirements {
             0
         };
         let allocations = self.operation_allocation_bound(kind)?;
-        let peak_bytes = add(self.peak_bound, output_bytes, Resource::PeakBytes)?;
+        let peak_bytes = if kind == OperationKind::Spans {
+            if let Some(cache) = self.cached_frontier {
+                cache.peak_bytes.max(add(
+                    cache.replay_bytes()?,
+                    output_bytes,
+                    Resource::PeakBytes,
+                )?)
+            } else if self.row_storage.is_some() {
+                self.peak_bound.max(add(
+                    self.requested_log_bytes,
+                    output_bytes,
+                    Resource::PeakBytes,
+                )?)
+            } else {
+                // Full-table selection retains the table while publishing
+                // output, unlike the reverse-row and cached-frontier routes
+                // whose construction scratch is gone before replay.
+                add(self.peak_bound, output_bytes, Resource::PeakBytes)?
+            }
+        } else {
+            self.peak_bound
+        };
         let work = self.work_bound;
         // Every generic logical source service is paired with admitted work;
         // byte/scalar/assertion services inspect at most eight bytes per
         // charged unit (two adjacent four-byte UTF-8 scalars).
-        let random_access_bytes_read = mul(work, 8, Resource::RandomAccessBytes)?;
+        // Intrinsic receipt derivation deliberately uses `usize::MAX` as the
+        // caller-independent observed-work ceiling. Saturation is still a
+        // conservative componentwise upper bound and cannot understate A.
+        let random_access_bytes_read = work.saturating_mul(8);
         let accounting = ExecutionAccounting {
             state_evaluations: work,
             transition_checks: work,
@@ -2973,8 +3207,12 @@ impl Requirements {
             url_candidate_insertions: 0,
             url_candidate_visits: 0,
             replay_steps: work,
-            successful_paths: match_events,
-            suppressed_empty: match_events,
+            successful_paths: accounting_match_events,
+            suppressed_empty: if nonempty_span_matches.is_some() {
+                0
+            } else {
+                accounting_match_events
+            },
             emitted_matches: output_matches,
             utf8_validation_work: utf8_validation,
             frontier_peak_states: work,
@@ -3157,6 +3395,92 @@ impl Requirements {
             scratch_bound: scratch,
             peak_bound: peak,
             sequential_bound: sequential,
+            allocations,
+            work_bound,
+            terminal_frontier: false,
+            frontier: None,
+            cached_frontier: None,
+            cache_attempt_work: 0,
+        })
+    }
+
+    fn new_ordered_root<const OBSERVED_WORK: bool>(
+        program: &Program,
+        boundaries: usize,
+        strategy: Strategy,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        if strategy != Strategy::ReverseSequentialRows
+            || program.root_alternation_arms() < 2
+            || program.root_split_count().checked_add(1) != Some(program.root_alternation_arms())
+        {
+            return Err(Error::InternalInvariant(
+                "ordered-root row requirements lack root metadata",
+            ));
+        }
+        let rows = ReverseRowRequirements::new_ordered_root(program, boundaries, passes)?;
+        enforce(
+            rows.row_bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(
+            rows.row_bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )?;
+        enforce(rows.log_bytes, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            rows.sequential_bound,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        let peak = add(rows.log_bytes, rows.row_bytes, Resource::PeakBytes)?;
+        enforce(peak, limits.max_peak_bytes, Resource::PeakBytes)?;
+
+        let skipped = mul(program.root_split_count(), 3, Resource::ExecutionWork)?;
+        let ordinary_without_root =
+            program
+                .execution_state_work()
+                .checked_sub(skipped)
+                .ok_or(Error::InternalInvariant(
+                    "ordered-root work exceeds certified program work",
+                ))?;
+        let state_work = add(
+            ordinary_without_root,
+            program.root_alternation_arms(),
+            Resource::ExecutionWork,
+        )?;
+        let per_boundary = add(
+            state_work,
+            usize::from(program.contains_scalar_transition()),
+            Resource::ExecutionWork,
+        )?;
+        let build_work = mul(per_boundary, boundaries, Resource::ExecutionWork)?;
+        let scan_work = mul(
+            mul(boundaries, 4, Resource::ExecutionWork)?,
+            passes,
+            Resource::ExecutionWork,
+        )?;
+        let work_bound = add(build_work, scan_work, Resource::ExecutionWork)?;
+        if !OBSERVED_WORK {
+            enforce(work_bound, limits.max_work, Resource::ExecutionWork)?;
+        }
+        let allocations = usize::from(rows.log_bytes != 0)
+            .checked_add(usize::from(!program.insts.is_empty()).saturating_mul(2))
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::Allocations,
+            })?;
+        Ok(Self {
+            table_cells: 0,
+            row_storage: Some(rows.storage),
+            record_bytes: rows.record_bytes,
+            requested_log_bytes: rows.log_bytes,
+            random_access_bound: rows.row_bytes,
+            scratch_bound: rows.row_bytes,
+            peak_bound: peak,
+            sequential_bound: rows.sequential_bound,
             allocations,
             work_bound,
             terminal_frontier: false,
@@ -3560,6 +3884,26 @@ impl CachedFrontierRequirements {
         )?;
         add(initialized, 6, Resource::ExecutionWork)
     }
+
+    fn replay_bytes(self) -> Result<usize, Error> {
+        add(
+            add(
+                self.log_bytes,
+                mul(
+                    self.state_word_capacity,
+                    core::mem::size_of::<u64>(),
+                    Resource::PeakBytes,
+                )?,
+                Resource::PeakBytes,
+            )?,
+            mul(
+                mul(self.words, 2, Resource::PeakBytes)?,
+                core::mem::size_of::<u64>(),
+                Resource::PeakBytes,
+            )?,
+            Resource::PeakBytes,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3652,6 +3996,41 @@ impl ReverseRowRequirements {
             replay_bound: 0,
         })
     }
+
+    fn new_ordered_root(
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+    ) -> Result<Self, Error> {
+        if program.root_alternation_arms() < 2
+            || program.root_split_count().checked_add(1) != Some(program.root_alternation_arms())
+        {
+            return Err(Error::InternalInvariant(
+                "ordered-root row requirements lack root metadata",
+            ));
+        }
+        let record_bytes = encoded_width(boundaries);
+        let log_bytes = mul(record_bytes, boundaries, Resource::LogBytes)?;
+        let row_words = mul(program.insts.len(), 2, Resource::RandomAccessBytes)?;
+        let row_bytes = mul(
+            row_words,
+            core::mem::size_of::<usize>(),
+            Resource::RandomAccessBytes,
+        )?;
+        let sequential_bound = mul(
+            log_bytes,
+            add(passes, 1, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?;
+        Ok(Self {
+            storage: RowStorage::ReachableEndpoints,
+            record_bytes,
+            row_bytes,
+            log_bytes,
+            sequential_bound,
+            replay_bound: 0,
+        })
+    }
 }
 
 enum Engine {
@@ -3713,29 +4092,33 @@ impl Engine {
             )
             .map(Self::Full),
             Strategy::ReverseSequentialRows => match sparse_seed {
-                Some(SparseSeed::RequiredSuffixes(seed)) => RowStore::build_sparse(
-                    program,
-                    haystack,
-                    assertions,
-                    requirements,
-                    seed,
-                    limits,
-                    accounting,
-                    actual_allocations,
-                )
-                .map(Self::SparseRows),
-                Some(SparseSeed::TerminalFrontier(seed)) => terminal_frontier::build(
-                    program,
-                    haystack,
-                    assertions,
-                    requirements,
-                    seed,
-                    limits,
-                    accounting,
-                    actual_allocations,
-                )
-                .map(Self::TerminalFrontier),
-                None => RowStore::build::<OBSERVED_WORK>(
+                Some(SparseSeed::RequiredSuffixes(seed)) => {
+                    RowStore::build_sparse::<OBSERVED_WORK>(
+                        program,
+                        haystack,
+                        assertions,
+                        requirements,
+                        seed,
+                        limits,
+                        accounting,
+                        actual_allocations,
+                    )
+                    .map(Self::SparseRows)
+                }
+                Some(SparseSeed::TerminalFrontier(seed)) => {
+                    terminal_frontier::build::<OBSERVED_WORK>(
+                        program,
+                        haystack,
+                        assertions,
+                        requirements,
+                        seed,
+                        limits,
+                        accounting,
+                        actual_allocations,
+                    )
+                    .map(Self::TerminalFrontier)
+                }
+                None => RowStore::build::<OBSERVED_WORK, false>(
                     program,
                     haystack,
                     assertions,
@@ -3748,6 +4131,44 @@ impl Engine {
                 .map(Self::Rows),
             },
         }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ordered-root construction binds the proved program, exact range, limits, and receipt ledger"
+    )]
+    fn build_ordered_root<const OBSERVED_WORK: bool>(
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        strategy: Strategy,
+        requirements: Requirements,
+        limits: OperationLimits,
+        track_source: bool,
+        accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+    ) -> Result<Self, Error> {
+        if strategy != Strategy::ReverseSequentialRows
+            || requirements.cached_frontier.is_some()
+            || requirements.frontier.is_some()
+            || program.root_alternation_arms() < 2
+            || program.root_split_count().checked_add(1) != Some(program.root_alternation_arms())
+        {
+            return Err(Error::InternalInvariant(
+                "ordered-root Count requires proved reverse rows",
+            ));
+        }
+        RowStore::build::<OBSERVED_WORK, true>(
+            program,
+            haystack,
+            assertions,
+            requirements,
+            limits,
+            track_source,
+            accounting,
+            actual_allocations,
+        )
+        .map(Self::Rows)
     }
 
     #[allow(
@@ -4026,6 +4447,10 @@ impl FullTable {
                     Inst::Split {
                         preferred,
                         fallback,
+                    }
+                    | Inst::RootSplit {
+                        preferred,
+                        fallback,
                     } => {
                         charge_transition::<OBSERVED_WORK>(
                             accounting,
@@ -4205,6 +4630,10 @@ fn cached_compute_row(
                     cached_symbol_assertion(symbol, *assertion) && cached_candidate_bit(row, *next)?
                 }
                 Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
                     preferred,
                     fallback,
                 } => {
@@ -4613,6 +5042,7 @@ impl CachedFrontierStore {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "cached replay keeps its source context and accounting ledger explicit at selection"
     )]
     fn selected(
@@ -4713,6 +5143,10 @@ impl CachedFrontierStore {
                     pc = *next;
                 }
                 Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
                     preferred,
                     fallback,
                 } => {
@@ -5044,7 +5478,7 @@ impl RowStore {
         clippy::too_many_lines,
         reason = "row construction keeps fixed-buffer lifetime and accounting in one audit unit"
     )]
-    fn build<const OBSERVED_WORK: bool>(
+    fn build<const OBSERVED_WORK: bool, const ORDERED_ROOT: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -5112,7 +5546,7 @@ impl RowStore {
             let (row, future_rows) = rows[..row_count]
                 .split_first_mut()
                 .ok_or(Error::InternalInvariant("row ring is empty"))?;
-            Self::build_row::<false, OBSERVED_WORK>(
+            Self::build_row::<false, OBSERVED_WORK, ORDERED_ROOT>(
                 program,
                 haystack,
                 assertions,
@@ -5144,7 +5578,7 @@ impl RowStore {
             let (row, future_rows) = rows[..row_count]
                 .split_first_mut()
                 .ok_or(Error::InternalInvariant("row ring is empty"))?;
-            Self::build_row::<true, OBSERVED_WORK>(
+            Self::build_row::<true, OBSERVED_WORK, ORDERED_ROOT>(
                 program,
                 haystack,
                 assertions,
@@ -5188,7 +5622,7 @@ impl RowStore {
         clippy::too_many_lines,
         reason = "sparse reverse construction keeps its complete storage and work certificate local"
     )]
-    fn build_sparse(
+    fn build_sparse<const OBSERVED_WORK: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -5239,6 +5673,11 @@ impl RowStore {
             limits.max_peak_bytes,
             Resource::PeakBytes,
         )?;
+        let admitted_work_bound = if OBSERVED_WORK {
+            requirements.work_bound.min(limits.max_work)
+        } else {
+            requirements.work_bound
+        };
 
         let mut write_offset = requirements.record_bytes;
         let mut next_any = {
@@ -5260,7 +5699,7 @@ impl RowStore {
                 terminal_record,
                 storage,
                 accounting,
-                requirements.work_bound,
+                admitted_work_bound,
             )?
         };
         accounting.sequential_bytes_written = add(
@@ -5290,7 +5729,7 @@ impl RowStore {
                 record,
                 storage,
                 accounting,
-                requirements.work_bound,
+                admitted_work_bound,
             )?;
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
@@ -5422,6 +5861,10 @@ impl RowStore {
                     Inst::Split {
                         preferred,
                         fallback,
+                    }
+                    | Inst::RootSplit {
+                        preferred,
+                        fallback,
                     } => {
                         try_charge_transition(accounting, admitted_work_bound)?;
                         let preferred_value = row[*preferred];
@@ -5462,7 +5905,7 @@ impl RowStore {
         clippy::too_many_lines,
         reason = "the specialized row loop keeps borrowed buffers and exact accounting explicit"
     )]
-    fn build_row<const HAS_INPUT: bool, const OBSERVED_WORK: bool>(
+    fn build_row<const HAS_INPUT: bool, const OBSERVED_WORK: bool, const ORDERED_ROOT: bool>(
         program: &Program,
         haystack: &[u8],
         assertions: AssertionContext<'_>,
@@ -5498,9 +5941,13 @@ impl RowStore {
             .map(ExactVec::as_slice)
             .unwrap_or_default();
         for &pc in &program.epsilon_order {
+            let inst = program.instruction(pc)?;
+            if ORDERED_ROOT && matches!(inst, Inst::RootSplit { .. }) {
+                continue;
+            }
             charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
             let value =
-                match program.instruction(pc)? {
+                match inst {
                     Inst::Unfilled => {
                         return Err(Error::InternalInvariant("unfilled execution state"));
                     }
@@ -5576,6 +6023,10 @@ impl RowStore {
                     Inst::Split {
                         preferred,
                         fallback,
+                    }
+                    | Inst::RootSplit {
+                        preferred,
+                        fallback,
                     } => {
                         charge_transition::<OBSERVED_WORK>(
                             accounting,
@@ -5606,6 +6057,15 @@ impl RowStore {
                 };
             row[pc] = value;
         }
+        if ORDERED_ROOT {
+            row[program.entry] = select_ordered_root::<OBSERVED_WORK>(
+                program,
+                row,
+                accounting,
+                admitted_work_bound,
+                caller_work_limit,
+            )?;
+        }
         match storage {
             RowStorage::SplitDecisions => {
                 if row[program.entry] != 0 {
@@ -5631,6 +6091,7 @@ impl RowStore {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "structural and caller work limits stay explicit during sequential replay"
     )]
     fn replay<const OBSERVED_WORK: bool>(
@@ -5728,6 +6189,10 @@ impl RowStore {
                 Inst::Split {
                     preferred,
                     fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
                 } => {
                     let rank = program.split_rank[pc];
                     if rank == NO_SPLIT_RANK {
@@ -5819,6 +6284,10 @@ impl RowStore {
                 Inst::Split {
                     preferred,
                     fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
                 } => {
                     let rank = program.split_rank[pc];
                     if rank == NO_SPLIT_RANK {
@@ -5832,6 +6301,57 @@ impl RowStore {
                         *fallback
                     };
                 }
+            }
+        }
+    }
+}
+
+fn select_ordered_root<const OBSERVED_WORK: bool>(
+    program: &Program,
+    row: &[usize],
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+    caller_work_limit: usize,
+) -> Result<usize, Error> {
+    let mut pc = program.entry;
+    let mut probes = 0_usize;
+    loop {
+        probes = add(probes, 1, Resource::ExecutionWork)?;
+        enforce(
+            probes,
+            program.root_alternation_arms(),
+            Resource::ExecutionWork,
+        )?;
+        // Charge before observing an arm endpoint so an exact one-below work
+        // limit cannot inspect the unadmitted row slot.
+        charge_root::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
+        if probes == program.root_alternation_arms() {
+            if matches!(program.instruction(pc)?, Inst::RootSplit { .. }) {
+                return Err(Error::InternalInvariant(
+                    "ordered-root chain exceeds its certified arm count",
+                ));
+            }
+            return row.get(pc).copied().ok_or(Error::InternalInvariant(
+                "ordered-root final arm outside row",
+            ));
+        }
+        match program.instruction(pc)? {
+            Inst::RootSplit {
+                preferred,
+                fallback,
+            } => {
+                let preferred_value = *row.get(*preferred).ok_or(Error::InternalInvariant(
+                    "ordered-root preferred arm outside row",
+                ))?;
+                if preferred_value != 0 {
+                    return Ok(preferred_value);
+                }
+                pc = *fallback;
+            }
+            _ => {
+                return Err(Error::InternalInvariant(
+                    "ordered-root chain ended before its certified arm count",
+                ));
             }
         }
     }
@@ -6099,13 +6619,11 @@ fn charge<const OBSERVED_WORK: bool>(
     admitted_work_bound: usize,
     caller_work_limit: usize,
 ) -> Result<(), Error> {
-    debug_assert!(accounting.work < admitted_work_bound);
+    debug_assert!(OBSERVED_WORK || accounting.work < admitted_work_bound);
     if OBSERVED_WORK {
-        enforce(
-            add(accounting.work, 1, Resource::ExecutionWork)?,
-            caller_work_limit,
-            Resource::ExecutionWork,
-        )?;
+        let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+        enforce(required, admitted_work_bound, Resource::ExecutionWork)?;
+        enforce(required, caller_work_limit, Resource::ExecutionWork)?;
     }
     accounting.work += 1;
     Ok(())
@@ -6493,6 +7011,7 @@ fn operation_identity(
     // assigning every other selected physical executor its own discriminator.
     let route_tag = match physical_route {
         OperationPhysicalRoute::DenseRows => 0,
+        OperationPhysicalRoute::OrderedRootRows => 131,
         OperationPhysicalRoute::RequiredSuffixRows => 17,
         OperationPhysicalRoute::TerminalFrontierRows => 43,
         OperationPhysicalRoute::CachedFrontier => 61,
@@ -6959,7 +7478,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v2_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+    fn accounting_v3_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
         let compiled = terminal_frontier_count();
         let haystack = b"no terminal prefix here";
         let limits = OperationLimits::default();
@@ -7030,10 +7549,10 @@ mod tests {
             CONTINUATION_OPERATION_MAX_ALLOCATIONS
         );
 
-        // The incumbent intrinsic receipt envelope still overflows while
-        // deriving its random-read P before publication. This is effect-free
-        // and is deliberately recorded separately from the v2 compact
-        // allocation projection.
+        // Intrinsic receipt publication must not turn the caller-independent
+        // `usize::MAX` work sentinel into a random-read arithmetic fault. The
+        // complete P is published first and the unchanged caller work limit
+        // then refuses it without effects.
         let receipt_failure = compiled
             .admit_spans_with_receipt(
                 haystack,
@@ -7044,11 +7563,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             receipt_failure.source,
-            Error::ArithmeticOverflow {
-                resource: Resource::RandomAccessBytes
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: usize::MAX,
+                limit: limits.max_work,
             }
         );
-        assert_eq!(receipt_failure.receipt.prospective, None);
+        let refused = receipt_failure.receipt.prospective.unwrap();
+        assert_eq!(refused.work_bound, usize::MAX);
+        assert_eq!(refused.accounting.random_access_bytes_read, usize::MAX);
         assert_eq!(
             receipt_failure.receipt.actual,
             ExecutionAccounting::default()
@@ -7057,7 +7580,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v2_allocation_encoding_is_checked_at_its_route_maximum() {
+    fn accounting_v3_allocation_encoding_is_checked_at_its_route_maximum() {
         for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
             assert_eq!(
                 compact_operation_allocation_count(allocations).unwrap(),
@@ -7545,6 +8068,588 @@ mod tests {
     }
 
     #[test]
+    fn observed_required_suffix_zero_exact_and_one_below_retain_bounded_receipts() {
+        let hir = ParserBuilder::new().build().parse(r"a+").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let strategy = Strategy::ReverseSequentialRows;
+        let dense = Requirements::new::<true>(
+            &compiled.program,
+            2,
+            strategy,
+            1,
+            super::intrinsic_attempt_limits(),
+        )
+        .unwrap();
+        let routing_limits = OperationLimits {
+            max_work: dense.work_bound - 1,
+            ..OperationLimits::default()
+        };
+        let baseline = compiled
+            .count_value_attempt(b"a", 0..1, strategy, routing_limits)
+            .unwrap();
+        assert_eq!(
+            baseline.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows)
+        );
+        let exact_work = baseline.receipt.actual.work;
+        assert!(exact_work > 0);
+
+        let exact_limits = OperationLimits {
+            max_work: exact_work,
+            ..OperationLimits::default()
+        };
+        let exact = compiled
+            .count_value_attempt(b"a", 0..1, strategy, exact_limits)
+            .unwrap();
+        let exact_p = exact.receipt.prospective.unwrap();
+        assert_eq!(
+            exact.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows)
+        );
+        assert_eq!(exact_p.work_bound, exact_work);
+        assert_eq!(exact.receipt.actual.work, exact_work);
+        assert!(exact_p.contains(exact.receipt.actual));
+
+        let one_below_limits = OperationLimits {
+            max_work: exact_work - 1,
+            ..OperationLimits::default()
+        };
+        let one_below = compiled
+            .count_value_attempt(b"a", 0..1, strategy, one_below_limits)
+            .unwrap_err();
+        assert!(matches!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            } if required == exact_work && limit == exact_work - 1
+        ));
+        assert_eq!(
+            one_below.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows)
+        );
+        let one_below_p = one_below
+            .receipt
+            .prospective
+            .expect("published one-below prospective");
+        assert_eq!(one_below_p.work_bound, exact_work - 1);
+        assert!(one_below_p.contains(one_below.receipt.actual));
+
+        let zero_limits = OperationLimits {
+            max_work: 0,
+            ..OperationLimits::default()
+        };
+        let failure = compiled
+            .count_value_attempt(b"a", 0..1, strategy, zero_limits)
+            .unwrap_err();
+        assert_eq!(
+            failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 2,
+                limit: 0,
+            },
+            "{failure:#?}"
+        );
+        assert_eq!(
+            failure.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows)
+        );
+        let prospective = failure.receipt.prospective.expect("published prospective");
+        assert_eq!(prospective.work_bound, 0);
+        assert!(prospective.contains(failure.receipt.actual), "{failure:#?}");
+    }
+
+    #[test]
+    fn observed_terminal_frontier_zero_exact_and_one_below_retain_bounded_receipts() {
+        let compiled = terminal_frontier_count();
+        let haystack = b"cargo/registry/";
+        let strategy = Strategy::ReverseSequentialRows;
+        let baseline = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            baseline.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::TerminalFrontierRows)
+        );
+        let exact_work = baseline.receipt.actual.work;
+        assert!(exact_work > 0);
+
+        let exact_limits = OperationLimits {
+            max_work: exact_work,
+            ..OperationLimits::default()
+        };
+        let exact = compiled
+            .count_value_attempt(haystack, 0..haystack.len(), strategy, exact_limits)
+            .unwrap();
+        let exact_p = exact.receipt.prospective.unwrap();
+        assert_eq!(
+            exact.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::TerminalFrontierRows)
+        );
+        assert_eq!(exact_p.work_bound, exact_work);
+        assert_eq!(exact.receipt.actual.work, exact_work);
+        assert!(exact_p.contains(exact.receipt.actual));
+
+        let one_below_limit = exact_work - 1;
+        let one_below = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: one_below_limit,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            } if required == exact_work && limit == one_below_limit
+        ));
+        assert_eq!(
+            one_below.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::TerminalFrontierRows)
+        );
+        let one_below_p = one_below.receipt.prospective.unwrap();
+        assert_eq!(one_below_p.work_bound, one_below_limit);
+        assert!(one_below_p.contains(one_below.receipt.actual));
+
+        let zero = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                strategy,
+                OperationLimits {
+                    max_work: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            zero.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::TerminalFrontierRows)
+        );
+        let zero_p = zero.receipt.prospective.unwrap();
+        assert_eq!(
+            zero.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: zero_p.work_bound,
+                limit: 0,
+            }
+        );
+        assert!(zero_p.work_bound > 0);
+        assert_eq!(zero.receipt.actual, ExecutionAccounting::default());
+        assert!(zero_p.contains(zero.receipt.actual));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one receipt regression audits all nonnullable, empty, and nullable exact bounds together"
+    )]
+    fn nonnullable_spans_publish_structural_cardinality_and_phase_peak_exactly() {
+        let hir = ParserBuilder::new().build().parse(r"a{4}").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(compiled.minimum_match_bytes, Some(4));
+        let haystack = [b'a'; 64];
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let baseline = compiled
+            .admit_spans_with_receipt(
+                &haystack,
+                range.clone(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let prospective = baseline.receipt.prospective.unwrap();
+        assert_eq!(prospective.match_events, 16);
+        assert_eq!(prospective.output_matches, 16);
+        assert_eq!(
+            prospective.output_bytes,
+            16 * core::mem::size_of::<super::Span>()
+        );
+        assert_eq!(prospective.accounting.successful_paths, 32);
+        assert_eq!(prospective.accounting.suppressed_empty, 0);
+        assert_eq!(prospective.accounting.emitted_matches, 16);
+        assert_eq!(baseline.admitted.as_slice().len(), 16);
+        assert!(prospective.contains(baseline.receipt.actual));
+
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: prospective.work_bound,
+        };
+        let exact_success = compiled
+            .admit_spans_with_receipt(&haystack, range.clone(), strategy, exact)
+            .unwrap();
+        assert_eq!(exact_success.receipt.prospective, Some(prospective));
+        assert_eq!(exact_success.admitted.as_slice().len(), 16);
+        assert!(prospective.contains(exact_success.receipt.actual));
+
+        for (limits, resource, required) in [
+            (
+                OperationLimits {
+                    max_match_events: prospective.match_events - 1,
+                    ..exact
+                },
+                Resource::MatchEvents,
+                prospective.match_events,
+            ),
+            (
+                OperationLimits {
+                    max_output_matches: prospective.output_matches - 1,
+                    ..exact
+                },
+                Resource::OutputMatches,
+                prospective.output_matches,
+            ),
+            (
+                OperationLimits {
+                    max_output_bytes: prospective.output_bytes - 1,
+                    ..exact
+                },
+                Resource::OutputBytes,
+                prospective.output_bytes,
+            ),
+            (
+                OperationLimits {
+                    max_peak_bytes: prospective.peak_bytes - 1,
+                    ..exact
+                },
+                Resource::PeakBytes,
+                prospective.peak_bytes,
+            ),
+        ] {
+            let allocation = allocation_fault::arm(0);
+            let failure = compiled
+                .admit_spans_with_receipt(&haystack, range.clone(), strategy, limits)
+                .unwrap_err();
+            assert_eq!(
+                failure.source,
+                Error::ResourceLimit {
+                    resource,
+                    required,
+                    limit: required - 1,
+                }
+            );
+            assert_eq!(failure.receipt.prospective, Some(prospective));
+            assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+            assert_eq!(failure.receipt.actual_allocations, 0);
+            assert_eq!(allocation_fault::calls(), 0);
+            drop(allocation);
+        }
+
+        let nullable_hir = ParserBuilder::new().build().parse(r"a*").unwrap();
+        let nullable = CompiledRegex::from_hir(
+            &nullable_hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(nullable.minimum_match_bytes, Some(0));
+        let nullable_attempt = nullable
+            .admit_spans_with_receipt(
+                b"aaaa",
+                0..4,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let nullable_prospective = nullable_attempt.receipt.prospective.unwrap();
+        assert_eq!(nullable_prospective.match_events, 10);
+        assert_eq!(nullable_prospective.output_matches, 5);
+        assert_eq!(nullable_prospective.accounting.suppressed_empty, 20);
+        assert!(nullable_prospective.contains(nullable_attempt.receipt.actual));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered-root regression audits route identity, exact limits, and one-below closure"
+    )]
+    fn ordered_root_count_receipt_closes_exact_limits_and_one_below() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"(?P<first>a+)|(?P<second>b+)|(?P<third>c+)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_ordered_root_count(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(compiled.program.root_alternation_arms(), 3);
+        assert_eq!(compiled.program.root_split_count(), 2);
+        let haystack = b"aa bb ccc";
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let mut published = None;
+        let baseline = compiled
+            .admit_ordered_root_count_observed_with_receipt_observer(
+                haystack,
+                range.clone(),
+                strategy,
+                OperationLimits::default(),
+                usize::MAX,
+                |prospective| {
+                    published = Some(prospective);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let prospective = published.unwrap();
+        assert_eq!(baseline.receipt.prospective, Some(prospective));
+        assert_eq!(baseline.admitted.value(), 3);
+        assert_eq!(
+            baseline.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::OrderedRootRows)
+        );
+        assert_eq!(
+            baseline.admitted.certificate().physical_route,
+            OperationPhysicalRoute::OrderedRootRows
+        );
+        assert_eq!(
+            baseline.receipt.identity.operation_id(),
+            Some(baseline.admitted.certificate().operation_id())
+        );
+        assert_eq!(
+            baseline.admitted.certificate().row_storage,
+            Some(RowStorage::ReachableEndpoints)
+        );
+        assert_eq!(baseline.admitted.accounting().replay_steps, 0);
+        assert!(baseline.admitted.accounting().root_probes > 0);
+        assert!(prospective.contains(baseline.receipt.actual));
+
+        let ordinary = compiled
+            .count_value_with_receipt(
+                haystack,
+                range.clone(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(ordinary.value, baseline.admitted.value());
+        assert_eq!(
+            ordinary.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+        assert_ne!(
+            ordinary.receipt.identity.operation_id(),
+            baseline.receipt.identity.operation_id()
+        );
+
+        let exact_work = baseline.receipt.actual.work;
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: exact_work,
+        };
+        let mut exact_published = None;
+        let exact_attempt = compiled
+            .admit_ordered_root_count_observed_with_receipt_observer(
+                haystack,
+                range.clone(),
+                strategy,
+                exact,
+                prospective.allocations,
+                |upper| {
+                    exact_published = Some(upper);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let exact_prospective = exact_published.unwrap();
+        assert_eq!(exact_prospective.work_bound, exact_work);
+        assert_eq!(exact_attempt.receipt.prospective, Some(exact_prospective));
+        assert_eq!(exact_attempt.receipt.actual.work, exact_work);
+        assert!(exact_prospective.contains(exact_attempt.receipt.actual));
+
+        for (limits, resource, required) in [
+            (
+                OperationLimits {
+                    max_boundaries: prospective.boundaries - 1,
+                    ..exact
+                },
+                Resource::Boundaries,
+                prospective.boundaries,
+            ),
+            (
+                OperationLimits {
+                    max_random_access_bytes: prospective.random_access_bytes - 1,
+                    ..exact
+                },
+                Resource::RandomAccessBytes,
+                prospective.random_access_bytes,
+            ),
+            (
+                OperationLimits {
+                    max_scratch_bytes: prospective.scratch_bytes - 1,
+                    ..exact
+                },
+                Resource::ScratchBytes,
+                prospective.scratch_bytes,
+            ),
+            (
+                OperationLimits {
+                    max_log_bytes: prospective.log_bytes - 1,
+                    ..exact
+                },
+                Resource::LogBytes,
+                prospective.log_bytes,
+            ),
+            (
+                OperationLimits {
+                    max_sequential_bytes: prospective.sequential_bytes - 1,
+                    ..exact
+                },
+                Resource::SequentialBytes,
+                prospective.sequential_bytes,
+            ),
+            (
+                OperationLimits {
+                    max_match_events: prospective.match_events - 1,
+                    ..exact
+                },
+                Resource::MatchEvents,
+                prospective.match_events,
+            ),
+            (
+                OperationLimits {
+                    max_output_matches: prospective.output_matches - 1,
+                    ..exact
+                },
+                Resource::OutputMatches,
+                prospective.output_matches,
+            ),
+            (
+                OperationLimits {
+                    max_peak_bytes: prospective.peak_bytes - 1,
+                    ..exact
+                },
+                Resource::PeakBytes,
+                prospective.peak_bytes,
+            ),
+        ] {
+            let allocation = allocation_fault::arm(0);
+            let failure = compiled
+                .admit_ordered_root_count_observed_with_receipt_observer(
+                    haystack,
+                    range.clone(),
+                    strategy,
+                    limits,
+                    prospective.allocations,
+                    |_| Ok(()),
+                )
+                .unwrap_err();
+            assert_eq!(
+                failure.source,
+                Error::ResourceLimit {
+                    resource,
+                    required,
+                    limit: required - 1,
+                }
+            );
+            assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+            assert_eq!(failure.receipt.actual_allocations, 0);
+            assert_eq!(allocation_fault::calls(), 0);
+            drop(allocation);
+        }
+
+        let allocation = allocation_fault::arm(0);
+        let allocation_failure = compiled
+            .admit_ordered_root_count_observed_with_receipt_observer(
+                haystack,
+                range.clone(),
+                strategy,
+                exact,
+                prospective.allocations - 1,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            allocation_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::Allocations,
+                required: prospective.allocations,
+                limit: prospective.allocations - 1,
+            }
+        );
+        assert_eq!(allocation_failure.receipt.actual_allocations, 0);
+        assert_eq!(allocation_fault::calls(), 0);
+        drop(allocation);
+
+        let one_below_work = OperationLimits {
+            max_work: exact_work - 1,
+            ..exact
+        };
+        let work_failure = compiled
+            .admit_ordered_root_count_observed_with_receipt_observer(
+                haystack,
+                range,
+                strategy,
+                one_below_work,
+                prospective.allocations,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            work_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: exact_work,
+                limit: exact_work - 1,
+            }
+        );
+        let work_prospective = work_failure.receipt.prospective.unwrap();
+        assert_eq!(work_prospective.work_bound, exact_work - 1);
+        assert_eq!(work_failure.receipt.actual.work, exact_work - 1);
+        assert!(work_prospective.contains(work_failure.receipt.actual));
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one focused matrix binds all three operation identities, stable P/A, resource refusal, and post-publication failure"
@@ -7859,6 +8964,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cached-policy regression audits exact, one-below, and zero-work closure"
+    )]
     fn endpoint_count_value_attempt_preserves_generic_cached_policy() {
         let compiled = endpoint_scalar_repeat();
         let haystack = [b'a'; 249];
@@ -7898,10 +9007,102 @@ mod tests {
             .unwrap();
         assert_eq!(attempt.value, incumbent);
         let prospective = attempt.receipt.prospective.unwrap();
+        assert_eq!(
+            attempt.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::CachedFrontier)
+        );
         assert_eq!(prospective.table_cells, 0);
         assert_eq!(prospective.row_storage, None);
         assert_eq!(prospective.random_access_bytes, cached.random_access_bound);
         assert!(prospective.contains(attempt.receipt.actual));
+
+        let exact_work = attempt.receipt.actual.work;
+        assert!(
+            exact_work
+                > cached
+                    .cached_frontier
+                    .unwrap()
+                    .initialization_work()
+                    .unwrap()
+        );
+        let exact_limits = OperationLimits {
+            max_work: exact_work,
+            ..OperationLimits::default()
+        };
+        let exact = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact_limits,
+            )
+            .unwrap();
+        let exact_p = exact.receipt.prospective.unwrap();
+        assert_eq!(
+            exact.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::CachedFrontier)
+        );
+        assert_eq!(exact_p.work_bound, exact_work);
+        assert_eq!(exact.receipt.actual.work, exact_work);
+        assert!(exact_p.contains(exact.receipt.actual));
+
+        let one_below_limit = exact_work - 1;
+        let one_below = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: one_below_limit,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            } if required == exact_work && limit == one_below_limit
+        ));
+        assert_eq!(
+            one_below.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::CachedFrontier)
+        );
+        let one_below_p = one_below.receipt.prospective.unwrap();
+        assert_eq!(one_below_p.work_bound, one_below_limit);
+        assert!(one_below_p.contains(one_below.receipt.actual));
+
+        // A zero-work caller cannot admit the cache's fixed initialization,
+        // so route selection deliberately retains the dense executor and it
+        // refuses on its first observed charge without crossing P.
+        let zero = compiled
+            .count_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            zero.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 1,
+                limit: 0,
+            }
+        ));
+        assert_eq!(
+            zero.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+        let zero_p = zero.receipt.prospective.unwrap();
+        assert_eq!(zero_p.work_bound, 0);
+        assert!(zero_p.contains(zero.receipt.actual));
     }
 
     #[test]
@@ -8004,6 +9205,43 @@ mod tests {
             }
         );
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+    }
+
+    #[test]
+    fn observed_work_below_utf8_prefix_refuses_before_source_with_closed_receipt() {
+        let hir = ParserBuilder::new().build().parse(r"\b.").unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"\xff\xff";
+        for limit in [0, haystack.len() - 1] {
+            let failure = compiled
+                .count_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_work: limit,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                failure.source,
+                Error::ResourceLimit {
+                    resource: Resource::ExecutionWork,
+                    required: haystack.len(),
+                    limit,
+                }
+            );
+            let prospective = failure.receipt.prospective.unwrap();
+            assert_eq!(prospective.work_bound, haystack.len());
+            assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+            assert!(prospective.contains(failure.receipt.actual));
+        }
     }
 
     #[test]

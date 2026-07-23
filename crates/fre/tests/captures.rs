@@ -2056,7 +2056,19 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
     );
     assert_control_selector_one_below!(max_span_sum, span_sum, AggregateResource::SpanSum);
     assert_control_selector_one_below!(max_peak_bytes, peak_bytes, AggregateResource::PeakBytes);
-    assert_control_selector_one_below!(max_work, work_bound, AggregateResource::ExecutionWork);
+
+    // The selector work theorem is retained as source-free control evidence,
+    // but the direct branch never executes that work. Lowering only this
+    // inactive ceiling must not reject an independently admitted direct run.
+    assert!(u3_control_prospective.work_bound > 0);
+    let mut inactive_control_work = exact_limits;
+    inactive_control_work.selector.max_work = u3_control_prospective.work_bound - 1;
+    let below_control = regex
+        .count_captures(haystack, inactive_control_work)
+        .expect("inactive selector work cannot refuse the direct route");
+    assert_eq!(below_control.accounting, baseline.accounting);
+    assert!(below_control.selector_receipt.is_none());
+    assert!(below_control.has_closed_count_attempt());
 
     macro_rules! assert_control_owner_one_below {
         ($limit:ident, $field:ident, $resource:expr) => {{
@@ -2509,7 +2521,36 @@ fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_re
     );
     assert_selector_one_below!(max_span_sum, span_sum, AggregateResource::SpanSum);
     assert_selector_one_below!(max_peak_bytes, peak_bytes, AggregateResource::PeakBytes);
-    assert_selector_one_below!(max_work, work_bound, AggregateResource::ExecutionWork);
+
+    // Observed-work Count publishes the caller's exact work ceiling instead
+    // of requiring the conservative dense replay bound. One below the
+    // successful actual still fails closed with a bounded partial receipt.
+    assert!(receipt.actual.work > 0);
+    let mut one_below_work = exact_limits;
+    one_below_work.selector.max_work = receipt.actual.work - 1;
+    let error = regex
+        .count_captures(haystack, one_below_work)
+        .expect_err("observed selector work one below actual must refuse");
+    assert!(matches!(
+        error.source,
+        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::ExecutionWork,
+            required,
+            limit,
+        }) if required > limit && limit == receipt.actual.work - 1
+    ));
+    let refused = error
+        .selector_receipt
+        .expect("observed-work refusal retains Count receipt");
+    assert_eq!(
+        refused
+            .prospective
+            .expect("observed-work refusal publishes P")
+            .work_bound,
+        receipt.actual.work - 1
+    );
+    assert!(refused.actual.work < receipt.actual.work);
+    assert!(refused.actual_allocations <= prospective.allocations);
 }
 
 #[test]
@@ -2540,6 +2581,10 @@ fn ordered_uniform_participation_count_preserves_leftmost_first_match_cardinalit
             .unicode(false)
             .build()
             .expect("ordered uniform capture build");
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            fre::CapturePlanKind::OrderedRootCaptureManyCount
+        );
         let result = regex
             .count_captures(haystack, CaptureRunLimits::default())
             .expect("ordered uniform Count");
@@ -2567,6 +2612,171 @@ fn ordered_uniform_participation_count_preserves_leftmost_first_match_cardinalit
                 .is_some_and(|prospective| !prospective.terminal_frontier)
         );
     }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered-root capture regression audits identity, parity, exact limits, and one-below closure"
+)]
+fn ordered_root_capture_many_closes_exact_receipts_and_one_below_limits() {
+    let pattern = r"([ab]+)|([cd]+)|(?-u:([\x80-\xFF]+))";
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("ordered-root capture-many build");
+    assert_eq!(
+        regex.build_report().plan_identity.plan,
+        fre::CapturePlanKind::OrderedRootCaptureManyCount
+    );
+    let proof = regex
+        .build_report()
+        .ordered_root_capture_many
+        .expect("ordered-root construction proof");
+    assert_eq!(proof.root_arms, 3);
+    assert_eq!(proof.participating_captures, 1);
+    assert_eq!(proof.groups_per_match, 2);
+    assert_eq!(
+        regex.build_report().plan_identity.ordered_root_capture_many,
+        Some(proof)
+    );
+
+    let haystack = [b'a', b'b', 0xFF, b'c', b'd'];
+    let baseline = regex
+        .count_captures(&haystack, CaptureRunLimits::default())
+        .expect("ordered-root baseline");
+    assert!(baseline.has_closed_count_attempt());
+    assert_eq!(baseline.accounting.matches, 3);
+    assert_eq!(baseline.accounting.count, 6);
+    assert_eq!(baseline.capture_events, 12);
+    assert_eq!(
+        baseline.accounting.count,
+        reference_count(pattern, &haystack)
+    );
+    let owner = baseline
+        .count_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prospective)
+        .expect("whole-operation prospective");
+    let selector = baseline
+        .selector_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prospective)
+        .expect("ordered-root selector prospective");
+    assert_eq!(owner.selector, selector);
+    assert_eq!(owner.matches, haystack.len());
+    assert_eq!(owner.capture_count, haystack.len() * proof.groups_per_match);
+    assert_eq!(
+        owner.capture_events,
+        haystack.len() * (regex.build_report().engine.captures + 1)
+    );
+
+    let exact_limits = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_results: owner.matches,
+            max_capture_count: owner.capture_count,
+            max_capture_events: owner.capture_events,
+            ..CaptureAggregateLimits::default()
+        },
+        selector: exact_selector_limits(&selector),
+        max_combined_peak_bytes: owner.combined_peak_bytes,
+        prefix_class_participation: fre::PrefixClassUniformParticipationLimits::default(),
+    };
+    let exact = regex
+        .count_captures(&haystack, exact_limits)
+        .expect("ordered-root exact limits");
+    assert!(exact.has_closed_count_attempt());
+    assert_eq!(exact.accounting, baseline.accounting);
+    assert_eq!(exact.capture_events, baseline.capture_events);
+    assert_eq!(
+        exact
+            .count_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.prospective),
+        Some(owner)
+    );
+
+    macro_rules! assert_owner_one_below {
+        ($limit:ident, $field:ident, $resource:expr) => {{
+            let required = owner.$field;
+            let mut one_below = exact_limits;
+            one_below.aggregate.$limit = required - 1;
+            let error = regex
+                .count_captures(&haystack, one_below)
+                .expect_err("capture-owner one below must refuse");
+            assert!(error.has_closed_count_attempt());
+            assert_eq!(
+                error.source,
+                CaptureExecutionSource::History(CaptureSearchError::Resource {
+                    kind: $resource,
+                    required,
+                    limit: required - 1,
+                })
+            );
+            let receipt = error
+                .count_receipt
+                .as_ref()
+                .expect("whole-operation refusal receipt");
+            assert_eq!(receipt.prospective, Some(owner));
+            assert_eq!(receipt.actual, fre::CaptureCountActual::default());
+            let selector_receipt = error
+                .selector_receipt
+                .as_ref()
+                .expect("nested selector refusal receipt");
+            assert_eq!(selector_receipt.prospective, Some(selector));
+            assert_eq!(
+                selector_receipt.actual,
+                AggregateExecutionAccounting::default()
+            );
+            assert_eq!(selector_receipt.actual_allocations, 0);
+        }};
+    }
+    assert_owner_one_below!(max_results, matches, CaptureResource::Results);
+    assert_owner_one_below!(
+        max_capture_count,
+        capture_count,
+        CaptureResource::CaptureCount
+    );
+    assert_owner_one_below!(
+        max_capture_events,
+        capture_events,
+        CaptureResource::CaptureEvents
+    );
+
+    let actual_work = exact
+        .selector_receipt
+        .as_ref()
+        .expect("exact selector receipt")
+        .actual
+        .work;
+    assert!(actual_work > 0);
+    let mut one_below_work = exact_limits;
+    one_below_work.selector.max_work = actual_work - 1;
+    let error = regex
+        .count_captures(&haystack, one_below_work)
+        .expect_err("observed ordered-root work one below must refuse");
+    assert!(error.has_closed_count_attempt());
+    assert!(matches!(
+        error.source,
+        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::ExecutionWork,
+            required,
+            limit,
+        }) if required > limit && limit == actual_work - 1
+    ));
+    let receipt = error
+        .selector_receipt
+        .as_ref()
+        .expect("bounded partial selector receipt");
+    assert_eq!(
+        receipt
+            .prospective
+            .expect("partial receipt prospective")
+            .work_bound,
+        actual_work - 1
+    );
+    assert!(receipt.actual.work < actual_work);
+    assert!(receipt.actual_allocations <= selector.allocations);
 }
 
 #[test]
@@ -2618,9 +2828,10 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     assert_eq!(regex.build_report().selector.program_states, 390);
     assert_eq!(regex.build_report().selector.temporary_states_peak, 390);
     // Exact-vector certification on the current URI frontier retains 542,600
-    // bytes; the fixed terminal-frontier proof adds exactly 56 bytes even
-    // when this Unicode plan is ineligible for that route.
-    assert_eq!(regex.build_report().selector.program_bytes, 542_656);
+    // bytes; the fixed terminal-frontier proof adds 56 bytes and the retained
+    // minimum-match-width proof adds one 16-byte Option<usize>, even when this
+    // Unicode plan is ineligible for the terminal route.
+    assert_eq!(regex.build_report().selector.program_bytes, 542_672);
     assert!(regex.build_report().selector.work >= 126_986);
 
     for haystack in [
@@ -2721,7 +2932,7 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
         .expect("fanout reduction");
     assert_eq!(
         result.identity.plan.plan,
-        fre::CapturePlanKind::LinearSelectorUniformParticipation
+        fre::CapturePlanKind::OrderedRootCaptureManyCount
     );
     assert_eq!(result.accounting.total_history_nodes, 0);
 

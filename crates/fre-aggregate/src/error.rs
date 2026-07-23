@@ -11,6 +11,9 @@ pub enum Unsupported {
     UnicodeClass,
     /// Captures are not erased by this capture-free operation boundary.
     Capture,
+    /// The dedicated capture-many compiler requires a nontrivial ordered
+    /// top-level alternation proved by its enclosing capture reducer.
+    OrderedRootCaptureManyShape,
     /// A look assertion outside the audited continuation subset.
     Look(Look),
 }
@@ -20,6 +23,7 @@ impl fmt::Display for Unsupported {
         match self {
             Self::UnicodeClass => f.write_str("Unicode scalar class"),
             Self::Capture => f.write_str("capture annotation"),
+            Self::OrderedRootCaptureManyShape => f.write_str("ordered-root capture-many shape"),
             Self::Look(look) => write!(f, "look assertion {look:?}"),
         }
     }
