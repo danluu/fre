@@ -485,6 +485,22 @@ fn public_identity_certificate_provenance_and_publication_mutations_fail_closed(
         .count_captures(DENSE_HAYSTACK, CaptureRunLimits::default())
         .expect("direct Count");
     assert_report_cache_identity_mutations_are_rejected(&direct_report);
+    let mut relabeled_success = direct_report
+        .count_receipt
+        .clone()
+        .expect("direct success receipt");
+    relabeled_success.terminal = CaptureCountTerminal::Failure;
+    let forged_failure = fre::CaptureExecutionError {
+        identity: direct_report.identity.clone(),
+        source: CaptureExecutionSource::CombinedPeak {
+            needed: direct_report.combined_peak_bytes,
+            limit: direct_report.combined_peak_bytes - 1,
+        },
+        selector_receipt: None,
+        prefix_class_participation_receipt: direct_report.prefix_class_participation_receipt,
+        count_receipt: Some(relabeled_success),
+    };
+    assert!(!forged_failure.has_closed_count_attempt());
     let direct_prospective = direct_report
         .count_receipt
         .as_ref()
@@ -497,6 +513,34 @@ fn public_identity_certificate_provenance_and_publication_mutations_fail_closed(
         .count_captures(DENSE_HAYSTACK, direct_one_below)
         .expect_err("direct one-below");
     assert_error_cache_identity_mutations_are_rejected(&mut direct_error);
+
+    let direct_receipt = direct_error
+        .prefix_class_participation_receipt
+        .as_mut()
+        .expect("direct failure receipt");
+    let prospective = direct_receipt.prospective.expect("direct failure P");
+    assert!(prospective.first_finder_bytes > 0);
+    assert!(prospective.work > 0);
+    let mut partial_actual = direct_receipt.actual;
+    partial_actual.first_finder_bytes = 1;
+    partial_actual.work = 1;
+    direct_receipt.actual = partial_actual;
+    let outer = direct_error
+        .count_receipt
+        .as_mut()
+        .expect("direct outer failure receipt");
+    outer
+        .direct
+        .as_mut()
+        .expect("nested direct failure receipt")
+        .actual = partial_actual;
+    outer.actual.direct = Some(partial_actual);
+    assert!(direct_error.has_closed_count_attempt());
+    direct_error.source = CaptureExecutionSource::CombinedPeak {
+        needed: direct_report.combined_peak_bytes,
+        limit: direct_report.combined_peak_bytes - 1,
+    };
+    assert!(!direct_error.has_closed_count_attempt());
 }
 
 #[test]

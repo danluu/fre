@@ -317,6 +317,9 @@ pub struct CaptureCountAttemptReceipt {
     /// Private publication frontier prevents deletion or insertion of public P
     /// fields from preserving closure.
     publication_phase: CaptureCountPublicationPhase,
+    /// Private terminal disposition prevents a completed success receipt from
+    /// being relabeled as a failure, or vice versa.
+    authenticated_terminal: CaptureCountTerminal,
     /// Complete receipt from the U3 selector route, when selected.
     pub selector: Option<SelectorOperationAttemptReceipt>,
     /// Complete receipt from the U4 direct route, when selected.
@@ -347,6 +350,7 @@ impl CaptureCountAttemptReceipt {
         Self {
             seal: seal.clone(),
             publication_phase,
+            authenticated_terminal: CaptureCountTerminal::Failure,
             selector: Some(selector),
             direct: None,
             prospective: prospective.copied(),
@@ -364,6 +368,7 @@ impl CaptureCountAttemptReceipt {
         Self {
             seal: seal.clone(),
             publication_phase: CaptureCountPublicationPhase::Whole,
+            authenticated_terminal: CaptureCountTerminal::Success,
             selector: Some(selector),
             direct: None,
             prospective: Some(*prospective),
@@ -388,6 +393,7 @@ impl CaptureCountAttemptReceipt {
         Self {
             seal: seal.clone(),
             publication_phase,
+            authenticated_terminal: CaptureCountTerminal::Failure,
             selector: None,
             direct: Some(*direct),
             prospective: prospective.copied(),
@@ -405,6 +411,7 @@ impl CaptureCountAttemptReceipt {
         Self {
             seal: seal.clone(),
             publication_phase: CaptureCountPublicationPhase::Whole,
+            authenticated_terminal: CaptureCountTerminal::Success,
             selector: None,
             direct: Some(*direct),
             prospective: Some(*prospective),
@@ -445,6 +452,7 @@ impl CaptureCountAttemptReceipt {
             };
         if self.seal != *seal
             || observed_publication_phase != Some(self.publication_phase)
+            || self.authenticated_terminal != self.terminal
             || route.plan.operation != CaptureOperation::CountParticipatingNonempty
             || route.selector_strategy != SelectorStrategy::ReverseSequentialRows
             || route.selector_operation != SelectorOperationAttemptKind::Count

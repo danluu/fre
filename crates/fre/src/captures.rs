@@ -462,11 +462,7 @@ impl CaptureExecutionError {
         if receipt.terminal != CaptureCountTerminal::Failure || !receipt.closes(seal) {
             return false;
         }
-        if !count_failure_source_closes(
-            seal.route_identity().branch,
-            receipt.publication_phase(),
-            &self.source,
-        ) {
+        if !count_failure_source_closes(seal, receipt, &self.source) {
             return false;
         }
         match seal.route_identity().branch {
@@ -585,10 +581,18 @@ impl CaptureExecutionReport {
 }
 
 fn count_failure_source_closes(
-    branch: CaptureCountBranch,
-    publication_phase: CaptureCountPublicationPhase,
+    seal: &CaptureCountSeal,
+    receipt: &CaptureCountAttemptReceipt,
     source: &CaptureExecutionSource,
 ) -> bool {
+    let branch = seal.route_identity().branch;
+    let publication_phase = receipt.publication_phase();
+    let direct_zero_effects = receipt.actual
+        == CaptureCountActual {
+            direct: Some(fre_kernels::PrefixClassUniformParticipationActual::default()),
+            combined_peak_bytes: seal.route_identity().retained_fallback_bytes,
+            ..CaptureCountActual::default()
+        };
     matches!(
         (branch, publication_phase, source),
         (
@@ -618,9 +622,20 @@ fn count_failure_source_closes(
         ) | (
             CaptureCountBranch::DirectPrefixClassParticipation,
             CaptureCountPublicationPhase::Whole,
-            _,
+            CaptureExecutionSource::PrefixClassParticipation(_)
+                | CaptureExecutionSource::InternalInvariant(_),
         )
-    )
+    ) || (direct_zero_effects
+        && matches!(
+            (branch, publication_phase, source),
+            (
+                CaptureCountBranch::DirectPrefixClassParticipation,
+                CaptureCountPublicationPhase::Whole,
+                CaptureExecutionSource::Selector(_)
+                    | CaptureExecutionSource::History(_)
+                    | CaptureExecutionSource::CombinedPeak { .. },
+            )
+        ))
 }
 
 #[allow(
