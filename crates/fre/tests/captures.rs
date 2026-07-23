@@ -4,8 +4,9 @@ use std::sync::Arc;
 use fre::{
     ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID,
-    CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits, CaptureBuilder,
-    CaptureExecutionSource, CaptureMatchKind, CaptureRequiredLiteralBuildLimits,
+    AggregateExecutionAccounting, AggregateOperationLimits, AggregateOperationProspective,
+    AggregateResource, CaptureAggregateLimits, CaptureBuildError, CaptureBuildLimits,
+    CaptureBuilder, CaptureExecutionSource, CaptureMatchKind, CaptureRequiredLiteralBuildLimits,
     CaptureRequiredLiteralRunLimits, CaptureResource, CaptureRunLimits, CaptureSearchConfig,
     CaptureSearchError, CaptureSearchKind, CaptureSearchLimits, CaptureWindow,
     LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource, LineCaptureBuilder,
@@ -32,6 +33,25 @@ fn reference_count(pattern: &str, haystack: &[u8]) -> usize {
         .captures_iter(haystack)
         .map(|captures| captures.iter().flatten().count())
         .sum()
+}
+
+const fn exact_selector_limits(
+    prospective: &AggregateOperationProspective,
+) -> AggregateOperationLimits {
+    AggregateOperationLimits {
+        max_boundaries: prospective.boundaries,
+        max_table_cells: prospective.table_cells,
+        max_random_access_bytes: prospective.random_access_bytes,
+        max_scratch_bytes: prospective.scratch_bytes,
+        max_log_bytes: prospective.log_bytes,
+        max_sequential_bytes: prospective.sequential_bytes,
+        max_match_events: prospective.match_events,
+        max_output_matches: prospective.output_matches,
+        max_output_bytes: prospective.output_bytes,
+        max_span_sum: prospective.span_sum,
+        max_peak_bytes: prospective.peak_bytes,
+        max_work: prospective.work_bound,
+    }
 }
 
 #[test]
@@ -1515,14 +1535,33 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
         .count_captures(haystack, CaptureRunLimits::default())
         .expect("terminal frontier capture count");
     assert_eq!(result.accounting.count, reference_count(pattern, haystack));
+    assert_eq!(result.capture_events, result.accounting.matches * 3);
     assert!(result.selector_certificate.terminal_frontier);
     assert!(result.selector_accounting.frontier_peak_states > 0);
+    assert_eq!(result.selector_accounting.output_bytes, 0);
+    let receipt = result
+        .selector_receipt
+        .as_ref()
+        .expect("uniform terminal Count receipt");
+    let prospective = receipt
+        .prospective
+        .expect("uniform terminal Count prospective");
+    assert!(prospective.terminal_frontier);
+    assert_eq!(receipt.actual, result.selector_accounting);
+    assert_eq!(
+        receipt.identity.operation_id,
+        Some(result.selector_certificate.operation_id)
+    );
     assert_eq!(result.accounting.total_state_visits, 0);
     assert_eq!(result.accounting.total_history_nodes, 0);
 }
 
 #[test]
-fn uniform_participation_preserves_count_and_event_limits() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one audit unit seals every selector and owner prospective dimension before source"
+)]
+fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_refusals() {
     let regex = CaptureBuilder::new(r"fn is_(\w+)|fn as_(\w+)")
         .unicode(false)
         .build()
@@ -1533,42 +1572,198 @@ fn uniform_participation_preserves_count_and_event_limits() {
         .expect("uniform exact limits");
     assert_eq!(exact.accounting.matches, 2);
     assert_eq!(exact.accounting.count, 4);
-    let count_starved = CaptureRunLimits {
+    assert_eq!(exact.capture_events, 6);
+    assert_eq!(exact.selector_accounting.output_bytes, 0);
+    assert!(!exact.selector_certificate.terminal_frontier);
+    let receipt = exact
+        .selector_receipt
+        .as_ref()
+        .expect("uniform dense Count receipt");
+    let prospective = receipt
+        .prospective
+        .expect("uniform dense Count prospective");
+    assert!(!prospective.terminal_frontier);
+    assert_eq!(receipt.actual, exact.selector_accounting);
+    // The canonical HIR proves a seven-byte minimum. Three matches are the
+    // complete non-overlap upper bound for this 21-byte haystack.
+    let prospective_matches = haystack.len() / 7;
+    assert_eq!(prospective_matches, 3);
+    let prospective_count = prospective_matches * 2;
+    let prospective_events = prospective_matches * 3;
+    let exact_limits = CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
-            max_capture_count: exact.accounting.count - 1,
+            max_results: prospective_matches,
+            max_capture_count: prospective_count,
+            max_capture_events: prospective_events,
             ..CaptureAggregateLimits::default()
         },
-        ..CaptureRunLimits::default()
+        selector: exact_selector_limits(&prospective),
+        max_combined_peak_bytes: prospective.peak_bytes,
     };
-    let count_error = regex
-        .count_captures(haystack, count_starved)
-        .expect_err("uniform count one below must refuse");
-    assert!(matches!(
-        count_error.source,
-        CaptureExecutionSource::History(CaptureSearchError::Resource {
-            kind: CaptureResource::CaptureCount,
-            required: 4,
-            limit: 3,
-        })
-    ));
-    let event_starved = CaptureRunLimits {
-        aggregate: CaptureAggregateLimits {
-            max_capture_events: 5,
-            ..CaptureAggregateLimits::default()
-        },
-        ..CaptureRunLimits::default()
-    };
-    let event_error = regex
-        .count_captures(haystack, event_starved)
-        .expect_err("uniform events one below must refuse");
-    assert!(matches!(
-        event_error.source,
-        CaptureExecutionSource::History(CaptureSearchError::Resource {
-            kind: CaptureResource::CaptureEvents,
-            required: 6,
-            limit: 5,
-        })
-    ));
+    let exact_again = regex
+        .count_captures(haystack, exact_limits)
+        .expect("exact selector and capture prospective");
+    assert_eq!(exact_again.accounting, exact.accounting);
+    assert_eq!(exact_again.capture_events, exact.capture_events);
+    assert_eq!(
+        exact_again
+            .selector_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.prospective),
+        Some(prospective)
+    );
+
+    macro_rules! assert_owner_one_below {
+        ($field:ident, $required:expr, $resource:expr) => {{
+            let required = $required;
+            let mut one_below = exact_limits;
+            one_below.aggregate.$field = required - 1;
+            let error = regex
+                .count_captures(haystack, one_below)
+                .expect_err("capture-owner one below must refuse");
+            assert_eq!(
+                error.source,
+                CaptureExecutionSource::History(CaptureSearchError::Resource {
+                    kind: $resource,
+                    required,
+                    limit: required - 1,
+                })
+            );
+            let receipt = error
+                .selector_receipt
+                .expect("capture-owner refusal retains selector receipt");
+            assert_eq!(receipt.prospective, Some(prospective));
+            assert_eq!(receipt.actual, AggregateExecutionAccounting::default());
+            assert_eq!(receipt.actual_allocations, 0);
+        }};
+    }
+    assert_owner_one_below!(max_results, prospective_matches, CaptureResource::Results);
+    assert_owner_one_below!(
+        max_capture_count,
+        prospective_count,
+        CaptureResource::CaptureCount
+    );
+    assert_owner_one_below!(
+        max_capture_events,
+        prospective_events,
+        CaptureResource::CaptureEvents
+    );
+
+    macro_rules! assert_selector_one_below {
+        ($limit:ident, $field:ident, $resource:expr) => {
+            if prospective.$field > 0 {
+                let mut one_below = exact_limits;
+                one_below.selector.$limit = prospective.$field - 1;
+                let error = regex
+                    .count_captures(haystack, one_below)
+                    .expect_err("selector one below must refuse");
+                assert!(matches!(
+                    error.source,
+                    CaptureExecutionSource::Selector(
+                        fre::AggregateEngineError::ResourceLimit {
+                            resource,
+                            required,
+                            limit,
+                        }
+                    ) if resource == $resource
+                        && required == prospective.$field
+                        && limit == prospective.$field - 1
+                ));
+                let receipt = error
+                    .selector_receipt
+                    .expect("selector refusal retains Count receipt");
+                assert_eq!(receipt.prospective, Some(prospective));
+                assert_eq!(receipt.actual, AggregateExecutionAccounting::default());
+                assert_eq!(receipt.actual_allocations, 0);
+            }
+        };
+    }
+    assert_selector_one_below!(max_boundaries, boundaries, AggregateResource::Boundaries);
+    assert_selector_one_below!(max_table_cells, table_cells, AggregateResource::TableCells);
+    assert_selector_one_below!(
+        max_random_access_bytes,
+        random_access_bytes,
+        AggregateResource::RandomAccessBytes
+    );
+    assert_selector_one_below!(
+        max_scratch_bytes,
+        scratch_bytes,
+        AggregateResource::ScratchBytes
+    );
+    assert_selector_one_below!(max_log_bytes, log_bytes, AggregateResource::LogBytes);
+    assert_selector_one_below!(
+        max_sequential_bytes,
+        sequential_bytes,
+        AggregateResource::SequentialBytes
+    );
+    assert_selector_one_below!(
+        max_match_events,
+        match_events,
+        AggregateResource::MatchEvents
+    );
+    assert_selector_one_below!(
+        max_output_matches,
+        output_matches,
+        AggregateResource::OutputMatches
+    );
+    assert_selector_one_below!(
+        max_output_bytes,
+        output_bytes,
+        AggregateResource::OutputBytes
+    );
+    assert_selector_one_below!(max_span_sum, span_sum, AggregateResource::SpanSum);
+    assert_selector_one_below!(max_peak_bytes, peak_bytes, AggregateResource::PeakBytes);
+    assert_selector_one_below!(max_work, work_bound, AggregateResource::ExecutionWork);
+}
+
+#[test]
+fn nullable_uniform_participation_retains_nonempty_reducer_refusal_and_span_validation() {
+    let regex = CaptureBuilder::new(r"(a*)")
+        .unicode(false)
+        .build()
+        .expect("nullable uniform capture build");
+    assert_eq!(
+        regex.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorUniformParticipation
+    );
+    let error = regex
+        .count_captures(b"ba", CaptureRunLimits::default())
+        .expect_err("nonempty-only capture reducer must reject an empty winner");
+    assert_eq!(
+        error.source,
+        CaptureExecutionSource::History(CaptureSearchError::EmptyMatch)
+    );
+    assert!(error.selector_receipt.is_none());
+}
+
+#[test]
+fn ordered_uniform_participation_count_preserves_leftmost_first_match_cardinality() {
+    let haystack = b"aaa";
+    for (pattern, matches, count) in [(r"(a)|(aa)", 3, 6), (r"(aa)|(a)", 2, 4)] {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("ordered uniform capture build");
+        let result = regex
+            .count_captures(haystack, CaptureRunLimits::default())
+            .expect("ordered uniform Count");
+        assert_eq!(result.accounting.matches, matches, "pattern={pattern:?}");
+        assert_eq!(result.accounting.count, count, "pattern={pattern:?}");
+        assert_eq!(
+            result.accounting.count,
+            reference_count(pattern, haystack),
+            "pattern={pattern:?}"
+        );
+        assert_eq!(result.capture_events, matches * 3);
+        assert_eq!(result.selector_accounting.output_bytes, 0);
+        assert!(
+            result
+                .selector_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.prospective)
+                .is_some_and(|prospective| !prospective.terminal_frontier)
+        );
+    }
 }
 
 #[test]

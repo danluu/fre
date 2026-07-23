@@ -7,8 +7,11 @@ use fre_aggregate::{
     CompileAccounting as SelectorCompileAccounting, CompileLimits as SelectorCompileLimits,
     CompiledRegex as SelectorRegex, Error as SelectorError,
     ExecutionAccounting as SelectorExecutionAccounting,
+    OperationAttemptError as SelectorOperationAttemptError,
+    OperationAttemptReceipt as SelectorOperationAttemptReceipt,
     OperationCertificate as SelectorOperationCertificate,
-    OperationLimits as SelectorOperationLimits, PlanId as SelectorPlanId,
+    OperationLimits as SelectorOperationLimits,
+    OperationProspective as SelectorOperationProspective, PlanId as SelectorPlanId,
     RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
@@ -330,6 +333,9 @@ pub struct CaptureExecutionError {
     pub identity: Box<CaptureCacheIdentity>,
     /// Typed selector/history/reducer failure.
     pub source: CaptureExecutionSource,
+    /// Complete Count-attempt receipt when the uniform-participation route
+    /// reached its prospective selector boundary.
+    pub selector_receipt: Option<SelectorOperationAttemptReceipt>,
 }
 
 impl fmt::Display for CaptureExecutionError {
@@ -355,6 +361,11 @@ pub struct CaptureExecutionReport {
     pub selector_certificate: SelectorOperationCertificate,
     /// Exact selector work and storage accounting.
     pub selector_accounting: SelectorExecutionAccounting,
+    /// Complete selector Count receipt for the positive-width uniform route.
+    /// Span-bearing selector/replay routes retain `None`.
+    pub selector_receipt: Option<SelectorOperationAttemptReceipt>,
+    /// Complete capture-schema entries logically inspected by the reducer.
+    pub capture_events: usize,
     /// Conservative logical dynamic peak across selection and exact replay.
     pub combined_peak_bytes: usize,
 }
@@ -1210,6 +1221,9 @@ impl CaptureBuilder {
             engine: HistoryRegex::from_program(program),
             selector: Arc::new(selector),
             required_literal,
+            uniform_count_minimum_match_bytes: uniform_participating_captures
+                .and_then(|_| rust.hir.properties().minimum_len())
+                .filter(|minimum| *minimum > 0),
             build_limits: limits,
             report,
         })
@@ -1222,6 +1236,10 @@ pub struct CaptureRegex {
     engine: HistoryRegex,
     selector: Arc<SelectorRegex>,
     required_literal: Option<CaptureRequiredLiteralPlan>,
+    /// Positive whole-match minimum from the same canonical HIR that proved
+    /// uniform capture participation. `None` retains the span validator for
+    /// nullable or empty-language plans.
+    uniform_count_minimum_match_bytes: Option<usize>,
     build_limits: CaptureBuildLimits,
     report: CaptureBuildReport,
 }
@@ -1392,8 +1410,9 @@ impl CaptureRegex {
 
     /// Reduce all non-overlapping non-empty matches over the complete byte haystack.
     #[allow(
+        clippy::result_large_err,
         clippy::too_many_lines,
-        reason = "selector, replay, and complete checked reducer accounting stay locally auditable"
+        reason = "selector, replay, and complete checked reducer accounting stay locally auditable; terminal errors retain the allocation-free Count P/A receipt inline"
     )]
     pub fn count_captures(
         &self,
@@ -1406,6 +1425,16 @@ impl CaptureRegex {
             .max_peak_bytes
             .min(limits.max_combined_peak_bytes);
         if let Some(participating) = self.report.uniform_participating_captures {
+            if let Some(minimum_match_bytes) = self.uniform_count_minimum_match_bytes {
+                return self.count_uniform_captures(
+                    haystack,
+                    limits,
+                    selector_limits,
+                    identity,
+                    participating,
+                    minimum_match_bytes,
+                );
+            }
             let selected = self
                 .selector
                 .admit_spans_observed(
@@ -1417,6 +1446,7 @@ impl CaptureRegex {
                 .map_err(|source| CaptureExecutionError {
                     identity: Box::new(identity.clone()),
                     source: CaptureExecutionSource::Selector(source),
+                    selector_receipt: None,
                 })?;
             let selector_accounting = selected.accounting();
             let mut matches = 0_usize;
@@ -1443,6 +1473,7 @@ impl CaptureRegex {
                         source: CaptureExecutionSource::InternalInvariant(
                             "uniform capture participation overflowed usize",
                         ),
+                        selector_receipt: None,
                     })?;
             let count = checked_capture_mul(
                 &identity,
@@ -1457,9 +1488,10 @@ impl CaptureRegex {
                     source: CaptureExecutionSource::InternalInvariant(
                         "capture schema overflowed usize",
                     ),
+                    selector_receipt: None,
                 }
             })?;
-            let _capture_events = checked_capture_mul(
+            let capture_events = checked_capture_mul(
                 &identity,
                 matches,
                 all_groups,
@@ -1479,6 +1511,8 @@ impl CaptureRegex {
                 },
                 selector_certificate: selected.certificate().clone(),
                 selector_accounting,
+                selector_receipt: None,
+                capture_events,
                 combined_peak_bytes: selector_accounting.peak_bytes,
             });
         }
@@ -1493,6 +1527,7 @@ impl CaptureRegex {
             .map_err(|source| CaptureExecutionError {
                 identity: Box::new(identity.clone()),
                 source: CaptureExecutionSource::Selector(source),
+                selector_receipt: None,
             })?;
         let selector_accounting = selected.accounting();
         let replay_scratch_limit = limits
@@ -1503,6 +1538,7 @@ impl CaptureRegex {
                 source: CaptureExecutionSource::InternalInvariant(
                     "selector output exceeded the admitted combined peak",
                 ),
+                selector_receipt: None,
             })?;
         let mut combined_peak_bytes = selector_accounting.peak_bytes;
         let mut accounting = CaptureCountOutcome {
@@ -1573,6 +1609,7 @@ impl CaptureRegex {
                     source: CaptureExecutionSource::InternalInvariant(
                         "combined selector/replay peak overflowed usize",
                     ),
+                    selector_receipt: None,
                 })?;
             combined_peak_bytes = combined_peak_bytes.max(replay_combined_peak);
             let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
@@ -1580,6 +1617,7 @@ impl CaptureRegex {
                 source: CaptureExecutionSource::InternalInvariant(
                     "selector-certified span produced no tagged winner",
                 ),
+                selector_receipt: None,
             })?;
             accounting.total_state_visits = checked_capture_add(
                 &identity,
@@ -1627,7 +1665,192 @@ impl CaptureRegex {
             accounting,
             selector_certificate: selected.certificate().clone(),
             selector_accounting,
+            selector_receipt: None,
+            capture_events,
             combined_peak_bytes,
+        })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "the uniform route preserves its complete selector P/A receipt on every terminal and keeps prospective publication adjacent to reduction"
+    )]
+    fn count_uniform_captures(
+        &self,
+        haystack: &[u8],
+        limits: CaptureRunLimits,
+        selector_limits: SelectorOperationLimits,
+        identity: CaptureCacheIdentity,
+        participating: usize,
+        minimum_match_bytes: usize,
+    ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        let participating_with_overall =
+            participating
+                .checked_add(1)
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "uniform capture participation overflowed usize",
+                    ),
+                    selector_receipt: None,
+                })?;
+        let all_groups =
+            self.report
+                .engine
+                .captures
+                .checked_add(1)
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "capture schema overflowed usize",
+                    ),
+                    selector_receipt: None,
+                })?;
+        let terminal_frontier = self.selector.has_terminal_frontier();
+        let mut published = None;
+        let mut owner_refusal = None;
+        let mut observer =
+            |selector: SelectorOperationProspective| match uniform_capture_prospective(
+                &selector,
+                haystack.len(),
+                minimum_match_bytes,
+                participating_with_overall,
+                all_groups,
+                limits.aggregate,
+            ) {
+                Ok(prospective) => {
+                    published = Some(prospective);
+                    Ok(())
+                }
+                Err(source) => {
+                    owner_refusal = Some(source);
+                    Err(SelectorError::InternalInvariant(
+                        "capture uniform Count prospective refused",
+                    ))
+                }
+            };
+        let attempt = if terminal_frontier {
+            self.selector
+                .admit_count_with_terminal_frontier_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
+                )
+        } else {
+            self.selector.admit_count_with_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                SelectorStrategy::ReverseSequentialRows,
+                selector_limits,
+                usize::MAX,
+                &mut observer,
+            )
+        };
+        let attempt = match attempt {
+            Ok(attempt) => attempt,
+            Err(SelectorOperationAttemptError { source, receipt }) => {
+                let source = owner_refusal.map_or(
+                    CaptureExecutionSource::Selector(source),
+                    CaptureExecutionSource::History,
+                );
+                return Err(CaptureExecutionError {
+                    identity: Box::new(identity),
+                    source,
+                    selector_receipt: Some(receipt),
+                });
+            }
+        };
+        if owner_refusal.is_some() {
+            return Err(CaptureExecutionError {
+                identity: Box::new(identity),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "selector succeeded after capture owner refused its prospective",
+                ),
+                selector_receipt: Some(attempt.receipt),
+            });
+        }
+        let prospective = published.ok_or_else(|| CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::InternalInvariant(
+                "uniform Count succeeded without publishing its prospective",
+            ),
+            selector_receipt: Some(attempt.receipt.clone()),
+        })?;
+        if prospective.selector.terminal_frontier != terminal_frontier
+            || attempt.receipt.prospective != Some(prospective.selector)
+        {
+            return Err(CaptureExecutionError {
+                identity: Box::new(identity),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "uniform Count route diverged from its published prospective",
+                ),
+                selector_receipt: Some(attempt.receipt),
+            });
+        }
+        let selected = attempt.admitted;
+        let selector_receipt = attempt.receipt;
+        let selector_accounting = selected.accounting();
+        let matches = selected.value();
+        if matches > prospective.matches
+            || selector_accounting.emitted_matches != matches
+            || selector_accounting.output_bytes != 0
+        {
+            return Err(CaptureExecutionError {
+                identity: Box::new(identity),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "uniform Count actual escaped its positive-width prospective",
+                ),
+                selector_receipt: Some(selector_receipt),
+            });
+        }
+        let count = matches
+            .checked_mul(participating_with_overall)
+            .ok_or_else(|| CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(
+                    EngineResource::CaptureCount,
+                )),
+                selector_receipt: Some(selector_receipt.clone()),
+            })?;
+        let capture_events =
+            matches
+                .checked_mul(all_groups)
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(
+                        EngineResource::CaptureEvents,
+                    )),
+                    selector_receipt: Some(selector_receipt.clone()),
+                })?;
+        if count > prospective.capture_count || capture_events > prospective.capture_events {
+            return Err(CaptureExecutionError {
+                identity: Box::new(identity),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "uniform capture arithmetic escaped its prospective",
+                ),
+                selector_receipt: Some(selector_receipt),
+            });
+        }
+        Ok(CaptureExecutionReport {
+            identity,
+            accounting: CaptureCountOutcome {
+                count,
+                matches,
+                searches: 0,
+                total_state_visits: 0,
+                total_history_nodes: 0,
+                total_history_walk: 0,
+                peak_threads: 0,
+            },
+            selector_certificate: selected.certificate().clone(),
+            selector_accounting,
+            selector_receipt: Some(selector_receipt),
+            capture_events,
+            combined_peak_bytes: selector_accounting.peak_bytes,
         })
     }
 
@@ -1638,10 +1861,86 @@ impl CaptureRegex {
         CaptureExecutionError {
             identity: Box::new(identity.clone()),
             source: CaptureExecutionSource::History(source),
+            selector_receipt: None,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UniformCaptureProspective {
+    selector: SelectorOperationProspective,
+    matches: usize,
+    capture_count: usize,
+    capture_events: usize,
+}
+
+fn uniform_capture_prospective(
+    selector: &SelectorOperationProspective,
+    haystack_len: usize,
+    minimum_match_bytes: usize,
+    participating_with_overall: usize,
+    all_groups: usize,
+    limits: AggregateLimits,
+) -> Result<UniformCaptureProspective, EngineSearchError> {
+    if minimum_match_bytes == 0 || selector.output_bytes != 0 {
+        return Err(EngineSearchError::InvalidProgram);
+    }
+    let matches = haystack_len
+        .checked_div(minimum_match_bytes)
+        .ok_or(EngineSearchError::InvalidProgram)?;
+    if matches > selector.output_matches {
+        return Err(EngineSearchError::InvalidProgram);
+    }
+    let capture_count =
+        matches
+            .checked_mul(participating_with_overall)
+            .ok_or(EngineSearchError::BoundOverflow(
+                EngineResource::CaptureCount,
+            ))?;
+    let capture_events =
+        matches
+            .checked_mul(all_groups)
+            .ok_or(EngineSearchError::BoundOverflow(
+                EngineResource::CaptureEvents,
+            ))?;
+    enforce_capture_prospective(matches, limits.max_results, EngineResource::Results)?;
+    enforce_capture_prospective(
+        capture_count,
+        limits.max_capture_count,
+        EngineResource::CaptureCount,
+    )?;
+    enforce_capture_prospective(
+        capture_events,
+        limits.max_capture_events,
+        EngineResource::CaptureEvents,
+    )?;
+    Ok(UniformCaptureProspective {
+        selector: *selector,
+        matches,
+        capture_count,
+        capture_events,
+    })
+}
+
+fn enforce_capture_prospective(
+    required: usize,
+    limit: usize,
+    resource: EngineResource,
+) -> Result<(), EngineSearchError> {
+    if required > limit {
+        return Err(EngineSearchError::Resource {
+            kind: resource,
+            required,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "capture terminals retain the complete allocation-free selector P/A receipt inline"
+)]
 fn capture_remaining(
     identity: &CaptureCacheIdentity,
     limit: usize,
@@ -1653,9 +1952,14 @@ fn capture_remaining(
         .ok_or_else(|| CaptureExecutionError {
             identity: Box::new(identity.clone()),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+            selector_receipt: None,
         })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "capture terminals retain the complete allocation-free selector P/A receipt inline"
+)]
 fn checked_capture_add(
     identity: &CaptureCacheIdentity,
     current: usize,
@@ -1668,6 +1972,7 @@ fn checked_capture_add(
         .ok_or_else(|| CaptureExecutionError {
             identity: Box::new(identity.clone()),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+            selector_receipt: None,
         })?;
     if required > limit {
         return Err(CaptureExecutionError {
@@ -1677,11 +1982,16 @@ fn checked_capture_add(
                 required,
                 limit,
             }),
+            selector_receipt: None,
         });
     }
     Ok(required)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "capture terminals retain the complete allocation-free selector P/A receipt inline"
+)]
 fn checked_capture_mul(
     identity: &CaptureCacheIdentity,
     left: usize,
@@ -1694,6 +2004,7 @@ fn checked_capture_mul(
         .ok_or_else(|| CaptureExecutionError {
             identity: Box::new(identity.clone()),
             source: CaptureExecutionSource::History(EngineSearchError::BoundOverflow(resource)),
+            selector_receipt: None,
         })?;
     if required > limit {
         return Err(CaptureExecutionError {
@@ -1703,6 +2014,7 @@ fn checked_capture_mul(
                 required,
                 limit,
             }),
+            selector_receipt: None,
         });
     }
     Ok(required)

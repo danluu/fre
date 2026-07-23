@@ -576,6 +576,14 @@ impl AdmittedSpanSum {
 }
 
 impl CompiledRegex {
+    /// Whether compilation retained the exact HIR-derived terminal-frontier
+    /// proof required by the explicit receipt-bearing Count route.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_terminal_frontier(&self) -> bool {
+        !self.terminal_frontier.is_empty()
+    }
+
     /// Admit and evaluate a complete non-overlapping span sequence.
     pub fn admit_spans(
         &self,
