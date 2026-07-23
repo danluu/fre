@@ -1179,6 +1179,7 @@ fn build_prefix_class_participation(
     };
     if unicode
         || case_insensitive
+        || limits.required_literal.is_some()
         || uniform_participating_captures != Some(1)
         || syntax.captures != 2
     {

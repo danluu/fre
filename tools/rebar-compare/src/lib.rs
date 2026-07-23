@@ -98,6 +98,9 @@ pub const RE2_VERSION: &str = "2025-11-05";
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
 /// Stable plan label for capture-erased selection with proved participation.
 pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-uniform-participation";
+/// Stable plan label for direct Unicode-off two-arm prefix/class participation.
+pub const CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN: &str =
+    fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID;
 /// Stable plan label for the proved uniform captured scalar-alternation path.
 pub const CURRENT_FRE_CAPTURE_SCALAR_PLAN: &str = "capture-uniform-alternation-unicode-scalar";
 /// Stable plan label for the exact-HIR allocation-free hard Ruff line reducer.
@@ -119,6 +122,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
         plan,
         CURRENT_FRE_CAPTURE_PLAN
             | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
+            | CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN
             | CURRENT_FRE_CAPTURE_SCALAR_PLAN
             | CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN
             | CURRENT_FRE_CAPTURE_SHEBANG_PLAN
@@ -156,7 +160,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v22-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-fixed-class-sandwich-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-uniform-prefix-class-participation-v1-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4677,6 +4681,24 @@ fn capture_build_error(error: &CaptureBuildError) -> ExecutionError {
 
 fn capture_execution_error(source: &CaptureExecutionSource, message: String) -> ExecutionError {
     match source {
+        CaptureExecutionSource::PrefixClassParticipation(
+            fre::PrefixClassUniformParticipationError::WorkLimit { .. }
+            | fre::PrefixClassUniformParticipationError::FirstFinderBytesLimit { .. }
+            | fre::PrefixClassUniformParticipationError::SecondFinderBytesLimit { .. }
+            | fre::PrefixClassUniformParticipationError::PrefixCandidatesLimit { .. }
+            | fre::PrefixClassUniformParticipationError::StartArbitrationsLimit { .. }
+            | fre::PrefixClassUniformParticipationError::FirstClassProbesLimit { .. }
+            | fre::PrefixClassUniformParticipationError::GreedyExtensionReadsLimit { .. }
+            | fre::PrefixClassUniformParticipationError::ResultsLimit { .. }
+            | fre::PrefixClassUniformParticipationError::CaptureCountLimit { .. }
+            | fre::PrefixClassUniformParticipationError::CaptureEventsLimit { .. }
+            | fre::PrefixClassUniformParticipationError::OperationAllocationsLimit { .. }
+            | fre::PrefixClassUniformParticipationError::OperationBytesLimit { .. }
+            | fre::PrefixClassUniformParticipationError::ScratchLimit { .. }
+            | fre::PrefixClassUniformParticipationError::PeakLimit { .. },
+        )
+        | CaptureExecutionSource::CombinedPeak { .. } => ExecutionError::unsupported(message),
+        CaptureExecutionSource::PrefixClassParticipation(_) => ExecutionError::fault(message),
         CaptureExecutionSource::Selector(source) => aggregate_engine_error(source, message),
         CaptureExecutionSource::History(CaptureSearchError::Resource { .. }) => {
             ExecutionError::unsupported(message)
@@ -4726,7 +4748,8 @@ fn capture_regex_one_with_build_limits(
     if identity.operation != CaptureOperation::CountParticipatingNonempty
         || !matches!(
             identity.plan,
-            CapturePlanKind::LinearSelectorUniformParticipation
+            CapturePlanKind::UniformPrefixClassParticipation
+                | CapturePlanKind::LinearSelectorUniformParticipation
                 | CapturePlanKind::LinearSelectorPersistentHistory
         )
     {
@@ -4784,6 +4807,7 @@ fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
         return CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN;
     }
     match regex.build_report().plan_identity.plan {
+        CapturePlanKind::UniformPrefixClassParticipation => CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN,
         CapturePlanKind::LinearSelectorUniformParticipation => CURRENT_FRE_CAPTURE_UNIFORM_PLAN,
         CapturePlanKind::LinearSelectorPersistentHistory => CURRENT_FRE_CAPTURE_PLAN,
     }
@@ -4845,6 +4869,21 @@ fn capture_run_limits(
     selector.max_sequential_bytes = selector_sequential_bytes;
     selector.max_peak_bytes = limits.fre_aggregate_peak_bytes;
     selector.max_work = selector_work;
+    let direct_prefix_candidates =
+        checked_aggregate_mul(haystack_len, 2, "direct capture prefix candidates")?;
+    let direct_start_arbitrations =
+        checked_aggregate_mul(haystack_len, 4, "direct capture start arbitrations")?;
+    let direct_first_class_probes =
+        checked_aggregate_mul(haystack_len, 2, "direct capture first-class probes")?;
+    let direct_greedy_extension_reads =
+        checked_aggregate_mul(haystack_len, 2, "direct capture greedy extension reads")?;
+    let direct_finder_bytes =
+        checked_aggregate_mul(haystack_len, 2, "direct capture finder source bytes")?;
+    let admitted_finder_service = if direct_finder_bytes <= selector_sequential_bytes {
+        haystack_len
+    } else {
+        0
+    };
     Ok(CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
@@ -4865,6 +4904,22 @@ fn capture_run_limits(
         },
         selector,
         max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
+        prefix_class_participation: fre::PrefixClassUniformParticipationLimits {
+            max_work: selector_work,
+            max_first_finder_bytes: admitted_finder_service,
+            max_second_finder_bytes: admitted_finder_service,
+            max_prefix_candidates: direct_prefix_candidates,
+            max_start_arbitrations: direct_start_arbitrations,
+            max_first_class_probes: direct_first_class_probes,
+            max_greedy_extension_reads: direct_greedy_extension_reads,
+            max_results: haystack_len,
+            max_capture_count: reducer_count,
+            max_capture_events: reducer_events,
+            max_operation_allocations: 0,
+            max_operation_bytes: 0,
+            max_scratch_bytes: 0,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        },
     })
 }
 
@@ -5661,10 +5716,13 @@ fn execute_grep_captures_inner(
             )));
         }
         count = checked_aggregate_add(count, result.accounting.count, "capture count")?;
+        let selector_accounting = result.selector_accounting.as_ref().ok_or_else(|| {
+            ExecutionError::fault("FRE grep-capture route returned no selector accounting")
+        })?;
         selector.charge(
-            result.selector_accounting.work,
-            result.selector_accounting.sequential_bytes_written,
-            result.selector_accounting.sequential_bytes_read,
+            selector_accounting.work,
+            selector_accounting.sequential_bytes_written,
+            selector_accounting.sequential_bytes_read,
             limits,
         )?;
         state_visits = checked_aggregate_add(
@@ -13012,6 +13070,40 @@ mod tests {
             unicode.execute("雪".as_bytes()).expect("Unicode capture"),
             2
         );
+    }
+
+    #[test]
+    fn rust_functions_direct_capture_lifecycle_is_eager_and_stable() {
+        let pattern = r"fn is_(\w+)|fn as_(\w+)";
+        let first = b"fn is_alpha fn as_beta";
+        let mutated = b"fn as_9 fn is_Z fn is_\xff";
+        let reference = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("Rust-functions reference build");
+        let lifecycle = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            false,
+            false,
+            mutated.len(),
+        )
+        .expect("Rust-functions direct lifecycle");
+        assert_eq!(lifecycle.model(), "count-captures");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN);
+        assert!(is_current_fre_capture_route(
+            lifecycle.model(),
+            lifecycle.plan()
+        ));
+        assert_eq!(
+            lifecycle.execute(first).expect("first public operation"),
+            count_captures(&reference, first, u64::MAX).expect("Rust-functions reference first"),
+        );
+        assert_eq!(
+            lifecycle
+                .execute(mutated)
+                .expect("mutated steady public operation"),
+            count_captures(&reference, mutated, u64::MAX).expect("Rust-functions reference steady"),
+        );
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN);
     }
 
     #[test]

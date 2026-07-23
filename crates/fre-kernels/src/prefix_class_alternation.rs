@@ -35,6 +35,14 @@
 //! two next-candidate slots, and scalar counters form an `O(1)` fixed frame.
 //! Allocation failure is typed and never changes the selected route.
 //!
+//! The capture-aware uniform-participation operation has a distinct identity
+//! and receipt. Before source access it reserves each complete Finder service
+//! separately, all candidates and start arbitration, first-class probes,
+//! greedy extension reads, results, checked participating output, complete
+//! capture-schema events, zero operation allocations/bytes/scratch, and the
+//! retained plan peak. Its actual receipt repeats every dimension and is
+//! fieldwise checked against the prospective at runtime.
+//!
 //! rebar-row:imported/leipzig/huck-saw@rust/regex
 
 #![allow(
@@ -110,8 +118,13 @@ pub struct BuildAccounting {
     pub class_ranges: usize,
     pub shape_units: usize,
     pub work_upper_bound: usize,
+    pub allocations: usize,
+    pub copied_prefix_bytes: usize,
+    pub finder_preprocess_bytes: usize,
+    pub initialized_bitmap_bytes: usize,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
+    pub retained_capacity_bytes: usize,
     pub peak_bytes: usize,
 }
 
@@ -281,6 +294,7 @@ impl Default for UniformParticipationLimits {
 pub struct UniformParticipationProspective {
     pub haystack_bytes: usize,
     pub shape_units: usize,
+    pub minimum_match_bytes: usize,
     pub first_finder_bytes: usize,
     pub second_finder_bytes: usize,
     pub prefix_candidates: usize,
@@ -643,8 +657,13 @@ impl PrefixClassAlternationPlan {
                 class_ranges,
                 shape_units,
                 work_upper_bound: work.used(),
+                allocations: 2,
+                copied_prefix_bytes: prefix_bytes,
+                finder_preprocess_bytes: prefix_bytes,
+                initialized_bitmap_bytes: size_of::<[u64; 8]>(),
                 scratch_bytes,
                 persistent_bytes,
+                retained_capacity_bytes: persistent_bytes,
                 peak_bytes,
             },
         })
@@ -739,7 +758,18 @@ impl PrefixClassAlternationPlan {
                 .ok_or(UniformParticipationError::ArithmeticOverflow {
                     computation: "greedy extension reads",
                 })?;
-        let results = haystack_len;
+        let minimum_match_bytes = self.alternatives[0]
+            .finder
+            .needle()
+            .len()
+            .min(self.alternatives[1].finder.needle().len())
+            .checked_add(1)
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "minimum positive match bytes",
+            })?;
+        let results = haystack_len
+            .checked_div(minimum_match_bytes)
+            .ok_or(UniformParticipationError::InvalidSchema)?;
         let capture_count = results
             .checked_mul(schema.participating_with_overall)
             .ok_or(UniformParticipationError::ArithmeticOverflow {
@@ -853,6 +883,7 @@ impl PrefixClassAlternationPlan {
         Ok(UniformParticipationProspective {
             haystack_bytes: haystack_len,
             shape_units: self.build.shape_units,
+            minimum_match_bytes,
             first_finder_bytes,
             second_finder_bytes,
             prefix_candidates,
@@ -1657,7 +1688,7 @@ mod tests {
         let plan = rust_functions_plan();
         let schema = rust_functions_schema();
         let mut previous = None;
-        for n in [128, 256, 512] {
+        for n in [140, 280, 560] {
             let prospective = plan
                 .uniform_participation_prospective(
                     n,
@@ -1671,15 +1702,68 @@ mod tests {
             assert_eq!(4 * n, prospective.start_arbitrations);
             assert_eq!(2 * n, prospective.first_class_probes);
             assert_eq!(2 * n, prospective.greedy_extension_reads);
-            assert_eq!(n, prospective.results);
-            assert_eq!(2 * n, prospective.capture_count);
-            assert_eq!(3 * n, prospective.capture_events);
+            assert_eq!(7, prospective.minimum_match_bytes);
+            assert_eq!(n / 7, prospective.results);
+            assert_eq!(2 * (n / 7), prospective.capture_count);
+            assert_eq!(3 * (n / 7), prospective.capture_events);
             if let Some((previous_n, previous_work)) = previous {
                 let fixed = plan.build_accounting().shape_units * 8 + 64;
-                assert_eq!((n - previous_n) * 18, prospective.work - previous_work);
-                assert_eq!(fixed + 18 * n, prospective.work);
+                assert_eq!(
+                    12 * (n - previous_n) + 6 * ((n - previous_n) / 7),
+                    prospective.work - previous_work
+                );
+                assert_eq!(fixed + 12 * n + 6 * (n / 7), prospective.work);
             }
             previous = Some((n, prospective.work));
+        }
+    }
+
+    #[test]
+    fn rust_functions_uniform_participation_actual_counters_are_linear_at_all_densities() {
+        let plan = rust_functions_plan();
+        let schema = rust_functions_schema();
+        let fixed = plan.build_accounting().shape_units * 8 + 64;
+        for n in [128_usize, 256, 512] {
+            let sparse = vec![b'x'; n];
+            let sparse = plan
+                .count_uniform_participation(
+                    &sparse,
+                    schema,
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap()
+                .accounting
+                .actual;
+            assert_eq!(n, sparse.first_finder_bytes);
+            assert_eq!(n, sparse.second_finder_bytes);
+            assert_eq!(0, sparse.prefix_candidates);
+            assert_eq!(0, sparse.results);
+            assert_eq!(2 * n + fixed, sparse.work);
+
+            let dense = b"fn is_a!".repeat(n / 8);
+            assert_eq!(n, dense.len());
+            let dense = plan
+                .count_uniform_participation(
+                    &dense,
+                    schema,
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap()
+                .accounting
+                .actual;
+            let matches = n / 8;
+            assert_eq!(n, dense.first_finder_bytes);
+            assert_eq!(n, dense.second_finder_bytes);
+            assert_eq!(matches, dense.first_finder_candidates);
+            assert_eq!(0, dense.second_finder_candidates);
+            assert_eq!(matches, dense.prefix_candidates);
+            assert_eq!(matches * 2, dense.start_arbitrations);
+            assert_eq!(matches, dense.first_class_probes);
+            assert_eq!(matches, dense.greedy_extension_reads);
+            assert_eq!(matches, dense.results);
+            assert_eq!(matches * 2, dense.capture_count);
+            assert_eq!(matches * 3, dense.capture_events);
+            assert_eq!(2 * n + 11 * matches + fixed, dense.work);
         }
     }
 

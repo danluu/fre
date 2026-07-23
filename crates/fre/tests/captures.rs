@@ -54,6 +54,27 @@ const fn exact_selector_limits(
     }
 }
 
+const fn exact_prefix_class_participation_limits(
+    prospective: &fre::PrefixClassUniformParticipationProspective,
+) -> fre::PrefixClassUniformParticipationLimits {
+    fre::PrefixClassUniformParticipationLimits {
+        max_work: prospective.work,
+        max_first_finder_bytes: prospective.first_finder_bytes,
+        max_second_finder_bytes: prospective.second_finder_bytes,
+        max_prefix_candidates: prospective.prefix_candidates,
+        max_start_arbitrations: prospective.start_arbitrations,
+        max_first_class_probes: prospective.first_class_probes,
+        max_greedy_extension_reads: prospective.greedy_extension_reads,
+        max_results: prospective.results,
+        max_capture_count: prospective.capture_count,
+        max_capture_events: prospective.capture_events,
+        max_operation_allocations: prospective.operation_allocations,
+        max_operation_bytes: prospective.operation_bytes,
+        max_scratch_bytes: prospective.scratch_bytes,
+        max_peak_bytes: prospective.peak_bytes,
+    }
+}
+
 #[test]
 fn required_ascii_class_prefilter_does_not_bypass_aggregate_result_limits() {
     let regex = CaptureBuilder::new(r"([0-9])|x(?:[0-9])")
@@ -1124,6 +1145,28 @@ fn reference_records(pattern: &str, haystack: &[u8]) -> Vec<CaptureFixture> {
         .collect()
 }
 
+fn capture_records(regex: &fre::CaptureRegex, haystack: &[u8]) -> Vec<CaptureFixture> {
+    regex
+        .captures_iter(haystack, CaptureAggregateLimits::default())
+        .expect("capture iteration")
+        .captures
+        .into_iter()
+        .map(|captures| {
+            captures
+                .groups
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.index,
+                        group.name,
+                        group.span.map(|span| (span.start, span.end)),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[test]
 fn materialized_capture_iteration_preserves_empty_unmatched_and_named_slots() {
     let cases: &[(&str, &[u8])] = &[
@@ -1455,7 +1498,7 @@ fn cross_family_capture_reducers_match_pinned_rust_bytes() {
 }
 
 #[test]
-fn uniform_participation_uses_selector_without_history() {
+fn uniform_participation_uses_direct_or_selector_without_history() {
     let cases: &[(&str, &[u8])] = &[
         (r"fn is_(\w+)|fn as_(\w+)", b"fn is_even fn as_byte"),
         (r"(?s)^((.*)()()($))", b"abc\ndef"),
@@ -1474,9 +1517,14 @@ fn uniform_participation_uses_selector_without_history() {
             .unicode(false)
             .build()
             .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let expected_plan = if pattern == r"fn is_(\w+)|fn as_(\w+)" {
+            fre::CapturePlanKind::UniformPrefixClassParticipation
+        } else {
+            fre::CapturePlanKind::LinearSelectorUniformParticipation
+        };
         assert_eq!(
             regex.build_report().plan_identity.plan,
-            fre::CapturePlanKind::LinearSelectorUniformParticipation,
+            expected_plan,
             "pattern={pattern:?}"
         );
         let limits = CaptureRunLimits {
@@ -1536,9 +1584,17 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
         .expect("terminal frontier capture count");
     assert_eq!(result.accounting.count, reference_count(pattern, haystack));
     assert_eq!(result.capture_events, result.accounting.matches * 3);
-    assert!(result.selector_certificate.terminal_frontier);
-    assert!(result.selector_accounting.frontier_peak_states > 0);
-    assert_eq!(result.selector_accounting.output_bytes, 0);
+    let certificate = result
+        .selector_certificate
+        .as_ref()
+        .expect("terminal selector certificate");
+    let selector_accounting = result
+        .selector_accounting
+        .as_ref()
+        .expect("terminal selector accounting");
+    assert!(certificate.terminal_frontier);
+    assert!(selector_accounting.frontier_peak_states > 0);
+    assert_eq!(selector_accounting.output_bytes, 0);
     let receipt = result
         .selector_receipt
         .as_ref()
@@ -1547,13 +1603,389 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
         .prospective
         .expect("uniform terminal Count prospective");
     assert!(prospective.terminal_frontier);
-    assert_eq!(receipt.actual, result.selector_accounting);
+    assert_eq!(&receipt.actual, selector_accounting);
     assert_eq!(
         receipt.identity.operation_id(),
-        Some(result.selector_certificate.operation_id())
+        Some(certificate.operation_id())
     );
     assert_eq!(result.accounting.total_state_visits, 0);
     assert_eq!(result.accounting.total_history_nodes, 0);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one direct-route audit seals HIR eligibility, complete capture shadows, P/A limits, fallback, mutation, and concurrency"
+)]
+fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
+    let pattern = r"fn is_(\w+)|fn as_(\w+)";
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("direct prefix/class capture build");
+    let build = regex.build_report();
+    assert_eq!(
+        build.plan_identity.plan,
+        fre::CapturePlanKind::UniformPrefixClassParticipation
+    );
+    assert_eq!(build.uniform_participating_captures, Some(1));
+    assert!(build.prefix_class_participation_planner_work > 0);
+    let direct_build = build
+        .prefix_class_participation
+        .expect("direct kernel build accounting");
+    assert_eq!(direct_build.allocations, 2);
+    assert_eq!(direct_build.copied_prefix_bytes, direct_build.prefix_bytes);
+    assert_eq!(
+        direct_build.finder_preprocess_bytes,
+        direct_build.prefix_bytes
+    );
+    assert_eq!(direct_build.initialized_bitmap_bytes, 64);
+    assert_eq!(
+        direct_build.retained_capacity_bytes,
+        direct_build.persistent_bytes
+    );
+    let direct_identity = build
+        .plan_identity
+        .prefix_class_participation
+        .expect("direct route identity");
+    assert_eq!(direct_identity.participating_capture_indices, [1, 2]);
+    assert_eq!(
+        direct_identity.declared_prepublication_fallback,
+        fre::CapturePlanKind::LinearSelectorUniformParticipation
+    );
+    assert_eq!(
+        direct_identity.kernel.plan_id,
+        fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID
+    );
+    assert_eq!(
+        direct_identity.kernel.operation_id,
+        fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID
+    );
+    assert_eq!(
+        direct_identity.kernel.algorithm_version,
+        fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION
+    );
+    assert_eq!(
+        direct_identity.kernel.accounting_version,
+        fre::PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION
+    );
+    assert_eq!(direct_identity.kernel.participating_with_overall, 2);
+    assert_eq!(direct_identity.kernel.capture_schema_slots, 3);
+
+    let cases = [
+        b"".as_slice(),
+        b"fn is_alpha fn as_beta",
+        b"fn as_9fn is_Z",
+        b"fn is_a\x00fn as_b\xfffn is_c",
+        b"fn is_azAZ09_fn as_0__ fn is_\x80",
+        b"fn is_a fn is_b fn as_c fn as_d",
+        b"prefix fn as_word suffix fn is_other",
+    ];
+    for haystack in cases {
+        let result = regex
+            .count_captures(haystack, CaptureRunLimits::default())
+            .unwrap_or_else(|error| panic!("haystack={haystack:?}: {error:?}"));
+        assert_eq!(
+            result.accounting.count,
+            reference_count(pattern, haystack),
+            "haystack={haystack:?}"
+        );
+        assert_eq!(
+            capture_records(&regex, haystack),
+            reference_records(pattern, haystack),
+            "haystack={haystack:?}"
+        );
+        assert!(result.selector_certificate.is_none());
+        assert!(result.selector_accounting.is_none());
+        assert!(result.selector_receipt.is_none());
+        let accounting = result
+            .prefix_class_participation
+            .expect("direct P/A accounting");
+        assert_eq!(accounting.identity, direct_identity.kernel);
+        assert_eq!(accounting.actual.results, result.accounting.matches);
+        assert_eq!(accounting.actual.capture_count, result.accounting.count);
+        assert_eq!(accounting.actual.capture_events, result.capture_events);
+        assert_eq!(accounting.actual.operation_allocations, 0);
+        assert_eq!(accounting.actual.operation_bytes, 0);
+        assert_eq!(accounting.actual.scratch_bytes, 0);
+        assert!(accounting.actual.work <= accounting.prospective.work);
+        assert!(accounting.actual.prefix_candidates <= accounting.prospective.prefix_candidates);
+        assert!(accounting.actual.start_arbitrations <= accounting.prospective.start_arbitrations);
+        assert!(accounting.actual.first_class_probes <= accounting.prospective.first_class_probes);
+        assert!(
+            accounting.actual.greedy_extension_reads
+                <= accounting.prospective.greedy_extension_reads
+        );
+    }
+
+    // Complete ASCII-word membership edge plus NUL/high-byte nonmembers.
+    for byte in u8::MIN..=u8::MAX {
+        let mut haystack = b"fn is_".to_vec();
+        haystack.push(byte);
+        let result = regex
+            .count_captures(&haystack, CaptureRunLimits::default())
+            .expect("byte-edge direct count");
+        assert_eq!(
+            result.accounting.count,
+            reference_count(pattern, &haystack),
+            "byte={byte:#04x}"
+        );
+    }
+
+    let haystack = b"fn is_alpha fn as_beta";
+    let baseline = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("direct baseline");
+    let steady = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("direct steady");
+    assert_eq!(
+        baseline.prefix_class_participation,
+        steady.prefix_class_participation
+    );
+    assert_eq!(baseline.identity, steady.identity);
+    let prospective = baseline
+        .prefix_class_participation
+        .expect("direct baseline P/A")
+        .prospective;
+    let exact_limits = CaptureRunLimits {
+        prefix_class_participation: exact_prefix_class_participation_limits(&prospective),
+        max_combined_peak_bytes: baseline.combined_peak_bytes,
+        ..CaptureRunLimits::default()
+    };
+    let exact = regex
+        .count_captures(haystack, exact_limits)
+        .expect("every direct dimension exact");
+    assert_eq!(exact.accounting, baseline.accounting);
+    assert_eq!(
+        exact
+            .prefix_class_participation
+            .expect("exact direct P/A")
+            .prospective,
+        prospective
+    );
+
+    macro_rules! assert_direct_one_below {
+        ($limit:ident, $prospective:ident, $pattern:pat) => {{
+            assert!(prospective.$prospective > 0);
+            let mut one_below = exact_limits;
+            one_below.prefix_class_participation.$limit = prospective.$prospective - 1;
+            let error = regex
+                .count_captures(haystack, one_below)
+                .expect_err("direct one-below must refuse");
+            assert!(matches!(
+                error.source,
+                CaptureExecutionSource::PrefixClassParticipation($pattern)
+            ));
+            assert!(error.selector_receipt.is_none());
+        }};
+    }
+    assert_direct_one_below!(
+        max_results,
+        results,
+        fre::PrefixClassUniformParticipationError::ResultsLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_capture_count,
+        capture_count,
+        fre::PrefixClassUniformParticipationError::CaptureCountLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_capture_events,
+        capture_events,
+        fre::PrefixClassUniformParticipationError::CaptureEventsLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_first_finder_bytes,
+        first_finder_bytes,
+        fre::PrefixClassUniformParticipationError::FirstFinderBytesLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_second_finder_bytes,
+        second_finder_bytes,
+        fre::PrefixClassUniformParticipationError::SecondFinderBytesLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_prefix_candidates,
+        prefix_candidates,
+        fre::PrefixClassUniformParticipationError::PrefixCandidatesLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_start_arbitrations,
+        start_arbitrations,
+        fre::PrefixClassUniformParticipationError::StartArbitrationsLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_first_class_probes,
+        first_class_probes,
+        fre::PrefixClassUniformParticipationError::FirstClassProbesLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_greedy_extension_reads,
+        greedy_extension_reads,
+        fre::PrefixClassUniformParticipationError::GreedyExtensionReadsLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_work,
+        work,
+        fre::PrefixClassUniformParticipationError::WorkLimit { .. }
+    );
+    assert_direct_one_below!(
+        max_peak_bytes,
+        peak_bytes,
+        fre::PrefixClassUniformParticipationError::PeakLimit { .. }
+    );
+
+    let mut combined_one_below = exact_limits;
+    combined_one_below.max_combined_peak_bytes = baseline.combined_peak_bytes - 1;
+    let combined_error = regex
+        .count_captures(haystack, combined_one_below)
+        .expect_err("co-live one below must refuse");
+    assert_eq!(
+        combined_error.source,
+        CaptureExecutionSource::CombinedPeak {
+            needed: baseline.combined_peak_bytes,
+            limit: baseline.combined_peak_bytes - 1,
+        }
+    );
+    assert_eq!(
+        combined_error.prefix_class_participation_prospective,
+        Some(prospective)
+    );
+
+    // Exact construction limits admit; every positive direct dimension one
+    // below retains the already-built U3 route before publication.
+    let exact_build_limits = CaptureBuildLimits {
+        max_prefix_class_participation_planner_work: build.prefix_class_participation_planner_work,
+        prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+            max_shape_units: direct_build.shape_units,
+            max_build_work: direct_build.work_upper_bound,
+            max_scratch_bytes: direct_build.scratch_bytes,
+            max_persistent_bytes: direct_build.persistent_bytes,
+            max_peak_bytes: direct_build.peak_bytes,
+        },
+        ..CaptureBuildLimits::default()
+    };
+    assert_eq!(
+        CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(exact_build_limits)
+            .build()
+            .expect("exact direct build")
+            .build_report()
+            .plan_identity
+            .plan,
+        fre::CapturePlanKind::UniformPrefixClassParticipation
+    );
+    for one_below in [
+        CaptureBuildLimits {
+            max_prefix_class_participation_planner_work: build
+                .prefix_class_participation_planner_work
+                - 1,
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+                max_shape_units: direct_build.shape_units - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+                max_build_work: direct_build.work_upper_bound - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+                max_persistent_bytes: direct_build.persistent_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+        CaptureBuildLimits {
+            prefix_class_participation: fre::PrefixClassAlternationBuildLimits {
+                max_peak_bytes: direct_build.peak_bytes - 1,
+                ..exact_build_limits.prefix_class_participation
+            },
+            ..exact_build_limits
+        },
+    ] {
+        let fallback = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(one_below)
+            .build()
+            .expect("optional direct refusal retains U3");
+        assert_eq!(
+            fallback.build_report().plan_identity.plan,
+            fre::CapturePlanKind::LinearSelectorUniformParticipation
+        );
+        assert!(
+            fallback
+                .build_report()
+                .plan_identity
+                .prefix_class_participation
+                .is_none()
+        );
+        assert_eq!(
+            fallback
+                .count_captures(haystack, CaptureRunLimits::default())
+                .expect("fallback Count")
+                .accounting
+                .count,
+            reference_count(pattern, haystack)
+        );
+    }
+
+    for near_miss in [
+        r"(fn is_)\w+|(fn as_)\w+",
+        r"fn is_(\w*)|fn as_(\w*)",
+        r"fn is_(\w+?)|fn as_(\w+?)",
+        r"fn is_(\w+)|fn as_(\w+)|fn has_(\w+)",
+    ] {
+        let fallback = CaptureBuilder::new(near_miss)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("near_miss={near_miss:?}: {error:?}"));
+        assert_ne!(
+            fallback.build_report().plan_identity.plan,
+            fre::CapturePlanKind::UniformPrefixClassParticipation,
+            "near_miss={near_miss:?}"
+        );
+    }
+
+    // Plan identity is immutable across mutation and concurrent first/steady
+    // calls; no haystack-derived state is retained.
+    let identity = regex.cache_identity(CaptureRunLimits::default());
+    let shared = Arc::new(regex);
+    let threads = [
+        b"fn is_a".as_slice(),
+        b"fn as_b",
+        b"fn is_c fn as_d",
+        b"\xfffn is_e\0fn as_f",
+    ]
+    .into_iter()
+    .map(|haystack| {
+        let regex = Arc::clone(&shared);
+        let haystack = haystack.to_vec();
+        std::thread::spawn(move || {
+            regex
+                .count_captures(&haystack, CaptureRunLimits::default())
+                .expect("concurrent direct count")
+                .accounting
+                .count
+        })
+    })
+    .collect::<Vec<_>>();
+    for thread in threads {
+        assert!(thread.join().expect("direct worker") > 0);
+    }
+    assert_eq!(
+        shared.cache_identity(CaptureRunLimits::default()).plan,
+        identity.plan
+    );
 }
 
 #[test]
@@ -1564,8 +1996,16 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
 fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_refusals() {
     let regex = CaptureBuilder::new(r"fn is_(\w+)|fn as_(\w+)")
         .unicode(false)
+        .limits(CaptureBuildLimits {
+            max_prefix_class_participation_planner_work: 0,
+            ..CaptureBuildLimits::default()
+        })
         .build()
         .expect("uniform alternation build");
+    assert_eq!(
+        regex.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorUniformParticipation
+    );
     let haystack = b"fn is_even fn as_byte";
     let exact = regex
         .count_captures(haystack, CaptureRunLimits::default())
@@ -1573,8 +2013,16 @@ fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_re
     assert_eq!(exact.accounting.matches, 2);
     assert_eq!(exact.accounting.count, 4);
     assert_eq!(exact.capture_events, 6);
-    assert_eq!(exact.selector_accounting.output_bytes, 0);
-    assert!(!exact.selector_certificate.terminal_frontier);
+    let exact_selector_accounting = exact
+        .selector_accounting
+        .as_ref()
+        .expect("dense selector accounting");
+    let exact_selector_certificate = exact
+        .selector_certificate
+        .as_ref()
+        .expect("dense selector certificate");
+    assert_eq!(exact_selector_accounting.output_bytes, 0);
+    assert!(!exact_selector_certificate.terminal_frontier);
     let receipt = exact
         .selector_receipt
         .as_ref()
@@ -1583,7 +2031,7 @@ fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_re
         .prospective
         .expect("uniform dense Count prospective");
     assert!(!prospective.terminal_frontier);
-    assert_eq!(receipt.actual, exact.selector_accounting);
+    assert_eq!(&receipt.actual, exact_selector_accounting);
     // The canonical HIR proves a seven-byte minimum. Three matches are the
     // complete non-overlap upper bound for this 21-byte haystack.
     let prospective_matches = haystack.len() / 7;
@@ -1599,6 +2047,7 @@ fn uniform_participation_count_has_exact_prospective_arithmetic_and_one_below_re
         },
         selector: exact_selector_limits(&prospective),
         max_combined_peak_bytes: prospective.peak_bytes,
+        prefix_class_participation: fre::PrefixClassUniformParticipationLimits::default(),
     };
     let exact_again = regex
         .count_captures(haystack, exact_limits)
@@ -1755,7 +2204,14 @@ fn ordered_uniform_participation_count_preserves_leftmost_first_match_cardinalit
             "pattern={pattern:?}"
         );
         assert_eq!(result.capture_events, matches * 3);
-        assert_eq!(result.selector_accounting.output_bytes, 0);
+        assert_eq!(
+            result
+                .selector_accounting
+                .as_ref()
+                .expect("ordered selector accounting")
+                .output_bytes,
+            0
+        );
         assert!(
             result
                 .selector_receipt
@@ -1867,16 +2323,23 @@ fn adversarial_operation_work(size: usize) -> (usize, usize) {
         .expect("operation-wide capture reduction");
     assert_eq!(size, result.accounting.matches);
     assert_eq!(size, result.accounting.count);
-    assert_eq!(size, result.selector_accounting.emitted_matches);
+    let selector_certificate = result
+        .selector_certificate
+        .as_ref()
+        .expect("adversarial selector certificate");
+    let selector_accounting = result
+        .selector_accounting
+        .as_ref()
+        .expect("adversarial selector accounting");
+    assert_eq!(size, selector_accounting.emitted_matches);
     assert_eq!(
         size.checked_add(1).expect("test input boundary count"),
-        result.selector_certificate.output_matches,
+        selector_certificate.output_matches,
         "the compact selector certificate retains its published input-only bound"
     );
-    let state_visits = result
-        .selector_accounting
+    let state_visits = selector_accounting
         .state_evaluations
-        .saturating_add(result.selector_accounting.replay_steps)
+        .saturating_add(selector_accounting.replay_steps)
         .saturating_add(result.accounting.total_state_visits);
     (state_visits, result.accounting.total_history_nodes)
 }
@@ -1951,14 +2414,19 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
     let admitted = regex
         .count_captures(b"ab", CaptureRunLimits::default())
         .expect("combined-peak baseline");
+    let selector_peak = admitted
+        .selector_accounting
+        .as_ref()
+        .expect("history selector accounting")
+        .peak_bytes;
     assert!(
-        admitted.combined_peak_bytes > admitted.selector_accounting.peak_bytes,
+        admitted.combined_peak_bytes > selector_peak,
         "fixture must expose retained spans plus replay scratch"
     );
     assert!(admitted.combined_peak_bytes <= CaptureRunLimits::default().max_combined_peak_bytes);
 
     let constrained = CaptureRunLimits {
-        max_combined_peak_bytes: admitted.selector_accounting.peak_bytes,
+        max_combined_peak_bytes: selector_peak,
         ..CaptureRunLimits::default()
     };
     let error = regex
