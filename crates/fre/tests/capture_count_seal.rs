@@ -72,6 +72,10 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
     let regex = selector_builder().build().expect("selector Count build");
     let cloned = regex.clone();
     let limits = CaptureRunLimits::default();
+    let eager = regex
+        .cache_identity(limits)
+        .count_seal
+        .expect("eager selector owner seal");
     let first = regex
         .count_captures(DENSE_HAYSTACK, limits)
         .expect("first selector Count");
@@ -98,6 +102,7 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
         .count_seal
         .as_ref()
         .expect("selector owner seal");
+    assert_eq!(seal, &eager);
     assert_eq!(steady.identity.count_seal.as_ref(), Some(seal));
     assert_eq!(cloned_steady.identity.count_seal.as_ref(), Some(seal));
     assert_eq!(first.count_receipt, steady.count_receipt);
@@ -105,6 +110,14 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
 
     let route = seal.route_identity();
     assert_eq!(route.plan, regex.build_report().plan_identity);
+    assert_eq!(route.build_limits, first.identity.build_limits);
+    assert_eq!(
+        route.build_limits,
+        CaptureBuildLimits {
+            max_prefix_class_participation_planner_work: 0,
+            ..CaptureBuildLimits::default()
+        }
+    );
     assert_eq!(
         route.plan.plan,
         CapturePlanKind::LinearSelectorUniformParticipation
@@ -189,6 +202,9 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
         .count_captures(DENSE_HAYSTACK, limits)
         .expect("separate selector Count");
     assert_ne!(separate.identity.count_seal, first.identity.count_seal);
+    let mut spliced = first.clone();
+    spliced.identity.count_seal = separate.identity.count_seal;
+    assert!(!spliced.has_closed_count_attempt());
 }
 
 #[test]
@@ -240,6 +256,10 @@ fn direct_owner_is_distinct_and_retains_u3_prepublication_fallback() {
         .build()
         .expect("direct Count build");
     let cloned = regex.clone();
+    let eager = regex
+        .cache_identity(CaptureRunLimits::default())
+        .count_seal
+        .expect("eager direct owner seal");
     let first = regex
         .count_captures(DENSE_HAYSTACK, CaptureRunLimits::default())
         .expect("first direct Count");
@@ -269,9 +289,11 @@ fn direct_owner_is_distinct_and_retains_u3_prepublication_fallback() {
         .count_seal
         .as_ref()
         .expect("direct owner seal");
+    assert_eq!(seal, &eager);
     assert_eq!(steady.identity.count_seal.as_ref(), Some(seal));
     assert_eq!(cloned_steady.identity.count_seal.as_ref(), Some(seal));
     let route = seal.route_identity();
+    assert_eq!(route.build_limits, first.identity.build_limits);
     assert_eq!(
         route.plan.plan,
         CapturePlanKind::UniformPrefixClassParticipation
@@ -314,6 +336,167 @@ fn direct_owner_is_distinct_and_retains_u3_prepublication_fallback() {
         .count_captures(DENSE_HAYSTACK, CaptureRunLimits::default())
         .expect("separate direct Count");
     assert_ne!(separate.identity.count_seal, first.identity.count_seal);
+    let mut spliced = first.clone();
+    spliced.identity.count_seal = separate.identity.count_seal;
+    assert!(!spliced.has_closed_count_attempt());
+}
+
+fn assert_report_cache_identity_mutations_are_rejected(report: &fre::CaptureExecutionReport) {
+    let mut tampered = report.clone();
+    tampered.identity.plan.plan = CapturePlanKind::LinearSelectorPersistentHistory;
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    tampered.identity.build_limits.max_hir_work =
+        tampered.identity.build_limits.max_hir_work.wrapping_add(1);
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    tampered.identity.run_limits.max_combined_peak_bytes = tampered
+        .identity
+        .run_limits
+        .max_combined_peak_bytes
+        .wrapping_add(1);
+    assert!(!tampered.has_closed_count_attempt());
+}
+
+fn assert_error_cache_identity_mutations_are_rejected(error: &mut fre::CaptureExecutionError) {
+    assert!(error.has_closed_count_attempt());
+
+    let original_plan = error.identity.plan.clone();
+    error.identity.plan.plan = CapturePlanKind::LinearSelectorPersistentHistory;
+    assert!(!error.has_closed_count_attempt());
+    error.identity.plan = original_plan;
+    assert!(error.has_closed_count_attempt());
+
+    let original_build_limits = error.identity.build_limits;
+    error.identity.build_limits.max_hir_work =
+        error.identity.build_limits.max_hir_work.wrapping_add(1);
+    assert!(!error.has_closed_count_attempt());
+    error.identity.build_limits = original_build_limits;
+    assert!(error.has_closed_count_attempt());
+
+    let original_run_limits = error.identity.run_limits;
+    error.identity.run_limits.max_combined_peak_bytes = error
+        .identity
+        .run_limits
+        .max_combined_peak_bytes
+        .wrapping_add(1);
+    assert!(!error.has_closed_count_attempt());
+    error.identity.run_limits = original_run_limits;
+    assert!(error.has_closed_count_attempt());
+
+    let published = error
+        .count_receipt
+        .as_ref()
+        .expect("sealed failure receipt")
+        .prospective;
+    assert!(published.is_some());
+    error
+        .count_receipt
+        .as_mut()
+        .expect("sealed failure receipt")
+        .prospective = None;
+    assert!(!error.has_closed_count_attempt());
+    error
+        .count_receipt
+        .as_mut()
+        .expect("sealed failure receipt")
+        .prospective = published;
+    assert!(error.has_closed_count_attempt());
+}
+
+fn assert_selector_certificate_mutations_are_rejected(report: &fre::CaptureExecutionReport) {
+    let mut tampered = report.clone();
+    let certificate = tampered
+        .selector_certificate
+        .as_mut()
+        .expect("selector certificate");
+    let published_range = certificate.range.clone();
+    certificate.range = published_range.end..published_range.start;
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    let certificate = tampered
+        .selector_certificate
+        .as_mut()
+        .expect("selector certificate");
+    certificate.work_bound = certificate.work_bound.wrapping_add(1);
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    let certificate = tampered
+        .selector_certificate
+        .as_mut()
+        .expect("selector certificate");
+    certificate.table_cells = certificate.table_cells.wrapping_add(1);
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    tampered
+        .selector_certificate
+        .as_mut()
+        .expect("selector certificate")
+        .prospective_allocations ^= 1;
+    assert!(!tampered.has_closed_count_attempt());
+
+    let mut tampered = report.clone();
+    tampered
+        .selector_certificate
+        .as_mut()
+        .expect("selector certificate")
+        .actual_allocations ^= 1;
+    assert!(!tampered.has_closed_count_attempt());
+}
+
+#[test]
+fn public_identity_certificate_provenance_and_publication_mutations_fail_closed() {
+    let selector = selector_builder().build().expect("selector Count build");
+    let selector_report = selector
+        .count_captures(DENSE_HAYSTACK, CaptureRunLimits::default())
+        .expect("selector Count");
+    assert_report_cache_identity_mutations_are_rejected(&selector_report);
+    assert_selector_certificate_mutations_are_rejected(&selector_report);
+    let selector_prospective = selector_report
+        .count_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prospective)
+        .expect("selector P");
+    let mut selector_one_below = CaptureRunLimits::default();
+    selector_one_below.selector.max_work = selector_prospective.selector.work_bound - 1;
+    let mut selector_error = selector
+        .count_captures(DENSE_HAYSTACK, selector_one_below)
+        .expect_err("selector one-below");
+    assert_error_cache_identity_mutations_are_rejected(&mut selector_error);
+    let original_source = selector_error.source.clone();
+    selector_error.source = CaptureExecutionSource::CombinedPeak {
+        needed: 1,
+        limit: 0,
+    };
+    assert!(!selector_error.has_closed_count_attempt());
+    selector_error.source = original_source;
+    assert!(selector_error.has_closed_count_attempt());
+
+    let direct = CaptureBuilder::new(DENSE_PATTERN)
+        .unicode(false)
+        .build()
+        .expect("direct Count build");
+    let direct_report = direct
+        .count_captures(DENSE_HAYSTACK, CaptureRunLimits::default())
+        .expect("direct Count");
+    assert_report_cache_identity_mutations_are_rejected(&direct_report);
+    let direct_prospective = direct_report
+        .count_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prospective)
+        .and_then(|prospective| prospective.direct)
+        .expect("direct P");
+    let mut direct_one_below = CaptureRunLimits::default();
+    direct_one_below.prefix_class_participation.max_work = direct_prospective.work - 1;
+    let mut direct_error = direct
+        .count_captures(DENSE_HAYSTACK, direct_one_below)
+        .expect_err("direct one-below");
+    assert_error_cache_identity_mutations_are_rejected(&mut direct_error);
 }
 
 #[test]
@@ -456,6 +639,17 @@ fn selector_exact_limits_accept_and_one_below_refuses_with_zero_actual() {
         let error = regex
             .count_captures(DENSE_HAYSTACK, one_below)
             .expect_err("combined-peak one-below must refuse");
+        assert!(matches!(
+            error.source,
+            CaptureExecutionSource::Selector(
+                fre::AggregateEngineError::ResourceLimit {
+                    resource: AggregateResource::PeakBytes,
+                    required,
+                    limit,
+                }
+            ) if required == prospective.combined_peak_bytes
+                && limit == prospective.combined_peak_bytes - 1
+        ));
         assert_selector_zero_effect_refusal(&error, &prospective);
     }
 }

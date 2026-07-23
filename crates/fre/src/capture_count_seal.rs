@@ -22,7 +22,9 @@ use fre_kernels::{
     PrefixClassUniformParticipationProspective as DirectOperationProspective,
 };
 
-use crate::captures::{CaptureBuildLimits, CapturePlanIdentity, CapturePlanKind, CaptureRunLimits};
+use crate::captures::{
+    CaptureBuildLimits, CaptureOperation, CapturePlanIdentity, CapturePlanKind, CaptureRunLimits,
+};
 
 /// Version of the positive-width uniform-participation Count algorithm.
 pub const CAPTURE_COUNT_ALGORITHM_VERSION: u32 = 1;
@@ -290,9 +292,31 @@ pub enum CaptureCountTerminal {
     Failure,
 }
 
+/// Authenticated publication frontier reached by one terminal attempt.
+///
+/// This remains crate-private so callers can inspect the public P/A payload
+/// but cannot relabel a cloned receipt after deleting a published envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureCountPublicationPhase {
+    /// Neither the nested route nor the whole-operation owner published P.
+    BeforeNested,
+    /// The nested route published P, but checked outer arithmetic did not
+    /// produce the complete whole-operation envelope.
+    Nested,
+    /// The complete whole-operation P was published.
+    Whole,
+}
+
 /// One whole-operation receipt retaining nested route P/A and capture P/A.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureCountAttemptReceipt {
+    /// Exact construction provenance and invocation limits. Keeping this
+    /// private prevents callers from splicing a structurally equal receipt
+    /// onto a separately built owner or a different run-limit identity.
+    seal: CaptureCountSeal,
+    /// Private publication frontier prevents deletion or insertion of public P
+    /// fields from preserving closure.
+    publication_phase: CaptureCountPublicationPhase,
     /// Complete receipt from the U3 selector route, when selected.
     pub selector: Option<SelectorOperationAttemptReceipt>,
     /// Complete receipt from the U4 direct route, when selected.
@@ -308,11 +332,21 @@ pub struct CaptureCountAttemptReceipt {
 
 impl CaptureCountAttemptReceipt {
     pub(crate) fn selector_failure(
+        seal: &CaptureCountSeal,
         selector: SelectorOperationAttemptReceipt,
         prospective: Option<&CaptureCountProspective>,
         actual: &CaptureCountActual,
     ) -> Self {
+        let publication_phase = if prospective.is_some() {
+            CaptureCountPublicationPhase::Whole
+        } else if selector.prospective.is_some() {
+            CaptureCountPublicationPhase::Nested
+        } else {
+            CaptureCountPublicationPhase::BeforeNested
+        };
         Self {
+            seal: seal.clone(),
+            publication_phase,
             selector: Some(selector),
             direct: None,
             prospective: prospective.copied(),
@@ -322,11 +356,14 @@ impl CaptureCountAttemptReceipt {
     }
 
     pub(crate) fn selector_success(
+        seal: &CaptureCountSeal,
         selector: SelectorOperationAttemptReceipt,
         prospective: &CaptureCountProspective,
         actual: &CaptureCountActual,
     ) -> Self {
         Self {
+            seal: seal.clone(),
+            publication_phase: CaptureCountPublicationPhase::Whole,
             selector: Some(selector),
             direct: None,
             prospective: Some(*prospective),
@@ -336,11 +373,21 @@ impl CaptureCountAttemptReceipt {
     }
 
     pub(crate) fn direct_failure(
+        seal: &CaptureCountSeal,
         direct: &DirectAttemptReceipt,
         prospective: Option<&CaptureCountProspective>,
         actual: &CaptureCountActual,
     ) -> Self {
+        let publication_phase = if prospective.is_some() {
+            CaptureCountPublicationPhase::Whole
+        } else if direct.prospective.is_some() {
+            CaptureCountPublicationPhase::Nested
+        } else {
+            CaptureCountPublicationPhase::BeforeNested
+        };
         Self {
+            seal: seal.clone(),
+            publication_phase,
             selector: None,
             direct: Some(*direct),
             prospective: prospective.copied(),
@@ -350,17 +397,24 @@ impl CaptureCountAttemptReceipt {
     }
 
     pub(crate) fn direct_success(
+        seal: &CaptureCountSeal,
         direct: &DirectAttemptReceipt,
         prospective: &CaptureCountProspective,
         actual: &CaptureCountActual,
     ) -> Self {
         Self {
+            seal: seal.clone(),
+            publication_phase: CaptureCountPublicationPhase::Whole,
             selector: None,
             direct: Some(*direct),
             prospective: Some(*prospective),
             actual: *actual,
             terminal: CaptureCountTerminal::Success,
         }
+    }
+
+    pub(crate) const fn publication_phase(&self) -> CaptureCountPublicationPhase {
+        self.publication_phase
     }
 
     /// Validate route identity, exact input-derived P, nested P/A, limits, and
@@ -372,7 +426,28 @@ impl CaptureCountAttemptReceipt {
     )]
     pub fn closes(&self, seal: &CaptureCountSeal) -> bool {
         let route = seal.route_identity();
-        if route.selector_operation != SelectorOperationAttemptKind::Count
+        let nested_prospective_is_some = match route.branch {
+            CaptureCountBranch::SelectorUniformParticipation => self
+                .selector
+                .as_ref()
+                .is_some_and(|selector| selector.prospective.is_some()),
+            CaptureCountBranch::DirectPrefixClassParticipation => self
+                .direct
+                .as_ref()
+                .is_some_and(|direct| direct.prospective.is_some()),
+        };
+        let observed_publication_phase =
+            match (nested_prospective_is_some, self.prospective.is_some()) {
+                (false, false) => Some(CaptureCountPublicationPhase::BeforeNested),
+                (true, false) => Some(CaptureCountPublicationPhase::Nested),
+                (true, true) => Some(CaptureCountPublicationPhase::Whole),
+                (false, true) => None,
+            };
+        if self.seal != *seal
+            || observed_publication_phase != Some(self.publication_phase)
+            || route.plan.operation != CaptureOperation::CountParticipatingNonempty
+            || route.selector_strategy != SelectorStrategy::ReverseSequentialRows
+            || route.selector_operation != SelectorOperationAttemptKind::Count
             || route.selector_work_mode != SelectorOperationWorkMode::ConservativeAdmission
             || route.selector_route.algorithm_version != CONTINUATION_OPERATION_ALGORITHM_VERSION
             || route.selector_route.accounting_version != CONTINUATION_OPERATION_ACCOUNTING_VERSION

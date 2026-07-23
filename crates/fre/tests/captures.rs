@@ -82,6 +82,7 @@ fn assert_direct_zero_actual_receipt(
     limits: &CaptureRunLimits,
     prospective: fre::PrefixClassUniformParticipationProspective,
 ) {
+    assert!(error.has_closed_count_attempt());
     assert_eq!(error.identity.run_limits, *limits);
     let receipt = error
         .prefix_class_participation_receipt
@@ -1847,6 +1848,15 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         .as_ref()
         .and_then(|receipt| receipt.prospective)
         .expect("retained U3 control prospective");
+    assert_eq!(
+        baseline
+            .count_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.prospective)
+            .expect("direct owner prospective")
+            .selector,
+        u3_control_prospective
+    );
     let u3_control_receipt = u3_control_result
         .selector_receipt
         .as_ref()

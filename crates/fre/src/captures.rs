@@ -49,7 +49,8 @@ use crate::capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
     CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
     CaptureCountOwnerSeal, CaptureCountPrepublicationFallback, CaptureCountProspective,
-    CaptureCountRouteIdentity, CaptureCountSeal, CaptureCountSelectorRoute, CaptureCountTerminal,
+    CaptureCountPublicationPhase, CaptureCountRouteIdentity, CaptureCountSeal,
+    CaptureCountSelectorRoute, CaptureCountTerminal,
 };
 use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
@@ -268,6 +269,17 @@ pub struct CaptureCacheIdentity {
     pub count_seal: Option<CaptureCountSeal>,
 }
 
+impl CaptureCacheIdentity {
+    fn has_coherent_count_seal(&self) -> bool {
+        self.count_seal.as_ref().is_some_and(|seal| {
+            let route = seal.route_identity();
+            self.plan == route.plan
+                && self.build_limits == route.build_limits
+                && self.run_limits == seal.run_limits()
+        })
+    }
+}
+
 /// Typed capture construction failure.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -438,6 +450,9 @@ impl CaptureExecutionError {
     /// owner and a complete whole-operation Count receipt.
     #[must_use]
     pub fn has_closed_count_attempt(&self) -> bool {
+        if !self.identity.has_coherent_count_seal() {
+            return false;
+        }
         let (Some(seal), Some(receipt)) = (
             self.identity.count_seal.as_ref(),
             self.count_receipt.as_ref(),
@@ -445,6 +460,13 @@ impl CaptureExecutionError {
             return false;
         };
         if receipt.terminal != CaptureCountTerminal::Failure || !receipt.closes(seal) {
+            return false;
+        }
+        if !count_failure_source_closes(
+            seal.route_identity().branch,
+            receipt.publication_phase(),
+            &self.source,
+        ) {
             return false;
         }
         match seal.route_identity().branch {
@@ -504,6 +526,9 @@ impl CaptureExecutionReport {
     /// complete whole-operation Count receipt.
     #[must_use]
     pub fn has_closed_count_attempt(&self) -> bool {
+        if !self.identity.has_coherent_count_seal() {
+            return false;
+        }
         let (Some(seal), Some(receipt)) = (
             self.identity.count_seal.as_ref(),
             self.count_receipt.as_ref(),
@@ -533,17 +558,7 @@ impl CaptureExecutionReport {
                 ),
                 (Some(selector), Some(nested), Some(certificate))
                     if selector == nested
-                        && selector.identity.operation_id() == Some(certificate.operation_id())
-                        && selector.identity.operation_limits_id
-                            == certificate.operation_limits_id
-                        && selector.identity.physical_route
-                            == Some(certificate.physical_route)
-                        && selector.identity.algorithm_version
-                            == certificate.algorithm_version
-                        && selector.identity.accounting_version
-                            == certificate.accounting_version
-                        && selector.identity.prepublication_fallback
-                            == certificate.prepublication_fallback
+                        && selector_certificate_closes(certificate, selector)
                         && self.selector_accounting.as_ref() == Some(&selector.actual)
                         && self.combined_peak_bytes == receipt.actual.combined_peak_bytes
                         && self.prefix_class_participation.is_none()
@@ -567,6 +582,94 @@ impl CaptureExecutionReport {
             ),
         }
     }
+}
+
+fn count_failure_source_closes(
+    branch: CaptureCountBranch,
+    publication_phase: CaptureCountPublicationPhase,
+    source: &CaptureExecutionSource,
+) -> bool {
+    matches!(
+        (branch, publication_phase, source),
+        (
+            CaptureCountBranch::SelectorUniformParticipation,
+            CaptureCountPublicationPhase::BeforeNested,
+            CaptureExecutionSource::Selector(_),
+        ) | (
+            CaptureCountBranch::SelectorUniformParticipation,
+            CaptureCountPublicationPhase::Nested,
+            CaptureExecutionSource::History(_),
+        ) | (
+            CaptureCountBranch::SelectorUniformParticipation,
+            CaptureCountPublicationPhase::Whole,
+            CaptureExecutionSource::Selector(_)
+                | CaptureExecutionSource::History(_)
+                | CaptureExecutionSource::InternalInvariant(_),
+        ) | (
+            CaptureCountBranch::DirectPrefixClassParticipation,
+            CaptureCountPublicationPhase::BeforeNested,
+            CaptureExecutionSource::PrefixClassParticipation(_),
+        ) | (
+            CaptureCountBranch::DirectPrefixClassParticipation,
+            CaptureCountPublicationPhase::Nested,
+            CaptureExecutionSource::Selector(_)
+                | CaptureExecutionSource::History(_)
+                | CaptureExecutionSource::InternalInvariant(_),
+        ) | (
+            CaptureCountBranch::DirectPrefixClassParticipation,
+            CaptureCountPublicationPhase::Whole,
+            _,
+        )
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the public compact certificate duplicates every published selector identity and prospective field, so closure names each field explicitly"
+)]
+fn selector_certificate_closes(
+    certificate: &SelectorOperationCertificate,
+    selector: &SelectorOperationAttemptReceipt,
+) -> bool {
+    let Some(prospective) = selector.prospective else {
+        return false;
+    };
+    let Some(boundaries) = certificate
+        .range
+        .end
+        .checked_sub(certificate.range.start)
+        .and_then(|bytes| bytes.checked_add(1))
+    else {
+        return false;
+    };
+    certificate.regex_plan_id == selector.identity.regex_plan_id
+        && certificate.operation_limits_id == selector.identity.operation_limits_id
+        && certificate.strategy == selector.identity.strategy
+        && certificate.operation == selector.identity.operation
+        && selector.identity.operation_id() == Some(certificate.operation_id())
+        && selector.identity.physical_route == Some(certificate.physical_route)
+        && certificate.algorithm_version == selector.identity.algorithm_version
+        && certificate.accounting_version == selector.identity.accounting_version
+        && certificate.prepublication_fallback == selector.identity.prepublication_fallback
+        && certificate.range == selector.invocation.range
+        && boundaries == prospective.boundaries
+        && certificate.states == prospective.states
+        && certificate.table_cells == prospective.table_cells
+        && certificate.row_storage == prospective.row_storage
+        && certificate.row_record_bytes == prospective.row_record_bytes
+        && certificate.terminal_frontier == prospective.terminal_frontier
+        && certificate.work_bound == prospective.work_bound
+        && certificate.random_access_bytes == prospective.random_access_bytes
+        && certificate.scratch_bytes == prospective.scratch_bytes
+        && certificate.log_bytes == prospective.log_bytes
+        && certificate.sequential_bytes_bound == prospective.sequential_bytes
+        && certificate.match_events == prospective.match_events
+        && certificate.output_matches == prospective.output_matches
+        && certificate.output_bytes == prospective.output_bytes
+        && certificate.span_sum == prospective.span_sum
+        && usize::from(certificate.prospective_allocations) == prospective.allocations
+        && usize::from(certificate.actual_allocations) == selector.actual_allocations
+        && certificate.peak_bytes == prospective.peak_bytes
 }
 
 /// Plan selected for bounded materialized capture iteration.
@@ -2228,7 +2331,9 @@ impl CaptureRegex {
             let route = seal.route_identity();
             (
                 route.branch,
+                route.plan.selector_plan_id,
                 route.selector_route.physical_route,
+                route.selector_strategy,
                 route.minimum_match_bytes,
                 route.participating_captures_per_match,
                 route.capture_schema_entries_per_match,
@@ -2239,7 +2344,9 @@ impl CaptureRegex {
         });
         let Some((
             CaptureCountBranch::DirectPrefixClassParticipation,
+            sealed_selector_plan_id,
             fre_aggregate::OperationPhysicalRoute::DenseRows,
+            SelectorStrategy::ReverseSequentialRows,
             minimum_match_bytes,
             sealed_participating,
             sealed_schema,
@@ -2260,6 +2367,7 @@ impl CaptureRegex {
         };
         if sealed_participating != plan.schema.participating_with_overall
             || sealed_schema != plan.schema.capture_schema_slots
+            || sealed_selector_plan_id != self.selector.plan_id()
             || self.uniform_count_minimum_match_bytes != Some(minimum_match_bytes)
         {
             return Err(CaptureExecutionError {
@@ -2489,8 +2597,18 @@ impl CaptureRegex {
                 Some(&owner_prospective),
             ));
         }
-        let count_receipt =
-            CaptureCountAttemptReceipt::direct_success(&receipt, &owner_prospective, &actual);
+        let Some(count_receipt) = identity.count_seal.as_ref().map(|seal| {
+            CaptureCountAttemptReceipt::direct_success(seal, &receipt, &owner_prospective, &actual)
+        }) else {
+            return Err(Self::direct_count_error(
+                &identity,
+                CaptureExecutionSource::InternalInvariant(
+                    "direct Count success lost its invocation seal",
+                ),
+                receipt,
+                Some(&owner_prospective),
+            ));
+        };
         if !identity
             .count_seal
             .as_ref()
@@ -2812,11 +2930,24 @@ impl CaptureRegex {
                 &actual,
             ));
         }
-        let count_receipt = CaptureCountAttemptReceipt::selector_success(
-            selector_receipt.clone(),
-            &prospective,
-            &actual,
-        );
+        let Some(count_receipt) = identity.count_seal.as_ref().map(|seal| {
+            CaptureCountAttemptReceipt::selector_success(
+                seal,
+                selector_receipt.clone(),
+                &prospective,
+                &actual,
+            )
+        }) else {
+            return Err(Self::uniform_count_error(
+                identity,
+                CaptureExecutionSource::InternalInvariant(
+                    "selector Count success lost its invocation seal",
+                ),
+                selector_receipt,
+                Some(&prospective),
+                &actual,
+            ));
+        };
         if !identity
             .count_seal
             .as_ref()
@@ -2876,17 +3007,20 @@ impl CaptureRegex {
         prospective: Option<&CaptureCountProspective>,
         actual: &CaptureCountActual,
     ) -> CaptureExecutionError {
-        let count_receipt = CaptureCountAttemptReceipt::selector_failure(
-            selector_receipt.clone(),
-            prospective,
-            actual,
-        );
+        let count_receipt = identity.count_seal.as_ref().map(|seal| {
+            CaptureCountAttemptReceipt::selector_failure(
+                seal,
+                selector_receipt.clone(),
+                prospective,
+                actual,
+            )
+        });
         CaptureExecutionError {
             identity,
             source,
             selector_receipt: Some(selector_receipt),
             prefix_class_participation_receipt: None,
-            count_receipt: Some(count_receipt),
+            count_receipt,
         }
     }
 
@@ -2916,7 +3050,7 @@ impl CaptureRegex {
         let count_receipt = identity.count_seal.as_ref().and_then(|seal| {
             let retained_fallback_bytes = seal.route_identity().retained_fallback_bytes;
             CaptureCountActual::from_direct(&receipt, retained_fallback_bytes).map(|actual| {
-                CaptureCountAttemptReceipt::direct_failure(&receipt, prospective, &actual)
+                CaptureCountAttemptReceipt::direct_failure(seal, &receipt, prospective, &actual)
             })
         });
         CaptureExecutionError {

@@ -36,7 +36,7 @@ fn without_allocations<T>(operation: impl FnOnce() -> T) -> T {
 fn direct_terminal_packaging_has_a_zero_allocation_census() {
     // The complete inline cache identity, route receipt, and owner receipt
     // remain bounded without restoring an error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 5_312);
+    assert_eq!(size_of::<CaptureExecutionError>(), 5_640);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";
@@ -48,6 +48,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
     let baseline = regex
         .count_captures(haystack, baseline_limits)
         .expect("direct capture baseline");
+    assert!(baseline.has_closed_count_attempt());
     let prospective = baseline
         .prefix_class_participation
         .expect("direct accounting")
@@ -69,6 +70,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
             PrefixClassUniformParticipationError::WorkLimit { .. }
         )
     ));
+    assert!(direct_error.has_closed_count_attempt());
     assert_eq!(
         direct_error
             .prefix_class_participation_receipt
@@ -98,6 +100,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
             .count_captures(haystack, control_one_below)
             .expect_err("U3 control one-below must refuse")
     });
+    assert!(control_error.has_closed_count_attempt());
     assert_eq!(
         control_error
             .prefix_class_participation_receipt
@@ -117,6 +120,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
         combined_error.source,
         CaptureExecutionSource::CombinedPeak { .. }
     ));
+    assert!(combined_error.has_closed_count_attempt());
 
     let identity = regex.cache_identity(baseline_limits);
     let injected_attempt =
