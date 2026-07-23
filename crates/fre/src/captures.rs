@@ -12,7 +12,7 @@ use fre_aggregate::{
     OperationCertificate as SelectorOperationCertificate,
     OperationLimits as SelectorOperationLimits,
     OperationProspective as SelectorOperationProspective, PlanId as SelectorPlanId,
-    RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
+    Resource as SelectorResource, RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
     AggregateLimits, AggregateOutcome, Assertion as CaptureAssertion, Ast,
@@ -1169,6 +1169,7 @@ fn build_prefix_class_participation(
     syntax: &ParseSummary,
     unicode: bool,
     case_insensitive: bool,
+    selector_has_terminal_frontier: bool,
     uniform_participating_captures: Option<usize>,
     limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
@@ -1179,6 +1180,7 @@ fn build_prefix_class_participation(
     };
     if unicode
         || case_insensitive
+        || selector_has_terminal_frontier
         || limits.required_literal.is_some()
         || uniform_participating_captures != Some(1)
         || syntax.captures != 2
@@ -1429,6 +1431,7 @@ impl CaptureBuilder {
             &syntax,
             unicode,
             case_insensitive,
+            selector.has_terminal_frontier(),
             uniform_participating_captures,
             &limits,
             &mut accounting,
@@ -1690,7 +1693,13 @@ impl CaptureRegex {
             .max_peak_bytes
             .min(limits.max_combined_peak_bytes);
         if let Some(plan) = &self.prefix_class_participation {
-            return self.count_prefix_class_participation(plan, haystack, limits, identity);
+            return self.count_prefix_class_participation(
+                plan,
+                haystack,
+                limits,
+                selector_limits,
+                identity,
+            );
         }
         if let Some(participating) = self.report.uniform_participating_captures {
             if let Some(minimum_match_bytes) = self.uniform_count_minimum_match_bytes {
@@ -1950,13 +1959,15 @@ impl CaptureRegex {
 
     #[allow(
         clippy::result_large_err,
-        reason = "direct terminals retain the complete fixed-layout prospective inline"
+        clippy::too_many_lines,
+        reason = "direct terminals retain the complete fixed-layout prospective inline beside source-free U3-control admission and co-live publication"
     )]
     fn count_prefix_class_participation(
         &self,
         plan: &CapturePrefixClassParticipationPlan,
         haystack: &[u8],
         limits: CaptureRunLimits,
+        selector_limits: SelectorOperationLimits,
         identity: CaptureCacheIdentity,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let prospective = plan
@@ -1972,6 +1983,64 @@ impl CaptureRegex {
                 selector_receipt: None,
                 prefix_class_participation_prospective: None,
             })?;
+        let selector_control = self
+            .selector
+            .fixed_scalar_dense_count_prospective(
+                haystack.len(),
+                SelectorStrategy::ReverseSequentialRows,
+            )
+            .map_err(|source| CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::Selector(source),
+                selector_receipt: None,
+                prefix_class_participation_prospective: Some(prospective),
+            })?;
+        enforce_selector_control(selector_control, selector_limits).map_err(|source| {
+            CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::Selector(source),
+                selector_receipt: None,
+                prefix_class_participation_prospective: Some(prospective),
+            }
+        })?;
+        let minimum_match_bytes =
+            self.uniform_count_minimum_match_bytes
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: Box::new(identity.clone()),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "direct prefix/class plan lost its positive minimum width",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_prospective: Some(prospective),
+                })?;
+        let selector_control = uniform_capture_prospective(
+            &selector_control,
+            haystack.len(),
+            minimum_match_bytes,
+            plan.schema.participating_with_overall,
+            plan.schema.capture_schema_slots,
+            limits.aggregate,
+        )
+        .map_err(|source| CaptureExecutionError {
+            identity: Box::new(identity.clone()),
+            source: CaptureExecutionSource::History(source),
+            selector_receipt: None,
+            prefix_class_participation_prospective: Some(prospective),
+        })?;
+        if selector_control.selector.terminal_frontier
+            || selector_control.matches != prospective.results
+            || selector_control.capture_count != prospective.capture_count
+            || selector_control.capture_events != prospective.capture_events
+        {
+            return Err(CaptureExecutionError {
+                identity: Box::new(identity.clone()),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "direct prefix/class envelope diverged from its retained U3 control",
+                ),
+                selector_receipt: None,
+                prefix_class_participation_prospective: Some(prospective),
+            });
+        }
         let retained_fallback_bytes = self
             .report
             .engine
@@ -2261,6 +2330,83 @@ struct UniformCaptureProspective {
     matches: usize,
     capture_count: usize,
     capture_events: usize,
+}
+
+fn enforce_selector_control(
+    prospective: SelectorOperationProspective,
+    limits: SelectorOperationLimits,
+) -> Result<(), SelectorError> {
+    for (required, limit, resource) in [
+        (
+            prospective.boundaries,
+            limits.max_boundaries,
+            SelectorResource::Boundaries,
+        ),
+        (
+            prospective.table_cells,
+            limits.max_table_cells,
+            SelectorResource::TableCells,
+        ),
+        (
+            prospective.random_access_bytes,
+            limits.max_random_access_bytes,
+            SelectorResource::RandomAccessBytes,
+        ),
+        (
+            prospective.scratch_bytes,
+            limits.max_scratch_bytes,
+            SelectorResource::ScratchBytes,
+        ),
+        (
+            prospective.log_bytes,
+            limits.max_log_bytes,
+            SelectorResource::LogBytes,
+        ),
+        (
+            prospective.sequential_bytes,
+            limits.max_sequential_bytes,
+            SelectorResource::SequentialBytes,
+        ),
+        (
+            prospective.match_events,
+            limits.max_match_events,
+            SelectorResource::MatchEvents,
+        ),
+        (
+            prospective.output_matches,
+            limits.max_output_matches,
+            SelectorResource::OutputMatches,
+        ),
+        (
+            prospective.output_bytes,
+            limits.max_output_bytes,
+            SelectorResource::OutputBytes,
+        ),
+        (
+            prospective.span_sum,
+            limits.max_span_sum,
+            SelectorResource::SpanSum,
+        ),
+        (
+            prospective.peak_bytes,
+            limits.max_peak_bytes,
+            SelectorResource::PeakBytes,
+        ),
+        (
+            prospective.work_bound,
+            limits.max_work,
+            SelectorResource::ExecutionWork,
+        ),
+    ] {
+        if required > limit {
+            return Err(SelectorError::ResourceLimit {
+                resource,
+                required,
+                limit,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn uniform_capture_prospective(

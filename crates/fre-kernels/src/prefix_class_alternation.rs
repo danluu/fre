@@ -1684,6 +1684,47 @@ mod tests {
     }
 
     #[test]
+    fn uniform_participation_overflow_is_typed_before_source_access() {
+        let plan = rust_functions_plan();
+        assert!(matches!(
+            plan.uniform_participation_prospective(
+                usize::MAX,
+                rust_functions_schema(),
+                UniformParticipationLimits::unlimited(),
+            ),
+            Err(UniformParticipationError::ArithmeticOverflow {
+                computation: "two complete prefix candidate streams",
+            })
+        ));
+        assert!(matches!(
+            plan.uniform_participation_prospective(
+                14,
+                UniformParticipationSchema {
+                    participating_with_overall: usize::MAX,
+                    capture_schema_slots: usize::MAX,
+                },
+                UniformParticipationLimits::unlimited(),
+            ),
+            Err(UniformParticipationError::ArithmeticOverflow {
+                computation: "prospective participating capture count",
+            })
+        ));
+        assert!(matches!(
+            plan.uniform_participation_prospective(
+                14,
+                UniformParticipationSchema {
+                    participating_with_overall: 1,
+                    capture_schema_slots: usize::MAX,
+                },
+                UniformParticipationLimits::unlimited(),
+            ),
+            Err(UniformParticipationError::ArithmeticOverflow {
+                computation: "prospective capture schema events",
+            })
+        ));
+    }
+
+    #[test]
     fn rust_functions_uniform_participation_n_2n_4n_is_deterministic() {
         let plan = rust_functions_plan();
         let schema = rust_functions_schema();

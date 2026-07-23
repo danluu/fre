@@ -1748,10 +1748,34 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         .prefix_class_participation
         .expect("direct baseline P/A")
         .prospective;
+    let u3_control = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .limits(CaptureBuildLimits {
+            max_prefix_class_participation_planner_work: 0,
+            ..CaptureBuildLimits::default()
+        })
+        .build()
+        .expect("retained U3 control");
+    let u3_control_result = u3_control
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("retained U3 control Count");
+    assert_eq!(u3_control_result.accounting, baseline.accounting);
+    assert_eq!(u3_control_result.capture_events, baseline.capture_events);
+    let u3_control_prospective = u3_control_result
+        .selector_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.prospective)
+        .expect("retained U3 control prospective");
     let exact_limits = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_results: prospective.results,
+            max_capture_count: prospective.capture_count,
+            max_capture_events: prospective.capture_events,
+            ..CaptureAggregateLimits::default()
+        },
+        selector: exact_selector_limits(&u3_control_prospective),
         prefix_class_participation: exact_prefix_class_participation_limits(&prospective),
         max_combined_peak_bytes: baseline.combined_peak_bytes,
-        ..CaptureRunLimits::default()
     };
     let exact = regex
         .count_captures(haystack, exact_limits)
@@ -1834,6 +1858,43 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
         max_peak_bytes,
         peak_bytes,
         fre::PrefixClassUniformParticipationError::PeakLimit { .. }
+    );
+
+    let mut selector_one_below = exact_limits;
+    selector_one_below.selector.max_work = u3_control_prospective.work_bound - 1;
+    let selector_error = regex
+        .count_captures(haystack, selector_one_below)
+        .expect_err("retained U3 selector one below must still refuse");
+    assert!(matches!(
+        selector_error.source,
+        CaptureExecutionSource::Selector(fre::AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::ExecutionWork,
+            required,
+            limit,
+        }) if required == u3_control_prospective.work_bound
+            && limit == u3_control_prospective.work_bound - 1
+    ));
+    assert_eq!(
+        selector_error.prefix_class_participation_prospective,
+        Some(prospective)
+    );
+
+    let mut aggregate_one_below = exact_limits;
+    aggregate_one_below.aggregate.max_capture_count = prospective.capture_count - 1;
+    let aggregate_error = regex
+        .count_captures(haystack, aggregate_one_below)
+        .expect_err("retained U3 capture owner one below must still refuse");
+    assert_eq!(
+        aggregate_error.source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::CaptureCount,
+            required: prospective.capture_count,
+            limit: prospective.capture_count - 1,
+        })
+    );
+    assert_eq!(
+        aggregate_error.prefix_class_participation_prospective,
+        Some(prospective)
     );
 
     let mut combined_one_below = exact_limits;
@@ -1953,6 +2014,29 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
             fallback.build_report().plan_identity.plan,
             fre::CapturePlanKind::UniformPrefixClassParticipation,
             "near_miss={near_miss:?}"
+        );
+    }
+    for fallback in [
+        CaptureBuilder::new(pattern)
+            .build()
+            .expect("Unicode-on control"),
+        CaptureBuilder::new(pattern)
+            .unicode(false)
+            .case_insensitive(true)
+            .build()
+            .expect("case-insensitive control"),
+        CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(CaptureBuildLimits {
+                required_literal: Some(CaptureRequiredLiteralBuildLimits::default()),
+                ..CaptureBuildLimits::default()
+            })
+            .build()
+            .expect("required-literal control"),
+    ] {
+        assert_ne!(
+            fallback.build_report().plan_identity.plan,
+            fre::CapturePlanKind::UniformPrefixClassParticipation
         );
     }
 
