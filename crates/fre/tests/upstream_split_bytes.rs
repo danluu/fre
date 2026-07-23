@@ -375,7 +375,7 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
         .expect("split selector");
     let exact = AggregateRunLimits {
         continuation: AggregateOperationLimits {
-            max_output_matches: 3,
+            max_output_matches: 4,
             ..AggregateOperationLimits::default()
         },
         ..AggregateRunLimits::default()
@@ -386,20 +386,20 @@ fn split_propagates_the_complete_selector_output_limit_exactly() {
 
     let below = AggregateRunLimits {
         continuation: AggregateOperationLimits {
-            max_output_matches: 2,
+            max_output_matches: 3,
             ..AggregateOperationLimits::default()
         },
         ..AggregateRunLimits::default()
     };
     let error = regex
         .split(b"XXX", below)
-        .expect_err("one below selected match count must fail");
+        .expect_err("one below the published selector bound must fail");
     assert!(matches!(
         error.source,
         AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
             resource: AggregateResource::OutputMatches,
-            required: 3,
-            limit: 2,
+            required: 4,
+            limit: 3,
         })
     ));
 }
