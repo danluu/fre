@@ -663,7 +663,7 @@ impl PrefixClassAlternationPlan {
                 initialized_bitmap_bytes: size_of::<[u64; 8]>(),
                 scratch_bytes,
                 persistent_bytes,
-                retained_capacity_bytes: persistent_bytes,
+                retained_capacity_bytes: prefix_bytes,
                 peak_bytes,
             },
         })

@@ -1642,8 +1642,9 @@ fn uniform_prefix_class_participation_is_generic_bounded_and_shadow_exact() {
     assert_eq!(direct_build.initialized_bitmap_bytes, 64);
     assert_eq!(
         direct_build.retained_capacity_bytes,
-        direct_build.persistent_bytes
+        direct_build.prefix_bytes
     );
+    assert!(direct_build.persistent_bytes > direct_build.retained_capacity_bytes);
     let direct_identity = build
         .plan_identity
         .prefix_class_participation

@@ -439,7 +439,8 @@ pub struct CaptureExecutionReport {
     pub prefix_class_participation: Option<PrefixClassUniformParticipationAccounting>,
     /// Complete capture-schema entries logically inspected by the reducer.
     pub capture_events: usize,
-    /// Conservative logical dynamic peak across selection and exact replay.
+    /// Conservative co-live retained and operation peak for the selected
+    /// route. Selector routes retain their existing dynamic interpretation.
     pub combined_peak_bytes: usize,
 }
 
