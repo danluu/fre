@@ -462,6 +462,10 @@ impl RequiredInternalAnchorPlan {
 
     /// Count while retaining exact terminal accounting when an invariant or
     /// arithmetic refusal occurs after source access.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the audited terminal error deliberately retains the complete exact execution ledger"
+    )]
     pub fn count_attempt(
         &self,
         haystack: &[u8],

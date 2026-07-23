@@ -1425,13 +1425,12 @@ impl CompiledRegex {
         };
         match result {
             Ok(mut result) => {
-                if let Some(prospective) = receipt.prospective.as_ref() {
-                    if let Err(source) = result
+                if let Some(prospective) = receipt.prospective.as_ref()
+                    && let Err(source) = result
                         .certificate
                         .retain_published_prospective(prospective, receipt.actual_allocations)
-                    {
-                        return Err(OperationAttemptError { source, receipt });
-                    }
+                {
+                    return Err(OperationAttemptError { source, receipt });
                 }
                 let valid = receipt.prospective.as_ref().is_some_and(|upper| {
                     (*upper).contains(receipt.actual)
@@ -7156,7 +7155,7 @@ mod tests {
         assert_eq!(normal.certificate().boundaries(), haystack.len() + 1);
 
         let mut reversed = normal.certificate().clone();
-        reversed.range = 2..1;
+        reversed.range = normal.certificate().range.end..normal.certificate().range.start;
         assert!(std::panic::catch_unwind(|| reversed.boundaries()).is_err());
 
         let mut overflowing = normal.certificate().clone();

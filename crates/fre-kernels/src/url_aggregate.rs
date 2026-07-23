@@ -640,8 +640,9 @@ impl UrlAggregatePlan {
     /// Return count and matched-byte sum while retaining exact terminal
     /// accounting when execution refuses after source access or allocation.
     #[allow(
+        clippy::result_large_err,
         clippy::too_many_lines,
-        reason = "one transaction keeps exact candidate ordering, metering, output publication and terminal accounting auditable"
+        reason = "one transaction and its deliberate full-ledger error keep exact candidate ordering, metering, output publication and terminal accounting auditable"
     )]
     pub fn span_sum_attempt(
         &self,

@@ -174,8 +174,9 @@ pub(crate) fn count(
 }
 
 #[allow(
+    clippy::result_large_err,
     clippy::too_many_lines,
-    reason = "candidate execution keeps validation, metering, scheduling, ordered draining and terminal accounting visible"
+    reason = "candidate execution and its deliberate full-ledger error keep validation, metering, scheduling, ordered draining and terminal accounting visible"
 )]
 pub(crate) fn count_attempt(
     plan: &Plan,
