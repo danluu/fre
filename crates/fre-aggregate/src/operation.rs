@@ -7,6 +7,7 @@ use fre_kernels::{
     RequiredInternalAnchorCountUpperBounds, RequiredInternalAnchorPlan, UrlAggregatePlan,
     UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
 };
+use sha2::{Digest, Sha256};
 
 use crate::accounting::ExecutionAccounting;
 use crate::candidate;
@@ -95,6 +96,36 @@ impl core::fmt::Display for OperationId {
     }
 }
 
+/// Stable identity of every caller-supplied operation limit.
+///
+/// The physical operation ID is derivable from the other attempt fields, so
+/// the receipt retains this independent full-policy seal in the same fixed
+/// footprint instead of duplicating that operation ID.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OperationLimitsId([u8; 16]);
+
+impl OperationLimitsId {
+    /// Canonically seal every field of one exact caller policy.
+    #[must_use]
+    pub fn from_limits(limits: OperationLimits) -> Self {
+        operation_limits_identity(limits)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl core::fmt::Display for OperationLimitsId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Whole-operation certificate checked before a result handle is published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationCertificate {
@@ -104,9 +135,9 @@ pub struct OperationCertificate {
     /// Exact executor selected before source access.
     pub physical_route: OperationPhysicalRoute,
     /// Explicit implementation version for the selected continuation route.
-    pub algorithm_version: u32,
+    pub algorithm_version: u8,
     /// Explicit schema version for prospective/actual accounting.
-    pub accounting_version: u32,
+    pub accounting_version: u8,
     pub range: Range<usize>,
     pub states: usize,
     pub boundaries: usize,
@@ -137,10 +168,10 @@ pub enum OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u32 = 1;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u32 = 1;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 1;
 
 /// Physical executor selected before a continuation attempt reads its source.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -185,21 +216,43 @@ pub enum OperationWorkMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationAttemptIdentity {
     pub regex_plan_id: PlanId,
-    /// Selected physical-operation identity. This is absent only when the
-    /// invocation is rejected before a route can be selected.
-    pub operation_id: Option<OperationId>,
+    /// Stable seal over every exact caller-supplied operation limit.
+    pub operation_limits_id: OperationLimitsId,
     pub strategy: Strategy,
     pub operation: OperationAttemptKind,
     pub work_mode: OperationWorkMode,
-    /// Exact caller limits authenticated by this attempt.
-    pub limits: OperationLimits,
     /// Selected physical route. This is absent only before route publication.
     pub physical_route: Option<OperationPhysicalRoute>,
-    pub algorithm_version: u32,
-    pub accounting_version: u32,
+    pub algorithm_version: u8,
+    pub accounting_version: u8,
     /// Construction- and invocation-derived route selection edge. This edge
     /// is exhausted before `physical_route` and P are published.
     pub prepublication_fallback: OperationPrepublicationFallback,
+}
+
+impl OperationAttemptIdentity {
+    /// Derive the incumbent physical operation ID once a route is published.
+    #[must_use]
+    pub fn operation_id(self) -> Option<OperationId> {
+        self.physical_route.map(|physical_route| {
+            operation_identity(
+                self.regex_plan_id,
+                self.strategy,
+                match self.operation {
+                    OperationAttemptKind::Spans => OperationKind::Spans,
+                    OperationAttemptKind::Count => OperationKind::Count,
+                    OperationAttemptKind::SpanSum => OperationKind::Sum,
+                },
+                physical_route,
+            )
+        })
+    }
+
+    /// Verify every exact caller limit against this attempt's stable seal.
+    #[must_use]
+    pub fn authenticates_limits(self, limits: OperationLimits) -> bool {
+        self.operation_limits_id == operation_limits_identity(limits)
+    }
 }
 
 /// Original-haystack invocation bound to an operation attempt.
@@ -619,14 +672,14 @@ pub struct AdmittedSpanSum {
     value: usize,
 }
 
-/// Successfully admitted SpanSum and its complete P/A attempt receipt.
+/// Successfully admitted `SpanSum` and its complete P/A attempt receipt.
 #[derive(Debug)]
 pub struct AdmittedSpanSumAttempt {
     pub admitted: AdmittedSpanSum,
     pub receipt: OperationAttemptReceipt,
 }
 
-/// Successfully evaluated value-only SpanSum and its complete P/A receipt.
+/// Successfully evaluated value-only `SpanSum` and its complete P/A receipt.
 #[derive(Debug)]
 pub struct SpanSumValueAttempt {
     pub value: usize,
@@ -1009,7 +1062,7 @@ impl CompiledRegex {
     }
 
     /// Admit and evaluate the ordinary construction-selected continuation
-    /// SpanSum route while retaining one complete success or terminal P/A
+    /// `SpanSum` route while retaining one complete success or terminal P/A
     /// receipt.
     #[allow(
         clippy::result_large_err,
@@ -1162,7 +1215,7 @@ impl CompiledRegex {
             .map(|result| result.summary.span_sum)
     }
 
-    /// Evaluate the ordinary construction-selected continuation SpanSum route
+    /// Evaluate the ordinary construction-selected continuation `SpanSum` route
     /// with observed-work admission and a complete P/A receipt.
     #[allow(
         clippy::result_large_err,
@@ -1210,7 +1263,7 @@ impl CompiledRegex {
         let mut receipt = OperationAttemptReceipt {
             identity: OperationAttemptIdentity {
                 regex_plan_id: self.plan_id(),
-                operation_id: None,
+                operation_limits_id: operation_limits_identity(limits),
                 strategy,
                 operation: match kind {
                     OperationKind::Spans => OperationAttemptKind::Spans,
@@ -1222,7 +1275,6 @@ impl CompiledRegex {
                 } else {
                     OperationWorkMode::ConservativeAdmission
                 },
-                limits,
                 physical_route: None,
                 algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
                 accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
@@ -1262,8 +1314,8 @@ impl CompiledRegex {
                     upper.contains(receipt.actual)
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
-                }) && receipt.identity.operation_id
-                    == Some(result.certificate.operation_id)
+                }) && receipt.identity.authenticates_limits(limits)
+                    && receipt.identity.operation_id() == Some(result.certificate.operation_id)
                     && receipt.identity.physical_route == Some(result.certificate.physical_route)
                     && receipt.identity.algorithm_version == result.certificate.algorithm_version
                     && receipt.identity.accounting_version == result.certificate.accounting_version;
@@ -1278,11 +1330,13 @@ impl CompiledRegex {
                 Ok((result, receipt))
             }
             Err(mut source) => {
-                if receipt.prospective.is_some_and(|upper| {
-                    !upper.contains(receipt.actual)
-                        || receipt.actual_allocations > upper.allocations
-                        || receipt.actual_allocations > receipt.allocation_limit
-                }) {
+                if !receipt.identity.authenticates_limits(limits)
+                    || receipt.prospective.is_some_and(|upper| {
+                        !upper.contains(receipt.actual)
+                            || receipt.actual_allocations > upper.allocations
+                            || receipt.actual_allocations > receipt.allocation_limit
+                    })
+                {
                     source = Error::InternalInvariant(
                         "continuation attempt route or actual counters diverged from its prospective certificate",
                     );
@@ -1677,8 +1731,6 @@ impl CompiledRegex {
             } else {
                 OperationPhysicalRoute::DenseRows
             };
-            let operation_id = operation_identity(self.plan_id(), strategy, kind, physical_route);
-            publication.identity.operation_id = Some(operation_id);
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = if forced_generic_count_route.is_some() {
                 OperationPrepublicationFallback::None
@@ -1868,6 +1920,11 @@ impl CompiledRegex {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the specialized route keeps publication, admission, execution, and terminal accounting in one auditable closure boundary"
+    )]
     fn execute_url_aggregate(
         &self,
         plan: &UrlAggregatePlan,
@@ -1889,12 +1946,6 @@ impl CompiledRegex {
             let prospective =
                 url_aggregate_prospective(&self.program, upper, kind, limits.max_work);
             let physical_route = OperationPhysicalRoute::UrlAggregate;
-            publication.identity.operation_id = Some(operation_identity(
-                self.plan_id(),
-                strategy,
-                kind,
-                physical_route,
-            ));
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
             *publication.prospective = Some(prospective);
@@ -2006,6 +2057,10 @@ impl CompiledRegex {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the specialized route receives the shared attempt publication and accounting state explicitly"
+    )]
     fn execute_required_internal_anchor(
         &self,
         plan: &RequiredInternalAnchorPlan,
@@ -2030,12 +2085,6 @@ impl CompiledRegex {
             let prospective =
                 required_internal_anchor_prospective(&self.program, boundaries, upper)?;
             let physical_route = OperationPhysicalRoute::RequiredInternalAnchor;
-            publication.identity.operation_id = Some(operation_identity(
-                self.plan_id(),
-                strategy,
-                OperationKind::Count,
-                physical_route,
-            ));
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
             *publication.prospective = Some(prospective);
@@ -2120,6 +2169,10 @@ impl CompiledRegex {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the specialized route receives the shared attempt publication and accounting state explicitly"
+    )]
     fn execute_candidate(
         &self,
         plan: &candidate::Plan,
@@ -2152,12 +2205,6 @@ impl CompiledRegex {
             let prospective =
                 candidate_prospective(plan, &self.program, input_bytes, boundaries, limits)?;
             let physical_route = OperationPhysicalRoute::Candidate;
-            publication.identity.operation_id = Some(operation_identity(
-                self.plan_id(),
-                strategy,
-                OperationKind::Count,
-                physical_route,
-            ));
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
             *publication.prospective = Some(prospective);
@@ -6297,6 +6344,37 @@ fn operation_identity(
     OperationId(bytes)
 }
 
+const OPERATION_LIMITS_IDENTITY_DOMAIN: &[u8] = b"fre.aggregate.operation-limits.identity.v1\0";
+
+fn operation_limits_identity(limits: OperationLimits) -> OperationLimitsId {
+    let fields = [
+        (1_u8, limits.max_boundaries),
+        (2, limits.max_table_cells),
+        (3, limits.max_random_access_bytes),
+        (4, limits.max_scratch_bytes),
+        (5, limits.max_log_bytes),
+        (6, limits.max_sequential_bytes),
+        (7, limits.max_match_events),
+        (8, limits.max_output_matches),
+        (9, limits.max_output_bytes),
+        (10, limits.max_span_sum),
+        (11, limits.max_peak_bytes),
+        (12, limits.max_work),
+    ];
+    let mut hash = Sha256::new();
+    hash.update(OPERATION_LIMITS_IDENTITY_DOMAIN);
+    for (tag, value) in fields {
+        hash.update([tag]);
+        let canonical =
+            u128::try_from(value).expect("Rust usize is never wider than the canonical u128 field");
+        hash.update(canonical.to_le_bytes());
+    }
+    let digest = hash.finalize();
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(&digest[..16]);
+    OperationLimitsId(identity)
+}
+
 #[cfg(test)]
 mod tests {
     use regex::bytes::RegexBuilder;
@@ -6311,11 +6389,11 @@ mod tests {
     use super::{
         CONTINUATION_OPERATION_ACCOUNTING_VERSION, CONTINUATION_OPERATION_ALGORITHM_VERSION,
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
-        MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationPhysicalRoute,
-        OperationProspective, Requirements, RowReader, RowStorage, UNCACHED_FRONTIER,
-        allocation_fault, cached_boundary_symbol, cached_compute_row, cached_frontier_words,
-        cached_program_assertion_mask, decode, encoded_width, exact_filled, operation_identity,
-        read_encoded, write_encoded,
+        MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
+        OperationPhysicalRoute, OperationProspective, Requirements, RowReader, RowStorage,
+        UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
+        cached_frontier_words, cached_program_assertion_mask, decode, encoded_width, exact_filled,
+        operation_identity, read_encoded, write_encoded,
     };
 
     fn endpoint_scalar_repeat() -> CompiledRegex {
@@ -6437,6 +6515,91 @@ mod tests {
     }
 
     #[test]
+    fn operation_limits_identity_is_canonical_and_binds_every_field() {
+        let ordered = OperationLimits {
+            max_boundaries: 11,
+            max_table_cells: 22,
+            max_random_access_bytes: 33,
+            max_scratch_bytes: 44,
+            max_log_bytes: 55,
+            max_sequential_bytes: 66,
+            max_match_events: 77,
+            max_output_matches: 88,
+            max_output_bytes: 99,
+            max_span_sum: 110,
+            max_peak_bytes: 121,
+            max_work: 132,
+        };
+        assert_eq!(
+            OperationLimitsId::from_limits(ordered).bytes(),
+            [
+                0x0b, 0xba, 0xcb, 0xe1, 0x86, 0xc3, 0x4c, 0xfe, 0xf9, 0x11, 0x8c, 0xea, 0xf7, 0x42,
+                0x5b, 0x5c,
+            ]
+        );
+        assert_eq!(
+            OperationLimitsId::from_limits(ordered),
+            OperationLimitsId::from_limits(ordered)
+        );
+
+        let baseline = OperationLimits::default();
+        let identity = OperationLimitsId::from_limits(baseline);
+        let mutations = [
+            OperationLimits {
+                max_boundaries: baseline.max_boundaries - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_table_cells: baseline.max_table_cells - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_random_access_bytes: baseline.max_random_access_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_scratch_bytes: baseline.max_scratch_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_log_bytes: baseline.max_log_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_sequential_bytes: baseline.max_sequential_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_match_events: baseline.max_match_events - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_output_matches: baseline.max_output_matches - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_output_bytes: baseline.max_output_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_span_sum: baseline.max_span_sum - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_peak_bytes: baseline.max_peak_bytes - 1,
+                ..baseline
+            },
+            OperationLimits {
+                max_work: baseline.max_work - 1,
+                ..baseline
+            },
+        ];
+        for mutation in mutations {
+            assert_ne!(OperationLimitsId::from_limits(mutation), identity);
+        }
+    }
+
+    #[test]
     fn endpoint_count_attempt_invalid_range_has_no_prospective_or_actual_work() {
         let compiled = endpoint_scalar_repeat();
         let failure = compiled
@@ -6458,7 +6621,13 @@ mod tests {
         assert_eq!(failure.receipt.invocation.range, 0..6);
         assert_eq!(failure.receipt.invocation.haystack_len, 5);
         assert_eq!(failure.receipt.identity.regex_plan_id, compiled.plan_id());
-        assert_eq!(failure.receipt.identity.operation_id, None);
+        assert!(
+            failure
+                .receipt
+                .identity
+                .authenticates_limits(OperationLimits::default())
+        );
+        assert_eq!(failure.receipt.identity.operation_id(), None);
         assert_eq!(failure.receipt.prospective, None);
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
     }
@@ -6490,7 +6659,7 @@ mod tests {
                 limit: 0,
             }
         );
-        assert!(failure.receipt.identity.operation_id.is_some());
+        assert!(failure.receipt.identity.operation_id().is_some());
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
         assert!(prospective.contains(failure.receipt.actual));
     }
@@ -6511,7 +6680,7 @@ mod tests {
             .unwrap();
         assert!(!ordinary_before.admitted.certificate().terminal_frontier);
         assert_eq!(
-            ordinary_before.receipt.identity.operation_id,
+            ordinary_before.receipt.identity.operation_id(),
             Some(operation_identity(
                 compiled.plan_id(),
                 Strategy::ReverseSequentialRows,
@@ -6537,7 +6706,7 @@ mod tests {
         assert_eq!(terminal.admitted.value(), ordinary_before.admitted.value());
         assert!(terminal.admitted.certificate().terminal_frontier);
         assert_eq!(
-            terminal.receipt.identity.operation_id,
+            terminal.receipt.identity.operation_id(),
             Some(operation_identity(
                 compiled.plan_id(),
                 Strategy::ReverseSequentialRows,
@@ -6546,12 +6715,12 @@ mod tests {
             ))
         );
         assert_eq!(
-            terminal.receipt.identity.operation_id,
+            terminal.receipt.identity.operation_id(),
             Some(terminal.admitted.certificate().operation_id)
         );
         assert_ne!(
-            terminal.receipt.identity.operation_id,
-            ordinary_before.receipt.identity.operation_id
+            terminal.receipt.identity.operation_id(),
+            ordinary_before.receipt.identity.operation_id()
         );
         assert!(
             terminal
@@ -6659,7 +6828,7 @@ mod tests {
         assert_eq!(observed, Some(prospective));
         assert_eq!(exact_success.receipt.prospective, Some(prospective));
         let mut exact_identity = identity;
-        exact_identity.limits = exact;
+        exact_identity.operation_limits_id = OperationLimitsId::from_limits(exact);
         assert_eq!(exact_success.receipt.identity, exact_identity);
         assert_eq!(exact_success.admitted.value(), baseline.admitted.value());
         assert!(prospective.contains(exact_success.receipt.actual));
@@ -6691,7 +6860,8 @@ mod tests {
                         }
                     );
                     let mut one_below_identity = identity;
-                    one_below_identity.limits = one_below;
+                    one_below_identity.operation_limits_id =
+                        OperationLimitsId::from_limits(one_below);
                     assert_eq!(failure.receipt.identity, one_below_identity);
                     assert_eq!(failure.receipt.prospective, Some(prospective));
                     assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
@@ -6770,7 +6940,7 @@ mod tests {
             failure.source,
             Error::InternalInvariant("terminal-frontier Count requires its compiled HIR proof")
         );
-        assert_eq!(failure.receipt.identity.operation_id, None);
+        assert_eq!(failure.receipt.identity.operation_id(), None);
         assert_eq!(failure.receipt.prospective, None);
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
         assert_eq!(failure.receipt.actual_allocations, 0);
@@ -6791,7 +6961,7 @@ mod tests {
             failure.source,
             Error::InternalInvariant("terminal-frontier Count requires reverse sequential rows")
         );
-        assert_eq!(failure.receipt.identity.operation_id, None);
+        assert_eq!(failure.receipt.identity.operation_id(), None);
         assert_eq!(failure.receipt.prospective, None);
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
         assert_eq!(failure.receipt.actual_allocations, 0);
@@ -6858,7 +7028,7 @@ mod tests {
             .unwrap();
         assert_eq!(exact_success.receipt.prospective, Some(prospective));
         let mut exact_identity = identity;
-        exact_identity.limits = exact;
+        exact_identity.operation_limits_id = OperationLimitsId::from_limits(exact);
         assert_eq!(exact_success.receipt.identity, exact_identity);
 
         macro_rules! assert_one_below {
@@ -6884,7 +7054,8 @@ mod tests {
                         }
                     );
                     let mut one_below_identity = identity;
-                    one_below_identity.limits = one_below;
+                    one_below_identity.operation_limits_id =
+                        OperationLimitsId::from_limits(one_below);
                     assert_eq!(failure.receipt.identity, one_below_identity);
                     assert_eq!(failure.receipt.prospective, Some(prospective));
                     assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
@@ -6955,6 +7126,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one focused matrix binds all three operation identities, stable P/A, resource refusal, and post-publication failure"
+    )]
     fn ordinary_operations_publish_stable_distinct_closed_receipts_and_never_late_fallback() {
         let compiled = endpoint_scalar_repeat();
         let haystack = [b'a'; 249];
@@ -6981,6 +7156,7 @@ mod tests {
             spans_first.receipt.identity.operation,
             OperationAttemptKind::Spans
         );
+        assert!(spans_first.receipt.identity.authenticates_limits(limits));
         let spans_upper = spans_first.receipt.prospective.unwrap();
         assert!(spans_upper.output_bytes > 0);
         assert_eq!(spans_upper.span_sum, 0);
@@ -6990,7 +7166,7 @@ mod tests {
             spans_first.admitted.accounting()
         );
         assert_eq!(
-            spans_first.receipt.identity.operation_id,
+            spans_first.receipt.identity.operation_id(),
             Some(spans_first.admitted.certificate().operation_id)
         );
         assert_eq!(
@@ -7031,12 +7207,12 @@ mod tests {
             OperationAttemptKind::Count
         );
         assert_ne!(
-            spans_first.receipt.identity.operation_id,
-            count.receipt.identity.operation_id
+            spans_first.receipt.identity.operation_id(),
+            count.receipt.identity.operation_id()
         );
         assert_ne!(
-            count.receipt.identity.operation_id,
-            sum_first.receipt.identity.operation_id
+            count.receipt.identity.operation_id(),
+            sum_first.receipt.identity.operation_id()
         );
         let sum_upper = sum_first.receipt.prospective.unwrap();
         assert_eq!(sum_upper.output_bytes, 0);
@@ -7058,6 +7234,13 @@ mod tests {
             }
         );
         assert_eq!(spans_refusal.receipt.prospective, Some(spans_upper));
+        assert!(
+            spans_refusal
+                .receipt
+                .identity
+                .authenticates_limits(spans_below)
+        );
+        assert!(!spans_refusal.receipt.identity.authenticates_limits(limits));
         assert_eq!(
             spans_refusal.receipt.identity.physical_route,
             spans_first.receipt.identity.physical_route
@@ -7083,6 +7266,7 @@ mod tests {
             }
         );
         assert_eq!(sum_refusal.receipt.prospective, Some(sum_upper));
+        assert!(sum_refusal.receipt.identity.authenticates_limits(sum_below));
         assert_eq!(sum_refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(sum_refusal.receipt.actual_allocations, 0);
 
@@ -7142,6 +7326,7 @@ mod tests {
             }
         );
         assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert!(refusal.receipt.identity.authenticates_limits(one_below));
         assert_eq!(
             refusal.receipt.identity.physical_route,
             first.receipt.identity.physical_route
@@ -7150,7 +7335,6 @@ mod tests {
             refusal.receipt.identity.prepublication_fallback,
             first.receipt.identity.prepublication_fallback
         );
-        assert_eq!(refusal.receipt.identity.limits, one_below);
         assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(refusal.receipt.actual_allocations, 0);
     }

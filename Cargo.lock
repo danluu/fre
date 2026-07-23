@@ -120,6 +120,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "sha2",
 ]
 
 [[package]]

@@ -62,7 +62,7 @@ pub use operation::{
     AdmittedSpansAttempt, CONTINUATION_OPERATION_ACCOUNTING_VERSION,
     CONTINUATION_OPERATION_ALGORITHM_VERSION, CountValueAttempt, MatchCount, OperationAttemptError,
     OperationAttemptIdentity, OperationAttemptKind, OperationAttemptReceipt, OperationCertificate,
-    OperationId, OperationInvocation, OperationPhysicalRoute, OperationPrepublicationFallback,
-    OperationProspective, OperationWorkMode, RowStorage, Span, SpanIter, SpanIteration, SpanSum,
-    SpanSumValueAttempt, Strategy,
+    OperationId, OperationInvocation, OperationLimitsId, OperationPhysicalRoute,
+    OperationPrepublicationFallback, OperationProspective, OperationWorkMode, RowStorage, Span,
+    SpanIter, SpanIteration, SpanSum, SpanSumValueAttempt, Strategy,
 };

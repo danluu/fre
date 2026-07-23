@@ -127,7 +127,7 @@ pub use fre_aggregate::{
     OperationAttemptReceipt as AggregateOperationAttemptReceipt,
     OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
     OperationInvocation as AggregateOperationInvocation,
-    OperationLimits as AggregateOperationLimits,
+    OperationLimits as AggregateOperationLimits, OperationLimitsId as AggregateOperationLimitsId,
     OperationPhysicalRoute as AggregateOperationPhysicalRoute,
     OperationPrepublicationFallback as AggregateOperationPrepublicationFallback,
     OperationProspective as AggregateOperationProspective,

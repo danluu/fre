@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use fre_aggregate::{
     AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
-    OperationAttemptError, OperationAttemptReceipt, OperationProspective, RustByteProfile,
-    SpanIter,
+    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt, OperationProspective,
+    RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
@@ -1774,14 +1774,35 @@ impl AggregateExecutionAttemptIdentity {
                 .receipt()
                 .residual_error()
                 .is_some_and(|(continuation, composite)| {
-                    composite.contains_actual_with(&continuation.receipt)
+                    continuation
+                        .receipt
+                        .identity
+                        .authenticates_limits(attempt.receipt().continuation_limits())
+                        && composite.contains_actual_with(&continuation.receipt)
                 }),
-            (Self::Continuation { receipt, .. }, AggregateExecutionSource::Continuation(_)) => {
-                receipt.prospective.is_some_and(|upper| {
-                    upper.contains(receipt.actual)
-                        && receipt.actual_allocations <= upper.allocations
-                        && receipt.actual_allocations <= receipt.allocation_limit
-                })
+            (Self::Continuation { cache, receipt }, AggregateExecutionSource::Continuation(_)) => {
+                let operation_matches = matches!(
+                    (cache.operation, receipt.identity.operation),
+                    (AggregateOperation::Spans, OperationAttemptKind::Spans)
+                        | (AggregateOperation::Count, OperationAttemptKind::Count)
+                        | (AggregateOperation::SpanSum, OperationAttemptKind::SpanSum)
+                );
+                let plan_matches = matches!(
+                    cache.plan_identity,
+                    AggregatePlanIdentity::Continuation(identity)
+                        if identity.program == receipt.identity.regex_plan_id
+                );
+                operation_matches
+                    && plan_matches
+                    && cache.continuation_strategy == Some(receipt.identity.strategy)
+                    && receipt
+                        .identity
+                        .authenticates_limits(cache.execution_limits.continuation)
+                    && receipt.prospective.is_some_and(|upper| {
+                        upper.contains(receipt.actual)
+                            && receipt.actual_allocations <= upper.allocations
+                            && receipt.actual_allocations <= receipt.allocation_limit
+                    })
             }
             _ => false,
         }
@@ -2652,6 +2673,10 @@ impl std::error::Error for AggregateExecutionError {
 
 /// Selected-plan execution details.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the continuation report retains its already-budgeted receipt inline; boxing would add an unaccounted reporting allocation"
+)]
 pub enum AggregateExecutionDetails {
     /// Exact-literal upper bounds, counters, and operation identity.
     ExactLiteral(LiteralAggregateReduceAccounting),
@@ -6126,17 +6151,14 @@ impl AggregatePlan {
                         limits.continuation,
                     )
                     .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-                let value = match u64::try_from(admitted.admitted.value()) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return Err(self.continuation_error_from_receipt(
-                            limits,
-                            admitted.receipt,
-                            AggregateExecutionSource::InternalInvariant(
-                                "continuation count does not fit u64",
-                            ),
-                        ));
-                    }
+                let Ok(value) = u64::try_from(admitted.admitted.value()) else {
+                    return Err(self.continuation_error_from_receipt(
+                        limits,
+                        admitted.receipt,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation count does not fit u64",
+                        ),
+                    ));
                 };
                 Ok(AggregateCountExecution::Continuation { admitted, value })
             }
@@ -6287,17 +6309,14 @@ impl AggregatePlan {
                 limits.continuation,
             )
             .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        let value = match u64::try_from(admitted.admitted.value()) {
-            Ok(value) => value,
-            Err(_) => {
-                return Err(self.continuation_error_from_receipt(
-                    limits,
-                    admitted.receipt,
-                    AggregateExecutionSource::InternalInvariant(
-                        "continuation span sum does not fit u64",
-                    ),
-                ));
-            }
+        let Ok(value) = u64::try_from(admitted.admitted.value()) else {
+            return Err(self.continuation_error_from_receipt(
+                limits,
+                admitted.receipt,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            ));
         };
         Ok(AggregateSpanSumExecution::Continuation { admitted, value })
     }

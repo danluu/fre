@@ -3247,6 +3247,10 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one facade matrix checks success and terminal receipt closure for all three continuation operations"
+)]
 fn continuation_facades_retain_closed_operation_specific_success_and_failure_receipts() {
     let pattern = r"(?:a+b|a)";
     let haystack = b"aaaab a";
@@ -3266,9 +3270,14 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
         spans_receipt.identity.operation,
         AggregateOperationAttemptKind::Spans
     );
-    assert_eq!(spans_receipt.identity.limits, limits.continuation);
+    assert_eq!(spans.report().cache_identity().execution_limits, limits);
+    assert!(
+        spans_receipt
+            .identity
+            .authenticates_limits(limits.continuation)
+    );
     assert_eq!(
-        spans_receipt.identity.operation_id,
+        spans_receipt.identity.operation_id(),
         Some(spans_certificate.operation_id)
     );
     assert_eq!(
@@ -3308,12 +3317,12 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
     assert_eq!(sum_upper.span_sum, haystack.len());
     assert!(sum_upper.contains(sum_receipt.actual));
     assert_ne!(
-        spans_receipt.identity.operation_id,
-        count_receipt.identity.operation_id
+        spans_receipt.identity.operation_id(),
+        count_receipt.identity.operation_id()
     );
     assert_ne!(
-        count_receipt.identity.operation_id,
-        sum_receipt.identity.operation_id
+        count_receipt.identity.operation_id(),
+        sum_receipt.identity.operation_id()
     );
 
     let mut spans_below = limits;
@@ -3326,8 +3335,17 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
         AggregateOperationAttemptKind::Spans
     );
     assert_eq!(
-        spans_failure_receipt.identity.limits,
-        spans_below.continuation
+        spans_error
+            .identity
+            .as_cache_identity()
+            .unwrap()
+            .execution_limits,
+        spans_below
+    );
+    assert!(
+        spans_failure_receipt
+            .identity
+            .authenticates_limits(spans_below.continuation)
     );
     assert_eq!(spans_failure_receipt.prospective, Some(spans_upper));
     assert!(matches!(
@@ -3348,7 +3366,19 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
         sum_failure_receipt.identity.operation,
         AggregateOperationAttemptKind::SpanSum
     );
-    assert_eq!(sum_failure_receipt.identity.limits, sum_below.continuation);
+    assert_eq!(
+        sum_error
+            .identity
+            .as_cache_identity()
+            .unwrap()
+            .execution_limits,
+        sum_below
+    );
+    assert!(
+        sum_failure_receipt
+            .identity
+            .authenticates_limits(sum_below.continuation)
+    );
     assert_eq!(sum_failure_receipt.prospective, Some(sum_upper));
     assert!(matches!(
         sum_error.source,

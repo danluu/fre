@@ -11,6 +11,7 @@ publish = false
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-kernels = { path = "../fre-kernels" }
 regex-syntax = "=0.8.11"
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 fre-iterator-lab = { path = "../fre-iterator-lab" }
