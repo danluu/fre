@@ -1550,7 +1550,7 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
     assert_eq!(receipt.actual, result.selector_accounting);
     assert_eq!(
         receipt.identity.operation_id(),
-        Some(result.selector_certificate.operation_id)
+        Some(result.selector_certificate.operation_id())
     );
     assert_eq!(result.accounting.total_state_visits, 0);
     assert_eq!(result.accounting.total_history_nodes, 0);

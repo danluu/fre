@@ -2673,10 +2673,6 @@ impl std::error::Error for AggregateExecutionError {
 
 /// Selected-plan execution details.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the continuation report retains its already-budgeted receipt inline; boxing would add an unaccounted reporting allocation"
-)]
 pub enum AggregateExecutionDetails {
     /// Exact-literal upper bounds, counters, and operation identity.
     ExactLiteral(LiteralAggregateReduceAccounting),
@@ -2712,7 +2708,6 @@ pub enum AggregateExecutionDetails {
     Continuation {
         certificate: AggregateOperationCertificate,
         accounting: AggregateExecutionAccounting,
-        receipt: OperationAttemptReceipt,
     },
 }
 
@@ -6651,7 +6646,6 @@ impl AggregateCountExecution {
                 AggregateExecutionDetails::Continuation {
                     certificate,
                     accounting,
-                    receipt: admitted.receipt,
                 }
             }
         }
@@ -6734,7 +6728,6 @@ impl AggregateSpanSumExecution {
                 AggregateExecutionDetails::Continuation {
                     certificate,
                     accounting,
-                    receipt: admitted.receipt,
                 }
             }
         }
@@ -8603,7 +8596,6 @@ impl AggregateSpansRegex {
         let details = AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
-            receipt: attempt.receipt,
         };
         let report = self.0.execution_report(limits, details);
         Ok(AggregateSpans {

@@ -2516,16 +2516,16 @@ fn plan_and_operation_identities_are_deterministic_and_typed() {
         rows.certificate().row_record_bytes * rows.certificate().boundaries
     );
     assert_eq!(
-        spans.certificate().operation_id,
-        spans_again.certificate().operation_id
+        spans.certificate().operation_id(),
+        spans_again.certificate().operation_id()
     );
     assert_ne!(
-        spans.certificate().operation_id,
-        rows.certificate().operation_id
+        spans.certificate().operation_id(),
+        rows.certificate().operation_id()
     );
     assert_ne!(
-        spans.certificate().operation_id,
-        count.certificate().operation_id
+        spans.certificate().operation_id(),
+        count.certificate().operation_id()
     );
 }
 

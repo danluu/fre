@@ -447,13 +447,32 @@ fn continuation_details(
     }
 }
 
-fn continuation_receipt(
-    details: &AggregateExecutionDetails,
-) -> &fre::AggregateOperationAttemptReceipt {
-    match details {
-        AggregateExecutionDetails::Continuation { receipt, .. } => receipt,
-        _ => panic!("expected continuation execution receipt"),
-    }
+fn assert_continuation_certificate_preserves_prospective(
+    certificate: &fre::AggregateOperationCertificate,
+    prospective: fre::AggregateOperationProspective,
+) {
+    assert_eq!(certificate.states, prospective.states);
+    assert_eq!(certificate.boundaries, prospective.boundaries);
+    assert_eq!(certificate.table_cells, prospective.table_cells);
+    assert_eq!(certificate.row_storage, prospective.row_storage);
+    assert_eq!(certificate.row_record_bytes, prospective.row_record_bytes);
+    assert_eq!(certificate.terminal_frontier, prospective.terminal_frontier);
+    assert_eq!(certificate.work_bound, prospective.work_bound);
+    assert_eq!(
+        certificate.random_access_bytes,
+        prospective.random_access_bytes
+    );
+    assert_eq!(certificate.scratch_bytes, prospective.scratch_bytes);
+    assert_eq!(certificate.log_bytes, prospective.log_bytes);
+    assert_eq!(
+        certificate.sequential_bytes_bound,
+        prospective.sequential_bytes
+    );
+    assert_eq!(certificate.match_events, prospective.match_events);
+    assert_eq!(certificate.output_matches, prospective.output_matches);
+    assert_eq!(certificate.output_bytes, prospective.output_bytes);
+    assert_eq!(certificate.span_sum, prospective.span_sum);
+    assert_eq!(certificate.peak_bytes, prospective.peak_bytes);
 }
 
 #[test]
@@ -3249,91 +3268,93 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "one facade matrix checks success and terminal receipt closure for all three continuation operations"
+    reason = "one facade matrix checks compact success and terminal receipt closure for all three continuation operations"
 )]
-fn continuation_facades_retain_closed_operation_specific_success_and_failure_receipts() {
+fn continuation_facades_retain_closed_operation_specific_success_and_failure_evidence() {
     let pattern = r"(?:a+b|a)";
     let haystack = b"aaaab a";
     let builder = || {
         aggregate_builder(pattern)
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceContinuation)
-            .strategy(AggregateStrategy::FullTable)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
     };
     let limits = AggregateRunLimits::default();
 
     let spans_regex = builder().build_spans().unwrap();
-    let spans = spans_regex.spans(haystack, limits).unwrap();
-    let spans_receipt = continuation_receipt(&spans.report().details);
+    let initial_spans = spans_regex.spans(haystack, limits).unwrap();
+    let (initial_spans_certificate, _) = continuation_details(&initial_spans.report().details);
+    let mut spans_exact = limits;
+    spans_exact.continuation.max_output_bytes = initial_spans_certificate.output_bytes;
+    let spans = spans_regex.spans(haystack, spans_exact).unwrap();
     let (spans_certificate, spans_accounting) = continuation_details(&spans.report().details);
     assert_eq!(
-        spans_receipt.identity.operation,
+        spans_certificate.operation,
         AggregateOperationAttemptKind::Spans
     );
-    assert_eq!(spans.report().cache_identity().execution_limits, limits);
-    assert!(
-        spans_receipt
-            .identity
-            .authenticates_limits(limits.continuation)
-    );
     assert_eq!(
-        spans_receipt.identity.operation_id(),
-        Some(spans_certificate.operation_id)
-    );
-    assert_eq!(
-        spans_receipt.identity.physical_route,
-        Some(spans_certificate.physical_route)
-    );
-    assert_eq!(spans_receipt.actual, *spans_accounting);
-    let spans_upper = spans_receipt.prospective.unwrap();
-    assert!(spans_upper.output_bytes > 0);
-    assert!(spans_upper.contains(spans_receipt.actual));
-
-    let count_regex = builder().build_count().unwrap();
-    let count = count_regex.count(haystack, limits).unwrap();
-    let count_receipt = continuation_receipt(&count.report().details);
-    assert_eq!(
-        count_receipt.identity.operation,
-        AggregateOperationAttemptKind::Count
+        spans.report().cache_identity().execution_limits,
+        spans_exact
     );
     assert!(
-        count_receipt
-            .prospective
-            .is_some_and(|upper| upper.contains(count_receipt.actual))
+        spans_certificate.authenticates_limits(spans_exact.continuation),
+        "the compact success certificate must seal the exact admitted policy"
     );
-    let count_steady = count_regex.count(haystack, limits).unwrap();
-    let count_steady_receipt = continuation_receipt(&count_steady.report().details);
-    assert_eq!(count_steady_receipt.identity, count_receipt.identity);
-    assert_eq!(count_steady_receipt.prospective, count_receipt.prospective);
-
-    let sum_regex = builder().build_span_sum().unwrap();
-    let sum = sum_regex.span_sum(haystack, limits).unwrap();
-    let sum_receipt = continuation_receipt(&sum.report().details);
     assert_eq!(
-        sum_receipt.identity.operation,
-        AggregateOperationAttemptKind::SpanSum
+        spans_certificate.algorithm_version,
+        fre::AGGREGATE_CONTINUATION_ALGORITHM_VERSION
     );
-    let sum_upper = sum_receipt.prospective.unwrap();
-    assert_eq!(sum_upper.span_sum, haystack.len());
-    assert!(sum_upper.contains(sum_receipt.actual));
-    assert_ne!(
-        spans_receipt.identity.operation_id(),
-        count_receipt.identity.operation_id()
+    assert_eq!(
+        spans_certificate.accounting_version,
+        fre::AGGREGATE_CONTINUATION_ACCOUNTING_VERSION
     );
     assert_ne!(
-        count_receipt.identity.operation_id(),
-        sum_receipt.identity.operation_id()
+        spans_certificate.prepublication_fallback,
+        fre::AggregateOperationPrepublicationFallback::None,
+        "a nontrivial declared fallback must survive success compaction"
     );
+    assert!(spans_certificate.output_bytes > 0);
 
-    let mut spans_below = limits;
-    spans_below.continuation.max_output_bytes = spans_upper.output_bytes - 1;
+    let mut spans_below = spans_exact;
+    spans_below.continuation.max_output_bytes -= 1;
     let spans_error = spans_regex.spans(haystack, spans_below).unwrap_err();
     assert!(spans_error.has_closed_continuation_attempt());
     let spans_failure_receipt = spans_error.continuation_receipt().unwrap();
+    let spans_upper = spans_failure_receipt.prospective.unwrap();
+    assert_eq!(
+        spans_failure_receipt.identity.regex_plan_id,
+        spans_certificate.regex_plan_id
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.strategy,
+        spans_certificate.strategy
+    );
     assert_eq!(
         spans_failure_receipt.identity.operation,
-        AggregateOperationAttemptKind::Spans
+        spans_certificate.operation
     );
+    assert_eq!(
+        spans_failure_receipt.identity.operation_id(),
+        Some(spans_certificate.operation_id())
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.physical_route,
+        Some(spans_certificate.physical_route)
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.algorithm_version,
+        spans_certificate.algorithm_version
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.accounting_version,
+        spans_certificate.accounting_version
+    );
+    assert_eq!(
+        spans_failure_receipt.identity.prepublication_fallback,
+        spans_certificate.prepublication_fallback
+    );
+    assert_continuation_certificate_preserves_prospective(spans_certificate, spans_upper);
+    assert!(spans_upper.contains(*spans_accounting));
     assert_eq!(
         spans_error
             .identity
@@ -3347,7 +3368,6 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
             .identity
             .authenticates_limits(spans_below.continuation)
     );
-    assert_eq!(spans_failure_receipt.prospective, Some(spans_upper));
     assert!(matches!(
         spans_error.source,
         AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
@@ -3357,11 +3377,46 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
         }) if required == spans_upper.output_bytes && limit + 1 == required
     ));
 
-    let mut sum_below = limits;
-    sum_below.continuation.max_span_sum = sum_upper.span_sum - 1;
+    let count_regex = builder().build_count().unwrap();
+    let count = count_regex.count(haystack, limits).unwrap();
+    let (count_certificate, count_accounting) = continuation_details(&count.report().details);
+    assert_eq!(
+        count_certificate.operation,
+        AggregateOperationAttemptKind::Count
+    );
+    assert!(count_certificate.authenticates_limits(limits.continuation));
+    assert!(count_accounting.work <= count_certificate.work_bound);
+    let count_steady = count_regex.count(haystack, limits).unwrap();
+    let (count_steady_certificate, count_steady_accounting) =
+        continuation_details(&count_steady.report().details);
+    assert_eq!(count_steady_certificate, count_certificate);
+    assert_eq!(count_steady_accounting, count_accounting);
+
+    let sum_regex = builder().build_span_sum().unwrap();
+    let mut sum_exact = limits;
+    sum_exact.continuation.max_span_sum = haystack.len();
+    let sum = sum_regex.span_sum(haystack, sum_exact).unwrap();
+    let (sum_certificate, sum_accounting) = continuation_details(&sum.report().details);
+    assert_eq!(
+        sum_certificate.operation,
+        AggregateOperationAttemptKind::SpanSum
+    );
+    assert!(sum_certificate.authenticates_limits(sum_exact.continuation));
+    assert_ne!(
+        spans_certificate.operation_id(),
+        count_certificate.operation_id()
+    );
+    assert_ne!(
+        count_certificate.operation_id(),
+        sum_certificate.operation_id()
+    );
+
+    let mut sum_below = sum_exact;
+    sum_below.continuation.max_span_sum -= 1;
     let sum_error = sum_regex.span_sum(haystack, sum_below).unwrap_err();
     assert!(sum_error.has_closed_continuation_attempt());
     let sum_failure_receipt = sum_error.continuation_receipt().unwrap();
+    let sum_upper = sum_failure_receipt.prospective.unwrap();
     assert_eq!(
         sum_failure_receipt.identity.operation,
         AggregateOperationAttemptKind::SpanSum
@@ -3379,7 +3434,37 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_rec
             .identity
             .authenticates_limits(sum_below.continuation)
     );
-    assert_eq!(sum_failure_receipt.prospective, Some(sum_upper));
+    assert_eq!(
+        sum_failure_receipt.identity.regex_plan_id,
+        sum_certificate.regex_plan_id
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.strategy,
+        sum_certificate.strategy
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.operation_id(),
+        Some(sum_certificate.operation_id())
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.physical_route,
+        Some(sum_certificate.physical_route)
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.algorithm_version,
+        sum_certificate.algorithm_version
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.accounting_version,
+        sum_certificate.accounting_version
+    );
+    assert_eq!(
+        sum_failure_receipt.identity.prepublication_fallback,
+        sum_certificate.prepublication_fallback
+    );
+    assert_continuation_certificate_preserves_prospective(sum_certificate, sum_upper);
+    assert_eq!(sum_upper.span_sum, haystack.len());
+    assert!(sum_upper.contains(*sum_accounting));
     assert!(matches!(
         sum_error.source,
         AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {

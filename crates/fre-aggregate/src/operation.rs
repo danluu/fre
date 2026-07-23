@@ -130,14 +130,20 @@ impl core::fmt::Display for OperationLimitsId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationCertificate {
     pub regex_plan_id: PlanId,
-    pub operation_id: OperationId,
+    /// Stable seal over every exact caller-supplied operation limit.
+    pub operation_limits_id: OperationLimitsId,
     pub strategy: Strategy,
+    /// Operation whose prospective and actual accounting this certifies.
+    pub operation: OperationAttemptKind,
     /// Exact executor selected before source access.
     pub physical_route: OperationPhysicalRoute,
     /// Explicit implementation version for the selected continuation route.
     pub algorithm_version: u8,
     /// Explicit schema version for prospective/actual accounting.
     pub accounting_version: u8,
+    /// Construction- and invocation-derived route-selection edge exhausted
+    /// before the physical route and prospective were published.
+    pub prepublication_fallback: OperationPrepublicationFallback,
     pub range: Range<usize>,
     pub states: usize,
     pub boundaries: usize,
@@ -159,12 +165,67 @@ pub struct OperationCertificate {
     pub peak_bytes: usize,
 }
 
+impl OperationCertificate {
+    fn retain_published_prospective(&mut self, prospective: OperationProspective) {
+        self.states = prospective.states;
+        self.boundaries = prospective.boundaries;
+        self.table_cells = prospective.table_cells;
+        self.row_storage = prospective.row_storage;
+        self.row_record_bytes = prospective.row_record_bytes;
+        self.terminal_frontier = prospective.terminal_frontier;
+        self.work_bound = prospective.work_bound;
+        self.random_access_bytes = prospective.random_access_bytes;
+        self.scratch_bytes = prospective.scratch_bytes;
+        self.log_bytes = prospective.log_bytes;
+        self.sequential_bytes_bound = prospective.sequential_bytes;
+        self.match_events = prospective.match_events;
+        self.output_matches = prospective.output_matches;
+        self.output_bytes = prospective.output_bytes;
+        self.span_sum = prospective.span_sum;
+        self.peak_bytes = prospective.peak_bytes;
+    }
+
+    /// Derive the physical operation identity from the retained plan, logical
+    /// operation, strategy, and selected physical route.
+    #[must_use]
+    pub fn operation_id(&self) -> OperationId {
+        operation_identity(
+            self.regex_plan_id,
+            self.strategy,
+            operation_kind(self.operation),
+            self.physical_route,
+        )
+    }
+
+    /// Verify every exact caller limit against this certificate's stable seal.
+    #[must_use]
+    pub fn authenticates_limits(&self, limits: OperationLimits) -> bool {
+        self.operation_limits_id == operation_limits_identity(limits)
+    }
+}
+
 /// Public operation tag retained by a receipt-bearing execution attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OperationAttemptKind {
     Spans,
     Count,
     SpanSum,
+}
+
+const fn operation_kind(kind: OperationAttemptKind) -> OperationKind {
+    match kind {
+        OperationAttemptKind::Spans => OperationKind::Spans,
+        OperationAttemptKind::Count => OperationKind::Count,
+        OperationAttemptKind::SpanSum => OperationKind::Sum,
+    }
+}
+
+const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
+    match kind {
+        OperationKind::Spans => OperationAttemptKind::Spans,
+        OperationKind::Count => OperationAttemptKind::Count,
+        OperationKind::Sum => OperationAttemptKind::SpanSum,
+    }
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
@@ -238,11 +299,7 @@ impl OperationAttemptIdentity {
             operation_identity(
                 self.regex_plan_id,
                 self.strategy,
-                match self.operation {
-                    OperationAttemptKind::Spans => OperationKind::Spans,
-                    OperationAttemptKind::Count => OperationKind::Count,
-                    OperationAttemptKind::SpanSum => OperationKind::Sum,
-                },
+                operation_kind(self.operation),
                 physical_route,
             )
         })
@@ -1265,11 +1322,7 @@ impl CompiledRegex {
                 regex_plan_id: self.plan_id(),
                 operation_limits_id: operation_limits_identity(limits),
                 strategy,
-                operation: match kind {
-                    OperationKind::Spans => OperationAttemptKind::Spans,
-                    OperationKind::Count => OperationAttemptKind::Count,
-                    OperationKind::Sum => OperationAttemptKind::SpanSum,
-                },
+                operation: operation_attempt_kind(kind),
                 work_mode: if OBSERVED_WORK {
                     OperationWorkMode::Observed
                 } else {
@@ -1309,16 +1362,25 @@ impl CompiledRegex {
             )
         };
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
+                if let Some(prospective) = receipt.prospective {
+                    result.certificate.retain_published_prospective(prospective);
+                }
                 let valid = receipt.prospective.is_some_and(|upper| {
                     upper.contains(receipt.actual)
                         && receipt.actual_allocations <= upper.allocations
                         && receipt.actual_allocations <= receipt.allocation_limit
                 }) && receipt.identity.authenticates_limits(limits)
-                    && receipt.identity.operation_id() == Some(result.certificate.operation_id)
+                    && result.certificate.authenticates_limits(limits)
+                    && receipt.identity.operation_limits_id
+                        == result.certificate.operation_limits_id
+                    && receipt.identity.operation == result.certificate.operation
+                    && receipt.identity.operation_id() == Some(result.certificate.operation_id())
                     && receipt.identity.physical_route == Some(result.certificate.physical_route)
                     && receipt.identity.algorithm_version == result.certificate.algorithm_version
-                    && receipt.identity.accounting_version == result.certificate.accounting_version;
+                    && receipt.identity.accounting_version == result.certificate.accounting_version
+                    && receipt.identity.prepublication_fallback
+                        == result.certificate.prepublication_fallback;
                 if !valid || receipt.actual != result.accounting {
                     return Err(OperationAttemptError {
                         source: Error::InternalInvariant(
@@ -1721,6 +1783,17 @@ impl CompiledRegex {
         };
         let requirements =
             requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
+        let prepublication_fallback = if forced_generic_count_route.is_some() {
+            OperationPrepublicationFallback::None
+        } else if terminal_seed.is_some() {
+            OperationPrepublicationFallback::TerminalFrontierThenDense
+        } else if fallback_seed.is_some() {
+            OperationPrepublicationFallback::DenseThenRequiredSuffix
+        } else if strategy == Strategy::ReverseSequentialRows {
+            OperationPrepublicationFallback::DenseThenCachedFrontier
+        } else {
+            OperationPrepublicationFallback::None
+        };
         if let Some(publication) = attempt.as_mut() {
             let physical_route = if requirements.terminal_frontier {
                 OperationPhysicalRoute::TerminalFrontierRows
@@ -1732,17 +1805,7 @@ impl CompiledRegex {
                 OperationPhysicalRoute::DenseRows
             };
             publication.identity.physical_route = Some(physical_route);
-            publication.identity.prepublication_fallback = if forced_generic_count_route.is_some() {
-                OperationPrepublicationFallback::None
-            } else if terminal_seed.is_some() {
-                OperationPrepublicationFallback::TerminalFrontierThenDense
-            } else if fallback_seed.is_some() {
-                OperationPrepublicationFallback::DenseThenRequiredSuffix
-            } else if strategy == Strategy::ReverseSequentialRows {
-                OperationPrepublicationFallback::DenseThenCachedFrontier
-            } else {
-                OperationPrepublicationFallback::None
-            };
+            publication.identity.prepublication_fallback = prepublication_fallback;
             let mut prospective = requirements.operation_prospective(
                 &self.program,
                 local.len(),
@@ -1889,11 +1952,13 @@ impl CompiledRegex {
         };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(self.plan_id(), strategy, kind, physical_route),
+            operation_limits_id: operation_limits_identity(limits),
             strategy,
+            operation: operation_attempt_kind(kind),
             physical_route,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -2016,16 +2081,13 @@ impl CompiledRegex {
         };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(
-                self.plan_id(),
-                strategy,
-                kind,
-                OperationPhysicalRoute::UrlAggregate,
-            ),
+            operation_limits_id: operation_limits_identity(limits),
             strategy,
+            operation: operation_attempt_kind(kind),
             physical_route: OperationPhysicalRoute::UrlAggregate,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -2128,16 +2190,13 @@ impl CompiledRegex {
         *actual_allocations = actual.allocations;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(
-                self.plan_id(),
-                strategy,
-                OperationKind::Count,
-                OperationPhysicalRoute::RequiredInternalAnchor,
-            ),
+            operation_limits_id: operation_limits_identity(limits),
             strategy,
+            operation: OperationAttemptKind::Count,
             physical_route: OperationPhysicalRoute::RequiredInternalAnchor,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -2223,16 +2282,13 @@ impl CompiledRegex {
         *actual_allocations = CANDIDATE_EXECUTION_ALLOCATIONS;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
-            operation_id: operation_identity(
-                self.plan_id(),
-                strategy,
-                OperationKind::Count,
-                OperationPhysicalRoute::Candidate,
-            ),
+            operation_limits_id: operation_limits_identity(limits),
             strategy,
+            operation: OperationAttemptKind::Count,
             physical_route: OperationPhysicalRoute::Candidate,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
             range,
             states: self.program.insts.len(),
             boundaries,
@@ -6716,7 +6772,7 @@ mod tests {
         );
         assert_eq!(
             terminal.receipt.identity.operation_id(),
-            Some(terminal.admitted.certificate().operation_id)
+            Some(terminal.admitted.certificate().operation_id())
         );
         assert_ne!(
             terminal.receipt.identity.operation_id(),
@@ -7167,7 +7223,7 @@ mod tests {
         );
         assert_eq!(
             spans_first.receipt.identity.operation_id(),
-            Some(spans_first.admitted.certificate().operation_id)
+            Some(spans_first.admitted.certificate().operation_id())
         );
         assert_eq!(
             spans_first.receipt.identity.physical_route,
@@ -8296,8 +8352,8 @@ mod tests {
         assert_eq!(count.value(), 25_957);
         assert_eq!(count.certificate().span_sum, 0);
         assert_ne!(
-            count.certificate().operation_id,
-            sum.certificate().operation_id
+            count.certificate().operation_id(),
+            sum.certificate().operation_id()
         );
         assert_eq!(count.certificate().regex_plan_id, compiled.plan_id());
         assert_eq!(sum.certificate().regex_plan_id, compiled.plan_id());
@@ -8391,12 +8447,12 @@ mod tests {
         assert!(reverse_sum.accounting().url_segments > 0);
         assert_eq!(full_sum.accounting().url_segments, 0);
         assert_ne!(
-            reverse_sum.certificate().operation_id,
-            full_sum.certificate().operation_id
+            reverse_sum.certificate().operation_id(),
+            full_sum.certificate().operation_id()
         );
         assert_ne!(
-            reverse_count.certificate().operation_id,
-            full_count.certificate().operation_id
+            reverse_count.certificate().operation_id(),
+            full_count.certificate().operation_id()
         );
 
         let ranged_sum = compiled
