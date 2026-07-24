@@ -208,6 +208,16 @@ pub(crate) struct GuardedFiniteAccounting {
     peak_bytes_actual_upper_bound: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedFiniteAccountingSummary {
+    pub allocations_upper_bound: usize,
+    pub allocations_actual: usize,
+    pub initialized_bytes_upper_bound: usize,
+    pub initialized_bytes_actual: usize,
+    pub peak_bytes_upper_bound: usize,
+    pub peak_bytes_actual_upper_bound: usize,
+}
+
 impl GuardedFiniteAccounting {
     fn is_consistent(self, dictionary: &GuardedDictionary) -> bool {
         let dictionary = dictionary.build_accounting();
@@ -251,6 +261,21 @@ impl GuardedFiniteAccounting {
             && self.allocations_actual <= self.allocations_upper_bound
             && self.initialized_bytes_actual <= self.initialized_bytes_upper_bound
             && self.peak_bytes_actual_upper_bound <= self.source.construction_peak_bytes_upper_bound
+    }
+
+    pub(crate) fn summary(
+        self,
+        dictionary: &GuardedDictionary,
+    ) -> Option<GuardedFiniteAccountingSummary> {
+        self.is_consistent(dictionary)
+            .then_some(GuardedFiniteAccountingSummary {
+                allocations_upper_bound: self.allocations_upper_bound,
+                allocations_actual: self.allocations_actual,
+                initialized_bytes_upper_bound: self.initialized_bytes_upper_bound,
+                initialized_bytes_actual: self.initialized_bytes_actual,
+                peak_bytes_upper_bound: self.source.construction_peak_bytes_upper_bound,
+                peak_bytes_actual_upper_bound: self.peak_bytes_actual_upper_bound,
+            })
     }
 }
 

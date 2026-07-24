@@ -2,14 +2,15 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics, AggregateLiteralIneligibility, AggregateOperation,
-    AggregateOperationAttemptKind, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateStrategy,
-    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError, PlanKind,
-    PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    AggregateFixedClassSandwichSemantics, AggregateGuardedAsciiWordSemantics,
+    AggregateLiteralIneligibility, AggregateOperation, AggregateOperationAttemptKind,
+    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
+    AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID,
+    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
+    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -441,7 +442,8 @@ fn continuation_details(
         | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::FixedAbsoluteDomain(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
-        | AggregateExecutionDetails::SparseFiniteLiteral { .. } => {
+        | AggregateExecutionDetails::SparseFiniteLiteral { .. }
+        | AggregateExecutionDetails::GuardedAsciiWord(_) => {
             panic!("expected continuation execution details")
         }
     }
@@ -1213,6 +1215,299 @@ fn unicode_profile_local_raw_byte_literal_uses_byte_stable_continuation() {
             ..
         })
     ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one count/span-sum route matrix keeps shared identity and oracle assertions adjacent"
+)]
+fn guarded_ascii_word_dictionary_routes_raw_and_factored_count_forms() {
+    let patterns = [
+        r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(Self)\b)|(?:\b(ab)\b)|(?:\b(ba)\b)",
+        r"\b(?:as|break|Self|ab|ba)\b",
+    ];
+    let haystack = b"as break xas as_ _as Self ab ba aba \xFFas\xFF";
+    for pattern in patterns {
+        let matches = upstream(pattern, haystack, false);
+        let expected = u64::try_from(matches.len()).unwrap();
+        let expected_span_sum = matches
+            .iter()
+            .try_fold(0_u64, |sum, (start, end)| {
+                sum.checked_add(u64::try_from(end - start).unwrap())
+            })
+            .unwrap();
+        let regex = aggregate_builder(pattern)
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            regex.build_report().plan,
+            AggregatePlanKind::GuardedAsciiWordDictionary
+        );
+        let AggregatePlanIdentity::GuardedAsciiWord(identity) = regex.build_report().plan_identity
+        else {
+            panic!("guarded dictionary identity");
+        };
+        assert_eq!(
+            identity.semantics,
+            AggregateGuardedAsciiWordSemantics::UnicodeOffMaximalAsciiWords
+        );
+        assert_eq!(identity.dictionary, guarded_ascii_word::PLAN_ID);
+        assert_eq!(identity.packing, guarded_ascii_word::PACKING_ID);
+        assert_eq!(identity.lookup, guarded_ascii_word::LOOKUP_ID);
+        assert_eq!(identity.fingerprint, guarded_ascii_word::FINGERPRINT_ID);
+        assert_eq!(identity.operation, guarded_ascii_word::COUNT_OPERATION_ID);
+        let AggregateBuildAccounting::GuardedAsciiWord(build) = regex.build_report().build else {
+            panic!("guarded dictionary build accounting");
+        };
+        let dictionary_actual = build.dictionary.actual().unwrap();
+        assert!(dictionary_actual.published);
+        assert!(build.allocations_actual <= build.allocations_upper_bound);
+        assert!(build.initialized_bytes_actual <= build.initialized_bytes_upper_bound);
+        assert!(build.peak_bytes_actual_upper_bound <= build.peak_bytes_upper_bound);
+        assert_eq!(
+            regex.build_report().retained_capacity_bytes,
+            dictionary_actual.persistent_bytes
+        );
+
+        let result = regex
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(result.value(), expected);
+        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details
+        else {
+            panic!("guarded dictionary execution accounting");
+        };
+        assert_eq!(
+            accounting.operation_id,
+            guarded_ascii_word::COUNT_OPERATION_ID
+        );
+        assert_eq!(accounting.actual.bytes_classified, haystack.len());
+        assert_eq!(accounting.actual.matches, expected);
+        assert!(accounting.actual.total_work <= accounting.upper_bounds.total_work);
+
+        let compiled = aggregate_builder(pattern)
+            .unicode(false)
+            .build_compile()
+            .unwrap();
+        assert_eq!(
+            compiled.build_report().plan,
+            AggregatePlanKind::GuardedAsciiWordDictionary
+        );
+        assert_eq!(
+            compiled
+                .verify_count(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value(),
+            expected
+        );
+
+        let span_sum = aggregate_builder(pattern)
+            .unicode(false)
+            .build_span_sum()
+            .unwrap();
+        assert_eq!(
+            span_sum.build_report().plan,
+            AggregatePlanKind::GuardedAsciiWordDictionary
+        );
+        let AggregatePlanIdentity::GuardedAsciiWord(identity) =
+            span_sum.build_report().plan_identity
+        else {
+            panic!("guarded span-sum identity");
+        };
+        assert_eq!(
+            identity.operation,
+            guarded_ascii_word::SPAN_SUM_OPERATION_ID
+        );
+        let result = span_sum
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(result.value(), expected_span_sum);
+        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details
+        else {
+            panic!("guarded span-sum execution accounting");
+        };
+        assert_eq!(
+            accounting.operation_id,
+            guarded_ascii_word::SPAN_SUM_OPERATION_ID
+        );
+        assert_eq!(accounting.actual.matches, expected);
+        assert_eq!(accounting.actual.span_sum, expected_span_sum);
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact and one-below matrix covers every independently enforced resource"
+)]
+fn guarded_ascii_word_execution_limits_refuse_before_source_access() {
+    let regex = aggregate_builder(r"\b(?:as|break|Self|ab|ba)\b")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let haystack = b"as break other Self ab ba";
+    let result = regex
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details else {
+        panic!("guarded execution accounting");
+    };
+    let upper = accounting.upper_bounds;
+    let exact_finite = fre::OrderedLiteralAggregateReduceLimits {
+        max_transitions: upper.haystack_bytes,
+        max_match_events: upper.candidate_words,
+        max_count: upper.matches,
+        max_reducer_steps: upper.lookup_steps,
+        max_total_work: upper.total_work,
+        max_peak_bytes: upper.peak_bytes,
+        ..fre::OrderedLiteralAggregateReduceLimits::default()
+    };
+    let exact = AggregateRunLimits {
+        finite_literal: exact_finite,
+        ..AggregateRunLimits::default()
+    };
+    assert_eq!(regex.count_value(haystack, exact).unwrap(), result.value());
+
+    let cases = [
+        (
+            guarded_ascii_word::ReduceResource::HaystackBytes,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_transitions: upper.haystack_bytes - 1,
+                ..exact_finite
+            },
+        ),
+        (
+            guarded_ascii_word::ReduceResource::CandidateWords,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_match_events: upper.candidate_words - 1,
+                ..exact_finite
+            },
+        ),
+        (
+            guarded_ascii_word::ReduceResource::Count,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_count: upper.matches - 1,
+                ..exact_finite
+            },
+        ),
+        (
+            guarded_ascii_word::ReduceResource::LookupSteps,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_reducer_steps: upper.lookup_steps - 1,
+                ..exact_finite
+            },
+        ),
+        (
+            guarded_ascii_word::ReduceResource::TotalWork,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_total_work: upper.total_work - 1,
+                ..exact_finite
+            },
+        ),
+        (
+            guarded_ascii_word::ReduceResource::PeakBytes,
+            fre::OrderedLiteralAggregateReduceLimits {
+                max_peak_bytes: upper.peak_bytes - 1,
+                ..exact_finite
+            },
+        ),
+    ];
+    for (resource, finite_literal) in cases {
+        let error = regex
+            .count(
+                haystack,
+                AggregateRunLimits {
+                    finite_literal,
+                    ..AggregateRunLimits::default()
+                },
+            )
+            .unwrap_err();
+        let AggregateExecutionSource::GuardedAsciiWord(source) = error.source else {
+            panic!("guarded execution source");
+        };
+        assert!(matches!(
+            source.kind,
+            guarded_ascii_word::ReduceErrorKind::ResourceLimit {
+                resource: actual,
+                ..
+            } if actual == resource
+        ));
+        assert_eq!(source.actual, guarded_ascii_word::ReduceActual::default());
+        assert_eq!(source.upper_bounds, Some(upper));
+    }
+
+    let span_sum = aggregate_builder(r"\b(?:as|break|Self|ab|ba)\b")
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    let error = span_sum
+        .span_sum(
+            haystack,
+            AggregateRunLimits {
+                finite_literal: fre::OrderedLiteralAggregateReduceLimits {
+                    max_span_sum: upper.span_sum - 1,
+                    ..exact_finite
+                },
+                ..AggregateRunLimits::default()
+            },
+        )
+        .unwrap_err();
+    let AggregateExecutionSource::GuardedAsciiWord(source) = error.source else {
+        panic!("guarded span-sum execution source");
+    };
+    assert!(matches!(
+        source.kind,
+        guarded_ascii_word::ReduceErrorKind::ResourceLimit {
+            resource: guarded_ascii_word::ReduceResource::SpanSum,
+            needed,
+            limit,
+        } if needed == upper.span_sum && limit == upper.span_sum - 1
+    ));
+    assert_eq!(source.actual, guarded_ascii_word::ReduceActual::default());
+    assert_eq!(source.upper_bounds, Some(upper));
+}
+
+#[test]
+fn guarded_ascii_word_scope_includes_span_sum_but_not_unicode_or_spans() {
+    let pattern = r"\b(?:as|break|Self|ab|ba)\b";
+    assert_eq!(
+        aggregate_builder(pattern)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .build_span_sum()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    assert_eq!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .build_spans()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
 }
 
 #[test]

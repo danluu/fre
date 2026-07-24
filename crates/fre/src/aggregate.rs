@@ -77,13 +77,13 @@ use crate::{
     AggregateCompileAccounting, AggregateCompileAttemptError, AggregateCompileLimits,
     AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
     AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match, finite,
-    finite_root, fixed_absolute, grapheme_scalar,
+    finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 24;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 25;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -143,6 +143,9 @@ pub enum AggregatePlanKind {
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
+    /// Finite nonempty ASCII-word bodies guarded on both endpoints, lowered
+    /// to an eager exact dictionary and allocation-free maximal-word scan.
+    GuardedAsciiWordDictionary,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -171,8 +174,30 @@ pub enum AggregatePlanIdentity {
     /// Finite-language DFA identity; the syntax key retains exact source and
     /// profile identity, including order, duplicates and arbitrary bytes.
     FiniteLiteral(AggregateFiniteLiteralIdentity),
+    /// Guarded ASCII-word dictionary and operation identity. The syntax key
+    /// retains exact HIR order, captures, duplicates, and profile inputs.
+    GuardedAsciiWord(AggregateGuardedAsciiWordIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
+}
+
+/// Stable identity for a guarded finite-body reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateGuardedAsciiWordIdentity {
+    pub semantics: AggregateGuardedAsciiWordSemantics,
+    pub dictionary: &'static str,
+    pub packing: &'static str,
+    pub lookup: &'static str,
+    pub fingerprint: &'static str,
+    pub operation: &'static str,
+}
+
+/// Profile and endpoint proof attached to the guarded dictionary route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateGuardedAsciiWordSemantics {
+    /// Rust bytes with Unicode disabled. Every finite path is one nonempty
+    /// ASCII-word body with a proved left-start and right-end word guard.
+    UnicodeOffMaximalAsciiWords,
 }
 
 /// Operation-specific identity for the shared finite-language reducer.
@@ -737,6 +762,20 @@ pub enum AggregateCaptureSemantics {
     ErasedForWholeMatchOnly,
 }
 
+/// Complete guarded finite-language construction receipt. Temporary source
+/// expansion and publication resources are retained alongside the persistent
+/// dictionary's exact prospective/actual accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateGuardedAsciiWordBuildAccounting {
+    pub dictionary: guarded_ascii_word::PublishedBuildAccounting,
+    pub allocations_upper_bound: usize,
+    pub allocations_actual: usize,
+    pub initialized_bytes_upper_bound: usize,
+    pub initialized_bytes_actual: usize,
+    pub peak_bytes_upper_bound: usize,
+    pub peak_bytes_actual_upper_bound: usize,
+}
+
 /// Complete construction accounting for the selected plan family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggregateBuildAccounting {
@@ -764,6 +803,8 @@ pub enum AggregateBuildAccounting {
     /// same finite-language semantic family with a different transition
     /// representation selected only after the dense cell cap is exceeded.
     SparseFiniteLiteral(SparseOrderedLiteralAggregateBuildAccounting),
+    /// Temporary finite-source closure plus persistent guarded dictionary.
+    GuardedAsciiWord(AggregateGuardedAsciiWordBuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
 }
@@ -2532,6 +2573,10 @@ pub enum AggregateExecutionSource {
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
     SparseFiniteLiteral(SparseOrderedLiteralAggregateReduceError),
+    /// Guarded maximal ASCII-word dictionary refusal. The reducer itself is
+    /// allocation-free; facade packaging boxes its complete P/A receipt so a
+    /// newly selected route does not inflate every public execution result.
+    GuardedAsciiWord(Box<guarded_ascii_word::ReduceError>),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -2555,6 +2600,7 @@ impl fmt::Display for AggregateExecutionSource {
             }
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
+            Self::GuardedAsciiWord(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -2579,6 +2625,7 @@ impl std::error::Error for AggregateExecutionSource {
             | Self::InternalInvariant(_) => None,
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
+            Self::GuardedAsciiWord(source) => Some(source.as_ref()),
             Self::Continuation(source) => Some(source),
         }
     }
@@ -2704,6 +2751,8 @@ pub enum AggregateExecutionDetails {
         upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
+    /// Allocation-free maximal ASCII-word scan bounds and exact counters.
+    GuardedAsciiWord(guarded_ascii_word::ReduceAccounting),
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -3053,6 +3102,24 @@ fn sparse_finite_reduce_limits(
         max_ring_initializations: limits.max_ring_initializations,
         max_total_work: total_work,
         max_scratch_bytes: limits.max_scratch_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+/// The guarded dictionary remains inside the existing finite-language
+/// invocation quota. Each scanner and lookup component is included in total
+/// work; the legacy transition/event/reducer fields provide independent
+/// ceilings without widening a caller's policy.
+const fn guarded_ascii_word_reduce_limits(
+    limits: OrderedLiteralAggregateReduceLimits,
+) -> guarded_ascii_word::ReduceLimits {
+    guarded_ascii_word::ReduceLimits {
+        max_haystack_bytes: limits.max_transitions,
+        max_candidate_words: limits.max_match_events,
+        max_count: limits.max_count,
+        max_span_sum: limits.max_span_sum,
+        max_lookup_steps: limits.max_reducer_steps,
+        max_total_work: limits.max_total_work,
         max_peak_bytes: limits.max_peak_bytes,
     }
 }
@@ -5329,17 +5396,129 @@ impl AggregateBuilder {
             }
         }
         let finite = if inspect_finite && !sparse_refused {
-            Some(
-                finite::extract(
-                    &rust.hir,
-                    limits.finite_literal.max_patterns,
-                    limits.finite_literal.max_pattern_bytes,
+            Some(finite::extract(
+                &rust.hir,
+                limits.finite_literal.max_patterns,
+                limits.finite_literal.max_pattern_bytes,
+                finite_planner_work,
+                limits.max_finite_planner_work,
+                !unicode
+                    && matches!(
+                        operation,
+                        AggregateOperation::Compile
+                            | AggregateOperation::Count
+                            | AggregateOperation::SpanSum
+                    ),
+            ))
+        } else {
+            None
+        };
+        if let Some(outcome) = &finite {
+            finite_planner_work = outcome.work();
+        }
+        let finite_words = match finite {
+            Some(finite::FiniteOutcome::Fits { words, .. }) => Some(words),
+            Some(finite::FiniteOutcome::GuardedFiniteBody {
+                dictionary,
+                accounting,
+                ..
+            }) => {
+                let summary = accounting.summary(&dictionary).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite accounting lost its construction closure",
+                    },
+                )?;
+                let dictionary_build = dictionary.build_accounting();
+                let dictionary_published = dictionary_build.published().ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded dictionary lost its exact publication receipt",
+                    },
+                )?;
+                let capture_erasure_work =
+                    expected_captures
+                        .checked_mul(2)
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "guarded finite capture-erasure accounting overflow",
+                        })?;
+                let build = AggregateGuardedAsciiWordBuildAccounting {
+                    dictionary: dictionary_published,
+                    allocations_upper_bound: summary.allocations_upper_bound,
+                    allocations_actual: summary.allocations_actual,
+                    initialized_bytes_upper_bound: summary.initialized_bytes_upper_bound,
+                    initialized_bytes_actual: summary.initialized_bytes_actual,
+                    peak_bytes_upper_bound: summary.peak_bytes_upper_bound,
+                    peak_bytes_actual_upper_bound: summary.peak_bytes_actual_upper_bound,
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::GuardedAsciiWordDictionary,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    bounded_context_planner_work,
+                    fixed_absolute_planner_work,
                     finite_planner_work,
-                    limits.max_finite_planner_work,
-                    false,
-                )
-                .into_incumbent_words()
-                .map_err(|error| match error {
+                    capture_erasure_work,
+                    captures_erased: expected_captures,
+                    build: AggregateBuildAccounting::GuardedAsciiWord(build),
+                    plan_identity: AggregatePlanIdentity::GuardedAsciiWord(
+                        AggregateGuardedAsciiWordIdentity {
+                            semantics:
+                                AggregateGuardedAsciiWordSemantics::UnicodeOffMaximalAsciiWords,
+                            dictionary: guarded_ascii_word::PLAN_ID,
+                            packing: guarded_ascii_word::PACKING_ID,
+                            lookup: guarded_ascii_word::LOOKUP_ID,
+                            fingerprint: guarded_ascii_word::FINGERPRINT_ID,
+                            operation: match operation {
+                                AggregateOperation::Compile | AggregateOperation::Count => {
+                                    guarded_ascii_word::COUNT_OPERATION_ID
+                                }
+                                AggregateOperation::SpanSum => {
+                                    guarded_ascii_word::SPAN_SUM_OPERATION_ID
+                                }
+                                AggregateOperation::Spans => {
+                                    return Err(AggregateBuildError::InternalInvariant {
+                                        operation,
+                                        selection,
+                                        detail:
+                                            "guarded finite span plan escaped operation eligibility",
+                                    });
+                                }
+                            },
+                        },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: dictionary_build.actual.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::GuardedAsciiWord(dictionary),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(finite::FiniteOutcome::ResourceFailure { error, .. }) => {
+                return Err(match error {
                     BuildError::PlannerWorkLimit { needed, limit } => {
                         AggregateBuildError::FinitePlannerWorkLimit {
                             operation,
@@ -5362,16 +5541,14 @@ impl AggregateBuilder {
                         selection,
                         detail: "finite-language planner returned an unrelated facade error",
                     },
-                })?,
+                });
+            }
+            Some(
+                finite::FiniteOutcome::TooLargeFixedSequence { .. }
+                | finite::FiniteOutcome::Unsupported { .. },
             )
-        } else {
-            None
-        };
-        if let Some((_, work)) = &finite {
-            finite_planner_work = *work;
+            | None => None,
         }
-        let finite_words = finite
-            .and_then(|(words, _)| words)
             .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
         if let Some(words) = finite_words {
             let capture_erasure_work =
@@ -5582,6 +5759,7 @@ enum AggregateEngine {
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
     SparseFiniteSpanSum(SparseOrderedLiteralSpanSumPlan),
+    GuardedAsciiWord(guarded_ascii_word::Dictionary),
     Continuation(CompiledRegex),
 }
 
@@ -6132,6 +6310,18 @@ impl AggregatePlan {
                     "count operation retained a sparse finite span-sum plan",
                 ),
             )),
+            AggregateEngine::GuardedAsciiWord(engine) => engine
+                .count(
+                    haystack,
+                    guarded_ascii_word_reduce_limits(limits.finite_literal),
+                )
+                .map(AggregateCountExecution::GuardedAsciiWord)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                    )
+                }),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -6279,6 +6469,18 @@ impl AggregatePlan {
                     "span-sum operation retained a sparse finite count plan",
                 ),
             )),
+            AggregateEngine::GuardedAsciiWord(engine) => engine
+                .span_sum(
+                    haystack,
+                    guarded_ascii_word_reduce_limits(limits.finite_literal),
+                )
+                .map(AggregateSpanSumExecution::GuardedAsciiWord)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                    )
+                }),
             AggregateEngine::Continuation(engine) => {
                 self.execute_continuation_span_sum(engine, haystack, limits)
             }
@@ -6556,6 +6758,7 @@ enum AggregateCountExecution {
         upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
+    GuardedAsciiWord(guarded_ascii_word::CountResult),
     Continuation {
         admitted: AdmittedCountAttempt,
         value: u64,
@@ -6579,6 +6782,7 @@ impl AggregateCountExecution {
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
+            Self::GuardedAsciiWord(result) => result.count,
         }
     }
 
@@ -6643,6 +6847,9 @@ impl AggregateCountExecution {
                 upper_bounds,
                 actual,
             },
+            Self::GuardedAsciiWord(result) => {
+                AggregateExecutionDetails::GuardedAsciiWord(result.accounting)
+            }
             Self::Continuation { admitted, .. } => {
                 let certificate = admitted.admitted.certificate().clone();
                 let accounting = admitted.admitted.accounting();
@@ -6674,6 +6881,7 @@ enum AggregateSpanSumExecution {
         upper_bounds: SparseOrderedLiteralAggregateUpperBounds,
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
+    GuardedAsciiWord(guarded_ascii_word::SpanSumResult),
     Continuation {
         admitted: AdmittedSpanSumAttempt,
         value: u64,
@@ -6687,6 +6895,7 @@ impl AggregateSpanSumExecution {
             Self::UnicodeScalar(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
+            Self::GuardedAsciiWord(result) => result.span_sum,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -6725,6 +6934,9 @@ impl AggregateSpanSumExecution {
                 upper_bounds,
                 actual,
             },
+            Self::GuardedAsciiWord(result) => {
+                AggregateExecutionDetails::GuardedAsciiWord(result.accounting)
+            }
             Self::Continuation { admitted, .. } => {
                 let certificate = admitted.admitted.certificate().clone();
                 let accounting = admitted.admitted.accounting();
