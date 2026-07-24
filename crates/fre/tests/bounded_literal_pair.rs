@@ -48,8 +48,8 @@ fn exact_supported_row_selects_operation_owned_count_and_span_sum_plans() {
         count.build_report().plan,
         AggregatePlanKind::BoundedLiteralPair
     );
-    assert_eq!(count.build_report().schema_version, 32);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 32);
+    assert_eq!(count.build_report().schema_version, 33);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 33);
     assert!(count.build_report().bounded_literal_pair_planner_work > 0);
     let AggregateBuildAccounting::BoundedLiteralPair(build) = count.build_report().build else {
         panic!("bounded literal-pair count retained another build receipt");
@@ -68,8 +68,13 @@ fn exact_supported_row_selects_operation_owned_count_and_span_sum_plans() {
         .count(&haystack, AggregateRunLimits::default())
         .unwrap();
     assert_eq!(counted.value(), expected.0);
+    assert!(counted.report().has_closed_direct_attempt());
+    let mut refused = AggregateRunLimits::default();
+    refused.bounded_literal_pair.max_input_bytes = 0;
+    let terminal = count.count(&haystack, refused).unwrap_err();
+    assert!(terminal.has_closed_direct_attempt());
     assert!(matches!(
-        counted.report().details,
+        counted.report().details(),
         AggregateExecutionDetails::BoundedLiteralPair(_)
     ));
 

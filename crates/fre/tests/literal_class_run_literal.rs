@@ -225,7 +225,7 @@ fn execution_exact_limits_publish_actual_at_or_below_upper() {
     let baseline = regex
         .span_sum(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::LiteralClassRunLiteral(accounting) = &baseline.report().details
+    let AggregateExecutionDetails::LiteralClassRunLiteral(accounting) = baseline.report().details()
     else {
         panic!("Sherlock row executed another plan");
     };
@@ -269,6 +269,7 @@ fn execution_exact_limits_publish_actual_at_or_below_upper() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::LiteralClassRunLiteral(

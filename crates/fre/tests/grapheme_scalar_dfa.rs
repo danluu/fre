@@ -471,7 +471,7 @@ fn facade_propagates_exact_and_one_below_count_limits() {
     let baseline = candidate
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::GraphemeScalarDfa(accounting) = &baseline.report().details
+    let AggregateExecutionDetails::GraphemeScalarDfa(accounting) = baseline.report().details()
     else {
         panic!("expected grapheme execution accounting")
     };
@@ -553,6 +553,7 @@ fn facade_propagates_exact_and_one_below_count_limits() {
             }
         }
         let error = candidate.count_value(haystack, limited).unwrap_err();
+        assert!(error.has_closed_direct_attempt(), "{gate:?}: {error:?}");
         let AggregateExecutionSource::GraphemeScalarDfa(source) = error.source else {
             panic!("{gate:?}: unexpected source {error:?}")
         };

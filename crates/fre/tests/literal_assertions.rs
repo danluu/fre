@@ -53,7 +53,7 @@ fn exact_sherlock_shape_selects_operation_owned_leaf_in_both_profiles() {
             count.build_report().plan,
             AggregatePlanKind::LiteralAssertions
         );
-        assert_eq!(count.build_report().schema_version, 32);
+        assert_eq!(count.build_report().schema_version, 33);
         let AggregatePlanIdentity::LiteralAssertions(count_identity) =
             count.build_report().plan_identity
         else {
@@ -245,7 +245,7 @@ fn planner_build_and_execution_fences_are_exact() {
     let result = baseline
         .span_sum(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::LiteralAssertions(accounting) = result.report().details else {
+    let AggregateExecutionDetails::LiteralAssertions(accounting) = result.report().details() else {
         panic!("literal assertions executed another family");
     };
     let upper = accounting.upper_bounds;
@@ -270,6 +270,7 @@ fn planner_build_and_execution_fences_are_exact() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::LiteralAssertions(

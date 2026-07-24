@@ -105,14 +105,14 @@ fn terminal_greedy_facade_is_closed_differential_and_pointwise_ready_at_one_kib(
         .span_sum(&one_kib, AggregateRunLimits::default())
         .unwrap();
     assert_eq!(first.value(), 1_024);
-    assert_eq!(first.report().identity, steady.report().identity);
+    assert_eq!(first.report().identity(), steady.report().identity());
     assert_eq!(
         first.report().cache_identity(),
         steady.report().cache_identity()
     );
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-    ) = &first.report().details
+    ) = first.report().details()
     else {
         panic!("terminal greedy execution lacks fixed guard receipt");
     };
@@ -337,7 +337,7 @@ fn terminal_greedy_facade_forwards_exact_and_every_one_below_run_fence() {
         .unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-    ) = &baseline.report().details
+    ) = baseline.report().details()
     else {
         panic!("terminal greedy baseline lacks fixed guard receipt");
     };

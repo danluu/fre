@@ -79,7 +79,7 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
         regex.build_report().plan,
         AggregatePlanKind::BoundedLiteralPair
     );
-    assert_eq!(regex.build_report().schema_version, 32);
+    assert_eq!(regex.build_report().schema_version, 33);
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
         .expect("typed route identity");
 
@@ -89,7 +89,8 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
         .span_sum(&haystack, limits)
         .expect("bounded literal-pair execution");
     assert_eq!(result.value(), 150);
-    let AggregateExecutionDetails::BoundedLiteralPair(accounting) = &result.report().details else {
+    let AggregateExecutionDetails::BoundedLiteralPair(accounting) = result.report().details()
+    else {
         panic!("expected bounded literal-pair accounting")
     };
     assert_eq!(accounting.upper_bounds.input_bytes, haystack.len());

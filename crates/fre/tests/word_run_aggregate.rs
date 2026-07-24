@@ -92,7 +92,7 @@ fn one_pass_reduction_matches_rust_across_boundaries_and_invalid_bytes() {
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(counted.value(), expected.0);
-        let AggregateExecutionDetails::WordRun(accounting) = &counted.report().details else {
+        let AggregateExecutionDetails::WordRun(accounting) = counted.report().details() else {
             panic!("count executed another family");
         };
         assert_eq!(accounting.actual.source_reads, haystack.len());
@@ -172,7 +172,7 @@ fn execution_fences_are_exact_and_preflighted() {
     let baseline = baseline
         .span_sum(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details else {
+    let AggregateExecutionDetails::WordRun(accounting) = baseline.report().details() else {
         panic!("word-run executed another family");
     };
     let upper = accounting.upper_bounds;
@@ -215,6 +215,7 @@ fn execution_fences_are_exact_and_preflighted() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::WordRun(WordRunReduceError::WorkLimit { needed, limit })

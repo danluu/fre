@@ -779,7 +779,7 @@ impl AggregateSpansRegex {
             bytes: output,
             report: FunctionalReplacementReport {
                 identity,
-                selector_details: selector_report.details,
+                selector_details: selector_report.into_details(),
                 accounting: FunctionalReplacementAccounting {
                     selected_matches: spans.len(),
                     replacements,
@@ -939,7 +939,7 @@ impl AggregateSpansRegex {
             bytes: output,
             report: LiteralReplacementReport {
                 identity,
-                selector_details: selector_report.details,
+                selector_details: selector_report.into_details(),
                 accounting,
             },
         })

@@ -158,8 +158,8 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         compiled.build_report().plan,
         AggregatePlanKind::FiniteLiteralDfa
     );
-    assert_eq!(compiled.build_report().schema_version, 32);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 32);
+    assert_eq!(compiled.build_report().schema_version, 33);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 33);
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";
@@ -169,7 +169,7 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
     let AggregateExecutionDetails::FiniteLiteral {
         upper_bounds,
         actual,
-    } = &baseline.report().details
+    } = baseline.report().details()
     else {
         panic!("finite compile artifact executed another plan")
     };
@@ -180,6 +180,7 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
     let mut limits = AggregateRunLimits::default();
     limits.finite_literal.max_total_work = actual.total_work - 1;
     let error = compiled.verify_count(haystack, limits).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::FiniteLiteral(
@@ -325,7 +326,7 @@ fn sparse_finite_facade_preserves_unicode_priority_and_frozen_cell_quota() {
     let AggregateExecutionDetails::SparseFiniteLiteral {
         upper_bounds,
         actual,
-    } = &audited.report().details
+    } = audited.report().details()
     else {
         panic!("sparse span-sum executed another representation")
     };
@@ -339,6 +340,7 @@ fn sparse_finite_facade_preserves_unicode_priority_and_frozen_cell_quota() {
     span.span_sum_value(&haystack, exact_run).unwrap();
     exact_run.finite_literal.max_total_work = exact_work - 1;
     let error = span.span_sum_value(&haystack, exact_run).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::SparseFiniteLiteral(
@@ -389,7 +391,7 @@ fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {
     let result = regex
         .count(&haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::FiniteLiteral { actual, .. } = &result.report().details else {
+    let AggregateExecutionDetails::FiniteLiteral { actual, .. } = result.report().details() else {
         panic!("finite scaling case executed another plan")
     };
     (actual.transitions, actual.reducer_steps, actual.total_work)

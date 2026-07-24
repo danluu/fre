@@ -40,7 +40,7 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
         let expected = oracle(pattern, haystack);
         let count = builder(pattern).build_count().unwrap();
         assert_eq!(count.build_report().plan, AggregatePlanKind::TokenPhrase);
-        assert_eq!(count.build_report().schema_version, 32);
+        assert_eq!(count.build_report().schema_version, 33);
         let AggregatePlanIdentity::TokenPhrase(count_identity) = count.build_report().plan_identity
         else {
             panic!("token phrase count selected another identity");
@@ -215,7 +215,7 @@ fn planner_build_and_execution_fences_are_exact() {
     let result = baseline
         .span_sum(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::TokenPhrase(accounting) = result.report().details else {
+    let AggregateExecutionDetails::TokenPhrase(accounting) = result.report().details() else {
         panic!("token phrase executed another family");
     };
     let upper = accounting.upper_bounds;
@@ -240,6 +240,7 @@ fn planner_build_and_execution_fences_are_exact() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::TokenPhrase(TokenPhraseReduceError::WorkLimit {

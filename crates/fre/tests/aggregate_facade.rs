@@ -532,7 +532,7 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
                 .collect();
             assert_eq!(actual, expected, "spans {pattern:?}/{strategy:?}");
             assert_eq!(spans.len(), expected.len());
-            let (certificate, _) = continuation_details(&spans.report().details);
+            let (certificate, _) = continuation_details(spans.report().details());
             assert_eq!(certificate.range, 0..haystack.len());
 
             let count = builder()
@@ -588,7 +588,7 @@ fn continuation_value_reducers_use_exact_work_for_byte_progress_and_unicode_offs
                 .count(haystack, AggregateRunLimits::default())
                 .unwrap();
             assert_eq!(audited.value(), expected_count);
-            let (certificate, accounting) = continuation_details(&audited.report().details);
+            let (certificate, accounting) = continuation_details(audited.report().details());
             assert!(accounting.work < certificate.work_bound);
 
             let mut exact = AggregateRunLimits::default();
@@ -625,7 +625,7 @@ fn continuation_value_reducers_use_exact_work_for_byte_progress_and_unicode_offs
                 .span_sum(haystack, AggregateRunLimits::default())
                 .unwrap();
             assert_eq!(audited.value(), expected_sum);
-            let (certificate, accounting) = continuation_details(&audited.report().details);
+            let (certificate, accounting) = continuation_details(audited.report().details());
             assert!(accounting.work < certificate.work_bound);
 
             exact.continuation.max_work = accounting.work;
@@ -1282,7 +1282,7 @@ fn guarded_ascii_word_dictionary_routes_raw_and_factored_count_forms() {
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(result.value(), expected);
-        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details
+        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details()
         else {
             panic!("guarded dictionary execution accounting");
         };
@@ -1331,7 +1331,7 @@ fn guarded_ascii_word_dictionary_routes_raw_and_factored_count_forms() {
             .span_sum(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(result.value(), expected_span_sum);
-        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details
+        let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details()
         else {
             panic!("guarded span-sum execution accounting");
         };
@@ -1448,7 +1448,7 @@ fn guarded_ascii_word_execution_limits_refuse_before_source_access() {
     let result = regex
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details else {
+    let AggregateExecutionDetails::GuardedAsciiWord(accounting) = result.report().details() else {
         panic!("guarded execution accounting");
     };
     let upper = accounting.upper_bounds;
@@ -1521,6 +1521,7 @@ fn guarded_ascii_word_execution_limits_refuse_before_source_access() {
                 },
             )
             .unwrap_err();
+        assert!(error.has_closed_direct_attempt());
         let AggregateExecutionSource::GuardedAsciiWord(source) = error.source else {
             panic!("guarded execution source");
         };
@@ -1551,6 +1552,7 @@ fn guarded_ascii_word_execution_limits_refuse_before_source_access() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     let AggregateExecutionSource::GuardedAsciiWord(source) = error.source else {
         panic!("guarded span-sum execution source");
     };
@@ -1803,7 +1805,8 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
             .count(haystack, AggregateRunLimits::default())
             .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::UnicodeScalar(accounting) = &counted.report().details else {
+        let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details()
+        else {
             panic!("root scalar count executed another family")
         };
         assert_eq!(accounting.actual.input_bytes_advanced, haystack.len());
@@ -1921,7 +1924,7 @@ fn bounded_capitals_count_selects_linear_plan_at_hand_derived_work_boundary() {
     };
     let counted = regex.count(haystack, exact).unwrap();
     assert_eq!(counted.value(), 1);
-    let AggregateExecutionDetails::BoundedClassSequence(accounting) = &counted.report().details
+    let AggregateExecutionDetails::BoundedClassSequence(accounting) = counted.report().details()
     else {
         panic!("assigned capitals row did not execute bounded sequence plan")
     };
@@ -1935,6 +1938,7 @@ fn bounded_capitals_count_selects_linear_plan_at_hand_derived_work_boundary() {
         ..AggregateRunLimits::default()
     };
     let error = regex.count(haystack, one_below).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::BoundedClassSequence(
@@ -2017,7 +2021,7 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
     };
     let counted = regex.count(haystack, exact_run).unwrap();
     assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
-    let AggregateExecutionDetails::BoundedSeparatedFields(accounting) = &counted.report().details
+    let AggregateExecutionDetails::BoundedSeparatedFields(accounting) = counted.report().details()
     else {
         panic!("assigned IP row did not execute bounded separated-field plan")
     };
@@ -2046,6 +2050,7 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::BoundedSeparatedFields(
@@ -2064,6 +2069,7 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::BoundedSeparatedFields(
@@ -2189,7 +2195,8 @@ fn bounded_capitals_execution_work_scales_at_n_2n_and_4n() {
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(counted.value(), u64::try_from(hand_spans.len()).unwrap());
-        let AggregateExecutionDetails::BoundedClassSequence(accounting) = &counted.report().details
+        let AggregateExecutionDetails::BoundedClassSequence(accounting) =
+            counted.report().details()
         else {
             panic!("assigned capitals row did not execute bounded sequence plan")
         };
@@ -2301,7 +2308,7 @@ fn fixed_class_sandwich_matches_pinned_bytes_oracle_for_both_unicode_profiles() 
             .count(haystack, AggregateRunLimits::default())
             .unwrap_or_else(|error| panic!("count run {pattern:?}: {error}"));
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::FixedClassSandwich(accounting) = &counted.report().details
+        let AggregateExecutionDetails::FixedClassSandwich(accounting) = counted.report().details()
         else {
             panic!("fixed class count executed another family")
         };
@@ -2465,7 +2472,7 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
     let audited = regex
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::FixedClassSandwich(accounting) = &audited.report().details
+    let AggregateExecutionDetails::FixedClassSandwich(accounting) = audited.report().details()
     else {
         panic!("fixed class plan executed another family")
     };
@@ -2476,6 +2483,7 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
         .checked_sub(1)
         .unwrap();
     let error = regex.count(haystack, run_limits).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::FixedClassSandwich(
@@ -2524,7 +2532,7 @@ fn rebar_row_curated_10_bounded_repeat_context_selects_linear_count() {
         .unwrap();
     assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
     assert!(matches!(
-        &counted.report().details,
+        counted.report().details(),
         AggregateExecutionDetails::BoundedContext(_)
     ));
 }
@@ -2546,6 +2554,7 @@ fn rebar_row_curated_10_bounded_repeat_context_exact_limit_and_one_below() {
     assert_eq!(regex.count_value(b"aa R bb", exact).unwrap(), 1);
     exact.bounded_context.max_work = 269;
     let error = regex.count_value(b"aa R bb", exact).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::BoundedContext(BoundedContextReduceError::WorkLimit {
@@ -2689,7 +2698,8 @@ fn unicode_scalar_plus_uses_the_run_automaton_for_greedy_and_lazy_reduction() {
             .count(haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(counted.value(), expected_count, "pattern={pattern:?}");
-        let AggregateExecutionDetails::UnicodeScalar(accounting) = &counted.report().details else {
+        let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details()
+        else {
             panic!("scalar repetition executed another family")
         };
         assert!(accounting.upper_bounds.reducer_steps > 0);
@@ -2880,6 +2890,106 @@ fn unicode_scalar_counted_repetition_is_direct_across_operations_and_positions()
 }
 
 #[test]
+fn counted_scalar_direct_owner_closes_success_and_terminal_for_count_and_span_sum() {
+    let haystack = "ab--αβγ--z".as_bytes();
+    for pattern in [r"\pL{2,4}", r"\pL{2,4}?"] {
+        let count = aggregate_builder(pattern).build_count().unwrap();
+        let counted = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert!(counted.report().has_closed_direct_attempt());
+        let count_owner = counted
+            .report()
+            .direct_owner()
+            .expect("counted scalar count success must retain its direct owner");
+        assert_eq!(
+            count_owner.identity().route,
+            fre::AggregateDirectRoute::UnicodeScalar
+        );
+        assert!(count_owner.authenticates(counted.report().identity()));
+
+        let mut refused = AggregateRunLimits::default();
+        refused.unicode_scalar.max_work = 0;
+        let count_error = count.count(haystack, refused).unwrap_err();
+        assert!(count_error.has_closed_direct_attempt());
+        let count_receipt = count_error
+            .direct_receipt()
+            .expect("counted scalar count refusal must retain its direct receipt");
+        assert_eq!(count_receipt.owner(), &count_owner);
+        assert!(count_receipt.authenticates_source(&count_error.source));
+        assert!(matches!(
+            count_error.source,
+            AggregateExecutionSource::UnicodeScalar(
+                UnicodeScalarAggregateReduceError::WorkLimit { .. }
+            )
+        ));
+
+        let compiled = aggregate_builder(pattern).build_compile().unwrap();
+        assert!(matches!(
+            compiled.build_report().plan_identity,
+            AggregatePlanIdentity::UnicodeScalar(identity)
+                if identity.kernel.operation == UnicodeScalarAggregateOperation::Count
+        ));
+        let verified = compiled
+            .verify_count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert!(verified.report().has_closed_direct_attempt());
+        let compile_owner = verified
+            .report()
+            .direct_owner()
+            .expect("counted scalar compile verification must retain its direct owner");
+        assert_eq!(
+            compile_owner.identity().operation,
+            AggregateOperation::Compile
+        );
+        assert!(compile_owner.authenticates(verified.report().identity()));
+
+        let compile_error = compiled.verify_count(haystack, refused).unwrap_err();
+        assert!(compile_error.has_closed_direct_attempt());
+        let compile_receipt = compile_error
+            .direct_receipt()
+            .expect("counted scalar compile refusal must retain its direct receipt");
+        assert_eq!(compile_receipt.owner(), &compile_owner);
+        assert!(compile_receipt.authenticates_source(&compile_error.source));
+        assert!(matches!(
+            compile_error.source,
+            AggregateExecutionSource::UnicodeScalar(
+                UnicodeScalarAggregateReduceError::WorkLimit { .. }
+            )
+        ));
+
+        let span_sum = aggregate_builder(pattern).build_span_sum().unwrap();
+        let summed = span_sum
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert!(summed.report().has_closed_direct_attempt());
+        let span_sum_owner = summed
+            .report()
+            .direct_owner()
+            .expect("counted scalar span-sum success must retain its direct owner");
+        assert_eq!(
+            span_sum_owner.identity().route,
+            fre::AggregateDirectRoute::UnicodeScalar
+        );
+        assert!(span_sum_owner.authenticates(summed.report().identity()));
+
+        let span_sum_error = span_sum.span_sum(haystack, refused).unwrap_err();
+        assert!(span_sum_error.has_closed_direct_attempt());
+        let span_sum_receipt = span_sum_error
+            .direct_receipt()
+            .expect("counted scalar span-sum refusal must retain its direct receipt");
+        assert_eq!(span_sum_receipt.owner(), &span_sum_owner);
+        assert!(span_sum_receipt.authenticates_source(&span_sum_error.source));
+        assert!(matches!(
+            span_sum_error.source,
+            AggregateExecutionSource::UnicodeScalar(
+                UnicodeScalarAggregateReduceError::WorkLimit { .. }
+            )
+        ));
+    }
+}
+
+#[test]
 fn ordered_captured_unicode_repetitions_use_one_bounded_scalar_run() {
     // Authenticated Rebar obligations:
     // - unicode/overlapping-words/english@rust/regex
@@ -2991,13 +3101,14 @@ fn unicode_scalar_root_captures_are_transparent_and_limits_remain_typed() {
     let audited = regex
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::UnicodeScalar(accounting) = &audited.report().details else {
+    let AggregateExecutionDetails::UnicodeScalar(accounting) = audited.report().details() else {
         panic!("root scalar class executed another plan")
     };
     assert!(accounting.upper_bounds.range_comparisons > 0);
     let mut run_limits = AggregateRunLimits::default();
     run_limits.unicode_scalar.max_range_comparisons = accounting.upper_bounds.range_comparisons - 1;
     let error = regex.count(haystack, run_limits).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::UnicodeScalar(
@@ -3180,6 +3291,14 @@ fn unicode_exact_count_error(
     let value = regex.count_value(haystack, *limits).unwrap_err();
     assert_eq!(value.identity, audited.identity);
     assert_eq!(value.source, audited.source);
+    assert!(audited.has_closed_direct_attempt());
+    assert!(value.has_closed_direct_attempt());
+    assert!(
+        audited
+            .direct_receipt()
+            .expect("Unicode exact refusal terminal receipt")
+            .authenticates_source(&audited.source)
+    );
     assert!(
         audited
             .identity
@@ -3289,7 +3408,7 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let audited = baseline
         .count(&haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::ExactLiteral(accounting) = audited.report().details else {
+    let AggregateExecutionDetails::ExactLiteral(accounting) = audited.report().details() else {
         panic!("forced Unicode literal executed another plan")
     };
     assert_eq!(audited.value(), 2);
@@ -3566,7 +3685,7 @@ fn absolute_anchors_use_the_complete_original_haystack() {
             .collect::<Vec<_>>(),
         vec![(2, 5)]
     );
-    let (certificate, _) = continuation_details(&spans.report().details);
+    let (certificate, _) = continuation_details(spans.report().details());
     assert_eq!(certificate.range, 0..5);
 }
 
@@ -3621,7 +3740,7 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
         admitted.report().cache_identity(),
         full.cache_identity(limits)
     );
-    let (certificate, accounting) = continuation_details(&admitted.report().details);
+    let (certificate, accounting) = continuation_details(admitted.report().details());
     assert_eq!(certificate.strategy, AggregateStrategy::FullTable);
     assert_eq!(certificate.range, 0..4);
     assert!(accounting.work <= certificate.work_bound);
@@ -3675,11 +3794,11 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
 
     let spans_regex = builder().build_spans().unwrap();
     let initial_spans = spans_regex.spans(haystack, limits).unwrap();
-    let (initial_spans_certificate, _) = continuation_details(&initial_spans.report().details);
+    let (initial_spans_certificate, _) = continuation_details(initial_spans.report().details());
     let mut spans_exact = limits;
     spans_exact.continuation.max_output_bytes = initial_spans_certificate.output_bytes;
     let spans = spans_regex.spans(haystack, spans_exact).unwrap();
-    let (spans_certificate, spans_accounting) = continuation_details(&spans.report().details);
+    let (spans_certificate, spans_accounting) = continuation_details(spans.report().details());
     assert_eq!(
         spans_certificate.operation,
         AggregateOperationAttemptKind::Spans
@@ -3771,7 +3890,7 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
 
     let count_regex = builder().build_count().unwrap();
     let count = count_regex.count(haystack, limits).unwrap();
-    let (count_certificate, count_accounting) = continuation_details(&count.report().details);
+    let (count_certificate, count_accounting) = continuation_details(count.report().details());
     assert_eq!(
         count_certificate.operation,
         AggregateOperationAttemptKind::Count
@@ -3780,7 +3899,7 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
     assert!(count_accounting.work <= count_certificate.work_bound);
     let count_steady = count_regex.count(haystack, limits).unwrap();
     let (count_steady_certificate, count_steady_accounting) =
-        continuation_details(&count_steady.report().details);
+        continuation_details(count_steady.report().details());
     assert_eq!(count_steady_certificate, count_certificate);
     assert_eq!(count_steady_accounting, count_accounting);
 
@@ -3788,7 +3907,7 @@ fn continuation_facades_retain_closed_operation_specific_success_and_failure_evi
     let mut sum_exact = limits;
     sum_exact.continuation.max_span_sum = haystack.len();
     let sum = sum_regex.span_sum(haystack, sum_exact).unwrap();
-    let (sum_certificate, sum_accounting) = continuation_details(&sum.report().details);
+    let (sum_certificate, sum_accounting) = continuation_details(sum.report().details());
     assert_eq!(
         sum_certificate.operation,
         AggregateOperationAttemptKind::SpanSum
@@ -4035,6 +4154,14 @@ fn exact_reduce_error(
     limits: &AggregateRunLimits,
 ) -> LiteralAggregateReduceError {
     let error = regex.count(b"needleneedleXneedle", *limits).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    let receipt = error
+        .direct_receipt()
+        .expect("exact refusal must retain its direct terminal receipt");
+    assert!(receipt.authenticates_source(&error.source));
+    assert_eq!(receipt.run_limits(), *limits);
+    assert_eq!(receipt.invocation.haystack_len, 19);
+    assert_eq!(receipt.invocation.range, 0..19);
     assert!(
         error
             .identity
@@ -4054,6 +4181,13 @@ fn exact_reduce_value_error(
     let error = regex
         .count_value(b"needleneedleXneedle", *limits)
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(
+        error
+            .direct_receipt()
+            .expect("value refusal must retain its direct terminal receipt")
+            .authenticates_source(&error.source)
+    );
     assert!(
         error
             .identity
@@ -4067,6 +4201,139 @@ fn exact_reduce_value_error(
 }
 
 #[test]
+fn direct_owner_is_exact_construction_provenance_on_success_and_terminal_failure() {
+    let regex = aggregate_builder("needle")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let first = regex
+        .count(b"needleneedleXneedle", AggregateRunLimits::default())
+        .unwrap();
+    let steady = regex
+        .count(b"needleneedleXneedle", AggregateRunLimits::default())
+        .unwrap();
+    assert!(first.report().has_closed_direct_attempt());
+    assert!(steady.report().has_closed_direct_attempt());
+    let first_owner = first
+        .report()
+        .direct_owner()
+        .expect("direct success must retain its construction owner");
+    let steady_owner = steady
+        .report()
+        .direct_owner()
+        .expect("steady direct success must retain its construction owner");
+    assert_eq!(first_owner, steady_owner);
+    assert!(first_owner.authenticates(first.report().identity()));
+    assert!(steady_owner.authenticates(steady.report().identity()));
+    assert_eq!(
+        first_owner.identity().route,
+        fre::AggregateDirectRoute::ExactLiteral
+    );
+    assert_eq!(
+        first_owner.identity().declared_fallback,
+        fre::AggregateDirectDeclaredFallback::None
+    );
+    assert_eq!(
+        first_owner.identity().algorithm_version,
+        fre::AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION
+    );
+    assert_eq!(
+        first_owner.identity().accounting_version,
+        fre::AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION
+    );
+
+    let separately_built = aggregate_builder("needle")
+        .unicode(false)
+        .build_count()
+        .unwrap()
+        .count(b"needleneedleXneedle", AggregateRunLimits::default())
+        .unwrap();
+    assert!(!first_owner.authenticates(separately_built.report().identity()));
+    assert_ne!(
+        first_owner,
+        separately_built
+            .report()
+            .direct_owner()
+            .expect("separate direct construction owner")
+    );
+
+    let mut refused = AggregateRunLimits::default();
+    refused.exact_literal.max_linear_terms = 0;
+    let error = regex.count(b"needleneedleXneedle", refused).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    let receipt = error
+        .direct_receipt()
+        .expect("direct terminal receipt must be present");
+    assert_eq!(receipt.owner(), &first_owner);
+    let terminal_cache = error
+        .identity
+        .as_cache_identity()
+        .expect("direct terminal cache");
+    assert!(!first_owner.authenticates(terminal_cache));
+    assert!(receipt.owner().authenticates(terminal_cache));
+    assert!(receipt.authenticates_source(&error.source));
+    assert_eq!(receipt.run_limits(), refused);
+    assert_eq!(
+        receipt.terminal,
+        fre::AggregateDirectAttemptTerminal::Failure
+    );
+}
+
+#[test]
+fn direct_terminal_public_source_and_identity_splices_fail_closed() {
+    let exact = aggregate_builder("needle")
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let haystack = b"needleneedleXneedle";
+
+    let mut linear_limits = AggregateRunLimits::default();
+    linear_limits.exact_literal.max_linear_terms = 0;
+    let exact_error = exact.count(haystack, linear_limits).unwrap_err();
+    assert!(exact_error.has_closed_direct_attempt());
+
+    let mut event_limits = AggregateRunLimits::default();
+    event_limits.exact_literal.max_match_events = 0;
+    let same_route_error = exact.count(haystack, event_limits).unwrap_err();
+    assert!(same_route_error.has_closed_direct_attempt());
+
+    let fixed = aggregate_builder("Sherlock Holmes")
+        .unicode(false)
+        .case_insensitive(true)
+        .build_count()
+        .unwrap();
+    let mut fixed_limits = AggregateRunLimits::default();
+    fixed_limits.finite_literal.max_transitions = 0;
+    let fixed_error = fixed
+        .count(b"xxSherLock Holmesyy", fixed_limits)
+        .unwrap_err();
+    assert!(fixed_error.has_closed_direct_attempt());
+
+    let mut changed = exact_error.clone();
+    changed.source = same_route_error.source.clone();
+    assert!(!changed.has_closed_direct_attempt());
+    changed.source = exact_error.source.clone();
+    assert!(changed.has_closed_direct_attempt());
+
+    changed.source = fixed_error.source.clone();
+    assert!(!changed.has_closed_direct_attempt());
+    changed.source = exact_error.source.clone();
+    assert!(changed.has_closed_direct_attempt());
+
+    changed.identity = fixed_error.identity.clone();
+    assert!(!changed.has_closed_direct_attempt());
+    changed.identity = exact_error.identity.clone();
+    assert!(changed.has_closed_direct_attempt());
+
+    changed.identity = fixed_error.identity.clone();
+    changed.source = fixed_error.source.clone();
+    assert!(changed.has_closed_direct_attempt());
+    changed.identity = exact_error.identity.clone();
+    changed.source = exact_error.source.clone();
+    assert!(changed.has_closed_direct_attempt());
+}
+
+#[test]
 fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let count = aggregate_builder("needle")
         .unicode(false)
@@ -4076,7 +4343,7 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let baseline = count
         .count(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::ExactLiteral(accounting) = baseline.report().details else {
+    let AggregateExecutionDetails::ExactLiteral(accounting) = baseline.report().details() else {
         panic!("auto literal selected continuation")
     };
     let upper = accounting.upper_bounds;
@@ -4252,8 +4519,10 @@ fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() 
     exact.prefix_class_alternation.max_work = 256;
     assert_eq!(2, witness.count_value(b"abcz--xy7", exact).unwrap());
     exact.prefix_class_alternation.max_work = 255;
+    let terminal = witness.count_value(b"abcz--xy7", exact).unwrap_err();
+    assert!(terminal.has_closed_direct_attempt());
     assert!(matches!(
-        witness.count_value(b"abcz--xy7", exact).unwrap_err().source,
+        terminal.source,
         AggregateExecutionSource::PrefixClassAlternation(
             PrefixClassAlternationReduceError::WorkLimit {
                 needed: 256,

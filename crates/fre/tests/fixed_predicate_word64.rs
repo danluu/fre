@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateRunLimits, FixedPredicateWord64MatchSelection,
-    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
-    FixedPredicateWord64ReduceError, RustProfile,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanIdentity,
+    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
+    FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, RustProfile,
 };
 
 const PATTERN: &str = "Sherlock Holmes";
@@ -75,7 +77,17 @@ fn count_identity_and_accounting_are_closed() {
         .count(HAYSTACK, AggregateRunLimits::default())
         .unwrap();
     assert_eq!(counted.value(), 3);
-    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = counted.report().details
+    assert!(counted.report().has_closed_direct_attempt());
+    let owner = counted
+        .report()
+        .direct_owner()
+        .expect("fixed predicate success must retain its direct owner");
+    assert_eq!(
+        owner.identity().route,
+        fre::AggregateDirectRoute::FixedPredicateWord64
+    );
+    assert!(owner.authenticates(counted.report().identity()));
+    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = counted.report().details()
     else {
         panic!("fixed predicate count executed another plan");
     };
@@ -94,6 +106,111 @@ fn count_identity_and_accounting_are_closed() {
 }
 
 #[test]
+fn success_owner_rejects_every_mutable_cache_discriminator_and_splice() {
+    let regex = builder().build_count().unwrap();
+    let counted = regex
+        .count(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    let owner = counted.report().direct_owner().unwrap();
+    let original = counted.report().cache_identity();
+    assert!(owner.authenticates(&original));
+
+    macro_rules! reject {
+        ($mutation:expr) => {{
+            let mut changed = original.clone();
+            $mutation(&mut changed);
+            assert!(!owner.authenticates(&changed));
+            assert!(owner.authenticates(&original));
+        }};
+    }
+
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.schema_version = cache.schema_version.wrapping_add(1);
+    });
+    let separate = builder()
+        .build_count()
+        .unwrap()
+        .count(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert!(!Arc::ptr_eq(
+        &original.syntax_key,
+        &separate.report().identity().syntax_key
+    ));
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.syntax_key = Arc::clone(&separate.report().identity().syntax_key);
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.operation = AggregateOperation::SpanSum;
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.selection = AggregatePlanSelection::ForceContinuation;
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.plan = AggregatePlanKind::ExactLiteral;
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.continuation_strategy = Some(AggregateStrategy::FullTable);
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.build_limits.max_literal_planner_work =
+            cache.build_limits.max_literal_planner_work.wrapping_add(1);
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.execution_limits.finite_literal.max_transitions = cache
+            .execution_limits
+            .finite_literal
+            .max_transitions
+            .wrapping_sub(1);
+    });
+    reject!(|cache: &mut fre::AggregateCacheIdentity| {
+        cache.execution_limits.exact_literal.max_linear_terms = cache
+            .execution_limits
+            .exact_literal
+            .max_linear_terms
+            .wrapping_sub(1);
+    });
+
+    for mutate in [
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.plan_id = "mutated-plan";
+        },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.operation_id = "mutated-operation";
+        },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.operation = FixedPredicateWord64Operation::SpanSum;
+        },
+        |identity: &mut fre::FixedPredicateWord64OperationIdentity| {
+            identity.width = identity.width.wrapping_add(1);
+        },
+    ] {
+        reject!(|cache: &mut fre::AggregateCacheIdentity| {
+            let AggregatePlanIdentity::FixedPredicateWord64(identity) = &mut cache.plan_identity
+            else {
+                panic!("fixed-predicate cache identity");
+            };
+            mutate(identity);
+        });
+    }
+
+    let span_cache = builder()
+        .build_span_sum()
+        .unwrap()
+        .span_sum(HAYSTACK, AggregateRunLimits::default())
+        .unwrap()
+        .report()
+        .cache_identity();
+    assert!(!owner.authenticates(&span_cache));
+    assert_ne!(
+        owner,
+        separate
+            .report()
+            .direct_owner()
+            .expect("separate construction owner")
+    );
+}
+
+#[test]
 fn span_sum_compile_captures_and_exclusions_are_closed() {
     let sum = builder().build_span_sum().unwrap();
     assert!(matches!(
@@ -101,23 +218,41 @@ fn span_sum_compile_captures_and_exclusions_are_closed() {
         AggregatePlanIdentity::FixedPredicateWord64(identity)
             if identity.operation == FixedPredicateWord64Operation::SpanSum
     ));
+    let summed = sum
+        .span_sum(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(summed.value(), 45);
+    assert!(summed.report().has_closed_direct_attempt());
     assert_eq!(
-        sum.span_sum_value(HAYSTACK, AggregateRunLimits::default())
-            .unwrap(),
-        45
+        summed
+            .report()
+            .direct_owner()
+            .expect("fixed predicate span-sum owner")
+            .identity()
+            .route,
+        fre::AggregateDirectRoute::FixedPredicateWord64
     );
     let compiled = builder().build_compile().unwrap();
     assert_eq!(
         compiled.build_report().plan,
         AggregatePlanKind::FixedPredicateWord64
     );
+    let verified = compiled
+        .verify_count(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(verified.value(), 3);
+    assert!(verified.report().has_closed_direct_attempt());
+    let compile_owner = verified.report().direct_owner().unwrap();
     assert_eq!(
-        compiled
-            .verify_count(HAYSTACK, AggregateRunLimits::default())
-            .unwrap()
-            .value(),
-        3
+        compile_owner.identity().operation,
+        AggregateOperation::Compile
     );
+    assert!(compile_owner.authenticates(verified.report().identity()));
+    assert!(matches!(
+        verified.report().identity().plan_identity,
+        AggregatePlanIdentity::FixedPredicateWord64(identity)
+            if identity.operation == FixedPredicateWord64Operation::Count
+    ));
 
     let captured = AggregateBuilder::new("((Sherlock Holmes))")
         .profile(RustProfile::rebar_1_12_4())
@@ -325,7 +460,8 @@ fn exact_run_limits() -> (
     let baseline = regex
         .count(HAYSTACK, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = baseline.report().details
+    assert!(baseline.report().has_closed_direct_attempt());
+    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = baseline.report().details()
     else {
         panic!("baseline executed another family");
     };
@@ -353,7 +489,9 @@ fn exact_run_limits() -> (
 #[test]
 fn shared_run_envelope_is_exact_and_failures_are_typed() {
     let (regex, exact, upper) = exact_run_limits();
-    assert_eq!(regex.count(HAYSTACK, exact).unwrap().value(), 3);
+    let counted = regex.count(HAYSTACK, exact).unwrap();
+    assert_eq!(counted.value(), 3);
+    assert!(counted.report().has_closed_direct_attempt());
 
     let mut one_below = exact;
     one_below.finite_literal.max_transitions -= 1;
@@ -398,6 +536,22 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     one_below = exact;
     one_below.finite_literal.max_peak_bytes -= 1;
     let error = regex.count(HAYSTACK, one_below).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(
+        error
+            .direct_receipt()
+            .expect("fixed predicate terminal receipt")
+            .authenticates_source(&error.source)
+    );
+    assert_eq!(
+        error
+            .direct_receipt()
+            .expect("fixed predicate terminal receipt")
+            .owner()
+            .identity()
+            .route,
+        fre::AggregateDirectRoute::FixedPredicateWord64
+    );
     assert!(matches!(
         error.source,
         AggregateExecutionSource::FixedPredicateWord64(
@@ -408,8 +562,16 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     let sum = builder().build_span_sum().unwrap();
     one_below = exact;
     one_below.finite_literal.max_span_sum -= 1;
+    let error = sum.span_sum(HAYSTACK, one_below).unwrap_err();
+    assert!(error.has_closed_direct_attempt());
+    assert!(
+        error
+            .direct_receipt()
+            .expect("fixed predicate span-sum terminal receipt")
+            .authenticates_source(&error.source)
+    );
     assert!(matches!(
-        sum.span_sum(HAYSTACK, one_below).unwrap_err().source,
+        error.source,
         AggregateExecutionSource::FixedPredicateWord64(
             FixedPredicateWord64ReduceError::SpanSumLimit { needed, limit }
         ) if needed == upper.span_sum && limit + 1 == needed

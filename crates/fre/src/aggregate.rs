@@ -1,5 +1,5 @@
 use core::{fmt, ops::Range};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use fre_aggregate::{
     AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
@@ -7,21 +7,24 @@ use fre_aggregate::{
     RustByteProfile, SpanIter,
 };
 use fre_kernels::{
-    BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
-    BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BlockingDelimiterBuildAccounting,
-    BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterCountResult,
-    BlockingDelimiterOperationIdentity, BlockingDelimiterPlan, BlockingDelimiterReduceAccounting,
-    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BlockingDelimiterSpanSumResult,
-    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
-    BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
-    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedContextBuildAccounting, BoundedContextBuildError,
-    BoundedContextBuildLimits, BoundedContextCountResult, BoundedContextOperationIdentity,
-    BoundedContextPlan, BoundedContextReduceAccounting, BoundedContextReduceError,
-    BoundedContextReduceLimits, BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError,
-    BoundedLiteralPairBuildLimits, BoundedLiteralPairCountResult,
-    BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
+    BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
+    BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CONTEXT_COUNT_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
+    BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
+    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
+    BlockingDelimiterCountResult, BlockingDelimiterOperationIdentity, BlockingDelimiterPlan,
+    BlockingDelimiterReduceAccounting, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
+    BlockingDelimiterSpanSumResult, BoundedClassSequenceBuildAccounting,
+    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceCountResult, BoundedClassSequenceOperationIdentity,
+    BoundedClassSequencePlan, BoundedClassSequenceReduceAccounting,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedContextBuildAccounting, BoundedContextBuildError, BoundedContextBuildLimits,
+    BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
+    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
+    BoundedLiteralPairCountResult, BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
     BoundedLiteralPairReduceAccounting, BoundedLiteralPairReduceError,
     BoundedLiteralPairReduceLimits, BoundedLiteralPairSpanSumResult,
     BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
@@ -30,6 +33,8 @@ use fre_kernels::{
     BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
+    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+    FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
@@ -48,27 +53,32 @@ use fre_kernels::{
     FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
     FixedPredicateWord64ReduceLimits, FixedPredicateWord64SpanSumResult,
+    GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID, GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    GraphemeScalarDfaRole, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateCountResult, LiteralAggregateOperationIdentity,
-    LiteralAggregatePlan, LiteralAggregateReduceAccounting, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult, LiteralAssertionsBuildAccounting,
-    LiteralAssertionsBuildError, LiteralAssertionsBuildLimits, LiteralAssertionsCountResult,
-    LiteralAssertionsOperationIdentity, LiteralAssertionsPlan, LiteralAssertionsReduceAccounting,
-    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits, LiteralAssertionsSpanSumResult,
-    LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
-    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralCountResult,
-    LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
-    LiteralClassRunLiteralReduceAccounting, LiteralClassRunLiteralReduceError,
-    LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
-    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
+    GraphemeScalarDfaRole, LITERAL_AGGREGATE_COUNT_OPERATION_ID,
+    LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID, LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+    LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateBuildAccounting,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateCountResult,
+    LiteralAggregateOperationIdentity, LiteralAggregatePlan, LiteralAggregateReduceAccounting,
+    LiteralAggregateReduceError, LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult,
+    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
+    LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity, LiteralAssertionsPlan,
+    LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    LiteralAssertionsSpanSumResult, LiteralClassRunLiteralBuildAccounting,
+    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
+    LiteralClassRunLiteralCountResult, LiteralClassRunLiteralOperationIdentity,
+    LiteralClassRunLiteralPlan, LiteralClassRunLiteralReduceAccounting,
+    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
+    LiteralClassRunLiteralSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PrefixClassAlternationBuildAccounting,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
     PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
@@ -78,12 +88,14 @@ use fre_kernels::{
     SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, TokenPhraseBuildAccounting,
-    TokenPhraseBuildError, TokenPhraseBuildLimits, TokenPhraseCountResult,
-    TokenPhraseOperationIdentity, TokenPhrasePlan, TokenPhraseReduceAccounting,
-    TokenPhraseReduceError, TokenPhraseReduceLimits, TokenPhraseSpanSumResult,
-    UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
-    UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
+    TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
+    TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
+    TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
+    UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
+    UnicodeScalarAggregateCountResult, UnicodeScalarAggregateOperation,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
@@ -109,7 +121,13 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 32;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 33;
+
+/// Version of the construction-owned direct-route protocol.
+pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
+
+/// Version of the lossless direct terminal-attempt envelope.
+pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 1;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1832,6 +1850,740 @@ pub struct AggregateCacheIdentity {
     pub execution_limits: AggregateRunLimits,
 }
 
+/// Physical direct reducer selected before an aggregate invocation can inspect
+/// source. Dense and sparse finite reducers remain distinct even though they
+/// intentionally share the public `FiniteLiteralDfa` plan kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateDirectRoute {
+    ExactLiteral,
+    UnicodeScalar,
+    WordRun,
+    LiteralAssertions,
+    BlockingDelimiter,
+    TokenPhrase,
+    FixedClassSandwich,
+    GraphemeScalarDfa,
+    BoundedClassSequence,
+    BoundedSeparatedFields,
+    PrefixClassAlternation,
+    LiteralClassRunLiteral,
+    BoundedLiteralPair,
+    BoundedContext,
+    DenseFiniteLiteral,
+    SparseFiniteLiteral,
+    GuardedAsciiWord,
+    FixedPredicateWord64,
+}
+
+/// Permitted action after a direct aggregate route has been published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateDirectDeclaredFallback {
+    /// A refusal or fault is terminal; no alternate plan may read source.
+    None,
+}
+
+/// Compact route identity owned by one published direct aggregate plan.
+///
+/// The syntax-key `Arc` is allocated by parsing and already retained by the
+/// build report. A private `Weak` handle to that allocation is the exact
+/// provenance root: it adds neither an allocation nor a strong source-key
+/// clone, and it prevents address reuse while a detached owner seal exists.
+/// The complete structural identity remains in the colocated public cache
+/// identity and is authenticated by [`AggregateDirectOwnerSeal::authenticates`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateDirectRouteIdentity {
+    pub schema_version: u32,
+    pub operation: AggregateOperation,
+    pub selection: AggregatePlanSelection,
+    pub route: AggregateDirectRoute,
+    pub plan: AggregatePlanKind,
+    pub capture_semantics: AggregateCaptureSemantics,
+    pub plan_identity: AggregatePlanIdentity,
+    pub build_limits: AggregateBuildLimits,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+    pub declared_fallback: AggregateDirectDeclaredFallback,
+}
+
+impl AggregateDirectRouteIdentity {
+    fn closes_cache_fields(&self, cache: &AggregateCacheIdentity) -> bool {
+        self.schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+            && cache.schema_version == self.schema_version
+            && self.operation == cache.operation
+            && self.selection == cache.selection
+            && self.plan == cache.plan
+            && cache.continuation_strategy.is_none()
+            && self.capture_semantics == cache.capture_semantics
+            && self.plan_identity == cache.plan_identity
+            && self.build_limits == cache.build_limits
+            && self.algorithm_version == AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION
+            && self.accounting_version == AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION
+            && self.declared_fallback == AggregateDirectDeclaredFallback::None
+            && direct_route_matches_plan(self.route, cache.plan, cache.plan_identity)
+            && direct_plan_operation_closes(cache)
+    }
+}
+
+fn direct_route_matches_plan(
+    route: AggregateDirectRoute,
+    plan: AggregatePlanKind,
+    identity: AggregatePlanIdentity,
+) -> bool {
+    match (route, plan, identity) {
+        (
+            AggregateDirectRoute::ExactLiteral,
+            AggregatePlanKind::ExactLiteral,
+            AggregatePlanIdentity::ExactLiteral(_),
+        )
+        | (
+            AggregateDirectRoute::UnicodeScalar,
+            AggregatePlanKind::UnicodeScalarClass,
+            AggregatePlanIdentity::UnicodeScalar(_),
+        )
+        | (
+            AggregateDirectRoute::WordRun,
+            AggregatePlanKind::WordRun,
+            AggregatePlanIdentity::WordRun(_),
+        )
+        | (
+            AggregateDirectRoute::LiteralAssertions,
+            AggregatePlanKind::LiteralAssertions,
+            AggregatePlanIdentity::LiteralAssertions(_),
+        )
+        | (
+            AggregateDirectRoute::BlockingDelimiter,
+            AggregatePlanKind::BlockingDelimiter,
+            AggregatePlanIdentity::BlockingDelimiter(_),
+        )
+        | (
+            AggregateDirectRoute::TokenPhrase,
+            AggregatePlanKind::TokenPhrase,
+            AggregatePlanIdentity::TokenPhrase(_),
+        )
+        | (
+            AggregateDirectRoute::FixedClassSandwich,
+            AggregatePlanKind::FixedClassSandwich,
+            AggregatePlanIdentity::FixedClassSandwich(_),
+        )
+        | (
+            AggregateDirectRoute::GraphemeScalarDfa,
+            AggregatePlanKind::GraphemeScalarDfa,
+            AggregatePlanIdentity::GraphemeScalarDfa(_),
+        )
+        | (
+            AggregateDirectRoute::BoundedClassSequence,
+            AggregatePlanKind::BoundedClassSequence,
+            AggregatePlanIdentity::BoundedClassSequence(_),
+        )
+        | (
+            AggregateDirectRoute::BoundedSeparatedFields,
+            AggregatePlanKind::BoundedSeparatedFields,
+            AggregatePlanIdentity::BoundedSeparatedFields(_),
+        )
+        | (
+            AggregateDirectRoute::PrefixClassAlternation,
+            AggregatePlanKind::PrefixClassAlternation,
+            AggregatePlanIdentity::PrefixClassAlternation(_),
+        )
+        | (
+            AggregateDirectRoute::LiteralClassRunLiteral,
+            AggregatePlanKind::LiteralClassRunLiteral,
+            AggregatePlanIdentity::LiteralClassRunLiteral(_),
+        )
+        | (
+            AggregateDirectRoute::BoundedLiteralPair,
+            AggregatePlanKind::BoundedLiteralPair,
+            AggregatePlanIdentity::BoundedLiteralPair(_),
+        )
+        | (
+            AggregateDirectRoute::BoundedContext,
+            AggregatePlanKind::BoundedContext,
+            AggregatePlanIdentity::BoundedContext(_),
+        )
+        | (
+            AggregateDirectRoute::GuardedAsciiWord,
+            AggregatePlanKind::GuardedAsciiWordDictionary,
+            AggregatePlanIdentity::GuardedAsciiWord(_),
+        )
+        | (
+            AggregateDirectRoute::FixedPredicateWord64,
+            AggregatePlanKind::FixedPredicateWord64,
+            AggregatePlanIdentity::FixedPredicateWord64(_),
+        ) => true,
+        (
+            AggregateDirectRoute::DenseFiniteLiteral,
+            AggregatePlanKind::FiniteLiteralDfa,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+        (
+            AggregateDirectRoute::SparseFiniteLiteral,
+            AggregatePlanKind::FiniteLiteralDfa,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+        _ => false,
+    }
+}
+
+fn direct_operation_id_closes(
+    operation: AggregateOperation,
+    operation_id: &str,
+    count_id: &str,
+    span_sum_id: Option<&str>,
+) -> bool {
+    match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => operation_id == count_id,
+        AggregateOperation::SpanSum => span_sum_id == Some(operation_id),
+        AggregateOperation::Spans => false,
+    }
+}
+
+fn unicode_scalar_direct_operation_closes(
+    operation: AggregateOperation,
+    identity: UnicodeScalarAggregateOperationIdentity,
+) -> bool {
+    let expected_operation = match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => {
+            UnicodeScalarAggregateOperation::Count
+        }
+        AggregateOperation::SpanSum => UnicodeScalarAggregateOperation::SpanSum,
+        AggregateOperation::Spans => return false,
+    };
+    identity
+        == UnicodeScalarAggregateOperationIdentity::for_repetition(
+            expected_operation,
+            identity.repetition,
+        )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive closure boundary keeps all direct operation identities adjacent"
+)]
+fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
+    match cache.plan_identity {
+        AggregatePlanIdentity::ExactLiteral(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            LITERAL_AGGREGATE_COUNT_OPERATION_ID,
+            Some(LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::UnicodeScalar(identity) => {
+            unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
+        }
+        AggregatePlanIdentity::WordRun(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            unicode_word_run::AGGREGATE_COUNT_OPERATION_ID,
+            Some(unicode_word_run::AGGREGATE_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::LiteralAssertions(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+            Some(LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::BlockingDelimiter(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            BLOCKING_DELIMITER_COUNT_OPERATION_ID,
+            Some(BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::TokenPhrase(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            TOKEN_PHRASE_COUNT_OPERATION_ID,
+            Some(TOKEN_PHRASE_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::FixedClassSandwich(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+            Some(FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::GraphemeScalarDfa(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID,
+            Some(GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::BoundedClassSequence(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.operation_id,
+            BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
+            None,
+        ),
+        AggregatePlanIdentity::BoundedSeparatedFields(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
+            None,
+        ),
+        AggregatePlanIdentity::PrefixClassAlternation(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+            None,
+        ),
+        AggregatePlanIdentity::LiteralClassRunLiteral(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+            Some(LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::BoundedLiteralPair(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+            Some(BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::BoundedContext(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            BOUNDED_CONTEXT_COUNT_OPERATION_ID,
+            None,
+        ),
+        AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
+            ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => direct_operation_id_closes(
+                cache.operation,
+                identity.operation,
+                ORDERED_LITERAL_COUNT_PLAN_ID,
+                Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+            ),
+            SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => direct_operation_id_closes(
+                cache.operation,
+                identity.operation,
+                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+            ),
+            _ => false,
+        },
+        AggregatePlanIdentity::GuardedAsciiWord(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.operation,
+            guarded_ascii_word::COUNT_OPERATION_ID,
+            Some(guarded_ascii_word::SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::FixedPredicateWord64(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.operation_id,
+            FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
+            Some(FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID),
+        ),
+        AggregatePlanIdentity::FixedAbsoluteDomain(_) | AggregatePlanIdentity::Continuation(_) => {
+            false
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive closure boundary keeps all direct route identities adjacent"
+)]
+fn direct_details_close_cache(
+    cache: &AggregateCacheIdentity,
+    details: &AggregateExecutionDetails,
+) -> bool {
+    match (&cache.plan_identity, details) {
+        (
+            AggregatePlanIdentity::ExactLiteral(identity),
+            AggregateExecutionDetails::ExactLiteral(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    LITERAL_AGGREGATE_COUNT_OPERATION_ID,
+                    Some(LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::UnicodeScalar(identity),
+            AggregateExecutionDetails::UnicodeScalar(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
+        }
+        (
+            AggregatePlanIdentity::WordRun(identity),
+            AggregateExecutionDetails::WordRun(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    unicode_word_run::AGGREGATE_COUNT_OPERATION_ID,
+                    Some(unicode_word_run::AGGREGATE_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::LiteralAssertions(identity),
+            AggregateExecutionDetails::LiteralAssertions(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+                    Some(LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::BlockingDelimiter(identity),
+            AggregateExecutionDetails::BlockingDelimiter(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    BLOCKING_DELIMITER_COUNT_OPERATION_ID,
+                    Some(BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::TokenPhrase(identity),
+            AggregateExecutionDetails::TokenPhrase(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    TOKEN_PHRASE_COUNT_OPERATION_ID,
+                    Some(TOKEN_PHRASE_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::FixedClassSandwich(identity),
+            AggregateExecutionDetails::FixedClassSandwich(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+                    Some(FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::GraphemeScalarDfa(identity),
+            AggregateExecutionDetails::GraphemeScalarDfa(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID,
+                    Some(GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::BoundedClassSequence(identity),
+            AggregateExecutionDetails::BoundedClassSequence(accounting),
+        ) => {
+            identity == &accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation_id,
+                    BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
+                    None,
+                )
+        }
+        (
+            AggregatePlanIdentity::BoundedSeparatedFields(identity),
+            AggregateExecutionDetails::BoundedSeparatedFields(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
+                    None,
+                )
+        }
+        (
+            AggregatePlanIdentity::PrefixClassAlternation(identity),
+            AggregateExecutionDetails::PrefixClassAlternation(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+                    None,
+                )
+        }
+        (
+            AggregatePlanIdentity::LiteralClassRunLiteral(identity),
+            AggregateExecutionDetails::LiteralClassRunLiteral(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+                    Some(LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::BoundedLiteralPair(identity),
+            AggregateExecutionDetails::BoundedLiteralPair(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+                    Some(BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::BoundedContext(identity),
+            AggregateExecutionDetails::BoundedContext(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    BOUNDED_CONTEXT_COUNT_OPERATION_ID,
+                    None,
+                )
+        }
+        (
+            AggregatePlanIdentity::FiniteLiteral(identity),
+            AggregateExecutionDetails::FiniteLiteral { .. },
+        ) => {
+            identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation,
+                    ORDERED_LITERAL_COUNT_PLAN_ID,
+                    Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::FiniteLiteral(identity),
+            AggregateExecutionDetails::SparseFiniteLiteral { .. },
+        ) => {
+            identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation,
+                    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                    Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::GuardedAsciiWord(identity),
+            AggregateExecutionDetails::GuardedAsciiWord(accounting),
+        ) => {
+            identity.operation == accounting.operation_id
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation,
+                    guarded_ascii_word::COUNT_OPERATION_ID,
+                    Some(guarded_ascii_word::SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::FixedPredicateWord64(identity),
+            AggregateExecutionDetails::FixedPredicateWord64(accounting),
+        ) => {
+            identity == &accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation_id,
+                    FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
+                    Some(FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Opaque construction provenance for one direct aggregate route.
+///
+/// Equality is exact syntax-owner provenance, not structural cache identity.
+/// Clones of one compiled aggregate plan keep the same owner, while another
+/// construction of the same pattern receives a different syntax-key `Arc`.
+#[derive(Clone, Debug)]
+pub struct AggregateDirectOwnerSeal {
+    syntax_provenance: Weak<CacheKey>,
+    identity: AggregateDirectRouteIdentity,
+    authenticated_execution_limits: AggregateRunLimits,
+}
+
+impl PartialEq for AggregateDirectOwnerSeal {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.syntax_provenance, &other.syntax_provenance)
+            && self.identity == other.identity
+    }
+}
+
+impl Eq for AggregateDirectOwnerSeal {}
+
+impl AggregateDirectOwnerSeal {
+    fn from_cache_identity(
+        cache: &AggregateCacheIdentity,
+        route: AggregateDirectRoute,
+    ) -> Option<Self> {
+        if !direct_route_matches_plan(route, cache.plan, cache.plan_identity)
+            || cache.continuation_strategy.is_some()
+            || !direct_plan_operation_closes(cache)
+        {
+            return None;
+        }
+        Some(Self {
+            syntax_provenance: Arc::downgrade(&cache.syntax_key),
+            authenticated_execution_limits: cache.execution_limits,
+            identity: AggregateDirectRouteIdentity {
+                schema_version: cache.schema_version,
+                operation: cache.operation,
+                selection: cache.selection,
+                route,
+                plan: cache.plan,
+                capture_semantics: cache.capture_semantics,
+                plan_identity: cache.plan_identity,
+                build_limits: cache.build_limits,
+                algorithm_version: AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
+                accounting_version: AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION,
+                declared_fallback: AggregateDirectDeclaredFallback::None,
+            },
+        })
+    }
+
+    /// Compact immutable route identity owned by this construction.
+    #[must_use]
+    pub const fn identity(&self) -> &AggregateDirectRouteIdentity {
+        &self.identity
+    }
+
+    fn closes_cache_identity(&self, cache: &AggregateCacheIdentity) -> bool {
+        self.syntax_provenance.as_ptr() == Arc::as_ptr(&cache.syntax_key)
+            && self.authenticated_execution_limits == cache.execution_limits
+            && self.identity.closes_cache_fields(cache)
+    }
+}
+
+/// Complete source identity for one direct aggregate invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateDirectInvocation {
+    pub haystack_len: usize,
+    pub range: Range<usize>,
+    pub operation: AggregateOperation,
+}
+
+/// Authenticated terminal disposition of a direct reducer attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateDirectAttemptTerminal {
+    /// The selected direct route completed without fallback.
+    Success,
+    /// The selected direct route refused or faulted without fallback.
+    Failure,
+}
+
+/// Lossless receipt-local source storage.
+///
+/// The public guarded-word source is boxed to keep the outer execution error
+/// compact. Keeping its receipt copy unboxed avoids a second allocation while
+/// every other direct source can retain its existing representation exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AggregateDirectReceiptSource {
+    Execution(AggregateExecutionSource),
+    GuardedAsciiWord(guarded_ascii_word::ReduceError),
+}
+
+impl AggregateDirectReceiptSource {
+    fn capture(source: &AggregateExecutionSource) -> Self {
+        match source {
+            AggregateExecutionSource::GuardedAsciiWord(source) => {
+                Self::GuardedAsciiWord(source.as_ref().clone())
+            }
+            source => Self::Execution(source.clone()),
+        }
+    }
+
+    fn authenticates(&self, source: &AggregateExecutionSource) -> bool {
+        match (self, source) {
+            (Self::Execution(receipt), source) => receipt == source,
+            (
+                Self::GuardedAsciiWord(receipt),
+                AggregateExecutionSource::GuardedAsciiWord(source),
+            ) => receipt == source.as_ref(),
+            (Self::GuardedAsciiWord(_), _) => false,
+        }
+    }
+}
+
+/// Lossless terminal receipt for one construction-owned direct route.
+///
+/// Existing reducer errors are deliberately retained intact: limit refusals
+/// preserve their exact prospective dimension, and post-publication
+/// accounting failures preserve their typed upper/actual values. U0-E can add
+/// the exact-literal kernel's finer-grained receipt without changing this
+/// owner-local envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateDirectAttemptReceipt {
+    owner: AggregateDirectOwnerSeal,
+    pub invocation: AggregateDirectInvocation,
+    source: AggregateDirectReceiptSource,
+    authenticated_terminal: AggregateDirectAttemptTerminal,
+    pub terminal: AggregateDirectAttemptTerminal,
+}
+
+impl AggregateDirectAttemptReceipt {
+    /// Construction owner shared by first, steady, and terminal attempts.
+    #[must_use]
+    pub const fn owner(&self) -> &AggregateDirectOwnerSeal {
+        &self.owner
+    }
+
+    /// Exact invocation limits bound before the selected route executes.
+    #[must_use]
+    pub const fn run_limits(&self) -> AggregateRunLimits {
+        self.owner.authenticated_execution_limits
+    }
+
+    /// Authenticate the complete typed reducer terminal retained by this
+    /// receipt. Guarded-word terminals use an unboxed receipt copy so error
+    /// packaging does not perform a second allocation.
+    #[must_use]
+    pub fn authenticates_source(&self, source: &AggregateExecutionSource) -> bool {
+        self.source.authenticates(source)
+    }
+
+    fn closes(&self, cache: &AggregateCacheIdentity, source: &AggregateExecutionSource) -> bool {
+        self.authenticated_terminal == AggregateDirectAttemptTerminal::Failure
+            && self.terminal == self.authenticated_terminal
+            && self.authenticates_source(source)
+            && self.run_limits() == cache.execution_limits
+            && self.invocation.operation == cache.operation
+            && self.invocation.range == (0..self.invocation.haystack_len)
+            && source.direct_route() == Some(self.owner.identity.route)
+            && self.owner.closes_cache_identity(cache)
+    }
+}
+
+/// Exact construction owner, cache identity, and terminal receipt for a direct
+/// aggregate execution failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateDirectAttemptIdentity {
+    cache: AggregateCacheIdentity,
+    receipt: AggregateDirectAttemptReceipt,
+}
+
+impl AggregateDirectAttemptIdentity {
+    /// Complete structural cache identity used by this invocation.
+    #[must_use]
+    pub fn cache_identity(&self) -> &AggregateCacheIdentity {
+        &self.cache
+    }
+
+    /// The one lossless construction-owned terminal receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &AggregateDirectAttemptReceipt {
+        &self.receipt
+    }
+}
+
 /// Allocation-free error identity for the U1 fixed-domain route. Only the
 /// limits that authenticate its nested guard/continuation receipts are kept;
 /// construction accounting lives once in the colocated owner seal.
@@ -1962,6 +2714,8 @@ impl AggregateFixedAbsoluteDomainAttemptIdentity {
 )]
 pub enum AggregateExecutionAttemptIdentity {
     Incumbent(Box<AggregateCacheIdentity>),
+    /// Construction-owned direct reducer and its one terminal receipt.
+    Direct(Box<AggregateDirectAttemptIdentity>),
     /// Continuation construction identity plus the one complete selected-route
     /// execution receipt.
     Continuation {
@@ -1985,6 +2739,10 @@ impl AggregateExecutionAttemptIdentity {
         ))
     }
 
+    fn direct(cache: AggregateCacheIdentity, receipt: AggregateDirectAttemptReceipt) -> Self {
+        Self::Direct(Box::new(AggregateDirectAttemptIdentity { cache, receipt }))
+    }
+
     fn continuation(cache: Box<AggregateCacheIdentity>, receipt: OperationAttemptReceipt) -> Self {
         Self::Continuation { cache, receipt }
     }
@@ -1993,6 +2751,7 @@ impl AggregateExecutionAttemptIdentity {
     pub fn as_cache_identity(&self) -> Option<&AggregateCacheIdentity> {
         match self {
             Self::Incumbent(identity) => Some(identity),
+            Self::Direct(attempt) => Some(attempt.cache_identity()),
             Self::Continuation { cache, .. } => Some(cache),
             Self::FixedAbsoluteDomain(_) => None,
         }
@@ -2004,7 +2763,7 @@ impl AggregateExecutionAttemptIdentity {
         &self,
     ) -> Option<&AggregateFixedAbsoluteDomainAttemptIdentity> {
         match self {
-            Self::Incumbent(_) | Self::Continuation { .. } => None,
+            Self::Incumbent(_) | Self::Direct(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt),
         }
     }
@@ -2012,7 +2771,7 @@ impl AggregateExecutionAttemptIdentity {
     #[must_use]
     pub fn as_fixed_absolute_domain(&self) -> Option<&AggregateFixedAbsoluteDomainErrorIdentity> {
         match self {
-            Self::Incumbent(_) | Self::Continuation { .. } => None,
+            Self::Incumbent(_) | Self::Direct(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt.owner_identity()),
         }
     }
@@ -2023,8 +2782,17 @@ impl AggregateExecutionAttemptIdentity {
         &self,
     ) -> Option<&AggregateFixedAbsoluteDomainAttemptReceipt> {
         match self {
-            Self::Incumbent(_) | Self::Continuation { .. } => None,
+            Self::Incumbent(_) | Self::Direct(_) | Self::Continuation { .. } => None,
             Self::FixedAbsoluteDomain(attempt) => Some(attempt.receipt()),
+        }
+    }
+
+    /// Construction-owned terminal receipt for a direct reducer.
+    #[must_use]
+    pub const fn direct_receipt(&self) -> Option<&AggregateDirectAttemptReceipt> {
+        match self {
+            Self::Direct(attempt) => Some(attempt.receipt()),
+            Self::Incumbent(_) | Self::Continuation { .. } | Self::FixedAbsoluteDomain(_) => None,
         }
     }
 
@@ -2033,7 +2801,14 @@ impl AggregateExecutionAttemptIdentity {
     pub const fn continuation_receipt(&self) -> Option<&OperationAttemptReceipt> {
         match self {
             Self::Continuation { receipt, .. } => Some(receipt),
-            Self::Incumbent(_) | Self::FixedAbsoluteDomain(_) => None,
+            Self::Incumbent(_) | Self::Direct(_) | Self::FixedAbsoluteDomain(_) => None,
+        }
+    }
+
+    fn closes_direct_source_kind(&self, source: &AggregateExecutionSource) -> bool {
+        match self {
+            Self::Direct(attempt) => attempt.receipt.closes(&attempt.cache, source),
+            Self::Incumbent(_) | Self::Continuation { .. } | Self::FixedAbsoluteDomain(_) => false,
         }
     }
 
@@ -3119,18 +3894,54 @@ impl std::error::Error for AggregateExecutionSource {
     }
 }
 
+impl AggregateExecutionSource {
+    const fn direct_route(&self) -> Option<AggregateDirectRoute> {
+        match self {
+            Self::ExactLiteral(_) => Some(AggregateDirectRoute::ExactLiteral),
+            Self::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
+            Self::WordRun(_) => Some(AggregateDirectRoute::WordRun),
+            Self::LiteralAssertions(_) => Some(AggregateDirectRoute::LiteralAssertions),
+            Self::BlockingDelimiter(_) => Some(AggregateDirectRoute::BlockingDelimiter),
+            Self::TokenPhrase(_) => Some(AggregateDirectRoute::TokenPhrase),
+            Self::FixedClassSandwich(_) => Some(AggregateDirectRoute::FixedClassSandwich),
+            Self::GraphemeScalarDfa(_) => Some(AggregateDirectRoute::GraphemeScalarDfa),
+            Self::BoundedClassSequence(_) => Some(AggregateDirectRoute::BoundedClassSequence),
+            Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
+            Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
+            Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
+            Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
+            Self::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            Self::FiniteLiteral(_) => Some(AggregateDirectRoute::DenseFiniteLiteral),
+            Self::SparseFiniteLiteral(_) => Some(AggregateDirectRoute::SparseFiniteLiteral),
+            Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
+            Self::FixedPredicateWord64(_) => Some(AggregateDirectRoute::FixedPredicateWord64),
+            Self::FixedAbsoluteDomain
+            | Self::FixedAbsoluteDomainResidual
+            | Self::Continuation(_)
+            | Self::InternalInvariant(_) => None,
+        }
+    }
+}
+
 /// Whole-operation failure. No alternate plan or strategy is attempted after
 /// this error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateExecutionError {
     /// Complete route-relevant attempted identity. Incumbents retain the full
-    /// cache key; U1 retains one construction owner and one lossless receipt.
+    /// cache key; direct and fixed routes retain a construction owner and one
+    /// lossless terminal receipt.
     pub identity: AggregateExecutionAttemptIdentity,
     /// Typed bounded selected-plan failure.
     pub source: AggregateExecutionSource,
 }
 
 impl AggregateExecutionError {
+    /// The one construction-owned terminal receipt for a direct reducer.
+    #[must_use]
+    pub const fn direct_receipt(&self) -> Option<&AggregateDirectAttemptReceipt> {
+        self.identity.direct_receipt()
+    }
+
     /// Complete selected-route continuation receipt retained on a
     /// continuation terminal outcome.
     #[must_use]
@@ -3164,6 +3975,14 @@ impl AggregateExecutionError {
         matches!(self.source, AggregateExecutionSource::Continuation(_))
             && self.identity.closes_fixed_source_kind(&self.source)
     }
+
+    /// Check that a direct terminal retains its exact construction owner,
+    /// invocation, limits, physical route, and lossless typed source.
+    #[must_use]
+    pub fn has_closed_direct_attempt(&self) -> bool {
+        self.source.direct_route().is_some()
+            && self.identity.closes_direct_source_kind(&self.source)
+    }
 }
 
 impl fmt::Display for AggregateExecutionError {
@@ -3174,6 +3993,14 @@ impl fmt::Display for AggregateExecutionError {
                 "aggregate {:?}/{:?}/{:?} execution failed: {}",
                 identity.operation, identity.plan, identity.plan_identity, self.source
             ),
+            AggregateExecutionAttemptIdentity::Direct(attempt) => {
+                let identity = attempt.cache_identity();
+                write!(
+                    f,
+                    "aggregate {:?}/{:?}/{:?} execution failed: {}",
+                    identity.operation, identity.plan, identity.plan_identity, self.source
+                )
+            }
             AggregateExecutionAttemptIdentity::Continuation { cache, .. } => write!(
                 f,
                 "aggregate {:?}/{:?}/{:?} execution failed: {}",
@@ -3198,6 +4025,7 @@ impl std::error::Error for AggregateExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.identity {
             AggregateExecutionAttemptIdentity::Incumbent(_)
+            | AggregateExecutionAttemptIdentity::Direct(_)
             | AggregateExecutionAttemptIdentity::Continuation { .. } => Some(&self.source),
             AggregateExecutionAttemptIdentity::FixedAbsoluteDomain(attempt) => {
                 Some(attempt.receipt().terminal_error())
@@ -3260,6 +4088,32 @@ pub enum AggregateExecutionDetails {
         certificate: AggregateOperationCertificate,
         accounting: AggregateExecutionAccounting,
     },
+}
+
+impl AggregateExecutionDetails {
+    const fn direct_route(&self) -> Option<AggregateDirectRoute> {
+        match self {
+            Self::ExactLiteral(_) => Some(AggregateDirectRoute::ExactLiteral),
+            Self::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
+            Self::WordRun(_) => Some(AggregateDirectRoute::WordRun),
+            Self::LiteralAssertions(_) => Some(AggregateDirectRoute::LiteralAssertions),
+            Self::BlockingDelimiter(_) => Some(AggregateDirectRoute::BlockingDelimiter),
+            Self::TokenPhrase(_) => Some(AggregateDirectRoute::TokenPhrase),
+            Self::FixedClassSandwich(_) => Some(AggregateDirectRoute::FixedClassSandwich),
+            Self::GraphemeScalarDfa(_) => Some(AggregateDirectRoute::GraphemeScalarDfa),
+            Self::BoundedClassSequence(_) => Some(AggregateDirectRoute::BoundedClassSequence),
+            Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
+            Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
+            Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
+            Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
+            Self::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            Self::FiniteLiteral { .. } => Some(AggregateDirectRoute::DenseFiniteLiteral),
+            Self::SparseFiniteLiteral { .. } => Some(AggregateDirectRoute::SparseFiniteLiteral),
+            Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
+            Self::FixedPredicateWord64(_) => Some(AggregateDirectRoute::FixedPredicateWord64),
+            Self::FixedAbsoluteDomain(_) | Self::Continuation { .. } => None,
+        }
+    }
 }
 
 /// Branch-explicit execution evidence for the fixed absolute-domain route.
@@ -3496,17 +4350,94 @@ fn fixed_residual_composite(
 }
 
 /// Exact execution facts and the complete cache identity used for the call.
+///
+/// The two fields are deliberately read-only. Callers can inspect or clone
+/// them through [`Self::identity`], [`Self::details`], and
+/// [`Self::cache_identity`], but cannot construct a report or splice mutated
+/// public fields around its construction provenance.
+///
+/// ```compile_fail
+/// use fre::{AggregateExecutionReport, AggregateRunLimits};
+///
+/// fn forge(report: &mut AggregateExecutionReport) {
+///     report.identity.execution_limits = AggregateRunLimits::default();
+///     report.details = report.details().clone();
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateExecutionReport {
-    pub identity: AggregateCacheIdentity,
-    pub details: AggregateExecutionDetails,
+    identity: AggregateCacheIdentity,
+    details: AggregateExecutionDetails,
 }
 
 impl AggregateExecutionReport {
+    /// Immutable complete cache identity sealed before report publication.
+    #[must_use]
+    pub const fn identity(&self) -> &AggregateCacheIdentity {
+        &self.identity
+    }
+
+    /// Immutable route-specific prospective and actual accounting.
+    #[must_use]
+    pub const fn details(&self) -> &AggregateExecutionDetails {
+        &self.details
+    }
+
+    pub(crate) fn into_details(self) -> AggregateExecutionDetails {
+        self.details
+    }
+
     /// Clone the complete public cache certificate without allocation.
     #[must_use]
     pub fn cache_identity(&self) -> AggregateCacheIdentity {
         self.identity.clone()
+    }
+
+    /// Construction owner shared by first and steady direct executions.
+    #[must_use]
+    pub fn direct_owner(&self) -> Option<AggregateDirectOwnerSeal> {
+        let route = self.details.direct_route()?;
+        AggregateDirectOwnerSeal::from_cache_identity(&self.identity, route)
+    }
+
+    /// Check the immutable cache, route, operation, identity, and P/A fields
+    /// retained before report publication.
+    #[must_use]
+    pub fn has_closed_direct_attempt(&self) -> bool {
+        let Some(owner) = self.direct_owner() else {
+            return false;
+        };
+        self.details.direct_route() == Some(owner.identity.route)
+            && owner.closes_cache_identity(&self.identity)
+            && direct_details_close_cache(&self.identity, &self.details)
+    }
+}
+
+impl AggregateDirectOwnerSeal {
+    /// Authenticate this construction owner against a complete public cache
+    /// identity from a success report or terminal attempt.
+    #[must_use]
+    pub fn authenticates(&self, cache: &AggregateCacheIdentity) -> bool {
+        self.closes_cache_identity(cache)
+    }
+}
+
+impl AggregateDirectAttemptIdentity {
+    /// Exact construction owner retained by this terminal direct attempt.
+    #[must_use]
+    pub const fn owner(&self) -> &AggregateDirectOwnerSeal {
+        self.receipt.owner()
+    }
+}
+
+impl AggregateExecutionAttemptIdentity {
+    /// Exact construction owner retained by a direct terminal attempt.
+    #[must_use]
+    pub const fn direct_owner(&self) -> Option<&AggregateDirectOwnerSeal> {
+        match self {
+            Self::Direct(attempt) => Some(attempt.owner()),
+            Self::Incumbent(_) | Self::Continuation { .. } | Self::FixedAbsoluteDomain(_) => None,
+        }
     }
 }
 
@@ -7437,6 +8368,56 @@ impl AggregatePlan {
         }
     }
 
+    const fn direct_route(&self) -> Option<AggregateDirectRoute> {
+        match self.engine {
+            AggregateEngine::ExactLiteral(_) => Some(AggregateDirectRoute::ExactLiteral),
+            AggregateEngine::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
+            AggregateEngine::WordRun(_) => Some(AggregateDirectRoute::WordRun),
+            AggregateEngine::LiteralAssertions(_) => Some(AggregateDirectRoute::LiteralAssertions),
+            AggregateEngine::BlockingDelimiter(_) => Some(AggregateDirectRoute::BlockingDelimiter),
+            AggregateEngine::TokenPhrase(_) => Some(AggregateDirectRoute::TokenPhrase),
+            AggregateEngine::FixedClassSandwich(_) => {
+                Some(AggregateDirectRoute::FixedClassSandwich)
+            }
+            AggregateEngine::GraphemeScalarDfa(_) => Some(AggregateDirectRoute::GraphemeScalarDfa),
+            AggregateEngine::BoundedClassSequence(_) => {
+                Some(AggregateDirectRoute::BoundedClassSequence)
+            }
+            AggregateEngine::BoundedSeparatedFields(_) => {
+                Some(AggregateDirectRoute::BoundedSeparatedFields)
+            }
+            AggregateEngine::PrefixClassAlternation(_) => {
+                Some(AggregateDirectRoute::PrefixClassAlternation)
+            }
+            AggregateEngine::LiteralClassRunLiteral(_) => {
+                Some(AggregateDirectRoute::LiteralClassRunLiteral)
+            }
+            AggregateEngine::BoundedLiteralPair(_) => {
+                Some(AggregateDirectRoute::BoundedLiteralPair)
+            }
+            AggregateEngine::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            AggregateEngine::FiniteCount(_) | AggregateEngine::FiniteSpanSum(_) => {
+                Some(AggregateDirectRoute::DenseFiniteLiteral)
+            }
+            AggregateEngine::SparseFiniteCount(_) | AggregateEngine::SparseFiniteSpanSum(_) => {
+                Some(AggregateDirectRoute::SparseFiniteLiteral)
+            }
+            AggregateEngine::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
+            AggregateEngine::FixedPredicateWord64(_) => {
+                Some(AggregateDirectRoute::FixedPredicateWord64)
+            }
+            AggregateEngine::FixedAbsoluteDomain(_) | AggregateEngine::Continuation(_) => None,
+        }
+    }
+
+    fn direct_owner_seal(
+        &self,
+        cache: &AggregateCacheIdentity,
+    ) -> Option<AggregateDirectOwnerSeal> {
+        let route = self.direct_route()?;
+        AggregateDirectOwnerSeal::from_cache_identity(cache, route)
+    }
+
     /// Return the exact fixed-domain guard envelope for a complete original
     /// haystack without borrowing or inspecting that haystack.
     ///
@@ -7568,6 +8549,44 @@ impl AggregatePlan {
         }
     }
 
+    fn direct_execution_error(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        source: AggregateExecutionSource,
+    ) -> AggregateExecutionError {
+        let cache = self.cache_identity(execution_limits);
+        let Some(owner) = self.direct_owner_seal(&cache) else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "direct terminal failure lacks its construction-owned route seal",
+                ),
+            );
+        };
+        if source.direct_route() != Some(owner.identity.route) {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "direct terminal failure differs from its published physical route",
+                ),
+            );
+        }
+        let receipt = AggregateDirectAttemptReceipt {
+            owner,
+            invocation: AggregateDirectInvocation {
+                haystack_len,
+                range: 0..haystack_len,
+                operation: self.operation(),
+            },
+            source: AggregateDirectReceiptSource::capture(&source),
+            authenticated_terminal: AggregateDirectAttemptTerminal::Failure,
+            terminal: AggregateDirectAttemptTerminal::Failure,
+        };
+        let identity = AggregateExecutionAttemptIdentity::direct(cache, receipt);
+        AggregateExecutionError { identity, source }
+    }
+
     fn continuation_execution_error(
         &self,
         execution_limits: &AggregateRunLimits,
@@ -7633,10 +8652,8 @@ impl AggregatePlan {
         execution_limits: &AggregateRunLimits,
         details: AggregateExecutionDetails,
     ) -> AggregateExecutionReport {
-        AggregateExecutionReport {
-            identity: self.cache_identity(execution_limits),
-            details,
-        }
+        let identity = self.cache_identity(execution_limits);
+        AggregateExecutionReport { identity, details }
     }
 
     fn fixed_residual_persistent_bytes(
@@ -7672,25 +8689,38 @@ impl AggregatePlan {
                 .count(haystack, limits.exact_literal)
                 .map(AggregateCountExecution::ExactLiteral)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ExactLiteral(source),
+                    )
                 }),
             AggregateEngine::UnicodeScalar(engine) => engine
                 .count(haystack, limits.unicode_scalar)
                 .map(AggregateCountExecution::UnicodeScalar)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
                 }),
             AggregateEngine::WordRun(engine) => engine
                 .aggregate_count(haystack, limits.word_run)
                 .map(AggregateCountExecution::WordRun)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
                 }),
             AggregateEngine::LiteralAssertions(engine) => engine
                 .count(haystack, limits.literal_assertions)
                 .map(AggregateCountExecution::LiteralAssertions)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::LiteralAssertions(source),
                     )
@@ -7699,7 +8729,8 @@ impl AggregatePlan {
                 .count(haystack, limits.blocking_delimiter)
                 .map(AggregateCountExecution::BlockingDelimiter)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BlockingDelimiter(source),
                     )
@@ -7708,13 +8739,18 @@ impl AggregatePlan {
                 .count(haystack, limits.token_phrase)
                 .map(AggregateCountExecution::TokenPhrase)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::TokenPhrase(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::TokenPhrase(source),
+                    )
                 }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .count(haystack, limits.fixed_class_sandwich)
                 .map(AggregateCountExecution::FixedClassSandwich)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::FixedClassSandwich(source),
                     )
@@ -7723,7 +8759,8 @@ impl AggregatePlan {
                 .count(haystack, limits.grapheme_scalar_dfa)
                 .map(AggregateCountExecution::GraphemeScalarDfa)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::GraphemeScalarDfa(source),
                     )
@@ -7732,7 +8769,8 @@ impl AggregatePlan {
                 .count(haystack, limits.bounded_class_sequence)
                 .map(AggregateCountExecution::BoundedClassSequence)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BoundedClassSequence(source),
                     )
@@ -7741,7 +8779,8 @@ impl AggregatePlan {
                 .count(haystack, limits.bounded_separated_fields)
                 .map(AggregateCountExecution::BoundedSeparatedFields)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BoundedSeparatedFields(source),
                     )
@@ -7750,7 +8789,8 @@ impl AggregatePlan {
                 .count(haystack, limits.prefix_class_alternation)
                 .map(AggregateCountExecution::PrefixClassAlternation)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::PrefixClassAlternation(source),
                     )
@@ -7759,7 +8799,8 @@ impl AggregatePlan {
                 .count(haystack, limits.literal_class_run_literal)
                 .map(AggregateCountExecution::LiteralClassRunLiteral)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
                     )
@@ -7768,7 +8809,8 @@ impl AggregatePlan {
                 .count(haystack, limits.bounded_literal_pair)
                 .map(AggregateCountExecution::BoundedLiteralPair)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BoundedLiteralPair(source),
                     )
@@ -7777,7 +8819,11 @@ impl AggregatePlan {
                 .count(haystack, limits.bounded_context)
                 .map(AggregateCountExecution::BoundedContext)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::BoundedContext(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedContext(source),
+                    )
                 }),
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 let guard = engine
@@ -7923,7 +8969,11 @@ impl AggregatePlan {
                     actual: result.accounting.actual,
                 })
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::FiniteLiteral(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
                 }),
             AggregateEngine::FiniteSpanSum(_) => Err(self.execution_error(
                 limits,
@@ -7939,7 +8989,8 @@ impl AggregatePlan {
                     actual: result.accounting.actual,
                 })
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::SparseFiniteLiteral(source),
                     )
@@ -7957,7 +9008,8 @@ impl AggregatePlan {
                 )
                 .map(AggregateCountExecution::GuardedAsciiWord)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
                     )
@@ -7969,7 +9021,8 @@ impl AggregatePlan {
                 )
                 .map(AggregateCountExecution::FixedPredicateWord64)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::FixedPredicateWord64(source),
                     )
@@ -8019,25 +9072,38 @@ impl AggregatePlan {
                 .span_sum(haystack, limits.exact_literal)
                 .map(AggregateSpanSumExecution::ExactLiteral)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::ExactLiteral(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ExactLiteral(source),
+                    )
                 }),
             AggregateEngine::UnicodeScalar(engine) => engine
                 .span_sum(haystack, limits.unicode_scalar)
                 .map(AggregateSpanSumExecution::UnicodeScalar)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
                 }),
             AggregateEngine::WordRun(engine) => engine
                 .aggregate_span_sum(haystack, limits.word_run)
                 .map(AggregateSpanSumExecution::WordRun)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
                 }),
             AggregateEngine::LiteralAssertions(engine) => engine
                 .span_sum(haystack, limits.literal_assertions)
                 .map(AggregateSpanSumExecution::LiteralAssertions)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::LiteralAssertions(source),
                     )
@@ -8046,7 +9112,8 @@ impl AggregatePlan {
                 .span_sum(haystack, limits.blocking_delimiter)
                 .map(AggregateSpanSumExecution::BlockingDelimiter)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BlockingDelimiter(source),
                     )
@@ -8055,13 +9122,18 @@ impl AggregatePlan {
                 .span_sum(haystack, limits.token_phrase)
                 .map(AggregateSpanSumExecution::TokenPhrase)
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::TokenPhrase(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::TokenPhrase(source),
+                    )
                 }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .span_sum(haystack, limits.fixed_class_sandwich)
                 .map(AggregateSpanSumExecution::FixedClassSandwich)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::FixedClassSandwich(source),
                     )
@@ -8094,7 +9166,8 @@ impl AggregatePlan {
                 .span_sum(haystack, limits.literal_class_run_literal)
                 .map(AggregateSpanSumExecution::LiteralClassRunLiteral)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
                     )
@@ -8103,7 +9176,8 @@ impl AggregatePlan {
                 .span_sum(haystack, limits.bounded_literal_pair)
                 .map(AggregateSpanSumExecution::BoundedLiteralPair)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::BoundedLiteralPair(source),
                     )
@@ -8142,7 +9216,11 @@ impl AggregatePlan {
                     actual: result.accounting.actual,
                 })
                 .map_err(|source| {
-                    self.execution_error(limits, AggregateExecutionSource::FiniteLiteral(source))
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
                 }),
             AggregateEngine::FiniteCount(_) => Err(self.execution_error(
                 limits,
@@ -8158,7 +9236,8 @@ impl AggregatePlan {
                     actual: result.accounting.actual,
                 })
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::SparseFiniteLiteral(source),
                     )
@@ -8176,7 +9255,8 @@ impl AggregatePlan {
                 )
                 .map(AggregateSpanSumExecution::GuardedAsciiWord)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
                     )
@@ -8188,7 +9268,8 @@ impl AggregatePlan {
                 )
                 .map(AggregateSpanSumExecution::FixedPredicateWord64)
                 .map_err(|source| {
-                    self.execution_error(
+                    self.direct_execution_error(
+                        haystack.len(),
                         limits,
                         AggregateExecutionSource::FixedPredicateWord64(source),
                     )

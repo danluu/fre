@@ -44,7 +44,7 @@ fn exact_quotes_shape_selects_operation_owned_leaf() {
         count.build_report().plan,
         AggregatePlanKind::BlockingDelimiter
     );
-    assert_eq!(count.build_report().schema_version, 32);
+    assert_eq!(count.build_report().schema_version, 33);
     let AggregatePlanIdentity::BlockingDelimiter(count_identity) =
         count.build_report().plan_identity
     else {
@@ -225,7 +225,7 @@ fn planner_build_and_execution_fences_are_exact() {
     let result = baseline
         .span_sum(haystack, AggregateRunLimits::default())
         .unwrap();
-    let AggregateExecutionDetails::BlockingDelimiter(accounting) = result.report().details else {
+    let AggregateExecutionDetails::BlockingDelimiter(accounting) = result.report().details() else {
         panic!("blocking delimiter executed another family");
     };
     let upper = accounting.upper_bounds;
@@ -250,6 +250,7 @@ fn planner_build_and_execution_fences_are_exact() {
             },
         )
         .unwrap_err();
+    assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::BlockingDelimiter(

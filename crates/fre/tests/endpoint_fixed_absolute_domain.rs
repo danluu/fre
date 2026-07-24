@@ -58,7 +58,7 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 504);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 48);
-    // Full public build/run provenance plus v31's independent WordRun,
+    // Full public build/run provenance plus schema 33's independent WordRun,
     // LiteralAssertions, BlockingDelimiter, and TokenPhrase policies remains
     // allocation-free and nonduplicated.
     assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_272);
@@ -135,7 +135,7 @@ fn endpoint_built_artifact_publishes_exact_authenticated_length_only_guard_p() {
     let count_result = count.count(b"aaa", AggregateRunLimits::default()).unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-    ) = &count_result.report().details
+    ) = count_result.report().details()
     else {
         panic!("fixed count execution lost its guard receipt");
     };
@@ -151,7 +151,7 @@ fn endpoint_built_artifact_publishes_exact_authenticated_length_only_guard_p() {
         .unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-    ) = &span_sum_result.report().details
+    ) = span_sum_result.report().details()
     else {
         panic!("fixed span-sum execution lost its guard receipt");
     };
@@ -257,14 +257,18 @@ fn endpoint_explicit_thirteen_row_mapping_has_one_eager_first_and_steady_identit
             expected_identity,
             "{name}"
         );
-        assert_eq!(steady.report().details, first.report().details, "{name}");
+        assert_eq!(
+            steady.report().details(),
+            first.report().details(),
+            "{name}"
+        );
         assert!(Arc::ptr_eq(
             &expected_identity.syntax_key,
             &first.report().cache_identity().syntax_key
         ));
         let AggregateExecutionDetails::FixedAbsoluteDomain(
             AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-        ) = &first.report().details
+        ) = first.report().details()
         else {
             panic!("{name} did not execute the direct fixed route")
         };
@@ -454,7 +458,7 @@ fn endpoint_start_prefix_preserves_canonical_hir_ordinals_and_rejects_wider_bran
             .unwrap();
         let AggregateExecutionDetails::FixedAbsoluteDomain(
             AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-        ) = &result.report().details
+        ) = result.report().details()
         else {
             panic!("ordered-prefix route lost direct guard details");
         };
@@ -547,7 +551,7 @@ fn endpoint_scalar_guard_is_direct_outside_envelope_and_nested_inside() {
             .count(&haystack, AggregateRunLimits::default())
             .unwrap();
         assert_eq!(result.value(), expected, "len={}", haystack.len());
-        match &result.report().details {
+        match result.report().details() {
             AggregateExecutionDetails::FixedAbsoluteDomain(
                 AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
             ) => {
@@ -1182,8 +1186,8 @@ fn endpoint_u1_limits_remain_exact_in_every_full_cache_identity() {
         assert_eq!(first.report().cache_identity(), baseline_identity);
         assert_eq!(second.report().cache_identity(), changed_identity);
         assert_ne!(baseline_identity, changed_identity);
-        assert_ne!(first.report().identity, second.report().identity);
-        assert_eq!(first.report().details, second.report().details);
+        assert_ne!(first.report().identity(), second.report().identity());
+        assert_eq!(first.report().details(), second.report().details());
     }
 }
 
@@ -1776,7 +1780,7 @@ fn endpoint_facade_forwards_exact_and_every_positive_one_below_fixed_run_limits(
         .unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
-    ) = &baseline.report().details
+    ) = baseline.report().details()
     else {
         panic!("ordered-prefix baseline lacks fixed guard receipt");
     };
@@ -1926,7 +1930,7 @@ fn endpoint_scalar_residual_publishes_one_p_before_every_positive_limit_refusal(
         .unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Residual { composite },
-    ) = &baseline.report().details
+    ) = baseline.report().details()
     else {
         panic!("scalar baseline did not select its eager residual");
     };
@@ -1985,7 +1989,7 @@ fn endpoint_scalar_outer_run_caps_are_exact_and_prefail_every_one_below() {
     let success = regex.count(&haystack, exact).unwrap();
     let AggregateExecutionDetails::FixedAbsoluteDomain(
         AggregateFixedAbsoluteDomainExecutionDetails::Residual { composite, .. },
-    ) = &success.report().details
+    ) = success.report().details()
     else {
         panic!("exact outer limits changed the scalar route");
     };
@@ -2064,7 +2068,7 @@ fn endpoint_scalar_complete_guard_has_no_hypothetical_composite_p() {
     let result = regex.count(&haystack, limits).unwrap();
     assert_eq!(result.value(), 0);
     assert!(matches!(
-        &result.report().details,
+        result.report().details(),
         AggregateExecutionDetails::FixedAbsoluteDomain(
             AggregateFixedAbsoluteDomainExecutionDetails::Direct { .. }
         )

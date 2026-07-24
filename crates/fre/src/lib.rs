@@ -53,13 +53,17 @@ mod token_phrase;
 mod unicode_word_run;
 
 pub use aggregate::{
+    AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
     AggregateBlockingDelimiterSemantics, AggregateBoundedContextIdentity,
     AggregateBoundedLiteralPairIdentity, AggregateBoundedSeparatedFieldsIdentity,
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
     AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
-    AggregateCountResult, AggregateExactLiteralIdentity, AggregateExactLiteralSemantics,
+    AggregateCountResult, AggregateDirectAttemptIdentity, AggregateDirectAttemptReceipt,
+    AggregateDirectAttemptTerminal, AggregateDirectDeclaredFallback, AggregateDirectInvocation,
+    AggregateDirectOwnerSeal, AggregateDirectRoute, AggregateDirectRouteIdentity,
+    AggregateExactLiteralIdentity, AggregateExactLiteralSemantics,
     AggregateExecutionAttemptIdentity, AggregateExecutionDetails, AggregateExecutionError,
     AggregateExecutionIdentity, AggregateExecutionReport, AggregateExecutionSource,
     AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,

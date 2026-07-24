@@ -175,7 +175,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v32-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v33-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4411,7 +4411,7 @@ fn execute_composite_count_stage(
     *slot = true;
     charge_count_execution(
         &mut state.accounting,
-        &result.report().details,
+        result.report().details(),
         result.value(),
         limits,
     )
@@ -16170,7 +16170,7 @@ mod tests {
                     &work_one_below,
                 )
                 .unwrap_err();
-                assert_eq!(work.status, Status::Unsupported);
+                assert_eq!(work.status, Status::Unsupported, "{work:?}");
 
                 let sequential_one_below = RunLimits {
                     fre_aggregate_sequential_bytes: bytes - 1,
@@ -16184,7 +16184,7 @@ mod tests {
                     &sequential_one_below,
                 )
                 .unwrap_err();
-                assert_eq!(sequential.status, Status::Unsupported);
+                assert_eq!(sequential.status, Status::Unsupported, "{sequential:?}");
             }
         }
     }
@@ -16423,7 +16423,7 @@ mod tests {
                         composite: receipt,
                         ..
                     },
-                ) = &execution.report().details
+                ) = execution.report().details()
                 else {
                     panic!("in-envelope scalar execution lacks residual receipt")
                 };
@@ -16697,14 +16697,14 @@ mod tests {
                         .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
                     assert_eq!(first.value(), case.expected, "{}", case.id);
                     assert_eq!(steady.value(), case.expected, "{}", case.id);
-                    assert_eq!(first.report().identity, identity, "{}", case.id);
+                    assert_eq!(first.report().identity(), &identity, "{}", case.id);
                     assert_eq!(steady.report(), first.report(), "{}", case.id);
                     assert!(std::sync::Arc::ptr_eq(
                         &identity.syntax_key,
-                        &first.report().identity.syntax_key
+                        &first.report().identity().syntax_key
                     ));
                     assert_guard(
-                        &first.report().details,
+                        first.report().details(),
                         prospective,
                         composite_prospective,
                         limits,
@@ -16743,14 +16743,14 @@ mod tests {
                         .unwrap_or_else(|error| panic!("{} steady: {error}", case.id));
                     assert_eq!(first.value(), case.expected, "{}", case.id);
                     assert_eq!(steady.value(), case.expected, "{}", case.id);
-                    assert_eq!(first.report().identity, identity, "{}", case.id);
+                    assert_eq!(first.report().identity(), &identity, "{}", case.id);
                     assert_eq!(steady.report(), first.report(), "{}", case.id);
                     assert!(std::sync::Arc::ptr_eq(
                         &identity.syntax_key,
-                        &first.report().identity.syntax_key
+                        &first.report().identity().syntax_key
                     ));
                     assert_guard(
-                        &first.report().details,
+                        first.report().details(),
                         prospective,
                         composite_prospective,
                         limits,
@@ -17536,7 +17536,7 @@ mod tests {
         let AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
-        } = &result.report().details
+        } = result.report().details()
         else {
             panic!("URL count must publish continuation execution details");
         };
@@ -17671,7 +17671,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v32-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v33-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -17731,7 +17731,8 @@ mod tests {
             .count(haystack, count_limits)
             .expect("audited Word64 count");
         assert_eq!(counted.value(), 3);
-        let AggregateExecutionDetails::FixedPredicateWord64(accounting) = counted.report().details
+        let AggregateExecutionDetails::FixedPredicateWord64(accounting) =
+            counted.report().details()
         else {
             panic!("expected fixed-predicate Word64 execution accounting");
         };
@@ -18866,7 +18867,7 @@ mod tests {
         let fre::AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
-        } = &audited.report().details
+        } = audited.report().details()
         else {
             panic!("expected continuation count details");
         };
@@ -18903,7 +18904,7 @@ mod tests {
         let fre::AggregateExecutionDetails::Continuation {
             certificate,
             accounting,
-        } = &audited.report().details
+        } = audited.report().details()
         else {
             panic!("expected continuation span-sum details");
         };
@@ -18950,7 +18951,7 @@ mod tests {
         let sequential = run_limits.continuation.max_sequential_bytes;
         let audited = regex.count(haystack, run_limits).unwrap();
         let fre::AggregateExecutionDetails::Continuation { accounting, .. } =
-            &audited.report().details
+            audited.report().details()
         else {
             panic!("expected continuation execution details");
         };
