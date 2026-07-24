@@ -12,6 +12,7 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+mod blocking_delimiter;
 mod bounded_class_sequence;
 mod bounded_context;
 mod bounded_literal_pair;
@@ -92,6 +93,20 @@ pub use bounded_separated_fields::{
     ReduceError as BoundedSeparatedFieldsReduceError,
     ReduceLimits as BoundedSeparatedFieldsReduceLimits,
     ReduceUpperBounds as BoundedSeparatedFieldsUpperBounds,
+};
+
+pub use blocking_delimiter::{
+    BlockingDelimiterPlan, BuildAccounting as BlockingDelimiterBuildAccounting,
+    BuildError as BlockingDelimiterBuildError, BuildLimits as BlockingDelimiterBuildLimits,
+    COUNT_OPERATION_ID as BLOCKING_DELIMITER_COUNT_OPERATION_ID,
+    CountResult as BlockingDelimiterCountResult,
+    OperationIdentity as BlockingDelimiterOperationIdentity, PLAN_ID as BLOCKING_DELIMITER_PLAN_ID,
+    ReduceAccounting as BlockingDelimiterReduceAccounting,
+    ReduceActualCounters as BlockingDelimiterActualCounters,
+    ReduceError as BlockingDelimiterReduceError, ReduceLimits as BlockingDelimiterReduceLimits,
+    ReduceUpperBounds as BlockingDelimiterUpperBounds,
+    SPAN_SUM_OPERATION_ID as BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as BlockingDelimiterSpanSumResult, Topology as BlockingDelimiterTopology,
 };
 pub use byte_start_map::{
     BuildAccounting as ByteStartMapBuildAccounting, BuildError as ByteStartMapBuildError,

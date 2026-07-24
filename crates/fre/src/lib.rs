@@ -27,6 +27,7 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_many;
+mod blocking_delimiter;
 mod bounded_literal_pair;
 mod capture_count_seal;
 mod capture_noqa;
@@ -50,7 +51,8 @@ mod text_set;
 mod unicode_word_run;
 
 pub use aggregate::{
-    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBoundedContextIdentity,
+    AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
+    AggregateBlockingDelimiterSemantics, AggregateBoundedContextIdentity,
     AggregateBoundedLiteralPairIdentity, AggregateBoundedSeparatedFieldsIdentity,
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
@@ -162,20 +164,26 @@ pub use fre_capture_lab::{
     Span as CaptureSpan, Window as CaptureWindow,
 };
 pub use fre_kernels::{
-    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
-    BOUNDED_CLASS_SEQUENCE_PLAN_ID, BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
+    BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,
+    BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_PLAN_ID,
+    BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CLASS_SEQUENCE_PLAN_ID,
+    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
     BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_PLAN_ID,
     BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
     BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
     BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BOUNDED_SEPARATED_FIELDS_PLAN_ID,
-    BoundedClassSequenceActualCounters, BoundedClassSequenceBuildAccounting,
-    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
-    BoundedClassSequenceOperationIdentity, BoundedClassSequenceReduceAccounting,
-    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
-    BoundedClassSequenceUpperBounds, BoundedContextActualCounters, BoundedContextBuildAccounting,
-    BoundedContextBuildError, BoundedContextBuildLimits, BoundedContextOperationIdentity,
-    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
-    BoundedContextUpperBounds, BoundedLiteralPairActualCounters, BoundedLiteralPairBuildAccounting,
+    BlockingDelimiterActualCounters, BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError,
+    BlockingDelimiterBuildLimits, BlockingDelimiterOperationIdentity,
+    BlockingDelimiterReduceAccounting, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
+    BlockingDelimiterTopology, BlockingDelimiterUpperBounds, BoundedClassSequenceActualCounters,
+    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
+    BoundedClassSequenceBuildLimits, BoundedClassSequenceOperationIdentity,
+    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
+    BoundedClassSequenceReduceLimits, BoundedClassSequenceUpperBounds,
+    BoundedContextActualCounters, BoundedContextBuildAccounting, BoundedContextBuildError,
+    BoundedContextBuildLimits, BoundedContextOperationIdentity, BoundedContextReduceAccounting,
+    BoundedContextReduceError, BoundedContextReduceLimits, BoundedContextUpperBounds,
+    BoundedLiteralPairActualCounters, BoundedLiteralPairBuildAccounting,
     BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
     BoundedLiteralPairOperationIdentity, BoundedLiteralPairReduceAccounting,
     BoundedLiteralPairReduceError, BoundedLiteralPairReduceLimits, BoundedLiteralPairTopology,
