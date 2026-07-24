@@ -45,10 +45,14 @@ pub enum ResourceKind {
     AggregateHistoryNodes,
     /// Total persistent history reconstruction steps in aggregate iteration.
     AggregateHistoryWalk,
-    /// Capture group entries inspected by an aggregate reducer.
+    /// Capture group entries inspected or materialized by an aggregate operation.
     CaptureEvents,
     /// Participating capture groups accumulated by an aggregate reducer.
     CaptureCount,
+    /// Versioned logical bytes retained by materialized capture output.
+    RetainedOutputBytes,
+    /// Peak logical retained/current-output bytes plus current search scratch.
+    CombinedPeakBytes,
 }
 
 /// A checked compiler admission failure.

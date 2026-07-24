@@ -34,7 +34,8 @@ pub use history::HistoryRegex;
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
 pub use model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord, MatchKind,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord,
+    HistoryProgramShape, HistorySearchProspective, MatchKind, RestartedHistoryProspective,
     RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;

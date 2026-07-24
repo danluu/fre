@@ -3,12 +3,263 @@
 use std::mem::size_of;
 
 use crate::ast::Assertion;
-use crate::compile::{Program, State};
+use crate::compile::Program;
 use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
-use crate::model::{CaptureRecord, GroupRecord, Span, Window};
+use crate::model::{
+    CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective,
+    RestartedHistoryProspective, Span, Window,
+};
 
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
+
+impl HistoryProgramShape {
+    /// Logical group-vector and cloned-name bytes present while one canonical
+    /// record is materialized. This versioned accounting intentionally uses
+    /// element sizes and name payload lengths, not allocator capacity.
+    pub fn materialized_record_bytes(self) -> Result<usize, SearchError> {
+        self.groups
+            .checked_mul(size_of::<GroupRecord>())
+            .and_then(|bytes| bytes.checked_add(self.name_payload_bytes))
+            .ok_or(SearchError::BoundOverflow(
+                ResourceKind::RetainedOutputBytes,
+            ))
+    }
+
+    /// Logical bytes retained per returned record: one outer vector cell plus
+    /// that record's group-vector cells and cloned name payloads.
+    pub fn retained_record_bytes(self) -> Result<usize, SearchError> {
+        self.materialized_record_bytes()?
+            .checked_add(size_of::<CaptureRecord>())
+            .ok_or(SearchError::BoundOverflow(
+                ResourceKind::RetainedOutputBytes,
+            ))
+    }
+
+    /// Derive one search envelope from immutable program shape and byte
+    /// boundaries only. No source byte is inspected.
+    pub fn search_prospective(
+        self,
+        window: Window,
+        from: usize,
+    ) -> Result<HistorySearchProspective, SearchError> {
+        if window.start > window.end || from < window.start || from > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        let boundaries = boundary_count(window, from)?;
+        self.search_prospective_for_boundaries(boundaries)
+    }
+
+    /// Derive the complete worst-case restarted-session envelope. At most one
+    /// capture record is retained at each byte boundary. Every nonterminal
+    /// boundary can be searched twice only when Rust empty-match progression
+    /// suppresses the second winner; the terminal boundary is searched once.
+    pub fn restarted_prospective(
+        self,
+        window: Window,
+    ) -> Result<RestartedHistoryProspective, SearchError> {
+        self.restarted_prospective_with_minimum(window, 0)
+    }
+
+    /// Derive the complete restarted-session envelope using a
+    /// construction-proved whole-match lower bound. A positive bound excludes
+    /// empty progression and limits successful restarts; zero retains the
+    /// general nullable envelope.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-independent restarted-work and retained-output proof remains one checked arithmetic derivation"
+    )]
+    pub fn restarted_prospective_with_minimum(
+        self,
+        window: Window,
+        minimum_match_bytes: usize,
+    ) -> Result<RestartedHistoryProspective, SearchError> {
+        if window.start > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        let boundaries = boundary_count(window, window.start)?;
+        let length = boundaries.saturating_sub(1);
+        let (searches, results, coefficient, bytes_examined, materialized_records) =
+            if minimum_match_bytes == 0 {
+                let searches = boundaries
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::Searches))?;
+                let coefficient = boundaries
+                    .checked_mul(boundaries.checked_add(1).ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?)
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?;
+                let bytes_examined =
+                    boundaries
+                        .checked_mul(length)
+                        .ok_or(SearchError::BoundOverflow(
+                            ResourceKind::AggregateStateVisits,
+                        ))?;
+                (searches, boundaries, coefficient, bytes_examined, searches)
+            } else {
+                let results = length
+                    .checked_div(minimum_match_bytes)
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::Results))?;
+                let searches = results
+                    .checked_add(1)
+                    .ok_or(SearchError::BoundOverflow(ResourceKind::Searches))?;
+                let progress = minimum_match_bytes
+                    .checked_mul(triangular(results, ResourceKind::AggregateStateVisits)?)
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?;
+                let coefficient = searches
+                    .checked_mul(boundaries)
+                    .and_then(|value| value.checked_sub(progress))
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?;
+                let bytes_examined = searches
+                    .checked_mul(length)
+                    .and_then(|value| value.checked_sub(progress))
+                    .ok_or(SearchError::BoundOverflow(
+                        ResourceKind::AggregateStateVisits,
+                    ))?;
+                (searches, results, coefficient, bytes_examined, results)
+            };
+        let state_visits_per_boundary =
+            self.states
+                .checked_mul(4)
+                .ok_or(SearchError::BoundOverflow(
+                    ResourceKind::AggregateStateVisits,
+                ))?;
+        let total_state_visits = state_visits_per_boundary.checked_mul(coefficient).ok_or(
+            SearchError::BoundOverflow(ResourceKind::AggregateStateVisits),
+        )?;
+        let total_history_nodes =
+            self.save_states
+                .checked_mul(coefficient)
+                .ok_or(SearchError::BoundOverflow(
+                    ResourceKind::AggregateHistoryNodes,
+                ))?;
+        let total_history_walk =
+            self.save_states
+                .checked_mul(coefficient)
+                .ok_or(SearchError::BoundOverflow(
+                    ResourceKind::AggregateHistoryWalk,
+                ))?;
+        let capture_events = materialized_records
+            .checked_mul(self.groups)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::CaptureEvents))?;
+        let starts_injected = coefficient;
+        let largest = self.search_prospective(window, window.start)?;
+        let retained_output_bytes = results.checked_mul(self.retained_record_bytes()?).ok_or(
+            SearchError::BoundOverflow(ResourceKind::RetainedOutputBytes),
+        )?;
+        // The retained bound includes one complete cell/payload budget for
+        // every possible boundary. It therefore also dominates the transient
+        // current materialization after any prior retained prefix, including
+        // a nullable winner that will be suppressed.
+        let combined_peak_bytes = retained_output_bytes
+            .checked_add(largest.scratch_bytes)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::CombinedPeakBytes))?;
+        Ok(RestartedHistoryProspective {
+            window,
+            minimum_match_bytes,
+            largest_search: largest,
+            searches,
+            materialized_records,
+            results,
+            total_state_visits,
+            total_slot_copies: 0,
+            total_history_nodes,
+            total_history_walk,
+            capture_events,
+            bytes_examined,
+            starts_injected,
+            peak_threads: self.states,
+            scratch_bytes: largest.scratch_bytes,
+            retained_output_bytes,
+            combined_peak_bytes,
+        })
+    }
+
+    pub(crate) fn search_prospective_for_boundaries(
+        self,
+        boundaries: usize,
+    ) -> Result<HistorySearchProspective, SearchError> {
+        let state_visits = self
+            .states
+            .checked_mul(4)
+            .and_then(|per_boundary| per_boundary.checked_mul(boundaries))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+        // `add_thread` marks a program counter before dispatch, and one mark
+        // generation spans all closure roots at an input boundary.
+        let history_nodes = self
+            .save_states
+            .checked_mul(boundaries)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
+        let thread_bytes = self
+            .states
+            .checked_mul(3)
+            .and_then(|count| count.checked_mul(size_of::<(usize, Option<usize>)>()))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let seen_bytes = self
+            .states
+            .checked_mul(size_of::<usize>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let history_bytes = history_nodes
+            .checked_mul(size_of::<(usize, usize, Option<usize>)>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let history_chunks = history_nodes
+            .checked_add(HISTORY_CHUNK_CAPACITY.saturating_sub(1))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?
+            .checked_div(HISTORY_CHUNK_CAPACITY)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let history_chunk_headers = history_chunks
+            .checked_mul(size_of::<Vec<(usize, usize, Option<usize>)>>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let materialized_slots = self
+            .slots
+            .checked_mul(size_of::<Option<usize>>())
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let container_headers = size_of::<Vec<usize>>()
+            .checked_mul(6)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        let scratch_bytes = thread_bytes
+            .checked_add(seen_bytes)
+            .and_then(|bytes| bytes.checked_add(history_bytes))
+            .and_then(|bytes| bytes.checked_add(history_chunk_headers))
+            .and_then(|bytes| bytes.checked_add(materialized_slots))
+            .and_then(|bytes| bytes.checked_add(container_headers))
+            .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+        Ok(HistorySearchProspective {
+            state_visits,
+            history_nodes,
+            history_walk: history_nodes,
+            bytes_examined: boundaries.saturating_sub(1),
+            starts_injected: boundaries,
+            peak_threads: self.states,
+            scratch_bytes,
+        })
+    }
+}
+
+fn triangular(value: usize, resource: ResourceKind) -> Result<usize, SearchError> {
+    let successor = value
+        .checked_add(1)
+        .ok_or(SearchError::BoundOverflow(resource))?;
+    if value.is_multiple_of(2) {
+        value
+            .checked_div(2)
+            .and_then(|half| half.checked_mul(successor))
+            .ok_or(SearchError::BoundOverflow(resource))
+    } else {
+        successor
+            .checked_div(2)
+            .and_then(|half| half.checked_mul(value))
+            .ok_or(SearchError::BoundOverflow(resource))
+    }
+}
 
 pub(crate) fn assertion_matches(
     assertion: Assertion,
@@ -252,81 +503,32 @@ fn admit_history_boundaries(
     boundaries: usize,
     limits: SearchLimits,
 ) -> Result<Admission, SearchError> {
-    let state_visit_bound = state_visit_bound(program, boundaries)?;
+    let prospective = program
+        .history_program_shape()
+        .search_prospective_for_boundaries(boundaries)?;
     check(
         ResourceKind::StateVisits,
-        state_visit_bound,
+        prospective.state_visits,
         limits.max_state_visits,
     )?;
-    // `add_thread` marks a program counter before dispatch, and one mark
-    // generation spans all closure roots at an input boundary. Therefore a
-    // Save instruction can append at most one history node per boundary.
-    // Charging every possible state visit as a history append needlessly
-    // refuses large capture-free programs whose only Save instructions are
-    // the two group-zero tags inserted by the compiler.
-    let save_states = program
-        .states
-        .iter()
-        .filter(|state| matches!(state, State::Save { .. }))
-        .count();
-    let history_node_bound = save_states
-        .checked_mul(boundaries)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::HistoryNodes))?;
     check(
         ResourceKind::HistoryNodes,
-        history_node_bound,
+        prospective.history_nodes,
         limits.max_history_nodes,
     )?;
     check(
         ResourceKind::HistoryWalk,
-        history_node_bound,
+        prospective.history_walk,
         limits.max_history_walk,
     )?;
-
-    let thread_bytes = program
-        .states
-        .len()
-        .checked_mul(3)
-        .and_then(|count| count.checked_mul(size_of::<(usize, Option<usize>)>()))
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let seen_bytes = program
-        .states
-        .len()
-        .checked_mul(size_of::<usize>())
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let history_bytes = history_node_bound
-        .checked_mul(size_of::<(usize, usize, Option<usize>)>())
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let history_chunks = history_node_bound
-        .checked_add(HISTORY_CHUNK_CAPACITY.saturating_sub(1))
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?
-        .checked_div(HISTORY_CHUNK_CAPACITY)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let history_chunk_headers = history_chunks
-        .checked_mul(size_of::<Vec<(usize, usize, Option<usize>)>>())
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let materialized_slots = program
-        .slot_count
-        .checked_mul(size_of::<Option<usize>>())
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let container_headers = size_of::<Vec<usize>>()
-        .checked_mul(6)
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
-    let scratch_bytes = thread_bytes
-        .checked_add(seen_bytes)
-        .and_then(|bytes| bytes.checked_add(history_bytes))
-        .and_then(|bytes| bytes.checked_add(history_chunk_headers))
-        .and_then(|bytes| bytes.checked_add(materialized_slots))
-        .and_then(|bytes| bytes.checked_add(container_headers))
-        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
     check(
         ResourceKind::ScratchBytes,
-        scratch_bytes,
+        prospective.scratch_bytes,
         limits.max_scratch_bytes,
     )?;
     Ok(Admission {
-        history_node_bound,
-        scratch_bytes,
+        history_node_bound: prospective.history_nodes,
+        scratch_bytes: prospective.scratch_bytes,
     })
 }
 
@@ -362,8 +564,8 @@ pub(crate) fn canonicalize(
     }
     let mut groups = Vec::new();
     groups
-        .try_reserve(program.groups.len())
-        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        .try_reserve_exact(program.groups.len())
+        .map_err(|_| SearchError::Allocation(ResourceKind::RetainedOutputBytes))?;
     for (numeric, meta) in program.groups.iter().enumerate() {
         let start_slot = numeric
             .checked_mul(2)
@@ -379,9 +581,21 @@ pub(crate) fn canonicalize(
             (None, None) => None,
             _ => return Err(SearchError::InvalidProgram),
         };
+        let name = meta
+            .name
+            .as_ref()
+            .map(|name| {
+                let mut copied = String::new();
+                copied
+                    .try_reserve_exact(name.len())
+                    .map_err(|_| SearchError::Allocation(ResourceKind::RetainedOutputBytes))?;
+                copied.push_str(name);
+                Ok(copied)
+            })
+            .transpose()?;
         groups.push(GroupRecord {
             index: meta.index,
-            name: meta.name.clone(),
+            name,
             span,
         });
     }

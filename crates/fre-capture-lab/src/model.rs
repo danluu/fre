@@ -180,6 +180,88 @@ pub struct AggregateOutcome {
     pub total_history_nodes: usize,
 }
 
+/// Immutable structural shape of the persistent-history program.
+///
+/// The capture facade binds this shape into its construction-owned
+/// capture-array seal. It is sufficient to reproduce the restarted-session
+/// prospective without inspecting source bytes or exposing program contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryProgramShape {
+    /// Thompson instruction count.
+    pub states: usize,
+    /// Tagged-save instruction count.
+    pub save_states: usize,
+    /// Internal tagged slot count.
+    pub slots: usize,
+    /// Canonical capture schema entries, including group zero.
+    pub groups: usize,
+    /// UTF-8 payload bytes cloned for named groups in each canonical record.
+    pub name_payload_bytes: usize,
+}
+
+/// One source-independent persistent-history search envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistorySearchProspective {
+    /// Maximum Thompson state visits.
+    pub state_visits: usize,
+    /// Maximum persistent-history nodes.
+    pub history_nodes: usize,
+    /// Maximum winning-history reconstruction steps.
+    pub history_walk: usize,
+    /// Maximum input bytes advanced over.
+    pub bytes_examined: usize,
+    /// Maximum candidate starts injected.
+    pub starts_injected: usize,
+    /// Maximum simultaneously live threads.
+    pub peak_threads: usize,
+    /// Conservative dynamic scratch bound.
+    pub scratch_bytes: usize,
+}
+
+/// Complete pre-source envelope for restarted persistent-history iteration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartedHistoryProspective {
+    /// Logical capture window used to derive this envelope.
+    pub window: Window,
+    /// Construction-proved whole-match lower bound. Zero selects the nullable
+    /// empty-progress envelope.
+    pub minimum_match_bytes: usize,
+    /// Largest single-search envelope in this session.
+    pub largest_search: HistorySearchProspective,
+    /// Maximum independently bounded searches.
+    pub searches: usize,
+    /// Maximum winners materialized, including nullable winners later
+    /// suppressed by iterator progression.
+    pub materialized_records: usize,
+    /// Maximum capture records retained by the returned output.
+    pub results: usize,
+    /// Maximum cumulative Thompson state visits.
+    pub total_state_visits: usize,
+    /// Persistent-history execution performs no inline slot copies.
+    pub total_slot_copies: usize,
+    /// Maximum cumulative persistent-history nodes.
+    pub total_history_nodes: usize,
+    /// Maximum cumulative winning-history reconstruction steps.
+    pub total_history_walk: usize,
+    /// Maximum complete-schema capture entries materialized, including an
+    /// empty winner later suppressed by iterator progress.
+    pub capture_events: usize,
+    /// Maximum cumulative input bytes advanced over.
+    pub bytes_examined: usize,
+    /// Maximum cumulative candidate starts injected.
+    pub starts_injected: usize,
+    /// Maximum simultaneously live threads in one search.
+    pub peak_threads: usize,
+    /// Maximum conservative dynamic scratch for one search.
+    pub scratch_bytes: usize,
+    /// Maximum versioned logical bytes retained by the returned capture
+    /// vector. Allocator capacity slack is deliberately outside this model.
+    pub retained_output_bytes: usize,
+    /// Maximum logical retained/current materialization bytes plus the
+    /// charged scratch envelope of the current search.
+    pub combined_peak_bytes: usize,
+}
+
 /// Result of a capture-participation reduction over non-empty matches.
 ///
 /// Unlike [`AggregateOutcome`], this does not retain one capture record per

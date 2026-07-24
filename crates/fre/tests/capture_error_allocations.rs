@@ -37,7 +37,7 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
     // The complete inline cache identity, ordered-root proof slot, route
     // receipt, and owner receipt remain bounded without restoring an
     // error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 5_680);
+    assert_eq!(size_of::<CaptureExecutionError>(), 5_728);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";

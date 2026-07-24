@@ -30,6 +30,7 @@ mod aggregate_many;
 mod blocking_delimiter;
 mod bounded_literal_pair;
 mod capture_count_seal;
+mod capture_iteration_seal;
 mod capture_noqa;
 mod capture_required_literal;
 mod captures;
@@ -104,6 +105,13 @@ pub use capture_count_seal::{
     CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
     CaptureCountOwnerSeal, CaptureCountPrepublicationFallback, CaptureCountProspective,
     CaptureCountRouteIdentity, CaptureCountSeal, CaptureCountSelectorRoute, CaptureCountTerminal,
+};
+pub use capture_iteration_seal::{
+    CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
+    CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
+    CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
+    CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
+    CaptureIterationTerminal,
 };
 pub use capture_noqa::{
     NOQA_ASCII_LEADING_PLAN_ID, NOQA_ASCII_NO_LEADING_PLAN_ID, NOQA_UNICODE_LEADING_PLAN_ID,

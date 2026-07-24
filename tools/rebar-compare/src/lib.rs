@@ -5115,6 +5115,8 @@ fn capture_run_limits(
             max_total_history_walk: history_walk,
             max_capture_events: reducer_events,
             max_capture_count: reducer_count,
+            max_retained_output_bytes: limits.fre_aggregate_peak_bytes,
+            max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
         },
         selector,
         max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,

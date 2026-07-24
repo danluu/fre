@@ -15,13 +15,13 @@ use fre_aggregate::{
     Resource as SelectorResource, RustByteProfile as SelectorProfile, Strategy as SelectorStrategy,
 };
 use fre_capture_lab::{
-    AggregateLimits, AggregateOutcome, Assertion as CaptureAssertion, Ast,
-    BuildError as EngineBuildError, BuildLimits as EngineBuildLimits,
-    BuildReport as EngineBuildReport, CaptureCountOutcome, CaptureProfile, CaptureRecord, Greed,
-    HistoryRegex, Program, ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
-    SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
-    SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
-    Window,
+    AggregateLimits, Assertion as CaptureAssertion, Ast, BuildError as EngineBuildError,
+    BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
+    CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureProfile, CaptureRecord,
+    Greed, HistoryRegex, HistorySearchProspective, Program, ResourceKind as EngineResource,
+    RunReport as EngineSearchAccounting, SearchConfig as CaptureSearchConfig,
+    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
+    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
 };
 use fre_kernels::{
     LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
@@ -51,6 +51,12 @@ use crate::capture_count_seal::{
     CaptureCountOwnerSeal, CaptureCountPrepublicationFallback, CaptureCountProspective,
     CaptureCountPublicationPhase, CaptureCountRouteIdentity, CaptureCountSeal,
     CaptureCountSelectorRoute, CaptureCountTerminal,
+};
+use crate::capture_iteration_seal::{
+    CAPTURE_ITERATION_ACCOUNTING_VERSION, CAPTURE_ITERATION_ALGORITHM_VERSION,
+    CaptureIterationActual, CaptureIterationAttemptReceipt, CaptureIterationBackend,
+    CaptureIterationDeclaredFallback, CaptureIterationOperation, CaptureIterationOwnerSeal,
+    CaptureIterationProspective, CaptureIterationRouteIdentity, CaptureIterationSeal,
 };
 use crate::capture_required_literal::{
     self, CaptureRequiredLiteralBuildAccounting, CaptureRequiredLiteralBuildError,
@@ -730,6 +736,9 @@ pub struct CaptureIterationIdentity {
     pub build_limits: CaptureBuildLimits,
     /// Aggregate limits used for this repeated-search invocation.
     pub run_limits: AggregateLimits,
+    /// Construction provenance, physical backend, search policy, versions,
+    /// limits, and declared terminal behavior for this exact invocation.
+    pub session_seal: CaptureIterationSeal,
 }
 
 /// Successful complete capture sequence and bounded execution accounting.
@@ -746,8 +755,25 @@ pub struct CaptureIterationReport {
     pub searches: usize,
     /// Total Thompson state visits.
     pub total_state_visits: usize,
+    /// Total inline capture-slot copies (zero for persistent history).
+    pub total_slot_copies: usize,
     /// Total persistent-history nodes.
     pub total_history_nodes: usize,
+    /// Total winning-history reconstruction steps.
+    pub total_history_walk: usize,
+    /// Complete capture-schema entries materialized.
+    pub capture_events: usize,
+    /// Maximum live persistent-history threads in any search.
+    pub peak_threads: usize,
+    /// Maximum admitted dynamic scratch bytes in any search.
+    pub peak_scratch_bytes: usize,
+    /// Exact versioned logical bytes retained by returned capture records.
+    pub retained_output_bytes: usize,
+    /// Maximum logical retained/current capture bytes plus charged current
+    /// search scratch.
+    pub combined_peak_bytes: usize,
+    /// Complete owner-local terminal success receipt.
+    pub session_receipt: CaptureIterationAttemptReceipt,
 }
 
 /// Checked capture-iteration failure retaining exact source and limit identity.
@@ -757,6 +783,51 @@ pub struct CaptureIterationError {
     pub identity: Box<CaptureIterationIdentity>,
     /// Persistent-history search or aggregate resource failure.
     pub source: EngineSearchError,
+    /// Complete owner-local terminal failure receipt. The receipt is boxed so
+    /// ordinary text-wrapper error paths do not inherit its inline size.
+    pub session_receipt: Box<CaptureIterationAttemptReceipt>,
+}
+
+impl CaptureIterationIdentity {
+    fn closes_session_seal(&self) -> bool {
+        let route = self.session_seal.route_identity();
+        self.syntax == route.syntax
+            && self.capture_profile == route.capture_profile
+            && self.plan == route.plan
+            && self.search == self.session_seal.search()
+            && self.build_limits == route.build_limits
+            && self.run_limits == self.session_seal.run_limits()
+    }
+}
+
+impl CaptureIterationReport {
+    /// Whether this success retains one immutable construction owner and a
+    /// complete capture-array session receipt with cumulative A≤P.
+    #[must_use]
+    pub fn has_closed_session_attempt(&self) -> bool {
+        let actual = self.session_receipt.actual;
+        self.identity.closes_session_seal()
+            && self.session_receipt.terminal == crate::CaptureIterationTerminal::Success
+            && self.session_receipt.closes(&self.identity.session_seal)
+            && self.captures.len() == actual.results
+            && self.searches == actual.searches
+            && self.total_slot_copies == actual.total_slot_copies
+            && self.capture_events == actual.capture_events
+            && self.peak_scratch_bytes == actual.scratch_bytes
+            && self.retained_output_bytes == actual.retained_output_bytes
+            && self.combined_peak_bytes == actual.combined_peak_bytes
+    }
+}
+
+impl CaptureIterationError {
+    /// Whether this failure retains one immutable construction owner and a
+    /// complete capture-array session receipt with cumulative A≤P.
+    #[must_use]
+    pub fn has_closed_session_attempt(&self) -> bool {
+        self.identity.closes_session_seal()
+            && self.session_receipt.terminal == crate::CaptureIterationTerminal::Failure
+            && self.session_receipt.closes(&self.identity.session_seal)
+    }
 }
 
 /// Construction evidence for the exact-HIR Rust text capture slice.
@@ -1374,6 +1445,53 @@ impl std::error::Error for CaptureIterationError {
     }
 }
 
+fn capture_iteration_failure(
+    identity: &CaptureIterationIdentity,
+    source: EngineSearchError,
+    prospective: Option<CaptureIterationProspective>,
+    actual: CaptureIterationActual,
+) -> CaptureIterationError {
+    CaptureIterationError {
+        identity: Box::new(identity.clone()),
+        source,
+        session_receipt: Box::new(CaptureIterationAttemptReceipt::failure(prospective, actual)),
+    }
+}
+
+fn capture_iteration_exact_add(
+    current: usize,
+    increment: usize,
+    resource: EngineResource,
+    limit: usize,
+) -> Result<usize, EngineSearchError> {
+    let required = current
+        .checked_add(increment)
+        .ok_or(EngineSearchError::BoundOverflow(resource))?;
+    if required > limit {
+        return Err(EngineSearchError::Resource {
+            kind: resource,
+            required,
+            limit,
+        });
+    }
+    Ok(required)
+}
+
+fn capture_iteration_search_fits(
+    prospective: HistorySearchProspective,
+    actual: &EngineSearchAccounting,
+) -> bool {
+    actual.candidate == EngineCandidateKind::PersistentHistory
+        && actual.state_visits <= prospective.state_visits
+        && actual.slot_copies == 0
+        && actual.history_nodes <= prospective.history_nodes
+        && actual.history_walk <= prospective.history_walk
+        && actual.bytes_examined <= prospective.bytes_examined
+        && actual.starts_injected <= prospective.starts_injected
+        && actual.peak_threads <= prospective.peak_threads
+        && actual.admitted_scratch_bytes <= prospective.scratch_bytes
+}
+
 fn optional_required_literal_refusal(error: &CaptureRequiredLiteralBuildError) -> bool {
     match error {
         CaptureRequiredLiteralBuildError::Resource { .. }
@@ -1863,6 +1981,19 @@ impl CaptureBuilder {
             }
             _ => None,
         };
+        let iteration_owner = CaptureIterationOwnerSeal::new(CaptureIterationRouteIdentity {
+            syntax: Arc::clone(&plan_identity.syntax),
+            capture_profile: plan_identity.capture_profile,
+            operation: CaptureIterationOperation::MaterializeCaptureArray,
+            plan: CaptureIterationPlanKind::RestartedPersistentHistory,
+            backend: CaptureIterationBackend::PersistentHistory,
+            engine_shape: program.history_program_shape(),
+            minimum_match_bytes: rust.hir.properties().minimum_len().unwrap_or(0),
+            build_limits: limits,
+            algorithm_version: CAPTURE_ITERATION_ALGORITHM_VERSION,
+            accounting_version: CAPTURE_ITERATION_ACCOUNTING_VERSION,
+            declared_fallback: CaptureIterationDeclaredFallback::None,
+        });
         let report = CaptureBuildReport {
             admission,
             syntax,
@@ -1885,6 +2016,7 @@ impl CaptureBuilder {
             prefix_class_participation: prefix_class_participation.plan,
             uniform_count_minimum_match_bytes,
             count_owner,
+            iteration_owner,
             build_limits: limits,
             report,
         })
@@ -1904,6 +2036,8 @@ pub struct CaptureRegex {
     uniform_count_minimum_match_bytes: Option<usize>,
     /// Construction-owned seal for each positive-width uniform Count route.
     count_owner: Option<CaptureCountOwnerSeal>,
+    /// Construction-owned materialized capture-array route.
+    iteration_owner: CaptureIterationOwnerSeal,
     build_limits: CaptureBuildLimits,
     report: CaptureBuildReport,
 }
@@ -1974,6 +2108,7 @@ impl CaptureRegex {
             search,
             build_limits: self.build_limits,
             run_limits,
+            session_seal: self.iteration_owner.for_invocation(search, run_limits),
         }
     }
 
@@ -2064,6 +2199,10 @@ impl CaptureRegex {
 
     /// Collect every match under explicit match-end, match-priority and
     /// start-injection policies.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "pre-source publication, charged terminal accounting, retained-output accounting, and Rust empty-progress semantics stay in one auditable owner-local session"
+    )]
     pub fn captures_iter_window_with_config(
         &self,
         haystack: &[u8],
@@ -2072,25 +2211,252 @@ impl CaptureRegex {
         limits: AggregateLimits,
     ) -> Result<CaptureIterationReport, CaptureIterationError> {
         let identity = self.iteration_identity_with_config(limits, config);
-        let AggregateOutcome {
-            captures,
-            searches,
-            total_state_visits,
-            total_slot_copies: _,
-            total_history_nodes,
-        } = self
-            .engine
-            .captures_iter_with_config(haystack, window, config, limits)
-            .map_err(|source| CaptureIterationError {
-                identity: Box::new(identity.clone()),
+        let mut actual = CaptureIterationActual::default();
+        let prospective = identity
+            .session_seal
+            .prospective(haystack.len(), window)
+            .map_err(|source| capture_iteration_failure(&identity, source, None, actual))?;
+        if let Some(source) = prospective.first_limit_error(limits) {
+            return Err(capture_iteration_failure(
+                &identity,
                 source,
+                Some(prospective),
+                actual,
+            ));
+        }
+        let shape = self.iteration_owner.identity().engine_shape;
+        let materialized_record_bytes = shape.materialized_record_bytes().map_err(|source| {
+            capture_iteration_failure(&identity, source, Some(prospective), actual)
+        })?;
+        let retained_record_bytes = shape.retained_record_bytes().map_err(|source| {
+            capture_iteration_failure(&identity, source, Some(prospective), actual)
+        })?;
+
+        let mut captures = Vec::new();
+        let mut total_state_visits = 0_usize;
+        let total_slot_copies = 0_usize;
+        let mut total_history_nodes = 0_usize;
+        let mut total_history_walk = 0_usize;
+        let mut peak_threads = 0_usize;
+        let mut peak_scratch_bytes = 0_usize;
+        let mut cursor = window.start;
+        let mut last_match_end = None;
+        loop {
+            let search_prospective =
+                self.engine
+                    .search_prospective(window, cursor)
+                    .map_err(|source| {
+                        capture_iteration_failure(&identity, source, Some(prospective), actual)
+                    })?;
+            let mut charged = actual;
+            charged
+                .charge_search(search_prospective)
+                .map_err(|source| {
+                    capture_iteration_failure(&identity, source, Some(prospective), actual)
+                })?;
+            if !prospective.contains(charged) {
+                return Err(capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::InvalidProgram,
+                    Some(prospective),
+                    actual,
+                ));
+            }
+            actual = charged;
+
+            let mut per_search = limits.per_search;
+            per_search.max_state_visits = per_search.max_state_visits.min(
+                limits
+                    .max_total_state_visits
+                    .checked_sub(total_state_visits)
+                    .ok_or_else(|| {
+                        capture_iteration_failure(
+                            &identity,
+                            EngineSearchError::BoundOverflow(EngineResource::AggregateStateVisits),
+                            Some(prospective),
+                            actual,
+                        )
+                    })?,
+            );
+            per_search.max_history_nodes = per_search.max_history_nodes.min(
+                limits
+                    .max_total_history_nodes
+                    .checked_sub(total_history_nodes)
+                    .ok_or_else(|| {
+                        capture_iteration_failure(
+                            &identity,
+                            EngineSearchError::BoundOverflow(EngineResource::AggregateHistoryNodes),
+                            Some(prospective),
+                            actual,
+                        )
+                    })?,
+            );
+            per_search.max_history_walk = per_search.max_history_walk.min(
+                limits
+                    .max_total_history_walk
+                    .checked_sub(total_history_walk)
+                    .ok_or_else(|| {
+                        capture_iteration_failure(
+                            &identity,
+                            EngineSearchError::BoundOverflow(EngineResource::AggregateHistoryWalk),
+                            Some(prospective),
+                            actual,
+                        )
+                    })?,
+            );
+
+            let outcome = self
+                .engine
+                .captures_from_with_config(haystack, window, cursor, config, per_search)
+                .map_err(|source| {
+                    capture_iteration_failure(&identity, source, Some(prospective), actual)
+                })?;
+            if !capture_iteration_search_fits(search_prospective, &outcome.report) {
+                return Err(capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::InvalidProgram,
+                    Some(prospective),
+                    actual,
+                ));
+            }
+            total_state_visits = capture_iteration_exact_add(
+                total_state_visits,
+                outcome.report.state_visits,
+                EngineResource::AggregateStateVisits,
+                limits.max_total_state_visits,
+            )
+            .map_err(|source| {
+                capture_iteration_failure(&identity, source, Some(prospective), actual)
             })?;
+            total_history_nodes = capture_iteration_exact_add(
+                total_history_nodes,
+                outcome.report.history_nodes,
+                EngineResource::AggregateHistoryNodes,
+                limits.max_total_history_nodes,
+            )
+            .map_err(|source| {
+                capture_iteration_failure(&identity, source, Some(prospective), actual)
+            })?;
+            total_history_walk = capture_iteration_exact_add(
+                total_history_walk,
+                outcome.report.history_walk,
+                EngineResource::AggregateHistoryWalk,
+                limits.max_total_history_walk,
+            )
+            .map_err(|source| {
+                capture_iteration_failure(&identity, source, Some(prospective), actual)
+            })?;
+            peak_threads = peak_threads.max(outcome.report.peak_threads);
+            peak_scratch_bytes = peak_scratch_bytes.max(outcome.report.admitted_scratch_bytes);
+
+            let Some(record) = outcome.captures else {
+                break;
+            };
+            let mut materialized = actual;
+            materialized
+                .record_materialized(
+                    shape.groups,
+                    materialized_record_bytes,
+                    search_prospective.scratch_bytes,
+                )
+                .map_err(|source| {
+                    capture_iteration_failure(&identity, source, Some(prospective), actual)
+                })?;
+            if !prospective.contains(materialized) {
+                return Err(capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::InvalidProgram,
+                    Some(prospective),
+                    actual,
+                ));
+            }
+            actual = materialized;
+            let overall = record.overall().ok_or_else(|| {
+                capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::InvalidProgram,
+                    Some(prospective),
+                    actual,
+                )
+            })?;
+            if overall.start == overall.end && last_match_end == Some(overall.start) {
+                if overall.end == window.end {
+                    break;
+                }
+                cursor = overall.end.checked_add(1).ok_or_else(|| {
+                    capture_iteration_failure(
+                        &identity,
+                        EngineSearchError::BoundOverflow(EngineResource::Searches),
+                        Some(prospective),
+                        actual,
+                    )
+                })?;
+                continue;
+            }
+            let mut retained = actual;
+            retained
+                .record_result(retained_record_bytes)
+                .map_err(|source| {
+                    capture_iteration_failure(&identity, source, Some(prospective), actual)
+                })?;
+            if !prospective.contains(retained) {
+                return Err(capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::InvalidProgram,
+                    Some(prospective),
+                    actual,
+                ));
+            }
+            captures.try_reserve_exact(1).map_err(|_| {
+                capture_iteration_failure(
+                    &identity,
+                    EngineSearchError::Allocation(EngineResource::RetainedOutputBytes),
+                    Some(prospective),
+                    actual,
+                )
+            })?;
+            actual = retained;
+            captures.push(record);
+            last_match_end = Some(overall.end);
+            if overall.start == overall.end {
+                if overall.end == window.end {
+                    break;
+                }
+                cursor = overall.end.checked_add(1).ok_or_else(|| {
+                    capture_iteration_failure(
+                        &identity,
+                        EngineSearchError::BoundOverflow(EngineResource::Searches),
+                        Some(prospective),
+                        actual,
+                    )
+                })?;
+            } else {
+                cursor = overall.end;
+            }
+        }
+        let session_receipt = CaptureIterationAttemptReceipt::success(prospective, actual);
+        if !session_receipt.closes(&identity.session_seal) {
+            return Err(capture_iteration_failure(
+                &identity,
+                EngineSearchError::InvalidProgram,
+                Some(prospective),
+                actual,
+            ));
+        }
         Ok(CaptureIterationReport {
             identity,
             captures,
-            searches,
+            searches: actual.searches,
             total_state_visits,
+            total_slot_copies,
             total_history_nodes,
+            total_history_walk,
+            capture_events: actual.capture_events,
+            peak_threads,
+            peak_scratch_bytes,
+            retained_output_bytes: actual.retained_output_bytes,
+            combined_peak_bytes: actual.combined_peak_bytes,
+            session_receipt,
         })
     }
 

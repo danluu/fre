@@ -7,7 +7,8 @@ use crate::compile::{Program, State};
 use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
-    AggregateOutcome, CandidateKind, CaptureCountOutcome, MatchKind, RunReport, SearchConfig,
+    AggregateOutcome, CandidateKind, CaptureCountOutcome, HistoryProgramShape,
+    HistorySearchProspective, MatchKind, RestartedHistoryProspective, RunReport, SearchConfig,
     SearchKind, SearchOutcome, Span, Window,
 };
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
@@ -125,6 +126,31 @@ impl HistoryRegex {
         &self.program
     }
 
+    /// Immutable shape used by an outer construction owner to authenticate
+    /// persistent-history prospective receipts.
+    #[must_use]
+    pub fn program_shape(&self) -> HistoryProgramShape {
+        self.program.history_program_shape()
+    }
+
+    /// Derive one search envelope without inspecting source bytes.
+    pub fn search_prospective(
+        &self,
+        window: Window,
+        from: usize,
+    ) -> Result<HistorySearchProspective, SearchError> {
+        self.program_shape().search_prospective(window, from)
+    }
+
+    /// Derive the complete restarted-session envelope without inspecting
+    /// source bytes.
+    pub fn restarted_prospective(
+        &self,
+        window: Window,
+    ) -> Result<RestartedHistoryProspective, SearchError> {
+        self.program_shape().restarted_prospective(window)
+    }
+
     /// Find the first leftmost-first match and its captures in `window`.
     pub fn captures(
         &self,
@@ -145,6 +171,20 @@ impl HistoryRegex {
         limits: SearchLimits,
     ) -> Result<SearchOutcome, SearchError> {
         self.search_from(haystack, window, window.start, config, limits)
+    }
+
+    /// Run one persistent-history search from `from` while preserving the
+    /// original logical window for assertions. This is the bounded primitive
+    /// used by the facade-owned restarted capture-array session.
+    pub fn captures_from_with_config(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        from: usize,
+        config: SearchConfig,
+        limits: SearchLimits,
+    ) -> Result<SearchOutcome, SearchError> {
+        self.search_from(haystack, window, from, config, limits)
     }
 
     /// Query one exact span while preserving assertion context from the

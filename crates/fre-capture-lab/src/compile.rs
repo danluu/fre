@@ -6,6 +6,7 @@ use std::mem::size_of;
 use crate::ast::{Assertion, Ast, Greed};
 use crate::error::{BuildError, ResourceKind};
 use crate::limits::BuildLimits;
+use crate::model::HistoryProgramShape;
 use crate::profile::CaptureProfile;
 
 const UNSET: usize = usize::MAX;
@@ -53,6 +54,7 @@ pub struct Program {
     pub(crate) start: usize,
     pub(crate) slot_count: usize,
     pub(crate) groups: Vec<GroupMeta>,
+    name_payload_bytes: usize,
     profile: CaptureProfile,
     report: BuildReport,
 }
@@ -73,6 +75,7 @@ impl Program {
             return Err(BuildError::ProfilePending(profile));
         }
         let admitted = admit(ast, limits)?;
+        let name_payload_bytes = admitted.name_payload_bytes;
         let mut compiler = Compiler::new(limits, admitted.groups.len(), admitted.metadata_bytes)?;
         let inner = compiler.compile(ast)?;
 
@@ -119,6 +122,7 @@ impl Program {
             start: start_save,
             slot_count,
             groups: admitted.groups,
+            name_payload_bytes,
             profile,
             report,
         })
@@ -142,6 +146,23 @@ impl Program {
         self.groups.len()
     }
 
+    /// Structural identity needed to reproduce persistent-history admission
+    /// without retaining or exposing the program's instruction stream.
+    #[must_use]
+    pub fn history_program_shape(&self) -> HistoryProgramShape {
+        HistoryProgramShape {
+            states: self.states.len(),
+            save_states: self
+                .states
+                .iter()
+                .filter(|state| matches!(state, State::Save { .. }))
+                .count(),
+            slots: self.slot_count,
+            groups: self.groups.len(),
+            name_payload_bytes: self.name_payload_bytes,
+        }
+    }
+
     /// Versioned semantic profile used for compilation.
     #[must_use]
     pub const fn profile(&self) -> CaptureProfile {
@@ -155,6 +176,7 @@ struct Admission {
     depth: usize,
     groups: Vec<GroupMeta>,
     metadata_bytes: usize,
+    name_payload_bytes: usize,
 }
 
 #[allow(
@@ -171,6 +193,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
         name: None,
     });
     let mut metadata_bytes = size_of::<GroupMeta>();
+    let mut name_payload_bytes = 0_usize;
     check_limit(
         ResourceKind::ProgramBytes,
         metadata_bytes,
@@ -279,6 +302,9 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
                         .try_reserve_exact(name.len())
                         .map_err(|_| BuildError::Allocation(ResourceKind::ProgramBytes))?;
                     copied.push_str(name);
+                    name_payload_bytes = name_payload_bytes
+                        .checked_add(name.len())
+                        .ok_or(BuildError::BoundOverflow(ResourceKind::RetainedOutputBytes))?;
                     Some(copied)
                 } else {
                     None
@@ -322,6 +348,7 @@ fn admit(ast: &Ast, limits: BuildLimits) -> Result<Admission, BuildError> {
         depth: max_depth,
         groups,
         metadata_bytes,
+        name_payload_bytes,
     })
 }
 
