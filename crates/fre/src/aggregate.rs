@@ -73,7 +73,10 @@ use fre_kernels::{
     SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan, TokenPhraseBuildAccounting,
+    TokenPhraseBuildError, TokenPhraseBuildLimits, TokenPhraseCountResult,
+    TokenPhraseOperationIdentity, TokenPhrasePlan, TokenPhraseReduceAccounting,
+    TokenPhraseReduceError, TokenPhraseReduceLimits, TokenPhraseSpanSumResult,
     UnicodeScalarAggregateBuildAccounting, UnicodeScalarAggregateBuildError,
     UnicodeScalarAggregateBuildLimits, UnicodeScalarAggregateCountResult,
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
@@ -94,13 +97,14 @@ use crate::{
     AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
     AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match,
     blocking_delimiter, bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar,
-    guarded_ascii_word, literal_assertions, literal_class_run_literal, unicode_word_run,
+    guarded_ascii_word, literal_assertions, literal_class_run_literal, token_phrase,
+    unicode_word_run,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 30;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 31;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -146,6 +150,9 @@ pub enum AggregatePlanKind {
     /// One monotone consecutive-delimiter stream for
     /// `D [^D]{0,N} T D` under Unicode-off byte semantics.
     BlockingDelimiter,
+    /// One monotone maximal-token stream for the Unicode-off ASCII grammar
+    /// `\w+\s+L\s+\w+`, optionally surrounded by ASCII word boundaries.
+    TokenPhrase,
     /// Direct bounded circular-window reducer for
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
@@ -195,6 +202,8 @@ pub enum AggregatePlanIdentity {
     LiteralAssertions(AggregateLiteralAssertionsIdentity),
     /// Blocking-delimiter grammar proof and native operation identity.
     BlockingDelimiter(AggregateBlockingDelimiterIdentity),
+    /// ASCII token-phrase grammar proof and native operation identity.
+    TokenPhrase(AggregateTokenPhraseIdentity),
     /// Fixed-width three-atom class sequence plus native reducer identity.
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
     /// Ordered scalar-property grammar plus native reducer identity.
@@ -368,6 +377,21 @@ pub enum AggregateBlockingDelimiterSemantics {
 pub struct AggregateBlockingDelimiterIdentity {
     pub semantics: AggregateBlockingDelimiterSemantics,
     pub kernel: BlockingDelimiterOperationIdentity,
+}
+
+/// Profile proof attached to the direct ASCII token-phrase reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateTokenPhraseSemantics {
+    /// Rust bytes with Unicode disabled: `\w` and `\s` are the exact ASCII
+    /// classes and malformed bytes are ordinary non-token separators.
+    UnicodeOffAsciiWordSpaceTokens,
+}
+
+/// Facade identity for the construction-selected token-phrase reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateTokenPhraseIdentity {
+    pub semantics: AggregateTokenPhraseSemantics,
+    pub kernel: TokenPhraseOperationIdentity,
 }
 
 /// Profile proof attached to the fixed class-sandwich reducer.
@@ -892,6 +916,8 @@ pub enum AggregateBuildAccounting {
     LiteralAssertions(LiteralAssertionsBuildAccounting),
     /// Fixed-size blocking-delimiter construction certificate.
     BlockingDelimiter(BlockingDelimiterBuildAccounting),
+    /// Exact retained literal plus fixed token-state construction certificate.
+    TokenPhrase(TokenPhraseBuildAccounting),
     /// Bounded class-sandwich construction certificate.
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Ordered scalar-property classifier construction certificate.
@@ -944,6 +970,9 @@ pub struct AggregateBuildLimits {
     /// Maximum allocation-free HIR/class/complement inspection work for the
     /// blocking-delimiter specialization.
     pub max_blocking_delimiter_planner_work: usize,
+    /// Maximum allocation-free HIR/class/literal inspection work for the
+    /// ASCII token-phrase specialization.
+    pub max_token_phrase_planner_work: usize,
     /// Maximum structural HIR/range inspection work for fixed-width class
     /// sandwiches.
     pub max_fixed_class_sandwich_planner_work: usize,
@@ -990,6 +1019,8 @@ pub struct AggregateBuildLimits {
     pub literal_assertions: LiteralAssertionsBuildLimits,
     /// Complete direct blocking-delimiter construction limits.
     pub blocking_delimiter: BlockingDelimiterBuildLimits,
+    /// Complete direct ASCII token-phrase construction limits.
+    pub token_phrase: TokenPhraseBuildLimits,
     /// Complete bounded fixed-class construction limits.
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
     /// Complete ordered scalar-grammar construction limits.
@@ -1027,6 +1058,7 @@ impl Default for AggregateBuildLimits {
             max_word_run_planner_work: 4_096,
             max_literal_assertions_planner_work: 4_096,
             max_blocking_delimiter_planner_work: 4_096,
+            max_token_phrase_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_affix_planner_work: 4_096,
             max_grapheme_scalar_dfa_planner_work: 1 << 20,
@@ -1043,6 +1075,7 @@ impl Default for AggregateBuildLimits {
             word_run: unicode_word_run::AggregateBuildLimits::default(),
             literal_assertions: LiteralAssertionsBuildLimits::default(),
             blocking_delimiter: BlockingDelimiterBuildLimits::default(),
+            token_phrase: TokenPhraseBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
@@ -1143,6 +1176,8 @@ pub struct AggregateRunLimits {
     pub literal_assertions: LiteralAssertionsReduceLimits,
     /// Direct blocking-delimiter whole-operation limits.
     pub blocking_delimiter: BlockingDelimiterReduceLimits,
+    /// Direct ASCII token-phrase whole-operation limits.
+    pub token_phrase: TokenPhraseReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
     /// Direct ordered scalar-grammar reducer limits.
@@ -1214,6 +1249,9 @@ pub struct AggregateBuildReport {
     /// Blocking-delimiter HIR/class/complement inspection work. This remains
     /// nonzero when an ineligible inspection precedes another family.
     pub blocking_delimiter_planner_work: usize,
+    /// ASCII token-phrase HIR/class/literal inspection work. This remains
+    /// nonzero when an ineligible inspection precedes another family.
+    pub token_phrase_planner_work: usize,
     /// Fixed-class structural inspection work, including every HIR node and
     /// canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
@@ -1308,6 +1346,7 @@ struct AggregateFixedAbsoluteDomainSeal {
     word_run_planner_work: usize,
     literal_assertions_planner_work: usize,
     blocking_delimiter_planner_work: usize,
+    token_phrase_planner_work: usize,
     fixed_class_sandwich_planner_work: usize,
     bounded_affix_planner_work: usize,
     grapheme_scalar_dfa_planner_work: usize,
@@ -1359,6 +1398,7 @@ impl AggregateFixedAbsoluteDomainSeal {
             && self.word_run_planner_work == report.word_run_planner_work
             && self.literal_assertions_planner_work == report.literal_assertions_planner_work
             && self.blocking_delimiter_planner_work == report.blocking_delimiter_planner_work
+            && self.token_phrase_planner_work == report.token_phrase_planner_work
             && self.fixed_class_sandwich_planner_work == report.fixed_class_sandwich_planner_work
             && self.bounded_affix_planner_work == report.bounded_affix_planner_work
             && self.grapheme_scalar_dfa_planner_work == report.grapheme_scalar_dfa_planner_work
@@ -2104,6 +2144,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// ASCII token-phrase inspection crossed its independent structural cap.
+    TokenPhrasePlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Fixed class-sandwich inspection crossed its structural work cap.
     FixedClassSandwichPlannerWorkLimit {
         operation: AggregateOperation,
@@ -2229,6 +2276,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: BlockingDelimiterBuildError,
+    },
+    /// Direct ASCII token-phrase construction failed after selection.
+    TokenPhraseBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: TokenPhraseBuildError,
     },
     /// Fixed class-sandwich construction failed after selection.
     FixedClassSandwichBuild {
@@ -2426,6 +2479,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} blocking-delimiter inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::TokenPhrasePlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} token-phrase inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FixedClassSandwichPlannerWorkLimit {
                 operation,
                 selection,
@@ -2582,6 +2644,14 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} blocking-delimiter construction failed: {source}"
+            ),
+            Self::TokenPhraseBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} token-phrase construction failed: {source}"
             ),
             Self::FixedClassSandwichBuild {
                 operation,
@@ -2740,6 +2810,7 @@ impl std::error::Error for AggregateBuildError {
             Self::WordRunBuild { source, .. } => Some(source),
             Self::LiteralAssertionsBuild { source, .. } => Some(source),
             Self::BlockingDelimiterBuild { source, .. } => Some(source),
+            Self::TokenPhraseBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
@@ -2760,6 +2831,7 @@ impl std::error::Error for AggregateBuildError {
             | Self::WordRunPlannerWorkLimit { .. }
             | Self::LiteralAssertionsPlannerWorkLimit { .. }
             | Self::BlockingDelimiterPlannerWorkLimit { .. }
+            | Self::TokenPhrasePlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedAffixPlannerWorkLimit { .. }
             | Self::GraphemeScalarDfaPlannerWorkLimit { .. }
@@ -2917,6 +2989,8 @@ pub enum AggregateExecutionSource {
     LiteralAssertions(LiteralAssertionsReduceError),
     /// Direct blocking-delimiter refusal after prospective admission.
     BlockingDelimiter(BlockingDelimiterReduceError),
+    /// Direct ASCII token-phrase refusal after prospective admission.
+    TokenPhrase(TokenPhraseReduceError),
     /// Direct fixed class-sandwich refusal.
     FixedClassSandwich(FixedClassSandwichReduceError),
     /// Direct ordered scalar-grammar refusal.
@@ -2961,6 +3035,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::WordRun(source) => source.fmt(f),
             Self::LiteralAssertions(source) => source.fmt(f),
             Self::BlockingDelimiter(source) => source.fmt(f),
+            Self::TokenPhrase(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
@@ -2992,6 +3067,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::WordRun(source) => Some(source),
             Self::LiteralAssertions(source) => Some(source),
             Self::BlockingDelimiter(source) => Some(source),
+            Self::TokenPhrase(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
             Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
@@ -3111,6 +3187,8 @@ pub enum AggregateExecutionDetails {
     LiteralAssertions(LiteralAssertionsReduceAccounting),
     /// Direct blocking-delimiter bounds and exact counters.
     BlockingDelimiter(BlockingDelimiterReduceAccounting),
+    /// Direct ASCII token-phrase prospective and actual counters.
+    TokenPhrase(TokenPhraseReduceAccounting),
     /// Fixed class-sandwich bounds, counters, and operation identity.
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
     /// Ordered scalar-grammar bounds, counters, and operation identity.
@@ -3794,6 +3872,7 @@ impl AggregateBuilder {
                 word_run_planner_work: 0,
                 literal_assertions_planner_work: 0,
                 blocking_delimiter_planner_work: 0,
+                token_phrase_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: 0,
@@ -3979,6 +4058,7 @@ impl AggregateBuilder {
                     word_run_planner_work: 0,
                     literal_assertions_planner_work: 0,
                     blocking_delimiter_planner_work: 0,
+                    token_phrase_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4094,6 +4174,7 @@ impl AggregateBuilder {
                     word_run_planner_work: inspection.work,
                     literal_assertions_planner_work: 0,
                     blocking_delimiter_planner_work: 0,
+                    token_phrase_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4208,6 +4289,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work: inspection.work,
                     blocking_delimiter_planner_work: 0,
+                    token_phrase_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4333,6 +4415,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work: inspection.work,
+                    token_phrase_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4366,6 +4449,122 @@ impl AggregateBuilder {
                 });
             }
             Some(blocking_delimiter::InspectionOutcome::Ineligible { work }) => work,
+            None => 0,
+        };
+        let token_phrase_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                token_phrase::inspect(&rust.hir, limits.max_token_phrase_planner_work).map_err(
+                    |error| match error {
+                        token_phrase::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::TokenPhrasePlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        token_phrase::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "token-phrase inspection accounting overflow",
+                            }
+                        }
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let token_phrase_planner_work = match token_phrase_inspection {
+            Some(token_phrase::InspectionOutcome::Eligible(inspection)) => {
+                if inspection.hir_nodes != expected_nodes
+                    || inspection.captures != expected_captures
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from token-phrase inspection",
+                    });
+                }
+                let engine = TokenPhrasePlan::build(
+                    inspection.literal,
+                    inspection.outer_word_assertions,
+                    limits.token_phrase,
+                )
+                .map_err(|source| AggregateBuildError::TokenPhraseBuild {
+                    operation,
+                    selection,
+                    source,
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected token-phrase reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::TokenPhrase,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    literal_assertions_planner_work,
+                    blocking_delimiter_planner_work,
+                    token_phrase_planner_work: inspection.work,
+                    fixed_class_sandwich_planner_work: 0,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work: 0,
+                    bounded_class_sequence_planner_work: 0,
+                    bounded_separated_fields_planner_work: 0,
+                    prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: inspection.captures,
+                    captures_erased: inspection.captures,
+                    build: AggregateBuildAccounting::TokenPhrase(build),
+                    plan_identity: AggregatePlanIdentity::TokenPhrase(
+                        AggregateTokenPhraseIdentity {
+                            semantics:
+                                AggregateTokenPhraseSemantics::UnicodeOffAsciiWordSpaceTokens,
+                            kernel,
+                        },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::TokenPhrase(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(token_phrase::InspectionOutcome::Ineligible { work }) => work,
             None => 0,
         };
         let fixed_class_inspection = if selection == AggregatePlanSelection::Auto
@@ -4460,6 +4659,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4654,6 +4854,7 @@ impl AggregateBuilder {
                 word_run_planner_work,
                 literal_assertions_planner_work,
                 blocking_delimiter_planner_work,
+                token_phrase_planner_work,
                 fixed_class_sandwich_planner_work,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: inspection.work,
@@ -4781,6 +4982,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4899,6 +5101,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -5021,6 +5224,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -5153,6 +5357,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -5274,6 +5479,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -5386,6 +5592,7 @@ impl AggregateBuilder {
                         word_run_planner_work,
                         literal_assertions_planner_work,
                         blocking_delimiter_planner_work,
+                        token_phrase_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work: work,
                         grapheme_scalar_dfa_planner_work,
@@ -5515,6 +5722,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6176,6 +6384,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6248,6 +6457,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6428,6 +6638,7 @@ impl AggregateBuilder {
                         word_run_planner_work,
                         literal_assertions_planner_work,
                         blocking_delimiter_planner_work,
+                        token_phrase_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
@@ -6553,6 +6764,7 @@ impl AggregateBuilder {
                     word_run_planner_work,
                     literal_assertions_planner_work,
                     blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6720,6 +6932,7 @@ impl AggregateBuilder {
                         word_run_planner_work,
                         literal_assertions_planner_work,
                         blocking_delimiter_planner_work,
+                        token_phrase_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
@@ -6812,6 +7025,7 @@ impl AggregateBuilder {
             word_run_planner_work,
             literal_assertions_planner_work,
             blocking_delimiter_planner_work,
+            token_phrase_planner_work,
             fixed_class_sandwich_planner_work,
             bounded_affix_planner_work,
             grapheme_scalar_dfa_planner_work,
@@ -6876,6 +7090,7 @@ enum AggregateEngine {
     WordRun(unicode_word_run::Plan),
     LiteralAssertions(LiteralAssertionsPlan),
     BlockingDelimiter(BlockingDelimiterPlan),
+    TokenPhrase(TokenPhrasePlan),
     FixedClassSandwich(FixedClassSandwichPlan),
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
@@ -7242,6 +7457,12 @@ impl AggregatePlan {
                         AggregateExecutionSource::BlockingDelimiter(source),
                     )
                 }),
+            AggregateEngine::TokenPhrase(engine) => engine
+                .count(haystack, limits.token_phrase)
+                .map(AggregateCountExecution::TokenPhrase)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::TokenPhrase(source))
+                }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .count(haystack, limits.fixed_class_sandwich)
                 .map(AggregateCountExecution::FixedClassSandwich)
@@ -7570,6 +7791,12 @@ impl AggregatePlan {
                         limits,
                         AggregateExecutionSource::BlockingDelimiter(source),
                     )
+                }),
+            AggregateEngine::TokenPhrase(engine) => engine
+                .span_sum(haystack, limits.token_phrase)
+                .map(AggregateSpanSumExecution::TokenPhrase)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::TokenPhrase(source))
                 }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .span_sum(haystack, limits.fixed_class_sandwich)
@@ -7950,6 +8177,7 @@ enum AggregateCountExecution {
     WordRun(unicode_word_run::AggregateCountResult),
     LiteralAssertions(LiteralAssertionsCountResult),
     BlockingDelimiter(BlockingDelimiterCountResult),
+    TokenPhrase(TokenPhraseCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
     GraphemeScalarDfa(GraphemeScalarDfaCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
@@ -7992,6 +8220,7 @@ impl AggregateCountExecution {
             Self::WordRun(result) => result.count,
             Self::LiteralAssertions(result) => result.count,
             Self::BlockingDelimiter(result) => result.count,
+            Self::TokenPhrase(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
             Self::GraphemeScalarDfa(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
@@ -8025,6 +8254,7 @@ impl AggregateCountExecution {
             Self::BlockingDelimiter(result) => {
                 AggregateExecutionDetails::BlockingDelimiter(result.accounting)
             }
+            Self::TokenPhrase(result) => AggregateExecutionDetails::TokenPhrase(result.accounting),
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
@@ -8109,6 +8339,7 @@ enum AggregateSpanSumExecution {
     WordRun(unicode_word_run::AggregateSpanSumResult),
     LiteralAssertions(LiteralAssertionsSpanSumResult),
     BlockingDelimiter(BlockingDelimiterSpanSumResult),
+    TokenPhrase(TokenPhraseSpanSumResult),
     FixedClassSandwich(FixedClassSandwichSpanSumResult),
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
@@ -8138,6 +8369,7 @@ impl AggregateSpanSumExecution {
             Self::WordRun(result) => result.span_sum,
             Self::LiteralAssertions(result) => result.span_sum,
             Self::BlockingDelimiter(result) => result.span_sum,
+            Self::TokenPhrase(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::LiteralClassRunLiteral(result) => result.span_sum,
@@ -8164,6 +8396,7 @@ impl AggregateSpanSumExecution {
             Self::BlockingDelimiter(result) => {
                 AggregateExecutionDetails::BlockingDelimiter(result.accounting)
             }
+            Self::TokenPhrase(result) => AggregateExecutionDetails::TokenPhrase(result.accounting),
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }

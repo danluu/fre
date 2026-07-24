@@ -48,6 +48,7 @@ mod set;
 mod split;
 mod text;
 mod text_set;
+mod token_phrase;
 mod unicode_word_run;
 
 pub use aggregate::{
@@ -81,8 +82,9 @@ pub use aggregate::{
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
     AggregatePrefixClassAlternationIdentity, AggregateRunLimits, AggregateSearchStep,
     AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult,
-    AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarIdentity,
-    AggregateUnicodeScalarSemantics, AggregateWordRunIdentity, AggregateWordRunSemantics,
+    AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateTokenPhraseIdentity,
+    AggregateTokenPhraseSemantics, AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
+    AggregateWordRunIdentity, AggregateWordRunSemantics,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
@@ -256,7 +258,11 @@ pub use fre_kernels::{
     SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
     SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
     SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, UnicodeScalarAggregateBuildAccounting,
+    SparseOrderedLiteralCountPlan, TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_PLAN_ID,
+    TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseActualCounters, TokenPhraseBuildAccounting,
+    TokenPhraseBuildError, TokenPhraseBuildLimits, TokenPhraseOperationIdentity,
+    TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
+    TokenPhraseTopology, TokenPhraseUpperBounds, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,

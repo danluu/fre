@@ -53,16 +53,16 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     // Exact typed fixed failures retain owner provenance, route limits, and
     // complete nested P/A without a terminal-path allocation.
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_560);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_616);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_624);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 504);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 48);
-    // Full public build/run provenance plus v30's independent WordRun,
-    // LiteralAssertions, and BlockingDelimiter policies remains
+    // Full public build/run provenance plus v31's independent WordRun,
+    // LiteralAssertions, BlockingDelimiter, and TokenPhrase policies remains
     // allocation-free and nonduplicated.
-    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_128);
-    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 3_128);
+    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_272);
+    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 3_272);
 }
 
 #[test]

@@ -34,6 +34,7 @@ mod prefix_class_alternation;
 mod required_internal_anchor;
 mod required_literal;
 mod sparse_ordered_literal_aggregate;
+mod token_phrase;
 mod unicode_scalar_aggregate;
 mod url_aggregate;
 
@@ -373,6 +374,16 @@ pub use sparse_ordered_literal_aggregate::{
     Semantics as SparseOrderedLiteralAggregateSemantics,
     SpanSumResult as SparseOrderedLiteralSpanSumResult, SparseOrderedLiteralCountPlan,
     SparseOrderedLiteralSpanSumPlan,
+};
+pub use token_phrase::{
+    BuildAccounting as TokenPhraseBuildAccounting, BuildError as TokenPhraseBuildError,
+    BuildLimits as TokenPhraseBuildLimits, COUNT_OPERATION_ID as TOKEN_PHRASE_COUNT_OPERATION_ID,
+    CountResult as TokenPhraseCountResult, OperationIdentity as TokenPhraseOperationIdentity,
+    PLAN_ID as TOKEN_PHRASE_PLAN_ID, ReduceAccounting as TokenPhraseReduceAccounting,
+    ReduceActualCounters as TokenPhraseActualCounters, ReduceError as TokenPhraseReduceError,
+    ReduceLimits as TokenPhraseReduceLimits, ReduceUpperBounds as TokenPhraseUpperBounds,
+    SPAN_SUM_OPERATION_ID as TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as TokenPhraseSpanSumResult, TokenPhrasePlan, Topology as TokenPhraseTopology,
 };
 pub use unicode_scalar_aggregate::{
     BuildAccounting as UnicodeScalarAggregateBuildAccounting,

@@ -437,6 +437,7 @@ fn continuation_details(
         | AggregateExecutionDetails::WordRun(_)
         | AggregateExecutionDetails::LiteralAssertions(_)
         | AggregateExecutionDetails::BlockingDelimiter(_)
+        | AggregateExecutionDetails::TokenPhrase(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
