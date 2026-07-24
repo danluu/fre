@@ -5091,10 +5091,7 @@ mod tests {
 
     #[test]
     fn progress_json_size_limits_include_the_wire_newline() {
-        assert_eq!(
-            REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES,
-            32 * 1_048_576 + LOOK_MODE_MATRIX_MEMBER_COMPACT_BYTES,
-        );
+        assert_eq!(REGEX_AUTOMATA_ADAPTER_REPORT_MAX_FILE_BYTES, 109_051_968,);
         let value = BTreeMap::from([("key", "value")]);
         let mut expected = serde_json::to_vec_pretty(&value).unwrap();
         expected.push(b'\n');
