@@ -7381,11 +7381,34 @@ fn sparse_ordered_literal_operation_limits(
     })
 }
 
+fn guarded_ascii_word_build_accounting_is_closed(
+    build: fre::AggregateGuardedAsciiWordBuildAccounting,
+) -> bool {
+    let prospective = build.dictionary.prospective;
+    let Some(actual) = build.dictionary.actual() else {
+        return false;
+    };
+    build.allocations_upper_bound >= prospective.allocations
+        && build.allocations_actual >= actual.allocations
+        && build.allocations_actual <= build.allocations_upper_bound
+        && build.initialized_bytes_upper_bound >= prospective.initialized_bytes
+        && build.initialized_bytes_actual >= actual.initialized_bytes
+        && build.initialized_bytes_actual <= build.initialized_bytes_upper_bound
+        && build.peak_bytes_upper_bound >= prospective.peak_bytes
+        && build.peak_bytes_actual_upper_bound >= actual.peak_bytes
+        && build.peak_bytes_actual_upper_bound <= build.peak_bytes_upper_bound
+}
+
 fn guarded_ascii_word_operation_limits(
     haystack_len: usize,
     build: fre::AggregateGuardedAsciiWordBuildAccounting,
     limits: &RunLimits,
 ) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
+    if !guarded_ascii_word_build_accounting_is_closed(build) {
+        return Err(ExecutionError::fault(
+            "FRE guarded dictionary build accounting is not closed",
+        ));
+    }
     let upper = guarded_ascii_word::published_reduce_upper_bounds(build.dictionary, haystack_len)
         .map_err(|error| {
         ExecutionError::fault(format!(
@@ -7704,24 +7727,48 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
-        AggregateBuildAccounting::GuardedAsciiWord(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            bounded_context: inactive_bounded_context_operation_limits(),
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: guarded_ascii_word_operation_limits(haystack_len, build, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
+        AggregateBuildAccounting::GuardedAsciiWord(build) => {
+            let AggregatePlanIdentity::GuardedAsciiWord(identity) = report.plan_identity else {
+                return Err(ExecutionError::fault(
+                    "FRE guarded ASCII-word resource identity is absent",
+                ));
+            };
+            let operation = match report.operation {
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    LiteralAggregateOperation::Count
+                }
+                AggregateOperation::SpanSum => LiteralAggregateOperation::SpanSum,
+                AggregateOperation::Spans => {
+                    return Err(ExecutionError::fault(
+                        "FRE guarded ASCII-word resource operation is invalid",
+                    ));
+                }
+            };
+            if !guarded_ascii_word_plan_identity_matches(report, identity, build, false, operation)
+            {
+                return Err(ExecutionError::fault(
+                    "FRE guarded ASCII-word resource identity mismatch",
+                ));
+            }
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: guarded_ascii_word_operation_limits(haystack_len, build, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::Continuation(compile) => {
             if report.authenticates_url_aggregate_identity()
                 && report.continuation_strategy == Some(AggregateStrategy::ReverseSequentialRows)
@@ -7848,28 +7895,7 @@ fn guarded_ascii_word_plan_identity_matches(
         && identity.operation == expected_operation_id
         && prospective.dimensions.words > 0
         && prospective.dimensions.packed_bytes >= prospective.dimensions.words
-        && actual.published
-        && actual.source_words == prospective.dimensions.words
-        && actual.source_len_calls == prospective.source_len_calls
-        && actual.source_next_calls == prospective.source_next_calls
-        && actual.unexpected_source_yields == 0
-        && actual.guard_checks == prospective.guard_checks
-        && actual.ascii_byte_checks == prospective.ascii_byte_checks
-        && actual.byte_copies == prospective.byte_copies
-        && actual.entry_writes == prospective.entry_writes
-        && actual.lookup_slot_writes == prospective.lookup_slot_writes
-        && actual.sort_comparisons <= prospective.sort_comparisons
-        && actual.sort_swaps <= prospective.sort_swaps
-        && actual.allocations == prospective.allocations
-        && actual.initialized_bytes == prospective.initialized_bytes
-        && actual.identity_bytes == prospective.identity_bytes
-        && actual.build_work <= prospective.build_work
-        && actual.scratch_bytes == prospective.scratch_bytes
-        && actual.persistent_bytes == prospective.persistent_bytes
-        && actual.peak_bytes == prospective.peak_bytes
-        && build.allocations_actual <= build.allocations_upper_bound
-        && build.initialized_bytes_actual <= build.initialized_bytes_upper_bound
-        && build.peak_bytes_actual_upper_bound <= build.peak_bytes_upper_bound
+        && guarded_ascii_word_build_accounting_is_closed(build)
         && report.retained_capacity_bytes == actual.persistent_bytes
 }
 
@@ -15844,6 +15870,46 @@ mod tests {
                 "aggregate-guarded-ascii-word",
             );
         }
+    }
+
+    #[test]
+    fn current_fre_guarded_ascii_word_receipts_fail_closed_under_forgery() {
+        let report = AggregateBuilder::new(r"\b(?:as|break|Self)\b")
+            .profile(rebar_profile())
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(aggregate_build_limits(&RunLimits::default()))
+            .build_count()
+            .unwrap()
+            .build_report()
+            .clone();
+        current_fre_rebar_validate_aggregate_identity(&report, false, "count").unwrap();
+
+        let mut forged = report.clone();
+        let AggregateBuildAccounting::GuardedAsciiWord(build) = &mut forged.build else {
+            panic!("guarded test report lost build accounting");
+        };
+        build.allocations_upper_bound = 0;
+        build.allocations_actual = 0;
+        build.initialized_bytes_upper_bound = 0;
+        build.initialized_bytes_actual = 0;
+        build.peak_bytes_upper_bound = 0;
+        build.peak_bytes_actual_upper_bound = 0;
+        assert!(current_fre_rebar_validate_aggregate_identity(&forged, false, "count").is_err());
+        assert!(current_fre_rebar_aggregate_run_limits(64, &forged).is_err());
+
+        let mut forged = report.clone();
+        let AggregateBuildAccounting::GuardedAsciiWord(build) = &mut forged.build else {
+            panic!("guarded test report lost build accounting");
+        };
+        build.dictionary.prospective.source_len_calls = 0;
+        assert!(current_fre_rebar_validate_aggregate_identity(&forged, false, "count").is_err());
+        assert!(current_fre_rebar_aggregate_run_limits(64, &forged).is_err());
+
+        let mut forged = report;
+        forged.retained_capacity_bytes = 0;
+        assert!(current_fre_rebar_validate_aggregate_identity(&forged, false, "count").is_err());
+        assert!(current_fre_rebar_aggregate_run_limits(64, &forged).is_err());
     }
 
     #[test]

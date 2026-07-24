@@ -243,6 +243,9 @@ impl PublishedBuildAccounting {
     #[must_use]
     pub fn actual(self) -> Option<BuildActual> {
         let prospective = self.prospective;
+        if close_prospective(prospective.dimensions).ok()? != prospective {
+            return None;
+        }
         let actual = BuildActual {
             source_len_calls: prospective.source_len_calls,
             source_next_calls: prospective.source_next_calls,
@@ -513,6 +516,17 @@ impl Dictionary {
         close_prospective(dimensions).map_err(preflight_error)
     }
 
+    /// Close and admit an exact dictionary envelope without reading or
+    /// materializing its source.
+    pub fn preflight(
+        dimensions: BuildDimensions,
+        limits: BuildLimits,
+    ) -> Result<BuildProspective, BuildError> {
+        let prospective = Self::prospective(dimensions)?;
+        enforce_limits(prospective, limits).map_err(|kind| admission_error(kind, prospective))?;
+        Ok(prospective)
+    }
+
     /// Build from dimensions already counted by the finite-language planner.
     ///
     /// Every dimension-dependent limit, exact allocation and worst-case sort
@@ -525,8 +539,7 @@ impl Dictionary {
     where
         I: ExactSizeIterator<Item = SourceWord<'a>>,
     {
-        let prospective = Self::prospective(dimensions)?;
-        enforce_limits(prospective, limits).map_err(|kind| admission_error(kind, prospective))?;
+        let prospective = Self::preflight(dimensions, limits)?;
         let actual = BuildActual {
             source_len_calls: 1,
             ..BuildActual::default()
@@ -2137,10 +2150,7 @@ pub fn reduce_upper_bounds(
     build: BuildAccounting,
     haystack_bytes: usize,
 ) -> Result<ReduceUpperBounds, ReduceError> {
-    if !build.actual.published
-        || build.actual.persistent_bytes != build.prospective.persistent_bytes
-        || build.actual.source_words != build.prospective.dimensions.words
-    {
+    if build.published().is_none() {
         return Err(reduce_preflight_invariant(
             "dictionary build receipt is not a published exact identity",
         ));
@@ -2475,6 +2485,69 @@ mod tests {
     }
 
     #[test]
+    fn directional_word_guards_match_unicode_off_oracles_exhaustively() {
+        let left_guards = [
+            (Guard::LeftBoundary, r"\b"),
+            (Guard::LeftStart, r"\b{start}"),
+            (Guard::LeftStartHalf, r"\b{start-half}"),
+        ];
+        let right_guards = [
+            (Guard::RightBoundary, r"\b"),
+            (Guard::RightEnd, r"\b{end}"),
+            (Guard::RightEndHalf, r"\b{end-half}"),
+        ];
+        let alphabet = [b'a', b's', b'_', b' ', 0xFF];
+        for (left, left_pattern) in left_guards {
+            for (right, right_pattern) in right_guards {
+                let source = [SourceWord {
+                    bytes: b"as",
+                    left,
+                    right,
+                }];
+                let dictionary = build(&source, BuildLimits::unlimited()).unwrap();
+                let oracle =
+                    regex::bytes::Regex::new(&format!("(?-u:{left_pattern}as{right_pattern})"))
+                        .unwrap();
+                let mut haystack = Vec::new();
+                for length in 0..=4 {
+                    let cases = alphabet.len().pow(length);
+                    for mut case in 0..cases {
+                        haystack.clear();
+                        for _ in 0..length {
+                            haystack.push(alphabet[case % alphabet.len()]);
+                            case /= alphabet.len();
+                        }
+                        let expected_count =
+                            u64::try_from(oracle.find_iter(&haystack).count()).unwrap();
+                        let expected_sum = oracle
+                            .find_iter(&haystack)
+                            .try_fold(0_u64, |sum, matched| {
+                                sum.checked_add(u64::try_from(matched.len()).unwrap())
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            dictionary
+                                .count(&haystack, ReduceLimits::unlimited())
+                                .unwrap()
+                                .count,
+                            expected_count,
+                            "left={left:?} right={right:?} haystack={haystack:?}"
+                        );
+                        assert_eq!(
+                            dictionary
+                                .span_sum(&haystack, ReduceLimits::unlimited())
+                                .unwrap()
+                                .span_sum,
+                            expected_sum,
+                            "left={left:?} right={right:?} haystack={haystack:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compact_published_accounting_is_lossless_and_fail_closed() {
         let dictionary = build(
             &[word(b"as"), word(b"break"), word(b"Self")],
@@ -2491,6 +2564,38 @@ mod tests {
         };
         assert_eq!(forged.actual(), None);
         assert_eq!(forged.expand(), None);
+
+        let forged_prospective = BuildProspective {
+            source_len_calls: 0,
+            ..published.prospective
+        };
+        let forged = PublishedBuildAccounting {
+            prospective: forged_prospective,
+            ..published
+        };
+        assert_eq!(forged.actual(), None);
+        assert_eq!(forged.expand(), None);
+
+        let forged = BuildAccounting {
+            prospective: forged_prospective,
+            actual: complete.actual,
+        };
+        let error = reduce_upper_bounds(forged, 64).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            ReduceErrorKind::InternalInvariant {
+                detail: "dictionary build receipt is not a published exact identity"
+            }
+        ));
+
+        let forged = BuildAccounting {
+            actual: BuildActual {
+                source_words: 0,
+                ..complete.actual
+            },
+            ..complete
+        };
+        assert!(reduce_upper_bounds(forged, 64).is_err());
     }
 
     #[test]

@@ -1811,6 +1811,7 @@ impl PortableBuilder {
             required_work,
             self.limits.max_planner_work,
             false,
+            finite::GuardedFiniteBuildLimits::unlimited(),
         )
         .into_incumbent_words()?;
         if let Some(words) = finite_words {

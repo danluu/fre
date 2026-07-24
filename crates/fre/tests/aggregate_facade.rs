@@ -1338,6 +1338,96 @@ fn guarded_ascii_word_dictionary_routes_raw_and_factored_count_forms() {
 }
 
 #[test]
+fn guarded_ascii_word_inherits_every_finite_build_cap_exactly() {
+    const PATTERN: &str = r"\b(?:as|break|Self|ab|ba)\b";
+
+    fn selected(finite_literal: fre::OrderedLiteralAggregateBuildLimits) -> AggregatePlanKind {
+        aggregate_builder(PATTERN)
+            .unicode(false)
+            .limits(AggregateBuildLimits {
+                finite_literal,
+                ..AggregateBuildLimits::default()
+            })
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan
+    }
+
+    let baseline = aggregate_builder(PATTERN)
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    let AggregateBuildAccounting::GuardedAsciiWord(build) = baseline.build_report().build else {
+        panic!("guarded baseline build accounting");
+    };
+    let prospective = build.dictionary.prospective;
+    let defaults = AggregateBuildLimits::default().finite_literal;
+
+    let mut exact = defaults;
+    exact.max_identity_bytes = prospective.identity_bytes;
+    assert_eq!(
+        selected(exact),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    exact.max_identity_bytes -= 1;
+    assert_eq!(selected(exact), AggregatePlanKind::ContinuationProgram);
+
+    let mut exact = defaults;
+    exact.max_build_work = prospective.build_work;
+    assert_eq!(
+        selected(exact),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    exact.max_build_work -= 1;
+    assert_eq!(selected(exact), AggregatePlanKind::ContinuationProgram);
+
+    let mut exact = defaults;
+    exact.max_persistent_bytes = prospective.persistent_bytes;
+    assert_eq!(
+        selected(exact),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    exact.max_persistent_bytes -= 1;
+    assert_eq!(selected(exact), AggregatePlanKind::ContinuationProgram);
+
+    let mut exact = defaults;
+    exact.max_peak_bytes = build.peak_bytes_upper_bound;
+    assert_eq!(
+        selected(exact),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    exact.max_peak_bytes -= 1;
+    assert_eq!(selected(exact), AggregatePlanKind::ContinuationProgram);
+
+    let mut low = 0_usize;
+    let mut high = defaults.max_scratch_bytes;
+    assert_eq!(
+        selected(defaults),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let mut limits = defaults;
+        limits.max_scratch_bytes = middle;
+        if selected(limits) == AggregatePlanKind::GuardedAsciiWordDictionary {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    assert!(low > 0);
+    let mut exact = defaults;
+    exact.max_scratch_bytes = low;
+    assert_eq!(
+        selected(exact),
+        AggregatePlanKind::GuardedAsciiWordDictionary
+    );
+    exact.max_scratch_bytes -= 1;
+    assert_eq!(selected(exact), AggregatePlanKind::ContinuationProgram);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the exact and one-below matrix covers every independently enforced resource"

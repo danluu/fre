@@ -448,6 +448,7 @@ fn prove_equivalence(
         0,
         limits.max_planner_work,
         false,
+        finite::GuardedFiniteBuildLimits::unlimited(),
     )
     .into_incumbent_words()
     .map_err(PortableTextBuildError::FiniteProof)?;
@@ -458,6 +459,7 @@ fn prove_equivalence(
         text_work,
         limits.max_planner_work,
         false,
+        finite::GuardedFiniteBuildLimits::unlimited(),
     )
     .into_incumbent_words()
     .map_err(PortableTextBuildError::FiniteProof)?;

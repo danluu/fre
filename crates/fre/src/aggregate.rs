@@ -2095,6 +2095,13 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: SparseOrderedLiteralAggregateBuildError,
     },
+    /// Guarded dictionary construction failed after its complete envelope was
+    /// admitted and before publication.
+    GuardedAsciiWordBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: guarded_ascii_word::BuildError,
+    },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
         operation: AggregateOperation,
@@ -2361,6 +2368,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} sparse finite-language construction failed: {source}"
             ),
+            Self::GuardedAsciiWordBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} guarded ASCII-word construction failed: {source}"
+            ),
             Self::ContinuationCompile {
                 operation,
                 selection,
@@ -2399,6 +2414,7 @@ impl std::error::Error for AggregateBuildError {
             Self::FixedAbsoluteDomainResidualCompile { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
+            Self::GuardedAsciiWordBuild { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
@@ -3057,6 +3073,31 @@ const fn sparse_finite_build_limits(
     }
 }
 
+/// Guarded construction reuses the finite-language identity, work, and memory
+/// ceilings. Sort, allocation-count, and initialized-byte counters remain
+/// checked but have no legacy dense-DFA analogue, so total work and peak bytes
+/// are the enclosing caller-selected bounds.
+const fn guarded_finite_build_limits(
+    limits: OrderedLiteralAggregateBuildLimits,
+) -> finite::GuardedFiniteBuildLimits {
+    finite::GuardedFiniteBuildLimits {
+        dictionary: guarded_ascii_word::BuildLimits {
+            max_words: limits.max_patterns,
+            max_packed_bytes: limits.max_pattern_bytes,
+            max_identity_bytes: limits.max_identity_bytes,
+            max_sort_comparisons: usize::MAX,
+            max_allocations: usize::MAX,
+            max_initialized_bytes: usize::MAX,
+            max_build_work: limits.max_build_work,
+            max_scratch_bytes: limits.max_scratch_bytes,
+            max_persistent_bytes: limits.max_persistent_bytes,
+            max_peak_bytes: limits.max_peak_bytes,
+        },
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
 fn sparse_finite_build_limit_allows_continuation(
     source: &SparseOrderedLiteralAggregateBuildError,
 ) -> bool {
@@ -3071,6 +3112,14 @@ fn sparse_finite_build_limit_allows_continuation(
             | SparseOrderedLiteralAggregateBuildError::ScratchLimit { .. }
             | SparseOrderedLiteralAggregateBuildError::PersistentLimit { .. }
             | SparseOrderedLiteralAggregateBuildError::PeakLimit { .. }
+    )
+}
+
+fn guarded_finite_build_limit_allows_continuation(source: &guarded_ascii_word::BuildError) -> bool {
+    matches!(
+        source.kind,
+        guarded_ascii_word::BuildErrorKind::ResourceLimit { .. }
+            | guarded_ascii_word::BuildErrorKind::WorkLimit { .. }
     )
 }
 
@@ -5409,6 +5458,7 @@ impl AggregateBuilder {
                             | AggregateOperation::Count
                             | AggregateOperation::SpanSum
                     ),
+                guarded_finite_build_limits(limits.finite_literal),
             ))
         } else {
             None
@@ -5515,6 +5565,33 @@ impl AggregateBuilder {
                     minimum_match_bytes,
                     limits,
                     report,
+                });
+            }
+            Some(finite::FiniteOutcome::GuardedResourceFailure {
+                error:
+                    finite::GuardedFiniteBuildError::Dictionary(source),
+                ..
+            }) if guarded_finite_build_limit_allows_continuation(&source) => None,
+            Some(finite::FiniteOutcome::GuardedResourceFailure {
+                error:
+                    finite::GuardedFiniteBuildError::ConstructionLimit {
+                        resource,
+                        needed,
+                        limit,
+                    },
+                ..
+            }) => {
+                let _ = (resource, needed, limit);
+                None
+            }
+            Some(finite::FiniteOutcome::GuardedResourceFailure {
+                error: finite::GuardedFiniteBuildError::Dictionary(source),
+                ..
+            }) => {
+                return Err(AggregateBuildError::GuardedAsciiWordBuild {
+                    operation,
+                    selection,
+                    source,
                 });
             }
             Some(finite::FiniteOutcome::ResourceFailure { error, .. }) => {

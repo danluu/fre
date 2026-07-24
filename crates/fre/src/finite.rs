@@ -12,9 +12,8 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::guarded_ascii_word::{
     BuildDimensions as GuardedBuildDimensions, BuildError as GuardedBuildError,
-    BuildErrorKind as GuardedBuildErrorKind, BuildLimits as GuardedBuildLimits,
-    BuildProspective as GuardedBuildProspective, Dictionary as GuardedDictionary, Guard,
-    SourceWord,
+    BuildLimits as GuardedBuildLimits, BuildProspective as GuardedBuildProspective,
+    Dictionary as GuardedDictionary, Guard, SourceWord,
 };
 use crate::{BuildError, charge_planner, reserve_planner};
 
@@ -43,9 +42,57 @@ pub(crate) enum FiniteOutcome {
         error: BuildError,
         work: u64,
     },
+    GuardedResourceFailure {
+        error: GuardedFiniteBuildError,
+        work: u64,
+    },
 }
 
 type IncumbentFiniteResult = Result<(Option<Vec<Vec<u8>>>, u64), BuildError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedFiniteBuildLimits {
+    pub dictionary: GuardedBuildLimits,
+    pub max_scratch_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl GuardedFiniteBuildLimits {
+    pub(crate) const fn unlimited() -> Self {
+        Self {
+            dictionary: GuardedBuildLimits::unlimited(),
+            max_scratch_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardedFiniteBuildResource {
+    ScratchBytes,
+    PeakBytes,
+}
+
+#[derive(Debug)]
+pub(crate) enum GuardedFiniteBuildError {
+    Dictionary(GuardedBuildError),
+    ConstructionLimit {
+        resource: GuardedFiniteBuildResource,
+        needed: usize,
+        limit: usize,
+    },
+}
+
+enum GuardedAttemptError {
+    Planner(BuildError),
+    Build(GuardedFiniteBuildError),
+}
+
+impl From<BuildError> for GuardedAttemptError {
+    fn from(error: BuildError) -> Self {
+        Self::Planner(error)
+    }
+}
 
 impl FiniteOutcome {
     pub(crate) const fn work(&self) -> u64 {
@@ -54,7 +101,8 @@ impl FiniteOutcome {
             | Self::GuardedFiniteBody { work, .. }
             | Self::TooLargeFixedSequence { work }
             | Self::Unsupported { work }
-            | Self::ResourceFailure { work, .. } => *work,
+            | Self::ResourceFailure { work, .. }
+            | Self::GuardedResourceFailure { work, .. } => *work,
         }
     }
 
@@ -78,6 +126,9 @@ impl FiniteOutcome {
                 Ok((None, cumulative_work))
             }
             Self::ResourceFailure { error, .. } => Err(error),
+            Self::GuardedResourceFailure { .. } => Err(BuildError::InternalInvariant(
+                "guarded finite failure escaped an incumbent-only extraction",
+            )),
         }
     }
 }
@@ -119,12 +170,20 @@ pub(crate) fn extract(
     initial_work: u64,
     work_limit: u64,
     derive_guarded_dictionary: bool,
+    guarded_limits: GuardedFiniteBuildLimits,
 ) -> FiniteOutcome {
     let mut work = initial_work;
     match extract_plain(hir, max_words, max_bytes, &mut work, work_limit) {
         Ok(Some(words)) => FiniteOutcome::Fits { words, work },
         Ok(None) if derive_guarded_dictionary => {
-            match extract_guarded_dictionary(hir, max_words, max_bytes, &mut work, work_limit) {
+            match extract_guarded_dictionary(
+                hir,
+                max_words,
+                max_bytes,
+                &mut work,
+                work_limit,
+                guarded_limits,
+            ) {
                 Ok(Ok((dictionary, accounting))) => FiniteOutcome::GuardedFiniteBody {
                     dictionary,
                     accounting,
@@ -134,7 +193,12 @@ pub(crate) fn extract(
                     FiniteOutcome::TooLargeFixedSequence { work }
                 }
                 Ok(Err(GuardedRefusal::Unsupported)) => FiniteOutcome::Unsupported { work },
-                Err(error) => FiniteOutcome::ResourceFailure { error, work },
+                Err(GuardedAttemptError::Planner(error)) => {
+                    FiniteOutcome::ResourceFailure { error, work }
+                }
+                Err(GuardedAttemptError::Build(error)) => {
+                    FiniteOutcome::GuardedResourceFailure { error, work }
+                }
             }
         }
         Ok(None) => FiniteOutcome::Unsupported { work },
@@ -470,15 +534,22 @@ fn extract_guarded_source(
     max_bytes: usize,
     work: &mut u64,
     work_limit: u64,
-) -> Result<GuardedSourceResult, BuildError> {
-    let materialization =
-        match prove_guarded_materialization(hir, max_words, max_bytes, work, work_limit)? {
-            Ok(materialization) => materialization,
-            Err(refusal) => return Ok(Err(refusal)),
-        };
+    guarded_limits: GuardedFiniteBuildLimits,
+) -> Result<GuardedSourceResult, GuardedAttemptError> {
+    let materialization = match prove_guarded_materialization(
+        hir,
+        max_words,
+        max_bytes,
+        work,
+        work_limit,
+        guarded_limits,
+    )? {
+        Ok(materialization) => materialization,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let plan = materialization.plan;
     admit_guarded_source_work(plan, *work, work_limit)?;
-    publish_guarded_source(materialization, plan, work, work_limit)
+    publish_guarded_source(materialization, plan, work, work_limit).map_err(Into::into)
 }
 
 struct GuardedMaterialization {
@@ -495,7 +566,8 @@ fn prove_guarded_materialization(
     max_bytes: usize,
     work: &mut u64,
     work_limit: u64,
-) -> Result<GuardedMaterializationResult, BuildError> {
+    guarded_limits: GuardedFiniteBuildLimits,
+) -> Result<GuardedMaterializationResult, GuardedAttemptError> {
     if !guarded_structure_supported(hir, work, work_limit)? {
         return Ok(Err(GuardedRefusal::Unsupported));
     }
@@ -513,9 +585,11 @@ fn prove_guarded_materialization(
     if shape.symbols != expected_symbols {
         return Err(BuildError::InternalInvariant(
             "guarded finite shape does not contain exactly two endpoint guards per word",
-        ));
+        )
+        .into());
     }
-    let plan = close_guarded_source_plan(shape)?;
+    let plan = close_guarded_source_plan(shape, guarded_limits)?;
+    admit_guarded_source_work(plan, *work, work_limit)?;
     let mut context = GuardedExpansionContext {
         max_words,
         max_bytes,
@@ -537,14 +611,16 @@ fn prove_guarded_materialization(
     if language.paths.len() != shape.paths || language.bytes != shape.bytes {
         return Err(BuildError::InternalInvariant(
             "guarded finite materialization differs from its shape theorem",
-        ));
+        )
+        .into());
     }
     if expansion_actual.allocations > shape.construction_allocations_upper_bound
         || expansion_actual.initialized_bytes > shape.construction_initialized_bytes_upper_bound
     {
         return Err(BuildError::InternalInvariant(
             "guarded finite expansion exceeded its prospective construction envelope",
-        ));
+        )
+        .into());
     }
     Ok(Ok(GuardedMaterialization {
         language,
@@ -570,7 +646,10 @@ struct GuardedSourcePlan {
     dictionary_prospective: GuardedBuildProspective,
 }
 
-fn close_guarded_source_plan(shape: GuardedShape) -> Result<GuardedSourcePlan, BuildError> {
+fn close_guarded_source_plan(
+    shape: GuardedShape,
+    limits: GuardedFiniteBuildLimits,
+) -> Result<GuardedSourcePlan, GuardedAttemptError> {
     let source_words = shape.paths;
     let source_word_bytes = shape.bytes;
     let expansion_final_bytes = shape
@@ -596,11 +675,9 @@ fn close_guarded_source_plan(shape: GuardedShape) -> Result<GuardedSourcePlan, B
         packed_bytes: source_word_bytes,
     };
     let dictionary_prospective =
-        GuardedDictionary::prospective(dictionary_dimensions).map_err(|_| {
-            BuildError::InternalInvariant(
-                "guarded dictionary dimensions rejected a proved finite shape",
-            )
-        })?;
+        GuardedDictionary::preflight(dictionary_dimensions, limits.dictionary).map_err(
+            |error| GuardedAttemptError::Build(GuardedFiniteBuildError::Dictionary(error)),
+        )?;
     let dictionary_peak_bytes_upper_bound = source_storage_bytes
         .checked_add(dictionary_prospective.peak_bytes)
         .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -617,6 +694,18 @@ fn close_guarded_source_plan(shape: GuardedShape) -> Result<GuardedSourcePlan, B
     let construction_peak_bytes_upper_bound = expansion_peak_bytes_upper_bound
         .max(source_transition_peak_bytes_upper_bound)
         .max(dictionary_peak_bytes_upper_bound);
+    let construction_scratch_bytes_upper_bound =
+        expansion_peak_bytes_upper_bound.max(source_transition_peak_bytes_upper_bound);
+    enforce_guarded_construction_limit(
+        GuardedFiniteBuildResource::ScratchBytes,
+        construction_scratch_bytes_upper_bound,
+        limits.max_scratch_bytes,
+    )?;
+    enforce_guarded_construction_limit(
+        GuardedFiniteBuildResource::PeakBytes,
+        construction_peak_bytes_upper_bound,
+        limits.max_peak_bytes,
+    )?;
     let source_publication_work = source_words
         .checked_mul(2)
         .and_then(|amount| source_word_bytes.checked_mul(2)?.checked_add(amount))
@@ -640,6 +729,23 @@ fn close_guarded_source_plan(shape: GuardedShape) -> Result<GuardedSourcePlan, B
         source_publication_work,
         dictionary_prospective,
     })
+}
+
+fn enforce_guarded_construction_limit(
+    resource: GuardedFiniteBuildResource,
+    needed: usize,
+    limit: usize,
+) -> Result<(), GuardedAttemptError> {
+    if needed > limit {
+        return Err(GuardedAttemptError::Build(
+            GuardedFiniteBuildError::ConstructionLimit {
+                resource,
+                needed,
+                limit,
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn admit_guarded_source_work(
@@ -1270,8 +1376,10 @@ fn extract_guarded_dictionary(
     max_bytes: usize,
     work: &mut u64,
     work_limit: u64,
-) -> Result<GuardedDictionaryResult, BuildError> {
-    let source = match extract_guarded_source(hir, max_words, max_bytes, work, work_limit)? {
+    limits: GuardedFiniteBuildLimits,
+) -> Result<GuardedDictionaryResult, GuardedAttemptError> {
+    let source = match extract_guarded_source(hir, max_words, max_bytes, work, work_limit, limits)?
+    {
         Ok(source) => source,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -1279,30 +1387,18 @@ fn extract_guarded_dictionary(
         words: source.accounting.words,
         packed_bytes: source.accounting.word_bytes,
     };
-    let remaining_work = work_limit
-        .checked_sub(*work)
-        .ok_or(BuildError::PlannerWorkLimit {
-            needed: *work,
-            limit: work_limit,
-        })?;
-    let mut limits = GuardedBuildLimits::unlimited();
-    limits.max_words = max_words;
-    limits.max_packed_bytes = max_bytes;
-    limits.max_build_work = remaining_work;
     let words = source.words.iter().map(|word| SourceWord {
         bytes: word.bytes.as_slice(),
         left: word.left,
         right: word.right,
     });
-    let dictionary_start_work = *work;
-    let dictionary = match GuardedDictionary::build_precounted(dimensions, words, limits) {
+    let dictionary = match GuardedDictionary::build_precounted(dimensions, words, limits.dictionary)
+    {
         Ok(dictionary) => dictionary,
         Err(error) => {
             charge_planner(work, error.actual().build_work, work_limit)?;
-            return Err(map_guarded_build_error(
-                &error,
-                dictionary_start_work,
-                work_limit,
+            return Err(GuardedAttemptError::Build(
+                GuardedFiniteBuildError::Dictionary(error),
             ));
         }
     };
@@ -1310,7 +1406,8 @@ fn extract_guarded_dictionary(
     if dictionary_accounting.prospective != source.dictionary_prospective {
         return Err(BuildError::InternalInvariant(
             "guarded dictionary prospective changed after source publication",
-        ));
+        )
+        .into());
     }
     charge_planner(work, dictionary_accounting.actual.build_work, work_limit)?;
     let allocations_actual = source
@@ -1341,7 +1438,8 @@ fn extract_guarded_dictionary(
     {
         return Err(BuildError::InternalInvariant(
             "guarded finite construction exceeded its prospective bound",
-        ));
+        )
+        .into());
     }
     let accounting = GuardedFiniteAccounting {
         source: source.accounting,
@@ -1354,32 +1452,10 @@ fn extract_guarded_dictionary(
     if !accounting.is_consistent(&dictionary) {
         return Err(BuildError::InternalInvariant(
             "guarded finite composed accounting is inconsistent",
-        ));
+        )
+        .into());
     }
     Ok(Ok((dictionary, accounting)))
-}
-
-fn map_guarded_build_error(
-    error: &GuardedBuildError,
-    initial_work: u64,
-    work_limit: u64,
-) -> BuildError {
-    match error.kind {
-        GuardedBuildErrorKind::WorkLimit { needed, .. } => BuildError::PlannerWorkLimit {
-            needed: initial_work.saturating_add(needed),
-            limit: work_limit,
-        },
-        GuardedBuildErrorKind::AllocationFailed {
-            structure,
-            additional,
-        } => BuildError::AllocationFailed {
-            structure,
-            additional,
-        },
-        _ => BuildError::InternalInvariant(
-            "guarded ASCII-word dictionary rejected its proved finite source",
-        ),
-    }
 }
 
 const fn map_left_guard(look: Look) -> Option<Guard> {
@@ -2444,8 +2520,14 @@ fn concat_pair(
 mod tests {
     use regex_syntax::ParserBuilder;
 
-    use super::{BuildError, FiniteOutcome, Guard, GuardedDictionary, extract};
-    use crate::guarded_ascii_word::{LOOKUP_ID, PACKING_ID, PLAN_ID};
+    use super::{
+        BuildError, FiniteOutcome, Guard, GuardedDictionary, GuardedFiniteBuildError,
+        GuardedFiniteBuildLimits, GuardedFiniteBuildResource,
+    };
+    use crate::guarded_ascii_word::{
+        BuildErrorKind as GuardedBuildErrorKind, BuildLimits as GuardedBuildLimits,
+        BuildResource as GuardedBuildResource, LOOKUP_ID, PACKING_ID, PLAN_ID,
+    };
 
     const RAW_KEYWORD_FORM: &str = r"(?:\b(as)\b)|(?:\b(break)\b)|(?:\b(const)\b)|(?:\b(continue)\b)|(?:\b(crate)\b)|(?:\b(else)\b)|(?:\b(enum)\b)|(?:\b(extern)\b)|(?:\b(false)\b)|(?:\b(fn)\b)|(?:\b(for)\b)|(?:\b(if)\b)|(?:\b(impl)\b)|(?:\b(in)\b)|(?:\b(let)\b)|(?:\b(loop)\b)|(?:\b(match)\b)|(?:\b(mod)\b)|(?:\b(move)\b)|(?:\b(mut)\b)|(?:\b(pub)\b)|(?:\b(ref)\b)|(?:\b(return)\b)|(?:\b(self)\b)|(?:\b(Self)\b)|(?:\b(static)\b)|(?:\b(struct)\b)|(?:\b(super)\b)|(?:\b(trait)\b)|(?:\b(true)\b)|(?:\b(type)\b)|(?:\b(unsafe)\b)|(?:\b(use)\b)|(?:\b(where)\b)|(?:\b(while)\b)|(?:\b(abstract)\b)|(?:\b(become)\b)|(?:\b(box)\b)|(?:\b(do)\b)|(?:\b(final)\b)|(?:\b(macro)\b)|(?:\b(override)\b)|(?:\b(priv)\b)|(?:\b(typeof)\b)|(?:\b(unsized)\b)|(?:\b(virtual)\b)|(?:\b(yield)\b)|(?:\b(try)\b)|(?:\b(i8)\b)|(?:\b(i16)\b)|(?:\b(i32)\b)|(?:\b(i64)\b)|(?:\b(i128)\b)|(?:\b(isize)\b)|(?:\b(u8)\b)|(?:\b(u16)\b)|(?:\b(u32)\b)|(?:\b(u64)\b)|(?:\b(u128)\b)|(?:\b(usize)\b)|(?:\b(bool)\b)|(?:\b(char)\b)|(?:\b(str)\b)|(?:\b(f32)\b)|(?:\b(f64)\b)";
     const FACTORED_KEYWORD_FORM: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";
@@ -2457,6 +2539,25 @@ mod tests {
             .build()
             .parse(pattern)
             .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"))
+    }
+
+    fn extract(
+        hir: &regex_syntax::hir::Hir,
+        max_words: usize,
+        max_bytes: usize,
+        initial_work: u64,
+        work_limit: u64,
+        derive_guarded_dictionary: bool,
+    ) -> FiniteOutcome {
+        super::extract(
+            hir,
+            max_words,
+            max_bytes,
+            initial_work,
+            work_limit,
+            derive_guarded_dictionary,
+            GuardedFiniteBuildLimits::unlimited(),
+        )
     }
 
     fn guarded(pattern: &str, max_words: usize, max_bytes: usize) -> (GuardedDictionary, u64) {
@@ -2688,6 +2789,113 @@ mod tests {
                 error: BuildError::PlannerWorkLimit { limit, .. },
                 work,
             } if limit == one_below && work >= initial && work <= one_below
+        ));
+    }
+
+    #[test]
+    fn guarded_build_caps_admit_exactly_and_refuse_one_below_before_expansion() {
+        let hir = parse(r"\b(a(?:s|sync)|Self)\b");
+        let FiniteOutcome::GuardedFiniteBody {
+            dictionary,
+            accounting,
+            ..
+        } = extract(&hir, 16, 128, 0, u64::MAX, true)
+        else {
+            panic!("guarded baseline should fit");
+        };
+        let prospective = dictionary.build_accounting().prospective;
+        let scratch_bytes = accounting
+            .source
+            .expansion_peak_bytes_upper_bound
+            .max(accounting.source.source_transition_peak_bytes_upper_bound);
+        let peak_bytes = accounting.source.construction_peak_bytes_upper_bound;
+        let exact = GuardedFiniteBuildLimits {
+            dictionary: GuardedBuildLimits {
+                max_words: prospective.dimensions.words,
+                max_packed_bytes: prospective.dimensions.packed_bytes,
+                max_identity_bytes: prospective.identity_bytes,
+                max_sort_comparisons: prospective.sort_comparisons,
+                max_allocations: prospective.allocations,
+                max_initialized_bytes: prospective.initialized_bytes,
+                max_build_work: prospective.build_work,
+                max_scratch_bytes: prospective.scratch_bytes,
+                max_persistent_bytes: prospective.persistent_bytes,
+                max_peak_bytes: prospective.peak_bytes,
+            },
+            max_scratch_bytes: scratch_bytes,
+            max_peak_bytes: peak_bytes,
+        };
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, exact),
+            FiniteOutcome::GuardedFiniteBody { .. }
+        ));
+
+        let mut one_below = exact;
+        one_below.dictionary.max_identity_bytes = prospective.identity_bytes - 1;
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::Dictionary(error),
+                ..
+            } if matches!(
+                error.kind,
+                GuardedBuildErrorKind::ResourceLimit {
+                        resource: GuardedBuildResource::IdentityBytes,
+                        ..
+                }
+            )
+        ));
+
+        let mut one_below = exact;
+        one_below.dictionary.max_build_work = prospective.build_work - 1;
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::Dictionary(error),
+                ..
+            } if matches!(error.kind, GuardedBuildErrorKind::WorkLimit { .. })
+        ));
+
+        let mut one_below = exact;
+        one_below.max_scratch_bytes = scratch_bytes - 1;
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::ConstructionLimit {
+                    resource: GuardedFiniteBuildResource::ScratchBytes,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut one_below = exact;
+        one_below.dictionary.max_persistent_bytes = prospective.persistent_bytes - 1;
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::Dictionary(error),
+                ..
+            } if matches!(
+                error.kind,
+                GuardedBuildErrorKind::ResourceLimit {
+                        resource: GuardedBuildResource::PersistentBytes,
+                        ..
+                }
+            )
+        ));
+
+        let mut one_below = exact;
+        one_below.max_peak_bytes = peak_bytes - 1;
+        assert!(matches!(
+            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::ConstructionLimit {
+                    resource: GuardedFiniteBuildResource::PeakBytes,
+                    ..
+                },
+                ..
+            }
         ));
     }
 
