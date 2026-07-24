@@ -91,7 +91,7 @@ fn exact_rebar_shapes_use_token_phrase() {
             .build_span_sum()
             .expect("exact token-phrase facade plan");
         assert_eq!(regex.build_report().plan, AggregatePlanKind::TokenPhrase);
-        assert_eq!(regex.build_report().schema_version, 31);
+        assert_eq!(regex.build_report().schema_version, 32);
         let AggregatePlanIdentity::TokenPhrase(identity) = regex.build_report().plan_identity
         else {
             panic!("exact token-phrase row selected another identity");

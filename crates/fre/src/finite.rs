@@ -17,6 +17,10 @@ use crate::guarded_ascii_word::{
 };
 use crate::{BuildError, charge_planner, reserve_planner};
 
+const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 2;
+const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
+const FIXED_PREDICATE_MAX_RANGES: usize = 2;
+
 /// Exhaustive finite-language planner disposition with cumulative work.
 ///
 /// In particular, a semantic refusal never resets the work charged by an
@@ -46,6 +50,129 @@ pub(crate) enum FiniteOutcome {
         error: GuardedFiniteBuildError,
         work: u64,
     },
+}
+
+pub(crate) struct FixedPredicateInspection {
+    pub(crate) source: Option<FixedPredicateWord64Source>,
+    pub(crate) work: u64,
+}
+
+/// Inline proof source for a fixed-width ASCII-byte predicate word.
+///
+/// Construction is only attempted after the incumbent finite route has
+/// returned a typed refusal, so this source cannot displace a finite or
+/// guarded-dictionary success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FixedPredicateWord64Source {
+    positions: [FixedPredicate; FIXED_PREDICATE_WORD64_MAX_WIDTH],
+    width: usize,
+    case_pairs: usize,
+    hir_nodes: usize,
+    captures: usize,
+}
+
+impl FixedPredicateWord64Source {
+    const EMPTY: Self = Self {
+        positions: [FixedPredicate::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH],
+        width: 0,
+        case_pairs: 0,
+        hir_nodes: 0,
+        captures: 0,
+    };
+
+    pub(crate) fn positions(&self) -> impl ExactSizeIterator<Item = FixedPredicateRanges> + '_ {
+        self.positions[..self.width()]
+            .iter()
+            .copied()
+            .map(FixedPredicate::ranges)
+    }
+
+    pub(crate) const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub(crate) const fn case_pairs(&self) -> usize {
+        self.case_pairs
+    }
+
+    pub(crate) const fn hir_nodes(&self) -> usize {
+        self.hir_nodes
+    }
+
+    pub(crate) const fn captures(&self) -> usize {
+        self.captures
+    }
+
+    fn push(&mut self, predicate: FixedPredicate, is_case_pair: bool) -> Result<bool, BuildError> {
+        let index = self.width();
+        if index == FIXED_PREDICATE_WORD64_MAX_WIDTH {
+            return Ok(false);
+        }
+        self.positions[index] = predicate;
+        self.width = self
+            .width
+            .checked_add(1)
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate width accounting overflow",
+            ))?;
+        if is_case_pair {
+            self.case_pairs =
+                self.case_pairs
+                    .checked_add(1)
+                    .ok_or(BuildError::InternalInvariant(
+                        "fixed-predicate case-pair accounting overflow",
+                    ))?;
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedPredicate(u16);
+
+impl FixedPredicate {
+    const EMPTY: Self = Self(0);
+
+    fn singleton(byte: u8) -> Self {
+        let byte = u16::from(byte);
+        Self(byte | (byte << 8))
+    }
+
+    fn pair(first: u8, second: u8) -> Self {
+        Self(u16::from(first) | (u16::from(second) << 8))
+    }
+
+    fn ranges(self) -> FixedPredicateRanges {
+        let [first, second] = self.0.to_le_bytes();
+        if first == second {
+            FixedPredicateRanges {
+                ranges: [(first, first), (0, 0)],
+                range_count: 1,
+            }
+        } else {
+            FixedPredicateRanges {
+                ranges: [(first, first), (second, second)],
+                range_count: 2,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixedPredicateRanges {
+    ranges: [(u8, u8); FIXED_PREDICATE_MAX_RANGES],
+    range_count: u8,
+}
+
+impl FixedPredicateRanges {
+    pub(crate) const EMPTY: Self = Self {
+        ranges: [(0, 0); FIXED_PREDICATE_MAX_RANGES],
+        range_count: 0,
+    };
+
+    pub(crate) fn ranges(&self) -> &[(u8, u8)] {
+        &self.ranges[..usize::from(self.range_count)]
+    }
 }
 
 type IncumbentFiniteResult = Result<(Option<Vec<Vec<u8>>>, u64), BuildError>;
@@ -205,6 +332,152 @@ pub(crate) fn extract(
         Err(PlainFailure::TooLargeFixedSequence) => FiniteOutcome::TooLargeFixedSequence { work },
         Err(PlainFailure::Resource(error)) => FiniteOutcome::ResourceFailure { error, work },
     }
+}
+
+/// Inspect the compact predicate proof after an incumbent finite route has
+/// refused. `initial_work` is the completed incumbent work, so this retry
+/// cannot reset or launder the shared planner quota.
+pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal(
+    hir: &Hir,
+    initial_work: u64,
+    work_limit: u64,
+) -> Result<FixedPredicateInspection, BuildError> {
+    let mut work = initial_work;
+    let source = inspect_fixed_predicate_word64(hir, &mut work, work_limit)?;
+    Ok(FixedPredicateInspection { source, work })
+}
+
+fn inspect_fixed_predicate_word64(
+    hir: &Hir,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<Option<FixedPredicateWord64Source>, BuildError> {
+    let mut tasks = Vec::new();
+    reserve_planner(
+        &mut tasks,
+        1,
+        work,
+        work_limit,
+        "fixed-predicate task stack",
+    )?;
+    tasks.push(hir);
+    let mut source = FixedPredicateWord64Source::EMPTY;
+    while let Some(node) = tasks.pop() {
+        charge_planner(work, 1, work_limit)?;
+        source.hir_nodes = source
+            .hir_nodes
+            .checked_add(1)
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate HIR-node accounting overflow",
+            ))?;
+        match node.kind() {
+            HirKind::Capture(capture) => {
+                source.captures =
+                    source
+                        .captures
+                        .checked_add(1)
+                        .ok_or(BuildError::InternalInvariant(
+                            "fixed-predicate capture accounting overflow",
+                        ))?;
+                reserve_planner(
+                    &mut tasks,
+                    1,
+                    work,
+                    work_limit,
+                    "fixed-predicate task stack",
+                )?;
+                tasks.push(capture.sub.as_ref());
+            }
+            HirKind::Concat(children) if !children.is_empty() => {
+                reserve_planner(
+                    &mut tasks,
+                    children.len(),
+                    work,
+                    work_limit,
+                    "fixed-predicate task stack",
+                )?;
+                tasks.extend(children.iter().rev());
+            }
+            HirKind::Literal(literal) if !literal.0.is_empty() => {
+                if !push_fixed_ascii_literal(&mut source, &literal.0, work, work_limit)? {
+                    return Ok(None);
+                }
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                if !push_fixed_ascii_case_pair(&mut source, class, work, work_limit)? {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    if source.width() < FIXED_PREDICATE_WORD64_MIN_WIDTH || source.case_pairs() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(source))
+}
+
+fn push_fixed_ascii_literal(
+    source: &mut FixedPredicateWord64Source,
+    literal: &[u8],
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<bool, BuildError> {
+    let width = source
+        .width()
+        .checked_add(literal.len())
+        .ok_or(BuildError::InternalInvariant(
+            "fixed-predicate width accounting overflow",
+        ))?;
+    if width > FIXED_PREDICATE_WORD64_MAX_WIDTH {
+        return Ok(false);
+    }
+    charge_planner(
+        work,
+        u64::try_from(literal.len()).unwrap_or(u64::MAX),
+        work_limit,
+    )?;
+    for &byte in literal {
+        if !byte.is_ascii() {
+            return Ok(false);
+        }
+        charge_planner(work, 1, work_limit)?;
+        if !source.push(FixedPredicate::singleton(byte), false)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn push_fixed_ascii_case_pair(
+    source: &mut FixedPredicateWord64Source,
+    class: &regex_syntax::hir::ClassBytes,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<bool, BuildError> {
+    let [first, second] = class.ranges() else {
+        return Ok(false);
+    };
+    if source.width() == FIXED_PREDICATE_WORD64_MAX_WIDTH {
+        return Ok(false);
+    }
+    charge_planner(work, 2, work_limit)?;
+    if first.start() != first.end() || second.start() != second.end() {
+        return Ok(false);
+    }
+    let first = first.start();
+    let second = second.start();
+    let is_ascii_case_pair = (first.is_ascii_uppercase()
+        && second.is_ascii_lowercase()
+        && first.to_ascii_lowercase() == second)
+        || (first.is_ascii_lowercase()
+            && second.is_ascii_uppercase()
+            && first == second.to_ascii_lowercase());
+    if !is_ascii_case_pair {
+        return Ok(false);
+    }
+    charge_planner(work, 1, work_limit)?;
+    source.push(FixedPredicate::pair(first, second), true)
 }
 
 enum PlainFailure {
@@ -2541,6 +2814,16 @@ mod tests {
             .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"))
     }
 
+    fn parse_case_insensitive(pattern: &str) -> regex_syntax::hir::Hir {
+        ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .case_insensitive(true)
+            .build()
+            .parse(pattern)
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error}"))
+    }
+
     fn extract(
         hir: &regex_syntax::hir::Hir,
         max_words: usize,
@@ -2925,6 +3208,87 @@ mod tests {
                 extract(&parse(pattern), 1, 1, 0, u64::MAX, true),
                 FiniteOutcome::Unsupported { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn typed_finite_refusal_can_continue_into_exact_inline_predicates() {
+        let hir = parse_case_insensitive("Sherlock Holmes");
+        let FiniteOutcome::TooLargeFixedSequence { work: refusal_work } =
+            extract(&hir, 4_096, usize::MAX, 17, u64::MAX, true)
+        else {
+            panic!("Sherlock closure should reach the typed finite refusal");
+        };
+        let inspected = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &hir,
+            refusal_work,
+            u64::MAX,
+        )
+        .unwrap();
+        let source = inspected
+            .source
+            .expect("typed refusal should retain the compact predicate proof");
+        assert_eq!(source.width(), 15);
+        assert_eq!(source.case_pairs(), 14);
+        assert_eq!(source.captures(), 0);
+        assert!(source.hir_nodes() >= source.width());
+        assert!(inspected.work > refusal_work);
+
+        let positions = source.positions().collect::<Vec<_>>();
+        assert_eq!(positions.len(), 15);
+        assert!(positions[0].ranges().contains(&(b'S', b'S')));
+        assert!(positions[0].ranges().contains(&(b's', b's')));
+        assert_eq!(positions[8].ranges(), &[(b' ', b' ')]);
+        assert!(positions[14].ranges().contains(&(b'S', b'S')));
+        assert!(positions[14].ranges().contains(&(b's', b's')));
+
+        let one_below = inspected.work.checked_sub(1).unwrap();
+        assert!(matches!(
+            super::inspect_fixed_predicate_word64_after_finite_refusal(
+                &hir,
+                refusal_work,
+                one_below,
+            ),
+            Err(BuildError::PlannerWorkLimit { needed, limit })
+                if needed == inspected.work && limit == one_below
+        ));
+    }
+
+    #[test]
+    fn compact_predicate_inspection_is_narrow_and_capture_aware() {
+        let captured = parse_case_insensitive("(?P<phrase>Ab)");
+        let inspected =
+            super::inspect_fixed_predicate_word64_after_finite_refusal(&captured, 0, u64::MAX)
+                .unwrap();
+        let source = inspected.source.unwrap();
+        assert_eq!(source.width(), 2);
+        assert_eq!(source.case_pairs(), 2);
+        assert_eq!(source.captures(), 1);
+
+        let width_64 = parse_case_insensitive(&"a".repeat(64));
+        assert_eq!(
+            super::inspect_fixed_predicate_word64_after_finite_refusal(&width_64, 0, u64::MAX,)
+                .unwrap()
+                .source
+                .unwrap()
+                .width(),
+            64
+        );
+        for hir in [
+            parse_case_insensitive("a"),
+            parse_case_insensitive(&"a".repeat(65)),
+            parse("ab"),
+            parse("[ace]x"),
+            parse_case_insensitive("a+"),
+            parse_case_insensitive(r"\ba"),
+            parse_case_insensitive(r"\xFFa"),
+        ] {
+            assert!(
+                super::inspect_fixed_predicate_word64_after_finite_refusal(&hir, 0, u64::MAX,)
+                    .unwrap()
+                    .source
+                    .is_none()
+            );
         }
     }
 }

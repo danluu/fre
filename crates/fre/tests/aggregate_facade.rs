@@ -449,7 +449,8 @@ fn continuation_details(
         | AggregateExecutionDetails::FixedAbsoluteDomain(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. }
-        | AggregateExecutionDetails::GuardedAsciiWord(_) => {
+        | AggregateExecutionDetails::GuardedAsciiWord(_)
+        | AggregateExecutionDetails::FixedPredicateWord64(_) => {
             panic!("expected continuation execution details")
         }
     }

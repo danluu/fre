@@ -1,15 +1,15 @@
 //! Fixed-width byte-predicate matching with one 64-bit Shift-And state.
 //!
 //! Construction accepts between two and 64 nonempty byte predicates. Each
-//! predicate is supplied as inclusive byte ranges and is compiled into a
-//! byte-to-position mask table. Reduction performs exactly one state
+//! predicate is supplied as inclusive ASCII-byte ranges and is compiled into
+//! a byte-to-position mask table. Reduction performs exactly one state
 //! transition per haystack byte, resets after each accepted word, allocates no
 //! operation memory, and materializes no spans.
 
 use core::{fmt, mem::size_of};
 
 /// Stable identity for the fixed-predicate Shift-And strategy.
-pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.nonoverlap.v1";
+pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.ascii.nonoverlap.v1";
 /// Stable identity for the count reducer.
 pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v1";
 /// Stable identity for the matched-byte-sum reducer.
@@ -19,11 +19,11 @@ pub const MIN_WIDTH: usize = 2;
 /// Maximum fixed word width representable by one Shift-And state.
 pub const MAX_WIDTH: usize = 64;
 
-const MASK_SLOTS: usize = 256;
-const MAX_MEMBERS_PER_RANGE: usize = 256;
+const MASK_SLOTS: usize = 128;
+const MAX_MEMBERS_PER_RANGE: usize = 128;
 const BUILD_FIXED_WORK: usize = 4;
 const RANGE_FIXED_WORK: usize = 2;
-const TRANSITION_WORK: usize = 5;
+const TRANSITION_WORK: usize = 6;
 const MATCH_WORK: usize = 3;
 const REDUCE_FINAL_WORK: usize = 1;
 
@@ -327,6 +327,13 @@ pub enum BuildError {
         start: u8,
         end: u8,
     },
+    /// One otherwise ordered range contains a non-ASCII byte.
+    NonAsciiRange {
+        position: usize,
+        range: usize,
+        start: u8,
+        end: u8,
+    },
     /// Checked arithmetic failed.
     ArithmeticOverflow { computation: &'static str },
     /// A post-preflight invariant failed closed.
@@ -386,6 +393,15 @@ impl fmt::Display for BuildError {
             } => write!(
                 formatter,
                 "word position {position} range {range} is reversed: {start}..={end}"
+            ),
+            Self::NonAsciiRange {
+                position,
+                range,
+                start,
+                end,
+            } => write!(
+                formatter,
+                "word position {position} range {range} is outside ASCII: {start}..={end}"
             ),
             Self::ArithmeticOverflow { computation } => {
                 write!(
@@ -605,6 +621,14 @@ fn compile_masks(positions: &[&[(u8, u8)]]) -> Result<([u64; MASK_SLOTS], usize)
         for (range, &(start, end)) in ranges.iter().enumerate() {
             if start > end {
                 return Err(BuildError::ReversedRange {
+                    position,
+                    range,
+                    start,
+                    end,
+                });
+            }
+            if !start.is_ascii() || !end.is_ascii() {
+                return Err(BuildError::NonAsciiRange {
                     position,
                     range,
                     start,
@@ -895,7 +919,7 @@ impl FixedPredicateWord64Plan {
         let mut state = 0_u64;
         let mut match_events = 0_usize;
         for &byte in haystack {
-            let mask = self.masks[usize::from(byte)];
+            let mask = self.masks.get(usize::from(byte)).copied().unwrap_or(0);
             state = (state.wrapping_shl(1) | 1) & mask;
             if state & self.accepting_bit != 0 {
                 match_events =
@@ -1210,6 +1234,16 @@ mod tests {
                 end: 4
             })
         ));
+        let non_ascii: &[(u8, u8)] = &[(0x7F, 0x80)];
+        assert!(matches!(
+            FixedPredicateWord64Plan::build(&[A, non_ascii], BuildLimits::unlimited()),
+            Err(BuildError::NonAsciiRange {
+                position: 1,
+                range: 0,
+                start: 0x7F,
+                end: 0x80
+            })
+        ));
 
         let width_63 = [X; 63];
         let plan_63 = FixedPredicateWord64Plan::build(&width_63, BuildLimits::unlimited()).unwrap();
@@ -1251,10 +1285,10 @@ mod tests {
         assert_eq!(accounting.reserves, 0);
         assert_eq!(accounting.temporary_copies, 0);
         assert_eq!(accounting.scratch_bytes, 0);
-        // P=2, R=4 and every range has one member: U=256+P+258R+4,
-        // while A=256+P+2R+B+4 with B=4.
-        assert_eq!(accounting.work_upper_bound, 1_294);
-        assert_eq!(accounting.work_charged, 274);
+        // P=2, R=4 and every range has one member: U=128+P+130R+4,
+        // while A=128+P+2R+B+4 with B=4.
+        assert_eq!(accounting.work_upper_bound, 654);
+        assert_eq!(accounting.work_charged, 146);
         assert!(accounting.work_charged <= accounting.work_upper_bound);
 
         let exact = BuildLimits {
@@ -1347,15 +1381,15 @@ mod tests {
         assert_eq!(exact_result.accounting.actual.allocations, 0);
         assert_eq!(exact_result.accounting.actual.reserves, 0);
         assert_eq!(exact_result.accounting.actual.temporary_copies, 0);
-        // N=12, W=2, M=6 and m=3: U=5N+3M+1 and A=5N+3m+1.
+        // N=12, W=2, M=6 and m=3: U=6N+3M+1 and A=6N+3m+1.
         assert_eq!(upper.transitions, 12);
         assert_eq!(upper.match_events, 6);
         assert_eq!(upper.span_sum, 12);
         assert_eq!(upper.reducer_steps, 13);
-        assert_eq!(upper.work, 79);
+        assert_eq!(upper.work, 91);
         assert_eq!(exact_result.accounting.actual.match_events, 3);
         assert_eq!(exact_result.accounting.actual.matched_bytes, 6);
-        assert_eq!(exact_result.accounting.actual.work_charged, 70);
+        assert_eq!(exact_result.accounting.actual.work_charged, 82);
 
         let count_limits = ReduceLimits {
             max_span_sum: 0,
@@ -1389,14 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn inclusive_ranges_union_arbitrary_bytes_without_allocation() {
-        const FIRST: &[(u8, u8)] = &[(0, 2), (2, 3), (0xFF, 0xFF)];
+    fn inclusive_ascii_ranges_union_without_allocation_and_high_bytes_mismatch() {
+        const FIRST: &[(u8, u8)] = &[(0, 2), (2, 3)];
         const SECOND: &[(u8, u8)] = &[(b'a', b'c')];
         let plan =
             FixedPredicateWord64Plan::build(&[FIRST, SECOND], BuildLimits::unlimited()).unwrap();
         let result = plan
             .count(
-                &[0, b'a', 2, b'b', 0xFF, b'c', 4, b'a'],
+                &[0, b'a', 2, b'b', 0xFF, b'c', 3, b'c', 4, b'a'],
                 ReduceLimits::unlimited(),
             )
             .unwrap();

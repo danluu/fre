@@ -1,0 +1,417 @@
+use fre::{
+    AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
+    AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateRunLimits, FixedPredicateWord64MatchSelection,
+    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
+    FixedPredicateWord64ReduceError, RustProfile,
+};
+
+const PATTERN: &str = "Sherlock Holmes";
+const HAYSTACK: &[u8] =
+    b"\xFFSHERLOCK HOLMES--sherlock holmes--SherLock Holmes--sherlock holme\x80";
+
+fn builder() -> AggregateBuilder {
+    AggregateBuilder::new(PATTERN)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(true)
+}
+
+fn upstream_spans(pattern: &str, haystack: &[u8], case_insensitive: bool) -> Vec<(usize, usize)> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(false)
+        .case_insensitive(case_insensitive)
+        .build()
+        .unwrap()
+        .find_iter(haystack)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect()
+}
+
+#[test]
+fn count_identity_and_accounting_are_closed() {
+    let expected = upstream_spans(PATTERN, HAYSTACK, true);
+    assert_eq!(expected.len(), 3);
+    let expected_sum = expected
+        .iter()
+        .map(|(start, end)| u64::try_from(end - start).unwrap())
+        .sum::<u64>();
+    assert_eq!(expected_sum, 45);
+
+    let count = builder().build_count().unwrap();
+    let report = count.build_report();
+    assert_eq!(report.plan, AggregatePlanKind::FixedPredicateWord64);
+    assert_eq!(report.continuation_strategy, None);
+    assert_eq!(report.captures_erased, 0);
+    let AggregatePlanIdentity::FixedPredicateWord64(identity) = report.plan_identity else {
+        panic!("fixed predicate count selected another identity");
+    };
+    assert_eq!(identity.operation, FixedPredicateWord64Operation::Count);
+    assert_eq!(
+        identity.semantics,
+        FixedPredicateWord64MatchSemantics::FixedBytePredicates
+    );
+    assert_eq!(
+        identity.selection,
+        FixedPredicateWord64MatchSelection::LeftmostFirstNonOverlapping
+    );
+    assert_eq!(identity.width, PATTERN.len());
+    let AggregateBuildAccounting::FixedPredicateWord64(build) = report.build else {
+        panic!("fixed predicate count retained another build certificate");
+    };
+    assert_eq!(build.positions, 15);
+    assert_eq!(build.source_ranges, 29);
+    assert_eq!(build.position_visits, build.positions);
+    assert_eq!(build.range_inspections, build.source_ranges);
+    assert!(build.work_charged <= build.work_upper_bound);
+    assert_eq!(build.allocations, 0);
+    assert_eq!(build.reserves, 0);
+    assert_eq!(build.temporary_copies, 0);
+    assert_eq!(build.scratch_bytes, 0);
+    assert_eq!(build.persistent_bytes, report.retained_capacity_bytes);
+    assert_eq!(build.peak_bytes, build.persistent_bytes);
+
+    let counted = count
+        .count(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), 3);
+    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = counted.report().details
+    else {
+        panic!("fixed predicate count executed another plan");
+    };
+    assert_eq!(accounting.identity, identity);
+    assert_eq!(accounting.actual.input_bytes, HAYSTACK.len());
+    assert_eq!(
+        accounting.actual.transitions,
+        accounting.upper_bounds.transitions
+    );
+    assert_eq!(accounting.actual.match_events, 3);
+    assert_eq!(accounting.actual.count, 3);
+    assert_eq!(accounting.actual.matched_bytes, expected_sum);
+    assert!(accounting.actual.work_charged <= accounting.upper_bounds.work);
+    assert_eq!(accounting.actual.allocations, 0);
+    assert_eq!(accounting.actual.scratch_bytes, 0);
+}
+
+#[test]
+fn span_sum_compile_captures_and_exclusions_are_closed() {
+    let sum = builder().build_span_sum().unwrap();
+    assert!(matches!(
+        sum.build_report().plan_identity,
+        AggregatePlanIdentity::FixedPredicateWord64(identity)
+            if identity.operation == FixedPredicateWord64Operation::SpanSum
+    ));
+    assert_eq!(
+        sum.span_sum_value(HAYSTACK, AggregateRunLimits::default())
+            .unwrap(),
+        45
+    );
+    let compiled = builder().build_compile().unwrap();
+    assert_eq!(
+        compiled.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert_eq!(
+        compiled
+            .verify_count(HAYSTACK, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        3
+    );
+
+    let captured = AggregateBuilder::new("((Sherlock Holmes))")
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(true)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        captured.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert_eq!(captured.build_report().captures_erased, 2);
+    assert_eq!(captured.build_report().capture_erasure_work, 4);
+    assert_eq!(
+        captured
+            .count_value(HAYSTACK, AggregateRunLimits::default())
+            .unwrap(),
+        3
+    );
+
+    assert_eq!(
+        AggregateBuilder::new("Sherlock")
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+            .case_insensitive(true)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::FiniteLiteralDfa
+    );
+    assert_ne!(
+        AggregateBuilder::new(PATTERN)
+            .profile(RustProfile::rebar_1_12_4())
+            .case_insensitive(true)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert_eq!(
+        builder().build_spans().unwrap().build_report().plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+    assert_eq!(
+        builder()
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::ContinuationProgram
+    );
+}
+
+#[test]
+fn planner_work_is_cumulative_for_typed_and_dense_refusals() {
+    let baseline = builder().build_count().unwrap();
+    let planner_work = baseline.build_report().finite_planner_work;
+    assert!(planner_work > 0);
+    assert_eq!(
+        builder()
+            .limits(AggregateBuildLimits {
+                max_finite_planner_work: planner_work,
+                ..AggregateBuildLimits::default()
+            })
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert!(matches!(
+        builder()
+            .limits(AggregateBuildLimits {
+                max_finite_planner_work: planner_work - 1,
+                ..AggregateBuildLimits::default()
+            })
+            .build_count(),
+        Err(AggregateBuildError::FinitePlannerWorkLimit { needed, limit, .. })
+            if needed == planner_work && limit + 1 == planner_work
+    ));
+
+    let mut finite = AggregateBuildLimits::default().finite_literal;
+    finite.max_patterns = 1_000_000;
+    finite.max_pattern_bytes = 536_870_912;
+    finite.max_identity_bytes = 33_554_432;
+    finite.max_trie_states = 4_194_304;
+    finite.max_dfa_cells = 4_194_304;
+    finite.max_build_work = 67_108_864;
+    finite.max_scratch_bytes = 33_554_432;
+    finite.max_persistent_bytes = 67_108_864;
+    finite.max_peak_bytes = 100_663_296;
+    let dense_refusal_limits = AggregateBuildLimits {
+        finite_literal: finite,
+        ..AggregateBuildLimits::default()
+    };
+    let retried = builder()
+        .limits(dense_refusal_limits)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        retried.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    let retry_work = retried.build_report().finite_planner_work;
+    assert!(retry_work > planner_work);
+    assert!(matches!(
+        builder()
+            .limits(AggregateBuildLimits {
+                max_finite_planner_work: retry_work - 1,
+                ..dense_refusal_limits
+            })
+            .build_count(),
+        Err(AggregateBuildError::FinitePlannerWorkLimit { needed, limit, .. })
+            if needed == retry_work && limit + 1 == retry_work
+    ));
+
+    let captured = AggregateBuilder::new("((Sherlock Holmes))")
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .case_insensitive(true)
+        .limits(dense_refusal_limits)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        captured.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert_eq!(captured.build_report().capture_erasure_work, 6);
+}
+
+#[test]
+fn shared_build_envelope_is_exact_and_one_below_falls_through() {
+    let baseline = builder().build_count().unwrap();
+    let AggregateBuildAccounting::FixedPredicateWord64(build) = baseline.build_report().build
+    else {
+        panic!("baseline selected another build family");
+    };
+    let mut finite = AggregateBuildLimits::default().finite_literal;
+    finite.max_patterns = build.positions;
+    finite.max_pattern_bytes = build.source_ranges;
+    finite.max_identity_bytes = build.source_ranges.checked_mul(2).unwrap();
+    finite.max_trie_states = build.positions.checked_add(1).unwrap();
+    finite.max_build_work = build.work_upper_bound;
+    finite.max_scratch_bytes = build.scratch_bytes;
+    finite.max_persistent_bytes = build.persistent_bytes;
+    finite.max_peak_bytes = build.peak_bytes;
+    let exact = AggregateBuildLimits {
+        finite_literal: finite,
+        ..AggregateBuildLimits::default()
+    };
+    assert_eq!(
+        builder()
+            .limits(exact)
+            .build_count()
+            .unwrap()
+            .build_report()
+            .plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+
+    let mut cases = Vec::new();
+    let mut one_below = exact;
+    one_below.finite_literal.max_patterns -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_pattern_bytes -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_identity_bytes -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_trie_states -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_build_work -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_persistent_bytes -= 1;
+    cases.push(one_below);
+    one_below = exact;
+    one_below.finite_literal.max_peak_bytes -= 1;
+    cases.push(one_below);
+    for limits in cases {
+        assert_eq!(
+            builder()
+                .limits(limits)
+                .build_count()
+                .unwrap()
+                .build_report()
+                .plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+    }
+}
+
+fn exact_run_limits() -> (
+    fre::AggregateCountRegex,
+    AggregateRunLimits,
+    fre::FixedPredicateWord64UpperBounds,
+) {
+    let regex = builder().build_count().unwrap();
+    let baseline = regex
+        .count(HAYSTACK, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::FixedPredicateWord64(accounting) = baseline.report().details
+    else {
+        panic!("baseline executed another family");
+    };
+    let upper = accounting.upper_bounds;
+    let mut finite = AggregateRunLimits::default().finite_literal;
+    finite.max_transitions = upper.transitions;
+    finite.max_match_events = upper.match_events;
+    finite.max_count = upper.count;
+    finite.max_span_sum = upper.span_sum;
+    finite.max_reducer_steps = upper.reducer_steps;
+    finite.max_ring_initializations = 0;
+    finite.max_total_work = usize::try_from(upper.work).unwrap();
+    finite.max_scratch_bytes = upper.scratch_bytes;
+    finite.max_peak_bytes = upper.peak_bytes;
+    (
+        regex,
+        AggregateRunLimits {
+            finite_literal: finite,
+            ..AggregateRunLimits::default()
+        },
+        upper,
+    )
+}
+
+#[test]
+fn shared_run_envelope_is_exact_and_failures_are_typed() {
+    let (regex, exact, upper) = exact_run_limits();
+    assert_eq!(regex.count(HAYSTACK, exact).unwrap().value(), 3);
+
+    let mut one_below = exact;
+    one_below.finite_literal.max_transitions -= 1;
+    assert!(matches!(
+        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::InputLimit { needed, limit }
+        ) if needed == upper.input_bytes && limit + 1 == needed
+    ));
+    one_below = exact;
+    one_below.finite_literal.max_match_events -= 1;
+    assert!(matches!(
+        regex.count_value(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::MatchEventsLimit { needed, limit }
+        ) if needed == upper.match_events && limit + 1 == needed
+    ));
+    one_below = exact;
+    one_below.finite_literal.max_count -= 1;
+    assert!(matches!(
+        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::CountLimit { needed, limit }
+        ) if needed == upper.count && limit + 1 == needed
+    ));
+    one_below = exact;
+    one_below.finite_literal.max_reducer_steps -= 1;
+    assert!(matches!(
+        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::ReducerStepsLimit { needed, limit }
+        ) if needed == upper.reducer_steps && limit + 1 == needed
+    ));
+    one_below = exact;
+    one_below.finite_literal.max_total_work -= 1;
+    assert!(matches!(
+        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::WorkLimit { needed, limit }
+        ) if needed == upper.work && limit + 1 == needed
+    ));
+    one_below = exact;
+    one_below.finite_literal.max_peak_bytes -= 1;
+    let error = regex.count(HAYSTACK, one_below).unwrap_err();
+    assert!(matches!(
+        error.source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::PersistentLimit { needed, limit }
+        ) if needed == upper.persistent_bytes && limit + 1 == needed
+    ));
+
+    let sum = builder().build_span_sum().unwrap();
+    one_below = exact;
+    one_below.finite_literal.max_span_sum -= 1;
+    assert!(matches!(
+        sum.span_sum(HAYSTACK, one_below).unwrap_err().source,
+        AggregateExecutionSource::FixedPredicateWord64(
+            FixedPredicateWord64ReduceError::SpanSumLimit { needed, limit }
+        ) if needed == upper.span_sum && limit + 1 == needed
+    ));
+}

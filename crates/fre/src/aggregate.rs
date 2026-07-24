@@ -43,6 +43,11 @@ use fre_kernels::{
     FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
+    FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildError,
+    FixedPredicateWord64BuildLimits, FixedPredicateWord64CountResult,
+    FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
+    FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
+    FixedPredicateWord64ReduceLimits, FixedPredicateWord64SpanSumResult,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
@@ -104,7 +109,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 31;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 32;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -185,6 +190,9 @@ pub enum AggregatePlanKind {
     /// Finite nonempty ASCII-word bodies guarded on both endpoints, lowered
     /// to an eager exact dictionary and allocation-free maximal-word scan.
     GuardedAsciiWordDictionary,
+    /// One fixed-width sequence of ASCII-byte predicates lowered to an inline
+    /// 64-bit Shift-And state and byte-to-position masks.
+    FixedPredicateWord64,
     /// Bounded prioritized continuation program from `fre-aggregate`.
     ContinuationProgram,
 }
@@ -229,6 +237,8 @@ pub enum AggregatePlanIdentity {
     /// Guarded ASCII-word dictionary and operation identity. The syntax key
     /// retains exact HIR order, captures, duplicates, and profile inputs.
     GuardedAsciiWord(AggregateGuardedAsciiWordIdentity),
+    /// Fixed ASCII-byte-predicate Shift-And operation identity.
+    FixedPredicateWord64(FixedPredicateWord64OperationIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
 }
@@ -944,6 +954,8 @@ pub enum AggregateBuildAccounting {
     SparseFiniteLiteral(SparseOrderedLiteralAggregateBuildAccounting),
     /// Temporary finite-source closure plus persistent guarded dictionary.
     GuardedAsciiWord(AggregateGuardedAsciiWordBuildAccounting),
+    /// Inline fixed ASCII-byte-predicate construction certificate.
+    FixedPredicateWord64(FixedPredicateWord64BuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
 }
@@ -2404,6 +2416,13 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: guarded_ascii_word::BuildError,
     },
+    /// Fixed ASCII-byte-predicate Shift-And construction failed after
+    /// semantic selection.
+    FixedPredicateWord64Build {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: FixedPredicateWord64BuildError,
+    },
     /// Bounded continuation compiler refusal.
     ContinuationCompile {
         operation: AggregateOperation,
@@ -2780,6 +2799,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} guarded ASCII-word construction failed: {source}"
             ),
+            Self::FixedPredicateWord64Build {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} fixed-predicate Word64 construction failed: {source}"
+            ),
             Self::ContinuationCompile {
                 operation,
                 selection,
@@ -2825,6 +2852,7 @@ impl std::error::Error for AggregateBuildError {
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::GuardedAsciiWordBuild { source, .. } => Some(source),
+            Self::FixedPredicateWord64Build { source, .. } => Some(source),
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
@@ -3021,6 +3049,8 @@ pub enum AggregateExecutionSource {
     /// allocation-free; facade packaging boxes its complete P/A receipt so a
     /// newly selected route does not inflate every public execution result.
     GuardedAsciiWord(Box<guarded_ascii_word::ReduceError>),
+    /// Fixed ASCII-byte-predicate Shift-And whole-operation refusal.
+    FixedPredicateWord64(FixedPredicateWord64ReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
     /// Facade conversion or selected-plan invariant failure.
@@ -3051,6 +3081,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::GuardedAsciiWord(source) => source.fmt(f),
+            Self::FixedPredicateWord64(source) => source.fmt(f),
             Self::Continuation(source) => source.fmt(f),
             Self::InternalInvariant(detail) => {
                 write!(f, "aggregate facade execution invariant failed: {detail}")
@@ -3082,6 +3113,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::GuardedAsciiWord(source) => Some(source.as_ref()),
+            Self::FixedPredicateWord64(source) => Some(source),
             Self::Continuation(source) => Some(source),
         }
     }
@@ -3221,6 +3253,8 @@ pub enum AggregateExecutionDetails {
     },
     /// Allocation-free maximal ASCII-word scan bounds and exact counters.
     GuardedAsciiWord(guarded_ascii_word::ReduceAccounting),
+    /// Fixed ASCII-byte-predicate Shift-And bounds and exact counters.
+    FixedPredicateWord64(FixedPredicateWord64ReduceAccounting),
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
         certificate: AggregateOperationCertificate,
@@ -3575,6 +3609,41 @@ fn guarded_finite_build_limit_allows_continuation(source: &guarded_ascii_word::B
     )
 }
 
+/// Fixed-predicate construction remains inside the existing finite-language
+/// quota envelope. One symbolic position contributes at least one source byte
+/// and trie state; one inclusive range needs two identity bytes.
+fn fixed_predicate_word64_build_limits(
+    limits: OrderedLiteralAggregateBuildLimits,
+) -> FixedPredicateWord64BuildLimits {
+    let trie_positions = limits.max_trie_states.saturating_sub(1);
+    let max_positions = limits
+        .max_patterns
+        .min(limits.max_pattern_bytes)
+        .min(trie_positions);
+    FixedPredicateWord64BuildLimits {
+        max_positions,
+        max_source_ranges: limits.max_pattern_bytes.min(limits.max_identity_bytes / 2),
+        max_build_work: limits.max_build_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_persistent_bytes: limits.max_persistent_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+fn fixed_predicate_word64_build_limit_allows_continuation(
+    source: &FixedPredicateWord64BuildError,
+) -> bool {
+    matches!(
+        source,
+        FixedPredicateWord64BuildError::PositionLimit { .. }
+            | FixedPredicateWord64BuildError::SourceRangesLimit { .. }
+            | FixedPredicateWord64BuildError::WorkLimit { .. }
+            | FixedPredicateWord64BuildError::ScratchLimit { .. }
+            | FixedPredicateWord64BuildError::PersistentLimit { .. }
+            | FixedPredicateWord64BuildError::PeakLimit { .. }
+    )
+}
+
 fn fixed_absolute_build_limit_allows_continuation(source: &FixedAbsoluteDomainBuildError) -> bool {
     matches!(
         source.kind,
@@ -3621,6 +3690,25 @@ const fn guarded_ascii_word_reduce_limits(
         max_span_sum: limits.max_span_sum,
         max_lookup_steps: limits.max_reducer_steps,
         max_total_work: limits.max_total_work,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+/// Fixed-predicate reduction also reuses the finite-language envelope. It
+/// performs one transition per byte with no dynamic scratch.
+fn fixed_predicate_word64_reduce_limits(
+    limits: OrderedLiteralAggregateReduceLimits,
+) -> FixedPredicateWord64ReduceLimits {
+    FixedPredicateWord64ReduceLimits {
+        max_input_bytes: limits.max_transitions,
+        max_transitions: limits.max_transitions,
+        max_match_events: limits.max_match_events,
+        max_count: limits.max_count,
+        max_span_sum: limits.max_span_sum,
+        max_reducer_steps: limits.max_reducer_steps,
+        max_work: u64::try_from(limits.max_total_work).unwrap_or(u64::MAX),
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_persistent_bytes: limits.max_peak_bytes,
         max_peak_bytes: limits.max_peak_bytes,
     }
 }
@@ -6710,6 +6798,8 @@ impl AggregateBuilder {
         if let Some(outcome) = &finite {
             finite_planner_work = outcome.work();
         }
+        let mut fixed_predicate_refused = false;
+        let mut dense_finite_refused = false;
         let finite_words = match finite {
             Some(finite::FiniteOutcome::Fits { words, .. }) => Some(words),
             Some(finite::FiniteOutcome::GuardedFiniteBody {
@@ -6870,11 +6960,11 @@ impl AggregateBuilder {
                     },
                 });
             }
-            Some(
-                finite::FiniteOutcome::TooLargeFixedSequence { .. }
-                | finite::FiniteOutcome::Unsupported { .. },
-            )
-            | None => None,
+            Some(finite::FiniteOutcome::TooLargeFixedSequence { .. }) => {
+                fixed_predicate_refused = !unicode;
+                None
+            }
+            Some(finite::FiniteOutcome::Unsupported { .. }) | None => None,
         }
             .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
         if let Some(words) = finite_words {
@@ -6970,13 +7060,169 @@ impl AggregateBuilder {
                         report,
                     });
                 }
-                Err(source) if finite_build_limit_allows_continuation(&source) => {}
+                Err(source) if finite_build_limit_allows_continuation(&source) => {
+                    fixed_predicate_refused = !unicode;
+                    dense_finite_refused = !unicode;
+                }
                 Err(source) => {
                     return Err(AggregateBuildError::FiniteLiteralBuild {
                         operation,
                         selection,
                         source,
                     });
+                }
+            }
+        }
+        if fixed_predicate_refused {
+            let inspected = finite::inspect_fixed_predicate_word64_after_finite_refusal(
+                &rust.hir,
+                finite_planner_work,
+                limits.max_finite_planner_work,
+            )
+            .map_err(|error| match error {
+                BuildError::PlannerWorkLimit { needed, limit } => {
+                    AggregateBuildError::FinitePlannerWorkLimit {
+                        operation,
+                        selection,
+                        needed,
+                        limit,
+                    }
+                }
+                BuildError::AllocationFailed {
+                    structure,
+                    additional,
+                } => AggregateBuildError::FinitePlannerAllocationFailed {
+                    operation,
+                    selection,
+                    structure,
+                    additional,
+                },
+                _ => AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "post-refusal fixed-predicate planner returned an unrelated facade error",
+                },
+            })?;
+            finite_planner_work = inspected.work;
+            if let Some(source) = inspected.source {
+                if unicode || source.case_pairs() == 0 {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-predicate source escaped its ASCII case-fold proof",
+                    });
+                }
+                if source.hir_nodes() != expected_nodes || source.captures() != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from fixed-predicate inspection",
+                    });
+                }
+                let mut normalized = [finite::FixedPredicateRanges::EMPTY; 64];
+                for (index, ranges) in source.positions().enumerate() {
+                    let Some(slot) = normalized.get_mut(index) else {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed-predicate source exceeded its inline width",
+                        });
+                    };
+                    *slot = ranges;
+                }
+                let Some(normalized) = normalized.get(..source.width()) else {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-predicate source width exceeded its inline storage",
+                    });
+                };
+                let mut positions: [&[(u8, u8)]; 64] = [&[]; 64];
+                for (slot, predicate) in positions.iter_mut().zip(normalized) {
+                    *slot = predicate.ranges();
+                }
+                let fixed_build = FixedPredicateWord64Plan::build(
+                    &positions[..normalized.len()],
+                    fixed_predicate_word64_build_limits(limits.finite_literal),
+                );
+                match fixed_build {
+                    Ok(engine) => {
+                        let build = engine.build_accounting();
+                        let kernel_operation = match operation {
+                            AggregateOperation::Compile | AggregateOperation::Count => {
+                                FixedPredicateWord64Operation::Count
+                            }
+                            AggregateOperation::SpanSum => FixedPredicateWord64Operation::SpanSum,
+                            AggregateOperation::Spans => {
+                                return Err(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "span materialization selected fixed-predicate reducer",
+                                });
+                            }
+                        };
+                        let capture_erasure_passes = if dense_finite_refused { 3 } else { 2 };
+                        let capture_erasure_work = expected_captures
+                            .checked_mul(capture_erasure_passes)
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed-predicate capture-erasure accounting overflow",
+                            })?;
+                        let report = AggregateBuildReport {
+                            schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                            syntax_key,
+                            admission,
+                            syntax,
+                            operation,
+                            selection,
+                            plan: AggregatePlanKind::FixedPredicateWord64,
+                            continuation_strategy: None,
+                            capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                            planner_work,
+                            unicode_scalar_planner_work,
+                            word_run_planner_work,
+                            literal_assertions_planner_work,
+                            blocking_delimiter_planner_work,
+                            token_phrase_planner_work,
+                            fixed_class_sandwich_planner_work,
+                            bounded_affix_planner_work,
+                            grapheme_scalar_dfa_planner_work,
+                            bounded_class_sequence_planner_work,
+                            bounded_separated_fields_planner_work,
+                            prefix_class_alternation_planner_work,
+                            literal_class_run_literal_planner_work,
+                            bounded_literal_pair_planner_work,
+                            bounded_context_planner_work,
+                            fixed_absolute_planner_work,
+                            finite_planner_work,
+                            capture_erasure_work,
+                            captures_erased: expected_captures,
+                            build: AggregateBuildAccounting::FixedPredicateWord64(build),
+                            plan_identity: AggregatePlanIdentity::FixedPredicateWord64(
+                                engine.operation_identity(kernel_operation),
+                            ),
+                            sealed_bounded_separated_fields_identity: None,
+                            sealed_required_internal_anchor_identity: None,
+                            sealed_url_aggregate_identity: None,
+                            retained_capacity_bytes: build.persistent_bytes,
+                        };
+                        return Ok(AggregatePlan {
+                            engine: AggregateEngine::FixedPredicateWord64(engine),
+                            minimum_match_bytes,
+                            limits,
+                            report,
+                        });
+                    }
+                    Err(source)
+                        if fixed_predicate_word64_build_limit_allows_continuation(&source) => {}
+                    Err(source) => {
+                        return Err(AggregateBuildError::FixedPredicateWord64Build {
+                            operation,
+                            selection,
+                            source,
+                        });
+                    }
                 }
             }
         }
@@ -7105,6 +7351,7 @@ enum AggregateEngine {
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
     SparseFiniteSpanSum(SparseOrderedLiteralSpanSumPlan),
     GuardedAsciiWord(guarded_ascii_word::Dictionary),
+    FixedPredicateWord64(FixedPredicateWord64Plan),
     Continuation(CompiledRegex),
 }
 
@@ -7715,6 +7962,18 @@ impl AggregatePlan {
                         AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
                     )
                 }),
+            AggregateEngine::FixedPredicateWord64(engine) => engine
+                .count(
+                    haystack,
+                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
+                )
+                .map(AggregateCountExecution::FixedPredicateWord64)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::FixedPredicateWord64(source),
+                    )
+                }),
             AggregateEngine::Continuation(engine) => {
                 let strategy = self.report.continuation_strategy.ok_or_else(|| {
                     self.execution_error(
@@ -7920,6 +8179,18 @@ impl AggregatePlan {
                     self.execution_error(
                         limits,
                         AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                    )
+                }),
+            AggregateEngine::FixedPredicateWord64(engine) => engine
+                .span_sum(
+                    haystack,
+                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
+                )
+                .map(AggregateSpanSumExecution::FixedPredicateWord64)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::FixedPredicateWord64(source),
                     )
                 }),
             AggregateEngine::Continuation(engine) => {
@@ -8206,6 +8477,7 @@ enum AggregateCountExecution {
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
     GuardedAsciiWord(guarded_ascii_word::CountResult),
+    FixedPredicateWord64(FixedPredicateWord64CountResult),
     Continuation {
         admitted: AdmittedCountAttempt,
         value: u64,
@@ -8236,6 +8508,7 @@ impl AggregateCountExecution {
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
             Self::GuardedAsciiWord(result) => result.count,
+            Self::FixedPredicateWord64(result) => result.count,
         }
     }
 
@@ -8317,6 +8590,9 @@ impl AggregateCountExecution {
             Self::GuardedAsciiWord(result) => {
                 AggregateExecutionDetails::GuardedAsciiWord(result.accounting)
             }
+            Self::FixedPredicateWord64(result) => {
+                AggregateExecutionDetails::FixedPredicateWord64(result.accounting)
+            }
             Self::Continuation { admitted, .. } => {
                 let certificate = admitted.admitted.certificate().clone();
                 let accounting = admitted.admitted.accounting();
@@ -8355,6 +8631,7 @@ enum AggregateSpanSumExecution {
         actual: SparseOrderedLiteralAggregateActualCounters,
     },
     GuardedAsciiWord(guarded_ascii_word::SpanSumResult),
+    FixedPredicateWord64(FixedPredicateWord64SpanSumResult),
     Continuation {
         admitted: AdmittedSpanSumAttempt,
         value: u64,
@@ -8375,6 +8652,7 @@ impl AggregateSpanSumExecution {
             Self::LiteralClassRunLiteral(result) => result.span_sum,
             Self::BoundedLiteralPair(result) => result.span_sum,
             Self::GuardedAsciiWord(result) => result.span_sum,
+            Self::FixedPredicateWord64(result) => result.span_sum,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -8429,6 +8707,9 @@ impl AggregateSpanSumExecution {
             },
             Self::GuardedAsciiWord(result) => {
                 AggregateExecutionDetails::GuardedAsciiWord(result.accounting)
+            }
+            Self::FixedPredicateWord64(result) => {
+                AggregateExecutionDetails::FixedPredicateWord64(result.accounting)
             }
             Self::Continuation { admitted, .. } => {
                 let certificate = admitted.admitted.certificate().clone();
