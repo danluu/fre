@@ -27,6 +27,7 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_many;
+mod bounded_literal_pair;
 mod capture_count_seal;
 mod capture_noqa;
 mod capture_required_literal;
@@ -38,6 +39,7 @@ mod forward_anchored;
 mod grapheme_scalar;
 pub mod guarded_ascii_word;
 mod line_capture;
+mod literal_class_run_literal;
 mod replacement;
 mod required_literal;
 mod set;
@@ -48,11 +50,11 @@ mod unicode_word_run;
 
 pub use aggregate::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBoundedContextIdentity,
-    AggregateBoundedSeparatedFieldsIdentity, AggregateBuildAccounting, AggregateBuildError,
-    AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCacheIdentity,
-    AggregateCaptureSemantics, AggregateCompileRegex, AggregateContinuationIdentity,
-    AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
-    AggregateExactLiteralIdentity, AggregateExactLiteralSemantics,
+    AggregateBoundedLiteralPairIdentity, AggregateBoundedSeparatedFieldsIdentity,
+    AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
+    AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateCountResult, AggregateExactLiteralIdentity, AggregateExactLiteralSemantics,
     AggregateExecutionAttemptIdentity, AggregateExecutionDetails, AggregateExecutionError,
     AggregateExecutionIdentity, AggregateExecutionReport, AggregateExecutionSource,
     AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
@@ -71,11 +73,12 @@ pub use aggregate::{
     AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaIdentity,
     AggregateGraphemeScalarDfaSemantics, AggregateGuardedAsciiWordBuildAccounting,
     AggregateGuardedAsciiWordIdentity, AggregateGuardedAsciiWordSemantics,
-    AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregatePrefixClassAlternationIdentity, AggregateRunLimits,
-    AggregateSearchStep, AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex,
-    AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex, AggregateStrategy,
-    AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
+    AggregateLiteralClassRunLiteralIdentity, AggregateLiteralIneligibility, AggregateOperation,
+    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
+    AggregatePrefixClassAlternationIdentity, AggregateRunLimits, AggregateSearchStep,
+    AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult,
+    AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateUnicodeScalarIdentity,
+    AggregateUnicodeScalarSemantics, AggregateWordRunIdentity, AggregateWordRunSemantics,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,
@@ -159,26 +162,31 @@ pub use fre_capture_lab::{
 pub use fre_kernels::{
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
     BOUNDED_CLASS_SEQUENCE_PLAN_ID, BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_PLAN_ID,
-    BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
-    BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
-    BOUNDED_SEPARATED_FIELDS_PLAN_ID, BoundedClassSequenceActualCounters,
-    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceOperationIdentity,
-    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedClassSequenceUpperBounds,
-    BoundedContextActualCounters, BoundedContextBuildAccounting, BoundedContextBuildError,
-    BoundedContextBuildLimits, BoundedContextOperationIdentity, BoundedContextReduceAccounting,
-    BoundedContextReduceError, BoundedContextReduceLimits, BoundedContextUpperBounds,
-    BoundedSeparatedFieldsActualCounters, BoundedSeparatedFieldsBuildAccounting,
-    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
-    BoundedSeparatedFieldsOperationIdentity, BoundedSeparatedFieldsReduceAccounting,
-    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
-    BoundedSeparatedFieldsUpperBounds, FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION,
-    FIXED_ABSOLUTE_DOMAIN_ALGORITHM_VERSION, FIXED_ABSOLUTE_DOMAIN_COUNT_OPERATION_ID,
-    FIXED_ABSOLUTE_DOMAIN_PLAN_ID, FIXED_ABSOLUTE_DOMAIN_SPAN_SUM_OPERATION_ID,
-    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_PLAN_ID,
-    FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
-    FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_PLAN_ID,
+    BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
+    BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
+    BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BOUNDED_SEPARATED_FIELDS_PLAN_ID,
+    BoundedClassSequenceActualCounters, BoundedClassSequenceBuildAccounting,
+    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceOperationIdentity, BoundedClassSequenceReduceAccounting,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedClassSequenceUpperBounds, BoundedContextActualCounters, BoundedContextBuildAccounting,
+    BoundedContextBuildError, BoundedContextBuildLimits, BoundedContextOperationIdentity,
+    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedContextUpperBounds, BoundedLiteralPairActualCounters, BoundedLiteralPairBuildAccounting,
+    BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
+    BoundedLiteralPairOperationIdentity, BoundedLiteralPairReduceAccounting,
+    BoundedLiteralPairReduceError, BoundedLiteralPairReduceLimits, BoundedLiteralPairTopology,
+    BoundedLiteralPairUpperBounds, BoundedSeparatedFieldsActualCounters,
+    BoundedSeparatedFieldsBuildAccounting, BoundedSeparatedFieldsBuildError,
+    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsOperationIdentity,
+    BoundedSeparatedFieldsReduceAccounting, BoundedSeparatedFieldsReduceError,
+    BoundedSeparatedFieldsReduceLimits, BoundedSeparatedFieldsUpperBounds,
+    FIXED_ABSOLUTE_DOMAIN_ACCOUNTING_VERSION, FIXED_ABSOLUTE_DOMAIN_ALGORITHM_VERSION,
+    FIXED_ABSOLUTE_DOMAIN_COUNT_OPERATION_ID, FIXED_ABSOLUTE_DOMAIN_PLAN_ID,
+    FIXED_ABSOLUTE_DOMAIN_SPAN_SUM_OPERATION_ID, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+    FIXED_CLASS_SANDWICH_PLAN_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
     FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainContentDigest,
@@ -198,10 +206,16 @@ pub use fre_kernels::{
     GraphemeScalarDfaOperation, GraphemeScalarDfaOperationIdentity,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     GraphemeScalarDfaRole, GraphemeScalarDfaSemantics, GraphemeScalarDfaUpperBounds,
-    LiteralAggregateActualCounters, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
-    LiteralAggregateReduceAccounting, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAggregateUpperBounds, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateActualCounters,
+    LiteralAggregateBuildAccounting, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceAccounting,
+    LiteralAggregateReduceError, LiteralAggregateReduceLimits, LiteralAggregateUpperBounds,
+    LiteralClassRunLiteralActualCounters, LiteralClassRunLiteralBuildAccounting,
+    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
+    LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralReduceAccounting,
+    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
+    LiteralClassRunLiteralUpperBounds, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
@@ -297,7 +311,20 @@ pub use fre_automata::{
     SearchError as K0SearchError, SearchLimits, SearchWindow,
     SetupAccounting as SearchSessionSetupAccounting, WorkspaceLimits as SearchSessionLimits,
 };
-pub use unicode_word_run::{Accounting as UnicodeWordRunAccounting, Error as UnicodeWordRunError};
+pub use unicode_word_run::{
+    AGGREGATE_COUNT_OPERATION_ID as WORD_RUN_COUNT_OPERATION_ID,
+    AGGREGATE_SPAN_SUM_OPERATION_ID as WORD_RUN_SPAN_SUM_OPERATION_ID,
+    ASCII_PLAN_ID as ASCII_WORD_RUN_PLAN_ID, Accounting as UnicodeWordRunAccounting,
+    AggregateBuildAccounting as WordRunBuildAccounting, AggregateBuildError as WordRunBuildError,
+    AggregateBuildLimits as WordRunBuildLimits, AggregateCountResult as WordRunCountResult,
+    AggregateOperationIdentity as WordRunOperationIdentity,
+    AggregateReduceAccounting as WordRunReduceAccounting,
+    AggregateReduceActual as WordRunReduceActual, AggregateReduceError as WordRunReduceError,
+    AggregateReduceLimits as WordRunReduceLimits, AggregateReduceResource as WordRunReduceResource,
+    AggregateReduceUpperBounds as WordRunReduceUpperBounds,
+    AggregateSpanSumResult as WordRunSpanSumResult, Error as UnicodeWordRunError,
+    UNICODE_PLAN_ID as UNICODE_WORD_RUN_PLAN_ID,
+};
 
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 5;

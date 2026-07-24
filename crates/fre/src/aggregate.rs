@@ -16,6 +16,10 @@ use fre_kernels::{
     BoundedContextBuildAccounting, BoundedContextBuildError, BoundedContextBuildLimits,
     BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
     BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
+    BoundedLiteralPairCountResult, BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
+    BoundedLiteralPairReduceAccounting, BoundedLiteralPairReduceError,
+    BoundedLiteralPairReduceLimits, BoundedLiteralPairSpanSumResult,
     BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
     BoundedSeparatedFieldsBuildAccounting, BoundedSeparatedFieldsBuildError,
     BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsCountResult,
@@ -42,6 +46,11 @@ use fre_kernels::{
     LiteralAggregateBuildLimits, LiteralAggregateCountResult, LiteralAggregateOperationIdentity,
     LiteralAggregatePlan, LiteralAggregateReduceAccounting, LiteralAggregateReduceError,
     LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult,
+    LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
+    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralCountResult,
+    LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
+    LiteralClassRunLiteralReduceAccounting, LiteralClassRunLiteralReduceError,
+    LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
     OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
@@ -76,14 +85,15 @@ use regex_syntax::hir::{
 use crate::{
     AggregateCompileAccounting, AggregateCompileAttemptError, AggregateCompileLimits,
     AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
-    AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match, finite,
-    finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
+    AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match,
+    bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
+    literal_class_run_literal, unicode_word_run,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 25;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 28;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -120,6 +130,9 @@ pub enum AggregatePlanKind {
     /// Direct Unicode scalar class/run stream over compact canonical ranges.
     /// This is not the continuation state engine.
     UnicodeScalarClass,
+    /// Single-pass maximal ASCII/Unicode word-run reducer for canonical
+    /// `\b\w{m,}\b`.
+    WordRun,
     /// Direct bounded circular-window reducer for
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
@@ -135,6 +148,12 @@ pub enum AggregatePlanKind {
     /// Two ordered literal-prefix/greedy-byte-class alternatives merged from
     /// persistent monotone occurrence streams.
     PrefixClassAlternation,
+    /// Fixed literals bracketing one maximal nonempty Unicode-off byte-class
+    /// run, reduced by one monotone run stream.
+    LiteralClassRunLiteral,
+    /// Two swapped literal endpoints separated by one common finite greedy
+    /// byte-class gap and reduced by bounded start/endpoint arbitration.
+    BoundedLiteralPair,
     /// Linear literal-interval stream for a fixed-class/bounded-gap context.
     BoundedContext,
     /// Fixed candidate derived from absolute StartText/EndText over the
@@ -157,6 +176,8 @@ pub enum AggregatePlanIdentity {
     ExactLiteral(AggregateExactLiteralIdentity),
     /// Root Unicode scalar-class proof plus native reducer identity.
     UnicodeScalar(AggregateUnicodeScalarIdentity),
+    /// Complete-boundary ASCII/Unicode word-run proof and operation identity.
+    WordRun(AggregateWordRunIdentity),
     /// Fixed-width three-atom class sequence plus native reducer identity.
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
     /// Ordered scalar-property grammar plus native reducer identity.
@@ -167,6 +188,11 @@ pub enum AggregatePlanIdentity {
     BoundedSeparatedFields(AggregateBoundedSeparatedFieldsIdentity),
     /// Unicode-off two-branch prefix/class proof and native count identity.
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
+    /// Unicode-off literal/class-run/literal proof and operation identity.
+    LiteralClassRunLiteral(AggregateLiteralClassRunLiteralIdentity),
+    /// Unicode-off swapped bounded literal-pair proof and native operation
+    /// identity.
+    BoundedLiteralPair(AggregateBoundedLiteralPairIdentity),
     /// Bounded byte-context proof plus native count identity.
     BoundedContext(AggregateBoundedContextIdentity),
     /// Closed fixed absolute-domain descriptor and declared residual identity.
@@ -279,6 +305,21 @@ pub struct AggregateUnicodeScalarIdentity {
     pub kernel: UnicodeScalarAggregateOperationIdentity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateWordRunSemantics {
+    /// ASCII word bytes; every input byte is one classified unit.
+    AsciiWordBytes,
+    /// Unicode word scalars under `utf8(false)`; malformed bytes are
+    /// individual non-word units.
+    UnicodeWordScalarsInvalidBytesNonWord,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateWordRunIdentity {
+    pub semantics: AggregateWordRunSemantics,
+    pub kernel: unicode_word_run::AggregateOperationIdentity,
+}
+
 /// Profile proof attached to the fixed class-sandwich reducer.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateFixedClassSandwichSemantics {
@@ -316,6 +357,18 @@ pub struct AggregateGraphemeScalarDfaIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregatePrefixClassAlternationIdentity {
     pub kernel: PrefixClassAlternationOperationIdentity,
+}
+
+/// Facade identity for the Unicode-off literal/class-run/literal reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateLiteralClassRunLiteralIdentity {
+    pub kernel: LiteralClassRunLiteralOperationIdentity,
+}
+
+/// Facade identity for the Unicode-off swapped bounded literal-pair reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateBoundedLiteralPairIdentity {
+    pub kernel: BoundedLiteralPairOperationIdentity,
 }
 
 /// Facade identity for the Unicode-off bounded separated-field reducer.
@@ -783,6 +836,8 @@ pub enum AggregateBuildAccounting {
     ExactLiteral(LiteralAggregateBuildAccounting),
     /// Compact scalar-range plan construction certificate.
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
+    /// Fixed-size direct word-run construction certificate.
+    WordRun(unicode_word_run::AggregateBuildAccounting),
     /// Bounded class-sandwich construction certificate.
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Ordered scalar-property classifier construction certificate.
@@ -793,6 +848,10 @@ pub enum AggregateBuildAccounting {
     BoundedSeparatedFields(BoundedSeparatedFieldsBuildAccounting),
     /// Two-branch prefix/class construction certificate.
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
+    /// Literal/class-run/literal construction certificate.
+    LiteralClassRunLiteral(LiteralClassRunLiteralBuildAccounting),
+    /// Swapped bounded literal-pair construction certificate.
+    BoundedLiteralPair(BoundedLiteralPairBuildAccounting),
     /// Bounded-context construction certificate.
     BoundedContext(BoundedContextBuildAccounting),
     /// Fixed absolute-domain guard and optional eager residual certificate.
@@ -822,6 +881,9 @@ pub struct AggregateBuildLimits {
     /// One unit is charged for every HIR node and canonical scalar range
     /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
+    /// Maximum structural HIR/range/membership inspection work for the direct
+    /// complete-boundary word-run specialization.
+    pub max_word_run_planner_work: usize,
     /// Maximum structural HIR/range inspection work for fixed-width class
     /// sandwiches.
     pub max_fixed_class_sandwich_planner_work: usize,
@@ -844,6 +906,13 @@ pub struct AggregateBuildLimits {
     /// Maximum allocation-free structural inspection work for the two-branch
     /// prefix/class specialization.
     pub max_prefix_class_alternation_planner_work: usize,
+    /// Maximum allocation-free structural inspection work for the
+    /// literal/class-run/literal specialization.
+    pub max_literal_class_run_literal_planner_work: usize,
+    /// Maximum allocation-free HIR/literal/range inspection work for the
+    /// swapped bounded literal-pair specialization. This quota is independent
+    /// so the new selector cannot consume any previously sufficient budget.
+    pub max_bounded_literal_pair_planner_work: usize,
     /// Maximum allocation-free HIR/range inspection work for bounded context.
     pub max_bounded_context_planner_work: usize,
     /// Maximum canonical-HIR work for closed fixed absolute-domain proofs.
@@ -855,6 +924,8 @@ pub struct AggregateBuildLimits {
     pub exact_literal: LiteralAggregateBuildLimits,
     /// Complete compact scalar-range construction limits.
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
+    /// Complete direct word-run construction limits.
+    pub word_run: unicode_word_run::AggregateBuildLimits,
     /// Complete bounded fixed-class construction limits.
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
     /// Complete ordered scalar-grammar construction limits.
@@ -865,6 +936,10 @@ pub struct AggregateBuildLimits {
     pub bounded_separated_fields: BoundedSeparatedFieldsBuildLimits,
     /// Complete two-branch prefix/class construction limits.
     pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
+    /// Complete literal/class-run/literal construction limits.
+    pub literal_class_run_literal: LiteralClassRunLiteralBuildLimits,
+    /// Complete swapped bounded literal-pair construction limits.
+    pub bounded_literal_pair: BoundedLiteralPairBuildLimits,
     /// Complete bounded-context construction limits.
     pub bounded_context: BoundedContextBuildLimits,
     /// Complete fixed absolute-domain guard construction limits.
@@ -885,22 +960,28 @@ impl Default for AggregateBuildLimits {
             syntax_safety: SafetyEnvelope::default(),
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
+            max_word_run_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_affix_planner_work: 4_096,
             max_grapheme_scalar_dfa_planner_work: 1 << 20,
             max_bounded_class_sequence_planner_work: 4_096,
             max_bounded_separated_fields_planner_work: 4_096,
             max_prefix_class_alternation_planner_work: 4_096,
+            max_literal_class_run_literal_planner_work: 4_096,
+            max_bounded_literal_pair_planner_work: 4_096,
             max_bounded_context_planner_work: 4_096,
             max_fixed_absolute_planner_work: 4_096,
             max_finite_planner_work: 8_000_000,
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
+            word_run: unicode_word_run::AggregateBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
             bounded_separated_fields: BoundedSeparatedFieldsBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
+            literal_class_run_literal: LiteralClassRunLiteralBuildLimits::default(),
+            bounded_literal_pair: BoundedLiteralPairBuildLimits::default(),
             bounded_context: BoundedContextBuildLimits::default(),
             fixed_absolute: FixedAbsoluteDomainBuildLimits::default(),
             fixed_absolute_residual: AggregateFixedAbsoluteDomainResidualBuildLimits::default(),
@@ -988,6 +1069,8 @@ pub struct AggregateRunLimits {
     pub exact_literal: LiteralAggregateReduceLimits,
     /// Direct Unicode scalar-stream limits.
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
+    /// Direct word-run whole-operation limits.
+    pub word_run: unicode_word_run::AggregateReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
     /// Direct ordered scalar-grammar reducer limits.
@@ -998,6 +1081,10 @@ pub struct AggregateRunLimits {
     pub bounded_separated_fields: BoundedSeparatedFieldsReduceLimits,
     /// Direct two-branch prefix/class count limits.
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
+    /// Direct literal/class-run/literal reduction limits.
+    pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
+    /// Direct swapped bounded literal-pair count/span-sum limits.
+    pub bounded_literal_pair: BoundedLiteralPairReduceLimits,
     /// Direct bounded-context literal interval-stream limits.
     pub bounded_context: BoundedContextReduceLimits,
     /// Fixed absolute-domain guard limits. Scalar residuals additionally use
@@ -1045,6 +1132,10 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
+    /// Direct word-run HIR/range/boundary-membership inspection work. This
+    /// remains nonzero when an ineligible inspection precedes another
+    /// selected family.
+    pub word_run_planner_work: usize,
     /// Fixed-class structural inspection work, including every HIR node and
     /// canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
@@ -1062,6 +1153,13 @@ pub struct AggregateBuildReport {
     /// Two-branch prefix/class structural inspection work. Every HIR node,
     /// literal byte, class range and self-overlap comparison is included.
     pub prefix_class_alternation_planner_work: usize,
+    /// Literal/class-run/literal structural inspection work, including every
+    /// HIR node, literal byte, class range and boundary membership probe.
+    pub literal_class_run_literal_planner_work: usize,
+    /// Swapped bounded literal-pair structural inspection work. Every visited
+    /// HIR node, literal byte, canonical class range and shape comparison is
+    /// included, including an ineligible inspection followed by another plan.
+    pub bounded_literal_pair_planner_work: usize,
     /// Bounded-context structural inspection work.
     pub bounded_context_planner_work: usize,
     /// Fixed absolute-domain canonical-HIR inspection work.
@@ -1129,6 +1227,7 @@ struct AggregateFixedAbsoluteDomainSeal {
     capture_semantics: AggregateCaptureSemantics,
     planner_work: usize,
     unicode_scalar_planner_work: usize,
+    word_run_planner_work: usize,
     fixed_class_sandwich_planner_work: usize,
     bounded_affix_planner_work: usize,
     grapheme_scalar_dfa_planner_work: usize,
@@ -1177,6 +1276,7 @@ impl AggregateFixedAbsoluteDomainSeal {
             && self.capture_semantics == report.capture_semantics
             && self.planner_work == report.planner_work
             && self.unicode_scalar_planner_work == report.unicode_scalar_planner_work
+            && self.word_run_planner_work == report.word_run_planner_work
             && self.fixed_class_sandwich_planner_work == report.fixed_class_sandwich_planner_work
             && self.bounded_affix_planner_work == report.bounded_affix_planner_work
             && self.grapheme_scalar_dfa_planner_work == report.grapheme_scalar_dfa_planner_work
@@ -1900,6 +2000,13 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Direct word-run inspection crossed its independent structural cap.
+    WordRunPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Fixed class-sandwich inspection crossed its structural work cap.
     FixedClassSandwichPlannerWorkLimit {
         operation: AggregateOperation,
@@ -1940,6 +2047,21 @@ pub enum AggregateBuildError {
     },
     /// Prefix/class alternation inspection crossed its structural work cap.
     PrefixClassAlternationPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
+    /// Literal/class-run/literal inspection crossed its structural work cap.
+    LiteralClassRunLiteralPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
+    /// Swapped bounded literal-pair inspection crossed its independent
+    /// structural work cap.
+    BoundedLiteralPairPlannerWorkLimit {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         needed: usize,
@@ -1993,6 +2115,12 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: UnicodeScalarAggregateBuildError,
     },
+    /// Direct word-run construction failed after selection.
+    WordRunBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: unicode_word_run::AggregateBuildError,
+    },
     /// Fixed class-sandwich construction failed after selection.
     FixedClassSandwichBuild {
         operation: AggregateOperation,
@@ -2022,6 +2150,18 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: PrefixClassAlternationBuildError,
+    },
+    /// Literal/class-run/literal construction failed after selection.
+    LiteralClassRunLiteralBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: LiteralClassRunLiteralBuildError,
+    },
+    /// Swapped bounded literal-pair construction failed after selection.
+    BoundedLiteralPairBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: BoundedLiteralPairBuildError,
     },
     /// Bounded-context construction failed after selection.
     BoundedContextBuild {
@@ -2150,6 +2290,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::WordRunPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} word-run inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FixedClassSandwichPlannerWorkLimit {
                 operation,
                 selection,
@@ -2203,6 +2352,24 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} prefix/class alternation inspection needs {needed} structural work units, limit is {limit}"
+            ),
+            Self::LiteralClassRunLiteralPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} literal/class-run/literal inspection needs {needed} structural work units, limit is {limit}"
+            ),
+            Self::BoundedLiteralPairPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded literal-pair inspection needs {needed} structural work units, limit is {limit}"
             ),
             Self::BoundedContextPlannerWorkLimit {
                 operation,
@@ -2265,6 +2432,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} Unicode scalar construction failed: {source}"
             ),
+            Self::WordRunBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} word-run construction failed: {source}"
+            ),
             Self::FixedClassSandwichBuild {
                 operation,
                 selection,
@@ -2304,6 +2479,22 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} prefix/class alternation construction failed: {source}"
+            ),
+            Self::LiteralClassRunLiteralBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} literal/class-run/literal construction failed: {source}"
+            ),
+            Self::BoundedLiteralPairBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} bounded literal-pair construction failed: {source}"
             ),
             Self::BoundedContextBuild {
                 operation,
@@ -2403,11 +2594,14 @@ impl std::error::Error for AggregateBuildError {
             Self::Syntax { source, .. } => Some(source),
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
+            Self::WordRunBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
             Self::BoundedSeparatedFieldsBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
+            Self::LiteralClassRunLiteralBuild { source, .. } => Some(source),
+            Self::BoundedLiteralPairBuild { source, .. } => Some(source),
             Self::BoundedContextBuild { source, .. } => Some(source),
             Self::FixedAbsoluteDomainBuild { source, .. }
             | Self::FixedAbsoluteDomainResidualGuardBuild { source, .. } => Some(source),
@@ -2418,12 +2612,15 @@ impl std::error::Error for AggregateBuildError {
             Self::ContinuationCompile { source, .. } => Some(source),
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
+            | Self::WordRunPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedAffixPlannerWorkLimit { .. }
             | Self::GraphemeScalarDfaPlannerWorkLimit { .. }
             | Self::BoundedClassSequencePlannerWorkLimit { .. }
             | Self::BoundedSeparatedFieldsPlannerWorkLimit { .. }
             | Self::PrefixClassAlternationPlannerWorkLimit { .. }
+            | Self::LiteralClassRunLiteralPlannerWorkLimit { .. }
+            | Self::BoundedLiteralPairPlannerWorkLimit { .. }
             | Self::BoundedContextPlannerWorkLimit { .. }
             | Self::FixedAbsoluteDomainPlannerWorkLimit { .. }
             | Self::FinitePlannerWorkLimit { .. }
@@ -2567,6 +2764,8 @@ pub enum AggregateExecutionSource {
     ExactLiteral(LiteralAggregateReduceError),
     /// Direct Unicode scalar-stream refusal.
     UnicodeScalar(UnicodeScalarAggregateReduceError),
+    /// Direct word-run refusal after prospective admission.
+    WordRun(unicode_word_run::AggregateReduceError),
     /// Direct fixed class-sandwich refusal.
     FixedClassSandwich(FixedClassSandwichReduceError),
     /// Direct ordered scalar-grammar refusal.
@@ -2577,6 +2776,10 @@ pub enum AggregateExecutionSource {
     BoundedSeparatedFields(BoundedSeparatedFieldsReduceError),
     /// Direct two-branch prefix/class refusal.
     PrefixClassAlternation(PrefixClassAlternationReduceError),
+    /// Direct literal/class-run/literal refusal.
+    LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
+    /// Direct swapped bounded literal-pair refusal.
+    BoundedLiteralPair(BoundedLiteralPairReduceError),
     /// Direct bounded-context refusal.
     BoundedContext(BoundedContextReduceError),
     /// Unit tag for a fixed absolute-domain guard refusal. The enclosing
@@ -2604,11 +2807,14 @@ impl fmt::Display for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
+            Self::WordRun(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
             Self::BoundedSeparatedFields(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
+            Self::LiteralClassRunLiteral(source) => source.fmt(f),
+            Self::BoundedLiteralPair(source) => source.fmt(f),
             Self::BoundedContext(source) => source.fmt(f),
             Self::FixedAbsoluteDomain => f.write_str("fixed absolute-domain guard attempt failed"),
             Self::FixedAbsoluteDomainResidual => {
@@ -2630,11 +2836,14 @@ impl std::error::Error for AggregateExecutionSource {
         match self {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
+            Self::WordRun(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
             Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
             Self::BoundedSeparatedFields(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
+            Self::LiteralClassRunLiteral(source) => Some(source),
+            Self::BoundedLiteralPair(source) => Some(source),
             Self::BoundedContext(source) => Some(source),
             Self::FixedAbsoluteDomain
             | Self::FixedAbsoluteDomainResidual
@@ -2741,6 +2950,8 @@ pub enum AggregateExecutionDetails {
     ExactLiteral(LiteralAggregateReduceAccounting),
     /// Direct scalar stream's complete bounds and structural counters.
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
+    /// Direct word-run prospective and actual counters.
+    WordRun(unicode_word_run::AggregateReduceAccounting),
     /// Fixed class-sandwich bounds, counters, and operation identity.
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
     /// Ordered scalar-grammar bounds, counters, and operation identity.
@@ -2751,6 +2962,10 @@ pub enum AggregateExecutionDetails {
     BoundedSeparatedFields(BoundedSeparatedFieldsReduceAccounting),
     /// Prefix/class stream bounds, counters, and identity.
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
+    /// Literal/class-run/literal bounds, counters, and identity.
+    LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
+    /// Swapped bounded literal-pair bounds, counters, and identity.
+    BoundedLiteralPair(BoundedLiteralPairReduceAccounting),
     /// Bounded-context bounds, counters, and operation identity.
     BoundedContext(BoundedContextReduceAccounting),
     /// Fixed absolute-domain guard proof and, when the scalar envelope admits
@@ -3416,12 +3631,15 @@ impl AggregateBuilder {
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
+                word_run_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: 0,
                 bounded_class_sequence_planner_work: 0,
                 bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
+                literal_class_run_literal_planner_work: 0,
+                bounded_literal_pair_planner_work: 0,
                 bounded_context_planner_work: 0,
                 fixed_absolute_planner_work: 0,
                 finite_planner_work: 0,
@@ -3596,12 +3814,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work: work,
+                    word_run_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
                     bounded_context_planner_work: 0,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -3632,6 +3853,116 @@ impl AggregateBuilder {
                 });
             }
             Some(UnicodeScalarInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let word_run_inspection = if !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                unicode_word_run::inspect_aggregate(&rust.hir, limits.max_word_run_planner_work)
+                    .map_err(|error| match error {
+                        unicode_word_run::AggregateInspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::WordRunPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        unicode_word_run::AggregateInspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "word-run inspection accounting overflow",
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let word_run_planner_work = match word_run_inspection {
+            Some(unicode_word_run::AggregateInspectionOutcome::Eligible(inspection)) => {
+                if inspection.hir_nodes != expected_nodes
+                    || inspection.captures != expected_captures
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from word-run inspection",
+                    });
+                }
+                let engine = inspection.plan;
+                let build =
+                    engine
+                        .aggregate_build_accounting(limits.word_run)
+                        .map_err(|source| AggregateBuildError::WordRunBuild {
+                            operation,
+                            selection,
+                            source,
+                        })?;
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.aggregate_count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.aggregate_span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected word-run reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::WordRun,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work: inspection.work,
+                    fixed_class_sandwich_planner_work: 0,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work: 0,
+                    bounded_class_sequence_planner_work: 0,
+                    bounded_separated_fields_planner_work: 0,
+                    prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: inspection.captures,
+                    captures_erased: inspection.captures,
+                    build: AggregateBuildAccounting::WordRun(build),
+                    plan_identity: AggregatePlanIdentity::WordRun(AggregateWordRunIdentity {
+                        semantics: if kernel.unicode {
+                            AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord
+                        } else {
+                            AggregateWordRunSemantics::AsciiWordBytes
+                        },
+                        kernel,
+                    }),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::WordRun(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(unicode_word_run::AggregateInspectionOutcome::Ineligible { work }) => work,
             None => 0,
         };
         let fixed_class_inspection = if selection == AggregatePlanSelection::Auto
@@ -3723,12 +4054,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
                     bounded_class_sequence_planner_work: 0,
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
                     bounded_context_planner_work: 0,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -3912,12 +4246,15 @@ impl AggregateBuilder {
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                 planner_work,
                 unicode_scalar_planner_work,
+                word_run_planner_work,
                 fixed_class_sandwich_planner_work,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: inspection.work,
                 bounded_class_sequence_planner_work: 0,
                 bounded_separated_fields_planner_work: 0,
                 prefix_class_alternation_planner_work: 0,
+                literal_class_run_literal_planner_work: 0,
+                bounded_literal_pair_planner_work: 0,
                 bounded_context_planner_work: 0,
                 fixed_absolute_planner_work: 0,
                 finite_planner_work: 0,
@@ -4034,12 +4371,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work: work,
                     bounded_separated_fields_planner_work: 0,
                     prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
                     bounded_context_planner_work: 0,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -4147,12 +4487,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work: work,
                     prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
                     bounded_context_planner_work: 0,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -4264,12 +4607,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work: work,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
                     bounded_context_planner_work: 0,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -4294,6 +4640,253 @@ impl AggregateBuilder {
                 });
             }
             Some(PrefixClassInspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let bounded_literal_pair_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && matches!(
+                operation,
+                AggregateOperation::Compile
+                    | AggregateOperation::Count
+                    | AggregateOperation::SpanSum
+            ) {
+            Some(
+                bounded_literal_pair::inspect(
+                    &rust.hir,
+                    limits.max_bounded_literal_pair_planner_work,
+                )
+                .map_err(|error| match error {
+                    bounded_literal_pair::InspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::BoundedLiteralPairPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    bounded_literal_pair::InspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded literal-pair inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let bounded_literal_pair_planner_work = match bounded_literal_pair_inspection {
+            Some(bounded_literal_pair::Inspection::Eligible {
+                left,
+                class,
+                right,
+                gap_max,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from bounded literal-pair inspection",
+                    });
+                }
+                let engine = BoundedLiteralPairPlan::build(
+                    left,
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    right,
+                    gap_max,
+                    limits.bounded_literal_pair,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::BoundedLiteralPairBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span operation selected bounded literal-pair reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::BoundedLiteralPair,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: work,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::BoundedLiteralPair(build),
+                    plan_identity: AggregatePlanIdentity::BoundedLiteralPair(
+                        AggregateBoundedLiteralPairIdentity { kernel },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::BoundedLiteralPair(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(bounded_literal_pair::Inspection::Ineligible { work }) => work,
+            None => 0,
+        };
+        let literal_class_run_literal_inspection = if !unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                literal_class_run_literal::inspect(
+                    &rust.hir,
+                    limits.max_literal_class_run_literal_planner_work,
+                )
+                .map_err(|error| match error {
+                    literal_class_run_literal::InspectionError::WorkLimit { needed, limit } => {
+                        AggregateBuildError::LiteralClassRunLiteralPlannerWorkLimit {
+                            operation,
+                            selection,
+                            needed,
+                            limit,
+                        }
+                    }
+                    literal_class_run_literal::InspectionError::Overflow => {
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "literal/class-run/literal inspection accounting overflow",
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let literal_class_run_literal_planner_work = match literal_class_run_literal_inspection {
+            Some(literal_class_run_literal::InspectionOutcome::Eligible(inspection)) => {
+                if inspection.hir_nodes != expected_nodes
+                    || inspection.captures != expected_captures
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from literal/class-run/literal inspection",
+                    });
+                }
+                let engine = LiteralClassRunLiteralPlan::build(
+                    inspection.prefix,
+                    inspection
+                        .class
+                        .ranges()
+                        .iter()
+                        .copied()
+                        .map(class_bytes_range_tuple),
+                    inspection.suffix,
+                    limits.literal_class_run_literal,
+                )
+                .map_err(|source| {
+                    AggregateBuildError::LiteralClassRunLiteralBuild {
+                        operation,
+                        selection,
+                        source,
+                    }
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected literal/class-run/literal reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::LiteralClassRunLiteral,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work: inspection.work,
+                    bounded_literal_pair_planner_work,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: inspection.captures,
+                    captures_erased: inspection.captures,
+                    build: AggregateBuildAccounting::LiteralClassRunLiteral(build),
+                    plan_identity: AggregatePlanIdentity::LiteralClassRunLiteral(
+                        AggregateLiteralClassRunLiteralIdentity { kernel },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::LiteralClassRunLiteral(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(literal_class_run_literal::InspectionOutcome::Ineligible { work, .. }) => work,
             None => 0,
         };
         let bounded_affix_planner_work;
@@ -4373,12 +4966,15 @@ impl AggregateBuilder {
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                         planner_work,
                         unicode_scalar_planner_work,
+                        word_run_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work: work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
+                        literal_class_run_literal_planner_work,
+                        bounded_literal_pair_planner_work,
                         bounded_context_planner_work: 0,
                         fixed_absolute_planner_work: 0,
                         finite_planner_work: 0,
@@ -4497,12 +5093,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work,
+                    bounded_literal_pair_planner_work,
                     bounded_context_planner_work: work,
                     fixed_absolute_planner_work: 0,
                     finite_planner_work: 0,
@@ -5153,6 +5752,7 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -5222,12 +5822,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work,
+                    bounded_literal_pair_planner_work,
                     bounded_context_planner_work,
                     fixed_absolute_planner_work: u32::try_from(work).map_err(|_| {
                         AggregateBuildError::InternalInvariant {
@@ -5397,12 +6000,15 @@ impl AggregateBuilder {
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                         planner_work,
                         unicode_scalar_planner_work,
+                        word_run_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
+                        literal_class_run_literal_planner_work,
+                        bounded_literal_pair_planner_work,
                         bounded_context_planner_work,
                         fixed_absolute_planner_work,
                         finite_planner_work,
@@ -5517,12 +6123,15 @@ impl AggregateBuilder {
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                     planner_work,
                     unicode_scalar_planner_work,
+                    word_run_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work,
+                    bounded_literal_pair_planner_work,
                     bounded_context_planner_work,
                     fixed_absolute_planner_work,
                     finite_planner_work,
@@ -5679,12 +6288,15 @@ impl AggregateBuilder {
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
                         planner_work,
                         unicode_scalar_planner_work,
+                        word_run_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
                         bounded_class_sequence_planner_work,
                         bounded_separated_fields_planner_work,
                         prefix_class_alternation_planner_work,
+                        literal_class_run_literal_planner_work,
+                        bounded_literal_pair_planner_work,
                         bounded_context_planner_work,
                         fixed_absolute_planner_work,
                         finite_planner_work,
@@ -5766,12 +6378,15 @@ impl AggregateBuilder {
             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
             planner_work,
             unicode_scalar_planner_work,
+            word_run_planner_work,
             fixed_class_sandwich_planner_work,
             bounded_affix_planner_work,
             grapheme_scalar_dfa_planner_work,
             bounded_class_sequence_planner_work,
             bounded_separated_fields_planner_work,
             prefix_class_alternation_planner_work,
+            literal_class_run_literal_planner_work,
+            bounded_literal_pair_planner_work,
             bounded_context_planner_work,
             fixed_absolute_planner_work,
             finite_planner_work,
@@ -5825,11 +6440,14 @@ fn tagged_grapheme_ranges(
 enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
+    WordRun(unicode_word_run::Plan),
     FixedClassSandwich(FixedClassSandwichPlan),
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
     BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
+    LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
+    BoundedLiteralPair(BoundedLiteralPairPlan),
     BoundedContext(BoundedContextPlan),
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainEngine),
     FiniteCount(OrderedLiteralCountPlan),
@@ -6165,6 +6783,12 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::WordRun(engine) => engine
+                .aggregate_count(haystack, limits.word_run)
+                .map(AggregateCountExecution::WordRun)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
+                }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .count(haystack, limits.fixed_class_sandwich)
                 .map(AggregateCountExecution::FixedClassSandwich)
@@ -6208,6 +6832,24 @@ impl AggregatePlan {
                     self.execution_error(
                         limits,
                         AggregateExecutionSource::PrefixClassAlternation(source),
+                    )
+                }),
+            AggregateEngine::LiteralClassRunLiteral(engine) => engine
+                .count(haystack, limits.literal_class_run_literal)
+                .map(AggregateCountExecution::LiteralClassRunLiteral)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::LiteralClassRunLiteral(source),
+                    )
+                }),
+            AggregateEngine::BoundedLiteralPair(engine) => engine
+                .count(haystack, limits.bounded_literal_pair)
+                .map(AggregateCountExecution::BoundedLiteralPair)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::BoundedLiteralPair(source),
                     )
                 }),
             AggregateEngine::BoundedContext(engine) => engine
@@ -6452,6 +7094,12 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::UnicodeScalar(source))
                 }),
+            AggregateEngine::WordRun(engine) => engine
+                .aggregate_span_sum(haystack, limits.word_run)
+                .map(AggregateSpanSumExecution::WordRun)
+                .map_err(|source| {
+                    self.execution_error(limits, AggregateExecutionSource::WordRun(source))
+                }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .span_sum(haystack, limits.fixed_class_sandwich)
                 .map(AggregateSpanSumExecution::FixedClassSandwich)
@@ -6485,6 +7133,24 @@ impl AggregatePlan {
                     "span-sum operation retained a count-only prefix/class plan",
                 ),
             )),
+            AggregateEngine::LiteralClassRunLiteral(engine) => engine
+                .span_sum(haystack, limits.literal_class_run_literal)
+                .map(AggregateSpanSumExecution::LiteralClassRunLiteral)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::LiteralClassRunLiteral(source),
+                    )
+                }),
+            AggregateEngine::BoundedLiteralPair(engine) => engine
+                .span_sum(haystack, limits.bounded_literal_pair)
+                .map(AggregateSpanSumExecution::BoundedLiteralPair)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::BoundedLiteralPair(source),
+                    )
+                }),
             AggregateEngine::BoundedContext(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
@@ -6810,11 +7476,14 @@ impl AggregatePlan {
 enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
+    WordRun(unicode_word_run::AggregateCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
     GraphemeScalarDfa(GraphemeScalarDfaCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
     BoundedSeparatedFields(BoundedSeparatedFieldsCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
+    LiteralClassRunLiteral(LiteralClassRunLiteralCountResult),
+    BoundedLiteralPair(BoundedLiteralPairCountResult),
     BoundedContext(BoundedContextCountResult),
     FixedAbsoluteDirect {
         value: u64,
@@ -6847,11 +7516,14 @@ impl AggregateCountExecution {
         match self {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
+            Self::WordRun(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
             Self::GraphemeScalarDfa(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
             Self::BoundedSeparatedFields(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
+            Self::LiteralClassRunLiteral(result) => result.count,
+            Self::BoundedLiteralPair(result) => result.count,
             Self::BoundedContext(result) => result.count,
             Self::FixedAbsoluteDirect { value, .. } | Self::FixedAbsoluteResidual { value, .. } => {
                 *value
@@ -6871,6 +7543,7 @@ impl AggregateCountExecution {
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
+            Self::WordRun(result) => AggregateExecutionDetails::WordRun(result.accounting),
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
@@ -6885,6 +7558,12 @@ impl AggregateCountExecution {
             }
             Self::PrefixClassAlternation(result) => {
                 AggregateExecutionDetails::PrefixClassAlternation(result.accounting)
+            }
+            Self::LiteralClassRunLiteral(result) => {
+                AggregateExecutionDetails::LiteralClassRunLiteral(result.accounting)
+            }
+            Self::BoundedLiteralPair(result) => {
+                AggregateExecutionDetails::BoundedLiteralPair(result.accounting)
             }
             Self::BoundedContext(result) => {
                 AggregateExecutionDetails::BoundedContext(result.accounting)
@@ -6946,8 +7625,11 @@ impl AggregateCountExecution {
 enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
+    WordRun(unicode_word_run::AggregateSpanSumResult),
     FixedClassSandwich(FixedClassSandwichSpanSumResult),
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
+    LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
+    BoundedLiteralPair(BoundedLiteralPairSpanSumResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -6970,8 +7652,11 @@ impl AggregateSpanSumExecution {
         match self {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
+            Self::WordRun(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
+            Self::LiteralClassRunLiteral(result) => result.span_sum,
+            Self::BoundedLiteralPair(result) => result.span_sum,
             Self::GuardedAsciiWord(result) => result.span_sum,
             Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
@@ -6987,6 +7672,7 @@ impl AggregateSpanSumExecution {
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
+            Self::WordRun(result) => AggregateExecutionDetails::WordRun(result.accounting),
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
@@ -6995,6 +7681,12 @@ impl AggregateSpanSumExecution {
                     guard: result.accounting,
                 },
             ),
+            Self::LiteralClassRunLiteral(result) => {
+                AggregateExecutionDetails::LiteralClassRunLiteral(result.accounting)
+            }
+            Self::BoundedLiteralPair(result) => {
+                AggregateExecutionDetails::BoundedLiteralPair(result.accounting)
+            }
             Self::FiniteLiteral {
                 upper_bounds,
                 actual,

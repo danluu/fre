@@ -434,11 +434,14 @@ fn continuation_details(
         } => (certificate, accounting),
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
+        | AggregateExecutionDetails::WordRun(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)
         | AggregateExecutionDetails::BoundedSeparatedFields(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
+        | AggregateExecutionDetails::LiteralClassRunLiteral(_)
+        | AggregateExecutionDetails::BoundedLiteralPair(_)
         | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::FixedAbsoluteDomain(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }

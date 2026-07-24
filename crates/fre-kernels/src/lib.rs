@@ -14,6 +14,7 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 mod bounded_class_sequence;
 mod bounded_context;
+mod bounded_literal_pair;
 mod bounded_separated_fields;
 mod byte_start_map;
 mod determinize_state_codec;
@@ -22,6 +23,7 @@ mod fixed_class_sandwich;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
 mod literal_aggregate;
+mod literal_class_run_literal;
 mod literal_set;
 mod ordered_literal_aggregate;
 mod packed_literal_set;
@@ -55,6 +57,20 @@ pub use bounded_context::{
     PLAN_ID as BOUNDED_CONTEXT_PLAN_ID, ReduceAccounting as BoundedContextReduceAccounting,
     ReduceActualCounters as BoundedContextActualCounters, ReduceError as BoundedContextReduceError,
     ReduceLimits as BoundedContextReduceLimits, ReduceUpperBounds as BoundedContextUpperBounds,
+};
+pub use bounded_literal_pair::{
+    BoundedLiteralPairPlan, BuildAccounting as BoundedLiteralPairBuildAccounting,
+    BuildError as BoundedLiteralPairBuildError, BuildLimits as BoundedLiteralPairBuildLimits,
+    COUNT_OPERATION_ID as BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+    CountResult as BoundedLiteralPairCountResult,
+    OperationIdentity as BoundedLiteralPairOperationIdentity,
+    PLAN_ID as BOUNDED_LITERAL_PAIR_PLAN_ID,
+    ReduceAccounting as BoundedLiteralPairReduceAccounting,
+    ReduceActualCounters as BoundedLiteralPairActualCounters,
+    ReduceError as BoundedLiteralPairReduceError, ReduceLimits as BoundedLiteralPairReduceLimits,
+    ReduceUpperBounds as BoundedLiteralPairUpperBounds,
+    SPAN_SUM_OPERATION_ID as BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as BoundedLiteralPairSpanSumResult, Topology as BoundedLiteralPairTopology,
 };
 pub use bounded_separated_fields::{
     AlternativeSource as BoundedSeparatedFieldsAlternativeSource,
@@ -178,6 +194,23 @@ pub use literal_aggregate::{
     ReduceUpperBounds as LiteralAggregateUpperBounds,
     SPAN_SUM_OPERATION_ID as LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID,
     SpanSumResult as LiteralAggregateSpanSumResult,
+};
+
+pub use literal_class_run_literal::{
+    BuildAccounting as LiteralClassRunLiteralBuildAccounting,
+    BuildError as LiteralClassRunLiteralBuildError,
+    BuildLimits as LiteralClassRunLiteralBuildLimits,
+    COUNT_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+    CountResult as LiteralClassRunLiteralCountResult, LiteralClassRunLiteralPlan,
+    OperationIdentity as LiteralClassRunLiteralOperationIdentity,
+    PLAN_ID as LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+    ReduceAccounting as LiteralClassRunLiteralReduceAccounting,
+    ReduceActualCounters as LiteralClassRunLiteralActualCounters,
+    ReduceError as LiteralClassRunLiteralReduceError,
+    ReduceLimits as LiteralClassRunLiteralReduceLimits,
+    ReduceUpperBounds as LiteralClassRunLiteralUpperBounds,
+    SPAN_SUM_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as LiteralClassRunLiteralSpanSumResult,
 };
 
 pub use literal_set::{
