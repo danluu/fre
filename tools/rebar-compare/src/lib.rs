@@ -49,12 +49,13 @@ use fre::{
     LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
     LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralClassRunLiteralBuildAccounting,
-    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
-    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
-    LiteralReplacementErrorSource, LiteralReplacementLimits, NoqaBuildError, NoqaBuildLimits,
-    NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError, NoqaRunLimits,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
+    LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
+    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
+    LiteralClassRunLiteralReduceLimits, LiteralReplacementErrorSource, LiteralReplacementLimits,
+    NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
+    NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
     OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
@@ -168,7 +169,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v28-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v29-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -517,6 +518,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs once with zero execution scratch",
+        );
+        identity.identity.push_str(
+            "; literal-assertions-v1 authenticates ordered (?m:^L)|(?m:L$) count/span-sum with overlap-complete candidate discovery and complete pre-source bounds",
+        );
+        identity.availability.push_str(
+            "; the direct literal-assertions reducer scans one monotone candidate stream with zero execution scratch",
         );
         identity.identity.push_str(
             "; literal-class-run-literal-v1 authenticates count/span-sum for fixed byte literals bracketing one greedy nonempty byte-class run",
@@ -1733,6 +1740,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-unicode-scalar-class"
         }
         ("compile", AggregatePlanKind::WordRun, _) => "compile-aggregate-word-run-v1",
+        ("compile", AggregatePlanKind::LiteralAssertions, _) => {
+            "compile-aggregate-literal-assertions-v1"
+        }
         ("compile", AggregatePlanKind::FixedClassSandwich, _) => {
             "compile-aggregate-fixed-class-sandwich"
         }
@@ -1773,6 +1783,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::ExactLiteral, _) => "aggregate-exact-literal",
         (_, AggregatePlanKind::UnicodeScalarClass, _) => "aggregate-unicode-scalar-class",
         (_, AggregatePlanKind::WordRun, _) => "aggregate-word-run-v1",
+        (_, AggregatePlanKind::LiteralAssertions, _) => "aggregate-literal-assertions-v1",
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "aggregate-literal-class-run-literal-v1"
@@ -3760,6 +3771,8 @@ fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionE
     for planner in [
         report.planner_work,
         report.unicode_scalar_planner_work,
+        report.word_run_planner_work,
+        report.literal_assertions_planner_work,
         report.fixed_class_sandwich_planner_work,
         report.bounded_affix_planner_work,
         report.grapheme_scalar_dfa_planner_work,
@@ -4272,6 +4285,7 @@ fn composite_replacement_component_limits(
         exact_literal: inactive_literal_operation_limits(run_limits),
         unicode_scalar: inactive_unicode_scalar_operation_limits(),
         word_run: inactive_word_run_operation_limits(),
+        literal_assertions: inactive_literal_assertions_operation_limits(),
         fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
         grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
         bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -5967,6 +5981,7 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
         max_literal_planner_work: limits.fre_literal_planner_work,
         max_unicode_scalar_planner_work: limits.fre_unicode_scalar_planner_work,
         max_word_run_planner_work: limits.fre_unicode_scalar_planner_work,
+        max_literal_assertions_planner_work: limits.fre_literal_planner_work,
         max_fixed_class_sandwich_planner_work: limits.fre_unicode_scalar_planner_work,
         max_grapheme_scalar_dfa_planner_work: limits.fre_aggregate_compile_work,
         max_bounded_class_sequence_planner_work: limits.fre_unicode_scalar_planner_work,
@@ -5998,6 +6013,13 @@ fn aggregate_build_limits(limits: &RunLimits) -> AggregateBuildLimits {
             max_scratch_bytes: 0,
             max_persistent_bytes: limits.fre_unicode_scalar_build_persistent_bytes,
             max_peak_bytes: limits.fre_unicode_scalar_build_peak_bytes,
+        },
+        literal_assertions: LiteralAssertionsBuildLimits {
+            max_literal_bytes: limits.fre_literal_build_needle_bytes,
+            max_build_work: usize::try_from(limits.fre_literal_build_work).unwrap_or(usize::MAX),
+            max_scratch_bytes: limits.fre_literal_build_scratch_bytes,
+            max_persistent_bytes: limits.fre_literal_build_persistent_bytes,
+            max_peak_bytes: limits.fre_literal_build_peak_bytes,
         },
         fixed_class_sandwich: FixedClassSandwichBuildLimits {
             max_source_ranges: limits.fre_unicode_scalar_build_source_ranges,
@@ -6925,6 +6947,86 @@ fn inactive_word_run_operation_limits() -> fre::WordRunReduceLimits {
     fre::WordRunReduceLimits::default()
 }
 
+fn literal_assertions_operation_limits(
+    haystack_len: usize,
+    build: LiteralAssertionsBuildAccounting,
+    operation: AggregateOperation,
+    limits: &RunLimits,
+) -> Result<LiteralAssertionsReduceLimits, ExecutionError> {
+    if build.literal_bytes == 0 {
+        return Err(ExecutionError::fault(
+            "FRE literal-assertions build retained an empty literal",
+        ));
+    }
+    let candidate_events = haystack_len
+        .checked_sub(build.literal_bytes)
+        .and_then(|remaining| remaining.checked_add(1))
+        .unwrap_or(0);
+    let candidate_scan_bytes = candidate_events;
+    let literal_comparisons = checked_aggregate_mul(
+        candidate_events,
+        build.literal_bytes,
+        "literal-assertions comparisons",
+    )?;
+    let assertion_checks = checked_aggregate_mul(candidate_events, 2, "literal-assertions checks")?;
+    let boundary_reads = assertion_checks;
+    let source_reads = [candidate_scan_bytes, literal_comparisons, boundary_reads]
+        .into_iter()
+        .try_fold(0_usize, |total, term| {
+            checked_aggregate_add(total, term, "literal-assertions source reads")
+        })?;
+    let match_events = haystack_len
+        .checked_div(build.literal_bytes)
+        .ok_or_else(|| ExecutionError::fault("literal-assertions match bound divided by zero"))?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("literal-assertions count bound does not fit u64"))?;
+    let span_sum = match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => 0,
+        AggregateOperation::SpanSum => u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("literal-assertions span bound does not fit u64"))?,
+        AggregateOperation::Spans => {
+            return Err(ExecutionError::fault(
+                "literal-assertions plan retained a spans operation",
+            ));
+        }
+    };
+    let work = [
+        candidate_scan_bytes,
+        checked_aggregate_mul(candidate_events, 2, "literal-assertions candidate work")?,
+        literal_comparisons,
+        checked_aggregate_mul(assertion_checks, 2, "literal-assertions assertion work")?,
+        boundary_reads,
+        checked_aggregate_mul(match_events, 4, "literal-assertions match work")?,
+        8,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, term| {
+        checked_aggregate_add(total, term, "literal-assertions total work")
+    })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    Ok(LiteralAssertionsReduceLimits {
+        max_input_bytes: haystack_len,
+        max_source_reads: source_reads,
+        max_work: work.min(limits.fre_aggregate_operation_work),
+        max_candidate_scan_bytes: candidate_scan_bytes,
+        max_literal_comparisons: literal_comparisons,
+        max_assertion_checks: assertion_checks,
+        max_boundary_reads: boundary_reads,
+        max_candidate_events: candidate_events.min(reducer_limit),
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: span_sum,
+        max_scratch_bytes: 0,
+        max_persistent_bytes: build.persistent_bytes,
+        max_peak_bytes: build.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
+fn inactive_literal_assertions_operation_limits() -> LiteralAssertionsReduceLimits {
+    LiteralAssertionsReduceLimits::default()
+}
+
 fn fixed_class_sandwich_operation_limits(
     haystack_len: usize,
     build: fre::FixedClassSandwichBuildAccounting,
@@ -7796,6 +7898,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: literal_operation_limits(haystack_len, build, limits)?,
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7819,6 +7922,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: unicode_scalar_operation_limits(haystack_len, build, limits)?,
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7840,6 +7944,34 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: word_run_operation_limits(haystack_len, build, report.operation, limits)?,
+            literal_assertions: inactive_literal_assertions_operation_limits(),
+            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
+        }),
+        AggregateBuildAccounting::LiteralAssertions(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            word_run: inactive_word_run_operation_limits(),
+            literal_assertions: literal_assertions_operation_limits(
+                haystack_len,
+                build,
+                report.operation,
+                limits,
+            )?,
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7861,6 +7993,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: fixed_class_sandwich_operation_limits(
                 haystack_len,
                 build,
@@ -7886,6 +8019,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: grapheme_scalar_dfa_operation_limits(haystack_len, build, limits)?,
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7907,6 +8041,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: bounded_class_sequence_operation_limits(
@@ -7944,6 +8079,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                 exact_literal: inactive_literal_operation_limits(limits),
                 unicode_scalar: inactive_unicode_scalar_operation_limits(),
                 word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
                 fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
                 grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
                 bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7971,6 +8107,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -7996,6 +8133,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8022,6 +8160,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8049,6 +8188,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8097,6 +8237,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                 exact_literal: inactive_literal_operation_limits(limits),
                 unicode_scalar: inactive_unicode_scalar_operation_limits(),
                 word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
                 fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
                 grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
                 bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8125,6 +8266,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8146,6 +8288,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
             word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
             fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
             grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
             bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8190,6 +8333,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                 exact_literal: inactive_literal_operation_limits(limits),
                 unicode_scalar: inactive_unicode_scalar_operation_limits(),
                 word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
                 fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
                 grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
                 bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8221,6 +8365,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                     exact_literal: inactive_literal_operation_limits(limits),
                     unicode_scalar: inactive_unicode_scalar_operation_limits(),
                     word_run: inactive_word_run_operation_limits(),
+                    literal_assertions: inactive_literal_assertions_operation_limits(),
                     fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
                     grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
                     bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8249,6 +8394,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                 exact_literal: inactive_literal_operation_limits(limits),
                 unicode_scalar: inactive_unicode_scalar_operation_limits(),
                 word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
                 fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
                 grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
                 bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
@@ -8349,6 +8495,61 @@ fn word_run_plan_identity_matches(
         && build.work_upper_bound == 1
         && build.scratch_bytes == 0
         && build.persistent_bytes > 0
+        && build.peak_bytes == build.persistent_bytes
+        && report.retained_capacity_bytes == build.persistent_bytes
+}
+
+fn literal_assertions_plan_identity_matches(
+    report: &AggregateBuildReport,
+    identity: fre::AggregateLiteralAssertionsIdentity,
+    build: LiteralAssertionsBuildAccounting,
+    unicode: bool,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    let expected_operation_id = match operation {
+        LiteralAggregateOperation::Count => fre::LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+        LiteralAggregateOperation::SpanSum => fre::LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID,
+    };
+    let operation_matches = matches!(
+        (report.operation, operation),
+        (
+            AggregateOperation::Compile | AggregateOperation::Count,
+            LiteralAggregateOperation::Count
+        ) | (
+            AggregateOperation::SpanSum,
+            LiteralAggregateOperation::SpanSum
+        )
+    );
+    let expected_semantics = if unicode {
+        fre::AggregateLiteralAssertionsSemantics::UnicodeOnByteStableLiteral
+    } else {
+        fre::AggregateLiteralAssertionsSemantics::UnicodeOffByteLiteral
+    };
+    let profile_matches = matches!(
+        &report.syntax_key.profile,
+        CompatibilityProfile::RustBytes(profile)
+            if profile.options.unicode == unicode
+                && profile.options.line_terminator == identity.kernel.line_terminator
+    );
+    operation_matches
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::LiteralAssertions
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && identity.semantics == expected_semantics
+        && identity.kernel.plan_id == fre::LITERAL_ASSERTIONS_PLAN_ID
+        && identity.kernel.operation_id == expected_operation_id
+        && identity.kernel.literal_bytes == build.literal_bytes
+        && identity.kernel.literal_bytes > 0
+        && identity.kernel.topology
+            == fre::LiteralAssertionsTopology::StartLineLiteralOrLiteralEndLine
+        && identity.kernel.branch_ordered
+        && identity.kernel.overlap_complete
+        && identity.kernel.non_overlapping
+        && profile_matches
+        && build.work_upper_bound > 0
+        && build.scratch_bytes == 0
+        && build.persistent_bytes > build.literal_bytes
         && build.peak_bytes == build.persistent_bytes
         && report.retained_capacity_bytes == build.persistent_bytes
 }
@@ -8810,6 +9011,31 @@ fn require_unicode_plan_identity(
         }
         return Err(ExecutionError::fault(format!(
             "word-run aggregate identity mismatch for {operation:?}: {:?}",
+            report.plan_identity
+        )));
+    }
+    if report.plan == AggregatePlanKind::LiteralAssertions
+        || matches!(report.build, AggregateBuildAccounting::LiteralAssertions(_))
+        || matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::LiteralAssertions(_)
+        )
+    {
+        let (
+            AggregatePlanIdentity::LiteralAssertions(identity),
+            AggregateBuildAccounting::LiteralAssertions(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(format!(
+                "literal-assertions aggregate identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        };
+        if literal_assertions_plan_identity_matches(report, identity, build, unicode, operation) {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(format!(
+            "literal-assertions aggregate identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )));
     }
@@ -9863,6 +10089,48 @@ fn word_run_build_error(source: &fre::WordRunBuildError, message: String) -> Exe
     }
 }
 
+fn literal_assertions_build_error(
+    source: &LiteralAssertionsBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        LiteralAssertionsBuildError::LiteralBytesLimit { .. }
+        | LiteralAssertionsBuildError::WorkLimit { .. }
+        | LiteralAssertionsBuildError::ScratchLimit { .. }
+        | LiteralAssertionsBuildError::PersistentLimit { .. }
+        | LiteralAssertionsBuildError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        LiteralAssertionsBuildError::EmptyLiteral
+        | LiteralAssertionsBuildError::AllocationFailed { .. }
+        | LiteralAssertionsBuildError::ArithmeticOverflow { .. }
+        | _ => ExecutionError::fault(message),
+    }
+}
+
+fn literal_assertions_reduce_error(
+    source: &LiteralAssertionsReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        LiteralAssertionsReduceError::InputBytesLimit { .. }
+        | LiteralAssertionsReduceError::SourceReadsLimit { .. }
+        | LiteralAssertionsReduceError::WorkLimit { .. }
+        | LiteralAssertionsReduceError::CandidateScanBytesLimit { .. }
+        | LiteralAssertionsReduceError::LiteralComparisonsLimit { .. }
+        | LiteralAssertionsReduceError::AssertionChecksLimit { .. }
+        | LiteralAssertionsReduceError::BoundaryReadsLimit { .. }
+        | LiteralAssertionsReduceError::CandidateEventsLimit { .. }
+        | LiteralAssertionsReduceError::MatchEventsLimit { .. }
+        | LiteralAssertionsReduceError::CountLimit { .. }
+        | LiteralAssertionsReduceError::SpanSumLimit { .. }
+        | LiteralAssertionsReduceError::ScratchLimit { .. }
+        | LiteralAssertionsReduceError::PersistentLimit { .. }
+        | LiteralAssertionsReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
+        LiteralAssertionsReduceError::ArithmeticOverflow { .. }
+        | LiteralAssertionsReduceError::AccountingInvariant { .. }
+        | _ => ExecutionError::fault(message),
+    }
+}
+
 fn aggregate_execution_error(source: &AggregateExecutionSource, message: String) -> ExecutionError {
     match source {
         AggregateExecutionSource::ExactLiteral(source) => literal_reduce_error(source, message),
@@ -9870,6 +10138,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
             unicode_scalar_reduce_error(source, message)
         }
         AggregateExecutionSource::WordRun(source) => word_run_reduce_error(source, message),
+        AggregateExecutionSource::LiteralAssertions(source) => {
+            literal_assertions_reduce_error(source, message)
+        }
         AggregateExecutionSource::FixedClassSandwich(source) => {
             fixed_class_sandwich_reduce_error(source, message)
         }
@@ -9987,6 +10258,7 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         | AggregateBuildError::LiteralPlannerWorkLimit { .. }
         | AggregateBuildError::UnicodeScalarPlannerWorkLimit { .. }
         | AggregateBuildError::WordRunPlannerWorkLimit { .. }
+        | AggregateBuildError::LiteralAssertionsPlannerWorkLimit { .. }
         | AggregateBuildError::FixedClassSandwichPlannerWorkLimit { .. }
         | AggregateBuildError::BoundedAffixPlannerWorkLimit { .. }
         | AggregateBuildError::GraphemeScalarDfaPlannerWorkLimit { .. }
@@ -10009,6 +10281,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
             unicode_scalar_build_error(source, message)
         }
         AggregateBuildError::WordRunBuild { source, .. } => word_run_build_error(source, message),
+        AggregateBuildError::LiteralAssertionsBuild { source, .. } => {
+            literal_assertions_build_error(source, message)
+        }
         AggregateBuildError::FixedClassSandwichBuild { source, .. } => {
             fixed_class_sandwich_build_error(source, message)
         }
@@ -16605,7 +16880,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v28-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v29-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

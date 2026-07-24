@@ -435,6 +435,7 @@ fn continuation_details(
         AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::WordRun(_)
+        | AggregateExecutionDetails::LiteralAssertions(_)
         | AggregateExecutionDetails::FixedClassSandwich(_)
         | AggregateExecutionDetails::GraphemeScalarDfa(_)
         | AggregateExecutionDetails::BoundedClassSequence(_)

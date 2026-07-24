@@ -45,7 +45,10 @@ use fre_kernels::{
     GraphemeScalarDfaRole, LiteralAggregateBuildAccounting, LiteralAggregateBuildError,
     LiteralAggregateBuildLimits, LiteralAggregateCountResult, LiteralAggregateOperationIdentity,
     LiteralAggregatePlan, LiteralAggregateReduceAccounting, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult,
+    LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult, LiteralAssertionsBuildAccounting,
+    LiteralAssertionsBuildError, LiteralAssertionsBuildLimits, LiteralAssertionsCountResult,
+    LiteralAssertionsOperationIdentity, LiteralAssertionsPlan, LiteralAssertionsReduceAccounting,
+    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits, LiteralAssertionsSpanSumResult,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralCountResult,
     LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
@@ -87,13 +90,13 @@ use crate::{
     AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
     AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match,
     bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
-    literal_class_run_literal, unicode_word_run,
+    literal_assertions, literal_class_run_literal, unicode_word_run,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 28;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 29;
 
 /// Whole-match operation fixed before an aggregate plan is constructed.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -133,6 +136,9 @@ pub enum AggregatePlanKind {
     /// Single-pass maximal ASCII/Unicode word-run reducer for canonical
     /// `\b\w{m,}\b`.
     WordRun,
+    /// One monotone literal-candidate stream for the exact ordered
+    /// `(?m:^L)|(?m:L$)` shape.
+    LiteralAssertions,
     /// Direct bounded circular-window reducer for
     /// `PREFIX MIDDLE{N} SUFFIX` class/literal sequences after transparent
     /// whole-match capture erasure.
@@ -178,6 +184,8 @@ pub enum AggregatePlanIdentity {
     UnicodeScalar(AggregateUnicodeScalarIdentity),
     /// Complete-boundary ASCII/Unicode word-run proof and operation identity.
     WordRun(AggregateWordRunIdentity),
+    /// Ordered line-assertion/literal proof and native operation identity.
+    LiteralAssertions(AggregateLiteralAssertionsIdentity),
     /// Fixed-width three-atom class sequence plus native reducer identity.
     FixedClassSandwich(AggregateFixedClassSandwichIdentity),
     /// Ordered scalar-property grammar plus native reducer identity.
@@ -318,6 +326,24 @@ pub enum AggregateWordRunSemantics {
 pub struct AggregateWordRunIdentity {
     pub semantics: AggregateWordRunSemantics,
     pub kernel: unicode_word_run::AggregateOperationIdentity,
+}
+
+/// Profile proof attached to the direct line-assertion literal reducer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateLiteralAssertionsSemantics {
+    /// Rust bytes with Unicode disabled; the literal and configured line
+    /// terminator are matched as arbitrary bytes.
+    UnicodeOffByteLiteral,
+    /// Rust bytes with Unicode enabled and `utf8(false)`; canonical HIR proved
+    /// one valid UTF-8 literal, while line assertions remain byte-stable.
+    UnicodeOnByteStableLiteral,
+}
+
+/// Facade identity for the construction-selected line-assertion reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateLiteralAssertionsIdentity {
+    pub semantics: AggregateLiteralAssertionsSemantics,
+    pub kernel: LiteralAssertionsOperationIdentity,
 }
 
 /// Profile proof attached to the fixed class-sandwich reducer.
@@ -838,6 +864,8 @@ pub enum AggregateBuildAccounting {
     UnicodeScalar(UnicodeScalarAggregateBuildAccounting),
     /// Fixed-size direct word-run construction certificate.
     WordRun(unicode_word_run::AggregateBuildAccounting),
+    /// Exact retained literal construction certificate.
+    LiteralAssertions(LiteralAssertionsBuildAccounting),
     /// Bounded class-sandwich construction certificate.
     FixedClassSandwich(FixedClassSandwichBuildAccounting),
     /// Ordered scalar-property classifier construction certificate.
@@ -884,6 +912,9 @@ pub struct AggregateBuildLimits {
     /// Maximum structural HIR/range/membership inspection work for the direct
     /// complete-boundary word-run specialization.
     pub max_word_run_planner_work: usize,
+    /// Maximum allocation-free HIR/literal inspection work for the ordered
+    /// start-line/end-line literal specialization.
+    pub max_literal_assertions_planner_work: usize,
     /// Maximum structural HIR/range inspection work for fixed-width class
     /// sandwiches.
     pub max_fixed_class_sandwich_planner_work: usize,
@@ -926,6 +957,8 @@ pub struct AggregateBuildLimits {
     pub unicode_scalar: UnicodeScalarAggregateBuildLimits,
     /// Complete direct word-run construction limits.
     pub word_run: unicode_word_run::AggregateBuildLimits,
+    /// Complete direct line-assertion literal construction limits.
+    pub literal_assertions: LiteralAssertionsBuildLimits,
     /// Complete bounded fixed-class construction limits.
     pub fixed_class_sandwich: FixedClassSandwichBuildLimits,
     /// Complete ordered scalar-grammar construction limits.
@@ -961,6 +994,7 @@ impl Default for AggregateBuildLimits {
             max_literal_planner_work: 4_096,
             max_unicode_scalar_planner_work: 4_096,
             max_word_run_planner_work: 4_096,
+            max_literal_assertions_planner_work: 4_096,
             max_fixed_class_sandwich_planner_work: 4_096,
             max_bounded_affix_planner_work: 4_096,
             max_grapheme_scalar_dfa_planner_work: 1 << 20,
@@ -975,6 +1009,7 @@ impl Default for AggregateBuildLimits {
             exact_literal: LiteralAggregateBuildLimits::default(),
             unicode_scalar: UnicodeScalarAggregateBuildLimits::default(),
             word_run: unicode_word_run::AggregateBuildLimits::default(),
+            literal_assertions: LiteralAssertionsBuildLimits::default(),
             fixed_class_sandwich: FixedClassSandwichBuildLimits::default(),
             grapheme_scalar_dfa: GraphemeScalarDfaBuildLimits::default(),
             bounded_class_sequence: BoundedClassSequenceBuildLimits::default(),
@@ -1071,6 +1106,8 @@ pub struct AggregateRunLimits {
     pub unicode_scalar: UnicodeScalarAggregateReduceLimits,
     /// Direct word-run whole-operation limits.
     pub word_run: unicode_word_run::AggregateReduceLimits,
+    /// Direct line-assertion literal whole-operation limits.
+    pub literal_assertions: LiteralAssertionsReduceLimits,
     /// Direct fixed-class circular-window limits.
     pub fixed_class_sandwich: FixedClassSandwichReduceLimits,
     /// Direct ordered scalar-grammar reducer limits.
@@ -1136,6 +1173,9 @@ pub struct AggregateBuildReport {
     /// remains nonzero when an ineligible inspection precedes another
     /// selected family.
     pub word_run_planner_work: usize,
+    /// Ordered line-assertion literal HIR/literal inspection work. This
+    /// remains nonzero when an ineligible inspection precedes another family.
+    pub literal_assertions_planner_work: usize,
     /// Fixed-class structural inspection work, including every HIR node and
     /// canonical range examined through transparent captures.
     pub fixed_class_sandwich_planner_work: usize,
@@ -1228,6 +1268,7 @@ struct AggregateFixedAbsoluteDomainSeal {
     planner_work: usize,
     unicode_scalar_planner_work: usize,
     word_run_planner_work: usize,
+    literal_assertions_planner_work: usize,
     fixed_class_sandwich_planner_work: usize,
     bounded_affix_planner_work: usize,
     grapheme_scalar_dfa_planner_work: usize,
@@ -1277,6 +1318,7 @@ impl AggregateFixedAbsoluteDomainSeal {
             && self.planner_work == report.planner_work
             && self.unicode_scalar_planner_work == report.unicode_scalar_planner_work
             && self.word_run_planner_work == report.word_run_planner_work
+            && self.literal_assertions_planner_work == report.literal_assertions_planner_work
             && self.fixed_class_sandwich_planner_work == report.fixed_class_sandwich_planner_work
             && self.bounded_affix_planner_work == report.bounded_affix_planner_work
             && self.grapheme_scalar_dfa_planner_work == report.grapheme_scalar_dfa_planner_work
@@ -2007,6 +2049,14 @@ pub enum AggregateBuildError {
         needed: usize,
         limit: usize,
     },
+    /// Line-assertion literal inspection crossed its independent structural
+    /// work cap.
+    LiteralAssertionsPlannerWorkLimit {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        needed: usize,
+        limit: usize,
+    },
     /// Fixed class-sandwich inspection crossed its structural work cap.
     FixedClassSandwichPlannerWorkLimit {
         operation: AggregateOperation,
@@ -2120,6 +2170,12 @@ pub enum AggregateBuildError {
         operation: AggregateOperation,
         selection: AggregatePlanSelection,
         source: unicode_word_run::AggregateBuildError,
+    },
+    /// Direct line-assertion literal construction failed after selection.
+    LiteralAssertionsBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: LiteralAssertionsBuildError,
     },
     /// Fixed class-sandwich construction failed after selection.
     FixedClassSandwichBuild {
@@ -2299,6 +2355,15 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} word-run inspection needs {needed} structural work units, limit is {limit}"
             ),
+            Self::LiteralAssertionsPlannerWorkLimit {
+                operation,
+                selection,
+                needed,
+                limit,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} literal-assertions inspection needs {needed} structural work units, limit is {limit}"
+            ),
             Self::FixedClassSandwichPlannerWorkLimit {
                 operation,
                 selection,
@@ -2439,6 +2504,14 @@ impl fmt::Display for AggregateBuildError {
             } => write!(
                 f,
                 "aggregate {operation:?}/{selection:?} word-run construction failed: {source}"
+            ),
+            Self::LiteralAssertionsBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} literal-assertions construction failed: {source}"
             ),
             Self::FixedClassSandwichBuild {
                 operation,
@@ -2595,6 +2668,7 @@ impl std::error::Error for AggregateBuildError {
             Self::ExactLiteralBuild { source, .. } => Some(source),
             Self::UnicodeScalarBuild { source, .. } => Some(source),
             Self::WordRunBuild { source, .. } => Some(source),
+            Self::LiteralAssertionsBuild { source, .. } => Some(source),
             Self::FixedClassSandwichBuild { source, .. } => Some(source),
             Self::GraphemeScalarDfaBuild { source, .. } => Some(source),
             Self::BoundedClassSequenceBuild { source, .. } => Some(source),
@@ -2613,6 +2687,7 @@ impl std::error::Error for AggregateBuildError {
             Self::LiteralPlannerWorkLimit { .. }
             | Self::UnicodeScalarPlannerWorkLimit { .. }
             | Self::WordRunPlannerWorkLimit { .. }
+            | Self::LiteralAssertionsPlannerWorkLimit { .. }
             | Self::FixedClassSandwichPlannerWorkLimit { .. }
             | Self::BoundedAffixPlannerWorkLimit { .. }
             | Self::GraphemeScalarDfaPlannerWorkLimit { .. }
@@ -2766,6 +2841,8 @@ pub enum AggregateExecutionSource {
     UnicodeScalar(UnicodeScalarAggregateReduceError),
     /// Direct word-run refusal after prospective admission.
     WordRun(unicode_word_run::AggregateReduceError),
+    /// Direct line-assertion literal refusal after prospective admission.
+    LiteralAssertions(LiteralAssertionsReduceError),
     /// Direct fixed class-sandwich refusal.
     FixedClassSandwich(FixedClassSandwichReduceError),
     /// Direct ordered scalar-grammar refusal.
@@ -2808,6 +2885,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::ExactLiteral(source) => source.fmt(f),
             Self::UnicodeScalar(source) => source.fmt(f),
             Self::WordRun(source) => source.fmt(f),
+            Self::LiteralAssertions(source) => source.fmt(f),
             Self::FixedClassSandwich(source) => source.fmt(f),
             Self::GraphemeScalarDfa(source) => source.fmt(f),
             Self::BoundedClassSequence(source) => source.fmt(f),
@@ -2837,6 +2915,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::ExactLiteral(source) => Some(source),
             Self::UnicodeScalar(source) => Some(source),
             Self::WordRun(source) => Some(source),
+            Self::LiteralAssertions(source) => Some(source),
             Self::FixedClassSandwich(source) => Some(source),
             Self::GraphemeScalarDfa(source) => Some(source),
             Self::BoundedClassSequence(source) => Some(source),
@@ -2952,6 +3031,8 @@ pub enum AggregateExecutionDetails {
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
     /// Direct word-run prospective and actual counters.
     WordRun(unicode_word_run::AggregateReduceAccounting),
+    /// Direct line-assertion literal bounds and exact counters.
+    LiteralAssertions(LiteralAssertionsReduceAccounting),
     /// Fixed class-sandwich bounds, counters, and operation identity.
     FixedClassSandwich(FixedClassSandwichReduceAccounting),
     /// Ordered scalar-grammar bounds, counters, and operation identity.
@@ -3488,6 +3569,7 @@ impl AggregateBuilder {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
+        let line_terminator = self.profile.options.line_terminator;
         let grapheme_profile = self.profile == RustProfile::rebar_1_12_4();
         let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
         expected_fixed_absolute_profile.options.unicode = unicode;
@@ -3632,6 +3714,7 @@ impl AggregateBuilder {
                 planner_work: work,
                 unicode_scalar_planner_work: 0,
                 word_run_planner_work: 0,
+                literal_assertions_planner_work: 0,
                 fixed_class_sandwich_planner_work: 0,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: 0,
@@ -3815,6 +3898,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work: work,
                     word_run_planner_work: 0,
+                    literal_assertions_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -3928,6 +4012,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work: inspection.work,
+                    literal_assertions_planner_work: 0,
                     fixed_class_sandwich_planner_work: 0,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -3963,6 +4048,121 @@ impl AggregateBuilder {
                 });
             }
             Some(unicode_word_run::AggregateInspectionOutcome::Ineligible { work }) => work,
+            None => 0,
+        };
+        let literal_assertions_inspection = if !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                literal_assertions::inspect(&rust.hir, limits.max_literal_assertions_planner_work)
+                    .map_err(|error| match error {
+                        literal_assertions::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::LiteralAssertionsPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        literal_assertions::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "literal-assertions inspection accounting overflow",
+                            }
+                        }
+                    })?,
+            )
+        } else {
+            None
+        };
+        let literal_assertions_planner_work = match literal_assertions_inspection {
+            Some(literal_assertions::InspectionOutcome::Eligible(inspection)) => {
+                if inspection.hir_nodes != expected_nodes
+                    || inspection.captures != expected_captures
+                {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from literal-assertions inspection",
+                    });
+                }
+                let engine = LiteralAssertionsPlan::build(
+                    inspection.literal,
+                    line_terminator,
+                    limits.literal_assertions,
+                )
+                .map_err(|source| AggregateBuildError::LiteralAssertionsBuild {
+                    operation,
+                    selection,
+                    source,
+                })?;
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected literal-assertions reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    plan: AggregatePlanKind::LiteralAssertions,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    literal_assertions_planner_work: inspection.work,
+                    fixed_class_sandwich_planner_work: 0,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work: 0,
+                    bounded_class_sequence_planner_work: 0,
+                    bounded_separated_fields_planner_work: 0,
+                    prefix_class_alternation_planner_work: 0,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: inspection.captures,
+                    captures_erased: inspection.captures,
+                    build: AggregateBuildAccounting::LiteralAssertions(build),
+                    plan_identity: AggregatePlanIdentity::LiteralAssertions(
+                        AggregateLiteralAssertionsIdentity {
+                            semantics: if unicode {
+                                AggregateLiteralAssertionsSemantics::UnicodeOnByteStableLiteral
+                            } else {
+                                AggregateLiteralAssertionsSemantics::UnicodeOffByteLiteral
+                            },
+                            kernel,
+                        },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::LiteralAssertions(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(literal_assertions::InspectionOutcome::Ineligible { work }) => work,
             None => 0,
         };
         let fixed_class_inspection = if selection == AggregatePlanSelection::Auto
@@ -4055,6 +4255,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work: work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work: 0,
@@ -4247,6 +4448,7 @@ impl AggregateBuilder {
                 planner_work,
                 unicode_scalar_planner_work,
                 word_run_planner_work,
+                literal_assertions_planner_work,
                 fixed_class_sandwich_planner_work,
                 bounded_affix_planner_work: 0,
                 grapheme_scalar_dfa_planner_work: inspection.work,
@@ -4372,6 +4574,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4488,6 +4691,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4608,6 +4812,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4738,6 +4943,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4857,6 +5063,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work: 0,
                     grapheme_scalar_dfa_planner_work,
@@ -4967,6 +5174,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         word_run_planner_work,
+                        literal_assertions_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work: work,
                         grapheme_scalar_dfa_planner_work,
@@ -5094,6 +5302,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -5753,6 +5962,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -5823,6 +6033,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6001,6 +6212,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         word_run_planner_work,
+                        literal_assertions_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
@@ -6124,6 +6336,7 @@ impl AggregateBuilder {
                     planner_work,
                     unicode_scalar_planner_work,
                     word_run_planner_work,
+                    literal_assertions_planner_work,
                     fixed_class_sandwich_planner_work,
                     bounded_affix_planner_work,
                     grapheme_scalar_dfa_planner_work,
@@ -6289,6 +6502,7 @@ impl AggregateBuilder {
                         planner_work,
                         unicode_scalar_planner_work,
                         word_run_planner_work,
+                        literal_assertions_planner_work,
                         fixed_class_sandwich_planner_work,
                         bounded_affix_planner_work,
                         grapheme_scalar_dfa_planner_work,
@@ -6379,6 +6593,7 @@ impl AggregateBuilder {
             planner_work,
             unicode_scalar_planner_work,
             word_run_planner_work,
+            literal_assertions_planner_work,
             fixed_class_sandwich_planner_work,
             bounded_affix_planner_work,
             grapheme_scalar_dfa_planner_work,
@@ -6441,6 +6656,7 @@ enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
     WordRun(unicode_word_run::Plan),
+    LiteralAssertions(LiteralAssertionsPlan),
     FixedClassSandwich(FixedClassSandwichPlan),
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
@@ -6789,6 +7005,15 @@ impl AggregatePlan {
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::WordRun(source))
                 }),
+            AggregateEngine::LiteralAssertions(engine) => engine
+                .count(haystack, limits.literal_assertions)
+                .map(AggregateCountExecution::LiteralAssertions)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::LiteralAssertions(source),
+                    )
+                }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .count(haystack, limits.fixed_class_sandwich)
                 .map(AggregateCountExecution::FixedClassSandwich)
@@ -7099,6 +7324,15 @@ impl AggregatePlan {
                 .map(AggregateSpanSumExecution::WordRun)
                 .map_err(|source| {
                     self.execution_error(limits, AggregateExecutionSource::WordRun(source))
+                }),
+            AggregateEngine::LiteralAssertions(engine) => engine
+                .span_sum(haystack, limits.literal_assertions)
+                .map(AggregateSpanSumExecution::LiteralAssertions)
+                .map_err(|source| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::LiteralAssertions(source),
+                    )
                 }),
             AggregateEngine::FixedClassSandwich(engine) => engine
                 .span_sum(haystack, limits.fixed_class_sandwich)
@@ -7477,6 +7711,7 @@ enum AggregateCountExecution {
     ExactLiteral(LiteralAggregateCountResult),
     UnicodeScalar(UnicodeScalarAggregateCountResult),
     WordRun(unicode_word_run::AggregateCountResult),
+    LiteralAssertions(LiteralAssertionsCountResult),
     FixedClassSandwich(FixedClassSandwichCountResult),
     GraphemeScalarDfa(GraphemeScalarDfaCountResult),
     BoundedClassSequence(BoundedClassSequenceCountResult),
@@ -7517,6 +7752,7 @@ impl AggregateCountExecution {
             Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
             Self::WordRun(result) => result.count,
+            Self::LiteralAssertions(result) => result.count,
             Self::FixedClassSandwich(result) => result.count,
             Self::GraphemeScalarDfa(result) => result.count,
             Self::BoundedClassSequence(result) => result.count,
@@ -7544,6 +7780,9 @@ impl AggregateCountExecution {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
             Self::WordRun(result) => AggregateExecutionDetails::WordRun(result.accounting),
+            Self::LiteralAssertions(result) => {
+                AggregateExecutionDetails::LiteralAssertions(result.accounting)
+            }
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }
@@ -7626,6 +7865,7 @@ enum AggregateSpanSumExecution {
     ExactLiteral(LiteralAggregateSpanSumResult),
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
     WordRun(unicode_word_run::AggregateSpanSumResult),
+    LiteralAssertions(LiteralAssertionsSpanSumResult),
     FixedClassSandwich(FixedClassSandwichSpanSumResult),
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
@@ -7653,6 +7893,7 @@ impl AggregateSpanSumExecution {
             Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
             Self::WordRun(result) => result.span_sum,
+            Self::LiteralAssertions(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::LiteralClassRunLiteral(result) => result.span_sum,
@@ -7673,6 +7914,9 @@ impl AggregateSpanSumExecution {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
             Self::WordRun(result) => AggregateExecutionDetails::WordRun(result.accounting),
+            Self::LiteralAssertions(result) => {
+                AggregateExecutionDetails::LiteralAssertions(result.accounting)
+            }
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
             }

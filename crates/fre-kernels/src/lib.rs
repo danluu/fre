@@ -23,6 +23,7 @@ mod fixed_class_sandwich;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
 mod literal_aggregate;
+mod literal_assertions;
 mod literal_class_run_literal;
 mod literal_set;
 mod ordered_literal_aggregate;
@@ -194,6 +195,20 @@ pub use literal_aggregate::{
     ReduceUpperBounds as LiteralAggregateUpperBounds,
     SPAN_SUM_OPERATION_ID as LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID,
     SpanSumResult as LiteralAggregateSpanSumResult,
+};
+
+pub use literal_assertions::{
+    BuildAccounting as LiteralAssertionsBuildAccounting, BuildError as LiteralAssertionsBuildError,
+    BuildLimits as LiteralAssertionsBuildLimits,
+    COUNT_OPERATION_ID as LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+    CountResult as LiteralAssertionsCountResult, LiteralAssertionsPlan,
+    OperationIdentity as LiteralAssertionsOperationIdentity, PLAN_ID as LITERAL_ASSERTIONS_PLAN_ID,
+    ReduceAccounting as LiteralAssertionsReduceAccounting,
+    ReduceActualCounters as LiteralAssertionsActualCounters,
+    ReduceError as LiteralAssertionsReduceError, ReduceLimits as LiteralAssertionsReduceLimits,
+    ReduceUpperBounds as LiteralAssertionsUpperBounds,
+    SPAN_SUM_OPERATION_ID as LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as LiteralAssertionsSpanSumResult, Topology as LiteralAssertionsTopology,
 };
 
 pub use literal_class_run_literal::{
