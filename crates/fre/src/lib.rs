@@ -36,6 +36,7 @@ mod finite_root;
 mod fixed_absolute;
 mod forward_anchored;
 mod grapheme_scalar;
+pub mod guarded_ascii_word;
 mod line_capture;
 mod replacement;
 mod required_literal;
@@ -1802,14 +1803,16 @@ impl PortableBuilder {
         } else if self.selection == PlanSelection::ForceRequiredLiteral {
             return Err(BuildError::RequiredLiteralShape);
         }
-        let extraction = finite::extract(
+        let (finite_words, finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
             required_work,
             self.limits.max_planner_work,
-        )?;
-        if let Some(words) = extraction.words {
+            false,
+        )
+        .into_incumbent_words()?;
+        if let Some(words) = finite_words {
             if words.len() == 1 {
                 let literal = LiteralPlan::new(&words[0], self.limits.literal)?;
                 let storage = literal.storage_bytes();
@@ -1825,7 +1828,7 @@ impl PortableBuilder {
                         admission,
                         syntax,
                         plan: PlanKind::ExactLiteral,
-                        planner_work: extraction.work,
+                        planner_work: finite_work,
                         lowering: None,
                         states: 0,
                         edges: 0,
@@ -1860,7 +1863,7 @@ impl PortableBuilder {
                             admission,
                             syntax,
                             plan: PlanKind::PackedLiteralSet,
-                            planner_work: extraction.work,
+                            planner_work: finite_work,
                             lowering: None,
                             states: 0,
                             edges: 0,
@@ -1892,7 +1895,7 @@ impl PortableBuilder {
                         admission,
                         syntax,
                         plan: PlanKind::LiteralSetDfa,
-                        planner_work: extraction.work,
+                        planner_work: finite_work,
                         lowering: None,
                         states: 0,
                         edges: 0,
@@ -1930,7 +1933,7 @@ impl PortableBuilder {
                 admission,
                 syntax,
                 plan: PlanKind::K0,
-                planner_work: extraction.work,
+                planner_work: finite_work,
                 lowering: Some(lowering),
                 states: plan.states(),
                 edges: plan.edges(),

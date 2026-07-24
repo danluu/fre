@@ -441,29 +441,37 @@ fn prove_equivalence(
     line_terminator: u8,
     limits: &BuildLimits,
 ) -> Result<PortableTextProof, PortableTextBuildError> {
-    let text_language = finite::extract(
+    let (text_language, text_work) = finite::extract(
         text,
         limits.literal_set.max_patterns,
         limits.literal_set.max_pattern_bytes,
         0,
         limits.max_planner_work,
+        false,
     )
-    .map_err(PortableTextBuildError::FiniteProof)?
-    .words;
-    let bytes_language = finite::extract(
+    .into_incumbent_words()
+    .map_err(PortableTextBuildError::FiniteProof)?;
+    let (bytes_language, bytes_work) = finite::extract(
         bytes,
         limits.literal_set.max_patterns,
         limits.literal_set.max_pattern_bytes,
-        0,
+        text_work,
         limits.max_planner_work,
+        false,
     )
-    .map_err(PortableTextBuildError::FiniteProof)?
-    .words;
+    .into_incumbent_words()
+    .map_err(PortableTextBuildError::FiniteProof)?;
     match (text_language, bytes_language) {
         (Some(text_language), Some(bytes_language)) => {
             finite_equivalence(&text_language, &bytes_language)
         }
-        (None, None) => hir_equivalence(text, bytes, line_terminator, limits.max_planner_work),
+        (None, None) => hir_equivalence(
+            text,
+            bytes,
+            line_terminator,
+            bytes_work,
+            limits.max_planner_work,
+        ),
         (Some(_), None) | (None, Some(_)) => Err(PortableTextBuildError::ProfileLanguageMismatch),
     }
 }
@@ -494,6 +502,7 @@ fn hir_equivalence(
     text: &regex_syntax::hir::Hir,
     bytes: &regex_syntax::hir::Hir,
     line_terminator: u8,
+    initial_work: u64,
     work_limit: u64,
 ) -> Result<PortableTextProof, PortableTextBuildError> {
     let properties = text.properties();
@@ -502,8 +511,13 @@ fn hir_equivalence(
     }
     if text != bytes || properties.minimum_len().is_none() {
         let Some((minimum_match_bytes, elided_alternatives)) =
-            ordered_top_level_alternatives_equal_after_impossible_elision(text, bytes, work_limit)
-                .map_err(PortableTextBuildError::EquivalenceProof)?
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                text,
+                bytes,
+                initial_work,
+                work_limit,
+            )
+            .map_err(PortableTextBuildError::EquivalenceProof)?
         else {
             return Err(PortableTextBuildError::NonFiniteLanguage);
         };
@@ -543,6 +557,7 @@ fn hir_equivalence(
 fn ordered_top_level_alternatives_equal_after_impossible_elision(
     text: &Hir,
     bytes: &Hir,
+    initial_work: u64,
     work_limit: u64,
 ) -> Result<Option<(usize, usize)>, BuildError> {
     let (HirKind::Alternation(text), HirKind::Alternation(bytes)) = (text.kind(), bytes.kind())
@@ -552,7 +567,7 @@ fn ordered_top_level_alternatives_equal_after_impossible_elision(
     if text.len() != bytes.len() {
         return Ok(None);
     }
-    let mut work = 0_u64;
+    let mut work = initial_work;
     let mut elided = 0_usize;
     let mut minimum_match_bytes = None;
     let mut tasks = Vec::new();
@@ -1049,13 +1064,23 @@ mod tests {
         let text = Hir::alternation(vec![text_dead.clone(), live.clone()]);
         let bytes = Hir::alternation(vec![bytes_dead.clone(), live]);
         assert_eq!(
-            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &bytes, u64::MAX,)
-                .unwrap(),
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text,
+                &bytes,
+                0,
+                u64::MAX,
+            )
+            .unwrap(),
             Some((1, 1))
         );
         assert_eq!(
-            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &text, u64::MAX,)
-                .unwrap(),
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text,
+                &text,
+                0,
+                u64::MAX,
+            )
+            .unwrap(),
             Some((1, 1))
         );
 
@@ -1065,6 +1090,7 @@ mod tests {
             ordered_top_level_alternatives_equal_after_impossible_elision(
                 &text,
                 &different_live,
+                0,
                 u64::MAX,
             )
             .unwrap(),
@@ -1075,6 +1101,7 @@ mod tests {
             ordered_top_level_alternatives_equal_after_impossible_elision(
                 &text,
                 &live_replacement,
+                0,
                 u64::MAX,
             )
             .unwrap(),
@@ -1084,6 +1111,7 @@ mod tests {
             ordered_top_level_alternatives_equal_after_impossible_elision(
                 &text_dead,
                 &bytes_dead,
+                0,
                 u64::MAX,
             )
             .unwrap(),
@@ -1096,6 +1124,7 @@ mod tests {
             ordered_top_level_alternatives_equal_after_impossible_elision(
                 &text_nullable,
                 &bytes_nullable,
+                0,
                 u64::MAX,
             )
             .unwrap(),
@@ -1113,8 +1142,13 @@ mod tests {
         let text = Hir::alternation(vec![text_live, Hir::literal("B".as_bytes())]);
         let bytes = Hir::alternation(vec![bytes_live, Hir::literal("B".as_bytes())]);
         assert_eq!(
-            ordered_top_level_alternatives_equal_after_impossible_elision(&text, &bytes, u64::MAX,)
-                .unwrap(),
+            ordered_top_level_alternatives_equal_after_impossible_elision(
+                &text,
+                &bytes,
+                0,
+                u64::MAX,
+            )
+            .unwrap(),
             None
         );
     }

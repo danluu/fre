@@ -5336,7 +5336,9 @@ impl AggregateBuilder {
                     limits.finite_literal.max_pattern_bytes,
                     finite_planner_work,
                     limits.max_finite_planner_work,
+                    false,
                 )
+                .into_incumbent_words()
                 .map_err(|error| match error {
                     BuildError::PlannerWorkLimit { needed, limit } => {
                         AggregateBuildError::FinitePlannerWorkLimit {
@@ -5365,11 +5367,11 @@ impl AggregateBuilder {
         } else {
             None
         };
-        if let Some(result) = &finite {
-            finite_planner_work = result.work;
+        if let Some((_, work)) = &finite {
+            finite_planner_work = *work;
         }
         let finite_words = finite
-            .and_then(|result| result.words)
+            .and_then(|(words, _)| words)
             .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
         if let Some(words) = finite_words {
             let capture_erasure_work =
