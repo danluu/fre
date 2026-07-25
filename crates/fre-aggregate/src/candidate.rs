@@ -225,7 +225,7 @@ pub(crate) fn reduce_attempt(
             actual_allocations: 0,
         });
     }
-    if plan.entries.len() < 2
+    if plan.entries.is_empty()
         || plan.entries.len() > MAX_ENTRIES
         || plan.buckets.len() != BUCKETS
         || plan.global_buckets.len() != BUCKETS

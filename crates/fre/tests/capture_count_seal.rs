@@ -944,7 +944,7 @@ fn retained_suffix_and_candidate_capture_routes_close_exact_and_one_below_work()
         (
             r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/",
             b"xcargo/registry/src/hash/name-1.2.3/ nope cargo/registry/src/x/bad/".as_slice(),
-            AggregateOperationPhysicalRoute::RequiredSuffixRows,
+            AggregateOperationPhysicalRoute::Candidate,
             3,
         ),
         (

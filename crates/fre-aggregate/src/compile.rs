@@ -1036,7 +1036,7 @@ impl CompiledRegex {
         let mut candidate = if ordered_root {
             None
         } else {
-            build_candidate_plan(hir, profile, budget)?
+            build_candidate_plan(hir, profile, capture_policy, budget)?
         };
         let candidate_bytes = candidate
             .as_ref()
@@ -1597,6 +1597,7 @@ fn map_url_build_error(error: &fre_kernels::UrlAggregateBuildError) -> Error {
 fn build_candidate_plan(
     hir: &Hir,
     profile: RustByteProfile,
+    capture_policy: CapturePolicy,
     budget: &mut CompileBudget,
 ) -> Result<Option<candidate::Plan>, Error> {
     // The executor is deliberately byte-only. Unicode-on plans retain their
@@ -1606,12 +1607,34 @@ fn build_candidate_plan(
     if profile.unicode {
         return Ok(None);
     }
-    let HirKind::Alternation(branches) = hir.kind() else {
-        return Ok(None);
+    let (branches, single_capture_selector) = match hir.kind() {
+        HirKind::Alternation(branches)
+            if (2..=candidate::MAX_ENTRIES).contains(&branches.len()) =>
+        {
+            (branches.as_slice(), false)
+        }
+        HirKind::Alternation(_) => return Ok(None),
+        _ if capture_policy == CapturePolicy::EraseForWholeMatch => {
+            (core::slice::from_ref(hir), true)
+        }
+        _ => return Ok(None),
     };
-    if !(2..=candidate::MAX_ENTRIES).contains(&branches.len()) {
-        return Ok(None);
-    }
+    let single_fixed = if single_capture_selector {
+        let fixed = leading_fixed_candidate(hir, budget)?;
+        // A one-owner scheduler is retained only when construction proved
+        // the complete fixed filter window. This keeps the generic selector
+        // from attaching an 8 KiB candidate table to every short or weakly
+        // prefixed regex while admitting long structural anchors.
+        if fixed
+            .as_ref()
+            .is_none_or(|candidate| candidate.check_len < candidate::MAX_FILTER_CHECKS)
+        {
+            return Ok(None);
+        }
+        fixed
+    } else {
+        None
+    };
 
     let draft_bytes = mul(
         branches.len(),
@@ -1661,7 +1684,12 @@ fn build_candidate_plan(
             };
             draft
         };
-        let mut draft = match leading_fixed_candidate(branch, budget)? {
+        let fixed = if single_capture_selector {
+            single_fixed
+        } else {
+            leading_fixed_candidate(branch, budget)?
+        };
+        let mut draft = match fixed {
             Some(fixed) if fixed.check_len >= 2 => choose_candidate(Some(fallback), fixed, budget)?
                 .ok_or(Error::InternalInvariant(
                     "candidate choice lost both proved alternatives",
@@ -4324,9 +4352,14 @@ impl<'a> Builder<'a> {
         entries: &mut [CandidateEntry],
     ) -> Result<usize, Error> {
         self.budget.charge(1)?;
+        if entries.len() == 1 && !matches!(hir.kind(), HirKind::Alternation(_)) {
+            let entry = self.compile_node(hir, continuation, 1)?;
+            entries[0].pc = entry;
+            return Ok(entry);
+        }
         let HirKind::Alternation(branches) = hir.kind() else {
             return Err(Error::InternalInvariant(
-                "candidate plan lost its direct-root alternation",
+                "candidate plan lost its direct-root shape",
             ));
         };
         if branches.len() != entries.len() || branches.is_empty() {
@@ -6131,6 +6164,40 @@ mod tests {
     }
 
     #[test]
+    fn single_capture_selector_requires_and_retains_a_full_fixed_prefix_filter() {
+        let hir = parse_bytes(r"cargo/registry/src/[^/]+/([a-z]+)-([0-9.]+)/");
+        let selector = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(selector.compile_accounting().candidate_entries, 1);
+        assert_eq!(
+            selector.uniform_capture_count_route(),
+            crate::OperationPhysicalRoute::Candidate
+        );
+
+        let ordinary = CompiledRegex::from_hir(
+            &parse_bytes(r"cargo/registry/src/[^/]+/[a-z]+-[0-9.]+/"),
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(ordinary.compile_accounting().candidate_entries, 0);
+
+        for pattern in [r"short([a-z]+)", r"[a-z]+suffix"] {
+            let weak = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &parse_bytes(pattern),
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(weak.compile_accounting().candidate_entries, 0, "{pattern}");
+        }
+    }
+
+    #[test]
     fn candidate_allocation_failures_commit_only_successful_storage() {
         let hir = parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z");
         let HirKind::Alternation(branches) = hir.kind() else {
@@ -6154,8 +6221,13 @@ mod tests {
                 }),
             );
             let fault = compiler_allocation_probe::fail_at(ordinal);
-            let error = build_candidate_plan(&hir, RustByteProfile::PINNED_1_12_4, &mut budget)
-                .unwrap_err();
+            let error = build_candidate_plan(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::Reject,
+                &mut budget,
+            )
+            .unwrap_err();
             drop(fault);
             assert!(matches!(error, Error::AllocationFailed { .. }));
             assert_eq!(budget.actual_allocations, ordinal);
@@ -6170,9 +6242,14 @@ mod tests {
                 prospective: 4,
             }),
         );
-        let plan = build_candidate_plan(&hir, RustByteProfile::PINNED_1_12_4, &mut budget)
-            .unwrap()
-            .unwrap();
+        let plan = build_candidate_plan(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            &mut budget,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(budget.actual_allocations, 4);
         assert_eq!(
             budget.current_construction_bytes,
