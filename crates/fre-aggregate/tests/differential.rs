@@ -4,9 +4,9 @@
 )]
 
 use fre_aggregate::{
-    CompileLimits, CompiledRegex, Error, OperationLimits, OperationPhysicalRoute,
-    OperationPrepublicationFallback, Resource, RowStorage, RustByteProfile, Span, Strategy,
-    Unsupported,
+    CompileLimits, CompiledRegex, Error, ExecutionAccounting, OperationLimits,
+    OperationPhysicalRoute, OperationPrepublicationFallback, Resource, RowStorage,
+    RustByteProfile, Span, Strategy, Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{
@@ -19,6 +19,7 @@ use regex_syntax::hir::{Hir, Look};
 const STRATEGIES: [Strategy; 2] = [Strategy::FullTable, Strategy::ReverseSequentialRows];
 type LimitMutation = fn(&mut CompileLimits);
 type OperationLimitMutation = fn(&mut OperationLimits) -> usize;
+type StorageGate = (Resource, usize, fn(&mut OperationLimits, usize));
 
 fn parse(pattern: &str) -> Hir {
     regex_syntax::ParserBuilder::new()
@@ -45,6 +46,22 @@ fn compile_unicode(pattern: &str) -> CompiledRegex {
         CompileLimits::default(),
     )
     .unwrap_or_else(|error| panic!("failed to compile Unicode {pattern:?}: {error}"))
+}
+
+fn compile_unicode_casefold(pattern: &str) -> CompiledRegex {
+    let hir = regex_syntax::ParserBuilder::new()
+        .unicode(true)
+        .utf8(false)
+        .case_insensitive(true)
+        .build()
+        .parse(pattern)
+        .unwrap_or_else(|error| panic!("failed to parse Unicode casefold {pattern:?}: {error}"));
+    CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("failed to compile Unicode casefold {pattern:?}: {error}"))
 }
 
 fn upstream_unicode(pattern: &str, haystack: &[u8]) -> Vec<Span> {
@@ -1063,19 +1080,7 @@ fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
 #[test]
 fn unicode_casefold_literal_domains_seed_semantic_scalar_verification() {
     let pattern = "Шерлок Холмс";
-    let hir = regex_syntax::ParserBuilder::new()
-        .unicode(true)
-        .utf8(false)
-        .case_insensitive(true)
-        .build()
-        .parse(pattern)
-        .unwrap();
-    let regex = CompiledRegex::from_hir(
-        &hir,
-        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-        CompileLimits::default(),
-    )
-    .unwrap();
+    let regex = compile_unicode_casefold(pattern);
     assert_eq!(
         (
             regex.compile_accounting().required_suffixes,
@@ -1263,21 +1268,462 @@ fn required_literal_census_composes_with_unicode_casefold_suffix_domains() {
 }
 
 #[test]
-fn unicode_casefold_suffix_domains_cover_width_changes_and_wide_refusal() {
-    for (pattern, haystack) in [("k", "Kk\u{212A}!".as_bytes()), ("σ", "Σσς!".as_bytes())] {
-        let hir = regex_syntax::ParserBuilder::new()
-            .unicode(true)
-            .utf8(false)
-            .case_insensitive(true)
-            .build()
-            .parse(pattern)
-            .unwrap();
-        let regex = CompiledRegex::from_hir(
-            &hir,
-            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
-            CompileLimits::default(),
+fn unicode_casefold_sparse_receipts_meter_exact_source_for_all_reducers() {
+    let regex = compile_unicode_casefold("k");
+    let haystack = b"K";
+
+    let count = regex
+        .admit_count_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
         )
         .unwrap();
+    assert_eq!(count.admitted.value(), 1);
+    assert_eq!(
+        count.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(count.receipt.actual.random_access_bytes_read, 4);
+    assert_eq!(count.receipt.actual, count.admitted.accounting());
+    assert!(count.receipt.authenticates_success());
+    assert!(
+        count
+            .receipt
+            .prospective
+            .is_some_and(|prospective| prospective.contains(count.receipt.actual))
+    );
+
+    let spans = regex
+        .admit_spans_with_receipt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(spans.admitted.as_slice(), &[Span { start: 0, end: 1 }]);
+    assert_eq!(
+        spans.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(spans.receipt.actual.random_access_bytes_read, 5);
+    assert_eq!(spans.receipt.actual, spans.admitted.accounting());
+    assert!(spans.receipt.authenticates_success());
+    assert!(
+        spans
+            .receipt
+            .prospective
+            .is_some_and(|prospective| prospective.contains(spans.receipt.actual))
+    );
+
+    let sum = regex
+        .admit_span_sum_with_receipt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(sum.admitted.value(), 1);
+    assert_eq!(
+        sum.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(sum.receipt.actual.random_access_bytes_read, 4);
+    assert_eq!(sum.receipt.actual, sum.admitted.accounting());
+    assert!(sum.receipt.authenticates_success());
+    assert!(
+        sum.receipt
+            .prospective
+            .is_some_and(|prospective| prospective.contains(sum.receipt.actual))
+    );
+}
+
+#[test]
+fn required_suffix_receipts_meter_multibyte_scalars_and_assertions_exactly() {
+    // Each row exercises a different UTF-8 width. The expected A values are
+    // the deterministic sum of short-circuit seed comparisons, reverse input
+    // loads, cached scalar decodes, and the selected replay decode.
+    for (pattern, haystack, expected_source_bytes) in [
+        ("σ", "Σ".as_bytes(), 10),
+        ("k", "\u{212A}".as_bytes(), 22),
+        ("\u{10428}", "\u{10400}".as_bytes(), 22),
+    ] {
+        let regex = compile_unicode_casefold(pattern);
+        let result = regex
+            .admit_count_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(result.admitted.value(), 1, "{pattern:?}");
+        assert_eq!(
+            result.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows),
+            "{pattern:?}"
+        );
+        assert_eq!(
+            result.receipt.actual.random_access_bytes_read, expected_source_bytes,
+            "{pattern:?}"
+        );
+        assert!(result.receipt.actual.transition_checks > 0, "{pattern:?}");
+        assert!(result.receipt.authenticates_success(), "{pattern:?}");
+    }
+
+    let asserted = compile(r"\ba");
+    let mut observed = None;
+    let result = asserted
+        .admit_count_observed_with_required_suffix_receipt_observer(
+            b"a",
+            0..1,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            usize::MAX,
+            |prospective| {
+                observed = Some(prospective);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(result.admitted.value(), 1);
+    assert_eq!(result.receipt.prospective, observed);
+    assert_eq!(
+        result.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(result.receipt.actual.random_access_bytes_read, 6);
+    assert!(result.receipt.actual.assertion_checks > 0);
+    assert!(result.receipt.authenticates_success());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the four storage gates retain their complete route, P, A, and closure assertions"
+)]
+fn automatic_unicode_suffix_receipt_publishes_before_all_storage_gates() {
+    // An unrestricted start keeps the observed selector away from the
+    // start-domain accelerator, while the case-folded terminal class still
+    // selects automatic sparse suffix verification.
+    let regex = compile_unicode_casefold(".*k");
+    let haystack = b"K";
+    let baseline = regex
+        .admit_count_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(baseline.admitted.value(), 1);
+    assert_eq!(
+        baseline.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    let prospective = baseline
+        .receipt
+        .prospective
+        .expect("automatic suffix receipt must publish P");
+    assert!(prospective.contains(baseline.receipt.actual));
+
+    let exact = OperationLimits {
+        max_random_access_bytes: prospective.random_access_bytes,
+        max_scratch_bytes: prospective.scratch_bytes,
+        max_log_bytes: prospective.log_bytes,
+        max_sequential_bytes: prospective.sequential_bytes,
+        ..OperationLimits::default()
+    };
+    for (name, required) in [
+        ("random access", prospective.random_access_bytes),
+        ("scratch", prospective.scratch_bytes),
+        ("log", prospective.log_bytes),
+        ("sequential", prospective.sequential_bytes),
+    ] {
+        assert!(required > 0, "{name} P must be nonzero");
+    }
+    let exact_success = regex
+        .admit_count_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            exact,
+        )
+        .unwrap();
+    assert_eq!(exact_success.admitted.value(), 1);
+    assert_eq!(exact_success.receipt.prospective, Some(prospective));
+    assert_eq!(
+        exact_success.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(
+        exact_success.receipt.actual.random_access_bytes_read,
+        baseline.receipt.actual.random_access_bytes_read
+    );
+    assert!(exact_success.receipt.authenticates_success());
+
+    let gates: [StorageGate; 4] = [
+        (
+            Resource::RandomAccessBytes,
+            prospective.random_access_bytes,
+            |limits, value| limits.max_random_access_bytes = value - 1,
+        ),
+        (
+            Resource::ScratchBytes,
+            prospective.scratch_bytes,
+            |limits, value| limits.max_scratch_bytes = value - 1,
+        ),
+        (
+            Resource::LogBytes,
+            prospective.log_bytes,
+            |limits, value| limits.max_log_bytes = value - 1,
+        ),
+        (
+            Resource::SequentialBytes,
+            prospective.sequential_bytes,
+            |limits, value| limits.max_sequential_bytes = value - 1,
+        ),
+    ];
+    for (resource, required, lower) in gates {
+        let mut limits = exact;
+        lower(&mut limits, required);
+        let failure = regex
+            .admit_count_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure.source,
+            Error::ResourceLimit {
+                resource,
+                required,
+                limit: required - 1,
+            }
+        );
+        assert_eq!(
+            failure.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RequiredSuffixRows)
+        );
+        assert_eq!(failure.receipt.prospective, Some(prospective));
+        assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(failure.receipt.actual_allocations, 0);
+        assert!(failure.receipt.identity.authenticates_limits(limits));
+        assert!(failure.receipt.authenticates_canonical());
+        assert!(failure.closes());
+    }
+}
+
+#[test]
+fn automatic_unicode_suffix_observed_work_is_exact_and_closes_one_below() {
+    let regex = compile_unicode_casefold(".*k");
+    let haystack = b"K";
+    let baseline = regex
+        .count_value_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(baseline.value, 1);
+    assert_eq!(
+        baseline.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert!(baseline.receipt.actual.random_access_bytes_read > 0);
+    let exact_work = baseline.receipt.actual.work;
+    assert!(exact_work > 0);
+
+    let exact_limits = OperationLimits {
+        max_work: exact_work,
+        ..OperationLimits::default()
+    };
+    let exact = regex
+        .count_value_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            exact_limits,
+        )
+        .unwrap();
+    assert_eq!(exact.value, 1);
+    assert_eq!(
+        exact.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(exact.receipt.actual.work, exact_work);
+    assert_eq!(
+        exact.receipt.actual.random_access_bytes_read,
+        baseline.receipt.actual.random_access_bytes_read
+    );
+    assert_eq!(
+        exact
+            .receipt
+            .prospective
+            .expect("observed exact-work success must publish P")
+            .work_bound,
+        exact_work
+    );
+    assert!(exact.receipt.authenticates_success());
+
+    let one_below = OperationLimits {
+        max_work: exact_work - 1,
+        ..OperationLimits::default()
+    };
+    let failure = regex
+        .count_value_attempt(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            one_below,
+        )
+        .unwrap_err();
+    assert_eq!(
+        failure.source,
+        Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required: exact_work,
+            limit: exact_work - 1,
+        }
+    );
+    assert_eq!(
+        failure.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    let refusal_prospective = failure
+        .receipt
+        .prospective
+        .expect("observed one-below refusal must retain P");
+    assert_eq!(refusal_prospective.work_bound, exact_work - 1);
+    assert!(refusal_prospective.contains(failure.receipt.actual));
+    assert!(failure.receipt.identity.authenticates_limits(one_below));
+    assert!(failure.receipt.authenticates_canonical());
+    assert!(failure.closes());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the shared suffix-path test keeps baseline, exact, and one-below receipts together"
+)]
+fn ordinary_required_suffix_receipt_uses_the_same_exact_source_ledger() {
+    let regex = compile("ab");
+    let haystack = b"ab";
+    assert_eq!(
+        (
+            regex.compile_accounting().required_suffixes,
+            regex.compile_accounting().required_suffix_bytes,
+        ),
+        (1, 2)
+    );
+
+    let mut observed = None;
+    let baseline = regex
+        .admit_count_observed_with_required_suffix_receipt_observer(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+            usize::MAX,
+            |prospective| {
+                observed = Some(prospective);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(baseline.admitted.value(), 1);
+    assert_eq!(
+        baseline.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(baseline.receipt.prospective, observed);
+    assert_eq!(baseline.receipt.actual.random_access_bytes_read, 6);
+    assert_eq!(baseline.receipt.actual, baseline.admitted.accounting());
+    assert!(baseline.receipt.authenticates_success());
+    assert!(
+        baseline
+            .receipt
+            .prospective
+            .is_some_and(|prospective| prospective.contains(baseline.receipt.actual))
+    );
+
+    let exact_work = baseline.receipt.actual.work;
+    let exact_limits = OperationLimits {
+        max_work: exact_work,
+        ..OperationLimits::default()
+    };
+    let mut exact_prospective = None;
+    let exact = regex
+        .admit_count_observed_with_required_suffix_receipt_observer(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            exact_limits,
+            usize::MAX,
+            |prospective| {
+                exact_prospective = Some(prospective);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(exact.admitted.value(), 1);
+    assert_eq!(exact.receipt.prospective, exact_prospective);
+    assert_eq!(exact.receipt.actual.work, exact_work);
+    assert_eq!(exact.receipt.actual.random_access_bytes_read, 6);
+    assert!(exact.receipt.authenticates_success());
+
+    let one_below = OperationLimits {
+        max_work: exact_work - 1,
+        ..OperationLimits::default()
+    };
+    let mut refusal_prospective = None;
+    let failure = regex
+        .admit_count_observed_with_required_suffix_receipt_observer(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            one_below,
+            usize::MAX,
+            |prospective| {
+                refusal_prospective = Some(prospective);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        failure.source,
+        Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required: exact_work,
+            limit: exact_work - 1,
+        }
+    );
+    assert_eq!(
+        failure.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(failure.receipt.prospective, refusal_prospective);
+    assert!(
+        failure
+            .receipt
+            .prospective
+            .is_some_and(|prospective| prospective.contains(failure.receipt.actual))
+    );
+    assert!(failure.receipt.identity.authenticates_limits(one_below));
+    assert!(failure.receipt.authenticates_canonical());
+    assert!(failure.closes());
+}
+
+#[test]
+fn unicode_casefold_suffix_domains_cover_width_changes_and_wide_refusal() {
+    for (pattern, haystack) in [("k", "Kk\u{212A}!".as_bytes()), ("σ", "Σσς!".as_bytes())] {
+        let regex = compile_unicode_casefold(pattern);
         let expected = regex::bytes::RegexBuilder::new(pattern)
             .unicode(true)
             .case_insensitive(true)
@@ -1304,6 +1750,20 @@ fn unicode_casefold_suffix_domains_cover_width_changes_and_wide_refusal() {
     let wide = compile_unicode("[a-z]");
     assert_eq!(wide.compile_accounting().required_suffixes, 0);
     assert_eq!(wide.compile_accounting().required_suffix_bytes, 0);
+    let wide_fallback = wide
+        .admit_count_attempt(
+            b"a",
+            0..1,
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(wide_fallback.admitted.value(), 1);
+    assert_eq!(
+        wide_fallback.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::DenseRows)
+    );
+    assert!(wide_fallback.receipt.authenticates_success());
 }
 
 #[test]

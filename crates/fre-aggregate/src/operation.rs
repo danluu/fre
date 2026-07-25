@@ -2328,6 +2328,17 @@ impl CompiledRegex {
         let prefer_unicode_suffix_domains = forced_generic_count_route.is_none()
             && strategy == Strategy::ReverseSequentialRows
             && self.required_suffixes.prefers_sparse_verification();
+        // Automatic Unicode suffix verification owns a deterministic sparse
+        // route. Derive its construction envelope from intrinsic engine
+        // limits so a caller storage policy cannot reject before route and P
+        // publish. Sparse observed work is different: its exact construction
+        // ledger is deliberately capped by the caller's residual work quota,
+        // so preserve that one selection input instead of publishing the
+        // intrinsic `usize::MAX` ceiling as P.
+        let unicode_suffix_limits = OperationLimits {
+            max_work: selection_limits.max_work,
+            ..engine_limits
+        };
         let dense = || {
             Requirements::new::<OBSERVED_WORK>(
                 &self.program,
@@ -2394,7 +2405,7 @@ impl CompiledRegex {
                     boundaries,
                     strategy,
                     passes,
-                    selection_limits,
+                    unicode_suffix_limits,
                     seed,
                 )?,
                 Some(seed),
@@ -5385,6 +5396,7 @@ impl Engine {
                         requirements,
                         seed,
                         limits,
+                        track_source,
                         accounting,
                         actual_allocations,
                     )
@@ -5537,6 +5549,7 @@ impl Engine {
                             &mut reader,
                             accounting,
                             admitted_work_bound,
+                            track_source,
                         )
                         .map(Some)
                     },
@@ -7060,6 +7073,7 @@ impl RowStore {
         requirements: Requirements,
         seed: &RequiredSuffixes,
         limits: OperationLimits,
+        track_source: bool,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
@@ -7131,6 +7145,7 @@ impl RowStore {
                 storage,
                 accounting,
                 admitted_work_bound,
+                track_source,
             )?
         };
         accounting.sequential_bytes_written = add(
@@ -7141,6 +7156,7 @@ impl RowStore {
         core::mem::swap(&mut row, &mut next_row);
 
         for (position, input) in haystack.iter().copied().enumerate().rev() {
+            record_source_accesses(accounting, 1, track_source)?;
             let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
             let record = store
                 .get_mut(write_offset..end)
@@ -7161,6 +7177,7 @@ impl RowStore {
                 storage,
                 accounting,
                 admitted_work_bound,
+                track_source,
             )?;
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
@@ -7208,9 +7225,16 @@ impl RowStore {
         storage: RowStorage,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        track_source: bool,
     ) -> Result<bool, Error> {
-        let seeded =
-            sparse_seed_matches(seed, haystack, position, accounting, admitted_work_bound)?;
+        let seeded = sparse_seed_matches(
+            seed,
+            haystack,
+            position,
+            accounting,
+            admitted_work_bound,
+            track_source,
+        )?;
         // A required suffix can only make Match live at a suffix-ending
         // boundary. If neither that seed nor the successor row is live, this
         // entire row is provably zero. The row buffer may retain old values,
@@ -7220,7 +7244,13 @@ impl RowStore {
         }
         let scalar = if next_any && program.contains_scalar_transition() {
             try_charge_transition(accounting, admitted_work_bound)?;
-            haystack.get(position..).and_then(decode_first_scalar)
+            let source = haystack.get(position..).unwrap_or_default();
+            record_source_accesses(
+                accounting,
+                cached_scalar_source_accesses(source),
+                track_source,
+            )?;
+            decode_first_scalar(source)
         } else {
             None
         };
@@ -7283,7 +7313,13 @@ impl RowStore {
                     }
                     Inst::Assert { assertion, next } => {
                         try_charge_assertion(accounting, admitted_work_bound)?;
-                        if assertions.is_match(*assertion, position)? {
+                        if assertion_matches(
+                            assertions,
+                            *assertion,
+                            position,
+                            accounting,
+                            track_source,
+                        )? {
                             row[*next]
                         } else {
                             0
@@ -7727,6 +7763,10 @@ impl RowStore {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "sparse replay keeps its source meter and admitted work ledger explicit"
+    )]
     fn replay_sparse(
         program: &Program,
         haystack: &[u8],
@@ -7735,6 +7775,7 @@ impl RowStore {
         reader: &mut RowReader<'_>,
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
+        track_source: bool,
     ) -> Result<usize, Error> {
         let mut pc = program.entry;
         let mut position = start;
@@ -7751,7 +7792,9 @@ impl RowStore {
                 }
                 Inst::Match => return Ok(position),
                 Inst::Consume { bytes, next } => {
-                    if position >= haystack.len() || !bytes.contains(haystack[position]) {
+                    let input = haystack.get(position).copied();
+                    record_source_accesses(accounting, usize::from(input.is_some()), track_source)?;
+                    if !input.is_some_and(|byte| bytes.contains(byte)) {
                         return Err(Error::InternalInvariant(
                             "sparse row log selected failing byte path",
                         ));
@@ -7763,12 +7806,15 @@ impl RowStore {
                     scalars,
                     next_by_width,
                 } => {
-                    let scalar = haystack
-                        .get(position..)
-                        .and_then(decode_first_scalar)
-                        .ok_or(Error::InternalInvariant(
-                            "sparse row log selected invalid Unicode scalar path",
-                        ))?;
+                    let source = haystack.get(position..).unwrap_or_default();
+                    record_source_accesses(
+                        accounting,
+                        cached_scalar_source_accesses(source),
+                        track_source,
+                    )?;
+                    let scalar = decode_first_scalar(source).ok_or(Error::InternalInvariant(
+                        "sparse row log selected invalid Unicode scalar path",
+                    ))?;
                     let matches = scalars.contains_with(scalar, || {
                         try_charge_replay(accounting, admitted_work_bound)
                     })?;
@@ -7793,7 +7839,13 @@ impl RowStore {
                 }
                 Inst::Assert { assertion, next } => {
                     try_charge_assertion(accounting, admitted_work_bound)?;
-                    if !assertions.is_match(*assertion, position)? {
+                    if !assertion_matches(
+                        assertions,
+                        *assertion,
+                        position,
+                        accounting,
+                        track_source,
+                    )? {
                         return Err(Error::InternalInvariant(
                             "sparse row log selected failing assertion",
                         ));
@@ -8103,6 +8155,7 @@ fn sparse_seed_matches(
     end: usize,
     accounting: &mut ExecutionAccounting,
     admitted_work_bound: usize,
+    track_source: bool,
 ) -> Result<bool, Error> {
     for suffix in seed.iter() {
         try_charge_transition_amount(
@@ -8110,11 +8163,24 @@ fn sparse_seed_matches(
             admitted_work_bound,
             add(suffix.len(), 1, Resource::ExecutionWork)?,
         )?;
-        let start = end.checked_sub(suffix.len());
-        if start
-            .and_then(|start| haystack.get(start..end))
-            .is_some_and(|got| got == suffix)
-        {
+        let Some(start) = end.checked_sub(suffix.len()) else {
+            continue;
+        };
+        let Some(got) = haystack.get(start..end) else {
+            continue;
+        };
+        // Keep the comparison scalar and short-circuiting so receipt A records
+        // the exact logical input bytes inspected, independent of a platform
+        // slice-equality implementation's wider loads.
+        let mut matches = true;
+        for (&actual, &expected) in got.iter().zip(suffix) {
+            record_source_accesses(accounting, 1, track_source)?;
+            if actual != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
             return Ok(true);
         }
     }
