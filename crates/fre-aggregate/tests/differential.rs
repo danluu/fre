@@ -4,8 +4,9 @@
 )]
 
 use fre_aggregate::{
-    CompileLimits, CompiledRegex, Error, OperationLimits, OperationPhysicalRoute, Resource,
-    RowStorage, RustByteProfile, Span, Strategy, Unsupported,
+    CompileLimits, CompiledRegex, Error, OperationLimits, OperationPhysicalRoute,
+    OperationPrepublicationFallback, Resource, RowStorage, RustByteProfile, Span, Strategy,
+    Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{
@@ -1161,6 +1162,104 @@ fn unicode_casefold_literal_domains_seed_semantic_scalar_verification() {
             limit,
         }) if required == limit + 1
     ));
+}
+
+#[test]
+fn required_literal_census_composes_with_unicode_casefold_suffix_domains() {
+    let pattern = "QШерлок Холмс";
+    let hir = regex_syntax::ParserBuilder::new()
+        .unicode(true)
+        .utf8(false)
+        .case_insensitive(true)
+        .build()
+        .parse(pattern)
+        .unwrap();
+    let regex = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    // The ASCII Q/q domain and the intervening ASCII space remain two
+    // independent theorems in canonical source order.
+    assert_eq!(regex.compile_accounting().required_literal_sets, 2);
+    assert_eq!(
+        (
+            regex.compile_accounting().required_suffixes,
+            regex.compile_accounting().required_suffix_bytes,
+        ),
+        (3, 7)
+    );
+
+    let missing_required_literal = "Шерлок Холмс".as_bytes();
+    let missing = regex
+        .admit_count_attempt(
+            missing_required_literal,
+            0..missing_required_literal.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(missing.admitted.value(), 0);
+    assert_eq!(
+        missing.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(
+        missing.receipt.identity.prepublication_fallback,
+        OperationPrepublicationFallback::None
+    );
+    assert_eq!(
+        missing.receipt.actual.required_literal_source_bytes,
+        missing_required_literal.len()
+    );
+    assert_eq!(
+        missing.receipt.actual.required_literal_comparisons,
+        missing_required_literal.len() * 2
+    );
+    assert_eq!(missing.receipt.actual.state_evaluations, 0);
+    assert_eq!(missing.receipt.actual_allocations, 0);
+    assert_eq!(missing.receipt.actual.random_access_bytes_read, 0);
+    assert_eq!(missing.receipt.actual.log_bytes, 0);
+    assert!(missing.receipt.authenticates_success());
+
+    let matching = "qшерлок холмс".as_bytes();
+    let expected = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(true)
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+        .find_iter(matching)
+        .count();
+    let hit = regex
+        .admit_count_attempt(
+            matching,
+            0..matching.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(hit.admitted.value(), expected);
+    assert_eq!(expected, 1);
+    assert_eq!(
+        hit.receipt.identity.physical_route,
+        Some(OperationPhysicalRoute::RequiredSuffixRows)
+    );
+    assert_eq!(
+        hit.receipt.identity.prepublication_fallback,
+        OperationPrepublicationFallback::None
+    );
+    let required_prefix = matching.iter().position(|&byte| byte == b' ').unwrap() + 1;
+    assert_eq!(
+        hit.receipt.actual.required_literal_source_bytes,
+        required_prefix
+    );
+    assert_eq!(
+        hit.receipt.actual.required_literal_comparisons,
+        required_prefix * 2
+    );
+    assert!(hit.receipt.actual.state_evaluations > 0);
+    assert!(hit.receipt.authenticates_success());
 }
 
 #[test]

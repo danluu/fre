@@ -6544,6 +6544,7 @@ struct ContinuationProgramShape {
     predecessor_edges: usize,
     terminal_frontier_prefix_bytes: usize,
     terminal_frontier_bytes: usize,
+    required_literal_sets: usize,
     execution_state_work: usize,
     has_scalar_transitions: bool,
     max_scalar_search_checks: usize,
@@ -6561,6 +6562,7 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
             predecessor_edges: accounting.predecessor_edges,
             terminal_frontier_prefix_bytes: accounting.terminal_frontier_prefix_bytes,
             terminal_frontier_bytes: accounting.terminal_frontier_bytes,
+            required_literal_sets: accounting.required_literal_sets,
             execution_state_work: accounting.execution_state_work,
             has_scalar_transitions: accounting.has_scalar_transitions,
             max_scalar_search_checks: accounting.max_scalar_search_checks,
@@ -6581,6 +6583,7 @@ fn inactive_continuation_shape() -> ContinuationProgramShape {
         predecessor_edges: 0,
         terminal_frontier_prefix_bytes: 0,
         terminal_frontier_bytes: 0,
+        required_literal_sets: 0,
         // One Match state is evaluated once and has no outgoing transition.
         execution_state_work: 1,
         has_scalar_transitions: false,
@@ -6607,6 +6610,7 @@ fn conservative_continuation_shape(
         predecessor_edges,
         terminal_frontier_prefix_bytes: 0,
         terminal_frontier_bytes: 0,
+        required_literal_sets: 0,
         execution_state_work,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
@@ -6857,7 +6861,7 @@ fn cached_frontier_limits(
 fn composed_continuation_storage_limits(
     program_states: usize,
     boundaries: usize,
-    prevalidation: usize,
+    source_prefix: usize,
     available_work: usize,
     has_terminal_frontier: bool,
     row: ContinuationStorageLimits,
@@ -6871,8 +6875,8 @@ fn composed_continuation_storage_limits(
     let cached = cached_frontier_limits(program_states, boundaries, 1)?;
     let cached_sequential = checked_aggregate_add(
         cached.sequential,
-        prevalidation,
-        "cached-frontier sequential bytes including UTF-8 prevalidation",
+        source_prefix,
+        "cached-frontier sequential bytes including pre-engine source prefixes",
     )?;
     Ok(ContinuationStorageLimits {
         random: row.random.max(cached.random),
@@ -6917,14 +6921,34 @@ fn continuation_operation_limits(
     } else {
         0
     };
+    let required_literal_source = if shape.required_literal_sets == 0 {
+        0
+    } else {
+        haystack_len
+    };
+    let required_literal_comparisons = checked_aggregate_mul(
+        required_literal_source,
+        shape.required_literal_sets,
+        "required-literal comparisons",
+    )?;
+    let required_literal_work = checked_aggregate_add(
+        required_literal_source,
+        required_literal_comparisons,
+        "required-literal source and comparison work",
+    )?;
+    let source_prefix = checked_aggregate_add(
+        prevalidation,
+        required_literal_source,
+        "sequential UTF-8 and required-literal prefixes",
+    )?;
     let sequential_upper = checked_aggregate_add(
         checked_aggregate_add(
             row_sequential_upper,
             route_source,
             "row plus frontier sequential bytes",
         )?,
-        prevalidation,
-        "sequential bytes including UTF-8 prevalidation",
+        source_prefix,
+        "sequential bytes including pre-engine source prefixes",
     )?;
     let row_peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
     let row_storage = ContinuationStorageLimits {
@@ -6957,16 +6981,21 @@ fn continuation_operation_limits(
         replay_work,
         "operation work",
     )?;
+    let prefix_work = checked_aggregate_add(
+        prevalidation,
+        required_literal_work,
+        "UTF-8 and required-literal prefix work",
+    )?;
     let work_upper = checked_aggregate_add(
         engine_work_upper,
-        prevalidation,
-        "operation work including UTF-8 prevalidation",
+        prefix_work,
+        "operation work with prefixes",
     )?;
     let available_work = work_upper.min(limits.fre_aggregate_operation_work);
     let storage = composed_continuation_storage_limits(
         program_states,
         boundaries,
-        prevalidation,
+        source_prefix,
         available_work,
         terminal_frontier.is_some(),
         row_storage,
@@ -7059,10 +7088,30 @@ fn continuation_spans_operation_limits(
     } else {
         0
     };
+    let required_literal_source = if shape.required_literal_sets == 0 {
+        0
+    } else {
+        haystack_len
+    };
+    let required_literal_comparisons = checked_aggregate_mul(
+        required_literal_source,
+        shape.required_literal_sets,
+        "span required-literal comparisons",
+    )?;
+    let required_literal_work = checked_aggregate_add(
+        required_literal_source,
+        required_literal_comparisons,
+        "span required-literal source and comparison work",
+    )?;
+    let source_prefix = checked_aggregate_add(
+        prevalidation,
+        required_literal_source,
+        "span sequential UTF-8 and required-literal prefixes",
+    )?;
     let sequential_upper = checked_aggregate_add(
         row_sequential_upper,
-        prevalidation,
-        "span sequential bytes including UTF-8 prevalidation",
+        source_prefix,
+        "span sequential bytes including pre-engine source prefixes",
     )?;
 
     let per_boundary_build = checked_aggregate_add(
@@ -7085,15 +7134,18 @@ fn continuation_spans_operation_limits(
         PASSES,
         "span replay work",
     )?;
-    let work_upper = checked_aggregate_add(
-        checked_aggregate_add(
-            checked_aggregate_add(build_work, scan_work, "span build plus scan work")?,
-            replay_work,
-            "span operation work",
-        )?,
-        prevalidation,
-        "span work including UTF-8 prevalidation",
+    let engine_work_upper = checked_aggregate_add(
+        checked_aggregate_add(build_work, scan_work, "span build plus scan work")?,
+        replay_work,
+        "span operation work",
     )?;
+    let prefix_work = checked_aggregate_add(
+        prevalidation,
+        required_literal_work,
+        "span UTF-8 and required-literal prefix work",
+    )?;
+    let work_upper =
+        checked_aggregate_add(engine_work_upper, prefix_work, "span work with prefixes")?;
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
@@ -19939,7 +19991,7 @@ mod tests {
 
         let selector_starved = RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 542_672,
+            fre_capture_selector_program_bytes: 542_680,
             ..RunLimits::default()
         };
         let refusal = current_fre(
@@ -19952,7 +20004,7 @@ mod tests {
         );
         assert!(
             matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 542673, limit is 542672")),
+                if reason.contains("ProgramBytes requires 542681, limit is 542680")),
             "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }
@@ -20214,6 +20266,33 @@ mod tests {
         .unwrap();
         assert_eq!(unicode.max_sequential_bytes, 32);
 
+        let required_literal_shape = ContinuationProgramShape {
+            required_literal_sets: 2,
+            ..conservative_continuation_shape(5).unwrap()
+        };
+        let required_literal =
+            continuation_operation_limits(10, required_literal_shape, &run).unwrap();
+        // The pre-engine proof reads the source once and compares every byte
+        // against both retained sets: N sequential units and N * (sets + 1)
+        // work units, independently of the incumbent continuation envelope.
+        assert_eq!(required_literal.max_sequential_bytes, 32);
+        assert_eq!(required_literal.max_work, 459);
+
+        let span_baseline = continuation_spans_operation_limits(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            1,
+            &run,
+        )
+        .unwrap();
+        let span_required =
+            continuation_spans_operation_limits(10, required_literal_shape, 1, &run).unwrap();
+        assert_eq!(
+            span_required.max_sequential_bytes,
+            span_baseline.max_sequential_bytes + 10
+        );
+        assert_eq!(span_required.max_work, span_baseline.max_work + 30);
+
         let one_below = continuation_operation_limits(
             10,
             conservative_continuation_shape(5).unwrap(),
@@ -20358,6 +20437,7 @@ mod tests {
             predecessor_edges: 0,
             terminal_frontier_prefix_bytes: 0,
             terminal_frontier_bytes: 0,
+            required_literal_sets: 0,
             execution_state_work: 27,
             has_scalar_transitions: false,
             max_scalar_search_checks: 0,
@@ -20540,6 +20620,7 @@ mod tests {
             predecessor_edges: 4,
             terminal_frontier_prefix_bytes: 0,
             terminal_frontier_bytes: 0,
+            required_literal_sets: 0,
             execution_state_work: 11,
             has_scalar_transitions: true,
             max_scalar_search_checks: 10,
