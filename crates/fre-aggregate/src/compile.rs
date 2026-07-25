@@ -1890,6 +1890,7 @@ fn build_candidate_plan(
     let shared_fixed_work = add(entries.len(), buckets.len(), Resource::CompileWork)?;
     budget.charge(shared_fixed_work)?;
     let shared_fixed = candidate::shared_fixed_anchors(&entries, &buckets)?;
+    let shape = candidate::packed_shape(max_offset, shared_fixed)?;
     budget.release_construction_bytes(draft_bytes)?;
     budget.accounting.candidate_entries = entries.len();
     budget.accounting.candidate_bytes = retained_bytes;
@@ -1897,8 +1898,7 @@ fn build_candidate_plan(
         entries,
         buckets,
         global_buckets,
-        max_offset,
-        shared_fixed,
+        shape,
     }))
 }
 
@@ -5496,8 +5496,8 @@ fn bind_candidate_identity(
     second.bytes(domain);
     first.bytes(&program.0);
     second.bytes(&program.0);
-    hash_usize(&mut first, plan.max_offset);
-    hash_usize(&mut second, plan.max_offset);
+    hash_usize(&mut first, plan.max_offset());
+    hash_usize(&mut second, plan.max_offset());
     for entry in &*plan.entries {
         hash_usize(&mut first, entry.pc);
         hash_usize(&mut second, entry.pc);

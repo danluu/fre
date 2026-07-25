@@ -3135,10 +3135,10 @@ fn candidate_prospective(
     kind: OperationKind,
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
-    let schedule = if plan.shared_fixed.is_some() {
+    let schedule = if plan.has_shared_fixed() {
         1
     } else {
-        add(plan.max_offset, 1, Resource::ScratchBytes)?
+        add(plan.max_offset(), 1, Resource::ScratchBytes)?
     };
     let states = program.insts.len();
     let stack = add(

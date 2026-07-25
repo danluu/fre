@@ -19,6 +19,11 @@ pub(crate) const MAX_ENTRIES: usize = 128;
 pub(crate) const MAX_OFFSET: usize = 4_096;
 const BUCKETS: usize = 256;
 pub(crate) const MAX_FILTER_CHECKS: usize = 7;
+const SHAPE_OFFSET_RADIX: usize = 8_192;
+#[cfg(target_pointer_width = "64")]
+const SHAPE_LENGTH_RADIX: usize = SHAPE_OFFSET_RADIX;
+#[cfg(target_pointer_width = "64")]
+const SHAPE_BYTE_RADICES: [usize; 3] = [32_768, 8_388_608, 2_147_483_648];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FilterCheck {
@@ -61,11 +66,68 @@ pub(crate) struct Plan {
     pub(crate) entries: ExactVec<Entry>,
     pub(crate) buckets: ExactVec<u128>,
     pub(crate) global_buckets: ExactVec<u128>,
-    pub(crate) max_offset: usize,
-    pub(crate) shared_fixed: Option<SharedFixedAnchors>,
+    pub(crate) shape: usize,
 }
 
 impl Plan {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "construction proves the packed shape is a sum of disjoint fields below the nonzero offset radix"
+    )]
+    pub(crate) const fn max_offset(&self) -> usize {
+        self.shape % SHAPE_OFFSET_RADIX
+    }
+
+    pub(crate) const fn has_shared_fixed(&self) -> bool {
+        self.shape >= SHAPE_OFFSET_RADIX
+    }
+
+    fn shared_fixed(&self) -> Result<Option<SharedFixedAnchors>, Error> {
+        if !self.has_shared_fixed() {
+            return Ok(None);
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            return Err(Error::InternalInvariant(
+                "shared fixed candidate flag is not supported on this pointer width",
+            ));
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            let len = self
+                .shape
+                .checked_div(SHAPE_LENGTH_RADIX)
+                .and_then(|value| value.checked_rem(4))
+                .ok_or(Error::InternalInvariant(
+                    "shared fixed candidate length field is invalid",
+                ))?;
+            if !(1..=3).contains(&len) {
+                return Err(Error::InternalInvariant(
+                    "shared fixed candidate length outside memchr support",
+                ));
+            }
+            let mut bytes = [0_u8; 3];
+            for (byte, radix) in bytes.iter_mut().zip(SHAPE_BYTE_RADICES) {
+                let value = self
+                    .shape
+                    .checked_div(radix)
+                    .and_then(|value| value.checked_rem(256))
+                    .ok_or(Error::InternalInvariant(
+                        "shared fixed candidate byte field is invalid",
+                    ))?;
+                *byte = u8::try_from(value).map_err(|_| {
+                    Error::InternalInvariant("shared fixed candidate byte exceeds u8")
+                })?;
+            }
+            Ok(Some(SharedFixedAnchors {
+                bytes,
+                len,
+                offset: self.max_offset(),
+                owners: complete_owner_mask(self.entries.len())?,
+            }))
+        }
+    }
+
     pub(crate) fn retained_bytes(&self) -> Result<usize, Error> {
         let buckets = add(
             self.buckets.len(),
@@ -99,7 +161,7 @@ pub(crate) fn has_complete_shared_fixed_filter(plan: &Plan) -> bool {
     };
     entry.min_offset == entry.max_offset
         && entry.check_len == MAX_FILTER_CHECKS
-        && plan.shared_fixed.is_some()
+        && plan.has_shared_fixed()
 }
 
 pub(crate) fn exact_drafts(capacity: usize) -> Result<ExactVec<Draft>, Error> {
@@ -305,20 +367,21 @@ pub(crate) fn reduce_attempt(
     let mut span_sum = 0_usize;
     let mut candidates = 0_usize;
     let result = (|| {
+        let shared_fixed = plan.shared_fixed()?;
         // A shared fixed anchor is drained immediately and therefore has only
         // one live start. Retain the offset-sized ring solely for the generic
         // interval scheduler, where starts remain live until its safe
         // frontier advances.
-        let schedule = if plan.shared_fixed.is_some() {
+        let schedule = if shared_fixed.is_some() {
             1
         } else {
-            add(plan.max_offset, 1, Resource::ScratchBytes)?
+            add(plan.max_offset(), 1, Resource::ScratchBytes)?
         };
         let mut workspace =
             Workspace::new(program.insts.len(), schedule, &mut meter, &mut allocations)?;
         let mut cursor = 0_usize;
 
-        if let Some(fixed) = plan.shared_fixed {
+        if let Some(fixed) = shared_fixed {
             // Preserve the mandatory global proof used by the generic
             // scheduler. A strong fixed prefix can still occur densely while
             // another byte sequence required by every match is absent. In
@@ -493,10 +556,10 @@ pub(crate) fn reduce_attempt(
                     }
                 }
             }
-            if position >= plan.max_offset {
+            if position >= plan.max_offset() {
                 let safe_through =
                     position
-                        .checked_sub(plan.max_offset)
+                        .checked_sub(plan.max_offset())
                         .ok_or(Error::InternalInvariant(
                             "candidate safe frontier underflow",
                         ))?;
@@ -586,6 +649,14 @@ impl SharedFixedAnchors {
     }
 }
 
+fn complete_owner_mask(entries: usize) -> Result<u128, Error> {
+    if entries == MAX_ENTRIES {
+        Ok(u128::MAX)
+    } else {
+        Ok(owner_bit(entries)?.saturating_sub(1))
+    }
+}
+
 pub(crate) fn shared_fixed_anchors(
     entries: &[Entry],
     buckets: &[u128],
@@ -600,11 +671,7 @@ pub(crate) fn shared_fixed_anchors(
     {
         return Ok(None);
     }
-    let all = if entries.len() == MAX_ENTRIES {
-        u128::MAX
-    } else {
-        owner_bit(entries.len())?.saturating_sub(1)
-    };
+    let all = complete_owner_mask(entries.len())?;
     let mut bytes = [0_u8; 3];
     let mut len = 0_usize;
     let mut observed_owners = 0_u128;
@@ -851,6 +918,49 @@ fn start_domain_attempt_accounting(
 
 pub(crate) fn start_domain_workspace_bytes(program: &Program) -> Result<usize, Error> {
     workspace_bytes(program.insts.len(), 0)
+}
+
+pub(crate) fn packed_shape(
+    max_offset: usize,
+    shared_fixed: Option<SharedFixedAnchors>,
+) -> Result<usize, Error> {
+    if max_offset > MAX_OFFSET {
+        return Err(Error::InternalInvariant(
+            "candidate maximum offset exceeds packed shape",
+        ));
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let _ = shared_fixed;
+        Ok(max_offset)
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let Some(fixed) = shared_fixed else {
+            return Ok(max_offset);
+        };
+        if fixed.offset != max_offset
+            || !(1..=fixed.bytes.len()).contains(&fixed.len)
+            || fixed.owners == 0
+        {
+            return Err(Error::InternalInvariant(
+                "shared fixed candidate cannot be packed",
+            ));
+        }
+        let mut shape = add(
+            max_offset,
+            mul(fixed.len, SHAPE_LENGTH_RADIX, Resource::ProgramBytes)?,
+            Resource::ProgramBytes,
+        )?;
+        for (&byte, radix) in fixed.bytes.iter().zip(SHAPE_BYTE_RADICES) {
+            shape = add(
+                shape,
+                mul(usize::from(byte), radix, Resource::ProgramBytes)?,
+                Resource::ProgramBytes,
+            )?;
+        }
+        Ok(shape)
+    }
 }
 
 fn filter_matches(
@@ -1449,6 +1559,18 @@ mod tests {
     use super::*;
     use crate::{CompileLimits, CompiledRegex, RustByteProfile, Strategy};
 
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the fixed field count restates the object-neutral candidate plan layout"
+    )]
+    fn candidate_plan_keeps_route_metadata_in_the_existing_shape_word() {
+        assert_eq!(
+            size_of::<Plan>(),
+            size_of::<ExactVec<Entry>>() * 3 + size_of::<usize>()
+        );
+    }
+
     fn compiled(pattern: &str) -> CompiledRegex {
         let hir = ParserBuilder::new()
             .unicode(false)
@@ -1923,7 +2045,7 @@ mod tests {
         let plan = compiled.candidate.as_ref().unwrap();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].check_len, MAX_FILTER_CHECKS);
-        assert!(plan.shared_fixed.is_some());
+        assert!(plan.has_shared_fixed());
         assert!(has_complete_shared_fixed_filter(plan));
 
         let mut haystack = vec![b'\\'; 32_768];
@@ -1963,7 +2085,7 @@ mod tests {
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
         assert_eq!(plan.entries.len(), 2);
-        assert!(plan.shared_fixed.is_some());
+        assert!(plan.has_shared_fixed());
         assert!(!has_complete_shared_fixed_filter(plan));
 
         let mut haystack = vec![b'x'; 32_768];
@@ -2007,7 +2129,7 @@ mod tests {
         let pattern = r".efghijklmnopq[a-z]+[A-Z]";
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
-        assert!(plan.shared_fixed.is_some());
+        assert!(plan.has_shared_fixed());
         // The start-relative scheduler uses the dense trailing `q` from the
         // fixed prefix, while the complementary source-wide proof retains the
         // mandatory uppercase suffix. Keeping both assertions here proves
@@ -2056,7 +2178,7 @@ mod tests {
         let pattern = r"abx|acy";
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
-        assert!(plan.shared_fixed.is_some());
+        assert!(plan.has_shared_fixed());
         let reference = RegexBuilder::new(pattern).unicode(false).build().unwrap();
         let alphabet = [b'a', b'b', b'c', b'x', b'y', 0xFF];
         let mut haystack = Vec::new();
@@ -2126,7 +2248,7 @@ mod tests {
         reason = "small test fixtures independently restate the checked production formula"
     )]
     fn plan_workspace_bytes(plan: &Plan, program: &Program) -> usize {
-        let schedule = plan.max_offset + 1;
+        let schedule = plan.max_offset() + 1;
         let states = program.insts.len();
         let stack = states * 2 + 1;
         schedule * size_of::<u128>()
