@@ -49,6 +49,7 @@ mod required_literal;
 mod set;
 mod split;
 mod text;
+mod text_match;
 mod text_set;
 mod token_phrase;
 mod unicode_word_run;
@@ -331,6 +332,7 @@ pub use text::{
     PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextMatches,
     PortableTextProof, PortableTextRegex, PortableTextSearchError,
 };
+pub use text_match::{PortableTextBorrowedMatches, PortableTextMatch};
 pub use text_set::{
     PORTABLE_TEXT_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableTextRegexSet,
     PortableTextRegexSetBuildError, PortableTextRegexSetBuildReport, PortableTextRegexSetBuilder,
