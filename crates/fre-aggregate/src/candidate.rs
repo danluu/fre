@@ -62,6 +62,7 @@ pub(crate) struct Plan {
     pub(crate) buckets: ExactVec<u128>,
     pub(crate) global_buckets: ExactVec<u128>,
     pub(crate) max_offset: usize,
+    pub(crate) shared_fixed: Option<SharedFixedAnchors>,
 }
 
 impl Plan {
@@ -267,12 +268,20 @@ pub(crate) fn reduce_attempt(
     let mut span_sum = 0_usize;
     let mut candidates = 0_usize;
     let result = (|| {
-        let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
+        // A shared fixed anchor is drained immediately and therefore has only
+        // one live start. Retain the offset-sized ring solely for the generic
+        // interval scheduler, where starts remain live until its safe
+        // frontier advances.
+        let schedule = if plan.shared_fixed.is_some() {
+            1
+        } else {
+            add(plan.max_offset, 1, Resource::ScratchBytes)?
+        };
         let mut workspace =
             Workspace::new(program.insts.len(), schedule, &mut meter, &mut allocations)?;
         let mut cursor = 0_usize;
 
-        if let Some(fixed) = shared_fixed_anchors(plan, &mut meter)? {
+        if let Some(fixed) = plan.shared_fixed {
             // The whole source scan is admitted before memchr can touch the
             // source. Each returned position then retains the same fixed
             // filter, assertion, candidate-event and verifier accounting as
@@ -357,6 +366,8 @@ pub(crate) fn reduce_attempt(
                     start,
                     &mut cursor,
                     &mut matches,
+                    &mut span_sum,
+                    kind,
                     &mut workspace,
                     &mut meter,
                 )?;
@@ -495,7 +506,7 @@ pub(crate) fn reduce_attempt(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SharedFixedAnchors {
+pub(crate) struct SharedFixedAnchors {
     bytes: [u8; 3],
     len: usize,
     offset: usize,
@@ -523,32 +534,29 @@ impl SharedFixedAnchors {
     }
 }
 
-fn shared_fixed_anchors(
-    plan: &Plan,
-    meter: &mut Meter,
+pub(crate) fn shared_fixed_anchors(
+    entries: &[Entry],
+    buckets: &[u128],
 ) -> Result<Option<SharedFixedAnchors>, Error> {
-    let Some(entry) = plan.entries.first() else {
+    let Some(entry) = entries.first() else {
         return Ok(None);
     };
     let fixed_offset = entry.min_offset;
-    meter.charge_work(plan.entries.len())?;
-    if plan
-        .entries
+    if entries
         .iter()
         .any(|entry| entry.min_offset != fixed_offset || entry.max_offset != fixed_offset)
     {
         return Ok(None);
     }
-    let all = if plan.entries.len() == MAX_ENTRIES {
+    let all = if entries.len() == MAX_ENTRIES {
         u128::MAX
     } else {
-        owner_bit(plan.entries.len())?.saturating_sub(1)
+        owner_bit(entries.len())?.saturating_sub(1)
     };
-    meter.charge_work(plan.buckets.len())?;
     let mut bytes = [0_u8; 3];
     let mut len = 0_usize;
     let mut observed_owners = 0_u128;
-    for (byte, &owners) in plan.buckets.iter().enumerate() {
+    for (byte, &owners) in buckets.iter().enumerate() {
         if owners == 0 {
             continue;
         }
@@ -1596,13 +1604,26 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, reference(pattern, &haystack));
+        assert_eq!(result.matches, reference(pattern, &haystack));
         assert!((1..=16).contains(&result.candidates));
         assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
         assert!(
             result.accounting.work < haystack.len().checked_mul(2).unwrap(),
             "single fixed scheduling must not drain every absent start"
         );
+        let span_sum = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(span_sum.matches, result.matches);
+        assert_eq!(span_sum.candidates, result.candidates);
+        assert_eq!(span_sum.accounting, result.accounting);
+        assert_eq!(span_sum.span_sum, reference_span_sum(pattern, &haystack));
     }
 
     #[test]
@@ -1612,12 +1633,7 @@ mod tests {
         let plan = compiled.candidate.as_ref().unwrap();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].check_len, MAX_FILTER_CHECKS);
-        let mut proof_meter = Meter::new(OperationLimits::default());
-        assert!(
-            shared_fixed_anchors(plan, &mut proof_meter)
-                .unwrap()
-                .is_some()
-        );
+        assert!(plan.shared_fixed.is_some());
 
         let mut haystack = vec![b'\\'; 32_768];
         haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2/");
@@ -1629,9 +1645,22 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, reference(pattern, &haystack));
+        assert_eq!(result.matches, reference(pattern, &haystack));
         assert_eq!(result.candidates, 1);
         assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+        let span_sum = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(span_sum.matches, result.matches);
+        assert_eq!(span_sum.candidates, result.candidates);
+        assert_eq!(span_sum.accounting, result.accounting);
+        assert_eq!(span_sum.span_sum, reference_span_sum(pattern, &haystack));
     }
 
     #[test]
@@ -1640,12 +1669,7 @@ mod tests {
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
         assert_eq!(plan.entries.len(), 2);
-        let mut proof_meter = Meter::new(OperationLimits::default());
-        assert!(
-            shared_fixed_anchors(plan, &mut proof_meter)
-                .unwrap()
-                .is_some()
-        );
+        assert!(plan.shared_fixed.is_some());
 
         let mut haystack = vec![b'x'; 32_768];
         haystack.extend_from_slice(
@@ -1659,12 +1683,25 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, reference(pattern, &haystack));
+        assert_eq!(result.matches, reference(pattern, &haystack));
         assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
         assert!(
             result.accounting.work < haystack.len().checked_mul(2).unwrap(),
             "shared fixed scheduling must not drain every absent start"
         );
+        let span_sum = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(span_sum.matches, result.matches);
+        assert_eq!(span_sum.candidates, result.candidates);
+        assert_eq!(span_sum.accounting, result.accounting);
+        assert_eq!(span_sum.span_sum, reference_span_sum(pattern, &haystack));
     }
 
     #[test]
@@ -1672,12 +1709,7 @@ mod tests {
         let pattern = r"abx|acy";
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
-        let mut proof_meter = Meter::new(OperationLimits::default());
-        assert!(
-            shared_fixed_anchors(plan, &mut proof_meter)
-                .unwrap()
-                .is_some()
-        );
+        assert!(plan.shared_fixed.is_some());
         let reference = RegexBuilder::new(pattern).unicode(false).build().unwrap();
         let alphabet = [b'a', b'b', b'c', b'x', b'y', 0xFF];
         let mut haystack = Vec::new();
@@ -1700,7 +1732,7 @@ mod tests {
                         OperationLimits::default(),
                     )
                     .unwrap()
-                    .value;
+                    .matches;
                     assert_eq!(
                         actual, expected,
                         "range={start}..{end} haystack={haystack:?}"

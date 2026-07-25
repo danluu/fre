@@ -2889,7 +2889,11 @@ fn candidate_prospective(
     kind: OperationKind,
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
-    let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
+    let schedule = if plan.shared_fixed.is_some() {
+        1
+    } else {
+        add(plan.max_offset, 1, Resource::ScratchBytes)?
+    };
     let states = program.insts.len();
     let stack = add(
         mul(states, 2, Resource::ScratchBytes)?,

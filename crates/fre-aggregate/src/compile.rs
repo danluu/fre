@@ -1871,6 +1871,9 @@ fn build_candidate_plan(
             }
         }
     }
+    let shared_fixed_work = add(entries.len(), buckets.len(), Resource::CompileWork)?;
+    budget.charge(shared_fixed_work)?;
+    let shared_fixed = candidate::shared_fixed_anchors(&entries, &buckets)?;
     budget.release_construction_bytes(draft_bytes)?;
     budget.accounting.candidate_entries = entries.len();
     budget.accounting.candidate_bytes = retained_bytes;
@@ -1879,6 +1882,7 @@ fn build_candidate_plan(
         buckets,
         global_buckets,
         max_offset,
+        shared_fixed,
     }))
 }
 
