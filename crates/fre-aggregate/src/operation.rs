@@ -6105,6 +6105,17 @@ impl RowStore {
         // Build the sole boundary without an input byte separately. Every
         // remaining row then has a byte, so every consuming state avoids an
         // `Option` discriminant check in the Q-by-N construction loop.
+        //
+        // Keep the overwhelmingly common byte-only, assertion-free row
+        // transition in a compact kernel. This decision is made once per
+        // table construction instead of rediscovering the same program shape
+        // at every input boundary.
+        let byte_only_rows = !ORDERED_ROOT
+            && !program.contains_scalar_transition()
+            && program
+                .insts
+                .iter()
+                .all(|inst| !matches!(inst, Inst::Assert { .. }));
         let mut write_offset = requirements.record_bytes;
         {
             let terminal_record = store
@@ -6145,21 +6156,56 @@ impl RowStore {
             let (row, future_rows) = rows[..row_count]
                 .split_first_mut()
                 .ok_or(Error::InternalInvariant("row ring is empty"))?;
-            Self::build_row::<true, OBSERVED_WORK, ORDERED_ROOT>(
-                program,
-                haystack,
-                assertions,
-                position,
-                input,
-                row,
-                future_rows,
-                record,
-                storage,
-                accounting,
-                requirements.work_bound,
-                limits.max_work,
-                track_source,
-            )?;
+            if byte_only_rows {
+                let next_row = future_rows
+                    .first()
+                    .map(ExactVec::as_slice)
+                    .unwrap_or_default();
+                match storage {
+                    RowStorage::SplitDecisions => {
+                        Self::build_byte_row::<OBSERVED_WORK, true>(
+                            program,
+                            position,
+                            input,
+                            row,
+                            next_row,
+                            record,
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
+                    }
+                    RowStorage::ReachableEndpoints => {
+                        Self::build_byte_row::<OBSERVED_WORK, false>(
+                            program,
+                            position,
+                            input,
+                            row,
+                            next_row,
+                            record,
+                            accounting,
+                            requirements.work_bound,
+                            limits.max_work,
+                        )?;
+                    }
+                }
+            } else {
+                Self::build_row::<true, OBSERVED_WORK, ORDERED_ROOT>(
+                    program,
+                    haystack,
+                    assertions,
+                    position,
+                    input,
+                    row,
+                    future_rows,
+                    record,
+                    storage,
+                    accounting,
+                    requirements.work_bound,
+                    limits.max_work,
+                    track_source,
+                )?;
+            }
             accounting.sequential_bytes_written = add(
                 accounting.sequential_bytes_written,
                 requirements.record_bytes,
@@ -6464,6 +6510,93 @@ impl RowStore {
             RowStorage::ReachableEndpoints => write_encoded(record, row[program.entry])?,
         }
         Ok(row_any)
+    }
+
+    #[inline(never)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the compact byte-row kernel keeps exact accounting beside each state transition"
+    )]
+    fn build_byte_row<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        program: &Program,
+        position: usize,
+        input: u8,
+        row: &mut [usize],
+        next_row: &[usize],
+        record: &mut [u8],
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+        caller_work_limit: usize,
+    ) -> Result<(), Error> {
+        for &pc in &program.epsilon_order {
+            charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
+            let value = match program.instruction(pc)? {
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant("unfilled execution state"));
+                }
+                Inst::Fail => 0,
+                Inst::Match => encode(position)?,
+                Inst::Consume { bytes, next } => {
+                    charge_transition::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
+                    if bytes.contains(input) {
+                        next_row[*next]
+                    } else {
+                        0
+                    }
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
+                } => {
+                    charge_transition::<OBSERVED_WORK>(
+                        accounting,
+                        admitted_work_bound,
+                        caller_work_limit,
+                    )?;
+                    let preferred_value = row[*preferred];
+                    let rank = program.split_rank[pc];
+                    if rank == NO_SPLIT_RANK {
+                        return Err(Error::InternalInvariant("split state has no decision rank"));
+                    }
+                    if preferred_value != 0 {
+                        if SPLIT_DECISIONS {
+                            set_bit(record, rank)?;
+                        }
+                        preferred_value
+                    } else {
+                        charge_transition::<OBSERVED_WORK>(
+                            accounting,
+                            admitted_work_bound,
+                            caller_work_limit,
+                        )?;
+                        row[*fallback]
+                    }
+                }
+                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                    return Err(Error::InternalInvariant(
+                        "byte-row kernel received a non-byte state",
+                    ));
+                }
+            };
+            row[pc] = value;
+        }
+        if SPLIT_DECISIONS {
+            if row[program.entry] != 0 {
+                set_bit(record, program.split_count)?;
+            }
+        } else {
+            write_encoded(record, row[program.entry])?;
+        }
+        Ok(())
     }
 
     #[inline]
