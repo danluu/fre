@@ -2016,18 +2016,20 @@ fn build_candidate_plan(
         _ => return Ok(None),
     };
     let single_fixed = if single_capture_selector {
-        let fixed = leading_fixed_candidate(hir, budget)?;
-        // A one-owner scheduler is retained only when construction proved
-        // the complete fixed filter window. This keeps the generic selector
-        // from attaching an 8 KiB candidate table to every short or weakly
-        // prefixed regex while admitting long structural anchors.
-        if fixed
+        leading_fixed_candidate(hir, budget)?
+    } else {
+        None
+    };
+    let fixed_continuation_proof = if single_capture_selector
+        && single_fixed
             .as_ref()
-            .is_none_or(|candidate| candidate.check_len < candidate::MAX_FILTER_CHECKS)
-        {
+            .is_none_or(|fixed| fixed.check_len < candidate::MAX_FILTER_CHECKS)
+    {
+        let Some(proof) = prove_fixed_continuation_candidate(hir, single_fixed.as_ref(), budget)?
+        else {
             return Ok(None);
-        }
-        fixed
+        };
+        Some(proof)
     } else {
         None
     };
@@ -2071,50 +2073,15 @@ fn build_candidate_plan(
     }
     for branch in branches {
         budget.charge(1)?;
-        let fallback = if let Some(draft) = required_candidate(branch, budget)? {
-            draft
-        } else {
-            let Some(draft) = leading_candidate(branch, budget)? else {
-                budget.release_construction_bytes(draft_bytes)?;
-                return Ok(None);
-            };
-            draft
-        };
         let fixed = if single_capture_selector {
             single_fixed
         } else {
             leading_fixed_candidate(branch, budget)?
         };
-        let mut draft = match fixed {
-            Some(fixed) if fixed.check_len >= 2 => choose_candidate(Some(fallback), fixed, budget)?
-                .ok_or(Error::InternalInvariant(
-                    "candidate choice lost both proved alternatives",
-                ))?,
-            _ => fallback,
-        };
-        let Some(mut global) = required_global_candidate(branch, budget)? else {
+        let Some(draft) = analyze_candidate_branch(branch, fixed.as_ref(), budget)? else {
             budget.release_construction_bytes(draft_bytes)?;
             return Ok(None);
         };
-        if let Some(trailing) = required_trailing_global_candidate(branch, budget)?
-            && !global_probe_equal(&global, &trailing, budget)?
-        {
-            // The scheduler already retains the strongest start-relative
-            // proof. Prefer a distinct mandatory trailing global proof when
-            // one exists, so the source-wide census is complementary instead
-            // of rechecking a potentially dense prefix. This retains one
-            // global scan and remains source-independent while catching
-            // missing suffixes and terminal classes.
-            global = trailing;
-        }
-        draft.global_bytes = global.bytes;
-        draft.global_checks = global.checks;
-        draft.global_check_len = global.check_len;
-        draft.leading_assertion = leading_assertion(branch, budget)?;
-        if draft.max_offset > candidate::MAX_OFFSET {
-            budget.release_construction_bytes(draft_bytes)?;
-            return Ok(None);
-        }
         drafts.try_push(draft).map_err(|_| {
             Error::InternalInvariant("candidate analysis exceeded exact branch census")
         })?;
@@ -2282,15 +2249,704 @@ fn build_candidate_plan(
     budget.charge(shared_fixed_work)?;
     let shared_fixed = candidate::shared_fixed_anchors(&entries, &buckets)?;
     let shape = candidate::packed_shape(max_offset, shared_fixed)?;
+    let shape = if let Some(proof) = fixed_continuation_proof {
+        let fixed = build_fixed_continuation(hir, proof, shape, budget)?;
+        retain_fixed_continuation(fixed, budget)?
+    } else {
+        candidate::inline_candidate_shape(shape)?
+    };
     budget.release_construction_bytes(draft_bytes)?;
-    budget.accounting.candidate_entries = entries.len();
-    budget.accounting.candidate_bytes = retained_bytes;
-    Ok(Some(candidate::Plan {
+    let plan = candidate::Plan {
         entries,
         buckets,
         global_buckets,
         shape,
+    };
+    budget.accounting.candidate_entries = plan.entries.len();
+    budget.accounting.candidate_bytes = plan.retained_bytes()?;
+    Ok(Some(plan))
+}
+
+fn analyze_candidate_branch(
+    branch: &Hir,
+    fixed: Option<&CandidateDraft>,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let fallback = if let Some(draft) = required_candidate(branch, budget)? {
+        draft
+    } else {
+        let Some(draft) = leading_candidate(branch, budget)? else {
+            return Ok(None);
+        };
+        draft
+    };
+    let mut draft = match fixed {
+        Some(fixed) if fixed.check_len >= 2 => choose_candidate(Some(fallback), *fixed, budget)?
+            .ok_or(Error::InternalInvariant(
+                "candidate choice lost both proved alternatives",
+            ))?,
+        _ => fallback,
+    };
+    let Some(mut global) = required_global_candidate(branch, budget)? else {
+        return Ok(None);
+    };
+    if let Some(trailing) = required_trailing_global_candidate(branch, budget)?
+        && !global_probe_equal(&global, &trailing, budget)?
+    {
+        // The scheduler already retains the strongest start-relative proof.
+        // Prefer a distinct mandatory trailing global proof so the source-wide
+        // census is complementary instead of rechecking a dense prefix.
+        global = trailing;
+    }
+    draft.global_bytes = global.bytes;
+    draft.global_checks = global.checks;
+    draft.global_check_len = global.check_len;
+    draft.leading_assertion = leading_assertion(branch, budget)?;
+    if draft.max_offset > candidate::MAX_OFFSET {
+        return Ok(None);
+    }
+    Ok(Some(draft))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedContinuationProof {
+    tokens: usize,
+    leading_tokens: usize,
+    body: ByteSet,
+    anchor: u8,
+    close: u8,
+    semicolon: u8,
+    comparison_work: usize,
+    comparison_bytes: usize,
+    retained_copy_bytes: usize,
+    leading_comparison_work: usize,
+    leading_comparison_bytes: usize,
+    leading_retained_copy_bytes: usize,
+}
+
+fn prove_fixed_continuation_candidate(
+    hir: &Hir,
+    fixed: Option<&CandidateDraft>,
+    budget: &mut CompileBudget,
+) -> Result<Option<FixedContinuationProof>, Error> {
+    let Some(parts) = transparent_concat(hir, budget)? else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    if parts.len() != 4 {
+        return Ok(None);
+    }
+    prove_fixed_continuation_candidate_after_root_shape(hir, fixed, budget)
+}
+
+fn prove_fixed_continuation_candidate_after_root_shape(
+    hir: &Hir,
+    fixed: Option<&CandidateDraft>,
+    budget: &mut CompileBudget,
+) -> Result<Option<FixedContinuationProof>, Error> {
+    let Some(draft) = analyze_candidate_branch(hir, fixed, budget)? else {
+        return Ok(None);
+    };
+    fixed_continuation_proof(hir, &draft, budget)
+}
+
+fn fixed_continuation_proof(
+    hir: &Hir,
+    draft: &CandidateDraft,
+    budget: &mut CompileBudget,
+) -> Result<Option<FixedContinuationProof>, Error> {
+    // This is a complete whole-match theorem, not a benchmark signature.
+    // Every accepted field comes from canonical HIR, and every rejected
+    // near-miss keeps the ordinary continuation program. The short bounded
+    // start proof limits retained candidate fan-out while the deterministic
+    // token languages make greedy repetition reducible without re-running the
+    // program at source-dependent candidate starts.
+    budget.charge(2)?; // bounded start interval and unfiltered-global checks
+    if draft.max_offset > candidate::MAX_FILTER_CHECKS || draft.global_check_len != 0 {
+        return Ok(None);
+    }
+
+    let mut anchor = None;
+    for byte in u8::MIN..=u8::MAX {
+        budget.charge(1)?;
+        if !draft.global_bytes.contains(byte) {
+            continue;
+        }
+        budget.charge(2)?; // singleton census and disjointness comparison
+        if anchor.is_some() || draft.bytes.contains(byte) {
+            return Ok(None);
+        }
+        anchor = Some(byte);
+    }
+    let Some(anchor) = anchor else {
+        return Ok(None);
+    };
+
+    let Some(parts) = transparent_concat(hir, budget)? else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    let [prefix, close, semicolon, suffix] = parts else {
+        return Ok(None);
+    };
+    let Some((prefix_sub, 1, None)) = greedy_repetition(prefix, budget)? else {
+        return Ok(None);
+    };
+    let Some((close_sub, 0, None)) = greedy_repetition(close, budget)? else {
+        return Ok(None);
+    };
+    let Some((semicolon_sub, 0, Some(1))) = greedy_repetition(semicolon, budget)? else {
+        return Ok(None);
+    };
+    let Some(suffix_parts) = transparent_concat(suffix, budget)? else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    let [leading, first_dot, second_dot, required, trailing_dot] = suffix_parts else {
+        return Ok(None);
+    };
+    let Some(body) = greedy_star_byte_class(first_dot, budget)? else {
+        return Ok(None);
+    };
+    if !fixed_continuation_greedy_star_equals(second_dot, body, budget)?
+        || !fixed_continuation_greedy_star_equals(trailing_dot, body, budget)?
+        || singleton_literal(required, budget)? != Some(anchor)
+        || !fixed_continuation_byte_set_contains(body, anchor, budget)?
+    {
+        return Ok(None);
+    }
+    let Some((leading_sub, 0, None)) = greedy_repetition(leading, budget)? else {
+        return Ok(None);
+    };
+    let Some(close) = singleton_literal(close_sub, budget)? else {
+        return Ok(None);
+    };
+    let Some(semicolon) = singleton_literal(semicolon_sub, budget)? else {
+        return Ok(None);
+    };
+    if !fixed_continuation_byte_set_contains(body, close, budget)?
+        || !fixed_continuation_byte_set_contains(body, semicolon, budget)?
+    {
+        return Ok(None);
+    }
+    let Some((tokens, comparison_work, comparison_bytes, retained_copy_bytes)) =
+        fixed_continuation_token_census(prefix_sub, Some(body), anchor, budget)?
+    else {
+        return Ok(None);
+    };
+    let Some((
+        leading_tokens,
+        leading_comparison_work,
+        leading_comparison_bytes,
+        leading_retained_copy_bytes,
+    )) = fixed_continuation_token_census(leading_sub, None, anchor, budget)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FixedContinuationProof {
+        tokens,
+        leading_tokens,
+        body,
+        anchor,
+        close,
+        semicolon,
+        comparison_work,
+        comparison_bytes,
+        retained_copy_bytes,
+        leading_comparison_work,
+        leading_comparison_bytes,
+        leading_retained_copy_bytes,
     }))
+}
+
+fn transparent_concat<'a>(
+    mut hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a [Hir]>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Concat(parts) => return Ok(Some(parts)),
+            _ => return Ok(None),
+        }
+    }
+}
+
+type GreedyRepetition<'a> = (&'a Hir, u32, Option<u32>);
+
+fn greedy_repetition<'a>(
+    mut hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<GreedyRepetition<'a>>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Repetition(repetition) if repetition.greedy => {
+                return Ok(Some((&repetition.sub, repetition.min, repetition.max)));
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn byte_class_set(
+    class: &regex_syntax::hir::ClassBytes,
+    budget: &mut CompileBudget,
+) -> Result<ByteSet, Error> {
+    let mut bytes = ByteSet::empty();
+    for range in class.ranges() {
+        let width = inclusive_byte_width(range.start(), range.end())?;
+        budget.charge(add(width, 1, Resource::CompileWork)?)?;
+        bytes.insert_range(range.start(), range.end());
+    }
+    Ok(bytes)
+}
+
+fn greedy_star_byte_class(hir: &Hir, budget: &mut CompileBudget) -> Result<Option<ByteSet>, Error> {
+    let Some((mut sub, 0, None)) = greedy_repetition(hir, budget)? else {
+        return Ok(None);
+    };
+    loop {
+        budget.charge(1)?;
+        match sub.kind() {
+            HirKind::Capture(capture) => sub = &capture.sub,
+            HirKind::Class(Class::Bytes(class)) => {
+                return byte_class_set(class, budget).map(Some);
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn singleton_literal(mut hir: &Hir, budget: &mut CompileBudget) -> Result<Option<u8>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Literal(regex_syntax::hir::Literal(bytes)) if bytes.len() == 1 => {
+                return Ok(bytes.first().copied());
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn fixed_continuation_byte_sets_equal(
+    left: ByteSet,
+    right: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    for index in 0..left.0.len() {
+        budget.charge(1)?;
+        if left.0[index] != right.0[index] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn fixed_continuation_greedy_star_equals(
+    hir: &Hir,
+    expected: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    let Some(actual) = greedy_star_byte_class(hir, budget)? else {
+        return Ok(false);
+    };
+    fixed_continuation_byte_sets_equal(expected, actual, budget)
+}
+
+fn fixed_continuation_byte_set_contains(
+    bytes: ByteSet,
+    byte: u8,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    budget.charge(1)?;
+    Ok(bytes.contains(byte))
+}
+
+fn fixed_continuation_byte_set_is_empty(
+    bytes: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    for word in bytes.0 {
+        budget.charge(1)?;
+        if word != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn fixed_continuation_byte_set_is_subset(
+    candidate: ByteSet,
+    allowed: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    for (candidate, allowed) in candidate.0.into_iter().zip(allowed.0) {
+        budget.charge(1)?;
+        if candidate & !allowed != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn fixed_continuation_byte_sets_overlap(
+    left: ByteSet,
+    right: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    for (left, right) in left.0.into_iter().zip(right.0) {
+        budget.charge(1)?;
+        if left & right != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn fixed_continuation_literal_is_in_body(
+    literal: &[u8],
+    body: ByteSet,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    for &byte in literal {
+        if !fixed_continuation_byte_set_contains(body, byte, budget)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn fixed_continuation_token_hirs(hir: &Hir) -> &[Hir] {
+    match hir.kind() {
+        HirKind::Alternation(branches) => branches,
+        _ => core::slice::from_ref(hir),
+    }
+}
+
+fn fixed_continuation_token_census(
+    hir: &Hir,
+    body: Option<ByteSet>,
+    anchor: u8,
+    budget: &mut CompileBudget,
+) -> Result<Option<(usize, usize, usize, usize)>, Error> {
+    let branches = fixed_continuation_token_hirs(hir);
+    if branches.is_empty() || branches.len() > candidate::MAX_ENTRIES {
+        return Ok(None);
+    }
+    let mut comparison_work = 0_usize;
+    let mut comparison_bytes = 0_usize;
+    let mut retained_copy_bytes = 0_usize;
+    for branch in branches {
+        budget.charge(1)?; // token dispatch plus bounded scalar shape/anchor checks
+        let bytes = match branch.kind() {
+            HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+                if bytes.is_empty() || bytes.len() > candidate::MAX_FIXED_CONTINUATION_TOKEN_BYTES {
+                    return Ok(None);
+                }
+                if let Some(body) = body
+                    && !fixed_continuation_literal_is_in_body(bytes, body, budget)?
+                {
+                    return Ok(None);
+                }
+                if bytes.first().is_some_and(|&byte| byte == anchor) {
+                    return Ok(None);
+                }
+                retained_copy_bytes = add(retained_copy_bytes, bytes.len(), Resource::CompileWork)?;
+                bytes.len()
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                let bytes = byte_class_set(class, budget)?;
+                if fixed_continuation_byte_set_contains(bytes, anchor, budget)?
+                    || fixed_continuation_byte_set_is_empty(bytes, budget)?
+                {
+                    return Ok(None);
+                }
+                if let Some(body) = body
+                    && !fixed_continuation_byte_set_is_subset(bytes, body, budget)?
+                {
+                    return Ok(None);
+                }
+                1
+            }
+            HirKind::Empty
+            | HirKind::Class(_)
+            | HirKind::Look(_)
+            | HirKind::Repetition(_)
+            | HirKind::Capture(_)
+            | HirKind::Concat(_)
+            | HirKind::Alternation(_) => return Ok(None),
+        };
+        comparison_bytes = add(comparison_bytes, bytes, Resource::CompileWork)?;
+        comparison_work = add(
+            comparison_work,
+            add(1, bytes, Resource::CompileWork)?,
+            Resource::CompileWork,
+        )?;
+    }
+    for (left_index, left) in branches.iter().enumerate() {
+        let right_start = left_index.checked_add(1).ok_or(Error::ArithmeticOverflow {
+            resource: Resource::CompileWork,
+        })?;
+        for right in &branches[right_start..] {
+            budget.charge(1)?;
+            if fixed_tokens_overlap(left, right, budget)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some((
+        branches.len(),
+        comparison_work,
+        comparison_bytes,
+        retained_copy_bytes,
+    )))
+}
+
+fn fixed_tokens_overlap(
+    left: &Hir,
+    right: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<bool, Error> {
+    match (left.kind(), right.kind()) {
+        (
+            HirKind::Literal(regex_syntax::hir::Literal(left)),
+            HirKind::Literal(regex_syntax::hir::Literal(right)),
+        ) => {
+            let common = left.len().min(right.len());
+            budget.charge(common)?;
+            Ok(left[..common] == right[..common])
+        }
+        (HirKind::Class(Class::Bytes(left)), HirKind::Class(Class::Bytes(right))) => {
+            let left = byte_class_set(left, budget)?;
+            let right = byte_class_set(right, budget)?;
+            fixed_continuation_byte_sets_overlap(left, right, budget)
+        }
+        (
+            HirKind::Class(Class::Bytes(class)),
+            HirKind::Literal(regex_syntax::hir::Literal(literal)),
+        )
+        | (
+            HirKind::Literal(regex_syntax::hir::Literal(literal)),
+            HirKind::Class(Class::Bytes(class)),
+        ) => {
+            let class = byte_class_set(class, budget)?;
+            let Some(&first) = literal.first() else {
+                return Ok(false);
+            };
+            fixed_continuation_byte_set_contains(class, first, budget)
+        }
+        _ => Err(Error::InternalInvariant(
+            "fixed-continuation token census admitted an unknown token",
+        )),
+    }
+}
+
+fn build_fixed_continuation(
+    hir: &Hir,
+    proof: FixedContinuationProof,
+    shape: usize,
+    budget: &mut CompileBudget,
+) -> Result<candidate::FixedContinuation, Error> {
+    let parts = transparent_concat(hir, budget)?.ok_or(Error::InternalInvariant(
+        "fixed-continuation proof lost its root concatenation",
+    ))?;
+    let prefix = parts.first().ok_or(Error::InternalInvariant(
+        "fixed-continuation proof lost its prefix",
+    ))?;
+    let (prefix_sub, 1, None) = greedy_repetition(prefix, budget)?.ok_or(
+        Error::InternalInvariant("fixed-continuation proof lost its greedy prefix"),
+    )?
+    else {
+        return Err(Error::InternalInvariant(
+            "fixed-continuation prefix repetition changed after proof",
+        ));
+    };
+    let suffix = parts.get(3).ok_or(Error::InternalInvariant(
+        "fixed-continuation proof lost its suffix",
+    ))?;
+    let suffix_parts = transparent_concat(suffix, budget)?.ok_or(Error::InternalInvariant(
+        "fixed-continuation proof lost its suffix concatenation",
+    ))?;
+    let leading = suffix_parts.first().ok_or(Error::InternalInvariant(
+        "fixed-continuation proof lost its leading repetition",
+    ))?;
+    let (leading_sub, 0, None) = greedy_repetition(leading, budget)?.ok_or(
+        Error::InternalInvariant("fixed-continuation proof lost its leading token repetition"),
+    )?
+    else {
+        return Err(Error::InternalInvariant(
+            "fixed-continuation leading repetition changed after proof",
+        ));
+    };
+    let tokens = retain_fixed_continuation_tokens(
+        prefix_sub,
+        proof.tokens,
+        proof.comparison_work,
+        proof.comparison_bytes,
+        proof.retained_copy_bytes,
+        budget,
+    )?;
+    let leading_tokens = retain_fixed_continuation_tokens(
+        leading_sub,
+        proof.leading_tokens,
+        proof.leading_comparison_work,
+        proof.leading_comparison_bytes,
+        proof.leading_retained_copy_bytes,
+        budget,
+    )?;
+    Ok(candidate::FixedContinuation {
+        tokens,
+        leading_tokens,
+        body: proof.body,
+        anchor: proof.anchor,
+        close: proof.close,
+        semicolon: proof.semicolon,
+        comparison_work: proof.comparison_work,
+        comparison_bytes: proof.comparison_bytes,
+        leading_comparison_work: proof.leading_comparison_work,
+        leading_comparison_bytes: proof.leading_comparison_bytes,
+        shape,
+    })
+}
+
+fn retain_fixed_continuation(
+    fixed: candidate::FixedContinuation,
+    budget: &mut CompileBudget,
+) -> Result<fre_exact_alloc::ExactBoxOrUsize<candidate::FixedContinuation>, Error> {
+    let retained_bytes = core::mem::size_of::<candidate::FixedContinuation>();
+    enforce(
+        add(
+            budget.current_construction_bytes,
+            retained_bytes,
+            Resource::ProgramBytes,
+        )?,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    budget.charge(1)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(retained_bytes)?;
+    } else {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    let fixed = compiler_allocation(
+        budget,
+        retained_bytes != 0,
+        Resource::ProgramBytes,
+        1,
+        || candidate::exact_fixed_continuation(fixed),
+        |_| Ok(retained_bytes),
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    budget.record_items::<candidate::FixedContinuation>(1, false)?;
+    Ok(fixed)
+}
+
+fn retain_fixed_continuation_tokens(
+    hir: &Hir,
+    expected_tokens: usize,
+    expected_comparison_work: usize,
+    expected_comparison_bytes: usize,
+    expected_copy_bytes: usize,
+    budget: &mut CompileBudget,
+) -> Result<fre_exact_alloc::ExactVec<candidate::FixedContinuationToken>, Error> {
+    let branches = fixed_continuation_token_hirs(hir);
+    if branches.len() != expected_tokens {
+        return Err(Error::InternalInvariant(
+            "fixed-continuation token census changed during retention",
+        ));
+    }
+    let retained_bytes = mul(
+        expected_tokens,
+        core::mem::size_of::<candidate::FixedContinuationToken>(),
+        Resource::ProgramBytes,
+    )?;
+    enforce(
+        add(
+            budget.current_construction_bytes,
+            retained_bytes,
+            Resource::ProgramBytes,
+        )?,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    // Admit the distinct retained-token visit and literal payload copy before
+    // allocation. These units are neither the earlier theorem proof nor the
+    // executor comparison census (a class compares one source byte but copies
+    // no HIR literal bytes). One atomic charge publishes the complete required
+    // work while retaining only completed proof work in a refusal receipt.
+    let retention_work = add(expected_tokens, expected_copy_bytes, Resource::CompileWork)?;
+    budget.charge(retention_work)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(retained_bytes)?;
+    } else {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    let mut tokens = compiler_allocation(
+        budget,
+        expected_tokens != 0,
+        Resource::ProgramBytes,
+        expected_tokens,
+        || candidate::exact_fixed_continuation_tokens(expected_tokens),
+        |values| {
+            mul(
+                values.capacity(),
+                core::mem::size_of::<candidate::FixedContinuationToken>(),
+                Resource::ProgramBytes,
+            )
+        },
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    let mut comparison_work = 0_usize;
+    let mut comparison_bytes = 0_usize;
+    let mut copy_bytes = 0_usize;
+    for branch in branches {
+        let token = match branch.kind() {
+            HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+                let token = candidate::FixedContinuationToken::literal(bytes)?;
+                budget.record_copy(bytes.len())?;
+                copy_bytes = add(copy_bytes, bytes.len(), Resource::CompileWork)?;
+                token
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                candidate::FixedContinuationToken::class(byte_class_set(class, budget)?)
+            }
+            _ => {
+                return Err(Error::InternalInvariant(
+                    "fixed-continuation token changed after proof",
+                ));
+            }
+        };
+        let bytes = token.comparison_bytes();
+        comparison_bytes = add(comparison_bytes, bytes, Resource::CompileWork)?;
+        comparison_work = add(
+            comparison_work,
+            add(1, bytes, Resource::CompileWork)?,
+            Resource::CompileWork,
+        )?;
+        tokens.try_push(token).map_err(|_| {
+            Error::InternalInvariant("fixed-continuation token allocation filled early")
+        })?;
+        budget.record_items::<candidate::FixedContinuationToken>(1, false)?;
+    }
+    if comparison_work != expected_comparison_work
+        || comparison_bytes != expected_comparison_bytes
+        || copy_bytes != expected_copy_bytes
+    {
+        return Err(Error::InternalInvariant(
+            "fixed-continuation census changed during retention",
+        ));
+    }
+    Ok(tokens)
 }
 
 const FILTER_WIDTH: usize = candidate::MAX_FILTER_CHECKS + 1;
@@ -6221,7 +6877,11 @@ fn bind_candidate_identity(
     plan: &candidate::Plan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = b"fre.aggregate.candidate-intervals.v1";
+    let domain = if plan.fixed_continuation().is_some() {
+        b"fre.aggregate.candidate-intervals.v2".as_slice()
+    } else {
+        b"fre.aggregate.candidate-intervals.v1".as_slice()
+    };
     let check_payload = mul(
         candidate::MAX_FILTER_CHECKS,
         add(
@@ -6259,11 +6919,46 @@ fn bind_candidate_identity(
         core::mem::size_of::<u128>(),
         Resource::CompileWork,
     )?;
+    let fixed_payload = if let Some(fixed) = plan.fixed_continuation() {
+        let token_payload = add(
+            2,
+            add(
+                candidate::MAX_FIXED_CONTINUATION_TOKEN_BYTES,
+                mul(4, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+                Resource::CompileWork,
+            )?,
+            Resource::CompileWork,
+        )?;
+        let tokens = add(
+            fixed.tokens.len(),
+            fixed.leading_tokens.len(),
+            Resource::CompileWork,
+        )?;
+        add(
+            add(
+                mul(tokens, token_payload, Resource::CompileWork)?,
+                mul(4, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+                Resource::CompileWork,
+            )?,
+            add(
+                4,
+                mul(6, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+                Resource::CompileWork,
+            )?,
+            Resource::CompileWork,
+        )?
+    } else {
+        0
+    };
     let payload = add(
         add(program.0.len(), domain.len(), Resource::CompileWork)?,
         add(
-            add(entry_payload, bucket_payload, Resource::CompileWork)?,
-            core::mem::size_of::<u64>(),
+            add(
+                add(entry_payload, bucket_payload, Resource::CompileWork)?,
+                core::mem::size_of::<u64>(),
+                Resource::CompileWork,
+            )?,
+            fixed_payload,
             Resource::CompileWork,
         )?,
         Resource::CompileWork,
@@ -6320,10 +7015,51 @@ fn bind_candidate_identity(
         first.bytes(&bucket.to_le_bytes());
         second.bytes(&bucket.to_le_bytes());
     }
+    if let Some(fixed) = plan.fixed_continuation() {
+        for hash in [&mut first, &mut second] {
+            hash.byte(1);
+            for word in fixed.body.0 {
+                hash.bytes(&word.to_le_bytes());
+            }
+            hash.byte(fixed.anchor);
+            hash.byte(fixed.close);
+            hash.byte(fixed.semicolon);
+            hash_usize(hash, fixed.tokens.len());
+            hash_usize(hash, fixed.leading_tokens.len());
+            hash_usize(hash, fixed.comparison_work);
+            hash_usize(hash, fixed.comparison_bytes);
+            hash_usize(hash, fixed.leading_comparison_work);
+            hash_usize(hash, fixed.leading_comparison_bytes);
+            for &token in fixed.tokens.iter().chain(fixed.leading_tokens.iter()) {
+                hash_fixed_continuation_token(hash, token);
+            }
+        }
+    }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
     bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
     Ok(PlanId(bytes))
+}
+
+fn hash_fixed_continuation_token(hash: &mut StableHash, token: candidate::FixedContinuationToken) {
+    match token {
+        candidate::FixedContinuationToken::Literal { bytes, len } => {
+            hash.byte(1);
+            hash.byte(len);
+            hash.bytes(&bytes);
+            for _ in 0..4 {
+                hash.bytes(&0_u64.to_le_bytes());
+            }
+        }
+        candidate::FixedContinuationToken::Class(bytes) => {
+            hash.byte(2);
+            hash.byte(0);
+            hash.bytes(&[0; candidate::MAX_FIXED_CONTINUATION_TOKEN_BYTES]);
+            for word in bytes.0 {
+                hash.bytes(&word.to_le_bytes());
+            }
+        }
+    }
 }
 
 fn bind_required_internal_anchor_identity(
@@ -6828,6 +7564,76 @@ mod tests {
             .unwrap()
     }
 
+    type FixedTokenCensus = (usize, usize, usize, usize);
+    type FixedTokenConstruction = Result<
+        (
+            fre_exact_alloc::ExactVec<candidate::FixedContinuationToken>,
+            FixedTokenCensus,
+        ),
+        Error,
+    >;
+
+    fn fixed_token_construction_attempt(
+        hir: &Hir,
+        body: ByteSet,
+        anchor: u8,
+        max_work: usize,
+    ) -> (FixedTokenConstruction, CompileBudget) {
+        let mut budget = CompileBudget::new_construction_receipt(
+            CompileLimits {
+                max_work,
+                ..CompileLimits::default()
+            },
+            None,
+        );
+        let result = (|| {
+            let census = fixed_continuation_token_census(hir, Some(body), anchor, &mut budget)?
+                .ok_or(Error::InternalInvariant(
+                    "fixed-token adversary must retain its language proof",
+                ))?;
+            let retained = retain_fixed_continuation_tokens(
+                hir,
+                census.0,
+                census.1,
+                census.2,
+                census.3,
+                &mut budget,
+            )?;
+            Ok((retained, census))
+        })();
+        (result, budget)
+    }
+
+    const fn fixed_test_identity() -> CompileAttemptIdentity {
+        CompileAttemptIdentity {
+            profile: RustByteProfile::PINNED_1_12_4,
+            kind: CompileAttemptKind::EraseCapturesForWholeMatch,
+        }
+    }
+
+    fn exercise_fixed_byte_set_traversals(budget: &mut CompileBudget) -> Result<(), Error> {
+        let full = ByteSet([u64::MAX; 4]);
+        let last_word_mismatch = ByteSet([u64::MAX, u64::MAX, u64::MAX, u64::MAX - 1]);
+        let high = ByteSet([0, 0, 0, 1]);
+        let low = ByteSet([1, 0, 0, 0]);
+
+        assert!(fixed_continuation_byte_sets_equal(full, full, budget)?);
+        assert!(!fixed_continuation_byte_sets_equal(
+            full,
+            last_word_mismatch,
+            budget
+        )?);
+        assert!(fixed_continuation_byte_set_contains(full, u8::MAX, budget)?);
+        assert!(!fixed_continuation_byte_set_is_empty(high, budget)?);
+        assert!(fixed_continuation_byte_set_is_empty(
+            ByteSet::empty(),
+            budget
+        )?);
+        assert!(fixed_continuation_byte_set_is_subset(high, full, budget)?);
+        assert!(!fixed_continuation_byte_sets_overlap(high, low, budget)?);
+        Ok(())
+    }
+
     fn parse_bytes(pattern: &str) -> Hir {
         ParserBuilder::new()
             .utf8(false)
@@ -7229,7 +8035,233 @@ mod tests {
     }
 
     #[test]
-    fn single_capture_selector_requires_and_retains_a_full_fixed_prefix_filter() {
+    fn fixed_continuation_byte_set_traversals_have_exact_partial_receipts() {
+        // Two four-word equalities, one membership, two four-word emptiness
+        // scans, one four-word subset scan and one four-word overlap scan.
+        const EXACT_WORK: usize = 4 + 4 + 1 + 4 + 4 + 4 + 4;
+        assert_eq!(EXACT_WORK, 25);
+
+        let mut exact = CompileBudget::new_construction_receipt(
+            CompileLimits {
+                max_work: EXACT_WORK,
+                ..CompileLimits::default()
+            },
+            None,
+        );
+        exercise_fixed_byte_set_traversals(&mut exact).unwrap();
+        assert_eq!(exact.accounting.work, EXACT_WORK);
+        assert_eq!(
+            exact.construction_actual(false),
+            CompileConstructionActual {
+                work: EXACT_WORK,
+                ..CompileConstructionActual::default()
+            }
+        );
+
+        let one_below_limit = EXACT_WORK - 1;
+        let mut one_below = CompileBudget::new_construction_receipt(
+            CompileLimits {
+                max_work: one_below_limit,
+                ..CompileLimits::default()
+            },
+            None,
+        );
+        assert_eq!(
+            exercise_fixed_byte_set_traversals(&mut one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: one_below_limit,
+            }
+        );
+        let receipt = one_below.construction_failure_receipt(fixed_test_identity());
+        assert_eq!(receipt.actual.work, one_below_limit);
+        assert_eq!(receipt.actual.allocations, 0);
+        assert!(receipt.authenticates_canonical());
+    }
+
+    #[test]
+    fn fixed_continuation_class_census_charges_all_admission_traversals() {
+        // One token visit, one two-byte range construction (range + two
+        // bytes), one anchor membership, a four-word high-byte emptiness scan
+        // and a complete four-word subset proof.
+        const EXACT_WORK: usize = 1 + 3 + 1 + 4 + 4;
+        assert_eq!(EXACT_WORK, 13);
+        let hir = Hir::class(Class::Bytes(regex_syntax::hir::ClassBytes::new([
+            regex_syntax::hir::ClassBytesRange::new(192, 193),
+        ])));
+        let body = ByteSet([u64::MAX; 4]);
+
+        let mut exact = CompileBudget::new_construction_receipt(
+            CompileLimits {
+                max_work: EXACT_WORK,
+                ..CompileLimits::default()
+            },
+            None,
+        );
+        assert_eq!(
+            fixed_continuation_token_census(&hir, Some(body), u8::MAX, &mut exact).unwrap(),
+            Some((1, 2, 1, 0))
+        );
+        assert_eq!(exact.accounting.work, EXACT_WORK);
+
+        let one_below_limit = EXACT_WORK - 1;
+        let mut one_below = CompileBudget::new_construction_receipt(
+            CompileLimits {
+                max_work: one_below_limit,
+                ..CompileLimits::default()
+            },
+            None,
+        );
+        assert_eq!(
+            fixed_continuation_token_census(&hir, Some(body), u8::MAX, &mut one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: one_below_limit,
+            }
+        );
+        let receipt = one_below.construction_failure_receipt(fixed_test_identity());
+        assert_eq!(receipt.actual.work, one_below_limit);
+        assert!(receipt.authenticates_canonical());
+    }
+
+    #[test]
+    fn fixed_continuation_max_width_literal_proof_and_copy_are_independent() {
+        const TOKENS: usize = 2;
+        const WIDTH: usize = 16;
+        const PAIRS: usize = 1;
+        // Proof: two token visits, 32 body-membership comparisons, one pair
+        // visit and one complete 16-byte prefix comparison.
+        const PROOF_WORK: usize = 2 + 32 + 1 + 16;
+        // Retention: two token visits plus a distinct copy of all 32 literal
+        // bytes. No proof comparison is credited to this later traversal.
+        const RETENTION_WORK: usize = 2 + 32;
+        const EXACT_WORK: usize = PROOF_WORK + RETENTION_WORK;
+        assert_eq!(candidate::MAX_FIXED_CONTINUATION_TOKEN_BYTES, WIDTH);
+        assert_eq!(PAIRS, TOKENS * (TOKENS - 1) / 2);
+        assert_eq!(PROOF_WORK, 51);
+        assert_eq!(RETENTION_WORK, 34);
+        assert_eq!(EXACT_WORK, 85);
+
+        let mut left = [b'a'; WIDTH];
+        left[0] = 1;
+        let mut right = [b'a'; WIDTH];
+        right[0] = 2;
+        let hir = Hir::alternation(vec![
+            Hir::literal(left.to_vec()),
+            Hir::literal(right.to_vec()),
+        ]);
+        assert!(matches!(
+            hir.kind(),
+            HirKind::Alternation(branches) if branches.len() == TOKENS
+        ));
+        let body = ByteSet([u64::MAX; 4]);
+
+        let (exact_result, exact_budget) =
+            fixed_token_construction_attempt(&hir, body, u8::MAX, EXACT_WORK);
+        let (tokens, census) = exact_result.unwrap();
+        assert_eq!(tokens.len(), TOKENS);
+        assert_eq!(census, (TOKENS, 34, 32, 32));
+        assert_eq!(exact_budget.accounting.work, EXACT_WORK);
+        let exact_actual = exact_budget.construction_actual(true);
+        assert_eq!(exact_actual.work, EXACT_WORK);
+        assert_eq!(exact_actual.allocations, 1);
+        assert_eq!(exact_actual.copied_bytes, TOKENS * WIDTH);
+        assert_eq!(
+            exact_actual.initialized_bytes,
+            TOKENS * core::mem::size_of::<candidate::FixedContinuationToken>()
+        );
+        assert!(exact_actual.is_closed());
+
+        let one_below_limit = EXACT_WORK - 1;
+        let (one_below_result, one_below_budget) =
+            fixed_token_construction_attempt(&hir, body, u8::MAX, one_below_limit);
+        assert_eq!(
+            one_below_result.unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: one_below_limit,
+            }
+        );
+        let receipt = one_below_budget.construction_failure_receipt(fixed_test_identity());
+        assert_eq!(receipt.actual.work, PROOF_WORK);
+        assert_eq!(receipt.actual.allocations, 0);
+        assert_eq!(receipt.actual.copied_bytes, 0);
+        assert_eq!(receipt.actual.live_construction_bytes, 0);
+        assert!(receipt.authenticates_canonical());
+    }
+
+    #[test]
+    fn fixed_continuation_max_alternatives_have_exact_proof_and_copy_receipts() {
+        const ALTERNATIVES: usize = 128;
+        const WIDTH: usize = 2;
+        const PAIRS: usize = 8_128;
+        // Proof: N token visits + N*2 body memberships + one pair visit and
+        // two compared bytes for every N*(N-1)/2 ordered-language pair.
+        const PROOF_WORK: usize = 128 + 256 + 8_128 + 16_256;
+        // Retention is a separate N-token + N*2-byte copy traversal.
+        const RETENTION_WORK: usize = 128 + 256;
+        const EXACT_WORK: usize = PROOF_WORK + RETENTION_WORK;
+        assert_eq!(candidate::MAX_ENTRIES, ALTERNATIVES);
+        assert_eq!(PAIRS, ALTERNATIVES * (ALTERNATIVES - 1) / 2);
+        assert_eq!(PROOF_WORK, 24_768);
+        assert_eq!(RETENTION_WORK, 384);
+        assert_eq!(EXACT_WORK, 25_152);
+
+        let branches = (0..ALTERNATIVES)
+            .map(|ordinal| {
+                Hir::literal(vec![
+                    u8::try_from(ordinal).expect("128 alternatives fit in one byte"),
+                    0xfe,
+                ])
+            })
+            .collect();
+        let hir = Hir::alternation(branches);
+        assert!(matches!(
+            hir.kind(),
+            HirKind::Alternation(branches) if branches.len() == ALTERNATIVES
+        ));
+        let body = ByteSet([u64::MAX; 4]);
+
+        let (exact_result, exact_budget) =
+            fixed_token_construction_attempt(&hir, body, u8::MAX, EXACT_WORK);
+        let (tokens, census) = exact_result.unwrap();
+        assert_eq!(tokens.len(), ALTERNATIVES);
+        assert_eq!(census, (ALTERNATIVES, 384, 256, 256));
+        assert_eq!(exact_budget.accounting.work, EXACT_WORK);
+        let exact_actual = exact_budget.construction_actual(true);
+        assert_eq!(exact_actual.work, EXACT_WORK);
+        assert_eq!(exact_actual.allocations, 1);
+        assert_eq!(exact_actual.copied_bytes, ALTERNATIVES * WIDTH);
+        assert_eq!(
+            exact_actual.initialized_bytes,
+            ALTERNATIVES * core::mem::size_of::<candidate::FixedContinuationToken>()
+        );
+        assert!(exact_actual.is_closed());
+
+        let one_below_limit = EXACT_WORK - 1;
+        let (one_below_result, one_below_budget) =
+            fixed_token_construction_attempt(&hir, body, u8::MAX, one_below_limit);
+        assert_eq!(
+            one_below_result.unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: EXACT_WORK,
+                limit: one_below_limit,
+            }
+        );
+        let receipt = one_below_budget.construction_failure_receipt(fixed_test_identity());
+        assert_eq!(receipt.actual.work, PROOF_WORK);
+        assert_eq!(receipt.actual.allocations, 0);
+        assert_eq!(receipt.actual.copied_bytes, 0);
+        assert_eq!(receipt.actual.live_construction_bytes, 0);
+        assert!(receipt.authenticates_canonical());
+    }
+
+    #[test]
+    fn single_capture_selector_requires_a_strong_or_short_complementary_proof() {
         let hir = parse_bytes(r"cargo/registry/src/[^/]+/([a-z]+)-([0-9.]+)/");
         let selector = CompiledRegex::from_hir_erasing_captures_for_whole_match(
             &hir,
@@ -7251,7 +8283,64 @@ mod tests {
         .unwrap();
         assert_eq!(ordinary.compile_accounting().candidate_entries, 0);
 
-        for pattern in [r"short([a-z]+)", r"[a-z]+suffix"] {
+        let complementary_pattern = r#"(?:(?:alpha|beta|nil|true|\d|["'\\+])+\)*;?((?:\s|-|~|!|\{\}|\|\||\+)*.*(?:.*=.*)))"#;
+        let complementary_hir = parse_bytes(complementary_pattern);
+        let complementary = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &complementary_hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let complementary_accounting = complementary.compile_accounting();
+        assert_eq!(complementary_accounting.candidate_entries, 1);
+        assert!(complementary_accounting.candidate_bytes > 0);
+        let plan = complementary.candidate.as_ref().unwrap();
+        assert!(!candidate::has_complete_shared_fixed_filter(plan));
+        assert!(plan.fixed_continuation().is_some());
+        assert!(plan.max_offset() <= candidate::MAX_FILTER_CHECKS);
+        assert_eq!(plan.global_buckets[usize::from(b'=')], 1);
+        assert_eq!(plan.buckets[usize::from(b'=')], 0);
+        let exact = CompileLimits {
+            max_program_bytes: complementary_accounting
+                .program_bytes
+                .max(complementary_accounting.construction_peak_bytes),
+            max_work: complementary_accounting.work,
+            ..CompileLimits::default()
+        };
+        let replay = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &complementary_hir,
+            RustByteProfile::PINNED_1_12_4,
+            exact,
+        )
+        .unwrap();
+        assert_eq!(replay.compile_accounting(), complementary_accounting);
+        assert_eq!(replay.plan_id(), complementary.plan_id());
+        assert!(matches!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &complementary_hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_work: complementary_accounting.work - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+
+        for pattern in [
+            r"short([a-z]+)",
+            r"[a-z]+suffix",
+            r"(?:alpha|beta)+(?:x|y)",
+            r"(?:alpha|beta)+.*(?:=.*)?",
+            r"(?:(?:q|eeeeeeeeez))+.*=.*",
+            r"(?:(?:a|ab)+\)*;?((?:\s|-)*.*(?:.*=.*)))",
+            r"(?:(?:alpha|beta)+?\)*;?((?:\s|-)*.*(?:.*=.*)))",
+            r"(?:(?:alpha|beta)+\)*;?((?:\s|  )*.*(?:.*=.*)))",
+            r"(?:(?:alpha|beta)+\)*((?:\s|-)*.*(?:.*=.*)))",
+        ] {
             let weak = CompiledRegex::from_hir_erasing_captures_for_whole_match(
                 &parse_bytes(pattern),
                 RustByteProfile::PINNED_1_12_4,
@@ -7260,6 +8349,20 @@ mod tests {
             .unwrap();
             assert_eq!(weak.compile_accounting().candidate_entries, 0, "{pattern}");
         }
+
+        let unicode_hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .build()
+            .parse(complementary_pattern)
+            .unwrap();
+        let unicode = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &unicode_hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(unicode.compile_accounting().candidate_entries, 0);
     }
 
     #[test]
@@ -7395,6 +8498,94 @@ mod tests {
         assert_eq!(
             budget.current_construction_bytes,
             plan.retained_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn fixed_continuation_allocation_receipts_cover_tokens_and_tagged_proof() {
+        let pattern = r#"(?:(?:alpha|beta|nil|true|\d|["'\\+])+\)*;?((?:\s|-|~|!|\{\}|\|\||\+)*.*(?:.*=.*)))"#;
+        let hir = parse_bytes(pattern);
+        let mut census_budget = CompileBudget::new(CompileLimits::default());
+        let census = build_candidate_plan(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::EraseForWholeMatch,
+            &mut census_budget,
+        )
+        .unwrap()
+        .unwrap();
+        let fixed = census.fixed_continuation().unwrap();
+        let token_bytes =
+            fixed.tokens.len() * core::mem::size_of::<candidate::FixedContinuationToken>();
+        let leading_token_bytes =
+            fixed.leading_tokens.len() * core::mem::size_of::<candidate::FixedContinuationToken>();
+        let retained_bytes = census.retained_bytes().unwrap();
+        drop(census);
+
+        let draft_bytes = core::mem::size_of::<CandidateDraft>();
+        let entry_bytes = core::mem::size_of::<CandidateEntry>();
+        let bucket_bytes = candidate::bucket_count() * core::mem::size_of::<u128>();
+        let base = draft_bytes + entry_bytes + 2 * bucket_bytes;
+        let expected_live = [
+            0,
+            draft_bytes,
+            draft_bytes + entry_bytes,
+            draft_bytes + entry_bytes + bucket_bytes,
+            base,
+            base + token_bytes,
+            base + token_bytes + leading_token_bytes,
+        ];
+        for (ordinal, expected_live) in expected_live.into_iter().enumerate() {
+            let mut budget = CompileBudget::new_construction_receipt(
+                CompileLimits::default(),
+                Some(AllocationScope {
+                    limit: 7,
+                    prospective: 7,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let error = build_candidate_plan(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::EraseForWholeMatch,
+                &mut budget,
+            )
+            .unwrap_err();
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.actual_allocated_bytes, expected_live);
+            assert_eq!(budget.actual_initialized_bytes, expected_live);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+
+        let mut budget = CompileBudget::new_construction_receipt(
+            CompileLimits::default(),
+            Some(AllocationScope {
+                limit: 7,
+                prospective: 7,
+            }),
+        );
+        let plan = build_candidate_plan(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::EraseForWholeMatch,
+            &mut budget,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(budget.actual_allocations, 7);
+        assert_eq!(budget.actual_allocated_bytes, retained_bytes + draft_bytes);
+        assert_eq!(
+            budget.actual_initialized_bytes,
+            retained_bytes + draft_bytes
+        );
+        assert_eq!(plan.retained_bytes().unwrap(), retained_bytes);
+        assert_eq!(budget.current_construction_bytes, retained_bytes);
+        assert_eq!(
+            budget.accounting.construction_peak_bytes,
+            retained_bytes + draft_bytes
         );
     }
 

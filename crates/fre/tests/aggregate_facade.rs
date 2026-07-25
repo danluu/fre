@@ -639,7 +639,7 @@ fn assert_continuation_certificate_preserves_prospective(
 
 #[test]
 fn operation_specific_continuation_facades_match_rust_for_directed_global_sequences() {
-    let cases: [(&str, &[u8], bool); 15] = [
+    let cases: [(&str, &[u8], bool); 16] = [
         ("", b"", false),
         ("", b"ab", false),
         ("a*?", b"aa", false),
@@ -654,6 +654,11 @@ fn operation_specific_continuation_facades_match_rust_for_directed_global_sequen
         (r"\b{start}[a-z]+\b{end}", b"_alpha beta!gamma42", false),
         (r"(?m:^sherlock$)", b"sherlock\nnot\nsherlock\n", false),
         (r"(?P<word>[a-z]+)", b"ab  c", false),
+        (
+            r"(?:(?:alpha|beta|nil|\d)+\)*;?((?:\s|-)*.*(?:.*:.*)))",
+            b"alpha \n x:y\nmiss\nbeta z:w",
+            false,
+        ),
         ("sherlock", b"SHERLOCK sherlock", true),
     ];
 

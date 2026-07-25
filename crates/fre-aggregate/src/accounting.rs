@@ -73,7 +73,8 @@ pub struct CompileAccounting {
     /// Direct root alternatives covered by the retained candidate scheduler.
     /// Zero preserves the established dense continuation route.
     pub candidate_entries: usize,
-    /// Exact retained bytes for candidate entries and first-byte buckets.
+    /// Exact retained bytes for candidate entries, first-byte buckets, and
+    /// any certified fixed-continuation descriptor and token tables.
     pub candidate_bytes: usize,
     /// Bytes in the retained inline whole-match minimum-width proof.
     ///

@@ -1,14 +1,16 @@
-//! HIR-certified candidate scheduling for large ordered byte programs.
+//! HIR-certified candidate reduction for large ordered byte programs.
 //!
 //! Compilation proves that every match owned by an entry consumes a byte from
 //! one retained bucket at an offset in a closed interval. Execution scans the
 //! source once, schedules only those bounded start intervals, and verifies
-//! each possible owner with the original prioritized program. The certificate
-//! is an execution hint: the program remains the sole semantic authority.
+//! each possible owner with the original prioritized program. A separate
+//! complete fixed-continuation HIR theorem admits two equivalent endpoint
+//! recurrences without program replay; every shape outside that theorem keeps
+//! the original program as semantic authority.
 
 use core::{mem::size_of, ops::Range};
 
-use fre_exact_alloc::{CopyError, ExactVec};
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
 
 use crate::accounting::ExecutionAccounting;
 use crate::error::{add, enforce, mul};
@@ -19,6 +21,7 @@ pub(crate) const MAX_ENTRIES: usize = 128;
 pub(crate) const MAX_OFFSET: usize = 4_096;
 const BUCKETS: usize = 256;
 pub(crate) const MAX_FILTER_CHECKS: usize = 7;
+pub(crate) const MAX_FIXED_CONTINUATION_TOKEN_BYTES: usize = 16;
 const SHAPE_OFFSET_RADIX: usize = 8_192;
 #[cfg(target_pointer_width = "64")]
 const SHAPE_LENGTH_RADIX: usize = SHAPE_OFFSET_RADIX;
@@ -61,25 +64,113 @@ pub(crate) struct Entry {
     pub(crate) global_check_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FixedContinuationToken {
+    Literal {
+        bytes: [u8; MAX_FIXED_CONTINUATION_TOKEN_BYTES],
+        len: u8,
+    },
+    Class(ByteSet),
+}
+
+impl FixedContinuationToken {
+    pub(crate) fn literal(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.is_empty() || bytes.len() > MAX_FIXED_CONTINUATION_TOKEN_BYTES {
+            return Err(Error::InternalInvariant(
+                "fixed-continuation literal outside certified width",
+            ));
+        }
+        let mut retained = [0_u8; MAX_FIXED_CONTINUATION_TOKEN_BYTES];
+        retained[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self::Literal {
+            bytes: retained,
+            len: u8::try_from(bytes.len()).map_err(|_| {
+                Error::InternalInvariant("fixed-continuation literal length exceeds u8")
+            })?,
+        })
+    }
+
+    pub(crate) const fn class(bytes: ByteSet) -> Self {
+        Self::Class(bytes)
+    }
+
+    pub(crate) fn comparison_bytes(self) -> usize {
+        match self {
+            Self::Literal { len, .. } => usize::from(len),
+            Self::Class(_) => 1,
+        }
+    }
+}
+
+/// Complete byte-language proof for
+/// `T+ C* S? (P* D* D* A D*)`.
+///
+/// `T` and `P` are construction-proved deterministic, prefix-free token
+/// languages, `C`/`S` are fixed punctuation, `D` is one byte class, and `A`
+/// is a mandatory byte in `D` but outside every `T` first-byte set. Captures
+/// are erased for whole-match reduction. These facts make the prioritized
+/// greedy program equivalent to two backward endpoint recurrences; the
+/// original continuation remains the fallback whenever any fact is absent.
+#[derive(Debug)]
+pub(crate) struct FixedContinuation {
+    pub(crate) tokens: ExactVec<FixedContinuationToken>,
+    pub(crate) leading_tokens: ExactVec<FixedContinuationToken>,
+    pub(crate) body: ByteSet,
+    pub(crate) anchor: u8,
+    pub(crate) close: u8,
+    pub(crate) semicolon: u8,
+    pub(crate) comparison_work: usize,
+    pub(crate) comparison_bytes: usize,
+    pub(crate) leading_comparison_work: usize,
+    pub(crate) leading_comparison_bytes: usize,
+    pub(crate) shape: usize,
+}
+
+impl FixedContinuation {
+    fn retained_bytes(&self) -> Result<usize, Error> {
+        let tokens = mul(
+            self.tokens.len(),
+            size_of::<FixedContinuationToken>(),
+            Resource::ProgramBytes,
+        )?;
+        add(
+            tokens,
+            mul(
+                self.leading_tokens.len(),
+                size_of::<FixedContinuationToken>(),
+                Resource::ProgramBytes,
+            )?,
+            Resource::ProgramBytes,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub(crate) entries: ExactVec<Entry>,
     pub(crate) buckets: ExactVec<u128>,
     pub(crate) global_buckets: ExactVec<u128>,
-    pub(crate) shape: usize,
+    pub(crate) shape: ExactBoxOrUsize<FixedContinuation>,
 }
 
 impl Plan {
+    fn packed_shape(&self) -> usize {
+        self.shape
+            .as_usize()
+            .or_else(|| self.shape.boxed().map(|fixed| fixed.shape))
+            .expect("candidate tagged shape always retains one variant")
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "construction proves the packed shape is a sum of disjoint fields below the nonzero offset radix"
     )]
-    pub(crate) const fn max_offset(&self) -> usize {
-        self.shape % SHAPE_OFFSET_RADIX
+    pub(crate) fn max_offset(&self) -> usize {
+        self.packed_shape() % SHAPE_OFFSET_RADIX
     }
 
-    pub(crate) const fn has_shared_fixed(&self) -> bool {
-        self.shape >= SHAPE_OFFSET_RADIX
+    pub(crate) fn has_shared_fixed(&self) -> bool {
+        self.packed_shape() >= SHAPE_OFFSET_RADIX
     }
 
     fn shared_fixed(&self) -> Result<Option<SharedFixedAnchors>, Error> {
@@ -95,7 +186,7 @@ impl Plan {
         #[cfg(target_pointer_width = "64")]
         {
             let len = self
-                .shape
+                .packed_shape()
                 .checked_div(SHAPE_LENGTH_RADIX)
                 .and_then(|value| value.checked_rem(4))
                 .ok_or(Error::InternalInvariant(
@@ -109,7 +200,7 @@ impl Plan {
             let mut bytes = [0_u8; 3];
             for (byte, radix) in bytes.iter_mut().zip(SHAPE_BYTE_RADICES) {
                 let value = self
-                    .shape
+                    .packed_shape()
                     .checked_div(radix)
                     .and_then(|value| value.checked_rem(256))
                     .ok_or(Error::InternalInvariant(
@@ -134,7 +225,7 @@ impl Plan {
             self.global_buckets.len(),
             Resource::ProgramBytes,
         )?;
-        add(
+        let ordinary = add(
             mul(
                 self.entries.len(),
                 size_of::<Entry>(),
@@ -142,7 +233,19 @@ impl Plan {
             )?,
             mul(buckets, size_of::<u128>(), Resource::ProgramBytes)?,
             Resource::ProgramBytes,
-        )
+        )?;
+        let fixed = self.fixed_continuation().map_or(Ok(0), |fixed| {
+            add(
+                size_of::<FixedContinuation>(),
+                fixed.retained_bytes()?,
+                Resource::ProgramBytes,
+            )
+        })?;
+        add(ordinary, fixed, Resource::ProgramBytes)
+    }
+
+    pub(crate) fn fixed_continuation(&self) -> Option<&FixedContinuation> {
+        self.shape.boxed()
     }
 }
 
@@ -177,6 +280,28 @@ pub(crate) fn exact_entries(capacity: usize) -> Result<ExactVec<Entry>, Error> {
 pub(crate) fn exact_buckets() -> Result<ExactVec<u128>, Error> {
     ExactVec::try_with_capacity(BUCKETS)
         .map_err(|error| allocation_error(error, Resource::ProgramBytes, BUCKETS))
+}
+
+pub(crate) fn exact_fixed_continuation_tokens(
+    capacity: usize,
+) -> Result<ExactVec<FixedContinuationToken>, Error> {
+    ExactVec::try_with_capacity(capacity)
+        .map_err(|error| allocation_error(error, Resource::ProgramBytes, capacity))
+}
+
+pub(crate) fn exact_fixed_continuation(
+    fixed: FixedContinuation,
+) -> Result<ExactBoxOrUsize<FixedContinuation>, Error> {
+    ExactBoxOrUsize::try_from_boxed(fixed)
+        .map_err(|error| allocation_error(error, Resource::ProgramBytes, 1))
+}
+
+pub(crate) fn inline_candidate_shape(
+    shape: usize,
+) -> Result<ExactBoxOrUsize<FixedContinuation>, Error> {
+    ExactBoxOrUsize::try_from_usize(shape).map_err(|_| {
+        Error::InternalInvariant("candidate packed shape exceeds its object-neutral tagged word")
+    })
 }
 
 pub(crate) const fn bucket_count() -> usize {
@@ -233,6 +358,13 @@ pub(crate) struct ReductionResult {
     pub(crate) accounting: ExecutionAccounting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixedContinuationUpper {
+    pub(crate) work: usize,
+    pub(crate) random_access_bytes_read: usize,
+    pub(crate) scratch_bytes: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReductionAttemptError {
     pub(crate) source: Error,
@@ -258,6 +390,7 @@ pub(crate) struct StartDomainAttemptError {
 }
 
 pub(crate) const START_DOMAIN_EXECUTION_ALLOCATIONS: usize = 4;
+pub(crate) const FIXED_CONTINUATION_EXECUTION_ALLOCATIONS: usize = 2;
 
 #[allow(
     clippy::too_many_lines,
@@ -299,6 +432,357 @@ pub(crate) fn count_attempt(
     limits: OperationLimits,
 ) -> Result<ReductionResult, ReductionAttemptError> {
     reduce_attempt(ReductionKind::Count, plan, program, haystack, range, limits)
+}
+
+pub(crate) fn fixed_continuation_upper(
+    plan: &FixedContinuation,
+    input_bytes: usize,
+    boundaries: usize,
+) -> Result<FixedContinuationUpper, Error> {
+    if plan.tokens.is_empty() || plan.leading_tokens.is_empty() || !plan.body.contains(plan.anchor)
+    {
+        return Err(Error::InternalInvariant(
+            "fixed-continuation plan lost its nonempty token or body proof",
+        ));
+    }
+    let initialization = mul(boundaries, 2, Resource::ExecutionWork)?;
+    let per_byte = add(
+        6,
+        add(
+            plan.leading_comparison_work,
+            mul(2, plan.comparison_work, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+        Resource::ExecutionWork,
+    )?;
+    let traversal = mul(input_bytes, per_byte, Resource::ExecutionWork)?;
+    let publications = mul(boundaries, 2, Resource::ExecutionWork)?;
+    let work = add(
+        add(initialization, traversal, Resource::ExecutionWork)?,
+        publications,
+        Resource::ExecutionWork,
+    )?;
+    let random_per_byte = add(
+        1,
+        add(
+            plan.leading_comparison_bytes,
+            mul(2, plan.comparison_bytes, Resource::RandomAccessBytes)?,
+            Resource::RandomAccessBytes,
+        )?,
+        Resource::RandomAccessBytes,
+    )?;
+    let random_access_bytes_read = mul(input_bytes, random_per_byte, Resource::RandomAccessBytes)?;
+    let scratch_bytes = mul(
+        mul(boundaries, 2, Resource::ScratchBytes)?,
+        size_of::<usize>(),
+        Resource::ScratchBytes,
+    )?;
+    Ok(FixedContinuationUpper {
+        work,
+        random_access_bytes_read,
+        scratch_bytes,
+    })
+}
+
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    reason = "the certified reducer keeps source traversal, token probes and every terminal ledger update visible"
+)]
+pub(crate) fn reduce_fixed_continuation_attempt(
+    kind: ReductionKind,
+    plan: &FixedContinuation,
+    haystack: &[u8],
+    range: Range<usize>,
+    limits: OperationLimits,
+) -> Result<ReductionResult, ReductionAttemptError> {
+    if range.start > range.end || range.end > haystack.len() {
+        return Err(ReductionAttemptError {
+            source: Error::InvalidRange {
+                start: range.start,
+                end: range.end,
+                haystack_len: haystack.len(),
+            },
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        });
+    }
+    if plan.tokens.is_empty() || plan.leading_tokens.is_empty() || !plan.body.contains(plan.anchor)
+    {
+        return Err(ReductionAttemptError {
+            source: Error::InternalInvariant(
+                "fixed-continuation plan no longer matches its byte proof",
+            ),
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        });
+    }
+    let local = &haystack[range.clone()];
+    let boundaries =
+        add(local.len(), 1, Resource::Boundaries).map_err(|source| ReductionAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        })?;
+    enforce(boundaries, limits.max_boundaries, Resource::Boundaries).map_err(|source| {
+        ReductionAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        }
+    })?;
+
+    let upper = fixed_continuation_upper(plan, local.len(), boundaries).map_err(|source| {
+        ReductionAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        }
+    })?;
+    enforce(
+        upper.scratch_bytes,
+        limits.max_random_access_bytes,
+        Resource::RandomAccessBytes,
+    )
+    .and_then(|()| {
+        enforce(
+            upper.scratch_bytes,
+            limits.max_scratch_bytes,
+            Resource::ScratchBytes,
+        )
+    })
+    .and_then(|()| {
+        enforce(
+            upper.scratch_bytes,
+            limits.max_peak_bytes,
+            Resource::PeakBytes,
+        )
+    })
+    .map_err(|source| ReductionAttemptError {
+        source,
+        accounting: ExecutionAccounting::default(),
+        actual_allocations: 0,
+    })?;
+
+    let mut meter = Meter::new(limits);
+    let mut allocations = AllocationLedger::default();
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    let mut candidates = 0_usize;
+    let result = (|| {
+        meter.charge_work(mul(boundaries, 2, Resource::ExecutionWork)?)?;
+        let mut suffix = exact_filled(
+            boundaries,
+            usize::MAX,
+            Resource::ScratchBytes,
+            &mut allocations,
+        )?;
+        let mut continuation = exact_filled(
+            boundaries,
+            usize::MAX,
+            Resource::ScratchBytes,
+            &mut allocations,
+        )?;
+
+        let mut body_end = local.len();
+        let mut body_anchor = None;
+        let mut next_was_body = false;
+        for position in (0..local.len()).rev() {
+            meter.charge_work(2)?; // reverse visit and body/anchor update
+            meter.charge_sequential(1)?;
+            let byte = *local.get(position).ok_or(Error::InternalInvariant(
+                "fixed-continuation suffix scan left its source",
+            ))?;
+            let base = if plan.body.contains(byte) {
+                if !next_was_body {
+                    body_end = add(position, 1, Resource::Boundaries)?;
+                    body_anchor = None;
+                }
+                if byte == plan.anchor {
+                    body_anchor = Some(position);
+                }
+                next_was_body = true;
+                body_anchor.map(|_| body_end)
+            } else {
+                next_was_body = false;
+                body_anchor = None;
+                None
+            };
+            let greedy = first_token_end(&plan.leading_tokens, local, position, &mut meter)?
+                .and_then(|end| suffix.get(end).copied())
+                .filter(|&end| end != usize::MAX);
+            suffix[position] = greedy.or(base).unwrap_or(usize::MAX);
+        }
+
+        for position in (0..local.len()).rev() {
+            meter.charge_work(2)?; // punctuation visit and greedy branch
+            meter.charge_random(1)?;
+            let byte = local[position];
+            let suffix_here = suffix[position];
+            let next_position = add(position, 1, Resource::Boundaries)?;
+            let semicolon = if byte == plan.semicolon {
+                suffix[next_position]
+            } else {
+                usize::MAX
+            };
+            let after_semicolon = if semicolon == usize::MAX {
+                suffix_here
+            } else {
+                semicolon
+            };
+            let closes = if byte == plan.close {
+                continuation[next_position]
+            } else {
+                usize::MAX
+            };
+            continuation[position] = if closes == usize::MAX {
+                after_semicolon
+            } else {
+                closes
+            };
+        }
+
+        for position in (0..local.len()).rev() {
+            meter.charge_work(1)?;
+            let greedy = first_token_end(&plan.tokens, local, position, &mut meter)?
+                .and_then(|end| continuation.get(end).copied())
+                .filter(|&end| end != usize::MAX);
+            if let Some(endpoint) = greedy {
+                continuation[position] = endpoint;
+            }
+        }
+
+        let mut cursor = 0_usize;
+        while cursor < local.len() {
+            meter.charge_work(1)?;
+            let required_candidates = add(candidates, 1, Resource::MatchEvents)?;
+            enforce(
+                required_candidates,
+                limits.max_match_events,
+                Resource::MatchEvents,
+            )?;
+            candidates = required_candidates;
+            let candidate_endpoint = first_token_end(&plan.tokens, local, cursor, &mut meter)?
+                .and_then(|end| continuation.get(end).copied())
+                .filter(|&end| end != usize::MAX);
+            let Some(endpoint) = candidate_endpoint else {
+                cursor = add(cursor, 1, Resource::Boundaries)?;
+                continue;
+            };
+            if endpoint <= cursor || endpoint > local.len() {
+                return Err(Error::InternalInvariant(
+                    "fixed-continuation endpoint outside its nonempty range",
+                ));
+            }
+            meter.charge_work(2)?; // success and output publication
+            let required_matches = add(matches, 1, Resource::OutputMatches)?;
+            enforce(
+                required_matches,
+                limits.max_output_matches,
+                Resource::OutputMatches,
+            )?;
+            let required_span_sum = match kind {
+                ReductionKind::Count => span_sum,
+                ReductionKind::SpanSum => {
+                    let width = endpoint
+                        .checked_sub(cursor)
+                        .ok_or(Error::InternalInvariant(
+                            "fixed-continuation endpoint precedes start",
+                        ))?;
+                    let required = add(span_sum, width, Resource::SpanSum)?;
+                    enforce(required, limits.max_span_sum, Resource::SpanSum)?;
+                    required
+                }
+            };
+            matches = required_matches;
+            span_sum = required_span_sum;
+            cursor = endpoint;
+        }
+        if allocations.bytes != upper.scratch_bytes {
+            return Err(Error::InternalInvariant(
+                "fixed-continuation workspace differs from its proof",
+            ));
+        }
+        if allocations.count != FIXED_CONTINUATION_EXECUTION_ALLOCATIONS {
+            return Err(Error::InternalInvariant(
+                "fixed-continuation allocation census changed",
+            ));
+        }
+        Ok(())
+    })();
+    let accounting = candidate_attempt_accounting(&meter, allocations.bytes, candidates, matches);
+    match result {
+        Ok(()) => Ok(ReductionResult {
+            matches,
+            span_sum,
+            candidates,
+            accounting,
+        }),
+        Err(source) => Err(ReductionAttemptError {
+            source,
+            accounting,
+            actual_allocations: allocations.count,
+        }),
+    }
+}
+
+fn first_token_end(
+    tokens: &[FixedContinuationToken],
+    haystack: &[u8],
+    start: usize,
+    meter: &mut Meter,
+) -> Result<Option<usize>, Error> {
+    for &token in tokens {
+        meter.charge_work(1)?; // ordered token dispatch
+        if let Some(end) = token_end(token, haystack, start, meter)? {
+            return Ok(Some(end));
+        }
+    }
+    Ok(None)
+}
+
+fn token_end(
+    token: FixedContinuationToken,
+    haystack: &[u8],
+    start: usize,
+    meter: &mut Meter,
+) -> Result<Option<usize>, Error> {
+    match token {
+        FixedContinuationToken::Literal { bytes, len } => {
+            let len = usize::from(len);
+            for (offset, &expected) in bytes[..len].iter().enumerate() {
+                meter.charge_work(1)?;
+                let Some(position) = start.checked_add(offset) else {
+                    return Ok(None);
+                };
+                let Some(&actual) = haystack.get(position) else {
+                    return Ok(None);
+                };
+                meter.charge_random(1)?;
+                if actual != expected {
+                    return Ok(None);
+                }
+            }
+            start
+                .checked_add(len)
+                .map(Some)
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::Boundaries,
+                })
+        }
+        FixedContinuationToken::Class(bytes) => {
+            meter.charge_work(1)?;
+            let Some(&byte) = haystack.get(start) else {
+                return Ok(None);
+            };
+            meter.charge_random(1)?;
+            if bytes.contains(byte) {
+                add(start, 1, Resource::Boundaries).map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[allow(
@@ -1564,7 +2048,7 @@ mod tests {
         clippy::arithmetic_side_effects,
         reason = "the fixed field count restates the object-neutral candidate plan layout"
     )]
-    fn candidate_plan_keeps_route_metadata_in_the_existing_shape_word() {
+    fn candidate_plan_retains_fixed_continuation_metadata_explicitly() {
         assert_eq!(
             size_of::<Plan>(),
             size_of::<ExactVec<Entry>>() * 3 + size_of::<usize>()

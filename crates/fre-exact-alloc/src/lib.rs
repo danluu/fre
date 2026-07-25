@@ -5,7 +5,8 @@
 use core::{
     alloc::Layout,
     fmt,
-    mem::size_of,
+    marker::PhantomData,
+    mem::{align_of, size_of},
     ops::{Deref, DerefMut},
     ptr,
 };
@@ -30,6 +31,92 @@ impl fmt::Display for CopyError {
 }
 
 impl std::error::Error for CopyError {}
+
+/// One word containing either an inline `usize` or one fallibly allocated
+/// initialized value.
+///
+/// Even words encode the integer shifted left by one. Odd words own an
+/// aligned allocation whose exposed address has its otherwise-zero low bit
+/// set. This lets object-neutral compiler plans retain a large optional proof
+/// without invoking Rust's infallible allocation-error handler.
+pub struct ExactBoxOrUsize<T> {
+    encoded: usize,
+    marker: PhantomData<T>,
+}
+
+impl<T> ExactBoxOrUsize<T> {
+    /// Retain an inline integer when its one-bit tag shift is representable.
+    pub fn try_from_usize(value: usize) -> Result<Self, CopyError> {
+        value
+            .checked_mul(2)
+            .map(|encoded| Self {
+                encoded,
+                marker: PhantomData,
+            })
+            .ok_or(CopyError::LayoutOverflow)
+    }
+
+    /// Allocate exactly one `T` and retain it behind the tagged word.
+    pub fn try_from_boxed(value: T) -> Result<Self, CopyError> {
+        exact_box_or_usize_with(value, false)
+    }
+
+    /// Return the inline integer, or `None` when this word owns a value.
+    #[must_use]
+    pub const fn as_usize(&self) -> Option<usize> {
+        if self.encoded & 1 == 0 {
+            Some(self.encoded >> 1)
+        } else {
+            None
+        }
+    }
+
+    /// Borrow the owned value, or `None` when this word contains an integer.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the tagged word recovers only the exposed provenance of its live owned allocation"
+    )]
+    pub fn boxed(&self) -> Option<&T> {
+        if self.encoded & 1 == 0 {
+            return None;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: the odd variant is created only from the exposed address of
+        // a live, aligned `Box<T>` allocation retained exclusively by `self`.
+        unsafe { ptr::with_exposed_provenance::<T>(address).as_ref() }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for ExactBoxOrUsize<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.as_usize(), self.boxed()) {
+            (Some(value), None) => formatter.debug_tuple("Usize").field(&value).finish(),
+            (None, Some(value)) => formatter.debug_tuple("Boxed").field(value).finish(),
+            _ => formatter.write_str("InvalidExactBoxOrUsize"),
+        }
+    }
+}
+
+impl<T> Drop for ExactBoxOrUsize<T> {
+    #[allow(
+        unsafe_code,
+        reason = "the tagged word reconstructs its uniquely owned exact allocation for one drop"
+    )]
+    fn drop(&mut self) {
+        if self.encoded & 1 == 0 {
+            return;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: this object uniquely owns the allocation encoded by the odd
+        // variant, and Drop runs exactly once.
+        unsafe {
+            drop(Box::from_raw(ptr::with_exposed_provenance_mut::<T>(
+                address,
+            )));
+        }
+    }
+}
 
 /// Fallible, exact-layout storage for incrementally initialized values.
 ///
@@ -150,6 +237,39 @@ impl<'a, T> IntoIterator for &'a mut ExactVec<T> {
 
 #[allow(
     unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout single-value allocation boundary"
+)]
+fn exact_box_or_usize_with<T>(
+    value: T,
+    force_failure: bool,
+) -> Result<ExactBoxOrUsize<T>, CopyError> {
+    if size_of::<T>() == 0 || align_of::<T>() < 2 {
+        return Err(CopyError::LayoutOverflow);
+    }
+    let layout = Layout::new::<T>();
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+    // SAFETY: `alloc` returned a fresh allocation for exactly one `T`.
+    // Writing initializes that object. Its exposed address retains recoverable
+    // provenance, and alignment proves the low tag bit was zero.
+    unsafe {
+        let typed = allocation.cast::<T>();
+        typed.write(value);
+        Ok(ExactBoxOrUsize {
+            encoded: typed.expose_provenance() | 1,
+            marker: PhantomData,
+        })
+    }
+}
+
+#[allow(
+    unsafe_code,
     reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
 )]
 fn exact_vec_with_capacity<T>(
@@ -253,8 +373,8 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use super::{
-        CopyError, ExactVec, copy_exact, copy_exact_with, exact_vec_with_capacity, zeroed_exact,
-        zeroed_exact_with,
+        CopyError, ExactBoxOrUsize, ExactVec, copy_exact, copy_exact_with, exact_box_or_usize_with,
+        exact_vec_with_capacity, zeroed_exact, zeroed_exact_with,
     };
 
     #[derive(Debug)]
@@ -265,6 +385,33 @@ mod tests {
             self.0
                 .set(self.0.get().checked_add(1).expect("two test drops fit"));
         }
+    }
+
+    #[test]
+    fn non_copy_single_value_uses_one_fallible_exact_allocation() {
+        assert_eq!(
+            size_of::<ExactBoxOrUsize<[usize; 64]>>(),
+            size_of::<usize>()
+        );
+        let inline = ExactBoxOrUsize::<DropSpy>::try_from_usize(17).unwrap();
+        assert_eq!(inline.as_usize(), Some(17));
+        assert!(inline.boxed().is_none());
+        let drops = Rc::new(Cell::new(0));
+        let value = ExactBoxOrUsize::try_from_boxed(DropSpy(Rc::clone(&drops))).unwrap();
+        assert!(value.as_usize().is_none());
+        assert!(value.boxed().is_some());
+        assert_eq!(drops.get(), 0);
+        drop(value);
+        assert_eq!(drops.get(), 1);
+        assert!(matches!(
+            exact_box_or_usize_with(DropSpy(Rc::clone(&drops)), true),
+            Err(CopyError::AllocationFailed)
+        ));
+        assert_eq!(drops.get(), 2);
+        assert!(matches!(
+            ExactBoxOrUsize::try_from_boxed(()),
+            Err(CopyError::LayoutOverflow)
+        ));
     }
 
     #[test]

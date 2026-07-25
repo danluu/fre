@@ -1015,10 +1015,9 @@ impl CompiledRegex {
             OperationPhysicalRoute::TerminalFrontierRows
         } else if !self.required_suffixes.is_empty() {
             if self.minimum_match_bytes.is_some_and(|minimum| minimum > 1)
-                && self
-                    .candidate
-                    .as_ref()
-                    .is_some_and(|_| candidate::executable_for(&self.program))
+                && self.candidate.as_ref().is_some_and(|plan| {
+                    plan.fixed_continuation().is_none() && candidate::executable_for(&self.program)
+                })
             {
                 OperationPhysicalRoute::Candidate
             } else {
@@ -2102,7 +2101,10 @@ impl CompiledRegex {
             Some(GenericCountRoute::Candidate)
                 if !OBSERVED_WORK
                     || strategy != Strategy::ReverseSequentialRows
-                    || self.candidate.is_none()
+                    || self
+                        .candidate
+                        .as_ref()
+                        .is_none_or(|plan| plan.fixed_continuation().is_some())
                     || !candidate::executable_for(&self.program) =>
             {
                 return Err(Error::InternalInvariant(
@@ -2231,6 +2233,41 @@ impl CompiledRegex {
                 prospective_observer,
             );
         }
+        if forced_generic_count_route.is_none()
+            && OBSERVED_WORK
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
+            && strategy == Strategy::ReverseSequentialRows
+            && self.terminal_frontier.is_empty()
+            && self.required_suffixes.is_empty()
+            && let Some(plan) = &self.candidate
+            && let Some(fixed) = plan.fixed_continuation()
+        {
+            let boundaries = add(local.len(), 1, Resource::Boundaries)?;
+            let candidate_work =
+                candidate::fixed_continuation_upper(fixed, local.len(), boundaries)?.work;
+            let dense_work_floor = dense_reduction_work_floor(&self.program, boundaries)?;
+            // The candidate quantity is a complete source-independent upper
+            // bound. The dense quantity is the unavoidable construction and
+            // scan work, excluding only optional replay. Publish the
+            // specialized route only when its worst case strictly beats that
+            // generic floor; equality and every unproved shape retain the
+            // generic continuation without a post-publication fallback.
+            if fixed_continuation_beats_dense(candidate_work, dense_work_floor) {
+                return self.execute_fixed_continuation_candidate::<OBSERVED_WORK>(
+                    fixed,
+                    local,
+                    range,
+                    strategy,
+                    kind,
+                    limits,
+                    attempt.as_mut(),
+                    accounting,
+                    actual_allocations,
+                    allocation_limit,
+                    prospective_observer,
+                );
+            }
+        }
         if matches!(
             forced_generic_count_route,
             None | Some(GenericCountRoute::Candidate)
@@ -2238,6 +2275,7 @@ impl CompiledRegex {
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.candidate
+            && plan.fixed_continuation().is_none()
             && candidate::executable_for(&self.program)
         {
             return self.execute_candidate(
@@ -3321,6 +3359,138 @@ impl CompiledRegex {
             spans: Vec::new(),
         })
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cost-selected proof route receives publication and terminal ledgers explicitly"
+    )]
+    fn execute_fixed_continuation_candidate<const OBSERVED_WORK: bool>(
+        &self,
+        plan: &candidate::FixedContinuation,
+        local: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+    ) -> Result<ExecutionResult, Error> {
+        let boundaries = add(local.len(), 1, Resource::Boundaries)?;
+        let mut prospective = fixed_continuation_candidate_prospective(
+            plan,
+            &self.program,
+            local.len(),
+            boundaries,
+            kind,
+        )?;
+        if attempt.is_some() && OBSERVED_WORK {
+            prospective.work_bound = prospective.work_bound.min(limits.max_work);
+            prospective.accounting.work = prospective.work_bound;
+        }
+        if let Some(publication) = attempt.as_mut() {
+            publication.identity.physical_route = Some(OperationPhysicalRoute::Candidate);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+        }
+        enforce(
+            candidate::FIXED_CONTINUATION_EXECUTION_ALLOCATIONS,
+            allocation_limit,
+            Resource::Allocations,
+        )?;
+        if attempt.is_some() {
+            prospective.enforce_limits(limits)?;
+        }
+        let reduction = match kind {
+            OperationKind::Count => candidate::ReductionKind::Count,
+            OperationKind::Sum => candidate::ReductionKind::SpanSum,
+            OperationKind::Spans => {
+                return Err(Error::InternalInvariant(
+                    "fixed-continuation candidate cannot materialize spans",
+                ));
+            }
+        };
+        let result = match candidate::reduce_fixed_continuation_attempt(
+            reduction,
+            plan,
+            local,
+            0..local.len(),
+            limits,
+        ) {
+            Ok(result) => result,
+            Err(failure) => {
+                *attempt_accounting = failure.accounting;
+                *actual_allocations = failure.actual_allocations;
+                return Err(failure.source);
+            }
+        };
+        *attempt_accounting = result.accounting;
+        *actual_allocations = candidate::FIXED_CONTINUATION_EXECUTION_ALLOCATIONS;
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_limits_id: operation_limits_identity(limits),
+            strategy,
+            operation: operation_attempt_kind(kind),
+            physical_route: OperationPhysicalRoute::Candidate,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: compact_operation_allocation_count(
+                candidate::FIXED_CONTINUATION_EXECUTION_ALLOCATIONS,
+            )?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
+            range,
+            states: self.program.insts.len(),
+            table_cells: 0,
+            row_storage: None,
+            row_record_bytes: 0,
+            terminal_frontier: false,
+            work_bound: result.accounting.work,
+            random_access_bytes: result.accounting.random_access_peak_bytes,
+            scratch_bytes: result.accounting.scratch_peak_bytes,
+            log_bytes: 0,
+            sequential_bytes_bound: result.accounting.sequential_bytes_read,
+            match_events: result.candidates,
+            output_matches: result.matches,
+            output_bytes: 0,
+            span_sum: result.span_sum,
+            peak_bytes: result.accounting.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting: result.accounting,
+            summary: ScanSummary {
+                matches: result.matches,
+                events: result.matches,
+                suppressed: 0,
+                span_sum: result.span_sum,
+            },
+            spans: Vec::new(),
+        })
+    }
+}
+
+fn dense_reduction_work_floor(program: &Program, boundaries: usize) -> Result<usize, Error> {
+    let per_boundary = add(
+        program.execution_state_work(),
+        usize::from(program.contains_scalar_transition()),
+        Resource::ExecutionWork,
+    )?;
+    let build = mul(per_boundary, boundaries, Resource::ExecutionWork)?;
+    let scan = mul(boundaries, 4, Resource::ExecutionWork)?;
+    add(build, scan, Resource::ExecutionWork)
+}
+
+const fn fixed_continuation_beats_dense(
+    candidate_work_upper: usize,
+    dense_work_floor: usize,
+) -> bool {
+    candidate_work_upper < dense_work_floor
 }
 
 fn state_byte_span_sum_prospective<const OBSERVED_WORK: bool>(
@@ -3796,6 +3966,54 @@ fn start_domain_prospective(
 }
 
 const CANDIDATE_EXECUTION_ALLOCATIONS: usize = 5;
+
+fn fixed_continuation_candidate_prospective(
+    plan: &candidate::FixedContinuation,
+    program: &Program,
+    input_bytes: usize,
+    boundaries: usize,
+    kind: OperationKind,
+) -> Result<OperationProspective, Error> {
+    let upper = candidate::fixed_continuation_upper(plan, input_bytes, boundaries)?;
+    let output_matches = input_bytes;
+    let span_sum = if kind == OperationKind::Sum {
+        input_bytes
+    } else {
+        0
+    };
+    let accounting = ExecutionAccounting {
+        root_probes: input_bytes,
+        successful_paths: output_matches,
+        emitted_matches: output_matches,
+        sequential_bytes_read: input_bytes,
+        random_access_bytes_read: upper.random_access_bytes_read,
+        random_access_peak_bytes: upper.scratch_bytes,
+        scratch_peak_bytes: upper.scratch_bytes,
+        peak_bytes: upper.scratch_bytes,
+        work: upper.work,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states: program.insts.len(),
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound: upper.work,
+        random_access_bytes: upper.scratch_bytes,
+        scratch_bytes: upper.scratch_bytes,
+        log_bytes: 0,
+        sequential_bytes: input_bytes,
+        match_events: input_bytes,
+        output_matches,
+        output_bytes: 0,
+        span_sum,
+        allocations: candidate::FIXED_CONTINUATION_EXECUTION_ALLOCATIONS,
+        peak_bytes: upper.scratch_bytes,
+        accounting,
+    })
+}
 
 fn candidate_prospective(
     plan: &candidate::Plan,
@@ -8707,8 +8925,9 @@ mod tests {
         OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
         Requirements, RowReader, RowStorage, RowStore, UNCACHED_FRONTIER, allocation_fault,
         cached_boundary_symbol, cached_compute_row, cached_frontier_words,
-        cached_program_assertion_mask, compact_operation_allocation_count, decode, encoded_width,
-        exact_filled, operation_identity, read_encoded, write_encoded,
+        cached_program_assertion_mask, compact_operation_allocation_count, decode,
+        dense_reduction_work_floor, encoded_width, exact_filled, fixed_continuation_beats_dense,
+        operation_identity, read_encoded, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -11567,6 +11786,448 @@ mod tests {
         assert_eq!(refusal.receipt.prospective, Some(prospective));
         assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(refusal.receipt.actual_allocations, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed theorem's semantics, route, limits and receipts form one directed matrix"
+    )]
+    fn fixed_continuation_candidate_preserves_priority_lf_and_exact_receipts() {
+        let pattern = r#"(?:(?:alpha|beta|nil|true|\d|["'\\+])+\)*;?((?:\s|-|~|!|\{\}|\|\||\+)*.*(?:.*=.*)))"#;
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert!(plan.fixed_continuation().is_some());
+        let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let cases = [
+            b"alpha x=tail".as_slice(),
+            b"9nil+alpha))); x==tail".as_slice(),
+            b"alpha x".as_slice(),
+            b"alpha \n x=y\n".as_slice(),
+            b"alpha x\n=y".as_slice(),
+            b"alpha q\nbeta x=y".as_slice(),
+            b"alpha x=y\r\n".as_slice(),
+            b"beta \xff=\0".as_slice(),
+            b"alpha a=b\nno match\ntrue c=d".as_slice(),
+            b"nil ||=x=last".as_slice(),
+        ];
+        for haystack in cases {
+            let expected = oracle.find_iter(haystack).collect::<Vec<_>>();
+            let expected_sum = expected
+                .iter()
+                .map(|matched| matched.end() - matched.start())
+                .sum::<usize>();
+            let span_sum = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(span_sum.value, expected_sum, "{haystack:?}");
+            assert_eq!(
+                span_sum.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::Candidate),
+                "{haystack:?}"
+            );
+            assert_eq!(
+                span_sum.receipt.actual_allocations,
+                candidate::FIXED_CONTINUATION_EXECUTION_ALLOCATIONS
+            );
+            assert!(
+                span_sum
+                    .receipt
+                    .prospective
+                    .unwrap()
+                    .contains(span_sum.receipt.actual)
+            );
+            let count = compiled
+                .count_value_attempt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(count.value, expected.len(), "{haystack:?}");
+            let dense = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::FullTable,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(dense.value, expected_sum, "{haystack:?}");
+        }
+
+        // Preserve the release residual with a different token language and
+        // source: one complete 107-byte match must remain an exact SpanSum
+        // 107 on the fixed physical route.
+        let mut exact_residual_source = vec![b'x'; 107];
+        exact_residual_source[..8].copy_from_slice(b"alpha x=");
+        let exact_residual = compiled
+            .span_sum_value_with_receipt(
+                &exact_residual_source,
+                0..exact_residual_source.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(exact_residual.value, 107);
+        assert_eq!(
+            exact_residual.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::Candidate)
+        );
+
+        let haystack = b"alpha x=zz";
+        let no_match = b"qqqqqqqqqq";
+        assert_eq!(haystack.len(), no_match.len());
+        let result = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let absent = compiled
+            .span_sum_value_with_receipt(
+                no_match,
+                0..no_match.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(result.receipt.identity, absent.receipt.identity);
+        assert_eq!(result.receipt.prospective, absent.receipt.prospective);
+        let no_output_limits = OperationLimits {
+            max_output_matches: 0,
+            max_span_sum: 0,
+            ..OperationLimits::default()
+        };
+        assert_eq!(
+            compiled
+                .span_sum_value(
+                    no_match,
+                    0..no_match.len(),
+                    Strategy::ReverseSequentialRows,
+                    no_output_limits,
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            compiled
+                .count_value(
+                    no_match,
+                    0..no_match.len(),
+                    Strategy::ReverseSequentialRows,
+                    no_output_limits,
+                )
+                .unwrap(),
+            0
+        );
+
+        let exact_sum_work = OperationLimits {
+            max_work: result.receipt.actual.work,
+            ..OperationLimits::default()
+        };
+        assert_eq!(
+            compiled
+                .span_sum_value(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    exact_sum_work,
+                )
+                .unwrap(),
+            result.value
+        );
+        let exact_sum_receipt = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact_sum_work,
+            )
+            .unwrap();
+        assert_eq!(exact_sum_receipt.value, result.value);
+        assert_eq!(
+            exact_sum_receipt.receipt.prospective.unwrap().work_bound,
+            result.receipt.actual.work
+        );
+        let below_sum_work = OperationLimits {
+            max_work: result.receipt.actual.work - 1,
+            ..OperationLimits::default()
+        };
+        assert!(matches!(
+            compiled.span_sum_value(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                below_sum_work,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            })
+        ));
+        let below_sum_receipt = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                below_sum_work,
+            )
+            .unwrap_err();
+        assert_eq!(
+            below_sum_receipt.receipt.prospective.unwrap().work_bound,
+            result.receipt.actual.work - 1
+        );
+        assert!(below_sum_receipt.receipt.actual.work < result.receipt.actual.work);
+
+        let count = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let exact_count_work = OperationLimits {
+            max_work: count.receipt.actual.work,
+            ..OperationLimits::default()
+        };
+        assert_eq!(
+            compiled
+                .count_value(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    exact_count_work,
+                )
+                .unwrap(),
+            count.value
+        );
+        assert_eq!(
+            compiled
+                .count_value_attempt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    exact_count_work,
+                )
+                .unwrap()
+                .value,
+            count.value
+        );
+        let below_count_work = OperationLimits {
+            max_work: count.receipt.actual.work - 1,
+            ..OperationLimits::default()
+        };
+        assert!(matches!(
+            compiled.count_value(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                below_count_work,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            })
+        ));
+        let below_count_receipt = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                below_count_work,
+            )
+            .unwrap_err();
+        assert_eq!(
+            below_count_receipt.receipt.prospective.unwrap().work_bound,
+            count.receipt.actual.work - 1
+        );
+        assert!(below_count_receipt.receipt.actual.work < count.receipt.actual.work);
+
+        let prospective = result.receipt.prospective.unwrap();
+        let boundaries = haystack.len() + 1;
+        let dense_work_floor = dense_reduction_work_floor(&compiled.program, boundaries).unwrap();
+        let dense_requirements = Requirements::new::<true>(
+            &compiled.program,
+            boundaries,
+            Strategy::ReverseSequentialRows,
+            1,
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(dense_work_floor, dense_requirements.work_bound);
+        assert!(prospective.work_bound < dense_work_floor);
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: prospective.work_bound,
+        };
+        let replay = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact,
+            )
+            .unwrap();
+        assert_eq!(replay.value, result.value);
+        assert_eq!(replay.receipt.prospective, Some(prospective));
+
+        let refusal = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_scratch_bytes: prospective.scratch_bytes - 1,
+                    ..exact
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::ScratchBytes,
+                required: prospective.scratch_bytes,
+                limit: prospective.scratch_bytes - 1,
+            }
+        );
+        assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
+    }
+
+    #[test]
+    fn fixed_continuation_candidate_is_anchor_generic_on_exhaustive_short_sources() {
+        let pattern = r"(?:(?:ab|cd|\d)+\)*;?((?:\s|-)*.*(?:.*:.*)))";
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let fixed = compiled
+            .candidate
+            .as_ref()
+            .and_then(candidate::Plan::fixed_continuation)
+            .unwrap();
+        assert_eq!(fixed.anchor, b':');
+        let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let alphabet = [
+            b'a', b'b', b'c', b'd', b'0', b')', b';', b' ', b':', b'\n', b'x', 0xff,
+        ];
+        for len in 0_u32..=4 {
+            let cases = alphabet.len().pow(len);
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0_u8; usize::try_from(len).unwrap()];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = oracle.find_iter(&haystack).collect::<Vec<_>>();
+                let expected_sum = expected
+                    .iter()
+                    .map(|matched| matched.end() - matched.start())
+                    .sum::<usize>();
+                let span_sum = candidate::reduce_fixed_continuation_attempt(
+                    candidate::ReductionKind::SpanSum,
+                    fixed,
+                    &haystack,
+                    0..haystack.len(),
+                    OperationLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(span_sum.matches, expected.len(), "{haystack:?}");
+                assert_eq!(span_sum.span_sum, expected_sum, "{haystack:?}");
+                assert!(
+                    candidate::fixed_continuation_upper(fixed, haystack.len(), haystack.len() + 1)
+                        .unwrap()
+                        .work
+                        >= span_sum.accounting.work
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_continuation_cost_gate_requires_a_strict_proved_win() {
+        assert!(fixed_continuation_beats_dense(40, 41));
+        assert!(!fixed_continuation_beats_dense(40, 40));
+        assert!(!fixed_continuation_beats_dense(41, 40));
+    }
+
+    #[test]
+    fn fixed_continuation_near_miss_retains_generic_dense_fallback() {
+        // Omitting the optional punctuation changes the root topology and
+        // deliberately invalidates the complete fixed-continuation theorem.
+        let pattern = r"(?:(?:alpha|beta)+\)*((?:\s|-)*.*(?:.*=.*)))";
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(compiled.candidate.is_none());
+        let haystack = b"none\nalpha--) x=value";
+        let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let expected = oracle
+            .find_iter(haystack)
+            .map(|matched| matched.end() - matched.start())
+            .sum::<usize>();
+        let result = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(result.value, expected);
+        assert_eq!(
+            result.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
     }
 
     #[test]

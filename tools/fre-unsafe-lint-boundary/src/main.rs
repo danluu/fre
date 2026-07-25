@@ -20,9 +20,71 @@ const EXACT_ALLOC_LIBRARY: &str = "fre_exact_alloc";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
 const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
-    0xe3, 0x49, 0xb8, 0xae, 0x70, 0x47, 0xd9, 0x31, 0x72, 0x6b, 0x6a, 0xf3, 0xe4, 0xb5, 0x5c, 0xbc,
-    0xfb, 0x20, 0xd4, 0xdb, 0x60, 0x2b, 0x64, 0x77, 0x4f, 0x9b, 0x68, 0x16, 0x58, 0x0f, 0xbd, 0xa2,
+    0x7e, 0x11, 0xb9, 0x8d, 0x42, 0x20, 0xff, 0x7b, 0xdc, 0x77, 0x55, 0xf9, 0x15, 0x39, 0x34, 0xd2,
+    0x15, 0x75, 0xba, 0x71, 0x13, 0x79, 0x02, 0x1d, 0xc8, 0x79, 0x27, 0xba, 0x1a, 0x0d, 0x34, 0x11,
 ];
+const EXACT_BOX_BORROW_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the tagged word recovers only the exposed provenance of its live owned allocation"
+    )]
+    pub fn boxed(&self) -> Option<&T> {
+        if self.encoded & 1 == 0 {
+            return None;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: the odd variant is created only from the exposed address of
+        // a live, aligned `Box<T>` allocation retained exclusively by `self`.
+        unsafe { ptr::with_exposed_provenance::<T>(address).as_ref() }
+    }"#;
+const EXACT_BOX_DROP_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the tagged word reconstructs its uniquely owned exact allocation for one drop"
+    )]
+    fn drop(&mut self) {
+        if self.encoded & 1 == 0 {
+            return;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: this object uniquely owns the allocation encoded by the odd
+        // variant, and Drop runs exactly once.
+        unsafe {
+            drop(Box::from_raw(ptr::with_exposed_provenance_mut::<T>(
+                address,
+            )));
+        }
+    }"#;
+const EXACT_BOX_CONSTRUCTION_REVIEWED_BLOCK: &str = r#"#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout single-value allocation boundary"
+)]
+fn exact_box_or_usize_with<T>(
+    value: T,
+    force_failure: bool,
+) -> Result<ExactBoxOrUsize<T>, CopyError> {
+    if size_of::<T>() == 0 || align_of::<T>() < 2 {
+        return Err(CopyError::LayoutOverflow);
+    }
+    let layout = Layout::new::<T>();
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err(CopyError::AllocationFailed);
+    }
+    // SAFETY: `alloc` returned a fresh allocation for exactly one `T`.
+    // Writing initializes that object. Its exposed address retains recoverable
+    // provenance, and alignment proves the low tag bit was zero.
+    unsafe {
+        let typed = allocation.cast::<T>();
+        typed.write(value);
+        Ok(ExactBoxOrUsize {
+            encoded: typed.expose_provenance() | 1,
+            marker: PhantomData,
+        })
+    }
+}"#;
 const EXACT_VEC_REVIEWED_BLOCK: &str = r#"#[allow(
     unsafe_code,
     reason = "this reviewed function owns FRE's exact-layout typed allocation boundary"
@@ -102,12 +164,15 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
         Ok(Vec::from_raw_parts(allocation, bytes.len(), bytes.len()))
     }
 }"#;
-const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 3] = [
+const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 6] = [
+    EXACT_BOX_BORROW_REVIEWED_BLOCK,
+    EXACT_BOX_DROP_REVIEWED_BLOCK,
+    EXACT_BOX_CONSTRUCTION_REVIEWED_BLOCK,
     EXACT_VEC_REVIEWED_BLOCK,
     ZEROED_EXACT_REVIEWED_BLOCK,
     COPY_EXACT_REVIEWED_BLOCK,
 ];
-const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 4;
+const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 7;
 
 const KERNEL_LINTS: &str = r#"
 [lints.rust]
@@ -688,7 +753,7 @@ fn canonical(path: &Path, description: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COPY_EXACT_REVIEWED_BLOCK, DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_VEC_REVIEWED_BLOCK,
+        DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_ALLOC_REVIEWED_BLOCKS, EXACT_VEC_REVIEWED_BLOCK,
         Package, Target, WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
         audit_exact_allocator_source, audit_exact_allocator_source_text, audit_kernel_targets,
         require_exact_lints,
@@ -773,12 +838,12 @@ mod tests {
     }
 
     fn exact_source() -> String {
-        format!(
-            "//! fixture\n#![deny(unsafe_code)]\n\n\
-             {EXACT_VEC_REVIEWED_BLOCK}\n\n\
-             {ZEROED_EXACT_REVIEWED_BLOCK}\n\n\
-             {COPY_EXACT_REVIEWED_BLOCK}\n"
-        )
+        let mut source = "//! fixture\n#![deny(unsafe_code)]\n\n".to_owned();
+        for block in EXACT_ALLOC_REVIEWED_BLOCKS {
+            source.push_str(block);
+            source.push_str("\n\n");
+        }
+        source
     }
 
     fn canonical_exact_source() -> &'static str {
@@ -871,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_three_reviewed_unsafe_blocks_in_order_are_accepted() {
+    fn exactly_six_reviewed_unsafe_blocks_in_order_are_accepted() {
         assert_eq!(audit_exact_allocator_source_text(&exact_source()), Ok(()));
     }
 
@@ -932,11 +997,7 @@ mod tests {
 
     #[test]
     fn every_missing_or_duplicated_reviewed_unsafe_block_is_rejected() {
-        for block in [
-            EXACT_VEC_REVIEWED_BLOCK,
-            ZEROED_EXACT_REVIEWED_BLOCK,
-            COPY_EXACT_REVIEWED_BLOCK,
-        ] {
+        for block in EXACT_ALLOC_REVIEWED_BLOCKS {
             assert_exact_source_rejected(&exact_source().replace(block, ""));
             assert_exact_source_rejected(&format!("{}\n{block}\n", exact_source()));
         }
@@ -963,9 +1024,27 @@ mod tests {
     #[test]
     fn every_reviewed_function_name_and_reason_is_exact() {
         for (original, replacement) in [
+            ("pub fn boxed(&self)", "pub fn renamed_boxed(&self)"),
+            ("fn drop(&mut self)", "fn renamed_drop(&mut self)"),
+            (
+                "fn exact_box_or_usize_with<T>(",
+                "fn renamed_exact_box_or_usize_with<T>(",
+            ),
             ("fn exact_vec_with_capacity<T>(", "fn renamed_exact_vec<T>("),
             ("fn zeroed_exact_with(", "fn renamed_zeroed_exact_with("),
             ("fn copy_exact_with(", "fn renamed_copy_exact_with("),
+            (
+                "the tagged word recovers only the exposed provenance of its live owned allocation",
+                "changed tagged borrow boundary",
+            ),
+            (
+                "the tagged word reconstructs its uniquely owned exact allocation for one drop",
+                "changed tagged drop boundary",
+            ),
+            (
+                "this reviewed function owns FRE's exact-layout single-value allocation boundary",
+                "changed single-value allocation boundary",
+            ),
             (
                 "this reviewed function owns FRE's exact-layout typed allocation boundary",
                 "changed typed allocation boundary",
@@ -988,6 +1067,18 @@ mod tests {
     #[test]
     fn every_reviewed_unsafe_body_is_exact() {
         for (original, replacement) in [
+            (
+                "ptr::with_exposed_provenance::<T>(address).as_ref()",
+                "ptr::without_provenance::<T>(address).as_ref()",
+            ),
+            (
+                "Box::from_raw(ptr::with_exposed_provenance_mut::<T>(\n                address,\n            ))",
+                "Box::from_raw(ptr::without_provenance_mut::<T>(address))",
+            ),
+            (
+                "encoded: typed.expose_provenance() | 1",
+                "encoded: typed.expose_provenance()",
+            ),
             (
                 "unsafe { alloc(layout) }",
                 "unsafe { alloc_zeroed(layout) }",
