@@ -54,6 +54,17 @@ pub struct CompileAccounting {
     /// by every compiled artifact, including ineligible and ordered-root
     /// shapes.
     pub state_byte_span_sum_persistent_bytes: usize,
+    /// Source-independent mirrored bounded-span plans retained for direct
+    /// whole-match `SpanSum` reduction.
+    pub ordered_bounded_span_sum_plans: usize,
+    /// Fixed anchor bytes retained by the ordered bounded-span theorem.
+    pub ordered_bounded_span_sum_anchor_bytes: usize,
+    /// Finite middle-chunk ceiling retained by the theorem.
+    pub ordered_bounded_span_sum_max_chunks: usize,
+    /// Exact logical work used to recognize and retain the theorem.
+    pub ordered_bounded_span_sum_build_work: usize,
+    /// Exact inline bytes retained by the theorem.
+    pub ordered_bounded_span_sum_persistent_bytes: usize,
     /// Bytes in the mandatory leading literal retained by the unbounded
     /// terminal-frontier certificate.
     pub terminal_frontier_prefix_bytes: usize,

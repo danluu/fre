@@ -22,6 +22,7 @@ use crate::program::{
 };
 use crate::{Error, OperationLimits, Resource};
 
+mod ordered_bounded_span_sum;
 mod terminal_frontier;
 
 /// Half-open absolute byte span in the original haystack.
@@ -326,6 +327,8 @@ pub enum OperationPhysicalRoute {
     Candidate,
     /// Forward continuation execution at compiler-proved start boundaries.
     StartDomain,
+    /// Source-independent mirrored finite-chunk `SpanSum` frontier.
+    OrderedBoundedSpanSum,
 }
 
 /// The only route-selection edge allowed before an attempt publishes its
@@ -2145,6 +2148,28 @@ impl CompiledRegex {
                 actual_allocations,
                 allocation_limit,
                 prospective_observer,
+            );
+        }
+        if forced_generic_count_route.is_none()
+            && kind == OperationKind::Sum
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.ordered_bounded_span_sum
+        {
+            return self.execute_ordered_bounded_span_sum(
+                plan,
+                local,
+                ordered_bounded_span_sum::RouteInvocation {
+                    range,
+                    strategy,
+                    limits,
+                    allocation_limit,
+                },
+                ordered_bounded_span_sum::RouteEffects {
+                    attempt: attempt.as_mut(),
+                    accounting,
+                    actual_allocations,
+                    prospective_observer,
+                },
             );
         }
         if matches!(
@@ -8613,6 +8638,10 @@ fn operation_identity(
         OperationPhysicalRoute::StateByteSpanSum => 167,
         OperationPhysicalRoute::Candidate => 113,
         OperationPhysicalRoute::StartDomain => 149,
+        // StateByteSpanSum already owns 167. Keep the composed ordered route
+        // independently typed so the two source-independent SpanSum proofs
+        // can never authenticate the same operation identity.
+        OperationPhysicalRoute::OrderedBoundedSpanSum => 181,
     };
     let mut bytes = plan.bytes();
     for (index, byte) in bytes.iter_mut().enumerate() {

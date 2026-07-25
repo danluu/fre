@@ -11,6 +11,10 @@ use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet
 use crate::required_internal_anchor;
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
+pub(crate) mod ordered_bounded_span_sum;
+
+pub(crate) use ordered_bounded_span_sum::OrderedBoundedSpanSumPlan;
+
 #[cfg(test)]
 pub(crate) mod url_pack_allocation_probe {
     use std::cell::Cell;
@@ -613,6 +617,7 @@ pub struct CompiledRegex {
     pub(crate) candidate: Option<candidate::Plan>,
     pub(crate) url_aggregate: Option<fre_kernels::UrlAggregatePlan>,
     pub(crate) state_byte_span_sum: Option<StateByteSpanSumPlan>,
+    pub(crate) ordered_bounded_span_sum: Option<OrderedBoundedSpanSumPlan>,
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_literals: RequiredLiteralSets,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
@@ -1190,6 +1195,11 @@ impl CompiledRegex {
             budget.record_copy(plan.literal().len())?;
         }
         budget.accounting.state_byte_span_sum_persistent_bytes = state_byte_span_sum_slot_bytes;
+        let ordered_bounded_span_sum = if ordered_root {
+            None
+        } else {
+            ordered_bounded_span_sum::build_plan(hir, profile, capture_policy, budget)?
+        };
         let mut candidate = if ordered_root {
             None
         } else {
@@ -1205,7 +1215,13 @@ impl CompiledRegex {
                     candidate_bytes,
                     Resource::ProgramBytes,
                 )?,
-                state_byte_span_sum_slot_bytes,
+                add(
+                    state_byte_span_sum_slot_bytes,
+                    ordered_bounded_span_sum
+                        .as_ref()
+                        .map_or(0, |_| OrderedBoundedSpanSumPlan::retained_bytes()),
+                    Resource::ProgramBytes,
+                )?,
                 Resource::ProgramBytes,
             )?,
             url_aggregate
@@ -1302,6 +1318,9 @@ impl CompiledRegex {
         if let Some(plan) = &state_byte_span_sum {
             plan_id = bind_state_byte_span_sum_identity(plan_id, plan, budget)?;
         }
+        if let Some(plan) = &ordered_bounded_span_sum {
+            plan_id = ordered_bounded_span_sum::bind_plan_identity(plan_id, plan, budget)?;
+        }
         if budget.current_construction_bytes != program_bytes {
             return Err(Error::InternalInvariant(
                 "compiler retained bytes differ from construction accounting",
@@ -1313,6 +1332,7 @@ impl CompiledRegex {
             candidate,
             url_aggregate,
             state_byte_span_sum,
+            ordered_bounded_span_sum,
             required_suffixes,
             required_literals,
             required_internal_anchor,
@@ -3493,6 +3513,11 @@ impl CompileBudget {
                 state_byte_span_sum_literal_bytes: 0,
                 state_byte_span_sum_build_work: 0,
                 state_byte_span_sum_persistent_bytes: 0,
+                ordered_bounded_span_sum_plans: 0,
+                ordered_bounded_span_sum_anchor_bytes: 0,
+                ordered_bounded_span_sum_max_chunks: 0,
+                ordered_bounded_span_sum_build_work: 0,
+                ordered_bounded_span_sum_persistent_bytes: 0,
                 terminal_frontier_prefix_bytes: 0,
                 terminal_frontier_bytes: 0,
                 candidate_entries: 0,
