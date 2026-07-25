@@ -513,29 +513,36 @@ fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
     )
 }
 
-fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
+fn specialized_aggregate_plan(model: &str, report: &AggregateBuildReport) -> Option<&'static str> {
     if matches!(
         report.plan_identity,
         fre::AggregatePlanIdentity::WordRun(identity)
             if identity.semantics
                 == fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
     ) {
-        return if model == "compile" {
+        return Some(if model == "compile" {
             "compile-aggregate-fixed-class-chunks-v1"
         } else {
             "aggregate-fixed-class-chunks-v1"
-        };
+        });
     }
     if matches!(
         report.plan_identity,
         AggregatePlanIdentity::BoundedContext(identity)
             if identity.kernel.plan_id == BOUNDED_AFFIX_PLAN_ID
     ) {
-        return if model == "compile" {
+        return Some(if model == "compile" {
             "compile-aggregate-bounded-affix"
         } else {
             "aggregate-bounded-affix"
-        };
+        });
+    }
+    None
+}
+
+fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
+    if let Some(plan) = specialized_aggregate_plan(model, report) {
+        return plan;
     }
     let sparse = matches!(
         report.build,
