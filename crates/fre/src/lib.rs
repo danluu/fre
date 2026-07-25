@@ -151,8 +151,9 @@ pub use capture_required_literal::{
     CAPTURE_REQUIRED_LITERAL_PLAN_ID, CaptureRequiredLiteralBuildAccounting,
     CaptureRequiredLiteralBuildError, CaptureRequiredLiteralBuildLimits,
     CaptureRequiredLiteralBuildReport, CaptureRequiredLiteralCacheIdentity,
-    CaptureRequiredLiteralIdentity, CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
-    CaptureRequiredLiteralSearchError, CaptureRequiredLiteralSearchReport,
+    CaptureRequiredLiteralIdentity, CaptureRequiredLiteralLinePartitionMatches,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchError,
+    CaptureRequiredLiteralSearchOperation, CaptureRequiredLiteralSearchReport,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,

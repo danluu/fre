@@ -6,13 +6,14 @@ use std::{alloc::Layout, sync::Arc};
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::{
     LiteralSetAccounting, LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError,
-    LiteralSetPlan, LiteralSetSearchLimits,
+    LiteralSetIterationAccounting, LiteralSetMatchSemantics, LiteralSetMatches, LiteralSetPlan,
+    LiteralSetSearchLimits,
 };
 use fre_syntax::CacheKey;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Versioned algorithm identity for the required-any-literal proof.
-pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v3";
+pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v4";
 
 const MAX_INLINE_NEEDLES: usize = 64;
 const NEEDLE_OFFSET_SLOTS: usize = MAX_INLINE_NEEDLES + 1;
@@ -98,6 +99,9 @@ pub struct CaptureRequiredLiteralBuildAccounting {
     pub needles: usize,
     pub needle_bytes: usize,
     pub minimum_needle_bytes: usize,
+    /// Whether no effective literal contains CR or LF, permitting a
+    /// construction-proved whole-input scan aligned with stripped lines.
+    pub line_partition_safe: bool,
     pub source_bytes: usize,
     pub scratch_bytes: usize,
     pub peak_bytes_upper_bound: usize,
@@ -249,10 +253,20 @@ impl Default for CaptureRequiredLiteralRunLimits {
 }
 
 /// Complete identity for one prefilter search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureRequiredLiteralSearchOperation {
+    /// One first-match candidate decision over an independent byte slice.
+    CandidateV1,
+    /// One non-overlapping literal stream aligned by the caller with lines.
+    LinePartitionMatchesV1,
+}
+
+/// Complete identity for one prefilter search.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureRequiredLiteralCacheIdentity {
     pub plan: CaptureRequiredLiteralIdentity,
     pub build_limits: CaptureRequiredLiteralBuildLimits,
+    pub operation: CaptureRequiredLiteralSearchOperation,
     pub run_limits: CaptureRequiredLiteralRunLimits,
 }
 
@@ -263,6 +277,44 @@ pub struct CaptureRequiredLiteralSearchReport {
     pub candidate: bool,
     pub accounting: LiteralSetAccounting,
 }
+
+/// One checked whole-input literal stream that is safe to align with
+/// LF/CRLF-stripped line partitions.
+///
+/// Construction is refused with `Ok(None)` when an effective literal contains
+/// either line-terminator byte. In that case a caller must retain independent
+/// per-line searches, since a whole-input match could otherwise cross or
+/// consume a semantic delimiter and shadow an in-line candidate.
+#[derive(Debug)]
+pub struct CaptureRequiredLiteralLinePartitionMatches<'plan, 'haystack> {
+    identity: CaptureRequiredLiteralCacheIdentity,
+    accounting: LiteralSetIterationAccounting,
+    matches: LiteralSetMatches<'plan, 'haystack>,
+}
+
+impl CaptureRequiredLiteralLinePartitionMatches<'_, '_> {
+    /// Complete plan/build/run identity for this scan.
+    #[must_use]
+    pub const fn identity(&self) -> &CaptureRequiredLiteralCacheIdentity {
+        &self.identity
+    }
+
+    /// Complete-haystack DFA prospective charged before iteration.
+    #[must_use]
+    pub const fn accounting(&self) -> LiteralSetIterationAccounting {
+        self.accounting
+    }
+}
+
+impl Iterator for CaptureRequiredLiteralLinePartitionMatches<'_, '_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.matches.next()
+    }
+}
+
+impl core::iter::FusedIterator for CaptureRequiredLiteralLinePartitionMatches<'_, '_> {}
 
 /// Failed candidate decision retaining complete identity.
 #[derive(Debug)]
@@ -400,9 +452,9 @@ fn build_from_hir_metered(
             "reserved peak build bytes",
         ))?;
     check_limit("peak bytes", peak_bytes_upper_bound, limits.max_peak_bytes)?;
-    // Admit every raw publication-loop visit, retained offset, byte copy,
-    // reference publication, and final publication before either exact
-    // allocation or copy work begins.
+    // Admit every raw publication-loop visit, retained offset, effective-byte
+    // visit (copy plus CR/LF classification), reference publication, and final
+    // publication before either exact allocation or copy work begins.
     let publication_work = effective
         .needles
         .checked_mul(2)
@@ -420,12 +472,14 @@ fn build_from_hir_metered(
         .map_err(|error| map_exact_allocation(error, "effective needle byte", effective.bytes))?;
     let mut offsets = [0_usize; NEEDLE_OFFSET_SLOTS];
     let mut effective_index = 0_usize;
+    let mut line_partition_safe = true;
     for (raw_index, needle) in raw_needles[..raw_count].iter().enumerate() {
         if !retained[raw_index] {
             continue;
         }
         offsets[effective_index] = arena.len();
         for &byte in needle.bytes() {
+            line_partition_safe &= byte != b'\r' && byte != b'\n';
             arena.try_push(byte).map_err(|_| {
                 CaptureRequiredLiteralBuildError::InternalInvariant(
                     "admitted exact needle arena rejected a byte",
@@ -467,9 +521,16 @@ fn build_from_hir_metered(
             )
         })?;
     }
-    let matcher = LiteralSetPlan::new(refs.as_slice(), dfa_limits)
+    let matcher = LiteralSetPlan::new_streaming_any(refs.as_slice(), dfa_limits)
         .map_err(CaptureRequiredLiteralBuildError::LiteralSet)?;
     let literal_set = matcher.build_accounting();
+    if literal_set.match_semantics != LiteralSetMatchSemantics::StreamingAny
+        || literal_set.minimum_pattern_bytes != effective.minimum_bytes
+    {
+        return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
+            "literal-set semantics or minimum differs from effective needle proof",
+        ));
+    }
 
     let actual_source_bytes = fixed_persistent
         .checked_add(literal_set.persistent_bytes)
@@ -508,6 +569,7 @@ fn build_from_hir_metered(
             needles: effective.needles,
             needle_bytes: effective.bytes,
             minimum_needle_bytes: effective.minimum_bytes,
+            line_partition_safe,
             source_bytes,
             scratch_bytes,
             peak_bytes_upper_bound,
@@ -544,11 +606,10 @@ impl CaptureRequiredLiteralPlan {
         haystack: &[u8],
         run_limits: CaptureRequiredLiteralRunLimits,
     ) -> Result<CaptureRequiredLiteralSearchReport, CaptureRequiredLiteralSearchError> {
-        let identity = CaptureRequiredLiteralCacheIdentity {
-            plan: self.report.identity.clone(),
-            build_limits: self.build_limits,
+        let identity = self.cache_identity(
             run_limits,
-        };
+            CaptureRequiredLiteralSearchOperation::CandidateV1,
+        );
         let (matched, accounting) = self
             .matcher
             .find(
@@ -566,6 +627,95 @@ impl CaptureRequiredLiteralPlan {
             candidate: matched.is_some(),
             accounting,
         })
+    }
+
+    /// Start one DFA traversal whose matches can be merged with a caller's
+    /// exact LF/CRLF line scan.
+    ///
+    /// `Ok(None)` is a semantic fallback signal, not a resource failure. It is
+    /// returned when any effective required literal contains CR or LF, because
+    /// a whole-haystack match could then consume a stripped delimiter. `Some`
+    /// retains a complete operation-specific cache identity and whole-input
+    /// iterator transition envelope.
+    #[allow(
+        clippy::result_large_err,
+        reason = "typed refusal retains complete cache identity without an unmetered error-path allocation"
+    )]
+    pub fn line_partition_matches<'plan, 'haystack>(
+        &'plan self,
+        haystack: &'haystack [u8],
+        run_limits: CaptureRequiredLiteralRunLimits,
+    ) -> Result<
+        Option<CaptureRequiredLiteralLinePartitionMatches<'plan, 'haystack>>,
+        CaptureRequiredLiteralSearchError,
+    > {
+        let Some(prospective) =
+            self.line_partition_prospective(haystack.len())
+                .map_err(|source| CaptureRequiredLiteralSearchError {
+                    identity: self.cache_identity(
+                        run_limits,
+                        CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1,
+                    ),
+                    source,
+                })?
+        else {
+            return Ok(None);
+        };
+        let identity = self.cache_identity(
+            run_limits,
+            CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1,
+        );
+        if prospective.transitions_upper_bound > run_limits.max_transitions {
+            return Err(CaptureRequiredLiteralSearchError {
+                identity,
+                source: LiteralSetError::TransitionLimit {
+                    needed: prospective.transitions_upper_bound,
+                    limit: run_limits.max_transitions,
+                },
+            });
+        }
+        let (matches, accounting) = self
+            .matcher
+            .find_iter(
+                haystack,
+                LiteralSetSearchLimits {
+                    max_transitions: run_limits.max_transitions,
+                },
+            )
+            .map_err(|source| CaptureRequiredLiteralSearchError {
+                identity: identity.clone(),
+                source,
+            })?;
+        Ok(Some(CaptureRequiredLiteralLinePartitionMatches {
+            identity,
+            accounting,
+            matches,
+        }))
+    }
+
+    /// Derive the complete line-partition iterator envelope without reading
+    /// input bytes. `None` is the construction-owned delimiter fallback.
+    pub fn line_partition_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<LiteralSetIterationAccounting>, LiteralSetError> {
+        if !self.report.accounting.line_partition_safe {
+            return Ok(None);
+        }
+        self.matcher.find_iter_accounting(haystack_len).map(Some)
+    }
+
+    fn cache_identity(
+        &self,
+        run_limits: CaptureRequiredLiteralRunLimits,
+        operation: CaptureRequiredLiteralSearchOperation,
+    ) -> CaptureRequiredLiteralCacheIdentity {
+        CaptureRequiredLiteralCacheIdentity {
+            plan: self.report.identity.clone(),
+            build_limits: self.build_limits,
+            operation,
+            run_limits,
+        }
     }
 }
 
@@ -1461,6 +1611,85 @@ mod tests {
                 .unwrap()
                 .candidate
         );
+    }
+
+    #[test]
+    fn line_partition_stream_is_single_scan_and_delimiter_literals_fall_back() {
+        let safe = build(
+            "(?:(AB)|(XY))",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .unwrap();
+        let haystack = b"ABAB\nA\nB\r\nXY\xFF";
+        assert!(safe.build_report().accounting.line_partition_safe);
+        let prospective = safe
+            .line_partition_prospective(haystack.len())
+            .unwrap()
+            .expect("construction-proved line partition");
+        let limits = CaptureRequiredLiteralRunLimits {
+            max_transitions: prospective.transitions_upper_bound,
+        };
+        let scan = safe
+            .line_partition_matches(haystack, limits)
+            .unwrap()
+            .expect("CR/LF-free effective literals permit one scan");
+        assert_eq!(scan.identity().plan, safe.build_report().identity);
+        assert_eq!(
+            scan.identity().operation,
+            CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1
+        );
+        assert_eq!(
+            scan.identity().build_limits,
+            CaptureRequiredLiteralBuildLimits::default()
+        );
+        assert_eq!(scan.identity().run_limits, limits);
+        assert_eq!(scan.accounting().searched_bytes, haystack.len());
+        assert_eq!(
+            scan.accounting().match_events_upper_bound,
+            haystack.len() / 2
+        );
+        assert_eq!(
+            scan.accounting().transitions_upper_bound,
+            prospective.transitions_upper_bound
+        );
+        assert_eq!(scan.collect::<Vec<_>>(), [(0, 2), (2, 4), (10, 12)]);
+        assert!(matches!(
+            safe.line_partition_matches(
+                haystack,
+                CaptureRequiredLiteralRunLimits {
+                    max_transitions: prospective.transitions_upper_bound - 1,
+                },
+            ),
+            Err(CaptureRequiredLiteralSearchError {
+                source: LiteralSetError::TransitionLimit { needed, limit },
+                ..
+            }) if needed == prospective.transitions_upper_bound
+                && limit == prospective.transitions_upper_bound - 1
+        ));
+
+        for pattern in [r"(?:(AB\r)|(BC))", r"(?:(AB\n)|(BC))"] {
+            let plan = build(pattern, CaptureRequiredLiteralBuildLimits::default())
+                .unwrap()
+                .plan
+                .unwrap();
+            assert!(!plan.build_report().accounting.line_partition_safe);
+            assert!(
+                plan.line_partition_prospective(usize::MAX)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                plan.line_partition_matches(
+                    b"ABC\r\nBC",
+                    CaptureRequiredLiteralRunLimits::default(),
+                )
+                .unwrap()
+                .is_none(),
+                "delimiter-bearing literals require independent line searches: {pattern}"
+            );
+        }
     }
 
     #[test]

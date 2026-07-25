@@ -1,9 +1,9 @@
-//! Ordered finite-literal alternation over a bounded Aho-Corasick DFA.
+//! Construction-selected finite-literal matching over a bounded Aho-Corasick DFA.
 
 use core::fmt;
 use core::mem;
 
-use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, Input, MatchKind};
 
 use crate::Window;
 
@@ -39,13 +39,26 @@ impl Default for LiteralSetBuildLimits {
     }
 }
 
+/// Match semantics sealed into one finite-literal construction receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiteralSetMatchSemantics {
+    /// Earliest start with source-order priority at that start.
+    LeftmostFirst,
+    /// Earliest ending match, suitable for a forward any-literal stream.
+    StreamingAny,
+}
+
 /// Checked construction certificate for a finite-literal DFA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiteralSetBuildAccounting {
+    /// Construction-selected search semantics.
+    pub match_semantics: LiteralSetMatchSemantics,
     /// Number of ordered alternatives.
     pub patterns: usize,
     /// Sum of alternative byte lengths.
     pub pattern_bytes: usize,
+    /// Shortest alternative, used to bound non-overlapping match emissions.
+    pub minimum_pattern_bytes: usize,
     /// Upper bound on trie states before DFA table decoration.
     pub trie_states_upper_bound: usize,
     /// Conservative alphabet transition cells charged before construction.
@@ -94,6 +107,19 @@ pub struct LiteralSetAccounting {
     pub scratch_bytes: usize,
 }
 
+/// Conservative accounting for one non-overlapping finite-literal iteration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiteralSetIterationAccounting {
+    /// Bytes in the complete searched haystack.
+    pub searched_bytes: usize,
+    /// Maximum non-overlapping match events for the shortest retained literal.
+    pub match_events_upper_bound: usize,
+    /// Maximum input transitions plus one initialization per search call.
+    pub transitions_upper_bound: usize,
+    /// External heap scratch required by the immutable iterator API.
+    pub scratch_bytes: usize,
+}
+
 /// Finite-literal build or search failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -118,6 +144,10 @@ pub enum LiteralSetError {
     },
     /// The conservative transition envelope exceeds its per-call cap.
     TransitionLimit { needed: usize, limit: usize },
+    /// Non-overlapping iteration requires strictly positive literal width.
+    EmptyPatternIterationUnsupported,
+    /// A forward iterator requires construction-selected streaming semantics.
+    OrderedIterationUnsupported,
     /// Checked resource arithmetic overflowed.
     ArithmeticOverflow { computation: &'static str },
     /// The pinned automaton constructor rejected the admitted finite language.
@@ -159,6 +189,15 @@ impl fmt::Display for LiteralSetError {
                 f,
                 "literal-set search needs at most {needed} transitions, exceeding {limit}"
             ),
+            Self::EmptyPatternIterationUnsupported => {
+                write!(f, "literal-set iteration does not admit empty patterns")
+            }
+            Self::OrderedIterationUnsupported => {
+                write!(
+                    f,
+                    "literal-set iteration requires streaming-any construction semantics"
+                )
+            }
             Self::ArithmeticOverflow { computation } => {
                 write!(f, "arithmetic overflow while computing {computation}")
             }
@@ -171,18 +210,52 @@ impl fmt::Display for LiteralSetError {
 
 impl std::error::Error for LiteralSetError {}
 
-/// Immutable ordered finite-literal matcher.
+/// Immutable finite-literal matcher.
 ///
-/// `LeftmostFirst` gives earliest-start matching and preserves pattern order at
-/// one start, which is exactly the capture-free span semantics of an ordered
-/// alternation of literals. Search is linear in the haystack for the pinned
-/// Aho-Corasick implementation. Construction is restricted by conservative
-/// work and memory envelopes before its DFA is built.
+/// The default constructor uses `LeftmostFirst`, giving earliest-start matches
+/// and source priority at one start. The streaming-any constructor uses
+/// earliest-end matches for one forward non-overlapping existence stream.
+/// Construction is restricted by conservative work and memory envelopes
+/// before its DFA is built.
 #[derive(Clone, Debug)]
 pub struct LiteralSetPlan {
     automaton: AhoCorasick,
     build: LiteralSetBuildAccounting,
 }
+
+/// Borrowed iterator over non-overlapping finite-literal matches.
+///
+/// The enclosing [`LiteralSetPlan`] fixes streaming-any semantics. This wrapper
+/// deliberately exposes only byte spans, keeping the matcher implementation
+/// and pattern identifiers private.
+#[derive(Debug)]
+pub struct LiteralSetMatches<'plan, 'haystack> {
+    automaton: &'plan AhoCorasick,
+    haystack: &'haystack [u8],
+    start: usize,
+    done: bool,
+}
+
+impl Iterator for LiteralSetMatches<'_, '_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let Some(matched) = self
+            .automaton
+            .find(Input::new(self.haystack).span(self.start..self.haystack.len()))
+        else {
+            self.done = true;
+            return None;
+        };
+        self.start = matched.end();
+        Some((matched.start(), matched.end()))
+    }
+}
+
+impl core::iter::FusedIterator for LiteralSetMatches<'_, '_> {}
 
 impl LiteralSetPlan {
     /// Compile ordered literal alternatives into a DFA.
@@ -195,10 +268,40 @@ impl LiteralSetPlan {
         patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<Self, LiteralSetError> {
-        let mut build = preflight(patterns, limits)?;
+        Self::new_with_semantics(patterns, limits, LiteralSetMatchSemantics::LeftmostFirst)
+    }
+
+    /// Compile literal alternatives for a forward non-overlapping any-match
+    /// stream.
+    ///
+    /// This mode reports the earliest ending match. It deliberately does not
+    /// retain source priority because its contract is existence filtering,
+    /// not ordered span selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns before automaton construction if any checked count or
+    /// conservative construction envelope exceeds its configured cap.
+    pub fn new_streaming_any<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
+        Self::new_with_semantics(patterns, limits, LiteralSetMatchSemantics::StreamingAny)
+    }
+
+    fn new_with_semantics<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: LiteralSetBuildLimits,
+        match_semantics: LiteralSetMatchSemantics,
+    ) -> Result<Self, LiteralSetError> {
+        let mut build = preflight(patterns, limits, match_semantics)?;
+        let match_kind = match match_semantics {
+            LiteralSetMatchSemantics::LeftmostFirst => MatchKind::LeftmostFirst,
+            LiteralSetMatchSemantics::StreamingAny => MatchKind::Standard,
+        };
         let automaton = AhoCorasick::builder()
             .kind(Some(AhoCorasickKind::DFA))
-            .match_kind(MatchKind::LeftmostFirst)
+            .match_kind(match_kind)
             .build(patterns.iter().map(AsRef::as_ref))
             .map_err(|error| LiteralSetError::AutomatonBuild {
                 detail: error.to_string(),
@@ -219,7 +322,8 @@ impl LiteralSetPlan {
         self.build
     }
 
-    /// Find the earliest ordered-alternation match in a complete haystack.
+    /// Find one match under the construction-selected semantics in a complete
+    /// haystack.
     ///
     /// # Errors
     ///
@@ -232,7 +336,86 @@ impl LiteralSetPlan {
         self.find_window(haystack, Window::full(haystack), limits)
     }
 
-    /// Find the earliest ordered-alternation match wholly inside a byte range.
+    /// Iterate over every non-overlapping earliest-ending literal match in one
+    /// complete haystack under a single checked transition envelope.
+    ///
+    /// This is useful to partition an outer semantic operation without
+    /// restarting the immutable DFA for each partition. The returned
+    /// accounting is the complete-haystack prospective and remains valid
+    /// whether the iterator reports zero or many matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked arithmetic or transition-limit error before creating
+    /// the iterator.
+    pub fn find_iter<'plan, 'haystack>(
+        &'plan self,
+        haystack: &'haystack [u8],
+        limits: LiteralSetSearchLimits,
+    ) -> Result<
+        (
+            LiteralSetMatches<'plan, 'haystack>,
+            LiteralSetIterationAccounting,
+        ),
+        LiteralSetError,
+    > {
+        let accounting = self.find_iter_accounting(haystack.len())?;
+        if accounting.transitions_upper_bound > limits.max_transitions {
+            return Err(LiteralSetError::TransitionLimit {
+                needed: accounting.transitions_upper_bound,
+                limit: limits.max_transitions,
+            });
+        }
+        Ok((
+            LiteralSetMatches {
+                automaton: &self.automaton,
+                haystack,
+                start: 0,
+                done: false,
+            },
+            accounting,
+        ))
+    }
+
+    /// Derive the complete prospective for [`Self::find_iter`] without
+    /// inspecting source bytes.
+    pub fn find_iter_accounting(
+        &self,
+        haystack_len: usize,
+    ) -> Result<LiteralSetIterationAccounting, LiteralSetError> {
+        if self.build.match_semantics != LiteralSetMatchSemantics::StreamingAny {
+            return Err(LiteralSetError::OrderedIterationUnsupported);
+        }
+        let minimum = self.build.minimum_pattern_bytes;
+        if minimum == 0 {
+            return Err(LiteralSetError::EmptyPatternIterationUnsupported);
+        }
+        let match_events_upper_bound =
+            haystack_len
+                .checked_div(minimum)
+                .ok_or(LiteralSetError::ArithmeticOverflow {
+                    computation: "literal-set iteration match events",
+                })?;
+        // Streaming-any search returns at the first ending match, so byte
+        // ranges consumed by successive wrapper searches are disjoint. Charge
+        // all N input transitions and one start-state initialization for each
+        // of at most M matches plus the terminal no-match search.
+        let transitions_upper_bound = haystack_len
+            .checked_add(match_events_upper_bound)
+            .and_then(|transitions| transitions.checked_add(1))
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "literal-set iteration transitions",
+            })?;
+        Ok(LiteralSetIterationAccounting {
+            searched_bytes: haystack_len,
+            match_events_upper_bound,
+            transitions_upper_bound,
+            scratch_bytes: 0,
+        })
+    }
+
+    /// Find one match under the construction-selected semantics wholly inside
+    /// a byte range.
     ///
     /// # Errors
     ///
@@ -244,35 +427,7 @@ impl LiteralSetPlan {
         window: Window,
         limits: LiteralSetSearchLimits,
     ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
-        if window.start() > window.end() || window.end() > haystack.len() {
-            return Err(LiteralSetError::InvalidWindow {
-                start: window.start(),
-                end: window.end(),
-                haystack_len: haystack.len(),
-            });
-        }
-        let searched_bytes = window.end().checked_sub(window.start()).ok_or(
-            LiteralSetError::ArithmeticOverflow {
-                computation: "literal-set window length",
-            },
-        )?;
-        let transitions_upper_bound =
-            searched_bytes
-                .checked_add(1)
-                .ok_or(LiteralSetError::ArithmeticOverflow {
-                    computation: "literal-set transitions",
-                })?;
-        if transitions_upper_bound > limits.max_transitions {
-            return Err(LiteralSetError::TransitionLimit {
-                needed: transitions_upper_bound,
-                limit: limits.max_transitions,
-            });
-        }
-        let accounting = LiteralSetAccounting {
-            searched_bytes,
-            transitions_upper_bound,
-            scratch_bytes: 0,
-        };
+        let accounting = search_accounting(window, haystack.len(), limits)?;
         let matched = self
             .automaton
             .find(&haystack[window.start()..window.end()])
@@ -294,9 +449,48 @@ impl LiteralSetPlan {
     }
 }
 
+fn search_accounting(
+    window: Window,
+    haystack_len: usize,
+    limits: LiteralSetSearchLimits,
+) -> Result<LiteralSetAccounting, LiteralSetError> {
+    if window.start() > window.end() || window.end() > haystack_len {
+        return Err(LiteralSetError::InvalidWindow {
+            start: window.start(),
+            end: window.end(),
+            haystack_len,
+        });
+    }
+    let searched_bytes =
+        window
+            .end()
+            .checked_sub(window.start())
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "literal-set window length",
+            })?;
+    let transitions_upper_bound =
+        searched_bytes
+            .checked_add(1)
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "literal-set transitions",
+            })?;
+    if transitions_upper_bound > limits.max_transitions {
+        return Err(LiteralSetError::TransitionLimit {
+            needed: transitions_upper_bound,
+            limit: limits.max_transitions,
+        });
+    }
+    Ok(LiteralSetAccounting {
+        searched_bytes,
+        transitions_upper_bound,
+        scratch_bytes: 0,
+    })
+}
+
 fn preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
+    match_semantics: LiteralSetMatchSemantics,
 ) -> Result<LiteralSetBuildAccounting, LiteralSetError> {
     if patterns.is_empty() {
         return Err(LiteralSetError::EmptyPatternSet);
@@ -307,13 +501,19 @@ fn preflight<P: AsRef<[u8]>>(
             limit: limits.max_patterns,
         });
     }
-    let pattern_bytes = patterns.iter().try_fold(0_usize, |total, pattern| {
-        total
-            .checked_add(pattern.as_ref().len())
-            .ok_or(LiteralSetError::ArithmeticOverflow {
-                computation: "literal-set pattern bytes",
-            })
-    })?;
+    let (pattern_bytes, minimum_pattern_bytes) =
+        patterns
+            .iter()
+            .try_fold((0_usize, usize::MAX), |(total, minimum), pattern| {
+                let bytes = pattern.as_ref().len();
+                let total =
+                    total
+                        .checked_add(bytes)
+                        .ok_or(LiteralSetError::ArithmeticOverflow {
+                            computation: "literal-set pattern bytes",
+                        })?;
+                Ok((total, minimum.min(bytes)))
+            })?;
     if pattern_bytes > limits.max_pattern_bytes {
         return Err(LiteralSetError::PatternBytesLimit {
             needed: pattern_bytes,
@@ -356,8 +556,10 @@ fn preflight<P: AsRef<[u8]>>(
         });
     }
     Ok(LiteralSetBuildAccounting {
+        match_semantics,
         patterns: patterns.len(),
         pattern_bytes,
+        minimum_pattern_bytes,
         trie_states_upper_bound,
         dfa_cells_upper_bound,
         build_work_upper_bound,
@@ -462,6 +664,19 @@ mod tests {
                 .0,
             Some((0, 1))
         );
+        assert_eq!(
+            empty_first.find_iter_accounting(1),
+            Err(LiteralSetError::OrderedIterationUnsupported)
+        );
+        let streaming_empty = LiteralSetPlan::new_streaming_any(
+            &[b"".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            streaming_empty.find_iter_accounting(1),
+            Err(LiteralSetError::EmptyPatternIterationUnsupported)
+        );
     }
 
     #[test]
@@ -491,6 +706,80 @@ mod tests {
                 needed: 7,
                 limit: 6
             })
+        );
+    }
+
+    #[test]
+    fn one_checked_iterator_reports_forward_matches_and_exact_full_input_bound() {
+        let plan = LiteralSetPlan::new_streaming_any(
+            &[b"AB".as_slice(), b"XY".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"ABAB\nmiss\nXY";
+        let prospective = plan.find_iter_accounting(haystack.len()).unwrap();
+        let (matches, accounting) = plan
+            .find_iter(
+                haystack,
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.transitions_upper_bound,
+                },
+            )
+            .unwrap();
+        assert_eq!(matches.collect::<Vec<_>>(), [(0, 2), (2, 4), (10, 12)]);
+        assert_eq!(accounting.searched_bytes, haystack.len());
+        assert_eq!(accounting.match_events_upper_bound, haystack.len() / 2);
+        assert_eq!(
+            accounting.transitions_upper_bound,
+            prospective.transitions_upper_bound
+        );
+        assert!(matches!(
+            plan.find_iter(
+                haystack,
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.transitions_upper_bound - 1,
+                },
+            ),
+            Err(LiteralSetError::TransitionLimit { needed, limit })
+                if needed == prospective.transitions_upper_bound
+                    && limit == prospective.transitions_upper_bound - 1
+        ));
+    }
+
+    #[test]
+    fn streaming_any_iteration_avoids_leftmost_lookahead_replay() {
+        let plan = LiteralSetPlan::new_streaming_any(
+            &[b"aaaaaaaaab".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"aaaaaaaaaaaa";
+        let prospective = plan.find_iter_accounting(haystack.len()).unwrap();
+        assert_eq!(prospective.match_events_upper_bound, haystack.len());
+        assert_eq!(prospective.transitions_upper_bound, haystack.len() * 2 + 1);
+        assert_eq!(
+            plan.find_iter(
+                haystack,
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.transitions_upper_bound,
+                },
+            )
+            .unwrap()
+            .0
+            .collect::<Vec<_>>(),
+            (0..haystack.len())
+                .map(|start| (start, start + 1))
+                .collect::<Vec<_>>()
+        );
+
+        let ordered = LiteralSetPlan::new(
+            &[b"aaaaaaaaab".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            ordered.find_iter_accounting(haystack.len()),
+            Err(LiteralSetError::OrderedIterationUnsupported)
         );
     }
 

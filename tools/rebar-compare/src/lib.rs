@@ -45,20 +45,21 @@ use fre::{
     BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
     CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
     CaptureRegex, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralPlan,
-    CaptureRequiredLiteralRunLimits, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
-    CompatibilityProfile, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedClassSandwichReduceLimits,
-    FixedPredicateWord64BuildError, FixedPredicateWord64MatchSelection,
-    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
-    FixedPredicateWord64ReduceError, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
-    GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
-    GraphemeScalarDfaReduceLimits, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
-    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
-    LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
-    LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchOperation, CaptureRunLimits,
+    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, FixedClassSandwichBuildError,
+    FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
+    FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
+    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
+    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LineCaptureBuildError, LineCaptureBuildLimits,
+    LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
+    LineCaptureRunLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
+    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
     LiteralClassRunLiteralReduceLimits, LiteralReplacementErrorSource, LiteralReplacementLimits,
@@ -188,7 +189,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v38-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v39-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -522,10 +523,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         let mut identity = AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, allocation-free ASCII fixed-predicate Word64 Shift-And, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields plan, with distinct immutable identities and a same-parse bounded required-any-literal DFA that prunes impossible LF-framed lines before unchanged selector/replay; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, allocation-free ASCII fixed-predicate Word64 Shift-And, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, an allocation-free Unicode-off fixed-predicate Word64 reducer after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and prune impossible lines through a bounded DFA before unchanged exact selector/replay; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, an allocation-free Unicode-off fixed-predicate Word64 reducer after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         };
@@ -5268,14 +5269,19 @@ impl CaptureSelectorLedger {
 
     fn preflight_lf_and_required_literal(
         haystack_len: usize,
+        prefilter_transitions: usize,
+        prefilter_match_events: usize,
         limits: &RunLimits,
     ) -> Result<Self, ExecutionError> {
-        let prefilter_transitions =
-            checked_aggregate_add(haystack_len, 1, "required-literal prospective transitions")?;
-        let work = checked_aggregate_add(
+        let scan_work = checked_aggregate_add(
             haystack_len,
             prefilter_transitions,
             "grep-captures LF and required-literal work",
+        )?;
+        let work = checked_aggregate_add(
+            scan_work,
+            prefilter_match_events,
+            "grep-captures required-literal match-event work",
         )?;
         let sequential_bytes = checked_aggregate_mul(
             haystack_len,
@@ -6145,18 +6151,36 @@ fn execute_grep_captures(
         haystack,
         limits,
     )
+    .map(|report| report.count)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GrepCaptureExecutionReport {
+    count: u64,
+    line_domains: usize,
+    candidate_domains: usize,
+    selector_executions: usize,
+    consolidated_prefilter: bool,
+    prefilter_transitions: usize,
+    prefilter_match_events: usize,
+    prefilter_match_events_upper_bound: usize,
+    prefilter_sequential_bytes: usize,
+    selector: CaptureSelectorLedger,
+    state_visits: usize,
+    history_nodes: usize,
+    history_walk: usize,
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "whole-input preflight and exact per-line prefilter/selector accounting remain one auditable transaction"
+    reason = "whole-input preflight, one DFA stream, and exact per-domain selector accounting remain one auditable transaction"
 )]
 fn execute_grep_captures_inner(
     prefilter: Option<&CaptureRequiredLiteralPlan>,
     regex: &CaptureRegex,
     haystack: &[u8],
     limits: &RunLimits,
-) -> Result<u64, ExecutionError> {
+) -> Result<GrepCaptureExecutionReport, ExecutionError> {
     let (reducer_limit, work_limit) = capture_reducer_budget(limits)?;
     let groups = regex
         .build_report()
@@ -6166,28 +6190,137 @@ fn execute_grep_captures_inner(
         .ok_or_else(|| ExecutionError::fault("FRE capture group count overflow"))?;
     let mut reducer_events = 0_usize;
     let mut count = 0_usize;
+    let fallback_prefilter_transitions = haystack
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("required-literal input transition overflow"))?;
+    let line_partition_prospective = if let Some(prefilter) = prefilter {
+        prefilter
+            .line_partition_prospective(haystack.len())
+            .map_err(|error| {
+                ExecutionError::fault(format!(
+                    "FRE required-literal line prospective failed: {error}"
+                ))
+            })?
+    } else {
+        None
+    };
+    let consolidated_prefilter = line_partition_prospective.is_some();
+    let prefilter_transition_bound = line_partition_prospective
+        .map_or(fallback_prefilter_transitions, |prospective| {
+            prospective.transitions_upper_bound
+        });
+    let prefilter_match_events_upper_bound =
+        line_partition_prospective.map_or(0, |prospective| prospective.match_events_upper_bound);
     // `ByteSlice::lines` scans the complete haystack for LF delimiters. Bind
-    // that work and sequential read, plus the complete optional DFA pass,
-    // before constructing the iterator so one-below callers cannot trigger a
-    // partial traversal.
+    // that work and sequential read, plus the complete optional DFA pass and
+    // every possible iterator emission, before constructing either iterator
+    // so one-below callers cannot trigger a partial traversal.
     let mut selector = if prefilter.is_some() {
-        CaptureSelectorLedger::preflight_lf_and_required_literal(haystack.len(), limits)?
+        CaptureSelectorLedger::preflight_lf_and_required_literal(
+            haystack.len(),
+            prefilter_transition_bound,
+            prefilter_match_events_upper_bound,
+            limits,
+        )?
     } else {
         CaptureSelectorLedger::preflight_lf_scan(haystack.len(), limits)?
     };
     let mut prefilter_transitions = 0_usize;
     let mut prefilter_sequential = 0_usize;
+    let mut prefilter_match_events = 0_usize;
+    let mut line_matches = if let Some(prefilter) = prefilter {
+        let scan = prefilter
+            .line_partition_matches(
+                haystack,
+                CaptureRequiredLiteralRunLimits {
+                    max_transitions: prefilter_transition_bound,
+                },
+            )
+            .map_err(|error| {
+                ExecutionError::fault(format!(
+                    "FRE required-literal whole-input line scan violated its exact bound: {error}"
+                ))
+            })?;
+        match (line_partition_prospective, scan) {
+            (Some(prospective), Some(scan)) => {
+                let expected_limits = CaptureRequiredLiteralRunLimits {
+                    max_transitions: prefilter_transition_bound,
+                };
+                let expected_build_limits = capture_required_literal_build_limits(limits);
+                if scan.identity().plan != prefilter.build_report().identity
+                    || scan.identity().build_limits != expected_build_limits
+                    || scan.identity().operation
+                        != CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1
+                    || scan.identity().run_limits != expected_limits
+                    || scan.accounting() != prospective
+                {
+                    return Err(ExecutionError::fault(
+                        "FRE required-literal line scan failed identity/P/A authentication",
+                    ));
+                }
+                let accounting = scan.accounting();
+                prefilter_transitions = accounting.transitions_upper_bound;
+                prefilter_sequential = accounting.searched_bytes;
+                Some(scan.peekable())
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ExecutionError::fault(
+                    "FRE required-literal construction proof and line scan disagreed",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let mut state_visits = 0_usize;
     let mut history_nodes = 0_usize;
     let mut history_walk = 0_usize;
-    for line in haystack.lines() {
+    let mut line_domains = 0_usize;
+    let mut candidate_domains = 0_usize;
+    let mut selector_executions = 0_usize;
+    let mut raw_cursor = 0_usize;
+    for raw_line in haystack.lines_with_terminator() {
+        let line_start = raw_cursor;
+        raw_cursor = raw_cursor
+            .checked_add(raw_line.len())
+            .ok_or_else(|| ExecutionError::fault("capture raw line cursor overflow"))?;
+        let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+            without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+        } else {
+            raw_line
+        };
+        let line_end = line_start
+            .checked_add(line.len())
+            .ok_or_else(|| ExecutionError::fault("capture semantic line end overflow"))?;
+        line_domains = checked_aggregate_add(line_domains, 1, "capture line domains")?;
         reducer_events = checked_aggregate_add(reducer_events, 1, "capture line events")?;
         if reducer_events > reducer_limit {
             return Err(ExecutionError::unsupported(format!(
                 "FRE grep-captures line events need {reducer_events}, exceeding {reducer_limit}"
             )));
         }
-        if let Some(prefilter) = prefilter {
+        let candidate = if let Some(matches) = line_matches.as_mut() {
+            let mut candidate = false;
+            while matches.peek().is_some_and(|&(start, _)| start < raw_cursor) {
+                let (start, end) = matches
+                    .next()
+                    .ok_or_else(|| ExecutionError::fault("peeked line match disappeared"))?;
+                prefilter_match_events = checked_aggregate_add(
+                    prefilter_match_events,
+                    1,
+                    "required-literal match events",
+                )?;
+                if start < line_start || start >= end || end > line_end {
+                    return Err(ExecutionError::fault(
+                        "FRE required-literal whole-input match escaped its semantic line",
+                    ));
+                }
+                candidate = true;
+            }
+            candidate
+        } else if let Some(prefilter) = prefilter {
             let transitions = line.len().checked_add(1).ok_or_else(|| {
                 ExecutionError::fault("required-literal line transition overflow")
             })?;
@@ -6213,10 +6346,15 @@ fn execute_grep_captures_inner(
                 filtered.accounting.searched_bytes,
                 "required-literal cumulative sequential bytes",
             )?;
-            if !filtered.candidate {
-                continue;
-            }
+            filtered.candidate
+        } else {
+            true
+        };
+        if !candidate {
+            continue;
         }
+        candidate_domains =
+            checked_aggregate_add(candidate_domains, 1, "capture candidate domains")?;
         let event_remaining = reducer_limit
             .checked_sub(reducer_events)
             .ok_or_else(|| ExecutionError::fault("FRE capture event accounting underflow"))?;
@@ -6260,6 +6398,8 @@ fn execute_grep_captures_inner(
                 "FRE grep-capture result failed identity/P/A authentication",
             ));
         }
+        selector_executions =
+            checked_aggregate_add(selector_executions, 1, "capture selector executions")?;
         let group_events = result
             .accounting
             .matches
@@ -6298,20 +6438,49 @@ fn execute_grep_captures_inner(
             "capture history walk",
         )?;
     }
-    let prospective_prefilter_transitions = haystack
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| ExecutionError::fault("required-literal input transition overflow"))?;
+    if raw_cursor != haystack.len() {
+        return Err(ExecutionError::fault(
+            "FRE capture line iterator did not consume the complete haystack",
+        ));
+    }
+    if let Some(matches) = line_matches.as_mut()
+        && matches.next().is_some()
+    {
+        return Err(ExecutionError::fault(
+            "FRE required-literal whole-input match was not assigned to a semantic line",
+        ));
+    }
     if prefilter.is_some()
-        && (prefilter_transitions > prospective_prefilter_transitions
+        && (prefilter_transitions > prefilter_transition_bound
+            || prefilter_match_events > prefilter_match_events_upper_bound
             || prefilter_sequential > haystack.len())
     {
         return Err(ExecutionError::fault(
             "FRE required-literal prefilter exceeded its prospective whole-input bound",
         ));
     }
-    u64::try_from(count)
-        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))
+    if selector_executions != candidate_domains || candidate_domains > line_domains {
+        return Err(ExecutionError::fault(
+            "FRE grep-capture selector/domain cardinality invariant failed",
+        ));
+    }
+    let count = u64::try_from(count)
+        .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
+    Ok(GrepCaptureExecutionReport {
+        count,
+        line_domains,
+        candidate_domains,
+        selector_executions,
+        consolidated_prefilter,
+        prefilter_transitions,
+        prefilter_match_events,
+        prefilter_match_events_upper_bound,
+        prefilter_sequential_bytes: prefilter_sequential,
+        selector,
+        state_visits,
+        history_nodes,
+        history_walk,
+    })
 }
 
 fn one_fre_pattern(request: CandidateRequest<'_>) -> Result<&str, ExecutionError> {
@@ -16334,11 +16503,19 @@ mod tests {
         assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
         assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
 
+        let accounting_regex = capture_grep_regex_one(AWS, false, false, &RunLimits::default())
+            .expect("required-literal accounting fixture");
+        let accounting_prefilter = active_capture_required_literal_plan(&accounting_regex)
+            .expect("AWS required-literal proof");
         for miss in [b"".as_slice(), b"xx\n".as_slice()] {
+            let prospective = accounting_prefilter
+                .line_partition_prospective(miss.len())
+                .expect("small line prospective")
+                .expect("AWS literals contain no line terminators");
             let work = miss
                 .len()
-                .checked_mul(2)
-                .and_then(|value| value.checked_add(1))
+                .checked_add(prospective.transitions_upper_bound)
+                .and_then(|value| value.checked_add(prospective.match_events_upper_bound))
                 .expect("small prefilter work");
             let sequential = miss.len().checked_mul(2).expect("small sequential");
             let exact = RunLimits {
@@ -16464,6 +16641,148 @@ mod tests {
                 .expect("resource fallback execution"),
             expected
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table-driven test authenticates line semantics, selector cardinality, and exact cumulative boundaries together"
+    )]
+    fn required_literal_line_stream_preserves_domains_priority_and_accounting() {
+        const PATTERN: &str = r"(?:(ABC)|(AB)(C)|(XY))";
+        let defaults = RunLimits::default();
+        let regex = capture_grep_regex_one(PATTERN, false, false, &defaults)
+            .expect("generic variable-participation capture fixture");
+        let prefilter = active_capture_required_literal_plan(&regex)
+            .expect("fixture has a same-HIR required-literal proof");
+        assert_eq!(
+            capture_plan_label(&regex),
+            CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+        );
+        let upstream = rust_compile_options(&[PATTERN.to_string()], false, false)
+            .expect("pinned Rust source-priority fixture");
+        let cases: &[(&[u8], usize, usize, usize)] = &[
+            (b"", 0, 0, 0),
+            (b"\n", 0, 1, 0),
+            (b"\n\n", 0, 2, 0),
+            (b"ABC\n", 1, 1, 1),
+            (b"ABC\r\n", 1, 1, 1),
+            (b"ABC\n\n", 1, 2, 1),
+            (b"A\nBC", 0, 2, 0),
+            (b"\xFFABC\r\nA\xFFB\nXY\x80", 2, 3, 2),
+            (b"ABCABC", 1, 1, 2),
+        ];
+        for &(haystack, candidate_domains, line_domains, match_events) in cases {
+            let expected =
+                grep_captures(&upstream, haystack, u64::MAX).expect("Rust grep-captures");
+            let first = execute_grep_captures_inner(Some(prefilter), &regex, haystack, &defaults)
+                .expect("first consolidated line execution");
+            let steady = execute_grep_captures_inner(Some(prefilter), &regex, haystack, &defaults)
+                .expect("steady consolidated line execution");
+            assert_eq!(first, steady, "retained execution changed for {haystack:?}");
+            assert_eq!(first.count, expected, "semantic mismatch for {haystack:?}");
+            assert_eq!(first.line_domains, line_domains, "{haystack:?}");
+            assert_eq!(first.candidate_domains, candidate_domains, "{haystack:?}");
+            assert_eq!(
+                first.selector_executions, candidate_domains,
+                "one selector execution is required per surviving domain: {haystack:?}"
+            );
+            assert!(first.consolidated_prefilter, "{haystack:?}");
+            let prospective = prefilter
+                .line_partition_prospective(haystack.len())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                first.prefilter_transitions,
+                prospective.transitions_upper_bound
+            );
+            assert_eq!(first.prefilter_match_events, match_events);
+            assert_eq!(
+                first.prefilter_match_events_upper_bound,
+                prospective.match_events_upper_bound
+            );
+            assert_eq!(first.prefilter_sequential_bytes, haystack.len());
+        }
+        assert_eq!(
+            execute_grep_captures_inner(Some(prefilter), &regex, b"ABC", &defaults)
+                .unwrap()
+                .count,
+            2,
+            "leftmost first arm contributes only overall plus its one capture"
+        );
+        assert_eq!(
+            execute_grep_captures_inner(Some(prefilter), &regex, b"ABCABC", &defaults)
+                .unwrap()
+                .count,
+            4,
+            "multiple matches in one line still use one selector operation"
+        );
+
+        let miss = b"miss\n";
+        let prospective = prefilter
+            .line_partition_prospective(miss.len())
+            .unwrap()
+            .unwrap();
+        let exact_work = miss
+            .len()
+            .checked_add(prospective.transitions_upper_bound)
+            .and_then(|work| work.checked_add(prospective.match_events_upper_bound))
+            .unwrap();
+        let exact = RunLimits {
+            fre_aggregate_operation_work: exact_work,
+            fre_aggregate_sequential_bytes: miss.len() * 2,
+            ..RunLimits::default()
+        };
+        let exact_report =
+            execute_grep_captures_inner(Some(prefilter), &regex, miss, &exact).unwrap();
+        assert_eq!(exact_report.count, 0);
+        assert_eq!(exact_report.selector_executions, 0);
+        assert_eq!(
+            exact_report.selector.work,
+            exact.fre_aggregate_operation_work
+        );
+        assert_eq!(
+            exact_report.selector.sequential_bytes,
+            exact.fre_aggregate_sequential_bytes
+        );
+        let one_below = RunLimits {
+            fre_aggregate_operation_work: exact.fre_aggregate_operation_work - 1,
+            ..exact
+        };
+        let refusal =
+            execute_grep_captures_inner(Some(prefilter), &regex, miss, &one_below).unwrap_err();
+        assert_eq!(refusal.status, Status::Unsupported);
+        assert!(refusal.message.contains("required-literal scans require"));
+    }
+
+    #[test]
+    fn required_literal_line_stream_keeps_delimiter_sensitive_fallback() {
+        const PATTERN: &str = r"(?:(AB\r)|(BC))";
+        let limits = RunLimits::default();
+        let regex = capture_grep_regex_one(PATTERN, false, false, &limits)
+            .expect("delimiter-sensitive required-literal fixture");
+        let prefilter =
+            active_capture_required_literal_plan(&regex).expect("required-literal proof");
+        let haystack = b"ABC\r\nmiss\nBC";
+        assert!(
+            prefilter
+                .line_partition_matches(haystack, CaptureRequiredLiteralRunLimits::default(),)
+                .unwrap()
+                .is_none(),
+            "terminator-bearing literals must retain independent line searches"
+        );
+        let upstream = rust_compile_options(&[PATTERN.to_string()], false, false)
+            .expect("pinned Rust delimiter-sensitive fixture");
+        let expected = grep_captures(&upstream, haystack, u64::MAX).expect("Rust grep-captures");
+        let report =
+            execute_grep_captures_inner(Some(prefilter), &regex, haystack, &limits).unwrap();
+        assert_eq!(report.count, expected);
+        assert!(!report.consolidated_prefilter);
+        assert_eq!(report.line_domains, 3);
+        assert_eq!(report.candidate_domains, 2);
+        assert_eq!(report.selector_executions, 2);
+        assert_eq!(report.prefilter_match_events, 0);
+        assert_eq!(report.prefilter_match_events_upper_bound, 0);
     }
 
     #[test]
@@ -18269,7 +18588,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v38-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v39-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -18300,6 +18619,16 @@ mod tests {
         assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
         assert!(identity.identity.contains("literal-class-run-literal-v1"));
         assert!(identity.identity.contains("bounded-literal-pair-v1"));
+        assert!(
+            identity
+                .identity
+                .contains("one checked whole-input literal stream")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("independent checked per-line fallback")
+        );
         assert!(
             identity
                 .identity
