@@ -2027,94 +2027,117 @@ fn leading_fixed_candidate(
     )))
 }
 
+// Keep recursive dispatch separate from the per-shape analyzers. `FixedPrefix`
+// retains several complete byte sets; combining all HIR-arm temporaries in one
+// debug frame makes otherwise bounded large-pattern compilation exhaust the
+// standard Rust test-thread stack on x86.
 fn fixed_prefix(hir: &Hir, budget: &mut CompileBudget) -> Result<FixedPrefix, Error> {
     budget.charge(1)?;
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => initialized_fixed_prefix(true, budget),
-        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
-            let mut output = initialized_fixed_prefix(bytes.len() <= FILTER_WIDTH, budget)?;
-            let retained = bytes.len().min(FILTER_WIDTH);
-            budget.charge(add(bytes.len(), retained, Resource::CompileWork)?)?;
-            for (index, &byte) in bytes.iter().take(retained).enumerate() {
-                let mut set = ByteSet::empty();
-                set.insert(byte);
-                output.sets[index] = set;
-            }
-            output.len = retained;
-            Ok(output)
-        }
-        HirKind::Class(Class::Bytes(class)) => {
-            let mut set = ByteSet::empty();
-            for range in class.ranges() {
-                let width = inclusive_byte_width(range.start(), range.end())?;
-                budget.charge(add(width, 1, Resource::CompileWork)?)?;
-                set.insert_range(range.start(), range.end());
-            }
-            let mut output = initialized_fixed_prefix(true, budget)?;
-            output.sets[0] = set;
-            output.len = 1;
-            Ok(output)
-        }
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => fixed_literal_prefix(bytes, budget),
+        HirKind::Class(Class::Bytes(class)) => fixed_byte_class_prefix(class, budget),
         HirKind::Class(Class::Unicode(_)) => initialized_fixed_prefix(false, budget),
         HirKind::Capture(capture) => fixed_prefix(&capture.sub, budget),
-        HirKind::Concat(parts) => {
-            let mut output = initialized_fixed_prefix(true, budget)?;
-            for part in parts {
-                budget.charge(1)?;
-                let child = fixed_prefix(part, budget)?;
-                output.append(child, budget)?;
-                if !child.exact || output.len == FILTER_WIDTH {
-                    output.exact = false;
-                    break;
-                }
-            }
-            Ok(output)
-        }
-        HirKind::Alternation(branches) => {
-            let Some((first, rest)) = branches.split_first() else {
-                return initialized_fixed_prefix(false, budget);
-            };
-            let mut output = fixed_prefix(first, budget)?;
-            for branch in rest {
-                budget.charge(1)?;
-                let branch = fixed_prefix(branch, budget)?;
-                let shared = output.len.min(branch.len);
-                for index in 0..shared {
-                    for word in 0..output.sets[index].0.len() {
-                        budget.charge(2)?;
-                        output.sets[index].0[word] |= branch.sets[index].0[word];
-                    }
-                }
-                output.exact &= branch.exact && output.len == branch.len;
-                output.len = shared;
-                if output.len == 0 {
-                    break;
-                }
-            }
-            Ok(output)
-        }
-        HirKind::Repetition(repetition) => {
-            budget.charge(1)?;
-            if repetition.min == 0 {
-                return initialized_fixed_prefix(false, budget);
-            }
-            let child = fixed_prefix(&repetition.sub, budget)?;
-            if child.len == 0 {
-                return initialized_fixed_prefix(false, budget);
-            }
-            let mut output = initialized_fixed_prefix(true, budget)?;
-            for _ in 0..repetition.min {
-                budget.charge(1)?;
-                output.append(child, budget)?;
-                if !child.exact || output.len == FILTER_WIDTH {
-                    output.exact = false;
-                    break;
-                }
-            }
-            output.exact &= child.exact && repetition.max == Some(repetition.min);
-            Ok(output)
+        HirKind::Concat(parts) => fixed_concat_prefix(parts, budget),
+        HirKind::Alternation(branches) => fixed_alternation_prefix(branches, budget),
+        HirKind::Repetition(repetition) => fixed_repetition_prefix(repetition, budget),
+    }
+}
+
+fn fixed_literal_prefix(bytes: &[u8], budget: &mut CompileBudget) -> Result<FixedPrefix, Error> {
+    let mut output = initialized_fixed_prefix(bytes.len() <= FILTER_WIDTH, budget)?;
+    let retained = bytes.len().min(FILTER_WIDTH);
+    budget.charge(add(bytes.len(), retained, Resource::CompileWork)?)?;
+    for (index, &byte) in bytes.iter().take(retained).enumerate() {
+        let mut set = ByteSet::empty();
+        set.insert(byte);
+        output.sets[index] = set;
+    }
+    output.len = retained;
+    Ok(output)
+}
+
+fn fixed_byte_class_prefix(
+    class: &regex_syntax::hir::ClassBytes,
+    budget: &mut CompileBudget,
+) -> Result<FixedPrefix, Error> {
+    let mut set = ByteSet::empty();
+    for range in class.ranges() {
+        let width = inclusive_byte_width(range.start(), range.end())?;
+        budget.charge(add(width, 1, Resource::CompileWork)?)?;
+        set.insert_range(range.start(), range.end());
+    }
+    let mut output = initialized_fixed_prefix(true, budget)?;
+    output.sets[0] = set;
+    output.len = 1;
+    Ok(output)
+}
+
+fn fixed_concat_prefix(parts: &[Hir], budget: &mut CompileBudget) -> Result<FixedPrefix, Error> {
+    let mut output = initialized_fixed_prefix(true, budget)?;
+    for part in parts {
+        budget.charge(1)?;
+        let child = fixed_prefix(part, budget)?;
+        output.append(child, budget)?;
+        if !child.exact || output.len == FILTER_WIDTH {
+            output.exact = false;
+            break;
         }
     }
+    Ok(output)
+}
+
+fn fixed_alternation_prefix(
+    branches: &[Hir],
+    budget: &mut CompileBudget,
+) -> Result<FixedPrefix, Error> {
+    let Some((first, rest)) = branches.split_first() else {
+        return initialized_fixed_prefix(false, budget);
+    };
+    let mut output = fixed_prefix(first, budget)?;
+    for branch in rest {
+        budget.charge(1)?;
+        let branch = fixed_prefix(branch, budget)?;
+        let shared = output.len.min(branch.len);
+        for index in 0..shared {
+            for word in 0..output.sets[index].0.len() {
+                budget.charge(2)?;
+                output.sets[index].0[word] |= branch.sets[index].0[word];
+            }
+        }
+        output.exact &= branch.exact && output.len == branch.len;
+        output.len = shared;
+        if output.len == 0 {
+            break;
+        }
+    }
+    Ok(output)
+}
+
+fn fixed_repetition_prefix(
+    repetition: &Repetition,
+    budget: &mut CompileBudget,
+) -> Result<FixedPrefix, Error> {
+    budget.charge(1)?;
+    if repetition.min == 0 {
+        return initialized_fixed_prefix(false, budget);
+    }
+    let child = fixed_prefix(&repetition.sub, budget)?;
+    if child.len == 0 {
+        return initialized_fixed_prefix(false, budget);
+    }
+    let mut output = initialized_fixed_prefix(true, budget)?;
+    for _ in 0..repetition.min {
+        budget.charge(1)?;
+        output.append(child, budget)?;
+        if !child.exact || output.len == FILTER_WIDTH {
+            output.exact = false;
+            break;
+        }
+    }
+    output.exact &= child.exact && repetition.max == Some(repetition.min);
+    Ok(output)
 }
 
 fn leading_assertion(hir: &Hir, budget: &mut CompileBudget) -> Result<Option<Assertion>, Error> {
@@ -2287,6 +2310,8 @@ fn required_candidate(
     }
 }
 
+// As with `fixed_prefix`, per-shape helpers prevent every recursive call from
+// retaining the union of all `CandidateDraft` temporaries in its debug frame.
 fn required_global_candidate(
     hir: &Hir,
     budget: &mut CompileBudget,
@@ -2295,76 +2320,99 @@ fn required_global_candidate(
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => Ok(None),
         HirKind::Literal(_) | HirKind::Class(Class::Bytes(_)) => {
-            if let Some(fixed) = leading_fixed_candidate(hir, budget)? {
-                Ok(Some(fixed))
-            } else {
-                required_candidate(hir, budget)
-            }
+            required_global_leaf_candidate(hir, budget)
         }
         HirKind::Capture(capture) => required_global_candidate(&capture.sub, budget),
-        HirKind::Repetition(repetition) => {
-            budget.charge(1)?;
-            if repetition.min == 0 {
-                Ok(None)
-            } else {
-                required_global_candidate(&repetition.sub, budget)
-            }
-        }
-        HirKind::Concat(parts) => {
-            let mut selected = if hir
-                .properties()
-                .minimum_len()
-                .is_some_and(|minimum| minimum > 0)
-            {
-                leading_fixed_candidate(hir, budget)?
-            } else {
-                None
-            };
-            for part in parts {
-                budget.charge(2)?; // child visit and nonempty property
-                if part
-                    .properties()
-                    .minimum_len()
-                    .is_some_and(|minimum| minimum > 0)
-                    && let Some(candidate) = required_global_candidate(part, budget)?
-                {
-                    selected = choose_candidate(selected, candidate, budget)?;
-                }
-            }
-            Ok(selected)
-        }
-        HirKind::Alternation(branches) => {
-            let mut combined: Option<CandidateDraft> = None;
-            for branch in branches {
-                budget.charge(1)?;
-                let Some(branch) = required_global_candidate(branch, budget)? else {
-                    return Ok(None);
-                };
-                combined = Some(match combined {
-                    None => branch,
-                    Some(mut combined) => {
-                        if global_probe_equal(&combined, &branch, budget)? {
-                            combined
-                        } else {
-                            for word in 0..combined.bytes.0.len() {
-                                budget.charge(2)?;
-                                combined.bytes.0[word] |= branch.bytes.0[word];
-                            }
-                            combined.checks = initialized_filter_checks(budget)?;
-                            combined.check_len = 0;
-                            combined.min_offset = 0;
-                            combined.max_offset = 0;
-                            combined.global_bytes = combined.bytes;
-                            combined.global_checks = combined.checks;
-                            combined.global_check_len = 0;
-                            combined
-                        }
-                    }
-                });
-            }
-            Ok(combined)
+        HirKind::Repetition(repetition) => required_global_repetition_candidate(repetition, budget),
+        HirKind::Concat(parts) => required_global_concat_candidate(hir, parts, budget),
+        HirKind::Alternation(branches) => required_global_alternation_candidate(branches, budget),
+    }
+}
+
+fn required_global_leaf_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    if let Some(fixed) = leading_fixed_candidate(hir, budget)? {
+        Ok(Some(fixed))
+    } else {
+        required_candidate(hir, budget)
+    }
+}
+
+fn required_global_repetition_candidate(
+    repetition: &Repetition,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    if repetition.min == 0 {
+        Ok(None)
+    } else {
+        required_global_candidate(&repetition.sub, budget)
+    }
+}
+
+fn required_global_concat_candidate(
+    hir: &Hir,
+    parts: &[Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let mut selected = if hir
+        .properties()
+        .minimum_len()
+        .is_some_and(|minimum| minimum > 0)
+    {
+        leading_fixed_candidate(hir, budget)?
+    } else {
+        None
+    };
+    for part in parts {
+        budget.charge(2)?; // child visit and nonempty property
+        if part
+            .properties()
+            .minimum_len()
+            .is_some_and(|minimum| minimum > 0)
+            && let Some(candidate) = required_global_candidate(part, budget)?
+        {
+            selected = choose_candidate(selected, candidate, budget)?;
         }
     }
+    Ok(selected)
+}
+
+fn required_global_alternation_candidate(
+    branches: &[Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let mut combined: Option<CandidateDraft> = None;
+    for branch in branches {
+        budget.charge(1)?;
+        let Some(branch) = required_global_candidate(branch, budget)? else {
+            return Ok(None);
+        };
+        combined = Some(match combined {
+            None => branch,
+            Some(mut combined) => {
+                if global_probe_equal(&combined, &branch, budget)? {
+                    combined
+                } else {
+                    for word in 0..combined.bytes.0.len() {
+                        budget.charge(2)?;
+                        combined.bytes.0[word] |= branch.bytes.0[word];
+                    }
+                    combined.checks = initialized_filter_checks(budget)?;
+                    combined.check_len = 0;
+                    combined.min_offset = 0;
+                    combined.max_offset = 0;
+                    combined.global_bytes = combined.bytes;
+                    combined.global_checks = combined.checks;
+                    combined.global_check_len = 0;
+                    combined
+                }
+            }
+        });
+    }
+    Ok(combined)
 }
 
 fn required_trailing_global_candidate(
@@ -2379,59 +2427,76 @@ fn required_trailing_global_candidate(
         }
         HirKind::Capture(capture) => required_trailing_global_candidate(&capture.sub, budget),
         HirKind::Repetition(repetition) => {
-            budget.charge(1)?;
-            if repetition.min == 0 {
-                Ok(None)
-            } else {
-                required_trailing_global_candidate(&repetition.sub, budget)
-            }
+            required_trailing_repetition_candidate(repetition, budget)
         }
-        HirKind::Concat(parts) => {
-            for part in parts.iter().rev() {
-                budget.charge(2)?; // child visit and mandatory-width property
-                if part
-                    .properties()
-                    .minimum_len()
-                    .is_some_and(|minimum| minimum > 0)
-                    && let Some(candidate) = required_trailing_global_candidate(part, budget)?
-                {
-                    return Ok(Some(candidate));
-                }
-            }
-            Ok(None)
-        }
-        HirKind::Alternation(branches) => {
-            let mut combined: Option<CandidateDraft> = None;
-            for branch in branches {
-                budget.charge(1)?;
-                let Some(branch) = required_trailing_global_candidate(branch, budget)? else {
-                    return Ok(None);
-                };
-                combined = Some(match combined {
-                    None => branch,
-                    Some(mut combined) => {
-                        if global_probe_equal(&combined, &branch, budget)? {
-                            combined
-                        } else {
-                            for word in 0..combined.bytes.0.len() {
-                                budget.charge(2)?;
-                                combined.bytes.0[word] |= branch.bytes.0[word];
-                            }
-                            combined.checks = initialized_filter_checks(budget)?;
-                            combined.check_len = 0;
-                            combined.min_offset = 0;
-                            combined.max_offset = 0;
-                            combined.global_bytes = combined.bytes;
-                            combined.global_checks = combined.checks;
-                            combined.global_check_len = 0;
-                            combined
-                        }
-                    }
-                });
-            }
-            Ok(combined)
+        HirKind::Concat(parts) => required_trailing_concat_candidate(parts, budget),
+        HirKind::Alternation(branches) => required_trailing_alternation_candidate(branches, budget),
+    }
+}
+
+fn required_trailing_repetition_candidate(
+    repetition: &Repetition,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    if repetition.min == 0 {
+        Ok(None)
+    } else {
+        required_trailing_global_candidate(&repetition.sub, budget)
+    }
+}
+
+fn required_trailing_concat_candidate(
+    parts: &[Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    for part in parts.iter().rev() {
+        budget.charge(2)?; // child visit and mandatory-width property
+        if part
+            .properties()
+            .minimum_len()
+            .is_some_and(|minimum| minimum > 0)
+            && let Some(candidate) = required_trailing_global_candidate(part, budget)?
+        {
+            return Ok(Some(candidate));
         }
     }
+    Ok(None)
+}
+
+fn required_trailing_alternation_candidate(
+    branches: &[Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    let mut combined: Option<CandidateDraft> = None;
+    for branch in branches {
+        budget.charge(1)?;
+        let Some(branch) = required_trailing_global_candidate(branch, budget)? else {
+            return Ok(None);
+        };
+        combined = Some(match combined {
+            None => branch,
+            Some(mut combined) => {
+                if global_probe_equal(&combined, &branch, budget)? {
+                    combined
+                } else {
+                    for word in 0..combined.bytes.0.len() {
+                        budget.charge(2)?;
+                        combined.bytes.0[word] |= branch.bytes.0[word];
+                    }
+                    combined.checks = initialized_filter_checks(budget)?;
+                    combined.check_len = 0;
+                    combined.min_offset = 0;
+                    combined.max_offset = 0;
+                    combined.global_bytes = combined.bytes;
+                    combined.global_checks = combined.checks;
+                    combined.global_check_len = 0;
+                    combined
+                }
+            }
+        });
+    }
+    Ok(combined)
 }
 
 fn global_probe_equal(
