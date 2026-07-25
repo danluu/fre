@@ -8,7 +8,6 @@ use fre_kernels::{
     RequiredInternalAnchorPlan, UrlAggregatePlan, UrlAggregateReduceAccounting,
     UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
 };
-use memchr::memmem;
 use sha2::{Digest, Sha256};
 
 use crate::accounting::ExecutionAccounting;
@@ -1943,7 +1942,7 @@ impl CompiledRegex {
         clippy::too_many_arguments,
         reason = "the certified route receives the shared publication and accounting state explicitly"
     )]
-    fn execute_state_byte_span_sum(
+    fn execute_state_byte_span_sum<const OBSERVED_WORK: bool>(
         &self,
         plan: &StateByteSpanSumPlan,
         local: &[u8],
@@ -1956,7 +1955,12 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let prospective = state_byte_span_sum_prospective(&self.program, plan, local.len())?;
+        let prospective = state_byte_span_sum_prospective::<OBSERVED_WORK>(
+            &self.program,
+            plan,
+            local.len(),
+            limits,
+        )?;
         if let Some(publication) = attempt.as_mut() {
             let physical_route = OperationPhysicalRoute::StateByteSpanSum;
             publication.identity.physical_route = Some(physical_route);
@@ -1979,12 +1983,21 @@ impl CompiledRegex {
         *actual_allocations = 0;
         let (matches, span_sum) = match plan.topology() {
             StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
-                reduce_greedy_prefix_literal_suffix(plan, local, attempt_accounting)?
+                reduce_greedy_prefix_literal_suffix(
+                    plan,
+                    local,
+                    prospective.work_bound,
+                    attempt_accounting,
+                )?
             }
-            StateByteSpanSumTopology::DisjointRunsLiteral => {
-                reduce_disjoint_runs_literal(plan, local, attempt_accounting)?
-            }
+            StateByteSpanSumTopology::DisjointRunsLiteral => reduce_disjoint_runs_literal(
+                plan,
+                local,
+                prospective.work_bound,
+                attempt_accounting,
+            )?,
         };
+        validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
         if !prospective.contains(*attempt_accounting) {
             return Err(Error::InternalInvariant(
                 "state-byte SpanSum actual accounting exceeds its prospective",
@@ -2121,7 +2134,7 @@ impl CompiledRegex {
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.state_byte_span_sum
         {
-            return self.execute_state_byte_span_sum(
+            return self.execute_state_byte_span_sum::<OBSERVED_WORK>(
                 plan,
                 local,
                 range,
@@ -3274,10 +3287,11 @@ impl CompiledRegex {
     }
 }
 
-fn state_byte_span_sum_prospective(
+fn state_byte_span_sum_prospective<const OBSERVED_WORK: bool>(
     program: &Program,
     plan: &StateByteSpanSumPlan,
     input_bytes: usize,
+    limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
     let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
     let work_factor = match plan.topology() {
@@ -3286,11 +3300,23 @@ fn state_byte_span_sum_prospective(
             add(plan.literal().len(), 7, Resource::ExecutionWork)?
         }
     };
-    let work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
-    let random_access_bytes_read = match plan.topology() {
+    let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
+    let work_bound = if OBSERVED_WORK {
+        structural_work_bound.min(limits.max_work)
+    } else {
+        structural_work_bound
+    };
+    let state_transition_bound = mul(input_bytes, 2, Resource::ExecutionWork)?;
+    let root_probe_bound = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::DisjointRunsLiteral => {
+            mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
+        }
+    };
+    let random_access_bytes_read = match plan.topology() {
+        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => input_bytes,
         StateByteSpanSumTopology::DisjointRunsLiteral => mul(
             input_bytes,
             add(plan.literal().len(), 1, Resource::ExecutionWork)?,
@@ -3298,13 +3324,13 @@ fn state_byte_span_sum_prospective(
         )?,
     };
     let accounting = ExecutionAccounting {
-        state_evaluations: work_bound,
-        transition_checks: work_bound,
-        root_probes: work_bound,
-        successful_paths: input_bytes,
-        emitted_matches: input_bytes,
-        sequential_bytes_read: input_bytes,
-        random_access_bytes_read,
+        state_evaluations: state_transition_bound.min(work_bound),
+        transition_checks: state_transition_bound.min(work_bound),
+        root_probes: root_probe_bound.min(work_bound),
+        successful_paths: input_bytes.min(work_bound),
+        emitted_matches: input_bytes.min(work_bound),
+        sequential_bytes_read: input_bytes.min(work_bound),
+        random_access_bytes_read: random_access_bytes_read.min(work_bound),
         work: work_bound,
         ..ExecutionAccounting::default()
     };
@@ -3333,76 +3359,81 @@ fn state_byte_span_sum_prospective(
 fn reduce_greedy_prefix_literal_suffix(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
+    work_limit: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
     let literal = plan.literal();
+    let literal_failure = plan.literal_failure();
     let mut cursor = 0_usize;
     let mut matches = 0_usize;
     let mut span_sum = 0_usize;
     while cursor < haystack.len() {
         if !state_byte_classify(
             suffix,
-            haystack[cursor],
+            haystack,
+            cursor,
             StateByteSourceAccess::Sequential,
+            work_limit,
             accounting,
-        )? {
+        )?
+        .matches
+        {
             cursor = add(cursor, 1, Resource::Boundaries)?;
             continue;
         }
         let suffix_start = cursor;
         cursor = add(cursor, 1, Resource::Boundaries)?;
-        while cursor < haystack.len()
-            && state_byte_classify(
+        while cursor < haystack.len() {
+            let classified = state_byte_classify(
                 suffix,
-                haystack[cursor],
+                haystack,
+                cursor,
                 StateByteSourceAccess::Sequential,
+                work_limit,
                 accounting,
-            )?
-        {
+            )?;
+            if !classified.matches {
+                break;
+            }
             cursor = add(cursor, 1, Resource::Boundaries)?;
         }
         let suffix_end = cursor;
         let mut scan = suffix_start;
         let mut selected_start = None;
+        let mut prefix_start = None;
+        let mut literal_matched = 0_usize;
         while scan < suffix_end {
-            if !state_byte_classify(
+            let classified = state_byte_classify(
                 prefix,
-                haystack[scan],
+                haystack,
+                scan,
                 StateByteSourceAccess::Random,
+                work_limit,
                 accounting,
-            )? {
-                scan = add(scan, 1, Resource::Boundaries)?;
-                continue;
-            }
-            let prefix_start = scan;
-            scan = add(scan, 1, Resource::Boundaries)?;
-            while scan < suffix_end
-                && state_byte_classify(
-                    prefix,
-                    haystack[scan],
-                    StateByteSourceAccess::Random,
+            )?;
+            if classified.matches {
+                let run_start = *prefix_start.get_or_insert(scan);
+                if state_byte_kmp_feed(
+                    classified.byte,
+                    literal,
+                    literal_failure,
+                    &mut literal_matched,
+                    work_limit,
                     accounting,
-                )?
-            {
-                scan = add(scan, 1, Resource::Boundaries)?;
+                )? {
+                    selected_start = Some(run_start);
+                    break;
+                }
+            } else {
+                prefix_start = None;
+                literal_matched = 0;
             }
-            let prefix_end = scan;
-            let window = &haystack[prefix_start..prefix_end];
-            state_byte_probe(accounting, window.len())?;
-            if window.len() >= literal.len() && memmem::find(window, literal).is_some() {
-                selected_start = Some(prefix_start);
-                break;
-            }
-            if scan < suffix_end {
-                // The prefix-run loop already classified this byte outside
-                // `prefix`; advance without charging the same predicate twice.
-                scan = add(scan, 1, Resource::Boundaries)?;
-            }
+            scan = add(scan, 1, Resource::Boundaries)?;
         }
         if let Some(start) = selected_start {
-            state_byte_event(accounting)?;
+            state_byte_event(work_limit, accounting)?;
             matches = add(matches, 1, Resource::OutputMatches)?;
             span_sum = add(
                 span_sum,
@@ -3427,6 +3458,7 @@ fn reduce_greedy_prefix_literal_suffix(
 fn reduce_disjoint_runs_literal(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
+    work_limit: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(usize, usize), Error> {
     let first = plan.first();
@@ -3438,35 +3470,49 @@ fn reduce_disjoint_runs_literal(
     while cursor < haystack.len() {
         if !state_byte_classify(
             first,
-            haystack[cursor],
+            haystack,
+            cursor,
             StateByteSourceAccess::Sequential,
+            work_limit,
             accounting,
-        )? {
+        )?
+        .matches
+        {
             cursor = add(cursor, 1, Resource::Boundaries)?;
             continue;
         }
         let start = cursor;
         cursor = add(cursor, 1, Resource::Boundaries)?;
-        while cursor < haystack.len()
-            && state_byte_classify(
+        while cursor < haystack.len() {
+            let classified = state_byte_classify(
                 first,
-                haystack[cursor],
+                haystack,
+                cursor,
                 StateByteSourceAccess::Sequential,
+                work_limit,
                 accounting,
-            )?
-        {
+            )?;
+            if !classified.matches {
+                break;
+            }
             cursor = add(cursor, 1, Resource::Boundaries)?;
         }
         let first_end = cursor;
         let mut second_end = first_end;
-        while second_end < haystack.len()
-            && state_byte_classify(
+        let mut second_terminator = None;
+        while second_end < haystack.len() {
+            let classified = state_byte_classify(
                 second,
-                haystack[second_end],
+                haystack,
+                second_end,
                 StateByteSourceAccess::Random,
+                work_limit,
                 accounting,
-            )?
-        {
+            )?;
+            if !classified.matches {
+                second_terminator = Some(classified.byte);
+                break;
+            }
             second_end = add(second_end, 1, Resource::Boundaries)?;
         }
         if second_end == first_end {
@@ -3479,20 +3525,17 @@ fn reduce_disjoint_runs_literal(
             };
             continue;
         }
-        let available = haystack.len().saturating_sub(second_end);
-        let compared = available.min(literal.len());
-        let mut literal_matches = available >= literal.len();
-        for (offset, &literal_byte) in literal.iter().take(compared).enumerate() {
-            state_byte_probe(accounting, 1)?;
-            let index = add(second_end, offset, Resource::Boundaries)?;
-            if haystack[index] != literal_byte {
-                literal_matches = false;
-                break;
-            }
-        }
+        let literal_matches = state_byte_disjoint_literal_matches(
+            literal,
+            haystack,
+            second_end,
+            second_terminator,
+            work_limit,
+            accounting,
+        )?;
         if literal_matches {
             let end = add(second_end, literal.len(), Resource::Boundaries)?;
-            state_byte_event(accounting)?;
+            state_byte_event(work_limit, accounting)?;
             matches = add(matches, 1, Resource::OutputMatches)?;
             span_sum = add(
                 span_sum,
@@ -3512,43 +3555,141 @@ fn reduce_disjoint_runs_literal(
     Ok((matches, span_sum))
 }
 
-fn state_byte_classify(
-    class: crate::program::ByteSet,
-    byte: u8,
-    access: StateByteSourceAccess,
+fn state_byte_disjoint_literal_matches(
+    literal: &[u8],
+    haystack: &[u8],
+    start: usize,
+    classified_first: Option<u8>,
+    work_limit: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<bool, Error> {
-    accounting.state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
-    accounting.transition_checks = add(accounting.transition_checks, 1, Resource::ExecutionWork)?;
-    accounting.work = add(accounting.work, 2, Resource::ExecutionWork)?;
-    match access {
-        StateByteSourceAccess::Sequential => {
-            accounting.sequential_bytes_read = add(
+    if haystack.len().saturating_sub(start) < literal.len() {
+        return Ok(false);
+    }
+    let first_byte = classified_first.ok_or(Error::InternalInvariant(
+        "state-byte literal candidate lost its classified first byte",
+    ))?;
+    if !state_byte_compare_cached(first_byte, literal[0], work_limit, accounting)? {
+        return Ok(false);
+    }
+    for (offset, &literal_byte) in literal.iter().enumerate().skip(1) {
+        let index = add(start, offset, Resource::Boundaries)?;
+        if !state_byte_compare_source(haystack, index, literal_byte, work_limit, accounting)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn state_byte_classify(
+    class: crate::program::ByteSet,
+    haystack: &[u8],
+    index: usize,
+    access: StateByteSourceAccess,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<StateByteClassification, Error> {
+    let state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
+    let transition_checks = add(accounting.transition_checks, 1, Resource::ExecutionWork)?;
+    let work = add(accounting.work, 2, Resource::ExecutionWork)?;
+    enforce(work, work_limit, Resource::ExecutionWork)?;
+    let (sequential_bytes_read, random_access_bytes_read) = match access {
+        StateByteSourceAccess::Sequential => (
+            add(
                 accounting.sequential_bytes_read,
                 1,
                 Resource::SequentialBytes,
-            )?;
-        }
-        StateByteSourceAccess::Random => {
-            accounting.random_access_bytes_read = add(
+            )?,
+            accounting.random_access_bytes_read,
+        ),
+        StateByteSourceAccess::Random => (
+            accounting.sequential_bytes_read,
+            add(
                 accounting.random_access_bytes_read,
                 1,
                 Resource::RandomAccessBytes,
-            )?;
-        }
-    }
-    Ok(class.contains(byte))
+            )?,
+        ),
+    };
+    let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+        "state-byte classification index exceeds admitted source",
+    ))?;
+    accounting.state_evaluations = state_evaluations;
+    accounting.transition_checks = transition_checks;
+    accounting.sequential_bytes_read = sequential_bytes_read;
+    accounting.random_access_bytes_read = random_access_bytes_read;
+    accounting.work = work;
+    Ok(StateByteClassification {
+        byte,
+        matches: class.contains(byte),
+    })
 }
 
-fn state_byte_probe(accounting: &mut ExecutionAccounting, amount: usize) -> Result<(), Error> {
-    accounting.root_probes = add(accounting.root_probes, amount, Resource::ExecutionWork)?;
-    accounting.random_access_bytes_read = add(
+fn state_byte_compare_source(
+    haystack: &[u8],
+    index: usize,
+    expected: u8,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    let root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
+    let random_access_bytes_read = add(
         accounting.random_access_bytes_read,
-        amount,
+        1,
         Resource::RandomAccessBytes,
     )?;
-    accounting.work = add(accounting.work, amount, Resource::ExecutionWork)?;
-    Ok(())
+    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
+    enforce(work, work_limit, Resource::ExecutionWork)?;
+    let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+        "state-byte literal index exceeds admitted source",
+    ))?;
+    accounting.root_probes = root_probes;
+    accounting.random_access_bytes_read = random_access_bytes_read;
+    accounting.work = work;
+    Ok(byte == expected)
+}
+
+fn state_byte_compare_cached(
+    byte: u8,
+    expected: u8,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    let root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
+    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
+    enforce(work, work_limit, Resource::ExecutionWork)?;
+    accounting.root_probes = root_probes;
+    accounting.work = work;
+    Ok(byte == expected)
+}
+
+fn state_byte_kmp_feed(
+    byte: u8,
+    literal: &[u8],
+    failure: &[u8],
+    matched: &mut usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    loop {
+        if state_byte_compare_cached(byte, literal[*matched], work_limit, accounting)? {
+            *matched = add(*matched, 1, Resource::ExecutionWork)?;
+            return Ok(*matched == literal.len());
+        }
+        if *matched == 0 {
+            return Ok(false);
+        }
+        let fallback_index = (*matched).checked_sub(1).ok_or(Error::InternalInvariant(
+            "positive state-byte KMP prefix lost its predecessor",
+        ))?;
+        *matched = usize::from(failure[fallback_index]);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StateByteClassification {
+    byte: u8,
+    matches: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3557,10 +3698,14 @@ enum StateByteSourceAccess {
     Random,
 }
 
-fn state_byte_event(accounting: &mut ExecutionAccounting) -> Result<(), Error> {
-    accounting.successful_paths = add(accounting.successful_paths, 1, Resource::MatchEvents)?;
-    accounting.emitted_matches = add(accounting.emitted_matches, 1, Resource::OutputMatches)?;
-    accounting.work = add(accounting.work, 1, Resource::ExecutionWork)?;
+fn state_byte_event(work_limit: usize, accounting: &mut ExecutionAccounting) -> Result<(), Error> {
+    let successful_paths = add(accounting.successful_paths, 1, Resource::MatchEvents)?;
+    let emitted_matches = add(accounting.emitted_matches, 1, Resource::OutputMatches)?;
+    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
+    enforce(work, work_limit, Resource::ExecutionWork)?;
+    accounting.successful_paths = successful_paths;
+    accounting.emitted_matches = emitted_matches;
+    accounting.work = work;
     Ok(())
 }
 
@@ -8464,10 +8609,11 @@ mod tests {
         CONTINUATION_OPERATION_ALGORITHM_VERSION, CONTINUATION_OPERATION_MAX_ALLOCATIONS,
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
-        OperationPhysicalRoute, OperationProspective, Requirements, RowReader, RowStorage,
-        RowStore, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
-        cached_frontier_words, cached_program_assertion_mask, compact_operation_allocation_count,
-        decode, encoded_width, exact_filled, operation_identity, read_encoded, write_encoded,
+        OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
+        Requirements, RowReader, RowStorage, RowStore, UNCACHED_FRONTIER, allocation_fault,
+        cached_boundary_symbol, cached_compute_row, cached_frontier_words,
+        cached_program_assertion_mask, compact_operation_allocation_count, decode, encoded_width,
+        exact_filled, operation_identity, read_encoded, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -12708,7 +12854,11 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_exhaustive_small_differential() {
-        let cases: [(&str, &[u8]); 2] = [(r"[ab]*ab[abc]*", b"abc\n"), (r"[ab]+[ ]+a", b"ab \n")];
+        let cases: [(&str, &[u8]); 3] = [
+            (r"[ab]*ab[abc]*", b"abc\n"),
+            (r"[ab]*abab[abc]*", b"abc\n"),
+            (r"[ab]+[ ]+a", b"ab \n"),
+        ];
         for (pattern, alphabet) in cases {
             let compiled = state_byte_span_sum_fixture(pattern);
             let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
@@ -12751,6 +12901,226 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_state_byte_exact_case(
+        pattern: &str,
+        haystack: &[u8],
+        expected: &ExecutionAccounting,
+        expected_span_sum: usize,
+    ) {
+        let compiled = state_byte_span_sum_fixture(pattern);
+        let baseline = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("{pattern:?}, {haystack:?}: {error:?}"));
+        assert_eq!(
+            baseline.value, expected_span_sum,
+            "{pattern:?}, {haystack:?}"
+        );
+        assert_eq!(
+            baseline.receipt.actual, *expected,
+            "{pattern:?}, {haystack:?}"
+        );
+        let structural = baseline.receipt.prospective.unwrap();
+        assert!(structural.contains(*expected));
+
+        let exact_limits = OperationLimits {
+            max_work: expected.work,
+            ..exact_state_byte_limits(&structural)
+        };
+        let exact = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact_limits,
+            )
+            .unwrap_or_else(|error| panic!("{pattern:?}, {haystack:?}: {error:?}"));
+        let exact_prospective = exact.receipt.prospective.unwrap();
+        assert_eq!(exact.value, expected_span_sum);
+        assert_eq!(exact.receipt.actual, *expected);
+        assert_eq!(exact_prospective.work_bound, expected.work);
+        assert_eq!(exact_prospective.accounting.work, expected.work);
+        assert!(exact_prospective.contains(*expected));
+        assert!(exact.receipt.authenticates_success());
+
+        let one_below_limit = expected.work.checked_sub(1).unwrap();
+        let one_below = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: one_below_limit,
+                    ..exact_limits
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: expected.work,
+                limit: one_below_limit,
+            },
+            "{pattern:?}, {haystack:?}"
+        );
+        let one_below_prospective = one_below.receipt.prospective.unwrap();
+        assert_eq!(one_below_prospective.work_bound, one_below_limit);
+        assert_eq!(one_below_prospective.accounting.work, one_below_limit);
+        assert!(one_below.receipt.actual.work <= one_below_limit);
+        assert!(one_below.receipt.actual.work > 0);
+        assert!(one_below_prospective.contains(one_below.receipt.actual));
+        assert_eq!(one_below.receipt.actual_allocations, 0);
+        assert_eq!(
+            one_below.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum)
+        );
+        assert_eq!(
+            one_below.receipt.identity.prepublication_fallback,
+            OperationPrepublicationFallback::None
+        );
+        assert!(one_below.closes());
+    }
+
+    #[test]
+    fn state_byte_span_sum_exact_kmp_accounting_and_one_below_are_adversarial() {
+        assert_eq!(
+            state_byte_span_sum_fixture(r"[ab]*abab[a-z]*")
+                .state_byte_span_sum
+                .as_ref()
+                .unwrap()
+                .literal_failure(),
+            &[0, 0, 1, 2]
+        );
+        assert_eq!(
+            state_byte_span_sum_fixture(r"[ab]*aaaa[a-z]*")
+                .state_byte_span_sum
+                .as_ref()
+                .unwrap()
+                .literal_failure(),
+            &[0, 1, 2, 3]
+        );
+        for (pattern, haystack, state, sequential, random, root, events, work, span_sum) in [
+            (r"[a-c]*ab[a-z]*", b"c!".as_slice(), 3, 2, 1, 1, 0, 7, 0),
+            (r"[a-c]*ab[a-z]*", b"ab!".as_slice(), 5, 3, 2, 2, 1, 13, 2),
+            (r"[a-c]*ab[a-z]*", b"ccab!".as_slice(), 9, 5, 4, 4, 1, 23, 4),
+            (r"[a-c]*ab[a-z]*", b"cccc!".as_slice(), 9, 5, 4, 4, 0, 22, 0),
+            (
+                r"[ab]*abab[a-z]*",
+                b"aabab!".as_slice(),
+                11,
+                6,
+                5,
+                6,
+                1,
+                29,
+                5,
+            ),
+            (
+                r"[a-c]*ab[a-z]*",
+                b"cxxabq!".as_slice(),
+                12,
+                7,
+                5,
+                3,
+                1,
+                28,
+                3,
+            ),
+            (
+                r"[ab]*aaaa[a-z]*",
+                b"aaabaaaa!".as_slice(),
+                17,
+                9,
+                8,
+                11,
+                1,
+                46,
+                8,
+            ),
+        ] {
+            assert_state_byte_exact_case(
+                pattern,
+                haystack,
+                &ExecutionAccounting {
+                    state_evaluations: state,
+                    transition_checks: state,
+                    root_probes: root,
+                    successful_paths: events,
+                    emitted_matches: events,
+                    sequential_bytes_read: sequential,
+                    random_access_bytes_read: random,
+                    work,
+                    ..ExecutionAccounting::default()
+                },
+                span_sum,
+            );
+        }
+    }
+
+    #[test]
+    fn state_byte_span_sum_disjoint_accounting_caches_literal_head_and_orders_source() {
+        for (haystack, state, sequential, random, root, events, work, span_sum) in [
+            (b"ab  a".as_slice(), 6, 3, 3, 1, 1, 14, 5),
+            (b"abx".as_slice(), 4, 3, 1, 0, 0, 8, 0),
+        ] {
+            assert_state_byte_exact_case(
+                r"[ab]+[ ]+a",
+                haystack,
+                &ExecutionAccounting {
+                    state_evaluations: state,
+                    transition_checks: state,
+                    root_probes: root,
+                    successful_paths: events,
+                    emitted_matches: events,
+                    sequential_bytes_read: sequential,
+                    random_access_bytes_read: random,
+                    work,
+                    ..ExecutionAccounting::default()
+                },
+                span_sum,
+            );
+        }
+
+        let compiled = state_byte_span_sum_fixture(r"[ab]+[ ]+abc");
+        let haystack = b"ab  abc";
+        let refusal = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: 13,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 14,
+                limit: 13,
+            }
+        );
+        assert_eq!(refusal.receipt.actual.work, 13);
+        assert_eq!(refusal.receipt.actual.root_probes, 1);
+        assert_eq!(refusal.receipt.actual.random_access_bytes_read, 3);
+        assert_eq!(refusal.receipt.actual.sequential_bytes_read, 3);
+        assert!(
+            refusal
+                .receipt
+                .prospective
+                .unwrap()
+                .contains(refusal.receipt.actual)
+        );
+        assert!(refusal.closes());
     }
 
     #[test]
@@ -12851,13 +13221,6 @@ mod tests {
                     ..exact
                 },
             ),
-            (
-                Resource::ExecutionWork,
-                OperationLimits {
-                    max_work: prospective.work_bound - 1,
-                    ..exact
-                },
-            ),
         ] {
             let failure = compiled
                 .span_sum_value_with_receipt(
@@ -12883,6 +13246,82 @@ mod tests {
             assert_eq!(failure.receipt.actual_allocations, 0);
             assert!(failure.receipt.prospective.is_some());
         }
+
+        let actual_work = baseline.receipt.actual.work;
+        let observed_exact_limits = OperationLimits {
+            max_work: actual_work,
+            ..exact
+        };
+        let observed_exact = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                observed_exact_limits,
+            )
+            .unwrap();
+        assert_eq!(
+            observed_exact.receipt.prospective.unwrap().work_bound,
+            actual_work
+        );
+        assert_eq!(observed_exact.receipt.actual, baseline.receipt.actual);
+        let observed_one_below = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: actual_work - 1,
+                    ..observed_exact_limits
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            observed_one_below.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
+        let observed_one_below_prospective = observed_one_below.receipt.prospective.unwrap();
+        assert_eq!(observed_one_below_prospective.work_bound, actual_work - 1);
+        assert!(observed_one_below.receipt.actual.work > 0);
+        assert!(observed_one_below_prospective.contains(observed_one_below.receipt.actual));
+        assert!(observed_one_below.closes());
+
+        let conservative = compiled
+            .admit_span_sum_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let conservative_prospective = conservative.receipt.prospective.unwrap();
+        let conservative_refusal = compiled
+            .admit_span_sum_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: conservative_prospective.work_bound - 1,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            conservative_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: conservative_prospective.work_bound,
+                limit: conservative_prospective.work_bound - 1,
+            }
+        );
+        assert_eq!(
+            conservative_refusal.receipt.actual,
+            ExecutionAccounting::default()
+        );
+        assert!(conservative_refusal.closes());
 
         let compile = compiled.compile_accounting();
         let exact_compile = CompileLimits {
@@ -12917,6 +13356,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn state_byte_span_sum_publishes_observed_prospective_before_source() {
+        let compiled = state_byte_span_sum_fixture(r"[a-c]*ab[a-z]*");
+        let haystack = b"ccab!";
+        let limits = OperationLimits {
+            max_work: 23,
+            ..OperationLimits::default()
+        };
+        let mut published_prospective = None;
+        let refusal = {
+            let mut publish_observer = |prospective| {
+                published_prospective = Some(prospective);
+                Err(Error::InternalInvariant(
+                    "state-byte prospective observer sentinel",
+                ))
+            };
+            match compiled.execute_with_receipt::<true>(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationKind::Sum,
+                None,
+                limits,
+                usize::MAX,
+                Some(&mut publish_observer),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("prospective observer sentinel must terminate the attempt"),
+            }
+        };
+        let prospective = published_prospective.expect("observer receives published prospective");
+        assert_eq!(prospective.work_bound, 23);
+        assert_eq!(prospective.accounting.work, 23);
+        assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert_eq!(
+            refusal.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StateByteSpanSum)
+        );
+        assert_eq!(
+            refusal.receipt.identity.prepublication_fallback,
+            OperationPrepublicationFallback::None
+        );
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
+        assert!(prospective.contains(refusal.receipt.actual));
+        assert!(refusal.closes());
     }
 
     fn state_byte_span_sum_fixture_with_limits(

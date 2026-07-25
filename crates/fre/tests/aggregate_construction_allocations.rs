@@ -64,7 +64,10 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             allocations: 25,
             deallocations: 21,
             reallocations: 4,
-            bytes_allocated: 4_148,
+            // The continuation owner now includes the complete fixed inline
+            // state-byte SpanSum slot. Its allocator size class grows by 32
+            // bytes without adding an allocation.
+            bytes_allocated: 4_180,
             bytes_deallocated: 1_894,
             bytes_reallocated: 149,
         }
@@ -158,7 +161,7 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             allocations: 47,
             deallocations: 39,
             reallocations: 5,
-            bytes_allocated: 7_346,
+            bytes_allocated: 7_378,
             bytes_deallocated: 4_297,
             bytes_reallocated: 912,
         }

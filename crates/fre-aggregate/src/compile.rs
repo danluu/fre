@@ -640,6 +640,7 @@ pub(crate) struct StateByteSpanSumPlan {
     first: ByteSet,
     second: ByteSet,
     literal: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
+    literal_failure: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
     literal_len: usize,
 }
 
@@ -668,8 +669,19 @@ impl StateByteSpanSumPlan {
         &self.literal[..self.literal_len]
     }
 
-    const fn retained_bytes() -> usize {
+    pub(crate) fn literal_failure(&self) -> &[u8] {
+        &self.literal_failure[..self.literal_len]
+    }
+
+    const fn materialized_bytes() -> usize {
         core::mem::size_of::<Self>()
+    }
+
+    const fn retained_slot_bytes() -> usize {
+        // `CompiledRegex` always retains this inline slot. An absent theorem
+        // therefore owns the same fixed program storage as a materialized
+        // theorem; only the logical plan count differs.
+        core::mem::size_of::<Option<Self>>()
     }
 
     const fn topology_tag(&self) -> u8 {
@@ -1156,11 +1168,28 @@ impl CompiledRegex {
             mut start_domain,
             retained_program_bytes,
         ) = build_retained_components(hir, profile, limits, budget)?;
+        let state_byte_span_sum_slot_bytes = StateByteSpanSumPlan::retained_slot_bytes();
+        budget.preflight_receipt_construction_bytes(state_byte_span_sum_slot_bytes)?;
+        if budget.receipt_scope {
+            budget.acquire_checked_construction_bytes(state_byte_span_sum_slot_bytes)?;
+        } else {
+            budget.acquire_construction_bytes(state_byte_span_sum_slot_bytes)?;
+            enforce(
+                budget.current_construction_bytes,
+                limits.max_program_bytes,
+                Resource::ProgramBytes,
+            )?;
+        }
         let state_byte_span_sum = if ordered_root {
             None
         } else {
             build_state_byte_span_sum_plan(hir, profile, capture_policy, budget)?
         };
+        budget.record_initialization(state_byte_span_sum_slot_bytes, false)?;
+        if let Some(plan) = &state_byte_span_sum {
+            budget.record_copy(plan.literal().len())?;
+        }
+        budget.accounting.state_byte_span_sum_persistent_bytes = state_byte_span_sum_slot_bytes;
         let mut candidate = if ordered_root {
             None
         } else {
@@ -1176,9 +1205,7 @@ impl CompiledRegex {
                     candidate_bytes,
                     Resource::ProgramBytes,
                 )?,
-                state_byte_span_sum
-                    .as_ref()
-                    .map_or(0, |_| StateByteSpanSumPlan::retained_bytes()),
+                state_byte_span_sum_slot_bytes,
                 Resource::ProgramBytes,
             )?,
             url_aggregate
@@ -1513,19 +1540,17 @@ fn build_state_byte_span_sum_plan(
         return Ok(None);
     };
 
-    let retained_bytes = StateByteSpanSumPlan::retained_bytes();
-    budget.preflight_receipt_construction_bytes(retained_bytes)?;
-    budget.acquire_checked_construction_bytes(retained_bytes)?;
+    let retained_bytes = StateByteSpanSumPlan::materialized_bytes();
     budget.charge(add(retained_bytes, literal.len(), Resource::CompileWork)?)?;
+    let literal_failure = state_byte_literal_failure(literal, budget)?;
     let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
     retained_literal[..literal.len()].copy_from_slice(literal);
-    budget.record_initialization(retained_bytes, false)?;
-    budget.record_copy(literal.len())?;
     let plan = StateByteSpanSumPlan {
         topology,
         first,
         second,
         literal: retained_literal,
+        literal_failure,
         literal_len: literal.len(),
     };
     budget.accounting.state_byte_span_sum_plans = 1;
@@ -1537,8 +1562,44 @@ fn build_state_byte_span_sum_plan(
         .ok_or(Error::InternalInvariant(
             "state-byte SpanSum build work underflow",
         ))?;
-    budget.accounting.state_byte_span_sum_persistent_bytes = retained_bytes;
     Ok(Some(plan))
+}
+
+fn state_byte_literal_failure(
+    literal: &[u8],
+    budget: &mut CompileBudget,
+) -> Result<[u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES], Error> {
+    let mut failure = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
+    let mut matched = 0_usize;
+    for index in 1..literal.len() {
+        while matched > 0 {
+            budget.charge(1)?;
+            if literal[index] == literal[matched] {
+                break;
+            }
+            let fallback_index = matched.checked_sub(1).ok_or(Error::InternalInvariant(
+                "positive state-byte failure prefix lost its predecessor",
+            ))?;
+            matched = usize::from(failure[fallback_index]);
+        }
+        if matched == 0 {
+            budget.charge(1)?;
+            if literal[index] == literal[0] {
+                matched = 1;
+            }
+        } else {
+            // The equality terminating the fallback loop was already
+            // charged and proved above.
+            matched = add(matched, 1, Resource::CompileWork)?;
+        }
+        failure[index] = u8::try_from(matched).map_err(|_| {
+            Error::InternalInvariant(
+                "state-byte literal failure prefix exceeds its fixed byte representation",
+            )
+        })?;
+        budget.charge(1)?;
+    }
+    Ok(failure)
 }
 
 fn state_byte_concat_parts<'a>(
@@ -6366,8 +6427,8 @@ fn bind_state_byte_span_sum_identity(
     plan: &StateByteSpanSumPlan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = b"fre.aggregate.state-byte-span-sum-plan.v1";
-    let operation = b"fre.aggregate.state-byte-span-sum-operation.v1";
+    let domain = b"fre.aggregate.state-byte-span-sum-plan.v2";
+    let operation = b"fre.aggregate.state-byte-span-sum-operation.v2";
     let class_bytes = mul(8, core::mem::size_of::<u64>(), Resource::CompileWork)?;
     let payload = add(
         add(
@@ -6376,7 +6437,15 @@ fn bind_state_byte_span_sum_identity(
             Resource::CompileWork,
         )?,
         add(
-            add(class_bytes, plan.literal().len(), Resource::CompileWork)?,
+            add(
+                class_bytes,
+                add(
+                    plan.literal().len(),
+                    plan.literal_failure().len(),
+                    Resource::CompileWork,
+                )?,
+                Resource::CompileWork,
+            )?,
             add(1, core::mem::size_of::<usize>(), Resource::CompileWork)?,
             Resource::CompileWork,
         )?,
@@ -6398,6 +6467,7 @@ fn bind_state_byte_span_sum_identity(
         }
         hash_usize(hash, plan.literal().len());
         hash.bytes(plan.literal());
+        hash.bytes(plan.literal_failure());
     }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
@@ -8755,6 +8825,221 @@ mod tests {
         let mut budget = CompileBudget::new(CompileLimits::default());
         bind_required_internal_anchor_identity(PlanId([0x5a; 16]), &plan, &mut budget)
             .expect("bind required-anchor identity")
+    }
+
+    #[derive(Clone, Copy)]
+    enum StateByteSlotCompileKind {
+        Erase,
+        Reject,
+        OrderedRoot,
+    }
+
+    fn compile_state_byte_slot_case(
+        hir: &Hir,
+        profile: RustByteProfile,
+        kind: StateByteSlotCompileKind,
+        limits: CompileLimits,
+    ) -> Result<CompiledRegex, Error> {
+        match kind {
+            StateByteSlotCompileKind::Erase => {
+                CompiledRegex::from_hir_erasing_captures_for_whole_match(hir, profile, limits)
+            }
+            StateByteSlotCompileKind::Reject => CompiledRegex::from_hir(hir, profile, limits),
+            StateByteSlotCompileKind::OrderedRoot => {
+                CompiledRegex::from_hir_erasing_captures_for_ordered_root_count(
+                    hir, profile, limits,
+                )
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps every eligible and ineligible inline-slot representation under the same exact-byte assertions"
+    )]
+    fn state_byte_span_sum_inline_slot_is_complete_for_every_shape() {
+        let eligible = parse_bytes(r"[a-c]*ab[a-z]*");
+        let structurally_ineligible = parse_bytes(r"[a-c]*az[a-z]*");
+        let unicode = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\w+\s+Holmes")
+            .unwrap();
+        let ordered_root = parse_bytes(r"ab|cd");
+        let cases = [
+            (
+                &eligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Erase,
+                true,
+            ),
+            (
+                &eligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Reject,
+                false,
+            ),
+            (
+                &structurally_ineligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Erase,
+                false,
+            ),
+            (
+                &unicode,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                StateByteSlotCompileKind::Erase,
+                false,
+            ),
+            (
+                &ordered_root,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::OrderedRoot,
+                false,
+            ),
+        ];
+        let retained_slot_bytes = core::mem::size_of::<Option<StateByteSpanSumPlan>>();
+        assert_eq!(retained_slot_bytes, 208);
+        for (hir, profile, kind, eligible) in cases {
+            let compiled =
+                compile_state_byte_slot_case(hir, profile, kind, CompileLimits::default()).unwrap();
+            let accounting = compiled.compile_accounting();
+            assert_eq!(
+                accounting.state_byte_span_sum_persistent_bytes,
+                retained_slot_bytes
+            );
+            assert_eq!(accounting.state_byte_span_sum_plans, usize::from(eligible));
+            assert_eq!(compiled.state_byte_span_sum.is_some(), eligible);
+
+            let exact = CompileLimits {
+                max_program_bytes: accounting.program_bytes,
+                ..CompileLimits::default()
+            };
+            let replay = compile_state_byte_slot_case(hir, profile, kind, exact).unwrap();
+            assert_eq!(replay.compile_accounting(), accounting);
+            assert_eq!(
+                compile_state_byte_slot_case(
+                    hir,
+                    profile,
+                    kind,
+                    CompileLimits {
+                        max_program_bytes: accounting.program_bytes - 1,
+                        ..exact
+                    },
+                )
+                .unwrap_err(),
+                Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    required: accounting.program_bytes,
+                    limit: accounting.program_bytes - 1,
+                }
+            );
+        }
+
+        let eligible_receipt =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &eligible,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        let ineligible_receipt =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &structurally_ineligible,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+        for receipt in [&eligible_receipt, &ineligible_receipt] {
+            let actual = receipt.actual();
+            assert!(actual.is_closed());
+            assert!(actual.published);
+            assert_eq!(
+                actual.live_program_bytes,
+                receipt.compiled().compile_accounting().program_bytes
+            );
+            assert_eq!(
+                receipt
+                    .compiled()
+                    .compile_accounting()
+                    .state_byte_span_sum_persistent_bytes,
+                retained_slot_bytes
+            );
+        }
+        assert_eq!(
+            eligible_receipt.actual().allocations,
+            ineligible_receipt.actual().allocations
+        );
+    }
+
+    #[test]
+    fn state_byte_failure_table_one_below_closes_construction_receipt() {
+        let hir = parse_bytes(r"[ab]*abab[a-z]*");
+        let profile = RustByteProfile::PINNED_1_12_4;
+        let limits = CompileLimits::default();
+        let mut budget = CompileBudget::new_construction_receipt(limits, None);
+        validate_hir(
+            &hir,
+            profile,
+            CapturePolicy::EraseForWholeMatch,
+            &mut budget,
+        )
+        .unwrap();
+        let _url = build_url_aggregate_plan(
+            &hir,
+            profile,
+            CapturePolicy::EraseForWholeMatch,
+            limits,
+            &mut budget,
+        )
+        .unwrap();
+        let _retained = build_retained_components(&hir, profile, limits, &mut budget).unwrap();
+        let slot_bytes = StateByteSpanSumPlan::retained_slot_bytes();
+        budget
+            .preflight_receipt_construction_bytes(slot_bytes)
+            .unwrap();
+        budget
+            .acquire_checked_construction_bytes(slot_bytes)
+            .unwrap();
+        assert!(
+            build_state_byte_span_sum_plan(
+                &hir,
+                profile,
+                CapturePolicy::EraseForWholeMatch,
+                &mut budget,
+            )
+            .unwrap()
+            .is_some()
+        );
+        let table_end_work = budget.accounting.work;
+        let one_below = table_end_work - 1;
+
+        let refusal =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &hir,
+                profile,
+                CompileLimits {
+                    max_work: one_below,
+                    ..limits
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            refusal.source(),
+            &Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: table_end_work,
+                limit: one_below,
+            }
+        );
+        assert!(refusal.closes());
+        assert!(refusal.receipt().contains_actual());
+        assert!(
+            refusal.receipt().actual.copied_bytes <= refusal.receipt().actual.initialized_bytes
+        );
+        assert_eq!(refusal.receipt().accounting.state_byte_span_sum_plans, 0);
     }
 
     #[test]

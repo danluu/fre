@@ -50,6 +50,9 @@ pub struct CompileAccounting {
     pub state_byte_span_sum_plans: usize,
     pub state_byte_span_sum_literal_bytes: usize,
     pub state_byte_span_sum_build_work: usize,
+    /// Complete fixed inline `Option<StateByteSpanSumPlan>` storage retained
+    /// by every compiled artifact, including ineligible and ordered-root
+    /// shapes.
     pub state_byte_span_sum_persistent_bytes: usize,
     /// Bytes in the mandatory leading literal retained by the unbounded
     /// terminal-frontier certificate.

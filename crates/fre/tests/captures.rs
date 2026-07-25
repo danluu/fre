@@ -2837,10 +2837,11 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     assert_eq!(regex.build_report().selector.temporary_states_peak, 390);
     // Exact-vector certification on the current URI frontier retains 542,600
     // bytes; the fixed terminal-frontier proof adds 56 bytes and the retained
-    // minimum-match-width proof adds one 16-byte Option<usize>, and the retained
-    // start-domain proof adds one byte, even when this Unicode plan is ineligible
-    // for the sparse-start route.
-    assert_eq!(regex.build_report().selector.program_bytes, 542_673);
+    // minimum-match-width proof adds one 16-byte Option<usize>, the retained
+    // start-domain proof adds one byte, and the complete fixed state-byte
+    // SpanSum Option slot adds 208 bytes, even when this Unicode plan is
+    // ineligible for those compact routes.
+    assert_eq!(regex.build_report().selector.program_bytes, 542_881);
     assert!(regex.build_report().selector.work >= 126_986);
 
     for haystack in [
