@@ -149,6 +149,10 @@ pub struct AggregateManyCompositionAccounting {
 
 /// Exact selected-engine construction accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "continuation accounting is an allocation-free authenticated receipt; boxing it would break Copy and introduce an unreported heap allocation"
+)]
 pub enum AggregateManyBuildAccounting {
     OrderedLiteral(OrderedLiteralAggregateBuildAccounting),
     Continuation(CompileAccounting),
