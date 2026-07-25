@@ -19075,6 +19075,26 @@ mod tests {
     }
 
     #[test]
+    fn rebar_span_sum_dense_prefix_absent_suffix_fits_derived_limits() {
+        // Exact shape and input construction from
+        // opt/reverse-inner/no-quadratic-forward. The lifecycle derives the
+        // same public-operation limit that the Rebar runner enforces.
+        let patterns = [r".efghijklmnopq[a-z]+[A-Z]".to_string()];
+        let haystack = b"bcdefghijklmnopq".repeat(500);
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count-spans",
+            &patterns,
+            false,
+            false,
+            haystack.len(),
+        )
+        .expect("candidate span-sum lifecycle");
+        assert_eq!(lifecycle.plan(), "aggregate-continuation-program");
+        assert_eq!(lifecycle.execute(&haystack).expect("first span sum"), 0);
+        assert_eq!(lifecycle.execute(&haystack).expect("steady span sum"), 0);
+    }
+
+    #[test]
     fn current_fre_fixed_class_sandwich_covers_count_span_sum_and_compile() {
         let limits = RunLimits::default();
         let byte_pattern = vec![r"[a-q][^u-z]{13}x".to_string()];

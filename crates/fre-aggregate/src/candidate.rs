@@ -300,6 +300,20 @@ pub(crate) fn reduce_attempt(
         let mut cursor = 0_usize;
 
         if let Some(fixed) = plan.shared_fixed {
+            // Preserve the mandatory global proof used by the generic
+            // scheduler. A strong fixed prefix can still occur densely while
+            // another byte sequence required by every match is absent. In
+            // that case, proving the owner absent before the anchor scan
+            // avoids pointless (and potentially long) program verification.
+            let eligible = globally_present_owners(plan, local, &mut meter)?;
+            if eligible == 0 {
+                if workspace.bytes != allocations.bytes {
+                    return Err(Error::InternalInvariant(
+                        "shared fixed candidate workspace diverged from allocation ledger",
+                    ));
+                }
+                return Ok(());
+            }
             // The whole source scan is admitted before memchr can touch the
             // source. Each returned position then retains the same fixed
             // filter, assertion, candidate-event and verifier accounting as
@@ -321,7 +335,8 @@ pub(crate) fn reduce_attempt(
                         .ok_or(Error::InternalInvariant(
                             "shared fixed anchor outside bucket table",
                         ))?
-                        & fixed.owners;
+                        & fixed.owners
+                        & eligible;
                 let mut scheduled_owners = 0_u128;
                 while owners != 0 {
                     meter.charge_work(1)?; // one owner selection
@@ -1624,9 +1639,12 @@ mod tests {
         .unwrap();
         assert_eq!(result.matches, reference(pattern, &haystack));
         assert!((1..=16).contains(&result.candidates));
-        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
         assert!(
-            result.accounting.work < haystack.len().checked_mul(2).unwrap(),
+            (haystack.len()..=haystack.len().checked_mul(2).unwrap())
+                .contains(&result.accounting.sequential_bytes_read)
+        );
+        assert!(
+            result.accounting.work < haystack.len().checked_mul(3).unwrap(),
             "single fixed scheduling must not drain every absent start"
         );
         let span_sum = reduce_attempt(
@@ -1666,7 +1684,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.matches, reference(pattern, &haystack));
         assert_eq!(result.candidates, 1);
-        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+        assert!(
+            (haystack.len()..=haystack.len().checked_mul(2).unwrap())
+                .contains(&result.accounting.sequential_bytes_read)
+        );
         let span_sum = reduce_attempt(
             ReductionKind::SpanSum,
             plan,
@@ -1704,9 +1725,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.matches, reference(pattern, &haystack));
-        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
         assert!(
-            result.accounting.work < haystack.len().checked_mul(2).unwrap(),
+            (haystack.len()..=haystack.len().checked_mul(2).unwrap())
+                .contains(&result.accounting.sequential_bytes_read)
+        );
+        assert!(
+            result.accounting.work < haystack.len().checked_mul(3).unwrap(),
             "shared fixed scheduling must not drain every absent start"
         );
         let span_sum = reduce_attempt(
@@ -1722,6 +1746,55 @@ mod tests {
         assert_eq!(span_sum.candidates, result.candidates);
         assert_eq!(span_sum.accounting, result.accounting);
         assert_eq!(span_sum.span_sum, reference_span_sum(pattern, &haystack));
+    }
+
+    #[test]
+    fn shared_fixed_candidate_skips_dense_prefix_when_global_suffix_is_absent() {
+        let pattern = r".efghijklmnopq[a-z]+[A-Z]";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert!(plan.shared_fixed.is_some());
+        // The start-relative scheduler uses the dense trailing `q` from the
+        // fixed prefix, while the complementary source-wide proof retains the
+        // mandatory uppercase suffix. Keeping both assertions here proves
+        // that the early-out below is not merely an absent-anchor shortcut.
+        assert_ne!(plan.buckets[usize::from(b'q')], 0);
+        assert_eq!(plan.global_buckets[usize::from(b'q')], 0);
+        assert_ne!(plan.global_buckets[usize::from(b'A')], 0);
+        assert_ne!(plan.global_buckets[usize::from(b'Z')], 0);
+        let haystack = b"bcdefghijklmnopq".repeat(500);
+
+        let result = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.span_sum, 0);
+        assert_eq!(result.candidates, 0);
+        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+        assert!(result.accounting.work < haystack.len().checked_mul(2).unwrap());
+
+        let exact = OperationLimits {
+            max_work: result.accounting.work,
+            ..OperationLimits::default()
+        };
+        assert_eq!(
+            reduce_attempt(
+                ReductionKind::SpanSum,
+                plan,
+                &compiled.program,
+                &haystack,
+                0..haystack.len(),
+                exact,
+            )
+            .unwrap(),
+            result
+        );
     }
 
     #[test]

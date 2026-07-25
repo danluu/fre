@@ -1696,10 +1696,21 @@ fn build_candidate_plan(
                 ))?,
             _ => fallback,
         };
-        let Some(global) = required_global_candidate(branch, budget)? else {
+        let Some(mut global) = required_global_candidate(branch, budget)? else {
             budget.release_construction_bytes(draft_bytes)?;
             return Ok(None);
         };
+        if let Some(trailing) = required_trailing_global_candidate(branch, budget)?
+            && !global_probe_equal(&global, &trailing, budget)?
+        {
+            // The scheduler already retains the strongest start-relative
+            // proof. Prefer a distinct mandatory trailing global proof when
+            // one exists, so the source-wide census is complementary instead
+            // of rechecking a potentially dense prefix. This retains one
+            // global scan and remains source-independent while catching
+            // missing suffixes and terminal classes.
+            global = trailing;
+        }
         draft.global_bytes = global.bytes;
         draft.global_checks = global.checks;
         draft.global_check_len = global.check_len;
@@ -2322,6 +2333,73 @@ fn required_global_candidate(
             for branch in branches {
                 budget.charge(1)?;
                 let Some(branch) = required_global_candidate(branch, budget)? else {
+                    return Ok(None);
+                };
+                combined = Some(match combined {
+                    None => branch,
+                    Some(mut combined) => {
+                        if global_probe_equal(&combined, &branch, budget)? {
+                            combined
+                        } else {
+                            for word in 0..combined.bytes.0.len() {
+                                budget.charge(2)?;
+                                combined.bytes.0[word] |= branch.bytes.0[word];
+                            }
+                            combined.checks = initialized_filter_checks(budget)?;
+                            combined.check_len = 0;
+                            combined.min_offset = 0;
+                            combined.max_offset = 0;
+                            combined.global_bytes = combined.bytes;
+                            combined.global_checks = combined.checks;
+                            combined.global_check_len = 0;
+                            combined
+                        }
+                    }
+                });
+            }
+            Ok(combined)
+        }
+    }
+}
+
+fn required_trailing_global_candidate(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<CandidateDraft>, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Unicode(_)) => Ok(None),
+        HirKind::Literal(_) | HirKind::Class(Class::Bytes(_)) => {
+            required_global_candidate(hir, budget)
+        }
+        HirKind::Capture(capture) => required_trailing_global_candidate(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            budget.charge(1)?;
+            if repetition.min == 0 {
+                Ok(None)
+            } else {
+                required_trailing_global_candidate(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            for part in parts.iter().rev() {
+                budget.charge(2)?; // child visit and mandatory-width property
+                if part
+                    .properties()
+                    .minimum_len()
+                    .is_some_and(|minimum| minimum > 0)
+                    && let Some(candidate) = required_trailing_global_candidate(part, budget)?
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+            Ok(None)
+        }
+        HirKind::Alternation(branches) => {
+            let mut combined: Option<CandidateDraft> = None;
+            for branch in branches {
+                budget.charge(1)?;
+                let Some(branch) = required_trailing_global_candidate(branch, budget)? else {
                     return Ok(None);
                 };
                 combined = Some(match combined {
