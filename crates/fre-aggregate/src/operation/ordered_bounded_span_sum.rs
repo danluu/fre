@@ -1084,7 +1084,7 @@ mod tests {
                 compile_accounting.ordered_bounded_span_sum_max_chunks,
                 compile_accounting.ordered_bounded_span_sum_persistent_bytes,
             ),
-            (1, 7, 10, OrderedBoundedSpanSumPlan::retained_bytes(),)
+            (1, 7, 10, OrderedBoundedSpanSumPlan::retained_slot_bytes(),)
         );
         assert!(compile_accounting.ordered_bounded_span_sum_build_work > 0);
         let greedy_witness = b"red blue red blue";

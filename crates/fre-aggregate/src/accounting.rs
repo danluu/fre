@@ -63,7 +63,9 @@ pub struct CompileAccounting {
     pub ordered_bounded_span_sum_max_chunks: usize,
     /// Exact logical work used to recognize and retain the theorem.
     pub ordered_bounded_span_sum_build_work: usize,
-    /// Exact inline bytes retained by the theorem.
+    /// Complete fixed inline `Option<OrderedBoundedSpanSumPlan>` storage
+    /// retained by every compiled artifact, including ineligible and
+    /// ordered-root shapes.
     pub ordered_bounded_span_sum_persistent_bytes: usize,
     /// Bytes in the mandatory leading literal retained by the unbounded
     /// terminal-frontier certificate.

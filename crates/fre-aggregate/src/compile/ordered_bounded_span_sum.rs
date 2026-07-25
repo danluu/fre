@@ -50,8 +50,15 @@ impl OrderedBoundedSpanSumPlan {
         usize::from(self.max_chunks)
     }
 
-    pub(crate) const fn retained_bytes() -> usize {
+    pub(crate) const fn materialized_bytes() -> usize {
         core::mem::size_of::<Self>()
+    }
+
+    pub(crate) const fn retained_slot_bytes() -> usize {
+        // `CompiledRegex` always retains this inline slot. An absent theorem
+        // therefore owns the same fixed program storage as a materialized
+        // theorem; only the logical plan count differs.
+        core::mem::size_of::<Option<Self>>()
     }
 }
 
@@ -120,17 +127,17 @@ pub(super) fn build_plan(
         return Ok(None);
     }
 
-    let retained_bytes = OrderedBoundedSpanSumPlan::retained_bytes();
+    let materialized_bytes = OrderedBoundedSpanSumPlan::materialized_bytes();
     let anchor_bytes = add(first.start.len(), first.end.len(), Resource::CompileWork)?;
-    budget.preflight_receipt_construction_bytes(retained_bytes)?;
-    budget.charge(add(retained_bytes, anchor_bytes, Resource::CompileWork)?)?;
-    budget.acquire_checked_construction_bytes(retained_bytes)?;
+    budget.charge(add(
+        materialized_bytes,
+        anchor_bytes,
+        Resource::CompileWork,
+    )?)?;
     let mut first_anchor = [0_u8; MAX_ORDERED_BOUNDED_ANCHOR_BYTES];
     let mut second_anchor = [0_u8; MAX_ORDERED_BOUNDED_ANCHOR_BYTES];
     first_anchor[..first.start.len()].copy_from_slice(first.start);
     second_anchor[..first.end.len()].copy_from_slice(first.end);
-    budget.record_initialization(retained_bytes, false)?;
-    budget.record_copy(anchor_bytes)?;
     let plan = OrderedBoundedSpanSumPlan {
         first_anchor,
         second_anchor,
@@ -156,7 +163,6 @@ pub(super) fn build_plan(
         .ok_or(Error::InternalInvariant(
             "ordered bounded-span build work underflow",
         ))?;
-    budget.accounting.ordered_bounded_span_sum_persistent_bytes = retained_bytes;
     Ok(Some(plan))
 }
 

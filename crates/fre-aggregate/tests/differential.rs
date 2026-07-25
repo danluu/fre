@@ -5,8 +5,8 @@
 
 use fre_aggregate::{
     CompileLimits, CompiledRegex, Error, ExecutionAccounting, OperationLimits,
-    OperationPhysicalRoute, OperationPrepublicationFallback, Resource, RowStorage,
-    RustByteProfile, Span, Strategy, Unsupported,
+    OperationPhysicalRoute, OperationPrepublicationFallback, Resource, RowStorage, RustByteProfile,
+    Span, Strategy, Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{

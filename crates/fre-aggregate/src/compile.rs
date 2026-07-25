@@ -1195,11 +1195,33 @@ impl CompiledRegex {
             budget.record_copy(plan.literal().len())?;
         }
         budget.accounting.state_byte_span_sum_persistent_bytes = state_byte_span_sum_slot_bytes;
+        let ordered_bounded_span_sum_slot_bytes = OrderedBoundedSpanSumPlan::retained_slot_bytes();
+        budget.preflight_receipt_construction_bytes(ordered_bounded_span_sum_slot_bytes)?;
+        if budget.receipt_scope {
+            budget.acquire_checked_construction_bytes(ordered_bounded_span_sum_slot_bytes)?;
+        } else {
+            budget.acquire_construction_bytes(ordered_bounded_span_sum_slot_bytes)?;
+            enforce(
+                budget.current_construction_bytes,
+                limits.max_program_bytes,
+                Resource::ProgramBytes,
+            )?;
+        }
         let ordered_bounded_span_sum = if ordered_root {
             None
         } else {
             ordered_bounded_span_sum::build_plan(hir, profile, capture_policy, budget)?
         };
+        budget.record_initialization(ordered_bounded_span_sum_slot_bytes, false)?;
+        if let Some(plan) = &ordered_bounded_span_sum {
+            budget.record_copy(add(
+                plan.first_anchor().len(),
+                plan.second_anchor().len(),
+                Resource::ProgramBytes,
+            )?)?;
+        }
+        budget.accounting.ordered_bounded_span_sum_persistent_bytes =
+            ordered_bounded_span_sum_slot_bytes;
         let mut candidate = if ordered_root {
             None
         } else {
@@ -1217,9 +1239,7 @@ impl CompiledRegex {
                 )?,
                 add(
                     state_byte_span_sum_slot_bytes,
-                    ordered_bounded_span_sum
-                        .as_ref()
-                        .map_or(0, |_| OrderedBoundedSpanSumPlan::retained_bytes()),
+                    ordered_bounded_span_sum_slot_bytes,
                     Resource::ProgramBytes,
                 )?,
                 Resource::ProgramBytes,
@@ -10188,6 +10208,122 @@ mod tests {
             eligible_receipt.actual().allocations,
             ineligible_receipt.actual().allocations
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix keeps every eligible and ineligible ordered inline-slot representation under the same exact-byte assertions"
+    )]
+    fn ordered_bounded_span_sum_inline_slot_is_complete_for_every_shape() {
+        let eligible = parse_bytes(
+            r"(?:red(?:[ _]*[a-z]+[ _]*){0,10}blue)|(?:blue(?:[ _]*[a-z]+[ _]*){0,10}red)",
+        );
+        let structurally_ineligible = parse_bytes(r"[a-c]*az[a-z]*");
+        let unicode = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\w+\s+Holmes")
+            .unwrap();
+        let ordered_root = parse_bytes(r"ab|cd");
+        let cases = [
+            (
+                &eligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Erase,
+                true,
+            ),
+            (
+                &eligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Reject,
+                false,
+            ),
+            (
+                &structurally_ineligible,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::Erase,
+                false,
+            ),
+            (
+                &unicode,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                StateByteSlotCompileKind::Erase,
+                false,
+            ),
+            (
+                &ordered_root,
+                RustByteProfile::PINNED_1_12_4,
+                StateByteSlotCompileKind::OrderedRoot,
+                false,
+            ),
+        ];
+        assert_eq!(OrderedBoundedSpanSumPlan::materialized_bytes(), 136);
+        let retained_slot_bytes = core::mem::size_of::<Option<OrderedBoundedSpanSumPlan>>();
+        assert_eq!(retained_slot_bytes, 144);
+        for (hir, profile, kind, eligible) in cases {
+            let compiled =
+                compile_state_byte_slot_case(hir, profile, kind, CompileLimits::default()).unwrap();
+            let accounting = compiled.compile_accounting();
+            assert_eq!(
+                accounting.ordered_bounded_span_sum_persistent_bytes,
+                retained_slot_bytes
+            );
+            assert_eq!(
+                accounting.ordered_bounded_span_sum_plans,
+                usize::from(eligible)
+            );
+            assert_eq!(compiled.ordered_bounded_span_sum.is_some(), eligible);
+
+            let exact = CompileLimits {
+                max_program_bytes: accounting.program_bytes,
+                ..CompileLimits::default()
+            };
+            let replay = compile_state_byte_slot_case(hir, profile, kind, exact).unwrap();
+            assert_eq!(replay.compile_accounting(), accounting);
+            assert_eq!(
+                compile_state_byte_slot_case(
+                    hir,
+                    profile,
+                    kind,
+                    CompileLimits {
+                        max_program_bytes: accounting.program_bytes - 1,
+                        ..exact
+                    },
+                )
+                .unwrap_err(),
+                Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    required: accounting.program_bytes,
+                    limit: accounting.program_bytes - 1,
+                }
+            );
+        }
+
+        for hir in [&eligible, &structurally_ineligible] {
+            let receipt =
+                CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                    hir,
+                    RustByteProfile::PINNED_1_12_4,
+                    CompileLimits::default(),
+                )
+                .unwrap();
+            let actual = receipt.actual();
+            assert!(actual.is_closed());
+            assert!(actual.published);
+            assert_eq!(
+                actual.live_program_bytes,
+                receipt.compiled().compile_accounting().program_bytes
+            );
+            assert_eq!(
+                receipt
+                    .compiled()
+                    .compile_accounting()
+                    .ordered_bounded_span_sum_persistent_bytes,
+                retained_slot_bytes
+            );
+        }
     }
 
     #[test]
